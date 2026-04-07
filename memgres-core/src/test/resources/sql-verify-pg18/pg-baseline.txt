@@ -1,0 +1,1905 @@
+=== FILE: 00_harness.sql ===
+--- STMT 1 ---
+SQL: SET client_min_messages = notice
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: SET extra_float_digits = 0
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET DateStyle = 'ISO, YMD'
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: SET IntervalStyle = 'postgres'
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: SET TimeZone = 'UTC'
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: SET standard_conforming_strings = on
+OK: 0 rows affected
+--- STMT 8 ---
+SQL: SELECT current_setting('server_version') AS server_version
+RESULT: 1 columns, 1 rows
+COLUMNS: server_version
+ROW: 18.0
+--- STMT 9 ---
+SQL: SELECT current_setting('server_encoding') AS server_encoding
+RESULT: 1 columns, 1 rows
+COLUMNS: server_encoding
+ROW: UTF8
+--- STMT 10 ---
+SQL: SELECT current_setting('client_encoding') AS client_encoding
+RESULT: 1 columns, 1 rows
+COLUMNS: client_encoding
+ROW: UTF8
+--- STMT 11 ---
+SQL: SELECT current_setting('DateStyle') AS datestyle, current_setting('IntervalStyle') AS intervalstyle, current_setting('TimeZone') AS timezone
+RESULT: 3 columns, 1 rows
+COLUMNS: datestyle, intervalstyle, timezone
+ROW: ISO, YMD | postgres | UTC
+--- STMT 12 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 13 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 14 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 15 ---
+SQL: SELECT 1 AS i, pg_typeof(1) AS i_type, 1.5 AS n, pg_typeof(1.5) AS n_type, 'x'::text AS t, pg_typeof('x'::text) AS t_type, true AS b, pg_typeof(true) AS b_type, NULL::int AS null_i, pg_typeof(NULL::in...
+RESULT: 10 columns, 1 rows
+COLUMNS: i, i_type, n, n_type, t, t_type, b, b_type, null_i, null_i_type
+ROW: 1 | integer | 1.5 | numeric | x | text | t | boolean | NULL | integer
+--- STMT 16 ---
+SQL: CREATE TABLE harness_table(a int, b text)
+OK: 0 rows affected
+--- STMT 17 ---
+SQL: INSERT INTO harness_table VALUES (1, 'one'), (2, 'two')
+OK: 2 rows affected
+--- STMT 18 ---
+SQL: TABLE harness_table
+RESULT: 2 columns, 2 rows
+COLUMNS: a, b
+ROW: 1 | one
+ROW: 2 | two
+--- STMT 19 ---
+SQL: -- duplicate object error CREATE TABLE harness_table(a int)
+ERROR [42P07]: ERROR: relation "harness_table" already exists
+--- STMT 20 ---
+SQL: -- semantic error SELECT missing_column FROM harness_table
+ERROR [42703]: ERROR: column "missing_column" does not exist
+--- STMT 21 ---
+SQL: -- runtime error SELECT 1 / 0
+ERROR [22012]: ERROR: division by zero
+--- STMT 22 ---
+SQL: -- parser error: missing expression SELECT FROM harness_table
+RESULT: 0 columns, 2 rows
+COLUMNS: 
+ROW: 
+ROW: 
+--- STMT 23 ---
+SQL: -- parser error: dangling comma SELECT 1, FROM harness_table
+ERROR [42601]: ERROR: syntax error at or near "FROM"
+--- STMT 24 ---
+SQL: -- parser error: mismatched parentheses SELECT (1 + 2 FROM harness_table
+ERROR [42601]: ERROR: syntax error at or near "FROM"
+--- STMT 25 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 01_parser_lexer.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: -- identifiers and quoting CREATE TABLE "MixedCase"("select" int, normal int, "has space" text)
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: INSERT INTO "MixedCase"("select", normal, "has space") VALUES (1, 2, 'ok')
+OK: 1 rows affected
+--- STMT 7 ---
+SQL: SELECT "select", normal, "has space" FROM "MixedCase"
+RESULT: 3 columns, 1 rows
+COLUMNS: select, normal, has space
+ROW: 1 | 2 | ok
+--- STMT 8 ---
+SQL: SELECT mixedcase.normal FROM "MixedCase" AS mixedcase
+RESULT: 1 columns, 1 rows
+COLUMNS: normal
+ROW: 2
+--- STMT 9 ---
+SQL: SELECT "MixedCase".normal FROM "MixedCase"
+RESULT: 1 columns, 1 rows
+COLUMNS: normal
+ROW: 2
+--- STMT 10 ---
+SQL: -- strings and comments SELECT 'simple string' AS s
+RESULT: 1 columns, 1 rows
+COLUMNS: s
+ROW: simple string
+--- STMT 11 ---
+SQL: SELECT E'line1\nline2' AS escaped
+RESULT: 1 columns, 1 rows
+COLUMNS: escaped
+ROW: line1\nline2
+--- STMT 12 ---
+SQL: SELECT $$dollar quoted$$ AS dq
+RESULT: 1 columns, 1 rows
+COLUMNS: dq
+ROW: dollar quoted
+--- STMT 13 ---
+SQL: SELECT $tag$another dollar quoted string$tag$ AS dq2
+RESULT: 1 columns, 1 rows
+COLUMNS: dq2
+ROW: another dollar quoted string
+--- STMT 14 ---
+SQL: SELECT 'abc' /* mid expression comment */ || 'def' AS concatenated
+RESULT: 1 columns, 1 rows
+COLUMNS: concatenated
+ROW: abcdef
+--- STMT 15 ---
+SQL: SELECT 1 + 2 * 3 AS precedence1, (1 + 2) * 3 AS precedence2
+RESULT: 2 columns, 1 rows
+COLUMNS: precedence1, precedence2
+ROW: 7 | 9
+--- STMT 16 ---
+SQL: SELECT NOT true AND false AS precedence3, NOT (true AND false) AS precedence4
+RESULT: 2 columns, 1 rows
+COLUMNS: precedence3, precedence4
+ROW: f | t
+--- STMT 17 ---
+SQL: -- reserved words / aliases SELECT 1 AS "from", 2 AS "where", 3 AS "group"
+RESULT: 3 columns, 1 rows
+COLUMNS: from, where, group
+ROW: 1 | 2 | 3
+--- STMT 18 ---
+SQL: SELECT 1 AS x, 2 AS x
+RESULT: 2 columns, 1 rows
+COLUMNS: x, x
+ROW: 1 | 2
+--- STMT 19 ---
+SQL: -- invalid syntax variations SELECT
+RESULT: 0 columns, 1 rows
+COLUMNS: 
+ROW: 
+--- STMT 20 ---
+SQL: SELECT , 1
+ERROR [42601]: ERROR: syntax error at or near ","
+--- STMT 21 ---
+SQL: SELECT 1 2
+ERROR [42601]: ERROR: syntax error at or near "2"
+--- STMT 22 ---
+SQL: SELECT (1 + 2))
+ERROR [42601]: ERROR: syntax error at or near ")"
+--- STMT 23 ---
+SQL: SELECT ((1 + 2)
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 24 ---
+SQL: SELECT * FROM
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 25 ---
+SQL: INSERT INTO VALUES (1)
+ERROR [42601]: ERROR: syntax error at or near "1"
+--- STMT 26 ---
+SQL: INSERT test VALUES (1)
+ERROR [42601]: ERROR: syntax error at or near "test"
+--- STMT 27 ---
+SQL: UPDATE SET x = 1
+ERROR [42601]: ERROR: syntax error at or near "="
+--- STMT 28 ---
+SQL: DELETE test WHERE 1 = 1
+ERROR [42601]: ERROR: syntax error at or near "test"
+--- STMT 29 ---
+SQL: CREATE TABLE t_parser_01 (a int, b text
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 30 ---
+SQL: CREATE TABLE t_parser_02 a int)
+ERROR [42601]: ERROR: syntax error at or near "a"
+--- STMT 31 ---
+SQL: CREATE TABLE t_parser_03 ((a int))
+ERROR [42601]: ERROR: syntax error at or near "("
+--- STMT 32 ---
+SQL: CREATE TABLE t_parser_04 (a int,, b int)
+ERROR [42601]: ERROR: syntax error at or near ","
+--- STMT 33 ---
+SQL: CREATE TABLE t_parser_05 (a int b int)
+ERROR [42601]: ERROR: syntax error at or near "b"
+--- STMT 34 ---
+SQL: ALTER TABLE t_missing ADD COLUMN
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 35 ---
+SQL: DROP TABLE IF EXISTS
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 36 ---
+SQL: CREATE VIEW v_bad AS
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 37 ---
+SQL: CREATE INDEX ON "MixedCase"
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 38 ---
+SQL: CREATE INDEX idx_bad ON "MixedCase" ()
+ERROR [42601]: ERROR: syntax error at or near ")"
+--- STMT 39 ---
+SQL: SELECT 1 FROM "MixedCase" WHERE
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 40 ---
+SQL: SELECT 1 FROM "MixedCase" ORDER
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 41 ---
+SQL: SELECT 1 FROM "MixedCase" GROUP BY
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 42 ---
+SQL: SELECT 1 FROM "MixedCase" HAVING
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 43 ---
+SQL: SELECT CASE WHEN true THEN 1 ELSE END
+ERROR [42601]: ERROR: syntax error at or near "END"
+--- STMT 44 ---
+SQL: SELECT CASE WHEN THEN 1 ELSE 2 END
+ERROR [42601]: ERROR: syntax error at or near "THEN"
+--- STMT 45 ---
+SQL: SELECT CAST(1 AS )
+ERROR [42601]: ERROR: syntax error at or near ")"
+--- STMT 46 ---
+SQL: SELECT 1::
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 47 ---
+SQL: SELECT ARRAY[1, 2, ]
+ERROR [42601]: ERROR: syntax error at or near "]"
+--- STMT 48 ---
+SQL: SELECT ARRAY[,1,2]
+ERROR [42601]: ERROR: syntax error at or near ","
+--- STMT 49 ---
+SQL: SELECT ARRAY[1 2]
+ERROR [42601]: ERROR: syntax error at or near "2"
+--- STMT 50 ---
+SQL: SELECT INTERVAL '1 day' '2 days'
+ERROR [42601]: ERROR: syntax error at or near "'2 days'"
+--- STMT 51 ---
+SQL: SELECT DATE '2024-01-01' 'junk'
+ERROR [42601]: ERROR: syntax error at or near "'junk'"
+--- STMT 52 ---
+SQL: SELECT * FROM "MixedCase" m JOIN ON m.normal = 1
+ERROR [42601]: ERROR: syntax error at or near "ON"
+--- STMT 53 ---
+SQL: WITH cte AS () SELECT 1
+ERROR [42601]: ERROR: syntax error at or near ")"
+--- STMT 54 ---
+SQL: WITH RECURSIVE cte(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cte WHERE n < 3 SELECT * FROM cte
+ERROR [42601]: ERROR: syntax error at or near "SELECT"
+--- STMT 55 ---
+SQL: MERGE INTO "MixedCase" USING "MixedCase" ON WHEN MATCHED THEN UPDATE SET normal = 0
+ERROR [42601]: ERROR: syntax error at or near "WHEN"
+--- STMT 56 ---
+SQL: -- valid but tricky SELECT 'It''s fine' AS quoted
+RESULT: 1 columns, 1 rows
+COLUMNS: quoted
+ROW: It's fine
+--- STMT 57 ---
+SQL: SELECT "select" + normal AS sum_cols FROM "MixedCase"
+RESULT: 1 columns, 1 rows
+COLUMNS: sum_cols
+ROW: 3
+--- STMT 58 ---
+SQL: SELECT 1::int4 + 2::int8 AS widened, pg_typeof(1::int4 + 2::int8) AS widened_type
+RESULT: 2 columns, 1 rows
+COLUMNS: widened, widened_type
+ROW: 3 | bigint
+--- STMT 59 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 02_types_and_casts.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: CREATE DOMAIN posint AS int CHECK (VALUE > 0)
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: CREATE TYPE pair AS (x int, y text)
+OK: 0 rows affected
+--- STMT 8 ---
+SQL: SELECT true AS v, pg_typeof(true) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: t | boolean
+--- STMT 9 ---
+SQL: SELECT 42::smallint AS v, pg_typeof(42::smallint) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 42 | smallint
+--- STMT 10 ---
+SQL: SELECT 42::integer AS v, pg_typeof(42::integer) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 42 | integer
+--- STMT 11 ---
+SQL: SELECT 42::bigint AS v, pg_typeof(42::bigint) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 42 | bigint
+--- STMT 12 ---
+SQL: SELECT 123.45::numeric(10,2) AS v, pg_typeof(123.45::numeric(10,2)) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 123.45 | numeric
+--- STMT 13 ---
+SQL: SELECT 1.25::real AS v, pg_typeof(1.25::real) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 1.25 | real
+--- STMT 14 ---
+SQL: SELECT 1.25::double precision AS v, pg_typeof(1.25::double precision) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 1.25 | double precision
+--- STMT 15 ---
+SQL: SELECT 'abc'::text AS v, pg_typeof('abc'::text) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: abc | text
+--- STMT 16 ---
+SQL: SELECT 'abc'::varchar(5) AS v, pg_typeof('abc'::varchar(5)) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: abc | character varying
+--- STMT 17 ---
+SQL: SELECT 'x'::char(3) AS v, pg_typeof('x'::char(3)) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: x   | character
+--- STMT 18 ---
+SQL: SELECT E'\\xDEADBEEF'::bytea AS v, pg_typeof(E'\\xDEADBEEF'::bytea) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: \\xdeadbeef | bytea
+--- STMT 19 ---
+SQL: SELECT '00000000-0000-0000-0000-000000000000'::uuid AS v, pg_typeof('00000000-0000-0000-0000-000000000000'::uuid) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 00000000-0000-0000-0000-000000000000 | uuid
+--- STMT 20 ---
+SQL: SELECT DATE '2024-02-29' AS v, pg_typeof(DATE '2024-02-29') AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 2024-02-29 | date
+--- STMT 21 ---
+SQL: SELECT TIME '23:59:59' AS v, pg_typeof(TIME '23:59:59') AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 23:59:59 | time without time zone
+--- STMT 22 ---
+SQL: SELECT TIMESTAMP '2024-02-29 12:34:56' AS v, pg_typeof(TIMESTAMP '2024-02-29 12:34:56') AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 2024-02-29 12:34:56 | timestamp without time zone
+--- STMT 23 ---
+SQL: SELECT TIMESTAMPTZ '2024-02-29 12:34:56+00' AS v, pg_typeof(TIMESTAMPTZ '2024-02-29 12:34:56+00') AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 2024-02-29 12:34:56+00 | timestamp with time zone
+--- STMT 24 ---
+SQL: SELECT INTERVAL '1 day 2 hours 3 minutes' AS v, pg_typeof(INTERVAL '1 day 2 hours 3 minutes') AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 1 day 02:03:00 | interval
+--- STMT 25 ---
+SQL: SELECT '{"a":1}'::json AS v, pg_typeof('{"a":1}'::json) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: {"a":1} | json
+--- STMT 26 ---
+SQL: SELECT '{"a":1}'::jsonb AS v, pg_typeof('{"a":1}'::jsonb) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: {"a": 1} | jsonb
+--- STMT 27 ---
+SQL: SELECT 'happy'::mood AS v, pg_typeof('happy'::mood) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: happy | mood
+--- STMT 28 ---
+SQL: SELECT 5::posint AS v, pg_typeof(5::posint) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 5 | posint
+--- STMT 29 ---
+SQL: SELECT ROW(1, 'a')::pair AS v, pg_typeof(ROW(1, 'a')::pair) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: (1,a) | pair
+--- STMT 30 ---
+SQL: SELECT ARRAY[1,2,3] AS v, pg_typeof(ARRAY[1,2,3]) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: {1,2,3} | integer[]
+--- STMT 31 ---
+SQL: SELECT ARRAY[['a','b'],['c','d']] AS v, pg_typeof(ARRAY[['a','b'],['c','d']]) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: {{a,b},{c,d}} | text[]
+--- STMT 32 ---
+SQL: -- coercions and type resolution SELECT 1 + 2.5 AS v, pg_typeof(1 + 2.5) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 3.5 | numeric
+--- STMT 33 ---
+SQL: SELECT 1 / 2 AS v, pg_typeof(1 / 2) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 0 | integer
+--- STMT 34 ---
+SQL: SELECT 1::numeric / 2 AS v, pg_typeof(1::numeric / 2) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 0.50000000000000000000 | numeric
+--- STMT 35 ---
+SQL: SELECT '123'::int + 1 AS v, pg_typeof('123'::int + 1) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 124 | integer
+--- STMT 36 ---
+SQL: SELECT CAST('123.45' AS numeric(10,2)) AS v
+RESULT: 1 columns, 1 rows
+COLUMNS: v
+ROW: 123.45
+--- STMT 37 ---
+SQL: SELECT CAST(NULL AS text) AS v, pg_typeof(CAST(NULL AS text)) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: NULL | text
+--- STMT 38 ---
+SQL: SELECT CAST(jsonb 'null' AS int) AS v, pg_typeof(CAST(jsonb 'null' AS int)) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: NULL | integer
+--- STMT 39 ---
+SQL: -- valid comparisons and ordering SELECT 'sad'::mood < 'happy'::mood AS enum_lt
+RESULT: 1 columns, 1 rows
+COLUMNS: enum_lt
+ROW: t
+--- STMT 40 ---
+SQL: SELECT ARRAY[1,2] < ARRAY[1,3] AS array_lt
+RESULT: 1 columns, 1 rows
+COLUMNS: array_lt
+ROW: t
+--- STMT 41 ---
+SQL: -- bad inputs and bad casts SELECT 'x'::boolean
+ERROR [22P02]: ERROR: invalid input syntax for type boolean: "x"
+--- STMT 42 ---
+SQL: SELECT 'abc'::integer
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "abc"
+--- STMT 43 ---
+SQL: SELECT '999999999999999999999999999'::bigint
+ERROR [22003]: ERROR: value "999999999999999999999999999" is out of range for type bigint
+--- STMT 44 ---
+SQL: SELECT '12.345'::numeric(4,2)
+RESULT: 1 columns, 1 rows
+COLUMNS: numeric
+ROW: 12.35
+--- STMT 45 ---
+SQL: SELECT 'too long'::varchar(3)
+RESULT: 1 columns, 1 rows
+COLUMNS: varchar
+ROW: too
+--- STMT 46 ---
+SQL: SELECT '2024-02-30'::date
+ERROR [22008]: ERROR: date/time field value out of range: "2024-02-30"
+--- STMT 47 ---
+SQL: SELECT '25:00:00'::time
+ERROR [22008]: ERROR: date/time field value out of range: "25:00:00"
+--- STMT 48 ---
+SQL: SELECT 'not a uuid'::uuid
+ERROR [22P02]: ERROR: invalid input syntax for type uuid: "not a uuid"
+--- STMT 49 ---
+SQL: SELECT 'not json'::json
+ERROR [22P02]: ERROR: invalid input syntax for type json
+--- STMT 50 ---
+SQL: SELECT 'angry'::mood
+ERROR [22P02]: ERROR: invalid input value for enum mood: "angry"
+--- STMT 51 ---
+SQL: SELECT (-1)::posint
+ERROR [23514]: ERROR: value for domain posint violates check constraint "posint_check"
+--- STMT 52 ---
+SQL: SELECT ROW(1)::pair
+ERROR [42846]: ERROR: cannot cast type record to pair
+--- STMT 53 ---
+SQL: SELECT ARRAY[1,'x']
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+--- STMT 54 ---
+SQL: SELECT ARRAY[[1,2],[3]]
+ERROR [2202E]: ERROR: multidimensional arrays must have array expressions with matching dimensions
+--- STMT 55 ---
+SQL: SELECT CAST('abc' AS bytea)
+RESULT: 1 columns, 1 rows
+COLUMNS: bytea
+ROW: \\x616263
+--- STMT 56 ---
+SQL: SELECT CAST(42 AS uuid)
+ERROR [42846]: ERROR: cannot cast type integer to uuid
+--- STMT 57 ---
+SQL: SELECT CAST(ARRAY[1,2] AS integer)
+ERROR [42846]: ERROR: cannot cast type integer[] to integer
+--- STMT 58 ---
+SQL: SELECT CAST(ROW(1,'a') AS integer)
+ERROR [42846]: ERROR: cannot cast type record to integer
+--- STMT 59 ---
+SQL: SELECT CAST('infinity' AS integer)
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "infinity"
+--- STMT 60 ---
+SQL: -- table-driven type behavior CREATE TABLE type_table( a smallint, b integer, c bigint, d numeric(10,2), e real, f double precision, g text, h varchar(4), i char(2), j uuid, k date, l timestamp, m tim...
+OK: 0 rows affected
+--- STMT 61 ---
+SQL: INSERT INTO type_table VALUES ( 1, 2, 3, 4.50, 1.25, 2.5, 'txt', 'abcd', 'z', '11111111-1111-1111-1111-111111111111', DATE '2024-01-01', TIMESTAMP '2024-01-01 10:00:00', TIMESTAMPTZ '2024-01-01 10:00:...
+OK: 1 rows affected
+--- STMT 62 ---
+SQL: SELECT a, pg_typeof(a), d, pg_typeof(d), o, pg_typeof(o), p, pg_typeof(p), r, pg_typeof(r), s, pg_typeof(s) FROM type_table
+RESULT: 12 columns, 1 rows
+COLUMNS: a, pg_typeof, d, pg_typeof, o, pg_typeof, p, pg_typeof, r, pg_typeof, s, pg_typeof
+ROW: 1 | smallint | 4.50 | numeric | {"x": 1} | jsonb | ok | mood | (7,seven) | pair | {1,2,3} | integer[]
+--- STMT 63 ---
+SQL: -- assignment errors INSERT INTO type_table(a) VALUES ('x')
+ERROR [22P02]: ERROR: invalid input syntax for type smallint: "x"
+--- STMT 64 ---
+SQL: INSERT INTO type_table(h) VALUES ('abcde')
+ERROR [22001]: ERROR: value too long for type character varying(4)
+--- STMT 65 ---
+SQL: INSERT INTO type_table(q) VALUES (0)
+ERROR [23514]: ERROR: value for domain posint violates check constraint "posint_check"
+--- STMT 66 ---
+SQL: INSERT INTO type_table(p) VALUES ('angry')
+ERROR [22P02]: ERROR: invalid input value for enum mood: "angry"
+--- STMT 67 ---
+SQL: INSERT INTO type_table(j) VALUES ('bad-uuid')
+ERROR [22P02]: ERROR: invalid input syntax for type uuid: "bad-uuid"
+--- STMT 68 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 03_nulls_expressions.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TABLE expr_t(a int, b int, c text, d boolean)
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: INSERT INTO expr_t VALUES (1, 2, 'abc', true), (NULL, 2, NULL, false), (3, NULL, 'xyz', NULL), (NULL, NULL, NULL, NULL)
+OK: 4 rows affected
+--- STMT 7 ---
+SQL: SELECT NULL = NULL AS eq_null, NULL IS NULL AS is_null, NULL IS NOT NULL AS is_not_null, NULL IS DISTINCT FROM NULL AS is_distinct, 1 IS DISTINCT FROM NULL AS one_distinct_null
+RESULT: 5 columns, 1 rows
+COLUMNS: eq_null, is_null, is_not_null, is_distinct, one_distinct_null
+ROW: NULL | t | f | f | t
+--- STMT 8 ---
+SQL: SELECT TRUE AND NULL AS t_and_n, FALSE AND NULL AS f_and_n, TRUE OR NULL AS t_or_n, FALSE OR NULL AS f_or_n, NOT NULL::boolean AS not_null_bool
+RESULT: 5 columns, 1 rows
+COLUMNS: t_and_n, f_and_n, t_or_n, f_or_n, not_null_bool
+ROW: NULL | f | t | NULL | NULL
+--- STMT 9 ---
+SQL: SELECT COALESCE(NULL, NULL, 5) AS coalesce_v, pg_typeof(COALESCE(NULL, NULL, 5)) AS coalesce_t
+RESULT: 2 columns, 1 rows
+COLUMNS: coalesce_v, coalesce_t
+ROW: 5 | integer
+--- STMT 10 ---
+SQL: SELECT NULLIF(1, 1) AS nullif_same, NULLIF(1, 2) AS nullif_diff
+RESULT: 2 columns, 1 rows
+COLUMNS: nullif_same, nullif_diff
+ROW: NULL | 1
+--- STMT 11 ---
+SQL: SELECT GREATEST(1, 5, 3) AS g1, LEAST(1, 5, 3) AS l1
+RESULT: 2 columns, 1 rows
+COLUMNS: g1, l1
+ROW: 5 | 1
+--- STMT 12 ---
+SQL: SELECT GREATEST(NULL::int, 5, 3) AS g2, LEAST(NULL::int, 5, 3) AS l2
+RESULT: 2 columns, 1 rows
+COLUMNS: g2, l2
+ROW: 5 | 3
+--- STMT 13 ---
+SQL: SELECT a, b, a + b AS sum_ab, a - b AS diff_ab, a * b AS mul_ab, a / b AS div_ab, a % b AS mod_ab, a ^ b AS pow_ab FROM expr_t ORDER BY a NULLS LAST, b NULLS LAST
+RESULT: 8 columns, 4 rows
+COLUMNS: a, b, sum_ab, diff_ab, mul_ab, div_ab, mod_ab, pow_ab
+ROW: 1 | 2 | 3 | -1 | 2 | 0 | 1 | 1
+ROW: 3 | NULL | NULL | NULL | NULL | NULL | NULL | NULL
+ROW: NULL | 2 | NULL | NULL | NULL | NULL | NULL | NULL
+ROW: NULL | NULL | NULL | NULL | NULL | NULL | NULL | NULL
+--- STMT 14 ---
+SQL: SELECT c, c || '_suffix' AS concat1, concat(c, '_x') AS concat2, length(c) AS len, upper(c) AS up, lower(c) AS low, substring(c FROM 1 FOR 2) AS sub, position('b' in c) AS pos_b, c LIKE 'a%' AS like_a...
+RESULT: 11 columns, 4 rows
+COLUMNS: c, concat1, concat2, len, up, low, sub, pos_b, like_a, similar1, re1
+ROW: abc | abc_suffix | abc_x | 3 | ABC | abc | ab | 2 | t | t | t
+ROW: xyz | xyz_suffix | xyz_x | 3 | XYZ | xyz | xy | 0 | f | t | t
+ROW: NULL | NULL | _x | NULL | NULL | NULL | NULL | NULL | NULL | NULL | NULL
+ROW: NULL | NULL | _x | NULL | NULL | NULL | NULL | NULL | NULL | NULL | NULL
+--- STMT 15 ---
+SQL: SELECT CASE WHEN a IS NULL THEN 'null-a' ELSE 'not-null-a' END AS case1, CASE a WHEN 1 THEN 'one' WHEN 3 THEN 'three' ELSE 'other' END AS case2 FROM expr_t ORDER BY a NULLS LAST
+RESULT: 2 columns, 4 rows
+COLUMNS: case1, case2
+ROW: not-null-a | one
+ROW: not-null-a | three
+ROW: null-a | other
+ROW: null-a | other
+--- STMT 16 ---
+SQL: SELECT count(*) AS cnt_all, count(a) AS cnt_a, sum(a) AS sum_a, avg(a) AS avg_a, min(c) AS min_c, max(c) AS max_c, bool_and(d) AS all_d, bool_or(d) AS any_d FROM expr_t
+RESULT: 8 columns, 1 rows
+COLUMNS: cnt_all, cnt_a, sum_a, avg_a, min_c, max_c, all_d, any_d
+ROW: 4 | 2 | 4 | 2.0000000000000000 | abc | xyz | f | t
+--- STMT 17 ---
+SQL: SELECT 1 IN (1,2,NULL) AS in1, 3 IN (1,2,NULL) AS in2, 3 NOT IN (1,2,NULL) AS not_in1, NULL IN (1,2,NULL) AS in_null
+RESULT: 4 columns, 1 rows
+COLUMNS: in1, in2, not_in1, in_null
+ROW: t | NULL | NULL | NULL
+--- STMT 18 ---
+SQL: -- expression errors SELECT 1 / 0
+ERROR [22012]: ERROR: division by zero
+--- STMT 19 ---
+SQL: SELECT 9223372036854775807::bigint + 1
+ERROR [22003]: ERROR: bigint out of range
+--- STMT 20 ---
+SQL: SELECT abs('x')
+ERROR [22P02]: ERROR: invalid input syntax for type double precision: "x"
+--- STMT 21 ---
+SQL: SELECT substring(1 FROM 1 FOR 1)
+ERROR [42883]: ERROR: function pg_catalog.substring(integer, integer, integer) does not exist
+--- STMT 22 ---
+SQL: SELECT repeat('a', -1)
+RESULT: 1 columns, 1 rows
+COLUMNS: repeat
+ROW: 
+--- STMT 23 ---
+SQL: SELECT position(NULL IN 'abc')
+RESULT: 1 columns, 1 rows
+COLUMNS: position
+ROW: NULL
+--- STMT 24 ---
+SQL: SELECT 1 LIKE '1'
+ERROR [42883]: ERROR: operator does not exist: integer ~~ unknown
+--- STMT 25 ---
+SQL: SELECT 'abc' ~ '('
+ERROR [2201B]: ERROR: invalid regular expression: parentheses () not balanced
+--- STMT 26 ---
+SQL: SELECT CASE WHEN true THEN 1 ELSE 'x' END
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+--- STMT 27 ---
+SQL: SELECT GREATEST(1, 'x')
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+--- STMT 28 ---
+SQL: SELECT COALESCE(1, 'x')
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+--- STMT 29 ---
+SQL: SELECT NULLIF(1, 'x')
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+--- STMT 30 ---
+SQL: SELECT 1 = ROW(1,2)
+ERROR [42883]: ERROR: operator does not exist: integer = record
+--- STMT 31 ---
+SQL: SELECT ARRAY[1,2] || 3
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: {1,2,3}
+--- STMT 32 ---
+SQL: SELECT 1 + INTERVAL '1 day'
+ERROR [42883]: ERROR: operator does not exist: integer + interval
+--- STMT 33 ---
+SQL: SELECT date_part('bogus', TIMESTAMP '2024-01-01 00:00:00')
+ERROR [22023]: ERROR: unit "bogus" not recognized for type timestamp without time zone
+--- STMT 34 ---
+SQL: SELECT make_date(2024, 2, 30)
+ERROR [22008]: ERROR: date field value out of range: 2024-02-30
+--- STMT 35 ---
+SQL: SELECT overlay('abc' placing 'xyz' from 0)
+ERROR [22011]: ERROR: negative substring length not allowed
+--- STMT 36 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 04_ddl_schema.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: CREATE SCHEMA compat_extra
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: CREATE TABLE base_tbl( id int, name text, created_at timestamp default current_timestamp )
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: CREATE VIEW base_v AS SELECT id, name FROM base_tbl
+OK: 0 rows affected
+--- STMT 8 ---
+SQL: CREATE SEQUENCE seq1 START 10 INCREMENT 5
+OK: 0 rows affected
+--- STMT 9 ---
+SQL: CREATE TABLE seq_tbl(id int DEFAULT nextval('seq1'), payload text)
+OK: 0 rows affected
+--- STMT 10 ---
+SQL: CREATE INDEX idx_base_name ON base_tbl(name)
+OK: 0 rows affected
+--- STMT 11 ---
+SQL: CREATE UNIQUE INDEX idx_base_id_uq ON base_tbl(id)
+OK: 0 rows affected
+--- STMT 12 ---
+SQL: CREATE TABLE child_tbl( child_id int, base_id int )
+OK: 0 rows affected
+--- STMT 13 ---
+SQL: ALTER TABLE child_tbl ADD COLUMN note text
+OK: 0 rows affected
+--- STMT 14 ---
+SQL: ALTER TABLE child_tbl RENAME COLUMN note TO remarks
+OK: 0 rows affected
+--- STMT 15 ---
+SQL: ALTER TABLE child_tbl RENAME TO child_tbl_renamed
+OK: 0 rows affected
+--- STMT 16 ---
+SQL: ALTER TABLE base_tbl ADD COLUMN flag boolean DEFAULT false
+OK: 0 rows affected
+--- STMT 17 ---
+SQL: ALTER TABLE base_tbl ALTER COLUMN name TYPE varchar(20)
+ERROR [0A000]: ERROR: cannot alter type of a column used by a view or rule
+--- STMT 18 ---
+SQL: ALTER TABLE base_tbl ALTER COLUMN flag SET DEFAULT true
+OK: 0 rows affected
+--- STMT 19 ---
+SQL: ALTER TABLE base_tbl ALTER COLUMN flag DROP DEFAULT
+OK: 0 rows affected
+--- STMT 20 ---
+SQL: INSERT INTO base_tbl(id, name) VALUES (1, 'one'), (2, 'two')
+OK: 2 rows affected
+--- STMT 21 ---
+SQL: SELECT * FROM base_v ORDER BY id
+RESULT: 2 columns, 2 rows
+COLUMNS: id, name
+ROW: 1 | one
+ROW: 2 | two
+--- STMT 22 ---
+SQL: SELECT nextval('seq1') AS seq_a, currval('seq1') AS seq_b
+RESULT: 2 columns, 1 rows
+COLUMNS: seq_a, seq_b
+ROW: 10 | 10
+--- STMT 23 ---
+SQL: CREATE TABLE compat_extra.qtab(x int)
+OK: 0 rows affected
+--- STMT 24 ---
+SQL: SELECT * FROM compat_extra.qtab
+RESULT: 1 columns, 0 rows
+COLUMNS: x
+--- STMT 25 ---
+SQL: -- DDL semantic errors CREATE SCHEMA compat
+ERROR [42P06]: ERROR: schema "compat" already exists
+--- STMT 26 ---
+SQL: CREATE TABLE base_tbl(id int)
+ERROR [42P07]: ERROR: relation "base_tbl" already exists
+--- STMT 27 ---
+SQL: CREATE VIEW base_v AS SELECT 1 AS x
+ERROR [42P07]: ERROR: relation "base_v" already exists
+--- STMT 28 ---
+SQL: CREATE SEQUENCE seq1
+ERROR [42P07]: ERROR: relation "seq1" already exists
+--- STMT 29 ---
+SQL: CREATE INDEX idx_base_name ON base_tbl(name)
+ERROR [42P07]: ERROR: relation "idx_base_name" already exists
+--- STMT 30 ---
+SQL: CREATE TABLE dup_cols(a int, a text)
+ERROR [42701]: ERROR: column "a" specified more than once
+--- STMT 31 ---
+SQL: CREATE TABLE bad_fk(a int REFERENCES no_such_table(id))
+ERROR [42P01]: ERROR: relation "no_such_table" does not exist
+--- STMT 32 ---
+SQL: CREATE TABLE bad_default(a int DEFAULT now())
+ERROR [42804]: ERROR: column "a" is of type integer but default expression is of type timestamp with time zone
+--- STMT 33 ---
+SQL: CREATE TABLE bad_generated(a int, b timestamp GENERATED ALWAYS AS (now()) STORED)
+ERROR [42P17]: ERROR: generation expression is not immutable
+--- STMT 34 ---
+SQL: ALTER TABLE no_such_table ADD COLUMN x int
+ERROR [42P01]: ERROR: relation "no_such_table" does not exist
+--- STMT 35 ---
+SQL: ALTER TABLE base_tbl ADD COLUMN name text
+ERROR [42701]: ERROR: column "name" of relation "base_tbl" already exists
+--- STMT 36 ---
+SQL: ALTER TABLE base_tbl ALTER COLUMN no_such_column TYPE text
+ERROR [42703]: ERROR: column "no_such_column" of relation "base_tbl" does not exist
+--- STMT 37 ---
+SQL: ALTER TABLE base_tbl DROP COLUMN no_such_column
+ERROR [42703]: ERROR: column "no_such_column" of relation "base_tbl" does not exist
+--- STMT 38 ---
+SQL: ALTER TABLE base_tbl RENAME COLUMN no_such_column TO x
+ERROR [42703]: ERROR: column "no_such_column" does not exist
+--- STMT 39 ---
+SQL: ALTER TABLE base_tbl RENAME TO child_tbl_renamed
+ERROR [42P07]: ERROR: relation "child_tbl_renamed" already exists
+--- STMT 40 ---
+SQL: ALTER TABLE base_tbl ALTER COLUMN id TYPE timestamp
+ERROR [42804]: ERROR: column "id" cannot be cast automatically to type timestamp without time zone
+--- STMT 41 ---
+SQL: DROP TABLE no_such_table
+ERROR [42P01]: ERROR: table "no_such_table" does not exist
+--- STMT 42 ---
+SQL: DROP VIEW base_tbl
+ERROR [42809]: ERROR: "base_tbl" is not a view
+--- STMT 43 ---
+SQL: DROP SEQUENCE base_tbl
+ERROR [42809]: ERROR: "base_tbl" is not a sequence
+--- STMT 44 ---
+SQL: DROP INDEX no_such_index
+ERROR [42704]: ERROR: index "no_such_index" does not exist
+--- STMT 45 ---
+SQL: CREATE INDEX idx_expr_bad ON base_tbl ((unknown_func(name)))
+ERROR [42883]: ERROR: function unknown_func(text) does not exist
+--- STMT 46 ---
+SQL: CREATE INDEX idx_bad_col ON base_tbl(no_such_column)
+ERROR [42703]: ERROR: column "no_such_column" does not exist
+--- STMT 47 ---
+SQL: -- dependency behavior DROP TABLE base_tbl
+ERROR [2BP01]: ERROR: cannot drop table base_tbl because other objects depend on it
+--- STMT 48 ---
+SQL: DROP TABLE base_tbl CASCADE
+OK: 0 rows affected
+--- STMT 49 ---
+SQL: -- recreate after cascade to continue CREATE TABLE base_tbl(id int, name text)
+OK: 0 rows affected
+--- STMT 50 ---
+SQL: CREATE VIEW base_v AS SELECT * FROM base_tbl
+OK: 0 rows affected
+--- STMT 51 ---
+SQL: -- syntax/DDL edge cases that parse differently from semantic failures CREATE TABLE ddl_bad_01 id int)
+ERROR [42601]: ERROR: syntax error at or near "id"
+--- STMT 52 ---
+SQL: CREATE TABLE ddl_bad_02 (id int CREATE INDEX ddl_bad_03 base_tbl(name)
+ERROR [42601]: ERROR: syntax error at or near "CREATE"
+--- STMT 53 ---
+SQL: ALTER TABLE base_tbl ADD
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 54 ---
+SQL: DROP VIEW IF EXISTS
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 55 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+--- STMT 56 ---
+SQL: DROP SCHEMA compat_extra CASCADE
+OK: 0 rows affected
+
+=== FILE: 05_constraints_and_generated.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TABLE parent( id int PRIMARY KEY, code text UNIQUE, qty int NOT NULL CHECK (qty >= 0), category text, category_norm text GENERATED ALWAYS AS (upper(category)) STORED )
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: CREATE TABLE child( id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, parent_id int REFERENCES parent(id), qty int CHECK (qty > 0), note text NOT NULL, uq1 int, uq2 int, UNIQUE(uq1, uq2) )
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: INSERT INTO parent(id, code, qty, category) VALUES (1, 'A', 10, 'foo'), (2, 'B', 0, 'bar')
+OK: 2 rows affected
+--- STMT 8 ---
+SQL: INSERT INTO child(parent_id, qty, note, uq1, uq2) VALUES (1, 1, 'ok1', 1, 1), (1, 2, 'ok2', 1, 2), (2, 5, 'ok3', 2, 1)
+OK: 3 rows affected
+--- STMT 9 ---
+SQL: SELECT id, code, qty, category, category_norm FROM parent ORDER BY id
+RESULT: 5 columns, 2 rows
+COLUMNS: id, code, qty, category, category_norm
+ROW: 1 | A | 10 | foo | FOO
+ROW: 2 | B | 0 | bar | BAR
+--- STMT 10 ---
+SQL: SELECT id, parent_id, qty, note, uq1, uq2 FROM child ORDER BY id
+RESULT: 6 columns, 3 rows
+COLUMNS: id, parent_id, qty, note, uq1, uq2
+ROW: 1 | 1 | 1 | ok1 | 1 | 1
+ROW: 2 | 1 | 2 | ok2 | 1 | 2
+ROW: 3 | 2 | 5 | ok3 | 2 | 1
+--- STMT 11 ---
+SQL: -- constraint violations INSERT INTO parent(id, code, qty, category) VALUES (1, 'C', 5, 'baz')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "parent_pkey"
+--- STMT 12 ---
+SQL: INSERT INTO parent(id, code, qty, category) VALUES (3, 'A', 5, 'baz')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "parent_code_key"
+--- STMT 13 ---
+SQL: INSERT INTO parent(id, code, qty, category) VALUES (4, 'D', -1, 'baz')
+ERROR [23514]: ERROR: new row for relation "parent" violates check constraint "parent_qty_check"
+--- STMT 14 ---
+SQL: INSERT INTO parent(id, code, qty, category) VALUES (5, 'E', NULL, 'baz')
+ERROR [23502]: ERROR: null value in column "qty" of relation "parent" violates not-null constraint
+--- STMT 15 ---
+SQL: INSERT INTO child(parent_id, qty, note, uq1, uq2) VALUES (999, 1, 'bad-fk', 9, 9)
+ERROR [23503]: ERROR: insert or update on table "child" violates foreign key constraint "child_parent_id_fkey"
+--- STMT 16 ---
+SQL: INSERT INTO child(parent_id, qty, note, uq1, uq2) VALUES (1, 0, 'bad-check', 8, 8)
+ERROR [23514]: ERROR: new row for relation "child" violates check constraint "child_qty_check"
+--- STMT 17 ---
+SQL: INSERT INTO child(parent_id, qty, note, uq1, uq2) VALUES (1, 1, NULL, 7, 7)
+ERROR [23502]: ERROR: null value in column "note" of relation "child" violates not-null constraint
+--- STMT 18 ---
+SQL: INSERT INTO child(parent_id, qty, note, uq1, uq2) VALUES (1, 1, 'dup-unique', 1, 1)
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "child_uq1_uq2_key"
+--- STMT 19 ---
+SQL: INSERT INTO child(id, parent_id, qty, note, uq1, uq2) VALUES (1, 1, 1, 'manual-id', 6, 6)
+ERROR [428C9]: ERROR: cannot insert a non-DEFAULT value into column "id"
+--- STMT 20 ---
+SQL: -- alter-table constraint cases ALTER TABLE child ADD CONSTRAINT child_qty_positive CHECK (qty > 0)
+OK: 0 rows affected
+--- STMT 21 ---
+SQL: ALTER TABLE child ADD CONSTRAINT child_qty_positive CHECK (qty > 0)
+ERROR [42710]: ERROR: constraint "child_qty_positive" for relation "child" already exists
+--- STMT 22 ---
+SQL: ALTER TABLE child ADD CONSTRAINT bad_fk2 FOREIGN KEY (note) REFERENCES parent(code)
+ERROR [23503]: ERROR: insert or update on table "child" violates foreign key constraint "bad_fk2"
+--- STMT 23 ---
+SQL: ALTER TABLE child ADD CONSTRAINT bad_fk3 FOREIGN KEY (parent_id) REFERENCES parent(no_such_col)
+ERROR [42703]: ERROR: column "no_such_col" referenced in foreign key constraint does not exist
+--- STMT 24 ---
+SQL: ALTER TABLE child ALTER COLUMN note DROP NOT NULL
+OK: 0 rows affected
+--- STMT 25 ---
+SQL: ALTER TABLE child ADD COLUMN derived int GENERATED ALWAYS AS (qty * 2) STORED
+OK: 0 rows affected
+--- STMT 26 ---
+SQL: SELECT id, qty, derived FROM child ORDER BY id
+RESULT: 3 columns, 3 rows
+COLUMNS: id, qty, derived
+ROW: 1 | 1 | 2
+ROW: 2 | 2 | 4
+ROW: 3 | 5 | 10
+--- STMT 27 ---
+SQL: -- generated column restrictions / errors CREATE TABLE gen_bad_01(a int, b timestamp GENERATED ALWAYS AS (clock_timestamp()) STORED)
+ERROR [42P17]: ERROR: generation expression is not immutable
+--- STMT 28 ---
+SQL: CREATE TABLE gen_bad_02(a int, b int GENERATED ALWAYS AS (c) STORED, c int)
+OK: 0 rows affected
+--- STMT 29 ---
+SQL: CREATE TABLE gen_bad_03(a int, b int GENERATED ALWAYS AS ((SELECT 1)) STORED)
+ERROR [0A000]: ERROR: cannot use subquery in column generation expression
+--- STMT 30 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 06_dml_and_returning.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TABLE dml_t( id int PRIMARY KEY, x int, y text DEFAULT 'd', z timestamp DEFAULT current_timestamp )
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: INSERT INTO dml_t(id, x, y) VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')
+OK: 3 rows affected
+--- STMT 7 ---
+SQL: SELECT * FROM dml_t ORDER BY id
+RESULT: 4 columns, 3 rows
+COLUMNS: id, x, y, z
+ROW: 1 | 10 | a | 2026-03-26 15:09:45.899417
+ROW: 2 | 20 | b | 2026-03-26 15:09:45.899417
+ROW: 3 | 30 | c | 2026-03-26 15:09:45.899417
+--- STMT 8 ---
+SQL: INSERT INTO dml_t(id, x) VALUES (4, 40) RETURNING id, x, y, pg_typeof(y)
+RESULT: 4 columns, 1 rows
+COLUMNS: id, x, y, pg_typeof
+ROW: 4 | 40 | d | text
+--- STMT 9 ---
+SQL: INSERT INTO dml_t AS t(id, x, y) VALUES (5, 50, 'e') RETURNING t.id, t.y
+RESULT: 2 columns, 1 rows
+COLUMNS: id, y
+ROW: 5 | e
+--- STMT 10 ---
+SQL: UPDATE dml_t SET x = x + 1 WHERE id IN (1,2) RETURNING id, x ORDER BY id
+ERROR [42601]: ERROR: syntax error at or near "ORDER"
+--- STMT 11 ---
+SQL: UPDATE dml_t SET y = upper(y) WHERE id = 3 RETURNING id, y
+RESULT: 2 columns, 1 rows
+COLUMNS: id, y
+ROW: 3 | C
+--- STMT 12 ---
+SQL: UPDATE dml_t AS t SET x = s.new_x FROM (VALUES (1, 100), (2, 200)) AS s(id, new_x) WHERE t.id = s.id RETURNING t.id, t.x ORDER BY t.id
+ERROR [42601]: ERROR: syntax error at or near "ORDER"
+--- STMT 13 ---
+SQL: DELETE FROM dml_t WHERE id = 5 RETURNING id, y
+RESULT: 2 columns, 1 rows
+COLUMNS: id, y
+ROW: 5 | e
+--- STMT 14 ---
+SQL: DELETE FROM dml_t WHERE id = 999 RETURNING id
+RESULT: 1 columns, 0 rows
+COLUMNS: id
+--- STMT 15 ---
+SQL: MERGE INTO dml_t AS t USING (VALUES (1, 111), (6, 60)) AS s(id, x) ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = s.x WHEN NOT MATCHED THEN INSERT (id, x, y) VALUES (s.id, s.x, 'merged')
+OK: 2 rows affected
+--- STMT 16 ---
+SQL: SELECT * FROM dml_t ORDER BY id
+RESULT: 4 columns, 5 rows
+COLUMNS: id, x, y, z
+ROW: 1 | 111 | a | 2026-03-26 15:09:45.899417
+ROW: 2 | 20 | b | 2026-03-26 15:09:45.899417
+ROW: 3 | 30 | C | 2026-03-26 15:09:45.899417
+ROW: 4 | 40 | d | 2026-03-26 15:09:45.900797
+ROW: 6 | 60 | merged | 2026-03-26 15:09:45.903841
+--- STMT 17 ---
+SQL: -- DML errors INSERT INTO dml_t VALUES (1, 9, 'dup')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "dml_t_pkey"
+--- STMT 18 ---
+SQL: INSERT INTO dml_t(id) VALUES (NULL)
+ERROR [23502]: ERROR: null value in column "id" of relation "dml_t" violates not-null constraint
+--- STMT 19 ---
+SQL: INSERT INTO dml_t(no_such_col) VALUES (1)
+ERROR [42703]: ERROR: column "no_such_col" of relation "dml_t" does not exist
+--- STMT 20 ---
+SQL: INSERT INTO dml_t(id, x, y) VALUES (7, 'x', 'bad-type')
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+--- STMT 21 ---
+SQL: INSERT INTO dml_t(id, x, y) VALUES (8, 80)
+ERROR [42601]: ERROR: INSERT has more target columns than expressions
+--- STMT 22 ---
+SQL: INSERT INTO dml_t SELECT 9
+OK: 1 rows affected
+--- STMT 23 ---
+SQL: UPDATE dml_t SET no_such_col = 1 WHERE id = 1
+ERROR [42703]: ERROR: column "no_such_col" of relation "dml_t" does not exist
+--- STMT 24 ---
+SQL: UPDATE dml_t SET x = 'bad' WHERE id = 1
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "bad"
+--- STMT 25 ---
+SQL: UPDATE dml_t SET x = (SELECT x FROM dml_t) WHERE id = 1
+ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
+--- STMT 26 ---
+SQL: UPDATE dml_t SET x = x + 1 FROM dml_t t2 WHERE dml_t.id = t2.id
+ERROR [42702]: ERROR: column reference "x" is ambiguous
+--- STMT 27 ---
+SQL: DELETE FROM dml_t WHERE no_such_col = 1
+ERROR [42703]: ERROR: column "no_such_col" does not exist
+--- STMT 28 ---
+SQL: DELETE FROM no_such_table
+ERROR [42P01]: ERROR: relation "no_such_table" does not exist
+--- STMT 29 ---
+SQL: MERGE INTO dml_t USING dml_t ON (dml_t.id = dml_t.id) WHEN MATCHED THEN UPDATE SET x = 0
+ERROR [42712]: ERROR: name "dml_t" specified more than once
+--- STMT 30 ---
+SQL: MERGE INTO dml_t AS t USING (VALUES (1)) AS s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET no_such_col = 1
+ERROR [42703]: ERROR: column "no_such_col" of relation "dml_t" does not exist
+--- STMT 31 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 07_select_setops_grouping.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TABLE s1(a int, b text, c int)
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: CREATE TABLE s2(a int, b text, c int)
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: INSERT INTO s1 VALUES (1, 'x', 10), (2, 'y', 20), (2, 'y', 30), (NULL, 'z', NULL)
+OK: 4 rows affected
+--- STMT 8 ---
+SQL: INSERT INTO s2 VALUES (2, 'y', 20), (3, 'w', 40), (NULL, 'z', NULL)
+OK: 3 rows affected
+--- STMT 9 ---
+SQL: SELECT a, b, c FROM s1 ORDER BY a NULLS LAST, b, c NULLS LAST
+RESULT: 3 columns, 4 rows
+COLUMNS: a, b, c
+ROW: 1 | x | 10
+ROW: 2 | y | 20
+ROW: 2 | y | 30
+ROW: NULL | z | NULL
+--- STMT 10 ---
+SQL: SELECT DISTINCT a, b FROM s1 ORDER BY a NULLS LAST, b
+RESULT: 2 columns, 3 rows
+COLUMNS: a, b
+ROW: 1 | x
+ROW: 2 | y
+ROW: NULL | z
+--- STMT 11 ---
+SQL: SELECT a, b FROM s1 ORDER BY 2, 1 NULLS LAST
+RESULT: 2 columns, 4 rows
+COLUMNS: a, b
+ROW: 1 | x
+ROW: 2 | y
+ROW: 2 | y
+ROW: NULL | z
+--- STMT 12 ---
+SQL: SELECT a, sum(c) AS s, count(*) AS n FROM s1 GROUP BY a ORDER BY a NULLS LAST
+RESULT: 3 columns, 3 rows
+COLUMNS: a, s, n
+ROW: 1 | 10 | 1
+ROW: 2 | 50 | 2
+ROW: NULL | NULL | 1
+--- STMT 13 ---
+SQL: SELECT b, avg(c) AS avg_c FROM s1 GROUP BY b HAVING avg(c) >= 15 ORDER BY b
+RESULT: 2 columns, 1 rows
+COLUMNS: b, avg_c
+ROW: y | 25.0000000000000000
+--- STMT 14 ---
+SQL: SELECT a FROM s1 UNION SELECT a FROM s2 ORDER BY 1 NULLS LAST
+RESULT: 1 columns, 4 rows
+COLUMNS: a
+ROW: 1
+ROW: 2
+ROW: 3
+ROW: NULL
+--- STMT 15 ---
+SQL: SELECT a FROM s1 UNION ALL SELECT a FROM s2 ORDER BY 1 NULLS LAST
+RESULT: 1 columns, 7 rows
+COLUMNS: a
+ROW: 1
+ROW: 2
+ROW: 2
+ROW: 2
+ROW: 3
+ROW: NULL
+ROW: NULL
+--- STMT 16 ---
+SQL: SELECT a FROM s1 INTERSECT SELECT a FROM s2 ORDER BY 1 NULLS LAST
+RESULT: 1 columns, 2 rows
+COLUMNS: a
+ROW: 2
+ROW: NULL
+--- STMT 17 ---
+SQL: SELECT a FROM s1 EXCEPT SELECT a FROM s2 ORDER BY 1 NULLS LAST
+RESULT: 1 columns, 1 rows
+COLUMNS: a
+ROW: 1
+--- STMT 18 ---
+SQL: SELECT a, b, c, row_number() OVER (PARTITION BY b ORDER BY c NULLS LAST) AS rn FROM s1 ORDER BY b, rn
+RESULT: 4 columns, 4 rows
+COLUMNS: a, b, c, rn
+ROW: 1 | x | 10 | 1
+ROW: 2 | y | 20 | 1
+ROW: 2 | y | 30 | 2
+ROW: NULL | z | NULL | 1
+--- STMT 19 ---
+SQL: -- select and grouping errors SELECT no_such_col FROM s1
+ERROR [42703]: ERROR: column "no_such_col" does not exist
+--- STMT 20 ---
+SQL: SELECT a, sum(c) FROM s1
+ERROR [42803]: ERROR: column "s1.a" must appear in the GROUP BY clause or be used in an aggregate function
+--- STMT 21 ---
+SQL: SELECT a, b, sum(c) FROM s1 GROUP BY a
+ERROR [42803]: ERROR: column "s1.b" must appear in the GROUP BY clause or be used in an aggregate function
+--- STMT 22 ---
+SQL: SELECT a FROM s1 GROUP BY sum(c)
+ERROR [42803]: ERROR: aggregate functions are not allowed in GROUP BY
+--- STMT 23 ---
+SQL: SELECT sum(c) FROM s1 WHERE sum(c) > 0
+ERROR [42803]: ERROR: aggregate functions are not allowed in WHERE
+--- STMT 24 ---
+SQL: SELECT a FROM s1 ORDER BY no_such_col
+ERROR [42703]: ERROR: column "no_such_col" does not exist
+--- STMT 25 ---
+SQL: SELECT DISTINCT a FROM s1 ORDER BY b
+ERROR [42P10]: ERROR: for SELECT DISTINCT, ORDER BY expressions must appear in select list
+--- STMT 26 ---
+SQL: SELECT * FROM s1 UNION SELECT a FROM s2
+ERROR [42601]: ERROR: each UNION query must have the same number of columns
+--- STMT 27 ---
+SQL: SELECT a FROM s1 UNION SELECT b FROM s2
+ERROR [42804]: ERROR: UNION types integer and text cannot be matched
+--- STMT 28 ---
+SQL: SELECT a, (SELECT c FROM s2) FROM s1
+ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
+--- STMT 29 ---
+SQL: SELECT 1 WHERE 1 = (SELECT a FROM s1)
+ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
+--- STMT 30 ---
+SQL: SELECT * FROM s1 FETCH FIRST -1 ROWS ONLY
+ERROR [2201W]: ERROR: LIMIT must not be negative
+--- STMT 31 ---
+SQL: SELECT * FROM s1 LIMIT 'x'
+ERROR [22P02]: ERROR: invalid input syntax for type bigint: "x"
+--- STMT 32 ---
+SQL: SELECT * FROM s1 OFFSET -1
+ERROR [2201X]: ERROR: OFFSET must not be negative
+--- STMT 33 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 08_joins_subqueries_ctes.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TABLE j1(id int, grp int, val text)
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: CREATE TABLE j2(id int, grp int, score int)
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: INSERT INTO j1 VALUES (1, 10, 'a'), (2, 10, 'b'), (3, 20, 'c'), (4, NULL, 'd')
+OK: 4 rows affected
+--- STMT 8 ---
+SQL: INSERT INTO j2 VALUES (1, 10, 100), (2, 30, 200), (NULL, 20, 300), (4, NULL, 400)
+OK: 4 rows affected
+--- STMT 9 ---
+SQL: SELECT j1.id, j1.grp, j2.score FROM j1 INNER JOIN j2 ON j1.id = j2.id ORDER BY 1
+RESULT: 3 columns, 3 rows
+COLUMNS: id, grp, score
+ROW: 1 | 10 | 100
+ROW: 2 | 10 | 200
+ROW: 4 | NULL | 400
+--- STMT 10 ---
+SQL: SELECT j1.id, j1.grp, j2.score FROM j1 LEFT JOIN j2 ON j1.id = j2.id ORDER BY 1
+RESULT: 3 columns, 4 rows
+COLUMNS: id, grp, score
+ROW: 1 | 10 | 100
+ROW: 2 | 10 | 200
+ROW: 3 | 20 | NULL
+ROW: 4 | NULL | 400
+--- STMT 11 ---
+SQL: SELECT j1.id AS j1_id, j2.id AS j2_id FROM j1 FULL JOIN j2 ON j1.grp = j2.grp ORDER BY 1 NULLS LAST, 2 NULLS LAST
+RESULT: 2 columns, 6 rows
+COLUMNS: j1_id, j2_id
+ROW: 1 | 1
+ROW: 2 | 1
+ROW: 3 | NULL
+ROW: 4 | NULL
+ROW: NULL | 2
+ROW: NULL | 4
+--- STMT 12 ---
+SQL: SELECT * FROM j1 JOIN j2 USING (id) ORDER BY id NULLS LAST
+RESULT: 5 columns, 3 rows
+COLUMNS: id, grp, val, grp, score
+ROW: 1 | 10 | a | 10 | 100
+ROW: 2 | 10 | b | 30 | 200
+ROW: 4 | NULL | d | NULL | 400
+--- STMT 13 ---
+SQL: SELECT id, val FROM j1 WHERE EXISTS (SELECT 1 FROM j2 WHERE j2.id = j1.id) ORDER BY id
+RESULT: 2 columns, 3 rows
+COLUMNS: id, val
+ROW: 1 | a
+ROW: 2 | b
+ROW: 4 | d
+--- STMT 14 ---
+SQL: SELECT id, val FROM j1 WHERE grp IN (SELECT grp FROM j2) ORDER BY id
+RESULT: 2 columns, 3 rows
+COLUMNS: id, val
+ROW: 1 | a
+ROW: 2 | b
+ROW: 3 | c
+--- STMT 15 ---
+SQL: SELECT id, val FROM j1 WHERE grp = ANY (SELECT grp FROM j2 WHERE grp IS NOT NULL) ORDER BY id
+RESULT: 2 columns, 3 rows
+COLUMNS: id, val
+ROW: 1 | a
+ROW: 2 | b
+ROW: 3 | c
+--- STMT 16 ---
+SQL: SELECT id, val FROM j1 WHERE grp < ALL (SELECT grp FROM j2 WHERE grp IS NOT NULL) ORDER BY id
+RESULT: 2 columns, 0 rows
+COLUMNS: id, val
+--- STMT 17 ---
+SQL: WITH cte AS ( SELECT id, grp FROM j1 WHERE grp IS NOT NULL ) SELECT * FROM cte ORDER BY id
+RESULT: 2 columns, 3 rows
+COLUMNS: id, grp
+ROW: 1 | 10
+ROW: 2 | 10
+ROW: 3 | 20
+--- STMT 18 ---
+SQL: WITH RECURSIVE r(n) AS ( SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5 ) SELECT n, pg_typeof(n) FROM r ORDER BY n
+RESULT: 2 columns, 5 rows
+COLUMNS: n, pg_typeof
+ROW: 1 | integer
+ROW: 2 | integer
+ROW: 3 | integer
+ROW: 4 | integer
+ROW: 5 | integer
+--- STMT 19 ---
+SQL: -- join/subquery/cte errors SELECT id FROM j1 JOIN j2 ON id = id
+ERROR [42702]: ERROR: column reference "id" is ambiguous
+--- STMT 20 ---
+SQL: SELECT * FROM j1 JOIN j2 USING (no_such_col)
+ERROR [42703]: ERROR: column "no_such_col" specified in USING clause does not exist in left table
+--- STMT 21 ---
+SQL: SELECT * FROM j1 NATURAL JOIN j2 ORDER BY id
+RESULT: 4 columns, 1 rows
+COLUMNS: id, grp, val, score
+ROW: 1 | 10 | a | 100
+--- STMT 22 ---
+SQL: SELECT * FROM j1 WHERE grp = (SELECT grp FROM j2)
+ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
+--- STMT 23 ---
+SQL: SELECT * FROM j1 WHERE grp < ALL (SELECT val FROM j1)
+ERROR [42883]: ERROR: operator does not exist: integer < text
+--- STMT 24 ---
+SQL: SELECT * FROM j1 WHERE (id, grp) IN (SELECT id FROM j2)
+ERROR [42601]: ERROR: subquery has too few columns
+--- STMT 25 ---
+SQL: WITH cte AS (SELECT 1 AS x) SELECT y FROM cte
+ERROR [42703]: ERROR: column "y" does not exist
+--- STMT 26 ---
+SQL: WITH RECURSIVE r(n) AS ( SELECT 'x' UNION ALL SELECT n + 1 FROM r WHERE n < 5 ) SELECT * FROM r
+ERROR [42883]: ERROR: operator does not exist: text + integer
+--- STMT 27 ---
+SQL: WITH RECURSIVE r(n) AS ( SELECT 1 UNION ALL SELECT n + 1 FROM missing_cte WHERE n < 5 ) SELECT * FROM r
+ERROR [42P01]: ERROR: relation "missing_cte" does not exist
+--- STMT 28 ---
+SQL: WITH cte(a, a) AS (SELECT 1, 2) SELECT * FROM cte
+RESULT: 2 columns, 1 rows
+COLUMNS: a, a
+ROW: 1 | 2
+--- STMT 29 ---
+SQL: LATERAL SELECT 1
+ERROR [42601]: ERROR: syntax error at or near "LATERAL"
+--- STMT 30 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 09_transactions_savepoints.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TABLE tx_t(id int PRIMARY KEY, note text)
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: INSERT INTO tx_t VALUES (1, 'one')
+OK: 1 rows affected
+--- STMT 7 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 8 ---
+SQL: INSERT INTO tx_t VALUES (2, 'two')
+OK: 1 rows affected
+--- STMT 9 ---
+SQL: SELECT * FROM tx_t ORDER BY id
+RESULT: 2 columns, 2 rows
+COLUMNS: id, note
+ROW: 1 | one
+ROW: 2 | two
+--- STMT 10 ---
+SQL: COMMIT
+OK: 0 rows affected
+--- STMT 11 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 12 ---
+SQL: INSERT INTO tx_t VALUES (1, 'dup-in-tx')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "tx_t_pkey"
+--- STMT 13 ---
+SQL: SELECT 'should fail because tx is aborted after previous error' AS msg
+RESULT: 1 columns, 1 rows
+COLUMNS: msg
+ROW: should fail because tx is aborted after previous error
+--- STMT 14 ---
+SQL: ROLLBACK
+OK: 0 rows affected
+--- STMT 15 ---
+SQL: SELECT * FROM tx_t ORDER BY id
+RESULT: 2 columns, 2 rows
+COLUMNS: id, note
+ROW: 1 | one
+ROW: 2 | two
+--- STMT 16 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 17 ---
+SQL: SAVEPOINT s1
+OK: 0 rows affected
+--- STMT 18 ---
+SQL: INSERT INTO tx_t VALUES (3, 'three')
+OK: 1 rows affected
+--- STMT 19 ---
+SQL: SAVEPOINT s2
+OK: 0 rows affected
+--- STMT 20 ---
+SQL: INSERT INTO tx_t VALUES (1, 'dup-again')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "tx_t_pkey"
+--- STMT 21 ---
+SQL: ROLLBACK TO s2
+ERROR [25P01]: ERROR: ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+--- STMT 22 ---
+SQL: INSERT INTO tx_t VALUES (4, 'four')
+OK: 1 rows affected
+--- STMT 23 ---
+SQL: RELEASE SAVEPOINT s2
+ERROR [25P01]: ERROR: RELEASE SAVEPOINT can only be used in transaction blocks
+--- STMT 24 ---
+SQL: RELEASE SAVEPOINT s1
+ERROR [25P01]: ERROR: RELEASE SAVEPOINT can only be used in transaction blocks
+--- STMT 25 ---
+SQL: COMMIT
+OK: 0 rows affected
+--- STMT 26 ---
+SQL: SELECT * FROM tx_t ORDER BY id
+RESULT: 2 columns, 3 rows
+COLUMNS: id, note
+ROW: 1 | one
+ROW: 2 | two
+ROW: 4 | four
+--- STMT 27 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 28 ---
+SQL: CREATE TABLE tx_ddl(a int)
+OK: 0 rows affected
+--- STMT 29 ---
+SQL: INSERT INTO tx_ddl VALUES (1)
+OK: 1 rows affected
+--- STMT 30 ---
+SQL: ROLLBACK
+OK: 0 rows affected
+--- STMT 31 ---
+SQL: SELECT * FROM tx_ddl
+ERROR [42P01]: ERROR: relation "tx_ddl" does not exist
+--- STMT 32 ---
+SQL: -- transaction syntax/state errors COMMIT
+OK: 0 rows affected
+--- STMT 33 ---
+SQL: ROLLBACK
+OK: 0 rows affected
+--- STMT 34 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 35 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 36 ---
+SQL: SAVEPOINT x
+OK: 0 rows affected
+--- STMT 37 ---
+SQL: SAVEPOINT x
+OK: 0 rows affected
+--- STMT 38 ---
+SQL: RELEASE SAVEPOINT no_such_savepoint
+ERROR [3B001]: ERROR: savepoint "no_such_savepoint" does not exist
+--- STMT 39 ---
+SQL: ROLLBACK TO SAVEPOINT no_such_savepoint
+ERROR [25P01]: ERROR: ROLLBACK TO SAVEPOINT can only be used in transaction blocks
+--- STMT 40 ---
+SQL: ROLLBACK
+OK: 0 rows affected
+--- STMT 41 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 10_routines_and_errors.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TABLE log_t(msg text)
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: CREATE FUNCTION add1(x int) RETURNS int LANGUAGE sql AS $$ SELECT x + 1 $$
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: CREATE FUNCTION concat_pair(a text, b text DEFAULT 'z') RETURNS text LANGUAGE sql AS $$ SELECT a || ':' || b $$
+OK: 0 rows affected
+--- STMT 8 ---
+SQL: CREATE OR REPLACE FUNCTION fail_if_negative(x int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN IF x < 0 THEN RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'negative input not allowed'; END IF; RETUR...
+OK: 0 rows affected
+--- STMT 9 ---
+SQL: CREATE OR REPLACE PROCEDURE p_insert(m text) LANGUAGE plpgsql AS $$ BEGIN INSERT INTO log_t(msg) VALUES (m); END $$
+OK: 0 rows affected
+--- STMT 10 ---
+SQL: CREATE OR REPLACE FUNCTION catch_div_zero() RETURNS text LANGUAGE plpgsql AS $$ BEGIN PERFORM 1 / 0; RETURN 'unreachable'; EXCEPTION WHEN division_by_zero THEN RETURN 'caught division_by_zero'; END $$
+OK: 0 rows affected
+--- STMT 11 ---
+SQL: SELECT add1(1) AS v, pg_typeof(add1(1)) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: v, t
+ROW: 2 | integer
+--- STMT 12 ---
+SQL: SELECT concat_pair('a') AS v1, concat_pair('a','b') AS v2
+RESULT: 2 columns, 1 rows
+COLUMNS: v1, v2
+ROW: a:z | a:b
+--- STMT 13 ---
+SQL: SELECT fail_if_negative(5)
+RESULT: 1 columns, 1 rows
+COLUMNS: fail_if_negative
+ROW: 5
+--- STMT 14 ---
+SQL: CALL p_insert('hello')
+OK: -1 rows affected
+--- STMT 15 ---
+SQL: CALL p_insert('world')
+OK: -1 rows affected
+--- STMT 16 ---
+SQL: SELECT * FROM log_t ORDER BY msg
+RESULT: 1 columns, 2 rows
+COLUMNS: msg
+ROW: hello
+ROW: world
+--- STMT 17 ---
+SQL: SELECT catch_div_zero()
+RESULT: 1 columns, 1 rows
+COLUMNS: catch_div_zero
+ROW: caught division_by_zero
+--- STMT 18 ---
+SQL: -- routine and call errors SELECT add1()
+ERROR [42883]: ERROR: function add1() does not exist
+--- STMT 19 ---
+SQL: SELECT add1(1, 2)
+ERROR [42883]: ERROR: function add1(integer, integer) does not exist
+--- STMT 20 ---
+SQL: SELECT add1('x')
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+--- STMT 21 ---
+SQL: SELECT no_such_function(1)
+ERROR [42883]: ERROR: function no_such_function(integer) does not exist
+--- STMT 22 ---
+SQL: SELECT fail_if_negative(-1)
+ERROR [22023]: ERROR: negative input not allowed
+--- STMT 23 ---
+SQL: CALL p_insert()
+ERROR [42883]: ERROR: procedure p_insert() does not exist
+--- STMT 24 ---
+SQL: CALL no_such_proc(1)
+ERROR [42883]: ERROR: procedure no_such_proc(integer) does not exist
+--- STMT 25 ---
+SQL: CALL add1(1)
+ERROR [42809]: ERROR: add1(integer) is not a procedure
+--- STMT 26 ---
+SQL: CREATE FUNCTION bad_sql_fn(x int) RETURNS int LANGUAGE sql AS $$ SELECT missing_col FROM log_t $$
+ERROR [42703]: ERROR: column "missing_col" does not exist
+--- STMT 27 ---
+SQL: SELECT bad_sql_fn(1)
+ERROR [42883]: ERROR: function bad_sql_fn(integer) does not exist
+--- STMT 28 ---
+SQL: CREATE OR REPLACE FUNCTION nested_exceptions(x int) RETURNS text LANGUAGE plpgsql AS $$ BEGIN BEGIN IF x = 0 THEN RAISE division_by_zero; ELSIF x = 1 THEN RAISE unique_violation USING MESSAGE = 'force...
+OK: 0 rows affected
+--- STMT 29 ---
+SQL: SELECT nested_exceptions(0)
+RESULT: 1 columns, 1 rows
+COLUMNS: nested_exceptions
+ROW: caught div0
+--- STMT 30 ---
+SQL: SELECT nested_exceptions(1)
+RESULT: 1 columns, 1 rows
+COLUMNS: nested_exceptions
+ROW: caught unique
+--- STMT 31 ---
+SQL: SELECT nested_exceptions(2)
+ERROR [P0001]: ERROR: generic plpgsql error
+--- STMT 32 ---
+SQL: -- syntax-ish routine errors CREATE FUNCTION bad_parse_fn(x int) RETURNS int LANGUAGE sql AS $$ SELECT x + $$
+ERROR [42601]: ERROR: syntax error at end of input
+--- STMT 33 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 11_json_arrays_ranges.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: SELECT json '{"a":1,"b":[10,20]}' AS j, pg_typeof(json '{"a":1,"b":[10,20]}') AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: j, t
+ROW: {"a":1,"b":[10,20]} | json
+--- STMT 6 ---
+SQL: SELECT jsonb '{"a":1,"b":[10,20]}' AS jb, pg_typeof(jsonb '{"a":1,"b":[10,20]}') AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: jb, t
+ROW: {"a": 1, "b": [10, 20]} | jsonb
+--- STMT 7 ---
+SQL: SELECT ('{"a":1,"b":[10,20]}'::jsonb -> 'b') AS b, ('{"a":1,"b":[10,20]}'::jsonb ->> 'a') AS a_text
+RESULT: 2 columns, 1 rows
+COLUMNS: b, a_text
+ROW: [10, 20] | 1
+--- STMT 8 ---
+SQL: SELECT jsonb_build_object('x', 1, 'y', true) AS obj
+RESULT: 1 columns, 1 rows
+COLUMNS: obj
+ROW: {"x": 1, "y": true}
+--- STMT 9 ---
+SQL: SELECT jsonb_build_array(1, 'x', true, null) AS arr
+RESULT: 1 columns, 1 rows
+COLUMNS: arr
+ROW: [1, "x", true, null]
+--- STMT 10 ---
+SQL: SELECT '{1,2,3}'::int[] AS arr, pg_typeof('{1,2,3}'::int[]) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: arr, t
+ROW: {1,2,3} | integer[]
+--- STMT 11 ---
+SQL: SELECT ARRAY[1,2,3][2] AS arr_elem
+ERROR [42601]: ERROR: syntax error at or near "["
+--- STMT 12 ---
+SQL: SELECT '[1,10)'::int4range AS r, pg_typeof('[1,10)'::int4range) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: r, t
+ROW: [1,10) | int4range
+--- STMT 13 ---
+SQL: SELECT '{[1,5),[10,20)}'::int4multirange AS mr, pg_typeof('{[1,5),[10,20)}'::int4multirange) AS t
+RESULT: 2 columns, 1 rows
+COLUMNS: mr, t
+ROW: {[1,5),[10,20)} | int4multirange
+--- STMT 14 ---
+SQL: SELECT int4range(1, 10) @> 5 AS contains1
+RESULT: 1 columns, 1 rows
+COLUMNS: contains1
+ROW: t
+--- STMT 15 ---
+SQL: SELECT int4range(1, 10) && int4range(5, 15) AS overlap1
+RESULT: 1 columns, 1 rows
+COLUMNS: overlap1
+ROW: t
+--- STMT 16 ---
+SQL: SELECT ARRAY[1,2,3] || ARRAY[4,5] AS arr_concat
+RESULT: 1 columns, 1 rows
+COLUMNS: arr_concat
+ROW: {1,2,3,4,5}
+--- STMT 17 ---
+SQL: SELECT array_length(ARRAY[1,2,3], 1) AS len1
+RESULT: 1 columns, 1 rows
+COLUMNS: len1
+ROW: 3
+--- STMT 18 ---
+SQL: SELECT array_dims(ARRAY[[1,2],[3,4]]) AS dims
+RESULT: 1 columns, 1 rows
+COLUMNS: dims
+ROW: [1:2][1:2]
+--- STMT 19 ---
+SQL: -- JSON / array / range errors SELECT 'not json'::json
+ERROR [22P02]: ERROR: invalid input syntax for type json
+--- STMT 20 ---
+SQL: SELECT 'not json'::jsonb
+ERROR [22P02]: ERROR: invalid input syntax for type json
+--- STMT 21 ---
+SQL: SELECT '[1,2,]'::json
+ERROR [22P02]: ERROR: invalid input syntax for type json
+--- STMT 22 ---
+SQL: SELECT '{"a":1}'::jsonb -> 999999999999999999999
+ERROR [42883]: ERROR: operator does not exist: jsonb -> numeric
+--- STMT 23 ---
+SQL: SELECT jsonb_path_query('{"a":1}'::jsonb, 'not a path')
+ERROR [42601]: ERROR: syntax error at or near " " of jsonpath input
+--- STMT 24 ---
+SQL: SELECT '{1,2,x}'::int[]
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+--- STMT 25 ---
+SQL: SELECT ARRAY[[1,2],[3]]
+ERROR [2202E]: ERROR: multidimensional arrays must have array expressions with matching dimensions
+--- STMT 26 ---
+SQL: SELECT ARRAY[1,2]['x']
+ERROR [42601]: ERROR: syntax error at or near "["
+--- STMT 27 ---
+SQL: SELECT array_length(ARRAY[1,2,3], 0)
+RESULT: 1 columns, 1 rows
+COLUMNS: array_length
+ROW: NULL
+--- STMT 28 ---
+SQL: SELECT '[1,2)'::int4range + 1
+ERROR [42883]: ERROR: operator does not exist: int4range + integer
+--- STMT 29 ---
+SQL: SELECT '[5,1)'::int4range
+ERROR [22000]: ERROR: range lower bound must be less than or equal to range upper bound
+--- STMT 30 ---
+SQL: SELECT '{[1,5),bad}'::int4multirange
+ERROR [22P02]: ERROR: malformed multirange literal: "{[1,5),bad}"
+--- STMT 31 ---
+SQL: SELECT int4range(1, 10) @> 'x'
+ERROR [22P02]: ERROR: malformed range literal: "x"
+--- STMT 32 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+
+=== FILE: 12_pg_specific.sql ===
+--- STMT 1 ---
+SQL: SET search_path = pg_catalog, public
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: DROP SCHEMA IF EXISTS compat CASCADE
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE SCHEMA compat
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SET search_path = compat, pg_catalog
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: -- PostgreSQL-specific or commonly nonportable behavior CREATE TYPE status_enum AS ENUM ('new', 'open', 'closed')
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: CREATE TABLE pg_only( id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, tags text[], payload jsonb, status status_enum, note text )
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: INSERT INTO pg_only(tags, payload, status, note) VALUES (ARRAY['a','b'], '{"k":1}', 'new', 'n1'), (ARRAY['x'], '{"k":2}', 'open', 'n2')
+OK: 2 rows affected
+--- STMT 8 ---
+SQL: SELECT id, tags, payload, status, note FROM pg_only ORDER BY id
+RESULT: 5 columns, 2 rows
+COLUMNS: id, tags, payload, status, note
+ROW: 1 | {a,b} | {"k": 1} | new | n1
+ROW: 2 | {x} | {"k": 2} | open | n2
+--- STMT 9 ---
+SQL: SELECT note FROM pg_only WHERE payload @> '{"k":1}'::jsonb
+RESULT: 1 columns, 1 rows
+COLUMNS: note
+ROW: n1
+--- STMT 10 ---
+SQL: SELECT note FROM pg_only WHERE tags @> ARRAY['a']
+RESULT: 1 columns, 1 rows
+COLUMNS: note
+ROW: n1
+--- STMT 11 ---
+SQL: SELECT note FROM pg_only WHERE status = 'open'
+RESULT: 1 columns, 1 rows
+COLUMNS: note
+ROW: n2
+--- STMT 12 ---
+SQL: SELECT * FROM pg_only WHERE note ILIKE 'N%'
+RESULT: 5 columns, 2 rows
+COLUMNS: id, tags, payload, status, note
+ROW: 1 | {a,b} | {"k": 1} | new | n1
+ROW: 2 | {x} | {"k": 2} | open | n2
+--- STMT 13 ---
+SQL: SELECT DISTINCT ON (status) status, id, note FROM pg_only ORDER BY status, id
+RESULT: 3 columns, 2 rows
+COLUMNS: status, id, note
+ROW: new | 1 | n1
+ROW: open | 2 | n2
+--- STMT 14 ---
+SQL: SELECT unnest(tags) FROM pg_only WHERE id = 1 ORDER BY 1
+RESULT: 1 columns, 2 rows
+COLUMNS: unnest
+ROW: a
+ROW: b
+--- STMT 15 ---
+SQL: SELECT generate_series(1, 3) AS gs
+RESULT: 1 columns, 3 rows
+COLUMNS: gs
+ROW: 1
+ROW: 2
+ROW: 3
+--- STMT 16 ---
+SQL: SELECT uuidv7()
+RESULT: 1 columns, 1 rows
+COLUMNS: uuidv7
+ROW: 019d2ab1-c279-77f7-8e92-fbc58346c68e
+--- STMT 17 ---
+SQL: SELECT crc32('abc')
+RESULT: 1 columns, 1 rows
+COLUMNS: crc32
+ROW: 891568578
+--- STMT 18 ---
+SQL: SELECT array_sort(ARRAY[3,1,2])
+RESULT: 1 columns, 1 rows
+COLUMNS: array_sort
+ROW: {1,2,3}
+--- STMT 19 ---
+SQL: SELECT array_reverse(ARRAY[1,2,3])
+RESULT: 1 columns, 1 rows
+COLUMNS: array_reverse
+ROW: {3,2,1}
+--- STMT 20 ---
+SQL: -- nonportable / PG-specific errors SELECT DISTINCT ON () * FROM pg_only
+ERROR [42601]: ERROR: syntax error at or near ")"
+--- STMT 21 ---
+SQL: SELECT unnest(1)
+ERROR [42883]: ERROR: function unnest(integer) does not exist
+--- STMT 22 ---
+SQL: SELECT generate_series('a', 'z')
+ERROR [42725]: ERROR: function generate_series(unknown, unknown) is not unique
+--- STMT 23 ---
+SQL: SELECT uuidv7(1)
+ERROR [42883]: ERROR: function uuidv7(integer) does not exist
+--- STMT 24 ---
+SQL: SELECT crc32(123)
+ERROR [42883]: ERROR: function crc32(integer) does not exist
+--- STMT 25 ---
+SQL: SELECT array_sort(1)
+ERROR [42883]: ERROR: function array_sort(integer) does not exist
+--- STMT 26 ---
+SQL: SELECT payload ->> 1 FROM pg_only
+RESULT: 1 columns, 2 rows
+COLUMNS: ?column?
+ROW: NULL
+ROW: NULL
+--- STMT 27 ---
+SQL: SELECT tags @> 'a' FROM pg_only
+ERROR [22P02]: ERROR: malformed array literal: "a"
+--- STMT 28 ---
+SQL: DROP SCHEMA compat CASCADE
+OK: 0 rows affected
+

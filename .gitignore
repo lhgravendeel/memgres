@@ -1,0 +1,18 @@
+target/
+*.class
+*.jar
+*.war
+*.ear
+*.iml
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+.m2
+progress/
+
+# Generated test output
+memgres-results-current.txt
+diff-report.txt

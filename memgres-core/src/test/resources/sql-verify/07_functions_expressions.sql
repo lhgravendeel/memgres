@@ -1,0 +1,201 @@
+-- ============================================================
+-- 07: Built-in Functions and Expressions
+-- ============================================================
+
+-- === String functions ===
+SELECT LENGTH('hello');
+SELECT CHAR_LENGTH('hello');
+SELECT OCTET_LENGTH('hello');
+SELECT UPPER('hello');
+SELECT LOWER('HELLO');
+SELECT TRIM('  hello  ');
+SELECT LTRIM('  hello');
+SELECT RTRIM('hello  ');
+SELECT TRIM(BOTH 'x' FROM 'xxxhelloxxx');
+SELECT TRIM(LEADING 'x' FROM 'xxxhello');
+SELECT TRIM(TRAILING 'x' FROM 'helloxxx');
+SELECT SUBSTRING('hello world' FROM 7);
+SELECT SUBSTRING('hello world' FROM 1 FOR 5);
+SELECT POSITION('world' IN 'hello world');
+SELECT REPLACE('hello world', 'world', 'there');
+SELECT OVERLAY('hello world' PLACING 'THERE' FROM 7);
+SELECT CONCAT('hello', ' ', 'world');
+SELECT CONCAT_WS(', ', 'a', 'b', 'c');
+SELECT CONCAT_WS(', ', 'a', NULL, 'c');
+SELECT LEFT('hello', 3);
+SELECT RIGHT('hello', 3);
+SELECT REPEAT('ab', 3);
+SELECT REVERSE('hello');
+SELECT LPAD('42', 5, '0');
+SELECT RPAD('hello', 10, '.');
+SELECT SPLIT_PART('a.b.c', '.', 2);
+SELECT TRANSLATE('hello', 'helo', 'HELO');
+SELECT INITCAP('hello world');
+SELECT MD5('hello');
+SELECT ENCODE('hello'::bytea, 'hex');
+SELECT DECODE('68656c6c6f', 'hex');
+SELECT 'hello' || ' ' || 'world';
+SELECT 'hello' LIKE 'hel%';
+SELECT 'hello' LIKE 'H%';
+SELECT 'hello' ILIKE 'H%';
+SELECT 'hello' SIMILAR TO 'h(e|a)llo';
+SELECT 'hello' ~ 'hel+o';
+SELECT 'hello' ~* 'HEL+O';
+SELECT 'hello' !~ 'xyz';
+SELECT 'hello' !~* 'XYZ';
+SELECT REGEXP_REPLACE('hello world', 'world', 'there');
+SELECT REGEXP_REPLACE('aaa bbb ccc', '[a-z]+', 'X', 'g');
+SELECT REGEXP_MATCHES('abc 123 def 456', '\d+', 'g');
+SELECT CHR(65);
+SELECT ASCII('A');
+SELECT FORMAT('Hello %s, you are %s', 'Alice', 'great');
+SELECT QUOTE_LITERAL('hello');
+SELECT QUOTE_IDENT('my column');
+SELECT TO_HEX(255);
+
+-- === Math functions ===
+SELECT ABS(-42);
+SELECT CEIL(4.2);
+SELECT CEILING(4.2);
+SELECT FLOOR(4.7);
+SELECT ROUND(4.567, 2);
+SELECT ROUND(4.5);
+SELECT TRUNC(4.567, 1);
+SELECT SIGN(-5);
+SELECT SIGN(5);
+SELECT SIGN(0);
+SELECT MOD(17, 5);
+SELECT POWER(2, 10);
+SELECT SQRT(144);
+SELECT CBRT(27);
+SELECT PI();
+SELECT RANDOM();
+SELECT GREATEST(1, 5, 3, 9, 2);
+SELECT LEAST(1, 5, 3, 9, 2);
+SELECT LOG(100);
+SELECT LN(2.71828);
+SELECT EXP(1);
+SELECT DEGREES(PI());
+SELECT RADIANS(180);
+SELECT SIN(0);
+SELECT COS(0);
+SELECT TAN(0);
+SELECT ASIN(1);
+SELECT ACOS(1);
+SELECT ATAN(1);
+SELECT ATAN2(1, 1);
+SELECT GCD(12, 8);
+SELECT LCM(12, 8);
+SELECT WIDTH_BUCKET(5.5, 0, 10, 5);
+SELECT FACTORIAL(5);
+SELECT DIV(17, 5);
+
+-- === Date/time functions ===
+SELECT CURRENT_DATE;
+SELECT CURRENT_TIME;
+SELECT CURRENT_TIMESTAMP;
+SELECT NOW();
+SELECT LOCALTIME;
+SELECT LOCALTIMESTAMP;
+SELECT DATE_PART('year', TIMESTAMP '2024-06-15 10:30:00');
+SELECT DATE_PART('month', TIMESTAMP '2024-06-15 10:30:00');
+SELECT DATE_PART('day', TIMESTAMP '2024-06-15 10:30:00');
+SELECT DATE_PART('hour', TIMESTAMP '2024-06-15 10:30:00');
+SELECT EXTRACT(YEAR FROM DATE '2024-06-15');
+SELECT EXTRACT(DOW FROM DATE '2024-06-15');
+SELECT EXTRACT(EPOCH FROM TIMESTAMP '2024-01-01 00:00:00');
+SELECT DATE_TRUNC('year', TIMESTAMP '2024-06-15 10:30:00');
+SELECT DATE_TRUNC('month', TIMESTAMP '2024-06-15 10:30:00');
+SELECT DATE_TRUNC('day', TIMESTAMP '2024-06-15 10:30:45');
+SELECT AGE(TIMESTAMP '2024-06-15', TIMESTAMP '2020-01-01');
+SELECT TO_CHAR(TIMESTAMP '2024-06-15 10:30:00', 'YYYY-MM-DD HH24:MI:SS');
+SELECT TO_CHAR(12345.67, '99999.99');
+SELECT TO_CHAR(DATE '2024-06-15', 'Day, Month DD, YYYY');
+SELECT TO_DATE('2024-06-15', 'YYYY-MM-DD');
+SELECT TO_TIMESTAMP('2024-06-15 10:30:00', 'YYYY-MM-DD HH24:MI:SS');
+SELECT MAKE_DATE(2024, 6, 15);
+SELECT MAKE_TIME(10, 30, 0);
+SELECT MAKE_TIMESTAMP(2024, 6, 15, 10, 30, 0);
+SELECT MAKE_INTERVAL(years => 1, months => 2, days => 3);
+SELECT '2024-01-15'::date + INTERVAL '30 days';
+SELECT '2024-01-15'::date - INTERVAL '1 month';
+SELECT ISFINITE(DATE '2024-01-01');
+SELECT ISFINITE('infinity'::timestamp);
+SELECT JUSTIFY_INTERVAL(INTERVAL '1 month -1 day');
+
+-- === Conditional expressions ===
+SELECT CASE WHEN 1 > 0 THEN 'yes' ELSE 'no' END;
+SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 1 > 0 THEN 'b' ELSE 'c' END;
+SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
+SELECT COALESCE(NULL, NULL, 'fallback');
+SELECT COALESCE(42, 0);
+SELECT NULLIF(1, 1);
+SELECT NULLIF(1, 2);
+SELECT GREATEST(1, NULL, 3);
+SELECT LEAST(1, NULL, 3);
+
+-- === JSON/JSONB functions ===
+SELECT '{"a":1,"b":2}'::jsonb -> 'a';
+SELECT '{"a":1,"b":2}'::jsonb ->> 'a';
+SELECT '{"a":{"b":3}}'::jsonb #> '{a,b}';
+SELECT '{"a":{"b":3}}'::jsonb #>> '{a,b}';
+SELECT '{"a":1}'::jsonb ? 'a';
+SELECT '{"a":1}'::jsonb ? 'x';
+SELECT '{"a":1,"b":2}'::jsonb - 'a';
+SELECT JSONB_BUILD_OBJECT('key', 'value', 'num', 42);
+SELECT JSONB_BUILD_ARRAY(1, 'two', true, null);
+SELECT JSONB_OBJECT_AGG(key, value) FROM (VALUES ('a', '1'), ('b', '2')) AS t(key, value);
+SELECT JSONB_ARRAY_LENGTH('[1,2,3]'::jsonb);
+SELECT JSONB_TYPEOF('42'::jsonb);
+SELECT JSONB_TYPEOF('"hello"'::jsonb);
+SELECT JSONB_TYPEOF('true'::jsonb);
+SELECT JSONB_TYPEOF('null'::jsonb);
+SELECT JSONB_TYPEOF('[1,2]'::jsonb);
+SELECT JSONB_TYPEOF('{"a":1}'::jsonb);
+SELECT JSONB_PRETTY('{"a":1,"b":[1,2,3]}'::jsonb);
+SELECT JSONB_SET('{"a":1}'::jsonb, '{a}', '99');
+SELECT JSONB_SET('{"a":{"b":1}}'::jsonb, '{a,b}', '42');
+SELECT JSONB_STRIP_NULLS('{"a":1,"b":null,"c":3}'::jsonb);
+SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb;
+SELECT '[1,2]'::jsonb || '[3,4]'::jsonb;
+
+-- === Array functions ===
+SELECT ARRAY[1,2,3];
+SELECT ARRAY[1,2,3] || ARRAY[4,5,6];
+SELECT ARRAY[1,2,3] || 4;
+SELECT 0 || ARRAY[1,2,3];
+SELECT ARRAY_LENGTH(ARRAY[1,2,3], 1);
+SELECT ARRAY_UPPER(ARRAY[1,2,3], 1);
+SELECT ARRAY_LOWER(ARRAY[1,2,3], 1);
+SELECT ARRAY_POSITION(ARRAY['a','b','c'], 'b');
+SELECT ARRAY_REMOVE(ARRAY[1,2,3,2], 2);
+SELECT ARRAY_REPLACE(ARRAY[1,2,3], 2, 99);
+SELECT ARRAY_TO_STRING(ARRAY[1,2,3], ', ');
+SELECT STRING_TO_ARRAY('a,b,c', ',');
+SELECT UNNEST(ARRAY[1,2,3]);
+SELECT ARRAY_AGG(x) FROM UNNEST(ARRAY[3,1,2]) AS x;
+SELECT 1 = ANY(ARRAY[1,2,3]);
+SELECT 4 = ANY(ARRAY[1,2,3]);
+SELECT 1 = ALL(ARRAY[1,1,1]);
+SELECT 1 = ALL(ARRAY[1,2,1]);
+
+-- === System functions ===
+SELECT CURRENT_USER;
+SELECT CURRENT_SCHEMA;
+SELECT CURRENT_DATABASE();
+SELECT PG_TYPEOF(42);
+SELECT PG_TYPEOF('hello');
+SELECT PG_TYPEOF(true);
+SELECT PG_TYPEOF(NULL);
+SELECT PG_TYPEOF(ARRAY[1,2,3]);
+SELECT PG_TYPEOF('{"a":1}'::jsonb);
+SELECT GEN_RANDOM_UUID();
+
+-- === INVALID: Function errors ===
+SELECT NONEXISTENT_FUNCTION(1);
+SELECT LENGTH();
+SELECT LENGTH('a', 'b');
+SELECT SQRT(-1);
+SELECT 1/0;
+SELECT LOG(0);
+SELECT LN(0);

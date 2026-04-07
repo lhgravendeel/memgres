@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memgres - In-Memory PostgreSQL for Java Testing</title>
+    <meta name="description" content="In-memory PostgreSQL-compatible database for Java testing. No Docker, no external processes. Millisecond startup, real PG wire protocol, 9,500+ tests.">
+    <meta property="og:title" content="Memgres - In-Memory PostgreSQL for Java Testing">
+    <meta property="og:description" content="No Docker, no external processes. Just add the dependency and write tests against real PostgreSQL SQL.">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://memgres.com">
+    <link rel="icon" href="favicon.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+        :root {
+            --bg: #0B1120;
+            --bg-card: #131C31;
+            --bg-code: #0D1526;
+            --border: #1E2D4A;
+            --text: #CBD5E1;
+            --text-muted: #64748B;
+            --text-bright: #F1F5F9;
+            --accent: #38BDF8;
+            --accent-dim: #0C4A6E;
+            --green: #34D399;
+            --purple: #A78BFA;
+            --orange: #FB923C;
+            --font: 'Inter', system-ui, -apple-system, sans-serif;
+            --mono: 'JetBrains Mono', 'Fira Code', monospace;
+        }
+
+        html { scroll-behavior: smooth }
+        body {
+            font-family: var(--font);
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        a { color: var(--accent); text-decoration: none }
+        a:hover { text-decoration: underline }
+
+        .container {
+            max-width: 1080px;
+            margin: 0 auto;
+            padding: 0 24px;
+        }
+
+        /* ── Nav ── */
+        nav {
+            position: sticky;
+            top: 0;
+            z-index: 50;
+            background: rgba(11, 17, 32, 0.85);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border);
+        }
+        nav .container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 60px;
+        }
+        .nav-logo {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--text-bright);
+            letter-spacing: -0.02em;
+        }
+        .nav-logo span { color: var(--accent) }
+        .nav-links { display: flex; gap: 28px; align-items: center }
+        .nav-links a {
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: color 0.15s;
+        }
+        .nav-links a:hover { color: var(--text-bright); text-decoration: none }
+        .nav-gh {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.875rem;
+            color: var(--text) !important;
+            transition: border-color 0.15s, color 0.15s;
+        }
+        .nav-gh:hover { border-color: var(--text-muted); color: var(--text-bright) !important }
+        .nav-gh svg { width: 18px; height: 18px; fill: currentColor }
+
+        /* ── Hero ── */
+        .hero {
+            padding: 100px 0 80px;
+            text-align: center;
+        }
+        .hero-badge {
+            display: inline-block;
+            padding: 4px 14px;
+            border-radius: 9999px;
+            border: 1px solid var(--accent-dim);
+            color: var(--accent);
+            font-size: 0.8rem;
+            font-weight: 500;
+            margin-bottom: 24px;
+            letter-spacing: 0.02em;
+        }
+        .hero h1 {
+            font-size: clamp(2.5rem, 5vw, 3.75rem);
+            font-weight: 700;
+            color: var(--text-bright);
+            line-height: 1.1;
+            letter-spacing: -0.03em;
+            margin-bottom: 20px;
+        }
+        .hero h1 em {
+            font-style: normal;
+            background: linear-gradient(135deg, var(--accent), var(--purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .hero p {
+            font-size: 1.2rem;
+            color: var(--text-muted);
+            max-width: 560px;
+            margin: 0 auto 40px;
+            line-height: 1.6;
+        }
+
+        .hero-install {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            background: var(--bg-code);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 14px 24px;
+            font-family: var(--mono);
+            font-size: 0.9rem;
+            color: var(--text);
+            cursor: pointer;
+            transition: border-color 0.15s;
+            position: relative;
+        }
+        .hero-install:hover { border-color: var(--text-muted) }
+        .hero-install .copy-icon {
+            color: var(--text-muted);
+            transition: color 0.15s;
+        }
+        .hero-install:hover .copy-icon { color: var(--text) }
+        .hero-install .copied-toast {
+            position: absolute;
+            top: -32px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: var(--accent);
+            color: var(--bg);
+            font-family: var(--font);
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 4px 10px;
+            border-radius: 6px;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s;
+        }
+        .hero-install .copied-toast.show { opacity: 1 }
+
+        .hero-tabs {
+            display: inline-flex;
+            gap: 0;
+            margin-bottom: 12px;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid var(--border);
+        }
+        .hero-tab {
+            padding: 6px 18px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-muted);
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            transition: color 0.15s, background 0.15s;
+            font-family: var(--font);
+        }
+        .hero-tab:hover { color: var(--text) }
+        .hero-tab.active {
+            background: var(--bg-card);
+            color: var(--text-bright);
+        }
+
+        /* ── Stats ── */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1px;
+            background: var(--border);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            overflow: hidden;
+            margin-bottom: 100px;
+        }
+        .stat {
+            background: var(--bg-card);
+            padding: 28px 20px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: var(--text-bright);
+            letter-spacing: -0.02em;
+        }
+        .stat-value .unit { color: var(--accent); font-weight: 600 }
+        .stat-label {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+            font-weight: 500;
+        }
+
+        /* ── Section ── */
+        section { padding: 60px 0 }
+        .section-label {
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--accent);
+            margin-bottom: 12px;
+        }
+        .section-title {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--text-bright);
+            letter-spacing: -0.02em;
+            margin-bottom: 12px;
+        }
+        .section-desc {
+            color: var(--text-muted);
+            max-width: 560px;
+            margin-bottom: 48px;
+            font-size: 1.05rem;
+        }
+
+        /* ── Code Block ── */
+        .code-block {
+            background: var(--bg-code);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            margin-bottom: 60px;
+        }
+        .code-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+        .code-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--border);
+        }
+        .code-block pre {
+            padding: 20px 24px;
+            overflow-x: auto;
+            font-family: var(--mono);
+            font-size: 0.85rem;
+            line-height: 1.7;
+            color: var(--text);
+        }
+
+        /* Syntax colors */
+        .kw { color: var(--purple) }
+        .ty { color: var(--accent) }
+        .st { color: var(--green) }
+        .cm { color: var(--text-muted) }
+        .an { color: var(--orange) }
+        .fn { color: #E2E8F0 }
+        .nr { color: var(--orange) }
+
+        /* ── Feature Grid ── */
+        .features {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 48px;
+        }
+        .feature {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            transition: border-color 0.2s;
+        }
+        .feature:hover { border-color: var(--text-muted) }
+        .feature-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 9px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.1rem;
+            margin-bottom: 14px;
+            background: var(--accent-dim);
+            color: var(--accent);
+        }
+        .feature h3 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: var(--text-bright);
+            margin-bottom: 6px;
+        }
+        .feature p {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+
+        /* ── Comparison Table ── */
+        .table-wrap {
+            overflow-x: auto;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 60px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+        th, td {
+            padding: 12px 18px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+        th {
+            background: var(--bg-card);
+            color: var(--text-muted);
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        th:first-child { color: var(--text-bright) }
+        td { color: var(--text) }
+        td:first-child {
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+        tr:last-child td { border-bottom: none }
+        /* highlight memgres column */
+        th:nth-child(2), td:nth-child(2) {
+            color: var(--accent);
+            font-weight: 500;
+        }
+        th:nth-child(2) {
+            color: var(--accent);
+        }
+        .check { color: var(--green) }
+        .cross { color: #EF4444 }
+
+        /* ── Limitations ── */
+        .limitations {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-bottom: 48px;
+        }
+        .limitation {
+            display: flex;
+            align-items: baseline;
+            gap: 10px;
+            padding: 10px 14px;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            border-radius: 8px;
+        }
+        .limitation::before {
+            content: '';
+            flex-shrink: 0;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--border);
+            margin-top: 7px;
+        }
+
+        /* ── Footer ── */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 40px 0;
+            margin-top: 60px;
+        }
+        footer .container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .footer-left {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+        .footer-links {
+            display: flex;
+            gap: 24px;
+        }
+        .footer-links a {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            font-weight: 500;
+            transition: color 0.15s;
+        }
+        .footer-links a:hover { color: var(--text-bright); text-decoration: none }
+
+        /* ── Responsive ── */
+        @media (max-width: 768px) {
+            .stats { grid-template-columns: repeat(2, 1fr) }
+            .features { grid-template-columns: 1fr }
+            .limitations { grid-template-columns: 1fr }
+            .nav-links a:not(.nav-gh) { display: none }
+            footer .container { flex-direction: column; gap: 16px; text-align: center }
+        }
+        @media (max-width: 480px) {
+            .hero { padding: 60px 0 50px }
+            .hero-install { font-size: 0.78rem; padding: 12px 16px }
+            .stats { grid-template-columns: 1fr 1fr }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+    <div class="container">
+        <div class="nav-logo"><span>M</span>emgres</div>
+        <div class="nav-links">
+            <a href="#features">Features</a>
+            <a href="#comparison">Compare</a>
+            <a href="#limitations">Limitations</a>
+            <a href="https://github.com/lhgravendeel/memgres" class="nav-gh">
+                <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+                GitHub
+            </a>
+        </div>
+    </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+    <div class="container">
+        <div class="hero-badge">PostgreSQL 18 compatible</div>
+        <h1>In-memory PostgreSQL<br>for <em>Java testing</em></h1>
+        <p>No Docker, no external processes, no native binaries. Add the dependency, write tests against real PostgreSQL SQL.</p>
+
+        <div>
+            <div class="hero-tabs">
+                <button class="hero-tab active" onclick="showInstall('maven')">Maven</button>
+                <button class="hero-tab" onclick="showInstall('gradle')">Gradle</button>
+            </div>
+            <br>
+            <div class="hero-install" onclick="copyInstall(this)" id="install-block">
+                <span id="install-text">com.memgres:memgres-junit5:0.1.0</span>
+                <svg class="copy-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                <span class="copied-toast" id="copied-toast">Copied!</span>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Stats -->
+<div class="container">
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-value">9,500<span class="unit">+</span></div>
+            <div class="stat-label">Passing tests</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">200<span class="unit">+</span></div>
+            <div class="stat-label">Built-in functions</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">80<span class="unit">+</span></div>
+            <div class="stat-label">System catalog tables</div>
+        </div>
+        <div class="stat">
+            <div class="stat-value">0</div>
+            <div class="stat-label">External dependencies</div>
+        </div>
+    </div>
+</div>
+
+<!-- Code Example -->
+<div class="container">
+    <div class="code-block">
+        <div class="code-header">
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span class="code-dot"></span>
+            <span>MyTest.java</span>
+        </div>
+<pre><span class="an">@MemgresTest</span>
+<span class="kw">class</span> <span class="ty">MyTest</span> {
+
+    <span class="an">@Test</span>
+    <span class="kw">void</span> <span class="fn">insertAndQuery</span>(<span class="ty">Connection</span> conn) <span class="kw">throws</span> <span class="ty">SQLException</span> {
+        conn.createStatement().execute(
+            <span class="st">"CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL)"</span>);
+        conn.createStatement().execute(
+            <span class="st">"INSERT INTO users (name) VALUES ('Alice'), ('Bob')"</span>);
+
+        <span class="ty">ResultSet</span> rs = conn.createStatement().executeQuery(
+            <span class="st">"SELECT name FROM users ORDER BY id"</span>);
+        rs.next();
+        assertEquals(<span class="st">"Alice"</span>, rs.getString(<span class="nr">1</span>));
+    }
+}</pre>
+    </div>
+</div>
+
+<!-- Features -->
+<section id="features">
+    <div class="container">
+        <div class="section-label">Features</div>
+        <div class="section-title">Real PostgreSQL, in-process</div>
+        <div class="section-desc">Implements the PostgreSQL wire protocol v3. Your tests run the same SQL that runs in production.</div>
+
+        <div class="features">
+            <div class="feature">
+                <div class="feature-icon">Q</div>
+                <h3>Full Query Support</h3>
+                <p>JOINs, CTEs (recursive), window functions, GROUPING SETS, DISTINCT ON, LATERAL, subqueries, set operations.</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">T</div>
+                <h3>40+ Data Types</h3>
+                <p>Numeric, text, boolean, date/time, UUID, JSON/JSONB, arrays, enums, composites, ranges, geometric, network, XML.</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">F</div>
+                <h3>200+ Functions</h3>
+                <p>String, math, date/time, JSON, array, full-text search, geometric, network, range, XML, and aggregate functions.</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">P</div>
+                <h3>PL/pgSQL</h3>
+                <p>Stored procedures, DO blocks, control flow, exception handling, cursors, RAISE, GET DIAGNOSTICS, IN/OUT parameters.</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">D</div>
+                <h3>pg_dump Compatible</h3>
+                <p>Works with real pg_dump and pg_restore. Custom, directory, plain, and tar formats. Full round-trip data integrity.</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">X</div>
+                <h3>Transactions &amp; Locking</h3>
+                <p>BEGIN/COMMIT/ROLLBACK, savepoints, 3 isolation levels, SELECT FOR UPDATE/SHARE, SKIP LOCKED, deadlock detection.</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">S</div>
+                <h3>Security</h3>
+                <p>Roles, GRANT/REVOKE, ALTER DEFAULT PRIVILEGES, row-level security policies.</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">C</div>
+                <h3>System Catalogs</h3>
+                <p>80+ pg_catalog tables and 13+ information_schema views. Compatible with ORMs, Flyway, Liquibase, and introspection tools.</p>
+            </div>
+            <div class="feature">
+                <div class="feature-icon">N</div>
+                <h3>LISTEN / NOTIFY</h3>
+                <p>Channel-based notifications with full transaction semantics. Deferred until COMMIT, discarded on ROLLBACK.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Comparison -->
+<section id="comparison">
+    <div class="container">
+        <div class="section-label">Comparison</div>
+        <div class="section-title">How Memgres compares</div>
+        <div class="section-desc">Choose Memgres when you want fast, zero-dependency PostgreSQL tests. Choose Testcontainers when you need 100% fidelity.</div>
+
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th></th>
+                        <th>Memgres</th>
+                        <th>Testcontainers</th>
+                        <th>H2 (PG mode)</th>
+                        <th>embedded-postgres</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Docker required</td>
+                        <td><span class="check">No</span></td>
+                        <td><span class="cross">Yes</span></td>
+                        <td><span class="check">No</span></td>
+                        <td><span class="check">No</span></td>
+                    </tr>
+                    <tr>
+                        <td>Native binary</td>
+                        <td><span class="check">No</span></td>
+                        <td><span class="check">No</span></td>
+                        <td><span class="check">No</span></td>
+                        <td><span class="cross">Downloads PG</span></td>
+                    </tr>
+                    <tr>
+                        <td>Startup time</td>
+                        <td>Milliseconds</td>
+                        <td>Seconds</td>
+                        <td>Milliseconds</td>
+                        <td>Seconds</td>
+                    </tr>
+                    <tr>
+                        <td>Wire protocol</td>
+                        <td>Real PG v3</td>
+                        <td>Real PG</td>
+                        <td>H2 protocol</td>
+                        <td>Real PG</td>
+                    </tr>
+                    <tr>
+                        <td>pg_dump compatible</td>
+                        <td><span class="check">Yes</span></td>
+                        <td><span class="check">Yes</span></td>
+                        <td><span class="cross">No</span></td>
+                        <td><span class="check">Yes</span></td>
+                    </tr>
+                    <tr>
+                        <td>SQL fidelity</td>
+                        <td>PG 18 subset</td>
+                        <td>Full PG</td>
+                        <td>Partial</td>
+                        <td>Full PG</td>
+                    </tr>
+                    <tr>
+                        <td>System catalogs</td>
+                        <td>80+ tables</td>
+                        <td>Full PG</td>
+                        <td>Limited</td>
+                        <td>Full PG</td>
+                    </tr>
+                    <tr>
+                        <td>PL/pgSQL</td>
+                        <td><span class="check">Yes</span></td>
+                        <td><span class="check">Yes</span></td>
+                        <td><span class="cross">No</span></td>
+                        <td><span class="check">Yes</span></td>
+                    </tr>
+                    <tr>
+                        <td>CI-friendly</td>
+                        <td><span class="check">No deps</span></td>
+                        <td>Needs Docker</td>
+                        <td><span class="check">No deps</span></td>
+                        <td>Needs network</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</section>
+
+<!-- Limitations -->
+<section id="limitations">
+    <div class="container">
+        <div class="section-label">Limitations</div>
+        <div class="section-title">What Memgres does not support</div>
+        <div class="section-desc">Memgres is designed for testing, not production. These PostgreSQL features are not implemented.</div>
+
+        <div class="limitations">
+            <div class="limitation">No persistence — fully in-memory by design</div>
+            <div class="limitation">Btree indexes only (no GiST, GIN, BRIN)</div>
+            <div class="limitation">Extensions parsed but not loaded (no PostGIS, pg_trgm)</div>
+            <div class="limitation">No replication (WAL, streaming, or logical)</div>
+            <div class="limitation">No foreign data wrappers or foreign tables</div>
+            <div class="limitation">No tablespaces</div>
+            <div class="limitation">No SSL/TLS connections</div>
+            <div class="limitation">pg_stat_* tables are stubs (no real statistics)</div>
+            <div class="limitation">No parallel query execution</div>
+            <div class="limitation">Parallel pg_dump/pg_restore not yet supported</div>
+            <div class="limitation">Basic collation only (no ICU)</div>
+            <div class="limitation">Single database per instance</div>
+        </div>
+    </div>
+</section>
+
+<!-- Getting Started -->
+<section>
+    <div class="container">
+        <div class="section-label">Get started</div>
+        <div class="section-title">Up and running in 60 seconds</div>
+        <div class="section-desc">Add the dependency, annotate your test class, and go.</div>
+
+        <div class="code-block">
+            <div class="code-header">
+                <span class="code-dot"></span>
+                <span class="code-dot"></span>
+                <span class="code-dot"></span>
+                <span>pom.xml</span>
+            </div>
+<pre><span class="kw">&lt;dependency&gt;</span>
+    <span class="kw">&lt;groupId&gt;</span><span class="st">com.memgres</span><span class="kw">&lt;/groupId&gt;</span>
+    <span class="kw">&lt;artifactId&gt;</span><span class="st">memgres-junit5</span><span class="kw">&lt;/artifactId&gt;</span>
+    <span class="kw">&lt;version&gt;</span><span class="nr">0.1.0</span><span class="kw">&lt;/version&gt;</span>
+    <span class="kw">&lt;scope&gt;</span><span class="st">test</span><span class="kw">&lt;/scope&gt;</span>
+<span class="kw">&lt;/dependency&gt;</span></pre>
+        </div>
+
+        <div style="text-align: center; padding: 20px 0 40px;">
+            <span style="color: var(--text-muted); font-size: 0.9rem;">Requires Java 8+ and the PostgreSQL JDBC driver on the test classpath.</span>
+        </div>
+    </div>
+</section>
+
+<!-- Footer -->
+<footer>
+    <div class="container">
+        <div class="footer-left">Memgres &middot; Apache License 2.0</div>
+        <div class="footer-links">
+            <a href="https://github.com/lhgravendeel/memgres">GitHub</a>
+            <a href="https://github.com/lhgravendeel/memgres/blob/main/README.md">Docs</a>
+            <a href="https://github.com/lhgravendeel/memgres/issues">Issues</a>
+        </div>
+    </div>
+</footer>
+
+<script>
+    const installs = {
+        maven: 'com.memgres:memgres-junit5:0.1.0',
+        gradle: "testImplementation 'com.memgres:memgres-junit5:0.1.0'"
+    };
+    let current = 'maven';
+
+    function showInstall(type) {
+        current = type;
+        document.getElementById('install-text').textContent = installs[type];
+        document.querySelectorAll('.hero-tab').forEach(t => t.classList.remove('active'));
+        event.target.classList.add('active');
+    }
+
+    function copyInstall(el) {
+        navigator.clipboard.writeText(installs[current]);
+        const toast = document.getElementById('copied-toast');
+        toast.classList.add('show');
+        setTimeout(() => toast.classList.remove('show'), 1200);
+    }
+</script>
+
+</body>
+</html>

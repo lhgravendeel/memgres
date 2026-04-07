@@ -1,0 +1,1149 @@
+package com.memgres.engine;
+
+import com.memgres.engine.util.Cols;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+import static com.memgres.engine.CatalogHelper.*;
+
+/**
+ * Builds pg_catalog view, stats-stub, timezone, text-search, and
+ * remaining empty-stub virtual tables.
+ * Extracted from PgCatalogBuilder to separate concerns.
+ */
+class CatalogStubBuilder {
+
+    final Database database;
+    final OidSupplier oids;
+
+    CatalogStubBuilder(Database database, OidSupplier oids) {
+        this.database = database;
+        this.oids = oids;
+    }
+
+    // ---------------------------------------------------------------
+    //  User-facing views
+    // ---------------------------------------------------------------
+
+    Table buildPgTables() {
+        List<Column> cols = Cols.listOf(
+                colNN("schemaname", DataType.TEXT),
+                colNN("tablename", DataType.TEXT),
+                colNN("tableowner", DataType.TEXT),
+                col("tablespace", DataType.TEXT),
+                col("hasindexes", DataType.BOOLEAN),
+                col("hasrules", DataType.BOOLEAN),
+                col("hastriggers", DataType.BOOLEAN)
+        );
+        Table table = new Table("pg_tables", cols);
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            for (String tableName : schemaEntry.getValue().getTables().keySet()) {
+                table.insertRow(new Object[]{
+                        schemaEntry.getKey(), tableName, "memgres", null, false, false, false
+                });
+            }
+        }
+        return table;
+    }
+
+    Table buildPgViews() {
+        List<Column> cols = Cols.listOf(
+                colNN("schemaname", DataType.TEXT),
+                colNN("viewname", DataType.TEXT),
+                colNN("viewowner", DataType.TEXT),
+                col("definition", DataType.TEXT)
+        );
+        Table table = new Table("pg_views", cols);
+        for (Database.ViewDef vd : database.getViews().values()) {
+            String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
+            String viewDef = null;
+            if (vd.query() != null) {
+                viewDef = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
+            }
+            table.insertRow(new Object[]{vSchema, vd.name(), "memgres", viewDef});
+        }
+        return table;
+    }
+
+    Table buildPgIndexes() {
+        List<Column> cols = Cols.listOf(
+                colNN("schemaname", DataType.TEXT),
+                colNN("tablename", DataType.TEXT),
+                colNN("indexname", DataType.TEXT),
+                col("tablespace", DataType.TEXT),
+                col("indexdef", DataType.TEXT)
+        );
+        Table table = new Table("pg_indexes", cols);
+        // Track which index names we've already added to avoid duplicates
+        Set<String> addedIndexes = new HashSet<>();
+
+        // 1. Explicit indexes (CREATE INDEX)
+        for (Map.Entry<String, List<String>> idx : database.getIndexColumns().entrySet()) {
+            String indexName = idx.getKey();
+            List<String> indexCols = idx.getValue();
+            String storedTableQualified = database.getIndexTable(indexName);
+            String schemaName = "public";
+            String tableName = storedTableQualified;
+            if (storedTableQualified != null && storedTableQualified.contains(".")) {
+                String[] parts = storedTableQualified.split("\\.", 2);
+                schemaName = parts[0];
+                tableName = parts[1];
+            }
+            boolean isUnique = database.isUniqueIndex(indexName);
+            String method = database.getIndexMethod(indexName);
+            String indexDef = "CREATE " + (isUnique ? "UNIQUE " : "") + "INDEX " + indexName
+                    + " ON " + (tableName != null ? tableName : "unknown")
+                    + " USING " + method + " (" + String.join(", ", indexCols) + ")";
+            table.insertRow(new Object[]{schemaName, tableName, indexName, null, indexDef});
+            addedIndexes.add(indexName.toLowerCase());
+        }
+
+        // 2. Implicit indexes from PRIMARY KEY and UNIQUE constraints
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                Table t = tableEntry.getValue();
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                            || sc.getType() == StoredConstraint.Type.UNIQUE) {
+                        String indexName = sc.getName();
+                        if (addedIndexes.contains(indexName.toLowerCase())) continue;
+                        String indexDef = "CREATE UNIQUE INDEX " + indexName
+                                + " ON " + t.getName()
+                                + " USING btree (" + String.join(", ", sc.getColumns()) + ")";
+                        table.insertRow(new Object[]{schemaName, t.getName(), indexName, null, indexDef});
+                        addedIndexes.add(indexName.toLowerCase());
+                    }
+                }
+            }
+        }
+        return table;
+    }
+
+    Table buildPgSequence() {
+        // pg_sequence: the catalog table (not the pg_sequences view)
+        List<Column> cols = Cols.listOf(
+                colNN("seqrelid", DataType.INTEGER),
+                colNN("seqtypid", DataType.INTEGER),
+                colNN("seqstart", DataType.BIGINT),
+                colNN("seqincrement", DataType.BIGINT),
+                colNN("seqmax", DataType.BIGINT),
+                colNN("seqmin", DataType.BIGINT),
+                colNN("seqcache", DataType.BIGINT),
+                colNN("seqcycle", DataType.BOOLEAN)
+        );
+        Table table = new Table("pg_sequence", cols);
+        for (String seqName : getSequenceNames(database)) {
+            Sequence seq = database.getSequence(seqName);
+            int seqOid = oids.oid("rel:public." + seqName);
+            // Determine sequence type from the source column type
+            DataType seqDataType = getSequenceDataType(database, seqName);
+            int typOid = seqDataType.getOid();
+            long startWith = seq != null ? seq.getStartWith() : 1L;
+            long incrementBy = seq != null ? seq.getIncrementBy() : 1L;
+            long maxValue = seq != null ? seq.getMaxValue() : getDefaultSeqMax(seqDataType);
+            long minValue = seq != null ? seq.getMinValue() : 1L;
+            boolean cycle = seq != null && seq.isCycle();
+            table.insertRow(new Object[]{
+                    seqOid, typOid,
+                    startWith, incrementBy,
+                    maxValue, minValue,
+                    1L, cycle
+            });
+        }
+        return table;
+    }
+
+    Table buildPgSequences() {
+        List<Column> cols = Cols.listOf(
+                colNN("schemaname", DataType.TEXT),
+                colNN("sequencename", DataType.TEXT),
+                colNN("sequenceowner", DataType.TEXT),
+                col("data_type", DataType.TEXT),
+                col("start_value", DataType.BIGINT),
+                col("min_value", DataType.BIGINT),
+                col("max_value", DataType.BIGINT),
+                col("increment_by", DataType.BIGINT),
+                col("cycle", DataType.BOOLEAN)
+        );
+        Table table = new Table("pg_sequences", cols);
+        for (String seqName : getSequenceNames(database)) {
+            Sequence seq = database.getSequence(seqName);
+            DataType seqDataType = getSequenceDataType(database, seqName);
+            String typeName;
+            switch (seqDataType) {
+                case SMALLINT:
+                case SMALLSERIAL:
+                    typeName = "smallint";
+                    break;
+                case INTEGER:
+                case SERIAL:
+                    typeName = "integer";
+                    break;
+                default:
+                    typeName = "bigint";
+                    break;
+            }
+            long startWith = seq != null ? seq.getStartWith() : 1L;
+            long minValue = seq != null ? seq.getMinValue() : 1L;
+            long maxValue = seq != null ? seq.getMaxValue() : getDefaultSeqMax(seqDataType);
+            long incrementBy = seq != null ? seq.getIncrementBy() : 1L;
+            boolean cycle = seq != null && seq.isCycle();
+            table.insertRow(new Object[]{
+                    "public", seqName, "memgres", typeName,
+                    startWith, minValue, maxValue,
+                    incrementBy, cycle
+            });
+        }
+        return table;
+    }
+
+    // ---------------------------------------------------------------
+    //  Stats stubs (and some with data)
+    // ---------------------------------------------------------------
+
+    Table buildPgStatUserTables() {
+        List<Column> cols = Cols.listOf(
+                col("relid", DataType.INTEGER),
+                col("schemaname", DataType.TEXT),
+                col("relname", DataType.TEXT),
+                col("seq_scan", DataType.BIGINT),
+                col("last_seq_scan", DataType.TIMESTAMPTZ),
+                col("seq_tup_read", DataType.BIGINT),
+                col("idx_scan", DataType.BIGINT),
+                col("last_idx_scan", DataType.TIMESTAMPTZ),
+                col("idx_tup_fetch", DataType.BIGINT),
+                col("n_tup_ins", DataType.BIGINT),
+                col("n_tup_upd", DataType.BIGINT),
+                col("n_tup_del", DataType.BIGINT),
+                col("n_tup_hot_upd", DataType.BIGINT),
+                col("n_live_tup", DataType.BIGINT),
+                col("n_dead_tup", DataType.BIGINT),
+                col("n_mod_since_analyze", DataType.BIGINT),
+                col("n_ins_since_vacuum", DataType.BIGINT),
+                col("last_vacuum", DataType.TIMESTAMPTZ),
+                col("last_autovacuum", DataType.TIMESTAMPTZ),
+                col("last_analyze", DataType.TIMESTAMPTZ),
+                col("last_autoanalyze", DataType.TIMESTAMPTZ),
+                col("vacuum_count", DataType.BIGINT),
+                col("autovacuum_count", DataType.BIGINT),
+                col("analyze_count", DataType.BIGINT),
+                col("autoanalyze_count", DataType.BIGINT)
+        );
+        Table table = new Table("pg_stat_user_tables", cols);
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                Table t = tableEntry.getValue();
+                table.insertRow(new Object[]{
+                        oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName()),
+                        schemaEntry.getKey(), t.getName(),
+                        0L, null, 0L, 0L, null, 0L,   // scans
+                        0L, 0L, 0L, 0L,               // ins, upd, del, hot_upd
+                        (long) t.getRows().size(), 0L, // live, dead
+                        0L, 0L,                        // mod_since_analyze, ins_since_vacuum
+                        null, null, null, null,         // last vacuum/analyze
+                        0L, 0L, 0L, 0L                 // counts
+                });
+            }
+        }
+        return table;
+    }
+
+    Table buildPgStatUserIndexes() {
+        List<Column> cols = Cols.listOf(
+                col("relid", DataType.INTEGER),
+                col("indexrelid", DataType.INTEGER),
+                col("schemaname", DataType.TEXT),
+                col("relname", DataType.TEXT),
+                col("indexrelname", DataType.TEXT),
+                col("idx_scan", DataType.BIGINT),
+                col("last_idx_scan", DataType.TIMESTAMPTZ),
+                col("idx_tup_read", DataType.BIGINT),
+                col("idx_tup_fetch", DataType.BIGINT)
+        );
+        Table table = new Table("pg_stat_user_indexes", cols);
+        // Populate with explicit indexes (zero stats)
+        for (Map.Entry<String, List<String>> idx : database.getIndexColumns().entrySet()) {
+            String indexName = idx.getKey();
+            String storedTable = database.getIndexTable(indexName);
+            String indexSchema = "public";
+            String tableName = null;
+            if (storedTable != null) {
+                String[] parts = storedTable.split("\\.", 2);
+                if (parts.length == 2) { indexSchema = parts[0]; tableName = parts[1]; }
+                else tableName = parts[0];
+            }
+            if (tableName != null) {
+                table.insertRow(new Object[]{
+                        oids.oid("rel:" + indexSchema + "." + tableName),
+                        oids.oid("rel:" + indexSchema + "." + indexName),
+                        indexSchema, tableName, indexName,
+                        0L, null, 0L, 0L
+                });
+            }
+        }
+        return table;
+    }
+
+    Table buildPgStatDatabase() {
+        List<Column> cols = Cols.listOf(
+                col("datid", DataType.INTEGER),
+                col("datname", DataType.TEXT),
+                col("numbackends", DataType.INTEGER),
+                col("xact_commit", DataType.BIGINT),
+                col("xact_rollback", DataType.BIGINT),
+                col("blks_read", DataType.BIGINT),
+                col("blks_hit", DataType.BIGINT),
+                col("tup_returned", DataType.BIGINT),
+                col("tup_fetched", DataType.BIGINT),
+                col("tup_inserted", DataType.BIGINT),
+                col("tup_updated", DataType.BIGINT),
+                col("tup_deleted", DataType.BIGINT),
+                col("conflicts", DataType.BIGINT),
+                col("temp_files", DataType.BIGINT),
+                col("temp_bytes", DataType.BIGINT),
+                col("deadlocks", DataType.BIGINT),
+                col("checksum_failures", DataType.BIGINT),
+                col("checksum_last_failure", DataType.TIMESTAMPTZ),
+                col("blk_read_time", DataType.DOUBLE_PRECISION),
+                col("blk_write_time", DataType.DOUBLE_PRECISION),
+                col("session_time", DataType.DOUBLE_PRECISION),
+                col("active_time", DataType.DOUBLE_PRECISION),
+                col("idle_in_transaction_time", DataType.DOUBLE_PRECISION),
+                col("sessions", DataType.BIGINT),
+                col("sessions_abandoned", DataType.BIGINT),
+                col("sessions_fatal", DataType.BIGINT),
+                col("sessions_killed", DataType.BIGINT),
+                col("stats_reset", DataType.TIMESTAMPTZ)
+        );
+        Table table = new Table("pg_stat_database", cols);
+        int numBackends = database.getActiveSessions().size();
+        table.insertRow(new Object[]{
+                oids.oid("db:memgres"), "memgres", numBackends,
+                0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                0L, null,    // checksum_failures, checksum_last_failure
+                0.0, 0.0,   // blk_read_time, blk_write_time
+                0.0, 0.0, 0.0, // session_time, active_time, idle_in_transaction_time
+                (long) numBackends, 0L, 0L, 0L, // sessions, abandoned, fatal, killed
+                null
+        });
+        return table;
+    }
+
+    Table buildPgStatBgwriter() {
+        // PG 15+ shape: checkpoint stats moved to pg_stat_checkpointer
+        List<Column> cols = Cols.listOf(
+                col("buffers_clean", DataType.BIGINT),
+                col("maxwritten_clean", DataType.BIGINT),
+                col("buffers_alloc", DataType.BIGINT),
+                col("stats_reset", DataType.TIMESTAMPTZ)
+        );
+        Table table = new Table("pg_stat_bgwriter", cols);
+        table.insertRow(new Object[]{0L, 0L, 0L, null});
+        return table;
+    }
+
+    Table buildPgStatCheckpointer() {
+        List<Column> cols = Cols.listOf(
+                col("num_timed", DataType.BIGINT),
+                col("num_requested", DataType.BIGINT),
+                col("restartpoints_timed", DataType.BIGINT),
+                col("restartpoints_req", DataType.BIGINT),
+                col("restartpoints_done", DataType.BIGINT),
+                col("write_time", DataType.DOUBLE_PRECISION),
+                col("sync_time", DataType.DOUBLE_PRECISION),
+                col("buffers_written", DataType.BIGINT),
+                col("stats_reset", DataType.TIMESTAMPTZ)
+        );
+        Table table = new Table("pg_stat_checkpointer", cols);
+        table.insertRow(new Object[]{0L, 0L, 0L, 0L, 0L, 0.0, 0.0, 0L, null});
+        return table;
+    }
+
+    Table buildPgStatWal() {
+        List<Column> cols = Cols.listOf(
+                col("wal_records", DataType.BIGINT),
+                col("wal_fpi", DataType.BIGINT),
+                col("wal_bytes", DataType.NUMERIC),
+                col("wal_buffers_full", DataType.BIGINT),
+                col("wal_write", DataType.BIGINT),
+                col("wal_sync", DataType.BIGINT),
+                col("wal_write_time", DataType.DOUBLE_PRECISION),
+                col("wal_sync_time", DataType.DOUBLE_PRECISION),
+                col("stats_reset", DataType.TIMESTAMPTZ)
+        );
+        Table table = new Table("pg_stat_wal", cols);
+        table.insertRow(new Object[]{0L, 0L, java.math.BigDecimal.ZERO, 0L, 0L, 0L, 0.0, 0.0, null});
+        return table;
+    }
+
+    Table buildPgStatReplication() {
+        List<Column> cols = Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("usesysid", DataType.INTEGER),
+                col("usename", DataType.TEXT),
+                col("application_name", DataType.TEXT),
+                col("client_addr", DataType.TEXT),
+                col("client_hostname", DataType.TEXT),
+                col("client_port", DataType.INTEGER),
+                col("backend_start", DataType.TIMESTAMPTZ),
+                col("backend_xmin", DataType.INTEGER),
+                col("state", DataType.TEXT),
+                col("sent_lsn", DataType.TEXT),
+                col("write_lsn", DataType.TEXT),
+                col("flush_lsn", DataType.TEXT),
+                col("replay_lsn", DataType.TEXT),
+                col("write_lag", DataType.TEXT),
+                col("flush_lag", DataType.TEXT),
+                col("replay_lag", DataType.TEXT),
+                col("sync_priority", DataType.INTEGER),
+                col("sync_state", DataType.TEXT),
+                col("reply_time", DataType.TIMESTAMPTZ)
+        );
+        return new Table("pg_stat_replication", cols); // empty, no replication
+    }
+
+    Table buildPgStatSubscription() {
+        List<Column> cols = Cols.listOf(
+                col("subid", DataType.INTEGER),
+                col("subname", DataType.TEXT),
+                col("pid", DataType.INTEGER),
+                col("relid", DataType.INTEGER),
+                col("received_lsn", DataType.TEXT),
+                col("last_msg_send_time", DataType.TIMESTAMPTZ),
+                col("last_msg_receipt_time", DataType.TIMESTAMPTZ),
+                col("latest_end_lsn", DataType.TEXT),
+                col("latest_end_time", DataType.TIMESTAMPTZ)
+        );
+        return new Table("pg_stat_subscription", cols); // empty, no subscriptions
+    }
+
+    Table buildPgStatProgressVacuum() {
+        List<Column> cols = Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("datid", DataType.INTEGER),
+                col("datname", DataType.TEXT),
+                col("relid", DataType.INTEGER),
+                col("phase", DataType.TEXT),
+                col("heap_blks_total", DataType.BIGINT),
+                col("heap_blks_scanned", DataType.BIGINT),
+                col("heap_blks_vacuumed", DataType.BIGINT),
+                col("index_vacuum_count", DataType.BIGINT),
+                col("max_dead_tuples", DataType.BIGINT),
+                col("num_dead_tuples", DataType.BIGINT)
+        );
+        return new Table("pg_stat_progress_vacuum", cols); // empty, no vacuum in progress
+    }
+
+    Table buildPgStatProgressCreateIndex() {
+        List<Column> cols = Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("datid", DataType.INTEGER),
+                col("datname", DataType.TEXT),
+                col("relid", DataType.INTEGER),
+                col("index_relid", DataType.INTEGER),
+                col("command", DataType.TEXT),
+                col("phase", DataType.TEXT),
+                col("lockers_total", DataType.BIGINT),
+                col("lockers_done", DataType.BIGINT),
+                col("current_locker_pid", DataType.BIGINT),
+                col("blocks_total", DataType.BIGINT),
+                col("blocks_done", DataType.BIGINT),
+                col("tuples_total", DataType.BIGINT),
+                col("tuples_done", DataType.BIGINT),
+                col("partitions_total", DataType.BIGINT),
+                col("partitions_done", DataType.BIGINT)
+        );
+        return new Table("pg_stat_progress_create_index", cols); // empty
+    }
+
+    Table buildPgStatWalReceiver() {
+        List<Column> cols = Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("status", DataType.TEXT),
+                col("receive_start_lsn", DataType.TEXT),
+                col("receive_start_tli", DataType.INTEGER),
+                col("received_lsn", DataType.TEXT),
+                col("received_tli", DataType.INTEGER),
+                col("last_msg_send_time", DataType.TIMESTAMPTZ),
+                col("last_msg_receipt_time", DataType.TIMESTAMPTZ),
+                col("latest_end_lsn", DataType.TEXT),
+                col("latest_end_time", DataType.TIMESTAMPTZ),
+                col("slot_name", DataType.TEXT),
+                col("sender_host", DataType.TEXT),
+                col("sender_port", DataType.INTEGER),
+                col("conninfo", DataType.TEXT)
+        );
+        return new Table("pg_stat_wal_receiver", cols); // empty, no WAL receiver
+    }
+
+    Table buildPgStatSsl() {
+        List<Column> cols = Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("ssl", DataType.BOOLEAN),
+                col("version", DataType.TEXT),
+                col("cipher", DataType.TEXT),
+                col("bits", DataType.INTEGER),
+                col("compression", DataType.BOOLEAN),
+                col("client_dn", DataType.TEXT),
+                col("client_serial", DataType.NUMERIC),
+                col("issuer_dn", DataType.TEXT)
+        );
+        return new Table("pg_stat_ssl", cols); // empty, no SSL
+    }
+
+    Table buildPgStatGssapi() {
+        List<Column> cols = Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("gss_authenticated", DataType.BOOLEAN),
+                col("principal", DataType.TEXT),
+                col("encrypted", DataType.BOOLEAN),
+                col("credentials_delegated", DataType.BOOLEAN)
+        );
+        Table table = new Table("pg_stat_gssapi", cols);
+        // One row for the current backend (no GSS auth in memgres)
+        table.insertRow(new Object[]{ 1, false, null, false, false });
+        return table;
+    }
+
+    Table buildPgStatioUserTables() {
+        List<Column> cols = Cols.listOf(
+                col("relid", DataType.INTEGER),
+                col("schemaname", DataType.TEXT),
+                col("relname", DataType.TEXT),
+                col("heap_blks_read", DataType.BIGINT),
+                col("heap_blks_hit", DataType.BIGINT),
+                col("idx_blks_read", DataType.BIGINT),
+                col("idx_blks_hit", DataType.BIGINT),
+                col("toast_blks_read", DataType.BIGINT),
+                col("toast_blks_hit", DataType.BIGINT),
+                col("tidx_blks_read", DataType.BIGINT),
+                col("tidx_blks_hit", DataType.BIGINT)
+        );
+        return new Table("pg_statio_user_tables", cols); // empty, in-memory with no I/O stats
+    }
+
+    // ---------------------------------------------------------------
+    //  Timezone
+    // ---------------------------------------------------------------
+
+    Table buildPgTimezoneNames() {
+        List<Column> cols = Cols.listOf(
+                colNN("name", DataType.TEXT),
+                col("abbrev", DataType.TEXT),
+                col("utc_offset", DataType.INTERVAL),
+                col("is_dst", DataType.BOOLEAN)
+        );
+        Table table = new Table("pg_timezone_names", cols);
+        // Add common timezones
+        for (String tz : java.time.ZoneId.getAvailableZoneIds().stream().sorted().collect(Collectors.toList())) {
+            try {
+                java.time.ZoneId zid = java.time.ZoneId.of(tz);
+                java.time.ZoneOffset offset = java.time.ZonedDateTime.now(zid).getOffset();
+                boolean isDst = zid.getRules().isDaylightSavings(java.time.Instant.now());
+                String abbrev = java.time.ZonedDateTime.now(zid).getZone().getId();
+                table.insertRow(new Object[]{tz, abbrev, offset.toString(), isDst});
+            } catch (Exception ignored) {}
+        }
+        return table;
+    }
+
+    Table buildPgTimezoneAbbrevs() {
+        List<Column> cols = Cols.listOf(
+                colNN("abbrev", DataType.TEXT),
+                col("utc_offset", DataType.INTERVAL),
+                col("is_dst", DataType.BOOLEAN)
+        );
+        Table table = new Table("pg_timezone_abbrevs", cols);
+        // Common timezone abbreviations
+        table.insertRow(new Object[]{"UTC", "00:00:00", false});
+        table.insertRow(new Object[]{"GMT", "00:00:00", false});
+        table.insertRow(new Object[]{"EST", "-05:00:00", false});
+        table.insertRow(new Object[]{"EDT", "-04:00:00", true});
+        table.insertRow(new Object[]{"CST", "-06:00:00", false});
+        table.insertRow(new Object[]{"CDT", "-05:00:00", true});
+        table.insertRow(new Object[]{"MST", "-07:00:00", false});
+        table.insertRow(new Object[]{"MDT", "-06:00:00", true});
+        table.insertRow(new Object[]{"PST", "-08:00:00", false});
+        table.insertRow(new Object[]{"PDT", "-07:00:00", true});
+        table.insertRow(new Object[]{"CET", "01:00:00", false});
+        table.insertRow(new Object[]{"CEST", "02:00:00", true});
+        table.insertRow(new Object[]{"EET", "02:00:00", false});
+        table.insertRow(new Object[]{"EEST", "03:00:00", true});
+        table.insertRow(new Object[]{"JST", "09:00:00", false});
+        table.insertRow(new Object[]{"IST", "05:30:00", false});
+        table.insertRow(new Object[]{"AEST", "10:00:00", false});
+        table.insertRow(new Object[]{"AEDT", "11:00:00", true});
+        // Additional abbreviations to match PG18
+        table.insertRow(new Object[]{"HST", "-10:00:00", false});
+        table.insertRow(new Object[]{"AKST", "-09:00:00", false});
+        table.insertRow(new Object[]{"AKDT", "-08:00:00", true});
+        table.insertRow(new Object[]{"AST", "-04:00:00", false});
+        table.insertRow(new Object[]{"ADT", "-03:00:00", true});
+        table.insertRow(new Object[]{"NST", "-03:30:00", false});
+        table.insertRow(new Object[]{"NDT", "-02:30:00", true});
+        table.insertRow(new Object[]{"WET", "00:00:00", false});
+        table.insertRow(new Object[]{"WEST", "01:00:00", true});
+        table.insertRow(new Object[]{"MET", "01:00:00", false});
+        table.insertRow(new Object[]{"MEST", "02:00:00", true});
+        table.insertRow(new Object[]{"BST", "01:00:00", true});
+        table.insertRow(new Object[]{"SST", "-11:00:00", false});
+        table.insertRow(new Object[]{"ChST", "10:00:00", false});
+        table.insertRow(new Object[]{"NZST", "12:00:00", false});
+        table.insertRow(new Object[]{"NZDT", "13:00:00", true});
+        table.insertRow(new Object[]{"AWST", "08:00:00", false});
+        table.insertRow(new Object[]{"ACST", "09:30:00", false});
+        table.insertRow(new Object[]{"ACDT", "10:30:00", true});
+        table.insertRow(new Object[]{"HKT", "08:00:00", false});
+        table.insertRow(new Object[]{"SGT", "08:00:00", false});
+        table.insertRow(new Object[]{"KST", "09:00:00", false});
+        table.insertRow(new Object[]{"ICT", "07:00:00", false});
+        table.insertRow(new Object[]{"WIB", "07:00:00", false});
+        table.insertRow(new Object[]{"WITA", "08:00:00", false});
+        table.insertRow(new Object[]{"WIT", "09:00:00", false});
+        table.insertRow(new Object[]{"PHT", "08:00:00", false});
+        table.insertRow(new Object[]{"THA", "07:00:00", false});
+        table.insertRow(new Object[]{"MSK", "03:00:00", false});
+        table.insertRow(new Object[]{"SAST", "02:00:00", false});
+        table.insertRow(new Object[]{"EAT", "03:00:00", false});
+        table.insertRow(new Object[]{"WAT", "01:00:00", false});
+        table.insertRow(new Object[]{"CAT", "02:00:00", false});
+        table.insertRow(new Object[]{"PKT", "05:00:00", false});
+        table.insertRow(new Object[]{"NPT", "05:45:00", false});
+        table.insertRow(new Object[]{"BDT", "06:00:00", false});
+        table.insertRow(new Object[]{"MMT", "06:30:00", false});
+        table.insertRow(new Object[]{"CST6CDT", "-06:00:00", false});
+        table.insertRow(new Object[]{"EST5EDT", "-05:00:00", false});
+        table.insertRow(new Object[]{"MST7MDT", "-07:00:00", false});
+        table.insertRow(new Object[]{"PST8PDT", "-08:00:00", false});
+        table.insertRow(new Object[]{"ART", "-03:00:00", false});
+        table.insertRow(new Object[]{"BRT", "-03:00:00", false});
+        table.insertRow(new Object[]{"CLT", "-04:00:00", false});
+        table.insertRow(new Object[]{"COT", "-05:00:00", false});
+        table.insertRow(new Object[]{"ECT", "-05:00:00", false});
+        table.insertRow(new Object[]{"PET", "-05:00:00", false});
+        table.insertRow(new Object[]{"VET", "-04:00:00", false});
+        table.insertRow(new Object[]{"GFT", "-03:00:00", false});
+        table.insertRow(new Object[]{"UYT", "-03:00:00", false});
+        table.insertRow(new Object[]{"PYT", "-04:00:00", false});
+        table.insertRow(new Object[]{"BOT", "-04:00:00", false});
+        table.insertRow(new Object[]{"GST", "04:00:00", false});
+        table.insertRow(new Object[]{"GET", "04:00:00", false});
+        table.insertRow(new Object[]{"AZT", "04:00:00", false});
+        table.insertRow(new Object[]{"AMT", "04:00:00", false});
+        table.insertRow(new Object[]{"HOVT", "07:00:00", false});
+        table.insertRow(new Object[]{"UZT", "05:00:00", false});
+        table.insertRow(new Object[]{"TJT", "05:00:00", false});
+        table.insertRow(new Object[]{"TMT", "05:00:00", false});
+        table.insertRow(new Object[]{"KGT", "06:00:00", false});
+        table.insertRow(new Object[]{"ALMT", "06:00:00", false});
+        table.insertRow(new Object[]{"YEKT", "05:00:00", false});
+        table.insertRow(new Object[]{"NOVT", "07:00:00", false});
+        table.insertRow(new Object[]{"KRAT", "07:00:00", false});
+        table.insertRow(new Object[]{"IRKT", "08:00:00", false});
+        table.insertRow(new Object[]{"YAKT", "09:00:00", false});
+        table.insertRow(new Object[]{"VLAT", "10:00:00", false});
+        table.insertRow(new Object[]{"MAGT", "11:00:00", false});
+        table.insertRow(new Object[]{"PETT", "12:00:00", false});
+        table.insertRow(new Object[]{"FJT", "12:00:00", false});
+        table.insertRow(new Object[]{"TVT", "12:00:00", false});
+        table.insertRow(new Object[]{"TOT", "13:00:00", false});
+        table.insertRow(new Object[]{"CHAST", "12:45:00", false});
+        table.insertRow(new Object[]{"FJST", "13:00:00", true});
+        return table;
+    }
+
+    // ---------------------------------------------------------------
+    //  Text search
+    // ---------------------------------------------------------------
+
+    Table buildPgTsParser() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("prsname", DataType.TEXT),
+                colNN("prsnamespace", DataType.INTEGER),
+                col("prsstart", DataType.INTEGER),
+                col("prstoken", DataType.INTEGER),
+                col("prsend", DataType.INTEGER),
+                col("prsheadline", DataType.INTEGER),
+                col("prslextype", DataType.INTEGER)
+        );
+        Table table = new Table("pg_ts_parser", cols);
+        // default parser
+        table.insertRow(new Object[]{3722, "default", oids.oid("ns:pg_catalog"), 0, 0, 0, 0, 0});
+        return table;
+    }
+
+    Table buildPgTsDict() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("dictname", DataType.TEXT),
+                colNN("dictnamespace", DataType.INTEGER),
+                col("dictowner", DataType.INTEGER),
+                col("dicttemplate", DataType.INTEGER),
+                col("dictinitoption", DataType.TEXT)
+        );
+        Table table = new Table("pg_ts_dict", cols);
+        int pgCatNs = oids.oid("ns:pg_catalog");
+        table.insertRow(new Object[]{3765, "simple", pgCatNs, 10, 3727, null});
+        table.insertRow(new Object[]{12676, "english_stem", pgCatNs, 10, 3726, "language = 'english'"});
+        return table;
+    }
+
+    Table buildPgTsTemplate() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("tmplname", DataType.TEXT),
+                colNN("tmplnamespace", DataType.INTEGER),
+                col("tmplinit", DataType.INTEGER),
+                col("tmpllexize", DataType.INTEGER)
+        );
+        Table table = new Table("pg_ts_template", cols);
+        int pgCatNs = oids.oid("ns:pg_catalog");
+        table.insertRow(new Object[]{3727, "simple", pgCatNs, 0, 0});
+        table.insertRow(new Object[]{3726, "snowball", pgCatNs, 0, 0});
+        return table;
+    }
+
+    Table buildPgTsConfig() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("cfgname", DataType.TEXT),
+                colNN("cfgnamespace", DataType.INTEGER),
+                col("cfgowner", DataType.INTEGER),
+                col("cfgparser", DataType.INTEGER)
+        );
+        Table table = new Table("pg_ts_config", cols);
+        int pgCatNs = oids.oid("ns:pg_catalog");
+        table.insertRow(new Object[]{3748, "simple", pgCatNs, 10, 3722});
+        table.insertRow(new Object[]{3764, "english", pgCatNs, 10, 3722});
+        return table;
+    }
+
+    Table buildPgTsConfigMap() {
+        List<Column> cols = Cols.listOf(
+                colNN("mapcfg", DataType.INTEGER),
+                colNN("maptokentype", DataType.INTEGER),
+                colNN("mapseqno", DataType.INTEGER),
+                colNN("mapdict", DataType.INTEGER)
+        );
+        return new Table("pg_ts_config_map", cols);
+    }
+
+    // ---------------------------------------------------------------
+    //  Infrastructure stubs
+    // ---------------------------------------------------------------
+
+    Table buildPgAm() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("amname", DataType.TEXT),
+                colNN("amtype", DataType.CHAR),
+                col("amhandler", DataType.INTEGER),
+                col("xmin", DataType.INTEGER)
+        );
+        Table table = new Table("pg_am", cols);
+        table.insertRow(new Object[]{2, "heap", "t", oids.oid("proc:heap_tableam_handler"), 1});
+        table.insertRow(new Object[]{403, "btree", "i", oids.oid("proc:bthandler"), 1});
+        table.insertRow(new Object[]{405, "hash", "i", oids.oid("proc:hashhandler"), 1});
+        table.insertRow(new Object[]{783, "gist", "i", oids.oid("proc:gisthandler"), 1});
+        table.insertRow(new Object[]{2742, "gin", "i", oids.oid("proc:ginhandler"), 1});
+        table.insertRow(new Object[]{4000, "spgist", "i", oids.oid("proc:spghandler"), 1});
+        table.insertRow(new Object[]{3580, "brin", "i", oids.oid("proc:brinhandler"), 1});
+        return table;
+    }
+
+    Table buildPgTablespace() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("spcname", DataType.TEXT),
+                colNN("spcowner", DataType.INTEGER),
+                col("spcacl", DataType.ACLITEM_ARRAY),
+                col("spcoptions", DataType.TEXT),
+                col("xmin", DataType.INTEGER)
+        );
+        Table table = new Table("pg_tablespace", cols);
+        table.insertRow(new Object[]{ oids.oid("tablespace:pg_default"), "pg_default", 10, null, null, 1 });
+        table.insertRow(new Object[]{ oids.oid("tablespace:pg_global"), "pg_global", 10, null, null, 1 });
+        return table;
+    }
+
+    Table buildPgShdescription() {
+        List<Column> cols = Cols.listOf(
+                colNN("objoid", DataType.INTEGER),
+                colNN("classoid", DataType.INTEGER),
+                col("description", DataType.TEXT)
+        );
+        return new Table("pg_shdescription", cols); // empty, no shared descriptions
+    }
+
+    Table buildPgConversion() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("conname", DataType.TEXT),
+                colNN("connamespace", DataType.INTEGER),
+                col("conowner", DataType.INTEGER),
+                col("conforencoding", DataType.INTEGER),
+                col("contoencoding", DataType.INTEGER),
+                col("conproc", DataType.INTEGER),
+                col("condefault", DataType.BOOLEAN)
+        );
+        return new Table("pg_conversion", cols);
+    }
+
+    Table buildPgLargeobjectMetadata() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                col("lomowner", DataType.INTEGER),
+                col("lomacl", DataType.ACLITEM_ARRAY)
+        );
+        return new Table("pg_largeobject_metadata", cols);
+    }
+
+    Table buildPgShdepend() {
+        List<Column> cols = Cols.listOf(
+                colNN("dbid", DataType.INTEGER),
+                colNN("classid", DataType.INTEGER),
+                colNN("objid", DataType.INTEGER),
+                colNN("objsubid", DataType.INTEGER),
+                colNN("refclassid", DataType.INTEGER),
+                colNN("refobjid", DataType.INTEGER),
+                colNN("deptype", DataType.CHAR)
+        );
+        return new Table("pg_shdepend", cols);
+    }
+
+    Table buildPgSeclabel(String name) {
+        List<Column> cols = Cols.listOf(
+                colNN("objoid", DataType.INTEGER),
+                colNN("classoid", DataType.INTEGER),
+                colNN("objsubid", DataType.INTEGER),
+                col("provider", DataType.TEXT),
+                col("label", DataType.TEXT)
+        );
+        return new Table(name, cols);
+    }
+
+    Table buildPgTransform() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("trftype", DataType.INTEGER),
+                colNN("trflang", DataType.INTEGER),
+                col("trffromsql", DataType.INTEGER),
+                col("trftosql", DataType.INTEGER)
+        );
+        return new Table("pg_transform", cols);
+    }
+
+    Table buildPgStatisticExt() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("stxrelid", DataType.INTEGER),
+                colNN("stxname", DataType.TEXT),
+                colNN("stxnamespace", DataType.INTEGER),
+                col("stxowner", DataType.INTEGER),
+                col("stxkeys", DataType.TEXT),
+                col("stxkind", DataType.TEXT),
+                col("stxstattarget", DataType.INTEGER)
+        );
+        return new Table("pg_statistic_ext", cols);
+    }
+
+    Table buildPgPublicationRel() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("prpubid", DataType.INTEGER),
+                colNN("prrelid", DataType.INTEGER),
+                col("prqual", DataType.TEXT),
+                col("prattrs", DataType.TEXT)
+        );
+        return new Table("pg_publication_rel", cols);
+    }
+
+    Table buildPgPublicationNamespace() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                colNN("pnpubid", DataType.INTEGER),
+                colNN("pnnspid", DataType.INTEGER)
+        );
+        return new Table("pg_publication_namespace", cols);
+    }
+
+    Table buildPgSubscriptionRel() {
+        List<Column> cols = Cols.listOf(
+                colNN("srsubid", DataType.INTEGER),
+                colNN("srrelid", DataType.INTEGER),
+                col("srsubstate", DataType.CHAR),
+                col("srsublsn", DataType.TEXT)
+        );
+        return new Table("pg_subscription_rel", cols);
+    }
+
+    Table buildPgPartitionedTable() {
+        List<Column> cols = Cols.listOf(
+                colNN("partrelid", DataType.INTEGER),
+                colNN("partstrat", DataType.CHAR),
+                colNN("partnatts", DataType.SMALLINT),
+                col("partdefid", DataType.INTEGER),
+                col("partattrs", DataType.TEXT),
+                col("partclass", DataType.TEXT),
+                col("partcollation", DataType.TEXT),
+                col("partexprs", DataType.TEXT)
+        );
+        return new Table("pg_partitioned_table", cols);
+    }
+
+    Table buildPgInherits() {
+        List<Column> cols = Cols.listOf(
+                colNN("inhrelid", DataType.INTEGER),
+                colNN("inhparent", DataType.INTEGER),
+                colNN("inhseqno", DataType.INTEGER),
+                col("inhdetachpending", DataType.BOOLEAN)
+        );
+        // Empty; no inheritance tracking yet, but columns must exist for JOINs
+        return new Table("pg_inherits", cols);
+    }
+
+    Table buildPgEventTrigger() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER), colNN("evtname", DataType.TEXT),
+                col("evtevent", DataType.TEXT), col("evtowner", DataType.INTEGER),
+                col("evtfoid", DataType.INTEGER), col("evtenabled", DataType.CHAR),
+                col("evttags", DataType.TEXT), col("xmin", DataType.INTEGER));
+        return new Table("pg_event_trigger", cols);
+    }
+
+    Table buildPgForeignDataWrapper() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER), colNN("fdwname", DataType.TEXT),
+                col("fdwowner", DataType.INTEGER), col("fdwhandler", DataType.INTEGER),
+                col("fdwvalidator", DataType.INTEGER), col("fdwacl", DataType.ACLITEM_ARRAY),
+                col("fdwoptions", DataType.TEXT), col("xmin", DataType.INTEGER));
+        return new Table("pg_foreign_data_wrapper", cols);
+    }
+
+    Table buildPgForeignServer() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER), colNN("srvname", DataType.TEXT),
+                col("srvowner", DataType.INTEGER), col("srvfdw", DataType.INTEGER),
+                col("srvtype", DataType.TEXT), col("srvversion", DataType.TEXT),
+                col("srvoptions", DataType.TEXT), col("srvacl", DataType.ACLITEM_ARRAY),
+                col("xmin", DataType.INTEGER));
+        return new Table("pg_foreign_server", cols);
+    }
+
+    Table buildPgUserMapping() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER), col("umuser", DataType.INTEGER),
+                col("umserver", DataType.INTEGER), col("umoptions", DataType.TEXT),
+                col("xmin", DataType.INTEGER));
+        return new Table("pg_user_mapping", cols);
+    }
+
+    Table buildPgForeignTable() {
+        List<Column> cols = Cols.listOf(
+                colNN("ftrelid", DataType.INTEGER), col("ftserver", DataType.INTEGER),
+                col("ftoptions", DataType.TEXT), col("xmin", DataType.INTEGER));
+        return new Table("pg_foreign_table", cols);
+    }
+
+    /** pg_seclabels: security labels view. Empty but needs correct columns for catalog queries. */
+    Table buildPgSeclabels() {
+        List<Column> cols = Cols.listOf(
+                colNN("objoid", DataType.INTEGER),
+                colNN("classoid", DataType.INTEGER),
+                colNN("objsubid", DataType.INTEGER),
+                col("objtype", DataType.TEXT),
+                col("objnamespace", DataType.INTEGER),
+                col("objname", DataType.TEXT),
+                col("provider", DataType.TEXT),
+                col("label", DataType.TEXT)
+        );
+        return new Table("pg_seclabels", cols);
+    }
+
+    Table buildPgInitPrivs() {
+        List<Column> cols = Cols.listOf(
+                colNN("objoid", DataType.INTEGER),
+                colNN("classoid", DataType.INTEGER),
+                colNN("objsubid", DataType.INTEGER),
+                col("privtype", DataType.CHAR),
+                col("initprivs", DataType.ACLITEM_ARRAY)
+        );
+        return new Table("pg_init_privs", cols); // empty, no initial privileges to track
+    }
+
+    Table buildPgPreparedXacts() {
+        List<Column> cols = Cols.listOf(
+                col("transaction", DataType.INTEGER),
+                col("gid", DataType.TEXT),
+                col("prepared", DataType.TIMESTAMPTZ),
+                col("owner", DataType.TEXT),
+                col("database", DataType.TEXT)
+        );
+        return new Table("pg_prepared_xacts", cols); // empty, no 2PC support
+    }
+
+    Table buildPgCursors() {
+        List<Column> cols = Cols.listOf(
+                col("name", DataType.TEXT),
+                col("statement", DataType.TEXT),
+                col("is_holdable", DataType.BOOLEAN),
+                col("is_binary", DataType.BOOLEAN),
+                col("is_scrollable", DataType.BOOLEAN),
+                col("creation_time", DataType.TIMESTAMPTZ)
+        );
+        return new Table("pg_cursors", cols); // empty, no real cursor tracking
+    }
+
+    Table buildPgPreparedStatements() {
+        List<Column> cols = Cols.listOf(
+                col("name", DataType.TEXT),
+                col("statement", DataType.TEXT),
+                col("prepare_time", DataType.TIMESTAMPTZ),
+                col("parameter_types", DataType.TEXT),
+                col("from_sql", DataType.BOOLEAN)
+        );
+        return new Table("pg_prepared_statements", cols); // empty
+    }
+
+    Table buildPgAvailableExtensions() {
+        List<Column> cols = Cols.listOf(
+                col("name", DataType.TEXT),
+                col("default_version", DataType.TEXT),
+                col("installed_version", DataType.TEXT),
+                col("trusted", DataType.BOOLEAN),
+                col("comment", DataType.TEXT)
+        );
+        Table table = new Table("pg_available_extensions", cols);
+        table.insertRow(new Object[]{"plpgsql", "1.0", "1.0", true, "PL/pgSQL procedural language"});
+        return table;
+    }
+
+    Table buildPgAvailableExtensionVersions() {
+        List<Column> cols = Cols.listOf(
+                col("name", DataType.TEXT),
+                col("version", DataType.TEXT),
+                col("installed", DataType.BOOLEAN),
+                col("superuser", DataType.BOOLEAN),
+                col("trusted", DataType.BOOLEAN),
+                col("relocatable", DataType.BOOLEAN),
+                col("schema", DataType.TEXT),
+                col("requires", DataType.TEXT),
+                col("comment", DataType.TEXT)
+        );
+        Table table = new Table("pg_available_extension_versions", cols);
+        table.insertRow(new Object[]{"plpgsql", "1.0", true, false, true, false, "pg_catalog", null, "PL/pgSQL procedural language"});
+        return table;
+    }
+
+    Table buildPgConfig() {
+        List<Column> cols = Cols.listOf(
+                col("name", DataType.TEXT),
+                col("setting", DataType.TEXT)
+        );
+        return new Table("pg_config", cols); // empty, no real config paths
+    }
+
+    Table buildPgFileSettings() {
+        List<Column> cols = Cols.listOf(
+                col("sourcefile", DataType.TEXT),
+                col("sourceline", DataType.INTEGER),
+                col("seqno", DataType.INTEGER),
+                col("name", DataType.TEXT),
+                col("setting", DataType.TEXT),
+                col("applied", DataType.BOOLEAN),
+                col("error", DataType.TEXT)
+        );
+        return new Table("pg_file_settings", cols); // empty, no file-based config
+    }
+
+    Table buildPgHbaFileRules() {
+        List<Column> cols = Cols.listOf(
+                col("rule_number", DataType.INTEGER),
+                col("file_name", DataType.TEXT),
+                col("line_number", DataType.INTEGER),
+                col("type", DataType.TEXT),
+                col("database", DataType.TEXT),
+                col("user_name", DataType.TEXT),
+                col("address", DataType.TEXT),
+                col("netmask", DataType.TEXT),
+                col("auth_method", DataType.TEXT),
+                col("options", DataType.TEXT),
+                col("error", DataType.TEXT)
+        );
+        Table table = new Table("pg_hba_file_rules", cols);
+        table.insertRow(new Object[]{1, null, 1, "host", "all", "all", "0.0.0.0/0", null, "trust", null, null});
+        return table;
+    }
+
+    Table buildPgShmemAllocations() {
+        List<Column> cols = Cols.listOf(
+                col("name", DataType.TEXT),
+                col("off", DataType.BIGINT),
+                col("size", DataType.BIGINT),
+                col("allocated_size", DataType.BIGINT)
+        );
+        return new Table("pg_shmem_allocations", cols); // empty, no shared memory
+    }
+
+    Table buildPgPublication() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                col("pubname", DataType.TEXT),
+                col("pubowner", DataType.INTEGER),
+                col("puballtables", DataType.BOOLEAN),
+                col("pubinsert", DataType.BOOLEAN),
+                col("pubupdate", DataType.BOOLEAN),
+                col("pubdelete", DataType.BOOLEAN),
+                col("pubtruncate", DataType.BOOLEAN),
+                col("pubviaroot", DataType.BOOLEAN),
+                col("pubgencols", DataType.TEXT)
+        );
+        return new Table("pg_publication", cols); // empty, no logical replication
+    }
+
+    Table buildPgSubscription() {
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.INTEGER),
+                col("subdbid", DataType.INTEGER),
+                col("subname", DataType.TEXT),
+                col("subowner", DataType.INTEGER),
+                col("subenabled", DataType.BOOLEAN),
+                col("subconninfo", DataType.TEXT),
+                col("subslotname", DataType.TEXT),
+                col("subsynccommit", DataType.TEXT),
+                col("subpublications", DataType.TEXT),
+                col("subtwophasestate", DataType.CHAR),
+                col("subdisableonerr", DataType.BOOLEAN),
+                col("subpasswordrequired", DataType.BOOLEAN),
+                col("subrunasowner", DataType.BOOLEAN),
+                col("subfailover", DataType.BOOLEAN)
+        );
+        return new Table("pg_subscription", cols); // empty
+    }
+
+    Table buildPgMatviews() {
+        List<Column> cols = Cols.listOf(
+                col("schemaname", DataType.TEXT),
+                col("matviewname", DataType.TEXT),
+                col("matviewowner", DataType.TEXT),
+                col("tablespace", DataType.TEXT),
+                col("hasindexes", DataType.BOOLEAN),
+                col("ispopulated", DataType.BOOLEAN),
+                col("definition", DataType.TEXT)
+        );
+        return new Table("pg_matviews", cols); // empty, no materialized views
+    }
+
+    Table buildPgRulesView() {
+        List<Column> cols = Cols.listOf(
+                col("schemaname", DataType.TEXT),
+                col("tablename", DataType.TEXT),
+                col("rulename", DataType.TEXT),
+                col("definition", DataType.TEXT)
+        );
+        return new Table("pg_rules", cols); // empty, no custom rules
+    }
+}

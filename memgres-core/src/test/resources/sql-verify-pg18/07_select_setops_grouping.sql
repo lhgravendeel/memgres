@@ -1,0 +1,42 @@
+\echo '=== 07_select_setops_grouping.sql ==='
+\set VERBOSITY verbose
+\set SHOW_CONTEXT never
+\set ON_ERROR_STOP off
+SET search_path = pg_catalog, public;
+DROP SCHEMA IF EXISTS compat CASCADE;
+CREATE SCHEMA compat;
+SET search_path = compat, pg_catalog;
+
+CREATE TABLE s1(a int, b text, c int);
+CREATE TABLE s2(a int, b text, c int);
+INSERT INTO s1 VALUES (1, 'x', 10), (2, 'y', 20), (2, 'y', 30), (NULL, 'z', NULL);
+INSERT INTO s2 VALUES (2, 'y', 20), (3, 'w', 40), (NULL, 'z', NULL);
+
+SELECT a, b, c FROM s1 ORDER BY a NULLS LAST, b, c NULLS LAST;
+SELECT DISTINCT a, b FROM s1 ORDER BY a NULLS LAST, b;
+SELECT a, b FROM s1 ORDER BY 2, 1 NULLS LAST;
+SELECT a, sum(c) AS s, count(*) AS n FROM s1 GROUP BY a ORDER BY a NULLS LAST;
+SELECT b, avg(c) AS avg_c FROM s1 GROUP BY b HAVING avg(c) >= 15 ORDER BY b;
+SELECT a FROM s1 UNION SELECT a FROM s2 ORDER BY 1 NULLS LAST;
+SELECT a FROM s1 UNION ALL SELECT a FROM s2 ORDER BY 1 NULLS LAST;
+SELECT a FROM s1 INTERSECT SELECT a FROM s2 ORDER BY 1 NULLS LAST;
+SELECT a FROM s1 EXCEPT SELECT a FROM s2 ORDER BY 1 NULLS LAST;
+SELECT a, b, c, row_number() OVER (PARTITION BY b ORDER BY c NULLS LAST) AS rn FROM s1 ORDER BY b, rn;
+
+-- select and grouping errors
+SELECT no_such_col FROM s1;
+SELECT a, sum(c) FROM s1;
+SELECT a, b, sum(c) FROM s1 GROUP BY a;
+SELECT a FROM s1 GROUP BY sum(c);
+SELECT sum(c) FROM s1 WHERE sum(c) > 0;
+SELECT a FROM s1 ORDER BY no_such_col;
+SELECT DISTINCT a FROM s1 ORDER BY b;
+SELECT * FROM s1 UNION SELECT a FROM s2;
+SELECT a FROM s1 UNION SELECT b FROM s2;
+SELECT a, (SELECT c FROM s2) FROM s1;
+SELECT 1 WHERE 1 = (SELECT a FROM s1);
+SELECT * FROM s1 FETCH FIRST -1 ROWS ONLY;
+SELECT * FROM s1 LIMIT 'x';
+SELECT * FROM s1 OFFSET -1;
+
+DROP SCHEMA compat CASCADE;

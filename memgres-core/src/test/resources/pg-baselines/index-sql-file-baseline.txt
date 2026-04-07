@@ -1,0 +1,217 @@
+=== GROUP: 1600 ===
+--- SQL: CREATE TABLE t_basic (id int, val int, extra text)
+OK: 0 rows affected
+--- SQL: INSERT INTO t_basic VALUES (1,10,'a'),(2,10,'b'),(3,NULL,'c')
+OK: 3 rows affected
+--- SQL: CREATE UNIQUE INDEX idx_basic_unique ON t_basic(id)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_basic_val ON t_basic(val)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_basic_include ON t_basic(val) INCLUDE (extra)
+OK: 0 rows affected
+--- SQL: SELECT COUNT(*) FROM t_basic
+COLUMNS: count
+ROW: 3
+=== GROUP: 1610 ===
+--- SQL: CREATE TABLE users (id int, email text, deleted_at timestamp)
+OK: 0 rows affected
+--- SQL: CREATE UNIQUE INDEX idx_users_email_active ON users(lower(email)) WHERE deleted_at IS NULL
+OK: 0 rows affected
+--- SQL: INSERT INTO users VALUES (1,'a@test.com',NULL),(2,'a@test.com','2024-01-01')
+OK: 2 rows affected
+--- SQL: SELECT COUNT(*) FROM users
+COLUMNS: count
+ROW: 2
+=== GROUP: 1620 ===
+--- SQL: CREATE TABLE expr_test (email text, payload jsonb)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_lower_email ON expr_test(lower(email))
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_json_sku ON expr_test((payload->>'sku'))
+OK: 0 rows affected
+--- SQL: INSERT INTO expr_test VALUES ('Alice@test.com','{"sku":"A1"}'),('alice@test.com','{"sku":"A2"}')
+OK: 2 rows affected
+--- SQL: SELECT COUNT(*) FROM expr_test
+COLUMNS: count
+ROW: 2
+=== GROUP: 1630 ===
+--- SQL: CREATE TABLE bad_idx (id int, created_at timestamp)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_bad ON bad_idx((random()))
+ERROR: 42P17: ERROR: functions in index expression must be marked IMMUTABLE
+=== GROUP: 1640 ===
+--- SQL: CREATE TABLE num_test (val numeric, fval double precision)
+OK: 0 rows affected
+--- SQL: CREATE UNIQUE INDEX idx_num_unique ON num_test(val)
+OK: 0 rows affected
+--- SQL: INSERT INTO num_test VALUES (2.00, 1.0)
+OK: 1 rows affected
+--- SQL: INSERT INTO num_test VALUES (2.0, 2.0)
+ERROR: 23505: ERROR: duplicate key value violates unique constraint "idx_num_unique"
+--- SQL: INSERT INTO num_test VALUES (NULL, 'NaN')
+OK: 1 rows affected
+--- SQL: INSERT INTO num_test VALUES (NULL, 'Infinity')
+OK: 1 rows affected
+--- SQL: SELECT COUNT(*) FROM num_test
+COLUMNS: count
+ROW: 3
+=== GROUP: 1650 ===
+--- SQL: CREATE TABLE docs (id int, payload jsonb, tags text[], doc tsvector)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_json ON docs USING gin(payload)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_tags ON docs USING gin(tags)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_doc ON docs USING gin(doc)
+OK: 0 rows affected
+--- SQL: INSERT INTO docs VALUES (1,'{"a":1}',ARRAY['x','y'],to_tsvector('hello world')),(2,'{"b":2}',ARRAY['y'],to_tsvector('world test'))
+OK: 2 rows affected
+--- SQL: SELECT id FROM docs WHERE payload @> '{"a":1}'
+COLUMNS: id
+ROW: 1
+=== GROUP: 1660 ===
+--- SQL: CREATE TABLE bookings (room int, period tsrange)
+OK: 0 rows affected
+--- SQL: CREATE EXTENSION IF NOT EXISTS btree_gist
+OK: 0 rows affected
+--- SQL: ALTER TABLE bookings ADD CONSTRAINT no_overlap EXCLUDE USING gist (room WITH =, period WITH &&)
+OK: 0 rows affected
+--- SQL: INSERT INTO bookings VALUES (1, tsrange('2024-01-01','2024-01-02'))
+OK: 1 rows affected
+--- SQL: INSERT INTO bookings VALUES (1, tsrange('2024-01-01 12:00','2024-01-03'))
+ERROR: 23P01: ERROR: conflicting key value violates exclusion constraint "no_overlap"
+=== GROUP: 1670 ===
+--- SQL: CREATE TABLE texts (t text)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_text_pattern ON texts(t text_pattern_ops)
+OK: 0 rows affected
+--- SQL: INSERT INTO texts VALUES ('abc'),('abcd'),('xyz')
+OK: 3 rows affected
+--- SQL: SELECT t FROM texts WHERE t LIKE 'abc%'
+COLUMNS: t
+ROW: abc
+ROW: abcd
+=== GROUP: 1680 ===
+--- SQL: CREATE TABLE introspect (id int)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_i ON introspect(id)
+OK: 0 rows affected
+--- SQL: SELECT indexname FROM pg_indexes WHERE tablename='introspect'
+COLUMNS: indexname
+ROW: idx_i
+=== GROUP: 1690 ===
+--- SQL: CREATE TABLE mix_idx (a int, b text, c numeric)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_mix ON mix_idx(a,b,c)
+OK: 0 rows affected
+--- SQL: INSERT INTO mix_idx VALUES (1,'x',1.0),(1,'x',1.00),(2,NULL,NULL)
+OK: 3 rows affected
+--- SQL: SELECT COUNT(*) FROM mix_idx
+COLUMNS: count
+ROW: 3
+=== GROUP: 1700 (MD: strategy/correctness) ===
+--- SQL: CREATE INDEX IF NOT EXISTS idx_mix ON mix_idx(a,b,c)
+OK: 0 rows affected
+--- SQL: DROP INDEX IF EXISTS nonexistent_index_xyz
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_mix ON mix_idx(a)
+ERROR: 42P07: ERROR: relation "idx_mix" already exists
+--- SQL: CREATE INDEX idx_bad_col ON mix_idx(nonexistent_col)
+ERROR: 42703: ERROR: column "nonexistent_col" does not exist
+--- SQL: CREATE INDEX idx_bad_tbl ON nonexistent_table(id)
+ERROR: 42P01: ERROR: relation "nonexistent_table" does not exist
+--- SQL: UPDATE t_basic SET id = 99 WHERE id = 4
+OK: 0 rows affected
+--- SQL: INSERT INTO t_basic VALUES (99, 1, 'dup')
+OK: 1 rows affected
+--- SQL: UPDATE t_basic SET id = 4 WHERE id = 99
+OK: 1 rows affected
+--- SQL: DELETE FROM t_basic WHERE id = 3
+OK: 1 rows affected
+--- SQL: INSERT INTO t_basic VALUES (3, 30, 'reinserted')
+OK: 1 rows affected
+--- SQL: INSERT INTO t_basic VALUES (3, 31, 'dup')
+ERROR: 23505: ERROR: duplicate key value violates unique constraint "idx_basic_unique"
+=== GROUP: 1710 (MD: capability matrix) ===
+--- SQL: CREATE TABLE idx_cap_btree (id int, val text)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_btree_default ON idx_cap_btree(id)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_btree_explicit ON idx_cap_btree USING btree(val)
+OK: 0 rows affected
+--- SQL: INSERT INTO idx_cap_btree VALUES (1,'a'),(2,'b'),(3,'c')
+OK: 3 rows affected
+--- SQL: SELECT COUNT(*) FROM idx_cap_btree WHERE id > 1
+COLUMNS: count
+ROW: 2
+--- SQL: CREATE TABLE idx_cap_hash (id int, name text)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_hash ON idx_cap_hash USING hash(name)
+OK: 0 rows affected
+--- SQL: INSERT INTO idx_cap_hash VALUES (1,'alice'),(2,'bob')
+OK: 2 rows affected
+--- SQL: SELECT id FROM idx_cap_hash WHERE name = 'alice'
+COLUMNS: id
+ROW: 1
+--- SQL: CREATE TABLE idx_cap_gin (id int, data jsonb)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_gin_data ON idx_cap_gin USING gin(data)
+OK: 0 rows affected
+--- SQL: INSERT INTO idx_cap_gin VALUES (1,'{"key":"val"}'),(2,'{"other":1}')
+OK: 2 rows affected
+--- SQL: SELECT id FROM idx_cap_gin WHERE data @> '{"key":"val"}'
+COLUMNS: id
+ROW: 1
+--- SQL: CREATE TABLE idx_cap_gist (id int, r tsrange)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_gist_r ON idx_cap_gist USING gist(r)
+OK: 0 rows affected
+--- SQL: INSERT INTO idx_cap_gist VALUES (1, tsrange('2024-01-01','2024-01-05'))
+OK: 1 rows affected
+--- SQL: INSERT INTO idx_cap_gist VALUES (2, tsrange('2024-02-01','2024-02-05'))
+OK: 1 rows affected
+--- SQL: SELECT id FROM idx_cap_gist WHERE r && tsrange('2024-01-03','2024-01-10') ORDER BY id
+COLUMNS: id
+ROW: 1
+--- SQL: CREATE TABLE idx_cap_brin (id int, ts timestamp)
+OK: 0 rows affected
+--- SQL: CREATE INDEX idx_brin_ts ON idx_cap_brin USING brin(ts)
+OK: 0 rows affected
+--- SQL: INSERT INTO idx_cap_brin VALUES (1, '2024-01-01'),(2, '2024-06-01')
+OK: 2 rows affected
+--- SQL: SELECT COUNT(*) FROM idx_cap_brin
+COLUMNS: count
+ROW: 2
+=== GROUP: 1720 (MD: concurrency/reindex) ===
+--- SQL: CREATE TABLE conc_test (id int, val text)
+OK: 0 rows affected
+--- SQL: INSERT INTO conc_test VALUES (1,'a'),(2,'b'),(3,'c')
+OK: 3 rows affected
+--- SQL: CREATE INDEX CONCURRENTLY idx_conc ON conc_test(id)
+OK: 0 rows affected
+--- SQL: SELECT COUNT(*) FROM conc_test WHERE id = 2
+COLUMNS: count
+ROW: 1
+--- SQL: CREATE UNIQUE INDEX CONCURRENTLY idx_conc_unique ON conc_test(val)
+OK: 0 rows affected
+--- SQL: INSERT INTO conc_test VALUES (4,'a')
+ERROR: 23505: ERROR: duplicate key value violates unique constraint "idx_conc_unique"
+--- SQL: CREATE TABLE reindex_test (id int PRIMARY KEY, val text)
+OK: 0 rows affected
+--- SQL: INSERT INTO reindex_test VALUES (1,'a'),(2,'b')
+OK: 2 rows affected
+--- SQL: REINDEX TABLE reindex_test
+OK: 0 rows affected
+--- SQL: SELECT COUNT(*) FROM reindex_test
+COLUMNS: count
+ROW: 2
+--- SQL: REINDEX INDEX reindex_test_pkey
+OK: 0 rows affected
+--- SQL: SELECT id FROM reindex_test WHERE id = 1
+COLUMNS: id
+ROW: 1
+--- SQL: DROP INDEX CONCURRENTLY idx_conc
+OK: 0 rows affected
+--- SQL: SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_conc'
+COLUMNS: count
+ROW: 0

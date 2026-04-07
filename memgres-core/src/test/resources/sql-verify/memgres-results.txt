@@ -1,0 +1,4422 @@
+=== FILE: 01_basic_ddl_dml.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 01: Basic DDL, DML, and SELECT -- ============================================================ -- === Table creation with various typ...
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: CREATE TABLE tags (id serial PRIMARY KEY, label text UNIQUE NOT NULL)
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE TABLE item_tags (item_id int REFERENCES items(id) ON DELETE CASCADE, tag_id int REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY(item_id, tag_id))
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: CREATE TABLE configs (key text PRIMARY KEY, value text, updated_at timestamptz DEFAULT now())
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: CREATE TABLE measurements (id bigserial PRIMARY KEY, sensor_id int NOT NULL, reading double precision, recorded_at timestamp NOT NULL DEFAULT now())
+OK: 0 rows affected
+--- STMT 6 ---
+SQL: CREATE TABLE blobs (id serial PRIMARY KEY, data bytea, mime text)
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: CREATE TABLE docs (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), title text NOT NULL, body text, metadata jsonb DEFAULT '{}')
+OK: 0 rows affected
+--- STMT 8 ---
+SQL: CREATE TABLE arrays_test (id serial PRIMARY KEY, int_arr int[], text_arr text[], nested int[][])
+OK: 0 rows affected
+--- STMT 9 ---
+SQL: -- === Basic INSERTs === INSERT INTO items (name, price) VALUES ('Widget', 9.99)
+OK: 1 rows affected
+--- STMT 10 ---
+SQL: INSERT INTO items (name, price) VALUES ('Gadget', 19.99)
+OK: 1 rows affected
+--- STMT 11 ---
+SQL: INSERT INTO items (name, price, active) VALUES ('Doohickey', 4.50, false)
+OK: 1 rows affected
+--- STMT 12 ---
+SQL: INSERT INTO items (name, price) VALUES ('Thingamajig', 149.99)
+OK: 1 rows affected
+--- STMT 13 ---
+SQL: INSERT INTO items (name, price) VALUES ('Whatchamacallit', 0.99)
+OK: 1 rows affected
+--- STMT 14 ---
+SQL: INSERT INTO tags (label) VALUES ('electronics')
+OK: 1 rows affected
+--- STMT 15 ---
+SQL: INSERT INTO tags (label) VALUES ('hardware')
+OK: 1 rows affected
+--- STMT 16 ---
+SQL: INSERT INTO tags (label) VALUES ('sale')
+OK: 1 rows affected
+--- STMT 17 ---
+SQL: INSERT INTO item_tags VALUES (1, 1)
+OK: 1 rows affected
+--- STMT 18 ---
+SQL: INSERT INTO item_tags VALUES (1, 2)
+OK: 1 rows affected
+--- STMT 19 ---
+SQL: INSERT INTO item_tags VALUES (2, 1)
+OK: 1 rows affected
+--- STMT 20 ---
+SQL: INSERT INTO item_tags VALUES (3, 3)
+OK: 1 rows affected
+--- STMT 21 ---
+SQL: INSERT INTO configs (key, value) VALUES ('theme', 'dark')
+OK: 1 rows affected
+--- STMT 22 ---
+SQL: INSERT INTO configs (key, value) VALUES ('lang', 'en')
+OK: 1 rows affected
+--- STMT 23 ---
+SQL: INSERT INTO configs (key, value) VALUES ('page_size', '25')
+OK: 1 rows affected
+--- STMT 24 ---
+SQL: INSERT INTO measurements (sensor_id, reading) VALUES (1, 23.5)
+OK: 1 rows affected
+--- STMT 25 ---
+SQL: INSERT INTO measurements (sensor_id, reading) VALUES (1, 24.1)
+OK: 1 rows affected
+--- STMT 26 ---
+SQL: INSERT INTO measurements (sensor_id, reading) VALUES (2, 18.7)
+OK: 1 rows affected
+--- STMT 27 ---
+SQL: INSERT INTO measurements (sensor_id, reading, recorded_at) VALUES (2, 19.3, '2024-06-15 10:30:00')
+OK: 1 rows affected
+--- STMT 28 ---
+SQL: INSERT INTO docs (title, body, metadata) VALUES ('First Doc', 'Hello world', '{"author": "alice", "tags": ["intro"]}')
+OK: 1 rows affected
+--- STMT 29 ---
+SQL: INSERT INTO docs (title, body) VALUES ('Second Doc', 'Goodbye world')
+OK: 1 rows affected
+--- STMT 30 ---
+SQL: INSERT INTO arrays_test (int_arr, text_arr) VALUES ('{1,2,3}', '{"a","b","c"}')
+OK: 1 rows affected
+--- STMT 31 ---
+SQL: INSERT INTO arrays_test (int_arr, text_arr) VALUES (ARRAY[4,5,6], ARRAY['d','e','f'])
+OK: 1 rows affected
+--- STMT 32 ---
+SQL: -- === INSERT with DEFAULT VALUES === INSERT INTO items (name, price) VALUES ('Default Item', 0) RETURNING id
+RESULT: 1 columns, 1 rows
+COLUMNS: id
+ROW: 6
+--- STMT 33 ---
+SQL: INSERT INTO docs DEFAULT VALUES
+ERROR [23502]: ERROR: null value in column "title" violates not-null constraint
+--- STMT 34 ---
+SQL: -- === INSERT with RETURNING === INSERT INTO items (name, price) VALUES ('Returned', 7.77) RETURNING id, name, price
+RESULT: 3 columns, 1 rows
+COLUMNS: id, name, price
+ROW: 7 | Returned | 7.77
+--- STMT 35 ---
+SQL: INSERT INTO configs (key, value) VALUES ('new_key', 'new_val') RETURNING *
+RESULT: 3 columns, 1 rows
+COLUMNS: key, value, updated_at
+ROW: new_key | new_val | 2026-04-02 16:51:10.747211+00
+--- STMT 36 ---
+SQL: -- === Basic SELECTs === SELECT * FROM items
+RESULT: 5 columns, 7 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 9.99 | t | 2026-04-02 18:51:10.671650
+ROW: 2 | Gadget | 19.99 | t | 2026-04-02 18:51:10.676410
+ROW: 3 | Doohickey | 4.50 | f | 2026-04-02 18:51:10.679411
+ROW: 4 | Thingamajig | 149.99 | t | 2026-04-02 18:51:10.679411
+ROW: 5 | Whatchamacallit | 0.99 | t | 2026-04-02 18:51:10.680410
+ROW: 6 | Default Item | 0.00 | t | 2026-04-02 18:51:10.711426
+ROW: 7 | Returned | 7.77 | t | 2026-04-02 18:51:10.746211
+--- STMT 37 ---
+SQL: SELECT id, name, price FROM items WHERE active = true
+RESULT: 3 columns, 6 rows
+COLUMNS: id, name, price
+ROW: 1 | Widget | 9.99
+ROW: 2 | Gadget | 19.99
+ROW: 4 | Thingamajig | 149.99
+ROW: 5 | Whatchamacallit | 0.99
+ROW: 6 | Default Item | 0.00
+ROW: 7 | Returned | 7.77
+--- STMT 38 ---
+SQL: SELECT name, price FROM items WHERE price > 10 ORDER BY price DESC
+RESULT: 2 columns, 2 rows
+COLUMNS: name, price
+ROW: Thingamajig | 149.99
+ROW: Gadget | 19.99
+--- STMT 39 ---
+SQL: SELECT name FROM items ORDER BY name ASC
+RESULT: 1 columns, 7 rows
+COLUMNS: name
+ROW: Default Item
+ROW: Doohickey
+ROW: Gadget
+ROW: Returned
+ROW: Thingamajig
+ROW: Whatchamacallit
+ROW: Widget
+--- STMT 40 ---
+SQL: SELECT * FROM items LIMIT 2
+RESULT: 5 columns, 2 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 9.99 | t | 2026-04-02 18:51:10.671650
+ROW: 2 | Gadget | 19.99 | t | 2026-04-02 18:51:10.676410
+--- STMT 41 ---
+SQL: SELECT * FROM items LIMIT 2 OFFSET 2
+RESULT: 5 columns, 2 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 3 | Doohickey | 4.50 | f | 2026-04-02 18:51:10.679411
+ROW: 4 | Thingamajig | 149.99 | t | 2026-04-02 18:51:10.679411
+--- STMT 42 ---
+SQL: SELECT * FROM items WHERE name LIKE '%get%'
+RESULT: 5 columns, 2 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 9.99 | t | 2026-04-02 18:51:10.671650
+ROW: 2 | Gadget | 19.99 | t | 2026-04-02 18:51:10.676410
+--- STMT 43 ---
+SQL: SELECT * FROM items WHERE name ILIKE '%WIDGET%'
+RESULT: 5 columns, 1 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 9.99 | t | 2026-04-02 18:51:10.671650
+--- STMT 44 ---
+SQL: SELECT * FROM items WHERE price BETWEEN 5 AND 50
+RESULT: 5 columns, 3 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 9.99 | t | 2026-04-02 18:51:10.671650
+ROW: 2 | Gadget | 19.99 | t | 2026-04-02 18:51:10.676410
+ROW: 7 | Returned | 7.77 | t | 2026-04-02 18:51:10.746211
+--- STMT 45 ---
+SQL: SELECT * FROM items WHERE id IN (1, 3, 5)
+RESULT: 5 columns, 3 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 9.99 | t | 2026-04-02 18:51:10.671650
+ROW: 3 | Doohickey | 4.50 | f | 2026-04-02 18:51:10.679411
+ROW: 5 | Whatchamacallit | 0.99 | t | 2026-04-02 18:51:10.680410
+--- STMT 46 ---
+SQL: SELECT * FROM items WHERE active IS TRUE
+RESULT: 5 columns, 6 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 9.99 | t | 2026-04-02 18:51:10.671650
+ROW: 2 | Gadget | 19.99 | t | 2026-04-02 18:51:10.676410
+ROW: 4 | Thingamajig | 149.99 | t | 2026-04-02 18:51:10.679411
+ROW: 5 | Whatchamacallit | 0.99 | t | 2026-04-02 18:51:10.680410
+ROW: 6 | Default Item | 0.00 | t | 2026-04-02 18:51:10.711426
+ROW: 7 | Returned | 7.77 | t | 2026-04-02 18:51:10.746211
+--- STMT 47 ---
+SQL: SELECT * FROM items WHERE active IS NOT FALSE
+RESULT: 5 columns, 6 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 9.99 | t | 2026-04-02 18:51:10.671650
+ROW: 2 | Gadget | 19.99 | t | 2026-04-02 18:51:10.676410
+ROW: 4 | Thingamajig | 149.99 | t | 2026-04-02 18:51:10.679411
+ROW: 5 | Whatchamacallit | 0.99 | t | 2026-04-02 18:51:10.680410
+ROW: 6 | Default Item | 0.00 | t | 2026-04-02 18:51:10.711426
+ROW: 7 | Returned | 7.77 | t | 2026-04-02 18:51:10.746211
+--- STMT 48 ---
+SQL: SELECT COUNT(*) FROM items
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 7
+--- STMT 49 ---
+SQL: SELECT COUNT(*) AS total, SUM(price) AS revenue FROM items WHERE active = true
+RESULT: 2 columns, 1 rows
+COLUMNS: total, revenue
+ROW: 6 | 188.73
+--- STMT 50 ---
+SQL: SELECT DISTINCT active FROM items
+RESULT: 1 columns, 2 rows
+COLUMNS: active
+ROW: t
+ROW: f
+--- STMT 51 ---
+SQL: SELECT active, COUNT(*) FROM items GROUP BY active
+RESULT: 2 columns, 2 rows
+COLUMNS: active, count
+ROW: t | 6
+ROW: f | 1
+--- STMT 52 ---
+SQL: SELECT active, COUNT(*) FROM items GROUP BY active HAVING COUNT(*) > 1
+RESULT: 2 columns, 1 rows
+COLUMNS: active, count
+ROW: t | 6
+--- STMT 53 ---
+SQL: -- === UPDATE === UPDATE items SET price = price * 1.1 WHERE active = true
+OK: 6 rows affected
+--- STMT 54 ---
+SQL: UPDATE items SET active = true WHERE id = 3 RETURNING *
+RESULT: 5 columns, 1 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 3 | Doohickey | 4.50 | t | 2026-04-02 18:51:10.679411
+--- STMT 55 ---
+SQL: UPDATE configs SET value = '50', updated_at = now() WHERE key = 'page_size' RETURNING key, value
+RESULT: 2 columns, 1 rows
+COLUMNS: key, value
+ROW: page_size | 50
+--- STMT 56 ---
+SQL: -- === DELETE === DELETE FROM item_tags WHERE item_id = 5
+OK: 0 rows affected
+--- STMT 57 ---
+SQL: DELETE FROM items WHERE id = 5 RETURNING name
+RESULT: 1 columns, 1 rows
+COLUMNS: name
+ROW: Whatchamacallit
+--- STMT 58 ---
+SQL: DELETE FROM configs WHERE key = 'new_key' RETURNING *
+RESULT: 3 columns, 1 rows
+COLUMNS: key, value, updated_at
+ROW: new_key | new_val | 2026-04-02 16:51:10.747211+00
+--- STMT 59 ---
+SQL: -- === Verify state === SELECT COUNT(*) FROM items
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 6
+--- STMT 60 ---
+SQL: SELECT * FROM items ORDER BY id
+RESULT: 5 columns, 6 rows
+COLUMNS: id, name, price, active, created_at
+ROW: 1 | Widget | 10.99 | t | 2026-04-02 18:51:10.671650
+ROW: 2 | Gadget | 21.99 | t | 2026-04-02 18:51:10.676410
+ROW: 3 | Doohickey | 4.50 | t | 2026-04-02 18:51:10.679411
+ROW: 4 | Thingamajig | 164.99 | t | 2026-04-02 18:51:10.679411
+ROW: 6 | Default Item | 0.00 | t | 2026-04-02 18:51:10.711426
+ROW: 7 | Returned | 8.55 | t | 2026-04-02 18:51:10.746211
+--- STMT 61 ---
+SQL: SELECT * FROM configs ORDER BY key
+RESULT: 3 columns, 3 rows
+COLUMNS: key, value, updated_at
+ROW: lang | en | 2026-04-02 16:51:10.690414+00
+ROW: page_size | 50 | 2026-04-02 16:51:10.825376+00
+ROW: theme | dark | 2026-04-02 16:51:10.688412+00
+--- STMT 62 ---
+SQL: -- === DROP === DROP TABLE IF EXISTS nonexistent_table
+OK: 0 rows affected
+--- STMT 63 ---
+SQL: CREATE TABLE temp_drop (id int)
+OK: 0 rows affected
+--- STMT 64 ---
+SQL: DROP TABLE temp_drop
+OK: 0 rows affected
+--- STMT 65 ---
+SQL: -- === CREATE TABLE IF NOT EXISTS === CREATE TABLE IF NOT EXISTS items (id serial PRIMARY KEY, name text)
+OK: 0 rows affected
+--- STMT 66 ---
+SQL: CREATE TABLE IF NOT EXISTS new_table (id serial PRIMARY KEY, val text)
+OK: 0 rows affected
+--- STMT 67 ---
+SQL: DROP TABLE new_table
+OK: 0 rows affected
+--- STMT 68 ---
+SQL: -- === TRUNCATE === CREATE TABLE trunc_test (id serial PRIMARY KEY, val text)
+OK: 0 rows affected
+--- STMT 69 ---
+SQL: INSERT INTO trunc_test (val) VALUES ('a'), ('b'), ('c')
+OK: 3 rows affected
+--- STMT 70 ---
+SQL: SELECT COUNT(*) FROM trunc_test
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 3
+--- STMT 71 ---
+SQL: TRUNCATE trunc_test
+OK: 0 rows affected
+--- STMT 72 ---
+SQL: SELECT COUNT(*) FROM trunc_test
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 0
+--- STMT 73 ---
+SQL: DROP TABLE trunc_test
+OK: 0 rows affected
+--- STMT 74 ---
+SQL: -- ============================================================ -- INVALID QUERIES -- ============================================================ -- Duplicate primary key INSERT INTO items (id, name,...
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "items_pkey"
+--- STMT 75 ---
+SQL: -- NOT NULL violation INSERT INTO items (name, price) VALUES (NULL, 0)
+ERROR [23502]: ERROR: null value in column "name" violates not-null constraint
+--- STMT 76 ---
+SQL: -- UNIQUE violation INSERT INTO tags (label) VALUES ('electronics')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "tags_label_key"
+--- STMT 77 ---
+SQL: -- FK violation INSERT INTO item_tags VALUES (999, 1)
+ERROR [23503]: ERROR: insert or update on table "item_tags" violates foreign key constraint "item_tags_item_id_fkey"
+--- STMT 78 ---
+SQL: INSERT INTO item_tags VALUES (1, 999)
+ERROR [23503]: ERROR: insert or update on table "item_tags" violates foreign key constraint "item_tags_tag_id_fkey"
+--- STMT 79 ---
+SQL: -- Table doesn't exist SELECT * FROM nonexistent_table
+ERROR [42P01]: ERROR: relation "nonexistent_table" does not exist
+--- STMT 80 ---
+SQL: INSERT INTO nonexistent_table VALUES (1)
+ERROR [42P01]: ERROR: relation "nonexistent_table" does not exist
+--- STMT 81 ---
+SQL: UPDATE nonexistent_table SET id = 1
+ERROR [42P01]: ERROR: relation "nonexistent_table" does not exist
+--- STMT 82 ---
+SQL: DELETE FROM nonexistent_table
+ERROR [42P01]: ERROR: relation "nonexistent_table" does not exist
+--- STMT 83 ---
+SQL: -- Column doesn't exist SELECT nonexistent_column FROM items
+ERROR [42703]: ERROR: column "nonexistent_column" does not exist
+--- STMT 84 ---
+SQL: INSERT INTO items (nonexistent_column) VALUES (1)
+ERROR [42703]: ERROR: Column not found: nonexistent_column
+--- STMT 85 ---
+SQL: UPDATE items SET nonexistent_column = 1
+ERROR [42703]: ERROR: Column not found: nonexistent_column
+--- STMT 86 ---
+SQL: -- Type mismatch INSERT INTO items (name, price) VALUES ('bad', 'not_a_number')
+ERROR [22P02]: ERROR: invalid input syntax for type numeric: "not_a_number"
+--- STMT 87 ---
+SQL: INSERT INTO measurements (sensor_id, reading) VALUES ('not_int', 1.0)
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "not_int"
+--- STMT 88 ---
+SQL: -- DROP without IF EXISTS DROP TABLE nonexistent_table
+ERROR [42P01]: ERROR: table "nonexistent_table" does not exist
+
+=== FILE: 02_syntax_errors.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 02: Syntax Errors and Malformed SQL -- ============================================================ -- Setup CREATE TABLE syn_test (i...
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: INSERT INTO syn_test (name, val) VALUES ('alpha', 10), ('beta', 20), ('gamma', 30)
+OK: 3 rows affected
+--- STMT 3 ---
+SQL: -- === Valid baseline queries (should all succeed) === SELECT 1
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 4 ---
+SQL: SELECT 1 AS one
+RESULT: 1 columns, 1 rows
+COLUMNS: one
+ROW: 1
+--- STMT 5 ---
+SQL: SELECT 1 + 2
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 3
+--- STMT 6 ---
+SQL: SELECT 'hello' || ' ' || 'world'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: hello world
+--- STMT 7 ---
+SQL: SELECT * FROM syn_test
+RESULT: 4 columns, 3 rows
+COLUMNS: id, name, val, active
+ROW: 1 | alpha | 10 | t
+ROW: 2 | beta | 20 | t
+ROW: 3 | gamma | 30 | t
+--- STMT 8 ---
+SQL: SELECT * FROM syn_test WHERE val > 15
+RESULT: 4 columns, 2 rows
+COLUMNS: id, name, val, active
+ROW: 2 | beta | 20 | t
+ROW: 3 | gamma | 30 | t
+--- STMT 9 ---
+SQL: SELECT name FROM syn_test ORDER BY val
+RESULT: 1 columns, 3 rows
+COLUMNS: name
+ROW: alpha
+ROW: beta
+ROW: gamma
+--- STMT 10 ---
+SQL: SELECT name FROM syn_test ORDER BY val DESC NULLS LAST
+RESULT: 1 columns, 3 rows
+COLUMNS: name
+ROW: gamma
+ROW: beta
+ROW: alpha
+--- STMT 11 ---
+SQL: -- === Misspelled keywords === SLECT * FROM syn_test
+ERROR [42601]: ERROR: Expected SQL statement at position 31 near 'slect'
+--- STMT 12 ---
+SQL: SELEC * FROM syn_test
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'selec'
+--- STMT 13 ---
+SQL: SELECT * FORM syn_test
+ERROR [42601]: ERROR: syntax error at or near "form" at position 9 near 'form'
+--- STMT 14 ---
+SQL: SELECT * FROM syn_test WHER val > 1
+ERROR [42601]: ERROR: syntax error at or near "val" at position 28 near 'val'
+--- STMT 15 ---
+SQL: SELECT * FROM syn_test WEHRE val > 1
+ERROR [42601]: ERROR: syntax error at or near "val" at position 29 near 'val'
+--- STMT 16 ---
+SQL: CREAT TABLE bad1 (id int)
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'creat'
+--- STMT 17 ---
+SQL: CRATE TABLE bad2 (id int)
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'crate'
+--- STMT 18 ---
+SQL: INSRT INTO syn_test (name) VALUES ('x')
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'insrt'
+--- STMT 19 ---
+SQL: INSER INTO syn_test (name) VALUES ('x')
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'inser'
+--- STMT 20 ---
+SQL: UPDAT syn_test SET val = 1
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'updat'
+--- STMT 21 ---
+SQL: DELET FROM syn_test
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'delet'
+--- STMT 22 ---
+SQL: DELTE FROM syn_test
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'delte'
+--- STMT 23 ---
+SQL: -- === Missing required clauses === SELECT * FROM
+ERROR [42601]: ERROR: Expected identifier at position 49 near ''
+--- STMT 24 ---
+SQL: SELECT * FROM syn_test WHERE
+ERROR [42601]: ERROR: Unexpected token in expression at position 28 near ''
+--- STMT 25 ---
+SQL: SELECT * FROM syn_test ORDER BY
+ERROR [42601]: ERROR: Unexpected token in expression at position 31 near ''
+--- STMT 26 ---
+SQL: SELECT * FROM syn_test GROUP BY
+ERROR [42601]: ERROR: Unexpected token in expression at position 31 near ''
+--- STMT 27 ---
+SQL: SELECT * FROM syn_test HAVING
+ERROR [42601]: ERROR: Unexpected token in expression at position 29 near ''
+--- STMT 28 ---
+SQL: SELECT FROM syn_test WHERE val > 1
+RESULT: 0 columns, 3 rows
+COLUMNS: 
+ROW: 
+ROW: 
+ROW: 
+--- STMT 29 ---
+SQL: INSERT INTO
+ERROR [42601]: ERROR: Expected identifier at position 11 near ''
+--- STMT 30 ---
+SQL: INSERT INTO syn_test VALUES
+ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 27 near ''
+--- STMT 31 ---
+SQL: INSERT INTO syn_test (name) VALUES
+ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 34 near ''
+--- STMT 32 ---
+SQL: UPDATE SET val = 1
+ERROR [42601]: ERROR: Expected keyword SET at position 15 near '='
+--- STMT 33 ---
+SQL: UPDATE syn_test SET
+ERROR [42601]: ERROR: Expected identifier at position 19 near ''
+--- STMT 34 ---
+SQL: DELETE FROM
+ERROR [42601]: ERROR: Expected identifier at position 11 near ''
+--- STMT 35 ---
+SQL: CREATE TABLE
+ERROR [42601]: ERROR: Expected identifier at position 12 near ''
+--- STMT 36 ---
+SQL: CREATE TABLE t1
+ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 15 near ''
+--- STMT 37 ---
+SQL: DROP TABLE
+ERROR [42601]: ERROR: Expected identifier at position 10 near ''
+--- STMT 38 ---
+SQL: ALTER TABLE
+ERROR [42601]: ERROR: Expected identifier at position 11 near ''
+--- STMT 39 ---
+SQL: -- === Duplicate clauses === SELECT * FROM syn_test WHERE val > 1 WHERE val < 100
+ERROR [42601]: ERROR: Multiple WHERE clauses at position 66 near 'WHERE'
+--- STMT 40 ---
+SQL: SELECT * FROM syn_test ORDER BY val ORDER BY name
+ERROR [42601]: ERROR: Multiple ORDER BY clauses at position 36 near 'ORDER'
+--- STMT 41 ---
+SQL: SELECT * FROM syn_test LIMIT 1 LIMIT 2
+ERROR [42601]: ERROR: Multiple LIMIT clauses at position 31 near 'LIMIT'
+--- STMT 42 ---
+SQL: -- === Unmatched parentheses === SELECT * FROM syn_test WHERE (val > 1
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 70 near ''
+--- STMT 43 ---
+SQL: SELECT * FROM syn_test WHERE val > 1)
+ERROR [42601]: ERROR: syntax error at or near ")" at position 36 near ')'
+--- STMT 44 ---
+SQL: INSERT INTO syn_test (name, val VALUES ('x', 1)
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found KEYWORD at position 32 near 'VALUES'
+--- STMT 45 ---
+SQL: INSERT INTO syn_test (name, val) VALUES ('x', 1
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 47 near ''
+--- STMT 46 ---
+SQL: SELECT (1 + 2
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 13 near ''
+--- STMT 47 ---
+SQL: SELECT 1 + 2)
+ERROR [42601]: ERROR: syntax error at or near ")" at position 12 near ')'
+--- STMT 48 ---
+SQL: CREATE TABLE bad_parens (id int, name text
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 42 near ''
+--- STMT 49 ---
+SQL: -- === Incomplete expressions === SELECT 1 +
+ERROR [42601]: ERROR: Unexpected token in expression at position 44 near ''
+--- STMT 50 ---
+SQL: SELECT 1 *
+ERROR [42601]: ERROR: Unexpected token in expression at position 10 near ''
+--- STMT 51 ---
+SQL: SELECT * FROM syn_test WHERE val =
+ERROR [42601]: ERROR: Unexpected token in expression at position 34 near ''
+--- STMT 52 ---
+SQL: SELECT * FROM syn_test WHERE val = AND name = 'alpha'
+ERROR [42601]: ERROR: syntax error at or near "AND" at position 35 near 'AND'
+--- STMT 53 ---
+SQL: SELECT * FROM syn_test WHERE AND val > 1
+ERROR [42601]: ERROR: syntax error at or near "AND" at position 29 near 'AND'
+--- STMT 54 ---
+SQL: SELECT * FROM syn_test WHERE val > 1 AND
+ERROR [42601]: ERROR: Unexpected token in expression at position 40 near ''
+--- STMT 55 ---
+SQL: SELECT * FROM syn_test WHERE val BETWEEN
+ERROR [42601]: ERROR: Unexpected token in expression at position 40 near ''
+--- STMT 56 ---
+SQL: SELECT * FROM syn_test WHERE val BETWEEN 1 AND
+ERROR [42601]: ERROR: Unexpected token in expression at position 46 near ''
+--- STMT 57 ---
+SQL: SELECT * FROM syn_test WHERE val IN
+ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 35 near ''
+--- STMT 58 ---
+SQL: SELECT * FROM syn_test WHERE val IN ()
+ERROR [42601]: ERROR: Unexpected token in expression at position 37 near ')'
+--- STMT 59 ---
+SQL: SELECT * FROM syn_test WHERE name LIKE
+ERROR [42601]: ERROR: Unexpected token in expression at position 38 near ''
+--- STMT 60 ---
+SQL: -- === Invalid identifiers === SELECT 123abc FROM syn_test
+ERROR [42601]: ERROR: trailing junk after numeric literal at or near "123a" at position 38 near '123'
+--- STMT 61 ---
+SQL: CREATE TABLE 123table (id int)
+ERROR [42601]: ERROR: trailing junk after numeric literal at or near "123t" at position 13 near '123'
+--- STMT 62 ---
+SQL: -- === Trailing garbage === SELECT 1 BANANA
+RESULT: 1 columns, 1 rows
+COLUMNS: banana
+ROW: 1
+--- STMT 63 ---
+SQL: SELECT * FROM syn_test POTATO
+RESULT: 4 columns, 3 rows
+COLUMNS: id, name, val, active
+ROW: 1 | alpha | 10 | t
+ROW: 2 | beta | 20 | t
+ROW: 3 | gamma | 30 | t
+--- STMT 64 ---
+SQL: INSERT INTO syn_test (name) VALUES ('x') GARBAGE
+ERROR [42601]: ERROR: syntax error at or near "garbage" at position 41 near 'garbage'
+--- STMT 65 ---
+SQL: -- === Multiple semicolons === SELECT 1
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 66 ---
+SQL: SELECT 1
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 67 ---
+SQL: -- === Valid but unusual === SELECT /* inline comment */ 1
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 68 ---
+SQL: SELECT 1 -- trailing comment
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 69 ---
+SQL: SELECT 1 AS "column with spaces"
+RESULT: 1 columns, 1 rows
+COLUMNS: column with spaces
+ROW: 1
+--- STMT 70 ---
+SQL: SELECT 1 AS "123numeric_start"
+RESULT: 1 columns, 1 rows
+COLUMNS: 123numeric_start
+ROW: 1
+--- STMT 71 ---
+SQL: SELECT 1 AS ""
+ERROR [42601]: ERROR: zero-length delimited identifier at position 12 near ''
+--- STMT 72 ---
+SQL: -- === Operator errors === SELECT 1 === 1
+ERROR [42883]: ERROR: operator does not exist: = at position 37 near '='
+--- STMT 73 ---
+SQL: SELECT 1 <> <> 1
+ERROR [42601]: ERROR: Unexpected token in expression at position 12 near '<>'
+--- STMT 74 ---
+SQL: SELECT 1 !! 2
+ERROR [42883]: ERROR: operator does not exist: !! at position 9 near '!!'
+--- STMT 75 ---
+SQL: SELECT * FROM syn_test WHERE val >> 1
+ERROR [42804]: ERROR: argument of WHERE must be type boolean, not type int4
+--- STMT 76 ---
+SQL: -- Cleanup DROP TABLE syn_test
+OK: 0 rows affected
+
+=== FILE: 03_type_coercion.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 03: Type Coercion, Casting, and Type Errors -- ============================================================ -- === Valid casts: :: sy...
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: 42
+--- STMT 2 ---
+SQL: SELECT '42'::bigint
+RESULT: 1 columns, 1 rows
+COLUMNS: int8
+ROW: 42
+--- STMT 3 ---
+SQL: SELECT '42'::smallint
+RESULT: 1 columns, 1 rows
+COLUMNS: int2
+ROW: 42
+--- STMT 4 ---
+SQL: SELECT '3.14'::numeric
+RESULT: 1 columns, 1 rows
+COLUMNS: numeric
+ROW: 3.14
+--- STMT 5 ---
+SQL: SELECT '3.14'::double precision
+RESULT: 1 columns, 1 rows
+COLUMNS: float8
+ROW: 3.14
+--- STMT 6 ---
+SQL: SELECT '3.14'::real
+RESULT: 1 columns, 1 rows
+COLUMNS: float4
+ROW: 3.14
+--- STMT 7 ---
+SQL: SELECT 42::text
+RESULT: 1 columns, 1 rows
+COLUMNS: text
+ROW: 42
+--- STMT 8 ---
+SQL: SELECT 42::varchar
+RESULT: 1 columns, 1 rows
+COLUMNS: varchar
+ROW: 42
+--- STMT 9 ---
+SQL: SELECT 3.14::int
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: 3
+--- STMT 10 ---
+SQL: SELECT 3.99::int
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: 4
+--- STMT 11 ---
+SQL: SELECT '2024-01-15'::date
+RESULT: 1 columns, 1 rows
+COLUMNS: date
+ROW: 2024-01-15
+--- STMT 12 ---
+SQL: SELECT '2024-01-15 10:30:00'::timestamp
+RESULT: 1 columns, 1 rows
+COLUMNS: timestamp
+ROW: 2024-01-15 10:30:00
+--- STMT 13 ---
+SQL: SELECT '2024-01-15 10:30:00+02'::timestamptz
+RESULT: 1 columns, 1 rows
+COLUMNS: timestamptz
+ROW: 2024-01-15 08:30:00+00
+--- STMT 14 ---
+SQL: SELECT '10:30:00'::time
+RESULT: 1 columns, 1 rows
+COLUMNS: time
+ROW: 10:30:00
+--- STMT 15 ---
+SQL: SELECT 'true'::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: t
+--- STMT 16 ---
+SQL: SELECT 'false'::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: f
+--- STMT 17 ---
+SQL: SELECT 't'::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: t
+--- STMT 18 ---
+SQL: SELECT 'f'::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: f
+--- STMT 19 ---
+SQL: SELECT 'yes'::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: t
+--- STMT 20 ---
+SQL: SELECT 'no'::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: f
+--- STMT 21 ---
+SQL: SELECT '1'::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: t
+--- STMT 22 ---
+SQL: SELECT '0'::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: f
+--- STMT 23 ---
+SQL: SELECT '{"a":1}'::jsonb
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb
+ROW: {"a": 1}
+--- STMT 24 ---
+SQL: SELECT '{"a":1}'::json
+RESULT: 1 columns, 1 rows
+COLUMNS: json
+ROW: {"a":1}
+--- STMT 25 ---
+SQL: SELECT '[1,2,3]'::jsonb
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb
+ROW: [1, 2, 3]
+--- STMT 26 ---
+SQL: SELECT 'hello'::bytea
+RESULT: 1 columns, 1 rows
+COLUMNS: bytea
+ROW: \\x68656c6c6f
+--- STMT 27 ---
+SQL: SELECT true::int
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: 1
+--- STMT 28 ---
+SQL: SELECT false::int
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: 0
+--- STMT 29 ---
+SQL: SELECT 1::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: t
+--- STMT 30 ---
+SQL: SELECT 0::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: f
+--- STMT 31 ---
+SQL: SELECT '1 day'::interval
+RESULT: 1 columns, 1 rows
+COLUMNS: interval
+ROW: 1 day
+--- STMT 32 ---
+SQL: SELECT '2 hours 30 minutes'::interval
+RESULT: 1 columns, 1 rows
+COLUMNS: interval
+ROW: 02:30:00
+--- STMT 33 ---
+SQL: SELECT '1 year 2 months'::interval
+RESULT: 1 columns, 1 rows
+COLUMNS: interval
+ROW: 1 year 2 mons
+--- STMT 34 ---
+SQL: -- === Valid casts: CAST syntax === SELECT CAST('42' AS int)
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: 42
+--- STMT 35 ---
+SQL: SELECT CAST('3.14' AS numeric)
+RESULT: 1 columns, 1 rows
+COLUMNS: numeric
+ROW: 3.14
+--- STMT 36 ---
+SQL: SELECT CAST(42 AS text)
+RESULT: 1 columns, 1 rows
+COLUMNS: text
+ROW: 42
+--- STMT 37 ---
+SQL: SELECT CAST('2024-01-15' AS date)
+RESULT: 1 columns, 1 rows
+COLUMNS: date
+ROW: 2024-01-15
+--- STMT 38 ---
+SQL: SELECT CAST('true' AS boolean)
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: t
+--- STMT 39 ---
+SQL: SELECT CAST('{"a":1}' AS jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb
+ROW: {"a": 1}
+--- STMT 40 ---
+SQL: -- === Numeric edge cases === SELECT 1e3::int
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: 1000
+--- STMT 41 ---
+SQL: SELECT '1e3'::numeric
+RESULT: 1 columns, 1 rows
+COLUMNS: numeric
+ROW: 1000
+--- STMT 42 ---
+SQL: SELECT 'Infinity'::double precision
+RESULT: 1 columns, 1 rows
+COLUMNS: float8
+ROW: Infinity
+--- STMT 43 ---
+SQL: SELECT '-Infinity'::double precision
+RESULT: 1 columns, 1 rows
+COLUMNS: float8
+ROW: -Infinity
+--- STMT 44 ---
+SQL: SELECT 'NaN'::double precision
+RESULT: 1 columns, 1 rows
+COLUMNS: float8
+ROW: NaN
+--- STMT 45 ---
+SQL: SELECT 9999999999999999::bigint
+RESULT: 1 columns, 1 rows
+COLUMNS: int8
+ROW: 9999999999999999
+--- STMT 46 ---
+SQL: SELECT 2147483647::int
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: 2147483647
+--- STMT 47 ---
+SQL: SELECT -2147483648::int
+ERROR [22003]: ERROR: integer out of range
+--- STMT 48 ---
+SQL: SELECT 0.1 + 0.2
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0.3
+--- STMT 49 ---
+SQL: SELECT 0.1::numeric + 0.2::numeric
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0.3
+--- STMT 50 ---
+SQL: SELECT 1.0 / 3.0
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0.33333333333333333333
+--- STMT 51 ---
+SQL: SELECT 10 % 3
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 52 ---
+SQL: SELECT 2 ^ 10
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1024
+--- STMT 53 ---
+SQL: SELECT |/ 144
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 12
+--- STMT 54 ---
+SQL: SELECT ||/ 27
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 3
+--- STMT 55 ---
+SQL: SELECT @ -42
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 42
+--- STMT 56 ---
+SQL: -- === String/text conversions === SELECT 42::text || ' items'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 42 items
+--- STMT 57 ---
+SQL: SELECT 'price: ' || 9.99::text
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: price: 9.99
+--- STMT 58 ---
+SQL: SELECT length('hello'::varchar(3))
+RESULT: 1 columns, 1 rows
+COLUMNS: length
+ROW: 3
+--- STMT 59 ---
+SQL: SELECT 'hello'::char(10)
+RESULT: 1 columns, 1 rows
+COLUMNS: bpchar
+ROW: hello     
+--- STMT 60 ---
+SQL: SELECT 'hello'::varchar(3)
+RESULT: 1 columns, 1 rows
+COLUMNS: varchar
+ROW: hel
+--- STMT 61 ---
+SQL: -- === Date/time conversions === SELECT '2024-01-15'::date + 30
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 2024-02-14
+--- STMT 62 ---
+SQL: SELECT '2024-01-15'::date + '30 days'::interval
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 2024-02-14 00:00:00
+--- STMT 63 ---
+SQL: SELECT '2024-01-15'::date - '2023-01-15'::date
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 365
+--- STMT 64 ---
+SQL: SELECT now()::date
+RESULT: 1 columns, 1 rows
+COLUMNS: now
+ROW: 2026-04-02
+--- STMT 65 ---
+SQL: SELECT now()::time
+RESULT: 1 columns, 1 rows
+COLUMNS: now
+ROW: 18:51:11.012257
+--- STMT 66 ---
+SQL: SELECT now()::timestamp
+RESULT: 1 columns, 1 rows
+COLUMNS: now
+ROW: 2026-04-02 18:51:11.012257
+--- STMT 67 ---
+SQL: SELECT EXTRACT(year FROM '2024-06-15'::date)
+RESULT: 1 columns, 1 rows
+COLUMNS: extract
+ROW: 2024
+--- STMT 68 ---
+SQL: SELECT EXTRACT(month FROM '2024-06-15'::date)
+RESULT: 1 columns, 1 rows
+COLUMNS: extract
+ROW: 6
+--- STMT 69 ---
+SQL: SELECT EXTRACT(dow FROM '2024-06-15'::date)
+RESULT: 1 columns, 1 rows
+COLUMNS: extract
+ROW: 6
+--- STMT 70 ---
+SQL: SELECT DATE_TRUNC('month', '2024-06-15 10:30:00'::timestamp)
+RESULT: 1 columns, 1 rows
+COLUMNS: date_trunc
+ROW: 2024-06-01 00:00:00
+--- STMT 71 ---
+SQL: -- === NULL coercion === SELECT NULL::int
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: NULL
+--- STMT 72 ---
+SQL: SELECT NULL::text
+RESULT: 1 columns, 1 rows
+COLUMNS: text
+ROW: NULL
+--- STMT 73 ---
+SQL: SELECT NULL::boolean
+RESULT: 1 columns, 1 rows
+COLUMNS: bool
+ROW: NULL
+--- STMT 74 ---
+SQL: SELECT NULL = NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 75 ---
+SQL: SELECT NULL IS NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 76 ---
+SQL: SELECT NULL IS NOT NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 77 ---
+SQL: SELECT COALESCE(NULL, 42)
+RESULT: 1 columns, 1 rows
+COLUMNS: coalesce
+ROW: 42
+--- STMT 78 ---
+SQL: SELECT COALESCE(NULL, NULL, 'fallback')
+RESULT: 1 columns, 1 rows
+COLUMNS: coalesce
+ROW: fallback
+--- STMT 79 ---
+SQL: SELECT NULLIF(1, 1)
+RESULT: 1 columns, 1 rows
+COLUMNS: nullif
+ROW: NULL
+--- STMT 80 ---
+SQL: SELECT NULLIF(1, 2)
+RESULT: 1 columns, 1 rows
+COLUMNS: nullif
+ROW: 1
+--- STMT 81 ---
+SQL: -- === Array casts === SELECT '{1,2,3}'::int[]
+RESULT: 1 columns, 1 rows
+COLUMNS: int4
+ROW: {1,2,3}
+--- STMT 82 ---
+SQL: SELECT ARRAY[1,2,3]::text[]
+RESULT: 1 columns, 1 rows
+COLUMNS: array
+ROW: {1,2,3}
+--- STMT 83 ---
+SQL: SELECT '{hello,world}'::text[]
+RESULT: 1 columns, 1 rows
+COLUMNS: text
+ROW: {hello,world}
+--- STMT 84 ---
+SQL: -- === Invalid casts === SELECT 'hello'::int
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "hello"
+--- STMT 85 ---
+SQL: SELECT 'not_a_number'::numeric
+ERROR [22P02]: ERROR: invalid input syntax for type numeric: "not_a_number"
+--- STMT 86 ---
+SQL: SELECT 'not_a_date'::date
+ERROR [22007]: ERROR: date/time field value out of range: "not_a_date"
+--- STMT 87 ---
+SQL: SELECT '25:00:00'::time
+ERROR [22008]: ERROR: date/time field value out of range: "25:00:00"
+--- STMT 88 ---
+SQL: SELECT 'not_a_bool'::boolean
+ERROR [22P02]: ERROR: invalid input syntax for type boolean: "not_a_bool"
+--- STMT 89 ---
+SQL: SELECT '{'::jsonb
+ERROR [22P02]: ERROR: invalid input syntax for type json
+--- STMT 90 ---
+SQL: SELECT 'invalid json'::jsonb
+ERROR [22P02]: ERROR: invalid input syntax for type json
+--- STMT 91 ---
+SQL: SELECT ''::int
+ERROR [22P02]: ERROR: invalid input syntax for type integer: ""
+--- STMT 92 ---
+SQL: SELECT 2147483648::int
+ERROR [22003]: ERROR: integer out of range
+--- STMT 93 ---
+SQL: SELECT 'hello'::uuid
+ERROR [22P02]: ERROR: invalid input syntax for type uuid: "hello"
+--- STMT 94 ---
+SQL: -- === Implicit coercion in operations === CREATE TABLE coerce_test (id serial PRIMARY KEY, int_col int, text_col text, bool_col boolean, num_col numeric)
+OK: 0 rows affected
+--- STMT 95 ---
+SQL: INSERT INTO coerce_test (int_col, text_col, bool_col, num_col) VALUES (42, 'hello', true, 3.14)
+OK: 1 rows affected
+--- STMT 96 ---
+SQL: SELECT * FROM coerce_test WHERE int_col = '42'
+RESULT: 5 columns, 1 rows
+COLUMNS: id, int_col, text_col, bool_col, num_col
+ROW: 1 | 42 | hello | t | 3.14
+--- STMT 97 ---
+SQL: SELECT * FROM coerce_test WHERE text_col = 42
+ERROR [42883]: ERROR: operator does not exist: text = integer
+--- STMT 98 ---
+SQL: SELECT * FROM coerce_test WHERE bool_col = 'true'
+RESULT: 5 columns, 1 rows
+COLUMNS: id, int_col, text_col, bool_col, num_col
+ROW: 1 | 42 | hello | t | 3.14
+--- STMT 99 ---
+SQL: SELECT * FROM coerce_test WHERE num_col = '3.14'
+RESULT: 5 columns, 1 rows
+COLUMNS: id, int_col, text_col, bool_col, num_col
+ROW: 1 | 42 | hello | t | 3.14
+--- STMT 100 ---
+SQL: SELECT int_col + '10' FROM coerce_test
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 52
+--- STMT 101 ---
+SQL: SELECT text_col || 123 FROM coerce_test
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: hello123
+--- STMT 102 ---
+SQL: DROP TABLE coerce_test
+OK: 0 rows affected
+
+=== FILE: 04_aggregates_groupby.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 04: Aggregate Functions and GROUP BY -- ============================================================ -- Setup CREATE TABLE sales (id ...
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: INSERT INTO sales (product, category, amount, quantity, sold_at) VALUES ('Widget A', 'hardware', 25.00, 10, '2024-01-15'), ('Widget B', 'hardware', 35.00, 5, '2024-01-20'), ('Service X', 'services', 1...
+OK: 10 rows affected
+--- STMT 3 ---
+SQL: -- === Basic aggregates === SELECT COUNT(*) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 10
+--- STMT 4 ---
+SQL: SELECT COUNT(DISTINCT product) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 6
+--- STMT 5 ---
+SQL: SELECT COUNT(DISTINCT category) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 3
+--- STMT 6 ---
+SQL: SELECT SUM(amount) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: sum
+ROW: 685.00
+--- STMT 7 ---
+SQL: SELECT SUM(amount * quantity) AS total_revenue FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: total_revenue
+ROW: 4200.00
+--- STMT 8 ---
+SQL: SELECT AVG(amount) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: avg
+ROW: 68.5000000000000000
+--- STMT 9 ---
+SQL: SELECT AVG(amount)::numeric(10,2) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: avg
+ROW: 68.50
+--- STMT 10 ---
+SQL: SELECT MIN(amount) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: min
+ROW: 25.00
+--- STMT 11 ---
+SQL: SELECT MAX(amount) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: max
+ROW: 200.00
+--- STMT 12 ---
+SQL: SELECT MIN(sold_at) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: min
+ROW: 2024-01-15
+--- STMT 13 ---
+SQL: SELECT MAX(sold_at) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: max
+ROW: 2024-05-01
+--- STMT 14 ---
+SQL: -- === GROUP BY === SELECT category, COUNT(*) FROM sales GROUP BY category ORDER BY category
+RESULT: 2 columns, 3 rows
+COLUMNS: category, count
+ROW: electronics | 3
+ROW: hardware | 4
+ROW: services | 3
+--- STMT 15 ---
+SQL: SELECT category, SUM(amount) FROM sales GROUP BY category ORDER BY SUM(amount) DESC
+RESULT: 2 columns, 3 rows
+COLUMNS: category, sum
+ROW: services | 400.00
+ROW: electronics | 175.00
+ROW: hardware | 110.00
+--- STMT 16 ---
+SQL: SELECT category, AVG(amount)::numeric(10,2) AS avg_price FROM sales GROUP BY category ORDER BY category
+RESULT: 2 columns, 3 rows
+COLUMNS: category, avg_price
+ROW: electronics | 58.33
+ROW: hardware | 27.50
+ROW: services | 133.33
+--- STMT 17 ---
+SQL: SELECT category, MIN(amount), MAX(amount) FROM sales GROUP BY category ORDER BY category
+RESULT: 3 columns, 3 rows
+COLUMNS: category, min, max
+ROW: electronics | 50.00 | 75.00
+ROW: hardware | 25.00 | 35.00
+ROW: services | 100.00 | 200.00
+--- STMT 18 ---
+SQL: SELECT product, COUNT(*), SUM(quantity) FROM sales GROUP BY product ORDER BY product
+RESULT: 3 columns, 6 rows
+COLUMNS: product, count, sum
+ROW: Gadget C | 2 | 27
+ROW: Gadget D | 1 | 15
+ROW: Service X | 2 | 4
+ROW: Service Y | 1 | 2
+ROW: Widget A | 3 | 30
+ROW: Widget B | 1 | 5
+--- STMT 19 ---
+SQL: SELECT category, product, SUM(quantity) FROM sales GROUP BY category, product ORDER BY category, product
+RESULT: 3 columns, 6 rows
+COLUMNS: category, product, sum
+ROW: electronics | Gadget C | 27
+ROW: electronics | Gadget D | 15
+ROW: hardware | Widget A | 30
+ROW: hardware | Widget B | 5
+ROW: services | Service X | 4
+ROW: services | Service Y | 2
+--- STMT 20 ---
+SQL: SELECT EXTRACT(month FROM sold_at) AS month, SUM(amount) FROM sales GROUP BY month ORDER BY month
+RESULT: 2 columns, 5 rows
+COLUMNS: month, sum
+ROW: 1 | 60.00
+ROW: 2 | 300.00
+ROW: 3 | 150.00
+ROW: 4 | 125.00
+ROW: 5 | 50.00
+--- STMT 21 ---
+SQL: -- === GROUP BY with HAVING === SELECT category, COUNT(*) FROM sales GROUP BY category HAVING COUNT(*) > 2 ORDER BY category
+RESULT: 2 columns, 3 rows
+COLUMNS: category, count
+ROW: electronics | 3
+ROW: hardware | 4
+ROW: services | 3
+--- STMT 22 ---
+SQL: SELECT product, SUM(quantity) FROM sales GROUP BY product HAVING SUM(quantity) > 10 ORDER BY product
+RESULT: 2 columns, 3 rows
+COLUMNS: product, sum
+ROW: Gadget C | 27
+ROW: Gadget D | 15
+ROW: Widget A | 30
+--- STMT 23 ---
+SQL: SELECT category, AVG(amount) FROM sales GROUP BY category HAVING AVG(amount) > 50 ORDER BY category
+RESULT: 2 columns, 2 rows
+COLUMNS: category, avg
+ROW: electronics | 58.3333333333333333
+ROW: services | 133.3333333333333333
+--- STMT 24 ---
+SQL: -- === GROUP BY with ordinals and aliases === SELECT category, COUNT(*) AS cnt FROM sales GROUP BY 1 ORDER BY 2 DESC
+RESULT: 2 columns, 3 rows
+COLUMNS: category, cnt
+ROW: hardware | 4
+ROW: services | 3
+ROW: electronics | 3
+--- STMT 25 ---
+SQL: SELECT category AS cat, SUM(amount) AS total FROM sales GROUP BY cat ORDER BY total DESC
+RESULT: 2 columns, 3 rows
+COLUMNS: cat, total
+ROW: services | 400.00
+ROW: electronics | 175.00
+ROW: hardware | 110.00
+--- STMT 26 ---
+SQL: -- === String aggregate === SELECT category, STRING_AGG(DISTINCT product, ', ' ORDER BY product) FROM sales GROUP BY category ORDER BY category
+RESULT: 2 columns, 3 rows
+COLUMNS: category, string_agg
+ROW: electronics | Gadget C, Gadget D
+ROW: hardware | Widget A, Widget B
+ROW: services | Service X, Service Y
+--- STMT 27 ---
+SQL: SELECT STRING_AGG(product, ' | ') FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: string_agg
+ROW: Widget A | Widget B | Service X | Service Y | Widget A | Gadget C | Gadget D | Service X | Widget A | Gadget C
+--- STMT 28 ---
+SQL: -- === Array aggregate === SELECT category, ARRAY_AGG(DISTINCT product ORDER BY product) FROM sales GROUP BY category ORDER BY category
+RESULT: 2 columns, 3 rows
+COLUMNS: category, array_agg
+ROW: electronics | {"Gadget C","Gadget D"}
+ROW: hardware | {"Widget A","Widget B"}
+ROW: services | {"Service X","Service Y"}
+--- STMT 29 ---
+SQL: SELECT ARRAY_AGG(amount ORDER BY amount) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: array_agg
+ROW: {25.00,25.00,25.00,35.00,50.00,50.00,75.00,100.00,100.00,200.00}
+--- STMT 30 ---
+SQL: -- === Bool aggregates === CREATE TABLE flags (id serial PRIMARY KEY, label text, flag boolean)
+OK: 0 rows affected
+--- STMT 31 ---
+SQL: INSERT INTO flags (label, flag) VALUES ('a', true), ('b', true), ('c', false), ('d', true), ('e', NULL)
+OK: 5 rows affected
+--- STMT 32 ---
+SQL: SELECT BOOL_AND(flag) FROM flags
+RESULT: 1 columns, 1 rows
+COLUMNS: bool_and
+ROW: f
+--- STMT 33 ---
+SQL: SELECT BOOL_OR(flag) FROM flags
+RESULT: 1 columns, 1 rows
+COLUMNS: bool_or
+ROW: t
+--- STMT 34 ---
+SQL: SELECT BOOL_AND(flag) FROM flags WHERE flag IS NOT NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: bool_and
+ROW: f
+--- STMT 35 ---
+SQL: SELECT label, BOOL_AND(flag) FROM flags GROUP BY label ORDER BY label
+RESULT: 2 columns, 5 rows
+COLUMNS: label, bool_and
+ROW: a | t
+ROW: b | t
+ROW: c | f
+ROW: d | t
+ROW: e | NULL
+--- STMT 36 ---
+SQL: DROP TABLE flags
+OK: 0 rows affected
+--- STMT 37 ---
+SQL: -- === COUNT with FILTER === SELECT COUNT(*) FILTER (WHERE category = 'hardware') AS hw_count, COUNT(*) FILTER (WHERE category = 'services') AS svc_count, COUNT(*) FILTER (WHERE category = 'electronic...
+RESULT: 3 columns, 1 rows
+COLUMNS: hw_count, svc_count, elec_count
+ROW: 4 | 3 | 3
+--- STMT 38 ---
+SQL: -- === SUM with FILTER === SELECT SUM(amount) FILTER (WHERE category = 'hardware') AS hw_total, SUM(amount) FILTER (WHERE category = 'services') AS svc_total FROM sales
+RESULT: 2 columns, 1 rows
+COLUMNS: hw_total, svc_total
+ROW: 110.00 | 400.00
+--- STMT 39 ---
+SQL: -- === Aggregate with ORDER BY inside === SELECT ARRAY_AGG(product ORDER BY amount DESC) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: array_agg
+ROW: {"Service Y","Service X","Service X","Gadget D","Gadget C","Gadget C","Widget B","Widget A","Widget A","Widget A"}
+--- STMT 40 ---
+SQL: SELECT STRING_AGG(product, ', ' ORDER BY sold_at) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: string_agg
+ROW: Widget A, Widget B, Service X, Service Y, Widget A, Gadget C, Gadget D, Service X, Widget A, Gadget C
+--- STMT 41 ---
+SQL: SELECT JSON_AGG(product ORDER BY product) FROM sales
+RESULT: 1 columns, 1 rows
+COLUMNS: json_agg
+ROW: ["Gadget C", "Gadget C", "Gadget D", "Service X", "Service X", "Service Y", "Widget A", "Widget A", "Widget A", "Widget B"]
+--- STMT 42 ---
+SQL: -- === Aggregate on empty set === SELECT COUNT(*) FROM sales WHERE 1 = 0
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 0
+--- STMT 43 ---
+SQL: SELECT SUM(amount) FROM sales WHERE 1 = 0
+RESULT: 1 columns, 1 rows
+COLUMNS: sum
+ROW: NULL
+--- STMT 44 ---
+SQL: SELECT AVG(amount) FROM sales WHERE 1 = 0
+RESULT: 1 columns, 1 rows
+COLUMNS: avg
+ROW: NULL
+--- STMT 45 ---
+SQL: SELECT MIN(amount) FROM sales WHERE 1 = 0
+RESULT: 1 columns, 1 rows
+COLUMNS: min
+ROW: NULL
+--- STMT 46 ---
+SQL: SELECT MAX(amount) FROM sales WHERE 1 = 0
+RESULT: 1 columns, 1 rows
+COLUMNS: max
+ROW: NULL
+--- STMT 47 ---
+SQL: SELECT ARRAY_AGG(product) FROM sales WHERE 1 = 0
+RESULT: 1 columns, 1 rows
+COLUMNS: array_agg
+ROW: NULL
+--- STMT 48 ---
+SQL: SELECT STRING_AGG(product, ',') FROM sales WHERE 1 = 0
+RESULT: 1 columns, 1 rows
+COLUMNS: string_agg
+ROW: NULL
+--- STMT 49 ---
+SQL: -- === INVALID: Aggregate errors === -- Non-aggregated column without GROUP BY SELECT category, COUNT(*) FROM sales
+ERROR [42803]: ERROR: column "category" must appear in the GROUP BY clause or be used in an aggregate function
+--- STMT 50 ---
+SQL: -- HAVING without GROUP BY (valid in PG if entire table is one group) SELECT COUNT(*) FROM sales HAVING COUNT(*) > 1
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 10
+--- STMT 51 ---
+SQL: -- Aggregate in WHERE SELECT * FROM sales WHERE SUM(amount) > 100
+ERROR [42803]: ERROR: aggregate functions are not allowed in WHERE
+--- STMT 52 ---
+SQL: -- Nested aggregate SELECT MAX(COUNT(*)) FROM sales GROUP BY category
+ERROR [42803]: ERROR: aggregate function calls cannot be nested
+--- STMT 53 ---
+SQL: -- Cleanup DROP TABLE sales
+OK: 0 rows affected
+
+=== FILE: 05_subqueries_ctes.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 05: Subqueries, CTEs, and Set Operations -- ============================================================ -- Setup CREATE TABLE depart...
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: CREATE TABLE employees (id serial PRIMARY KEY, name text NOT NULL, dept_id int REFERENCES departments(id), salary numeric(10,2), active boolean DEFAULT true)
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: INSERT INTO departments (name) VALUES ('Engineering'), ('Sales'), ('Marketing'), ('HR')
+OK: 4 rows affected
+--- STMT 4 ---
+SQL: INSERT INTO employees (name, dept_id, salary) VALUES ('Alice', 1, 95000), ('Bob', 1, 85000), ('Charlie', 2, 70000), ('Diana', 2, 75000), ('Eve', 3, 65000), ('Frank', 3, 60000), ('Grace', 4, 80000), ('...
+OK: 9 rows affected
+--- STMT 5 ---
+SQL: -- === Scalar subquery in SELECT === SELECT name, salary, (SELECT AVG(salary) FROM employees) AS avg_sal FROM employees ORDER BY name
+RESULT: 3 columns, 9 rows
+COLUMNS: name, salary, avg_sal
+ROW: Alice | 95000.00 | 76666.6666666666666667
+ROW: Bob | 85000.00 | 76666.6666666666666667
+ROW: Charlie | 70000.00 | 76666.6666666666666667
+ROW: Diana | 75000.00 | 76666.6666666666666667
+ROW: Eve | 65000.00 | 76666.6666666666666667
+ROW: Frank | 60000.00 | 76666.6666666666666667
+ROW: Grace | 80000.00 | 76666.6666666666666667
+ROW: Hank | 110000.00 | 76666.6666666666666667
+ROW: Ivy | 50000.00 | 76666.6666666666666667
+--- STMT 6 ---
+SQL: SELECT name, salary - (SELECT AVG(salary) FROM employees) AS diff FROM employees ORDER BY name
+RESULT: 2 columns, 9 rows
+COLUMNS: name, diff
+ROW: Alice | 18333.3333333333333333
+ROW: Bob | 8333.3333333333333333
+ROW: Charlie | -6666.6666666666666667
+ROW: Diana | -1666.6666666666666667
+ROW: Eve | -11666.6666666666666667
+ROW: Frank | -16666.6666666666666667
+ROW: Grace | 3333.3333333333333333
+ROW: Hank | 33333.3333333333333333
+ROW: Ivy | -26666.6666666666666667
+--- STMT 7 ---
+SQL: -- === Subquery in WHERE: comparison === SELECT name FROM employees WHERE salary > (SELECT AVG(salary) FROM employees) ORDER BY name
+RESULT: 1 columns, 4 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+ROW: Grace
+ROW: Hank
+--- STMT 8 ---
+SQL: SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)
+RESULT: 1 columns, 1 rows
+COLUMNS: name
+ROW: Hank
+--- STMT 9 ---
+SQL: SELECT name FROM employees WHERE dept_id = (SELECT id FROM departments WHERE name = 'Engineering')
+RESULT: 1 columns, 3 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+ROW: Hank
+--- STMT 10 ---
+SQL: -- === Subquery in WHERE: IN === SELECT name FROM employees WHERE dept_id IN (SELECT id FROM departments WHERE name IN ('Engineering', 'Sales')) ORDER BY name
+RESULT: 1 columns, 5 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+ROW: Charlie
+ROW: Diana
+ROW: Hank
+--- STMT 11 ---
+SQL: SELECT name FROM employees WHERE dept_id NOT IN (SELECT id FROM departments WHERE name = 'HR') AND dept_id IS NOT NULL ORDER BY name
+RESULT: 1 columns, 7 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+ROW: Charlie
+ROW: Diana
+ROW: Eve
+ROW: Frank
+ROW: Hank
+--- STMT 12 ---
+SQL: -- === Subquery in WHERE: EXISTS === SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id AND e.salary > 90000) ORDER BY d.name
+RESULT: 1 columns, 1 rows
+COLUMNS: name
+ROW: Engineering
+--- STMT 13 ---
+SQL: SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id) ORDER BY d.name
+RESULT: 1 columns, 0 rows
+COLUMNS: name
+--- STMT 14 ---
+SQL: -- === Subquery in WHERE: ANY/ALL === SELECT name FROM employees WHERE salary > ANY (SELECT salary FROM employees WHERE dept_id = 2) ORDER BY name
+RESULT: 1 columns, 5 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+ROW: Diana
+ROW: Grace
+ROW: Hank
+--- STMT 15 ---
+SQL: SELECT name FROM employees WHERE salary > ALL (SELECT salary FROM employees WHERE dept_id = 3) ORDER BY name
+RESULT: 1 columns, 6 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+ROW: Charlie
+ROW: Diana
+ROW: Grace
+ROW: Hank
+--- STMT 16 ---
+SQL: -- === Subquery in FROM === SELECT sub.dept_name, sub.emp_count FROM (SELECT d.name AS dept_name, COUNT(e.id) AS emp_count FROM departments d LEFT JOIN employees e ON e.dept_id = d.id GROUP BY d.name)...
+RESULT: 2 columns, 4 rows
+COLUMNS: dept_name, emp_count
+ROW: Engineering | 3
+ROW: Sales | 2
+ROW: Marketing | 2
+ROW: HR | 1
+--- STMT 17 ---
+SQL: SELECT * FROM (SELECT name, salary, RANK() OVER (ORDER BY salary DESC) AS rnk FROM employees) ranked WHERE rnk <= 3
+RESULT: 3 columns, 3 rows
+COLUMNS: name, salary, rnk
+ROW: Alice | 95000.00 | 2
+ROW: Bob | 85000.00 | 3
+ROW: Hank | 110000.00 | 1
+--- STMT 18 ---
+SQL: -- === Correlated subquery === SELECT e.name, e.salary, (SELECT d.name FROM departments d WHERE d.id = e.dept_id) AS dept FROM employees e ORDER BY e.name
+RESULT: 3 columns, 9 rows
+COLUMNS: name, salary, dept
+ROW: Alice | 95000.00 | Engineering
+ROW: Bob | 85000.00 | Engineering
+ROW: Charlie | 70000.00 | Sales
+ROW: Diana | 75000.00 | Sales
+ROW: Eve | 65000.00 | Marketing
+ROW: Frank | 60000.00 | Marketing
+ROW: Grace | 80000.00 | HR
+ROW: Hank | 110000.00 | Engineering
+ROW: Ivy | 50000.00 | NULL
+--- STMT 19 ---
+SQL: SELECT e.name FROM employees e WHERE e.salary > (SELECT AVG(e2.salary) FROM employees e2 WHERE e2.dept_id = e.dept_id) ORDER BY e.name
+RESULT: 1 columns, 3 rows
+COLUMNS: name
+ROW: Diana
+ROW: Eve
+ROW: Hank
+--- STMT 20 ---
+SQL: -- === CTE: basic === WITH active_emps AS (SELECT * FROM employees WHERE active = true) SELECT COUNT(*) FROM active_emps
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 9
+--- STMT 21 ---
+SQL: WITH dept_stats AS ( SELECT dept_id, COUNT(*) AS cnt, AVG(salary) AS avg_sal FROM employees WHERE dept_id IS NOT NULL GROUP BY dept_id ) SELECT d.name, ds.cnt, ds.avg_sal::numeric(10,2) FROM dept_stat...
+RESULT: 3 columns, 4 rows
+COLUMNS: name, cnt, avg_sal
+ROW: Engineering | 3 | 96666.67
+ROW: HR | 1 | 80000.00
+ROW: Marketing | 2 | 62500.00
+ROW: Sales | 2 | 72500.00
+--- STMT 22 ---
+SQL: -- === CTE: multiple CTEs === WITH eng AS (SELECT * FROM employees WHERE dept_id = 1), sales AS (SELECT * FROM employees WHERE dept_id = 2) SELECT 'Engineering' AS dept, COUNT(*) AS cnt, AVG(salary)::...
+RESULT: 3 columns, 2 rows
+COLUMNS: dept, cnt, avg
+ROW: Engineering | 3 | 96666.67
+ROW: Sales | 2 | 72500.00
+--- STMT 23 ---
+SQL: -- === CTE with DML === CREATE TABLE archive (id int, name text, archived_at timestamp DEFAULT now())
+OK: 0 rows affected
+--- STMT 24 ---
+SQL: WITH removed AS ( DELETE FROM employees WHERE active = false RETURNING id, name ) INSERT INTO archive (id, name) SELECT id, name FROM removed
+OK: 0 rows affected
+--- STMT 25 ---
+SQL: SELECT * FROM archive
+RESULT: 3 columns, 0 rows
+COLUMNS: id, name, archived_at
+--- STMT 26 ---
+SQL: -- === Recursive CTE === CREATE TABLE tree (id serial PRIMARY KEY, parent_id int REFERENCES tree(id), label text)
+OK: 0 rows affected
+--- STMT 27 ---
+SQL: INSERT INTO tree (parent_id, label) VALUES (NULL, 'root'), (1, 'child1'), (1, 'child2'), (2, 'grandchild1'), (2, 'grandchild2'), (3, 'grandchild3')
+OK: 6 rows affected
+--- STMT 28 ---
+SQL: WITH RECURSIVE descendants AS ( SELECT id, parent_id, label, 0 AS depth FROM tree WHERE parent_id IS NULL UNION ALL SELECT t.id, t.parent_id, t.label, d.depth + 1 FROM tree t JOIN descendants d ON t.p...
+RESULT: 4 columns, 6 rows
+COLUMNS: id, parent_id, label, depth
+ROW: 1 | NULL | root | 0
+ROW: 2 | 1 | child1 | 1
+ROW: 3 | 1 | child2 | 1
+ROW: 4 | 2 | grandchild1 | 2
+ROW: 5 | 2 | grandchild2 | 2
+ROW: 6 | 3 | grandchild3 | 2
+--- STMT 29 ---
+SQL: -- === Set operations === SELECT name FROM employees WHERE dept_id = 1 UNION SELECT name FROM employees WHERE salary > 80000 ORDER BY name
+RESULT: 1 columns, 3 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+ROW: Hank
+--- STMT 30 ---
+SQL: SELECT name FROM employees WHERE dept_id = 1 UNION ALL SELECT name FROM employees WHERE salary > 80000 ORDER BY name
+RESULT: 1 columns, 6 rows
+COLUMNS: name
+ROW: Alice
+ROW: Alice
+ROW: Bob
+ROW: Bob
+ROW: Hank
+ROW: Hank
+--- STMT 31 ---
+SQL: SELECT name FROM employees WHERE dept_id = 1 INTERSECT SELECT name FROM employees WHERE salary > 80000 ORDER BY name
+RESULT: 1 columns, 3 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+ROW: Hank
+--- STMT 32 ---
+SQL: SELECT name FROM employees WHERE dept_id = 1 EXCEPT SELECT name FROM employees WHERE salary > 100000 ORDER BY name
+RESULT: 1 columns, 2 rows
+COLUMNS: name
+ROW: Alice
+ROW: Bob
+--- STMT 33 ---
+SQL: -- === UNION ALL inside EXISTS === SELECT EXISTS ( SELECT 1 FROM employees WHERE dept_id = 1 UNION ALL SELECT 1 FROM employees WHERE dept_id = 2 )
+RESULT: 1 columns, 1 rows
+COLUMNS: exists
+ROW: t
+--- STMT 34 ---
+SQL: -- === UNION ALL inside IN === SELECT name FROM departments WHERE id IN ( SELECT dept_id FROM employees WHERE salary > 90000 UNION SELECT dept_id FROM employees WHERE active = false ) ORDER BY name
+RESULT: 1 columns, 1 rows
+COLUMNS: name
+ROW: Engineering
+--- STMT 35 ---
+SQL: -- === INVALID: Subquery errors === -- Subquery returns multiple rows where scalar expected SELECT name FROM employees WHERE salary = (SELECT salary FROM employees)
+ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
+--- STMT 36 ---
+SQL: -- Column count mismatch in UNION SELECT name, salary FROM employees UNION SELECT name FROM employees
+ERROR [42601]: ERROR: each UNION query must have the same number of columns
+--- STMT 37 ---
+SQL: -- Recursive CTE without RECURSIVE keyword WITH bad_recursive AS ( SELECT 1 AS n UNION ALL SELECT n+1 FROM bad_recursive WHERE n < 5 ) SELECT * FROM bad_recursive
+ERROR [42P01]: ERROR: relation "bad_recursive" does not exist
+--- STMT 38 ---
+SQL: -- Cleanup DROP TABLE archive
+OK: 0 rows affected
+--- STMT 39 ---
+SQL: DROP TABLE tree
+OK: 0 rows affected
+--- STMT 40 ---
+SQL: DROP TABLE employees
+OK: 0 rows affected
+--- STMT 41 ---
+SQL: DROP TABLE departments
+OK: 0 rows affected
+
+=== FILE: 06_joins.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 06: JOINs and Advanced Queries -- ============================================================ -- Setup CREATE TABLE authors (id seri...
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: CREATE TABLE books (id serial PRIMARY KEY, title text NOT NULL, author_id int REFERENCES authors(id), published date, price numeric(8,2))
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE TABLE reviews (id serial PRIMARY KEY, book_id int REFERENCES books(id), rating int CHECK (rating BETWEEN 1 AND 5), comment text)
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: INSERT INTO authors (name, country) VALUES ('Author A', 'US'), ('Author B', 'UK'), ('Author C', 'FR'), ('Author D', NULL)
+OK: 4 rows affected
+--- STMT 5 ---
+SQL: INSERT INTO books (title, author_id, published, price) VALUES ('Book 1', 1, '2020-03-15', 19.99), ('Book 2', 1, '2021-07-01', 24.99), ('Book 3', 2, '2019-11-20', 14.99), ('Book 4', 2, '2022-01-10', 29...
+OK: 6 rows affected
+--- STMT 6 ---
+SQL: INSERT INTO reviews (book_id, rating, comment) VALUES (1, 5, 'Excellent'), (1, 4, 'Good read'), (2, 3, 'Average'), (3, 5, 'Masterpiece'), (3, 4, NULL), (4, 2, 'Disappointing'), (5, 5, 'Short but great...
+OK: 7 rows affected
+--- STMT 7 ---
+SQL: -- === INNER JOIN === SELECT b.title, a.name FROM books b INNER JOIN authors a ON a.id = b.author_id ORDER BY b.title
+RESULT: 2 columns, 5 rows
+COLUMNS: title, name
+ROW: Book 1 | Author A
+ROW: Book 2 | Author A
+ROW: Book 3 | Author B
+ROW: Book 4 | Author B
+ROW: Book 5 | Author C
+--- STMT 8 ---
+SQL: SELECT b.title, a.name FROM books b JOIN authors a ON a.id = b.author_id ORDER BY b.title
+RESULT: 2 columns, 5 rows
+COLUMNS: title, name
+ROW: Book 1 | Author A
+ROW: Book 2 | Author A
+ROW: Book 3 | Author B
+ROW: Book 4 | Author B
+ROW: Book 5 | Author C
+--- STMT 9 ---
+SQL: SELECT b.title, r.rating FROM books b JOIN reviews r ON r.book_id = b.id ORDER BY b.title, r.rating
+RESULT: 2 columns, 7 rows
+COLUMNS: title, rating
+ROW: Book 1 | 4
+ROW: Book 1 | 5
+ROW: Book 2 | 3
+ROW: Book 3 | 4
+ROW: Book 3 | 5
+ROW: Book 4 | 2
+ROW: Book 5 | 5
+--- STMT 10 ---
+SQL: -- === LEFT JOIN === SELECT b.title, a.name FROM books b LEFT JOIN authors a ON a.id = b.author_id ORDER BY b.title
+RESULT: 2 columns, 6 rows
+COLUMNS: title, name
+ROW: Book 1 | Author A
+ROW: Book 2 | Author A
+ROW: Book 3 | Author B
+ROW: Book 4 | Author B
+ROW: Book 5 | Author C
+ROW: Book 6 | NULL
+--- STMT 11 ---
+SQL: SELECT a.name, b.title FROM authors a LEFT JOIN books b ON b.author_id = a.id ORDER BY a.name, b.title
+RESULT: 2 columns, 6 rows
+COLUMNS: name, title
+ROW: Author A | Book 1
+ROW: Author A | Book 2
+ROW: Author B | Book 3
+ROW: Author B | Book 4
+ROW: Author C | Book 5
+ROW: Author D | NULL
+--- STMT 12 ---
+SQL: SELECT a.name, COUNT(b.id) AS book_count FROM authors a LEFT JOIN books b ON b.author_id = a.id GROUP BY a.name ORDER BY a.name
+RESULT: 2 columns, 4 rows
+COLUMNS: name, book_count
+ROW: Author A | 2
+ROW: Author B | 2
+ROW: Author C | 1
+ROW: Author D | 0
+--- STMT 13 ---
+SQL: -- === RIGHT JOIN === SELECT b.title, a.name FROM books b RIGHT JOIN authors a ON a.id = b.author_id ORDER BY a.name, b.title
+RESULT: 2 columns, 6 rows
+COLUMNS: title, name
+ROW: Book 1 | Author A
+ROW: Book 2 | Author A
+ROW: Book 3 | Author B
+ROW: Book 4 | Author B
+ROW: Book 5 | Author C
+ROW: NULL | Author D
+--- STMT 14 ---
+SQL: -- === FULL OUTER JOIN === SELECT a.name, b.title FROM authors a FULL OUTER JOIN books b ON a.id = b.author_id ORDER BY a.name, b.title
+RESULT: 2 columns, 7 rows
+COLUMNS: name, title
+ROW: Author A | Book 1
+ROW: Author A | Book 2
+ROW: Author B | Book 3
+ROW: Author B | Book 4
+ROW: Author C | Book 5
+ROW: Author D | NULL
+ROW: NULL | Book 6
+--- STMT 15 ---
+SQL: -- === CROSS JOIN === SELECT a.name, b.title FROM authors a CROSS JOIN books b WHERE a.id = 1 ORDER BY b.title
+RESULT: 2 columns, 6 rows
+COLUMNS: name, title
+ROW: Author A | Book 1
+ROW: Author A | Book 2
+ROW: Author A | Book 3
+ROW: Author A | Book 4
+ROW: Author A | Book 5
+ROW: Author A | Book 6
+--- STMT 16 ---
+SQL: SELECT COUNT(*) FROM authors CROSS JOIN books
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 24
+--- STMT 17 ---
+SQL: -- === Multi-table JOIN === SELECT a.name, b.title, r.rating FROM authors a JOIN books b ON b.author_id = a.id JOIN reviews r ON r.book_id = b.id ORDER BY a.name, b.title, r.rating
+RESULT: 3 columns, 7 rows
+COLUMNS: name, title, rating
+ROW: Author A | Book 1 | 4
+ROW: Author A | Book 1 | 5
+ROW: Author A | Book 2 | 3
+ROW: Author B | Book 3 | 4
+ROW: Author B | Book 3 | 5
+ROW: Author B | Book 4 | 2
+ROW: Author C | Book 5 | 5
+--- STMT 18 ---
+SQL: SELECT a.name, b.title, r.rating, r.comment FROM authors a JOIN books b ON b.author_id = a.id LEFT JOIN reviews r ON r.book_id = b.id ORDER BY a.name, b.title
+RESULT: 4 columns, 7 rows
+COLUMNS: name, title, rating, comment
+ROW: Author A | Book 1 | 5 | Excellent
+ROW: Author A | Book 1 | 4 | Good read
+ROW: Author A | Book 2 | 3 | Average
+ROW: Author B | Book 3 | 5 | Masterpiece
+ROW: Author B | Book 3 | 4 | NULL
+ROW: Author B | Book 4 | 2 | Disappointing
+ROW: Author C | Book 5 | 5 | Short but great
+--- STMT 19 ---
+SQL: -- === Self-join === SELECT b1.title, b2.title FROM books b1 JOIN books b2 ON b1.author_id = b2.author_id AND b1.id < b2.id ORDER BY b1.title
+RESULT: 2 columns, 2 rows
+COLUMNS: title, title
+ROW: Book 1 | Book 2
+ROW: Book 3 | Book 4
+--- STMT 20 ---
+SQL: -- === JOIN with USING === CREATE TABLE t_join1 (id int PRIMARY KEY, val text)
+OK: 0 rows affected
+--- STMT 21 ---
+SQL: CREATE TABLE t_join2 (id int PRIMARY KEY, info text)
+OK: 0 rows affected
+--- STMT 22 ---
+SQL: INSERT INTO t_join1 VALUES (1, 'a'), (2, 'b'), (3, 'c')
+OK: 3 rows affected
+--- STMT 23 ---
+SQL: INSERT INTO t_join2 VALUES (2, 'x'), (3, 'y'), (4, 'z')
+OK: 3 rows affected
+--- STMT 24 ---
+SQL: SELECT * FROM t_join1 JOIN t_join2 USING (id) ORDER BY id
+RESULT: 3 columns, 2 rows
+COLUMNS: id, val, info
+ROW: 2 | b | x
+ROW: 3 | c | y
+--- STMT 25 ---
+SQL: SELECT * FROM t_join1 LEFT JOIN t_join2 USING (id) ORDER BY id
+RESULT: 3 columns, 3 rows
+COLUMNS: id, val, info
+ROW: 1 | a | NULL
+ROW: 2 | b | x
+ROW: 3 | c | y
+--- STMT 26 ---
+SQL: DROP TABLE t_join1
+OK: 0 rows affected
+--- STMT 27 ---
+SQL: DROP TABLE t_join2
+OK: 0 rows affected
+--- STMT 28 ---
+SQL: -- === NATURAL JOIN === CREATE TABLE nat1 (id int, name text)
+OK: 0 rows affected
+--- STMT 29 ---
+SQL: CREATE TABLE nat2 (id int, city text)
+OK: 0 rows affected
+--- STMT 30 ---
+SQL: INSERT INTO nat1 VALUES (1, 'Alice'), (2, 'Bob')
+OK: 2 rows affected
+--- STMT 31 ---
+SQL: INSERT INTO nat2 VALUES (1, 'NYC'), (3, 'London')
+OK: 2 rows affected
+--- STMT 32 ---
+SQL: SELECT * FROM nat1 NATURAL JOIN nat2
+RESULT: 3 columns, 1 rows
+COLUMNS: id, name, city
+ROW: 1 | Alice | NYC
+--- STMT 33 ---
+SQL: SELECT * FROM nat1 NATURAL LEFT JOIN nat2 ORDER BY id
+RESULT: 3 columns, 2 rows
+COLUMNS: id, name, city
+ROW: 1 | Alice | NYC
+ROW: 2 | Bob | NULL
+--- STMT 34 ---
+SQL: DROP TABLE nat1
+OK: 0 rows affected
+--- STMT 35 ---
+SQL: DROP TABLE nat2
+OK: 0 rows affected
+--- STMT 36 ---
+SQL: -- === Parenthesized JOINs (pg_dump style) === SELECT a.name, b.title, r.rating FROM ((authors a JOIN books b ON ((b.author_id = a.id))) JOIN reviews r ON ((r.book_id = b.id))) ORDER BY a.name, b.titl...
+RESULT: 3 columns, 7 rows
+COLUMNS: name, title, rating
+ROW: Author A | Book 1 | 5
+ROW: Author A | Book 1 | 4
+ROW: Author A | Book 2 | 3
+ROW: Author B | Book 3 | 5
+ROW: Author B | Book 3 | 4
+ROW: Author B | Book 4 | 2
+ROW: Author C | Book 5 | 5
+--- STMT 37 ---
+SQL: -- === LATERAL JOIN === SELECT a.name, top_book.title, top_book.price FROM authors a LEFT JOIN LATERAL ( SELECT title, price FROM books WHERE author_id = a.id ORDER BY price DESC LIMIT 1 ) top_book ON...
+RESULT: 3 columns, 4 rows
+COLUMNS: name, title, price
+ROW: Author A | Book 2 | 24.99
+ROW: Author B | Book 4 | 29.99
+ROW: Author C | Book 5 | 9.99
+ROW: Author D | NULL | NULL
+--- STMT 38 ---
+SQL: -- === DISTINCT ON === SELECT DISTINCT ON (author_id) author_id, title, price FROM books WHERE author_id IS NOT NULL ORDER BY author_id, price DESC
+RESULT: 3 columns, 3 rows
+COLUMNS: author_id, title, price
+ROW: 1 | Book 2 | 24.99
+ROW: 2 | Book 4 | 29.99
+ROW: 3 | Book 5 | 9.99
+--- STMT 39 ---
+SQL: -- === Window functions === SELECT name, salary, ROW_NUMBER() OVER (ORDER BY salary DESC) AS rn FROM (SELECT a.name, b.price AS salary FROM authors a JOIN books b ON b.author_id = a.id) sub ORDER BY r...
+RESULT: 3 columns, 5 rows
+COLUMNS: name, salary, rn
+ROW: Author B | 29.99 | 1
+ROW: Author A | 24.99 | 2
+ROW: Author A | 19.99 | 3
+ROW: Author B | 14.99 | 4
+ROW: Author C | 9.99 | 5
+--- STMT 40 ---
+SQL: SELECT title, price, RANK() OVER (ORDER BY price DESC) AS rnk FROM books ORDER BY rnk
+RESULT: 3 columns, 6 rows
+COLUMNS: title, price, rnk
+ROW: Book 4 | 29.99 | 1
+ROW: Book 2 | 24.99 | 2
+ROW: Book 1 | 19.99 | 3
+ROW: Book 3 | 14.99 | 4
+ROW: Book 6 | 12.99 | 5
+ROW: Book 5 | 9.99 | 6
+--- STMT 41 ---
+SQL: SELECT title, price, SUM(price) OVER (ORDER BY published) AS running_total FROM books WHERE price IS NOT NULL ORDER BY published
+RESULT: 3 columns, 6 rows
+COLUMNS: title, price, running_total
+ROW: Book 3 | 14.99 | 14.99
+ROW: Book 1 | 19.99 | 34.98
+ROW: Book 6 | 12.99 | 47.97
+ROW: Book 2 | 24.99 | 72.96
+ROW: Book 4 | 29.99 | 102.95
+ROW: Book 5 | 9.99 | 112.94
+--- STMT 42 ---
+SQL: SELECT title, author_id, price, AVG(price) OVER (PARTITION BY author_id) AS avg_by_author FROM books WHERE author_id IS NOT NULL ORDER BY author_id, title
+RESULT: 4 columns, 5 rows
+COLUMNS: title, author_id, price, avg_by_author
+ROW: Book 1 | 1 | 19.99 | 22.4900000000000000
+ROW: Book 2 | 1 | 24.99 | 22.4900000000000000
+ROW: Book 3 | 2 | 14.99 | 22.4900000000000000
+ROW: Book 4 | 2 | 29.99 | 22.4900000000000000
+ROW: Book 5 | 3 | 9.99 | 9.9900000000000000
+--- STMT 43 ---
+SQL: -- === VALUES clause === SELECT * FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three')) AS t(num, word) ORDER BY num
+RESULT: 2 columns, 3 rows
+COLUMNS: num, word
+ROW: 1 | one
+ROW: 2 | two
+ROW: 3 | three
+--- STMT 44 ---
+SQL: SELECT * FROM (VALUES (1, 'one'), (2, 'two')) AS t(id, label) JOIN authors a ON a.id = t.id
+RESULT: 5 columns, 2 rows
+COLUMNS: id, label, id, name, country
+ROW: 1 | one | 1 | Author A | US
+ROW: 2 | two | 2 | Author B | UK
+--- STMT 45 ---
+SQL: -- === INVALID: JOIN errors === -- Ambiguous column SELECT id FROM authors JOIN books ON books.author_id = authors.id
+ERROR [42702]: ERROR: column reference "id" is ambiguous
+--- STMT 46 ---
+SQL: -- Missing ON clause for non-CROSS join SELECT * FROM authors JOIN books
+ERROR [42601]: ERROR: JOIN requires ON or USING clause at position 72 near ''
+--- STMT 47 ---
+SQL: -- Reference to unknown table in ON SELECT * FROM authors a JOIN books b ON b.author_id = c.id
+ERROR [42P01]: ERROR: missing FROM-clause entry for table "c"
+--- STMT 48 ---
+SQL: -- Cleanup DROP TABLE reviews
+OK: 0 rows affected
+--- STMT 49 ---
+SQL: DROP TABLE books
+OK: 0 rows affected
+--- STMT 50 ---
+SQL: DROP TABLE authors
+OK: 0 rows affected
+
+=== FILE: 07_functions_expressions.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 07: Built-in Functions and Expressions -- ============================================================ -- === String functions === SE...
+RESULT: 1 columns, 1 rows
+COLUMNS: length
+ROW: 5
+--- STMT 2 ---
+SQL: SELECT CHAR_LENGTH('hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: char_length
+ROW: 5
+--- STMT 3 ---
+SQL: SELECT OCTET_LENGTH('hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: octet_length
+ROW: 5
+--- STMT 4 ---
+SQL: SELECT UPPER('hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: upper
+ROW: HELLO
+--- STMT 5 ---
+SQL: SELECT LOWER('HELLO')
+RESULT: 1 columns, 1 rows
+COLUMNS: lower
+ROW: hello
+--- STMT 6 ---
+SQL: SELECT TRIM(' hello ')
+RESULT: 1 columns, 1 rows
+COLUMNS: btrim
+ROW: hello
+--- STMT 7 ---
+SQL: SELECT LTRIM(' hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: ltrim
+ROW: hello
+--- STMT 8 ---
+SQL: SELECT RTRIM('hello ')
+RESULT: 1 columns, 1 rows
+COLUMNS: rtrim
+ROW: hello
+--- STMT 9 ---
+SQL: SELECT TRIM(BOTH 'x' FROM 'xxxhelloxxx')
+RESULT: 1 columns, 1 rows
+COLUMNS: btrim
+ROW: hello
+--- STMT 10 ---
+SQL: SELECT TRIM(LEADING 'x' FROM 'xxxhello')
+RESULT: 1 columns, 1 rows
+COLUMNS: ltrim
+ROW: hello
+--- STMT 11 ---
+SQL: SELECT TRIM(TRAILING 'x' FROM 'helloxxx')
+RESULT: 1 columns, 1 rows
+COLUMNS: rtrim
+ROW: hello
+--- STMT 12 ---
+SQL: SELECT SUBSTRING('hello world' FROM 7)
+RESULT: 1 columns, 1 rows
+COLUMNS: substring
+ROW: world
+--- STMT 13 ---
+SQL: SELECT SUBSTRING('hello world' FROM 1 FOR 5)
+RESULT: 1 columns, 1 rows
+COLUMNS: substring
+ROW: hello
+--- STMT 14 ---
+SQL: SELECT POSITION('world' IN 'hello world')
+RESULT: 1 columns, 1 rows
+COLUMNS: position
+ROW: 7
+--- STMT 15 ---
+SQL: SELECT REPLACE('hello world', 'world', 'there')
+RESULT: 1 columns, 1 rows
+COLUMNS: replace
+ROW: hello there
+--- STMT 16 ---
+SQL: SELECT OVERLAY('hello world' PLACING 'THERE' FROM 7)
+RESULT: 1 columns, 1 rows
+COLUMNS: overlay
+ROW: hello THERE
+--- STMT 17 ---
+SQL: SELECT CONCAT('hello', ' ', 'world')
+RESULT: 1 columns, 1 rows
+COLUMNS: concat
+ROW: hello world
+--- STMT 18 ---
+SQL: SELECT CONCAT_WS(', ', 'a', 'b', 'c')
+RESULT: 1 columns, 1 rows
+COLUMNS: concat_ws
+ROW: a, b, c
+--- STMT 19 ---
+SQL: SELECT CONCAT_WS(', ', 'a', NULL, 'c')
+RESULT: 1 columns, 1 rows
+COLUMNS: concat_ws
+ROW: a, c
+--- STMT 20 ---
+SQL: SELECT LEFT('hello', 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: left
+ROW: hel
+--- STMT 21 ---
+SQL: SELECT RIGHT('hello', 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: right
+ROW: llo
+--- STMT 22 ---
+SQL: SELECT REPEAT('ab', 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: repeat
+ROW: ababab
+--- STMT 23 ---
+SQL: SELECT REVERSE('hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: reverse
+ROW: olleh
+--- STMT 24 ---
+SQL: SELECT LPAD('42', 5, '0')
+RESULT: 1 columns, 1 rows
+COLUMNS: lpad
+ROW: 00042
+--- STMT 25 ---
+SQL: SELECT RPAD('hello', 10, '.')
+RESULT: 1 columns, 1 rows
+COLUMNS: rpad
+ROW: hello.....
+--- STMT 26 ---
+SQL: SELECT SPLIT_PART('a.b.c', '.', 2)
+RESULT: 1 columns, 1 rows
+COLUMNS: split_part
+ROW: b
+--- STMT 27 ---
+SQL: SELECT TRANSLATE('hello', 'helo', 'HELO')
+RESULT: 1 columns, 1 rows
+COLUMNS: translate
+ROW: HELLO
+--- STMT 28 ---
+SQL: SELECT INITCAP('hello world')
+RESULT: 1 columns, 1 rows
+COLUMNS: initcap
+ROW: Hello World
+--- STMT 29 ---
+SQL: SELECT MD5('hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: md5
+ROW: 5d41402abc4b2a76b9719d911017c592
+--- STMT 30 ---
+SQL: SELECT ENCODE('hello'::bytea, 'hex')
+RESULT: 1 columns, 1 rows
+COLUMNS: encode
+ROW: 68656c6c6f
+--- STMT 31 ---
+SQL: SELECT DECODE('68656c6c6f', 'hex')
+RESULT: 1 columns, 1 rows
+COLUMNS: decode
+ROW: \\x68656c6c6f
+--- STMT 32 ---
+SQL: SELECT 'hello' || ' ' || 'world'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: hello world
+--- STMT 33 ---
+SQL: SELECT 'hello' LIKE 'hel%'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 34 ---
+SQL: SELECT 'hello' LIKE 'H%'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 35 ---
+SQL: SELECT 'hello' ILIKE 'H%'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 36 ---
+SQL: SELECT 'hello' SIMILAR TO 'h(e|a)llo'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 37 ---
+SQL: SELECT 'hello' ~ 'hel+o'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 38 ---
+SQL: SELECT 'hello' ~* 'HEL+O'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 39 ---
+SQL: SELECT 'hello' !~ 'xyz'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 40 ---
+SQL: SELECT 'hello' !~* 'XYZ'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 41 ---
+SQL: SELECT REGEXP_REPLACE('hello world', 'world', 'there')
+RESULT: 1 columns, 1 rows
+COLUMNS: regexp_replace
+ROW: hello there
+--- STMT 42 ---
+SQL: SELECT REGEXP_REPLACE('aaa bbb ccc', '[a-z]+', 'X', 'g')
+RESULT: 1 columns, 1 rows
+COLUMNS: regexp_replace
+ROW: X X X
+--- STMT 43 ---
+SQL: SELECT REGEXP_MATCHES('abc 123 def 456', '\d+', 'g')
+RESULT: 1 columns, 2 rows
+COLUMNS: regexp_matches
+ROW: {123}
+ROW: {456}
+--- STMT 44 ---
+SQL: SELECT CHR(65)
+RESULT: 1 columns, 1 rows
+COLUMNS: chr
+ROW: A
+--- STMT 45 ---
+SQL: SELECT ASCII('A')
+RESULT: 1 columns, 1 rows
+COLUMNS: ascii
+ROW: 65
+--- STMT 46 ---
+SQL: SELECT FORMAT('Hello %s, you are %s', 'Alice', 'great')
+RESULT: 1 columns, 1 rows
+COLUMNS: format
+ROW: Hello Alice, you are great
+--- STMT 47 ---
+SQL: SELECT QUOTE_LITERAL('hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: quote_literal
+ROW: 'hello'
+--- STMT 48 ---
+SQL: SELECT QUOTE_IDENT('my column')
+RESULT: 1 columns, 1 rows
+COLUMNS: quote_ident
+ROW: "my column"
+--- STMT 49 ---
+SQL: SELECT TO_HEX(255)
+RESULT: 1 columns, 1 rows
+COLUMNS: to_hex
+ROW: ff
+--- STMT 50 ---
+SQL: -- === Math functions === SELECT ABS(-42)
+RESULT: 1 columns, 1 rows
+COLUMNS: abs
+ROW: 42
+--- STMT 51 ---
+SQL: SELECT CEIL(4.2)
+RESULT: 1 columns, 1 rows
+COLUMNS: ceil
+ROW: 5
+--- STMT 52 ---
+SQL: SELECT CEILING(4.2)
+RESULT: 1 columns, 1 rows
+COLUMNS: ceiling
+ROW: 5
+--- STMT 53 ---
+SQL: SELECT FLOOR(4.7)
+RESULT: 1 columns, 1 rows
+COLUMNS: floor
+ROW: 4
+--- STMT 54 ---
+SQL: SELECT ROUND(4.567, 2)
+RESULT: 1 columns, 1 rows
+COLUMNS: round
+ROW: 4.57
+--- STMT 55 ---
+SQL: SELECT ROUND(4.5)
+RESULT: 1 columns, 1 rows
+COLUMNS: round
+ROW: 5
+--- STMT 56 ---
+SQL: SELECT TRUNC(4.567, 1)
+RESULT: 1 columns, 1 rows
+COLUMNS: trunc
+ROW: 4.5
+--- STMT 57 ---
+SQL: SELECT SIGN(-5)
+RESULT: 1 columns, 1 rows
+COLUMNS: sign
+ROW: -1
+--- STMT 58 ---
+SQL: SELECT SIGN(5)
+RESULT: 1 columns, 1 rows
+COLUMNS: sign
+ROW: 1
+--- STMT 59 ---
+SQL: SELECT SIGN(0)
+RESULT: 1 columns, 1 rows
+COLUMNS: sign
+ROW: 0
+--- STMT 60 ---
+SQL: SELECT MOD(17, 5)
+RESULT: 1 columns, 1 rows
+COLUMNS: mod
+ROW: 2
+--- STMT 61 ---
+SQL: SELECT POWER(2, 10)
+RESULT: 1 columns, 1 rows
+COLUMNS: power
+ROW: 1024
+--- STMT 62 ---
+SQL: SELECT SQRT(144)
+RESULT: 1 columns, 1 rows
+COLUMNS: sqrt
+ROW: 12
+--- STMT 63 ---
+SQL: SELECT CBRT(27)
+RESULT: 1 columns, 1 rows
+COLUMNS: cbrt
+ROW: 3
+--- STMT 64 ---
+SQL: SELECT PI()
+RESULT: 1 columns, 1 rows
+COLUMNS: pi
+ROW: 3.141592653589793
+--- STMT 65 ---
+SQL: SELECT RANDOM()
+RESULT: 1 columns, 1 rows
+COLUMNS: random
+ROW: 0.37083149859097386
+--- STMT 66 ---
+SQL: SELECT GREATEST(1, 5, 3, 9, 2)
+RESULT: 1 columns, 1 rows
+COLUMNS: greatest
+ROW: 9
+--- STMT 67 ---
+SQL: SELECT LEAST(1, 5, 3, 9, 2)
+RESULT: 1 columns, 1 rows
+COLUMNS: least
+ROW: 1
+--- STMT 68 ---
+SQL: SELECT LOG(100)
+RESULT: 1 columns, 1 rows
+COLUMNS: log
+ROW: 2
+--- STMT 69 ---
+SQL: SELECT LN(2.71828)
+RESULT: 1 columns, 1 rows
+COLUMNS: ln
+ROW: 0.999999327347282
+--- STMT 70 ---
+SQL: SELECT EXP(1)
+RESULT: 1 columns, 1 rows
+COLUMNS: exp
+ROW: 2.718281828459045
+--- STMT 71 ---
+SQL: SELECT DEGREES(PI())
+RESULT: 1 columns, 1 rows
+COLUMNS: degrees
+ROW: 180
+--- STMT 72 ---
+SQL: SELECT RADIANS(180)
+RESULT: 1 columns, 1 rows
+COLUMNS: radians
+ROW: 3.141592653589793
+--- STMT 73 ---
+SQL: SELECT SIN(0)
+RESULT: 1 columns, 1 rows
+COLUMNS: sin
+ROW: 0
+--- STMT 74 ---
+SQL: SELECT COS(0)
+RESULT: 1 columns, 1 rows
+COLUMNS: cos
+ROW: 1
+--- STMT 75 ---
+SQL: SELECT TAN(0)
+RESULT: 1 columns, 1 rows
+COLUMNS: tan
+ROW: 0
+--- STMT 76 ---
+SQL: SELECT ASIN(1)
+RESULT: 1 columns, 1 rows
+COLUMNS: asin
+ROW: 1.5707963267948966
+--- STMT 77 ---
+SQL: SELECT ACOS(1)
+RESULT: 1 columns, 1 rows
+COLUMNS: acos
+ROW: 0
+--- STMT 78 ---
+SQL: SELECT ATAN(1)
+RESULT: 1 columns, 1 rows
+COLUMNS: atan
+ROW: 0.7853981633974483
+--- STMT 79 ---
+SQL: SELECT ATAN2(1, 1)
+RESULT: 1 columns, 1 rows
+COLUMNS: atan2
+ROW: 0.7853981633974483
+--- STMT 80 ---
+SQL: SELECT GCD(12, 8)
+RESULT: 1 columns, 1 rows
+COLUMNS: gcd
+ROW: 4
+--- STMT 81 ---
+SQL: SELECT LCM(12, 8)
+RESULT: 1 columns, 1 rows
+COLUMNS: lcm
+ROW: 24
+--- STMT 82 ---
+SQL: SELECT WIDTH_BUCKET(5.5, 0, 10, 5)
+RESULT: 1 columns, 1 rows
+COLUMNS: width_bucket
+ROW: 3
+--- STMT 83 ---
+SQL: SELECT FACTORIAL(5)
+RESULT: 1 columns, 1 rows
+COLUMNS: factorial
+ROW: 120
+--- STMT 84 ---
+SQL: SELECT DIV(17, 5)
+RESULT: 1 columns, 1 rows
+COLUMNS: div
+ROW: 3
+--- STMT 85 ---
+SQL: -- === Date/time functions === SELECT CURRENT_DATE
+RESULT: 1 columns, 1 rows
+COLUMNS: current_date
+ROW: 2026-04-02
+--- STMT 86 ---
+SQL: SELECT CURRENT_TIME
+RESULT: 1 columns, 1 rows
+COLUMNS: current_time
+ROW: 18:51:11.264351
+--- STMT 87 ---
+SQL: SELECT CURRENT_TIMESTAMP
+RESULT: 1 columns, 1 rows
+COLUMNS: current_timestamp
+ROW: 2026-04-02 16:51:11.264351+00
+--- STMT 88 ---
+SQL: SELECT NOW()
+RESULT: 1 columns, 1 rows
+COLUMNS: now
+ROW: 2026-04-02 16:51:11.264351+00
+--- STMT 89 ---
+SQL: SELECT LOCALTIME
+RESULT: 1 columns, 1 rows
+COLUMNS: localtime
+ROW: 18:51:11.265351
+--- STMT 90 ---
+SQL: SELECT LOCALTIMESTAMP
+RESULT: 1 columns, 1 rows
+COLUMNS: localtimestamp
+ROW: 2026-04-02 18:51:11.265351
+--- STMT 91 ---
+SQL: SELECT DATE_PART('year', TIMESTAMP '2024-06-15 10:30:00')
+RESULT: 1 columns, 1 rows
+COLUMNS: date_part
+ROW: 2024
+--- STMT 92 ---
+SQL: SELECT DATE_PART('month', TIMESTAMP '2024-06-15 10:30:00')
+RESULT: 1 columns, 1 rows
+COLUMNS: date_part
+ROW: 6
+--- STMT 93 ---
+SQL: SELECT DATE_PART('day', TIMESTAMP '2024-06-15 10:30:00')
+RESULT: 1 columns, 1 rows
+COLUMNS: date_part
+ROW: 15
+--- STMT 94 ---
+SQL: SELECT DATE_PART('hour', TIMESTAMP '2024-06-15 10:30:00')
+RESULT: 1 columns, 1 rows
+COLUMNS: date_part
+ROW: 10
+--- STMT 95 ---
+SQL: SELECT EXTRACT(YEAR FROM DATE '2024-06-15')
+RESULT: 1 columns, 1 rows
+COLUMNS: extract
+ROW: 2024
+--- STMT 96 ---
+SQL: SELECT EXTRACT(DOW FROM DATE '2024-06-15')
+RESULT: 1 columns, 1 rows
+COLUMNS: extract
+ROW: 6
+--- STMT 97 ---
+SQL: SELECT EXTRACT(EPOCH FROM TIMESTAMP '2024-01-01 00:00:00')
+RESULT: 1 columns, 1 rows
+COLUMNS: extract
+ROW: 1704067200
+--- STMT 98 ---
+SQL: SELECT DATE_TRUNC('year', TIMESTAMP '2024-06-15 10:30:00')
+RESULT: 1 columns, 1 rows
+COLUMNS: date_trunc
+ROW: 2024-01-01 00:00:00
+--- STMT 99 ---
+SQL: SELECT DATE_TRUNC('month', TIMESTAMP '2024-06-15 10:30:00')
+RESULT: 1 columns, 1 rows
+COLUMNS: date_trunc
+ROW: 2024-06-01 00:00:00
+--- STMT 100 ---
+SQL: SELECT DATE_TRUNC('day', TIMESTAMP '2024-06-15 10:30:45')
+RESULT: 1 columns, 1 rows
+COLUMNS: date_trunc
+ROW: 2024-06-15 00:00:00
+--- STMT 101 ---
+SQL: SELECT AGE(TIMESTAMP '2024-06-15', TIMESTAMP '2020-01-01')
+RESULT: 1 columns, 1 rows
+COLUMNS: age
+ROW: 4 years 5 mons 14 days
+--- STMT 102 ---
+SQL: SELECT TO_CHAR(TIMESTAMP '2024-06-15 10:30:00', 'YYYY-MM-DD HH24:MI:SS')
+RESULT: 1 columns, 1 rows
+COLUMNS: to_char
+ROW: 2024-06-15 10:30:00
+--- STMT 103 ---
+SQL: SELECT TO_CHAR(12345.67, '99999.99')
+RESULT: 1 columns, 1 rows
+COLUMNS: to_char
+ROW:  12345.67
+--- STMT 104 ---
+SQL: SELECT TO_CHAR(DATE '2024-06-15', 'Day, Month DD, YYYY')
+RESULT: 1 columns, 1 rows
+COLUMNS: to_char
+ROW: Saturday , June      15, 2024
+--- STMT 105 ---
+SQL: SELECT TO_DATE('2024-06-15', 'YYYY-MM-DD')
+RESULT: 1 columns, 1 rows
+COLUMNS: to_date
+ROW: 2024-06-15
+--- STMT 106 ---
+SQL: SELECT TO_TIMESTAMP('2024-06-15 10:30:00', 'YYYY-MM-DD HH24:MI:SS')
+RESULT: 1 columns, 1 rows
+COLUMNS: to_timestamp
+ROW: 2024-06-15 10:30:00+00
+--- STMT 107 ---
+SQL: SELECT MAKE_DATE(2024, 6, 15)
+RESULT: 1 columns, 1 rows
+COLUMNS: make_date
+ROW: 2024-06-15
+--- STMT 108 ---
+SQL: SELECT MAKE_TIME(10, 30, 0)
+RESULT: 1 columns, 1 rows
+COLUMNS: make_time
+ROW: 10:30:00
+--- STMT 109 ---
+SQL: SELECT MAKE_TIMESTAMP(2024, 6, 15, 10, 30, 0)
+RESULT: 1 columns, 1 rows
+COLUMNS: make_timestamp
+ROW: 2024-06-15 10:30:00
+--- STMT 110 ---
+SQL: SELECT MAKE_INTERVAL(years => 1, months => 2, days => 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: make_interval
+ROW: 1 year 2 mons 3 days
+--- STMT 111 ---
+SQL: SELECT '2024-01-15'::date + INTERVAL '30 days'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 2024-02-14 00:00:00
+--- STMT 112 ---
+SQL: SELECT '2024-01-15'::date - INTERVAL '1 month'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 2023-12-15 00:00:00
+--- STMT 113 ---
+SQL: SELECT ISFINITE(DATE '2024-01-01')
+RESULT: 1 columns, 1 rows
+COLUMNS: isfinite
+ROW: t
+--- STMT 114 ---
+SQL: SELECT ISFINITE('infinity'::timestamp)
+RESULT: 1 columns, 1 rows
+COLUMNS: isfinite
+ROW: f
+--- STMT 115 ---
+SQL: SELECT JUSTIFY_INTERVAL(INTERVAL '1 month -1 day')
+RESULT: 1 columns, 1 rows
+COLUMNS: justify_interval
+ROW: 29 days
+--- STMT 116 ---
+SQL: -- === Conditional expressions === SELECT CASE WHEN 1 > 0 THEN 'yes' ELSE 'no' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: yes
+--- STMT 117 ---
+SQL: SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 1 > 0 THEN 'b' ELSE 'c' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: b
+--- STMT 118 ---
+SQL: SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: two
+--- STMT 119 ---
+SQL: SELECT COALESCE(NULL, NULL, 'fallback')
+RESULT: 1 columns, 1 rows
+COLUMNS: coalesce
+ROW: fallback
+--- STMT 120 ---
+SQL: SELECT COALESCE(42, 0)
+RESULT: 1 columns, 1 rows
+COLUMNS: coalesce
+ROW: 42
+--- STMT 121 ---
+SQL: SELECT NULLIF(1, 1)
+RESULT: 1 columns, 1 rows
+COLUMNS: nullif
+ROW: NULL
+--- STMT 122 ---
+SQL: SELECT NULLIF(1, 2)
+RESULT: 1 columns, 1 rows
+COLUMNS: nullif
+ROW: 1
+--- STMT 123 ---
+SQL: SELECT GREATEST(1, NULL, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: greatest
+ROW: 3
+--- STMT 124 ---
+SQL: SELECT LEAST(1, NULL, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: least
+ROW: 1
+--- STMT 125 ---
+SQL: -- === JSON/JSONB functions === SELECT '{"a":1,"b":2}'::jsonb -> 'a'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 126 ---
+SQL: SELECT '{"a":1,"b":2}'::jsonb ->> 'a'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 127 ---
+SQL: SELECT '{"a":{"b":3}}'::jsonb #> '{a,b}'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 3
+--- STMT 128 ---
+SQL: SELECT '{"a":{"b":3}}'::jsonb #>> '{a,b}'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 3
+--- STMT 129 ---
+SQL: SELECT '{"a":1}'::jsonb ? 'a'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 130 ---
+SQL: SELECT '{"a":1}'::jsonb ? 'x'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 131 ---
+SQL: SELECT '{"a":1,"b":2}'::jsonb - 'a'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: {"b": 2}
+--- STMT 132 ---
+SQL: SELECT JSONB_BUILD_OBJECT('key', 'value', 'num', 42)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_build_object
+ROW: {"key": "value", "num": 42}
+--- STMT 133 ---
+SQL: SELECT JSONB_BUILD_ARRAY(1, 'two', true, null)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_build_array
+ROW: [1, "two", true, null]
+--- STMT 134 ---
+SQL: SELECT JSONB_OBJECT_AGG(key, value) FROM (VALUES ('a', '1'), ('b', '2')) AS t(key, value)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_object_agg
+ROW: {"a": "1", "b": "2"}
+--- STMT 135 ---
+SQL: SELECT JSONB_ARRAY_LENGTH('[1,2,3]'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_array_length
+ROW: 3
+--- STMT 136 ---
+SQL: SELECT JSONB_TYPEOF('42'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_typeof
+ROW: number
+--- STMT 137 ---
+SQL: SELECT JSONB_TYPEOF('"hello"'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_typeof
+ROW: string
+--- STMT 138 ---
+SQL: SELECT JSONB_TYPEOF('true'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_typeof
+ROW: boolean
+--- STMT 139 ---
+SQL: SELECT JSONB_TYPEOF('null'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_typeof
+ROW: null
+--- STMT 140 ---
+SQL: SELECT JSONB_TYPEOF('[1,2]'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_typeof
+ROW: array
+--- STMT 141 ---
+SQL: SELECT JSONB_TYPEOF('{"a":1}'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_typeof
+ROW: object
+--- STMT 142 ---
+SQL: SELECT JSONB_PRETTY('{"a":1,"b":[1,2,3]}'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_pretty
+ROW: {\n    "a": 1,\n    "b": [\n        1,\n        2,\n        3\n    ]\n}
+--- STMT 143 ---
+SQL: SELECT JSONB_SET('{"a":1}'::jsonb, '{a}', '99')
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_set
+ROW: {"a": 99}
+--- STMT 144 ---
+SQL: SELECT JSONB_SET('{"a":{"b":1}}'::jsonb, '{a,b}', '42')
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_set
+ROW: {"a": {"b": 42}}
+--- STMT 145 ---
+SQL: SELECT JSONB_STRIP_NULLS('{"a":1,"b":null,"c":3}'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: jsonb_strip_nulls
+ROW: {"a": 1, "c": 3}
+--- STMT 146 ---
+SQL: SELECT '{"a":1}'::jsonb || '{"b":2}'::jsonb
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: {"a": 1, "b": 2}
+--- STMT 147 ---
+SQL: SELECT '[1,2]'::jsonb || '[3,4]'::jsonb
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: [1, 2, 3, 4]
+--- STMT 148 ---
+SQL: -- === Array functions === SELECT ARRAY[1,2,3]
+RESULT: 1 columns, 1 rows
+COLUMNS: array
+ROW: {1,2,3}
+--- STMT 149 ---
+SQL: SELECT ARRAY[1,2,3] || ARRAY[4,5,6]
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: {1,2,3,4,5,6}
+--- STMT 150 ---
+SQL: SELECT ARRAY[1,2,3] || 4
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: {1,2,3,4}
+--- STMT 151 ---
+SQL: SELECT 0 || ARRAY[1,2,3]
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: {0,1,2,3}
+--- STMT 152 ---
+SQL: SELECT ARRAY_LENGTH(ARRAY[1,2,3], 1)
+RESULT: 1 columns, 1 rows
+COLUMNS: array_length
+ROW: 3
+--- STMT 153 ---
+SQL: SELECT ARRAY_UPPER(ARRAY[1,2,3], 1)
+RESULT: 1 columns, 1 rows
+COLUMNS: array_upper
+ROW: 3
+--- STMT 154 ---
+SQL: SELECT ARRAY_LOWER(ARRAY[1,2,3], 1)
+RESULT: 1 columns, 1 rows
+COLUMNS: array_lower
+ROW: 1
+--- STMT 155 ---
+SQL: SELECT ARRAY_POSITION(ARRAY['a','b','c'], 'b')
+RESULT: 1 columns, 1 rows
+COLUMNS: array_position
+ROW: 2
+--- STMT 156 ---
+SQL: SELECT ARRAY_REMOVE(ARRAY[1,2,3,2], 2)
+RESULT: 1 columns, 1 rows
+COLUMNS: array_remove
+ROW: {1,3}
+--- STMT 157 ---
+SQL: SELECT ARRAY_REPLACE(ARRAY[1,2,3], 2, 99)
+RESULT: 1 columns, 1 rows
+COLUMNS: array_replace
+ROW: {1,99,3}
+--- STMT 158 ---
+SQL: SELECT ARRAY_TO_STRING(ARRAY[1,2,3], ', ')
+RESULT: 1 columns, 1 rows
+COLUMNS: array_to_string
+ROW: 1, 2, 3
+--- STMT 159 ---
+SQL: SELECT STRING_TO_ARRAY('a,b,c', ',')
+RESULT: 1 columns, 1 rows
+COLUMNS: string_to_array
+ROW: {a,b,c}
+--- STMT 160 ---
+SQL: SELECT UNNEST(ARRAY[1,2,3])
+RESULT: 1 columns, 3 rows
+COLUMNS: unnest
+ROW: 1
+ROW: 2
+ROW: 3
+--- STMT 161 ---
+SQL: SELECT ARRAY_AGG(x) FROM UNNEST(ARRAY[3,1,2]) AS x
+RESULT: 1 columns, 1 rows
+COLUMNS: array_agg
+ROW: {3,1,2}
+--- STMT 162 ---
+SQL: SELECT 1 = ANY(ARRAY[1,2,3])
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 163 ---
+SQL: SELECT 4 = ANY(ARRAY[1,2,3])
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 164 ---
+SQL: SELECT 1 = ALL(ARRAY[1,1,1])
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 165 ---
+SQL: SELECT 1 = ALL(ARRAY[1,2,1])
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 166 ---
+SQL: -- === System functions === SELECT CURRENT_USER
+RESULT: 1 columns, 1 rows
+COLUMNS: current_user
+ROW: memgres
+--- STMT 167 ---
+SQL: SELECT CURRENT_SCHEMA
+RESULT: 1 columns, 1 rows
+COLUMNS: current_schema
+ROW: public
+--- STMT 168 ---
+SQL: SELECT CURRENT_DATABASE()
+RESULT: 1 columns, 1 rows
+COLUMNS: current_database
+ROW: memgres
+--- STMT 169 ---
+SQL: SELECT PG_TYPEOF(42)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: integer
+--- STMT 170 ---
+SQL: SELECT PG_TYPEOF('hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: unknown
+--- STMT 171 ---
+SQL: SELECT PG_TYPEOF(true)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: boolean
+--- STMT 172 ---
+SQL: SELECT PG_TYPEOF(NULL)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: unknown
+--- STMT 173 ---
+SQL: SELECT PG_TYPEOF(ARRAY[1,2,3])
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: integer[]
+--- STMT 174 ---
+SQL: SELECT PG_TYPEOF('{"a":1}'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: jsonb
+--- STMT 175 ---
+SQL: SELECT GEN_RANDOM_UUID()
+RESULT: 1 columns, 1 rows
+COLUMNS: gen_random_uuid
+ROW: a13cbf73-1f4b-48ef-9223-0136d41c579b
+--- STMT 176 ---
+SQL: -- === INVALID: Function errors === SELECT NONEXISTENT_FUNCTION(1)
+ERROR [42883]: ERROR: function nonexistent_function(integer) does not exist
+--- STMT 177 ---
+SQL: SELECT LENGTH()
+ERROR [42883]: ERROR: function length() does not exist
+--- STMT 178 ---
+SQL: SELECT LENGTH('a', 'b')
+ERROR [22023]: ERROR: "b" is not a valid encoding name
+--- STMT 179 ---
+SQL: SELECT SQRT(-1)
+ERROR [2201F]: ERROR: cannot take square root of a negative number
+--- STMT 180 ---
+SQL: SELECT 1/0
+ERROR [22012]: ERROR: division by zero
+--- STMT 181 ---
+SQL: SELECT LOG(0)
+ERROR [2201E]: ERROR: cannot take logarithm of zero
+--- STMT 182 ---
+SQL: SELECT LN(0)
+ERROR [2201E]: ERROR: cannot take logarithm of zero
+
+=== FILE: 08_constraints_transactions.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 08: Constraints, Transactions, and Error Handling -- ============================================================ -- === Setup with v...
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: CREATE TABLE child (id serial PRIMARY KEY, parent_id int NOT NULL REFERENCES parent(id) ON DELETE CASCADE, data text)
+OK: 0 rows affected
+--- STMT 3 ---
+SQL: CREATE TABLE checked (id serial PRIMARY KEY, val int CHECK (val > 0 AND val < 1000), label text CHECK (length(label) <= 50))
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: CREATE TABLE multi_unique (a int, b int, c text, UNIQUE(a, b))
+OK: 0 rows affected
+--- STMT 5 ---
+SQL: INSERT INTO parent (name) VALUES ('alpha'), ('beta'), ('gamma')
+OK: 3 rows affected
+--- STMT 6 ---
+SQL: INSERT INTO child (parent_id, data) VALUES (1, 'child1'), (1, 'child2'), (2, 'child3')
+OK: 3 rows affected
+--- STMT 7 ---
+SQL: -- === PK violations === INSERT INTO parent (id, name) VALUES (1, 'duplicate_pk')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "parent_pkey"
+--- STMT 8 ---
+SQL: -- === UNIQUE violations === INSERT INTO parent (name) VALUES ('alpha')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "parent_name_key"
+--- STMT 9 ---
+SQL: INSERT INTO multi_unique (a, b, c) VALUES (1, 2, 'first')
+OK: 1 rows affected
+--- STMT 10 ---
+SQL: INSERT INTO multi_unique (a, b, c) VALUES (1, 2, 'duplicate')
+ERROR [23505]: ERROR: duplicate key value violates unique constraint "multi_unique_a_b_key"
+--- STMT 11 ---
+SQL: INSERT INTO multi_unique (a, b, c) VALUES (1, 3, 'different_b_ok')
+OK: 1 rows affected
+--- STMT 12 ---
+SQL: -- === NOT NULL violations === INSERT INTO parent (name) VALUES (NULL)
+ERROR [23502]: ERROR: null value in column "name" violates not-null constraint
+--- STMT 13 ---
+SQL: INSERT INTO child (parent_id, data) VALUES (NULL, 'no_parent')
+ERROR [23502]: ERROR: null value in column "parent_id" violates not-null constraint
+--- STMT 14 ---
+SQL: -- === CHECK violations === INSERT INTO checked (val) VALUES (0)
+ERROR [23514]: ERROR: new row violates check constraint "checked_check"
+--- STMT 15 ---
+SQL: INSERT INTO checked (val) VALUES (1000)
+ERROR [23514]: ERROR: new row violates check constraint "checked_check"
+--- STMT 16 ---
+SQL: INSERT INTO checked (val) VALUES (-5)
+ERROR [23514]: ERROR: new row violates check constraint "checked_check"
+--- STMT 17 ---
+SQL: INSERT INTO checked (val, label) VALUES (50, REPEAT('x', 51))
+ERROR [23514]: ERROR: new row violates check constraint "checked_check"
+--- STMT 18 ---
+SQL: INSERT INTO checked (val) VALUES (500)
+OK: 1 rows affected
+--- STMT 19 ---
+SQL: SELECT * FROM checked
+RESULT: 3 columns, 1 rows
+COLUMNS: id, val, label
+ROW: 5 | 500 | NULL
+--- STMT 20 ---
+SQL: -- === FK violations === INSERT INTO child (parent_id, data) VALUES (999, 'bad_fk')
+ERROR [23503]: ERROR: insert or update on table "child" violates foreign key constraint "child_parent_id_fkey"
+--- STMT 21 ---
+SQL: UPDATE child SET parent_id = 999 WHERE id = 1
+ERROR [23503]: ERROR: insert or update on table "child" violates foreign key constraint "child_parent_id_fkey"
+--- STMT 22 ---
+SQL: DELETE FROM parent WHERE id = 1
+OK: 1 rows affected
+--- STMT 23 ---
+SQL: -- Wait — ON DELETE CASCADE should work SELECT COUNT(*) FROM child WHERE parent_id = 1
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 0
+--- STMT 24 ---
+SQL: DELETE FROM parent WHERE id = 1
+OK: 0 rows affected
+--- STMT 25 ---
+SQL: SELECT COUNT(*) FROM child WHERE parent_id = 1
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 0
+--- STMT 26 ---
+SQL: SELECT * FROM child ORDER BY id
+RESULT: 3 columns, 1 rows
+COLUMNS: id, parent_id, data
+ROW: 3 | 2 | child3
+--- STMT 27 ---
+SQL: -- === ON DELETE SET NULL === CREATE TABLE set_null_parent (id serial PRIMARY KEY, name text)
+OK: 0 rows affected
+--- STMT 28 ---
+SQL: CREATE TABLE set_null_child (id serial PRIMARY KEY, parent_id int REFERENCES set_null_parent(id) ON DELETE SET NULL, info text)
+OK: 0 rows affected
+--- STMT 29 ---
+SQL: INSERT INTO set_null_parent (name) VALUES ('parent1')
+OK: 1 rows affected
+--- STMT 30 ---
+SQL: INSERT INTO set_null_child (parent_id, info) VALUES (1, 'will_be_nulled')
+OK: 1 rows affected
+--- STMT 31 ---
+SQL: DELETE FROM set_null_parent WHERE id = 1
+OK: 1 rows affected
+--- STMT 32 ---
+SQL: SELECT parent_id, info FROM set_null_child
+RESULT: 2 columns, 1 rows
+COLUMNS: parent_id, info
+ROW: NULL | will_be_nulled
+--- STMT 33 ---
+SQL: DROP TABLE set_null_child
+OK: 0 rows affected
+--- STMT 34 ---
+SQL: DROP TABLE set_null_parent
+OK: 0 rows affected
+--- STMT 35 ---
+SQL: -- === ON UPDATE CASCADE === CREATE TABLE cascade_parent (id int PRIMARY KEY, label text)
+OK: 0 rows affected
+--- STMT 36 ---
+SQL: CREATE TABLE cascade_child (id serial PRIMARY KEY, parent_id int REFERENCES cascade_parent(id) ON UPDATE CASCADE, data text)
+OK: 0 rows affected
+--- STMT 37 ---
+SQL: INSERT INTO cascade_parent VALUES (100, 'original')
+OK: 1 rows affected
+--- STMT 38 ---
+SQL: INSERT INTO cascade_child (parent_id, data) VALUES (100, 'tracks_parent')
+OK: 1 rows affected
+--- STMT 39 ---
+SQL: UPDATE cascade_parent SET id = 200 WHERE id = 100
+OK: 1 rows affected
+--- STMT 40 ---
+SQL: SELECT parent_id FROM cascade_child
+RESULT: 1 columns, 1 rows
+COLUMNS: parent_id
+ROW: 200
+--- STMT 41 ---
+SQL: DROP TABLE cascade_child
+OK: 0 rows affected
+--- STMT 42 ---
+SQL: DROP TABLE cascade_parent
+OK: 0 rows affected
+--- STMT 43 ---
+SQL: -- === Transactions: basic === CREATE TABLE txn_test (id serial PRIMARY KEY, val text)
+OK: 0 rows affected
+--- STMT 44 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 45 ---
+SQL: INSERT INTO txn_test (val) VALUES ('committed')
+OK: 1 rows affected
+--- STMT 46 ---
+SQL: COMMIT
+OK: 0 rows affected
+--- STMT 47 ---
+SQL: SELECT * FROM txn_test
+RESULT: 2 columns, 1 rows
+COLUMNS: id, val
+ROW: 1 | committed
+--- STMT 48 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 49 ---
+SQL: INSERT INTO txn_test (val) VALUES ('rolled_back')
+OK: 1 rows affected
+--- STMT 50 ---
+SQL: ROLLBACK
+OK: 0 rows affected
+--- STMT 51 ---
+SQL: SELECT * FROM txn_test
+RESULT: 2 columns, 1 rows
+COLUMNS: id, val
+ROW: 1 | committed
+--- STMT 52 ---
+SQL: SELECT COUNT(*) FROM txn_test
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 1
+--- STMT 53 ---
+SQL: -- === Transactions: error and rollback === BEGIN
+OK: 0 rows affected
+--- STMT 54 ---
+SQL: INSERT INTO txn_test (val) VALUES ('before_error')
+OK: 1 rows affected
+--- STMT 55 ---
+SQL: INSERT INTO parent (name) VALUES ('alpha')
+OK: 1 rows affected
+--- STMT 56 ---
+SQL: SELECT COUNT(*) FROM txn_test
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 2
+--- STMT 57 ---
+SQL: ROLLBACK
+OK: 0 rows affected
+--- STMT 58 ---
+SQL: SELECT COUNT(*) FROM txn_test
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 1
+--- STMT 59 ---
+SQL: -- === Savepoints === BEGIN
+OK: 0 rows affected
+--- STMT 60 ---
+SQL: INSERT INTO txn_test (val) VALUES ('base')
+OK: 1 rows affected
+--- STMT 61 ---
+SQL: SAVEPOINT sp1
+OK: 0 rows affected
+--- STMT 62 ---
+SQL: INSERT INTO txn_test (val) VALUES ('after_sp1')
+OK: 1 rows affected
+--- STMT 63 ---
+SQL: SAVEPOINT sp2
+OK: 0 rows affected
+--- STMT 64 ---
+SQL: INSERT INTO txn_test (val) VALUES ('after_sp2')
+OK: 1 rows affected
+--- STMT 65 ---
+SQL: ROLLBACK TO sp2
+OK: 0 rows affected
+--- STMT 66 ---
+SQL: INSERT INTO txn_test (val) VALUES ('after_rollback_to_sp2')
+OK: 1 rows affected
+--- STMT 67 ---
+SQL: COMMIT
+OK: 0 rows affected
+--- STMT 68 ---
+SQL: SELECT val FROM txn_test ORDER BY id
+RESULT: 1 columns, 4 rows
+COLUMNS: val
+ROW: committed
+ROW: base
+ROW: after_sp1
+ROW: after_rollback_to_sp2
+--- STMT 69 ---
+SQL: -- === Autocommit behavior === INSERT INTO txn_test (val) VALUES ('autocommit1')
+OK: 1 rows affected
+--- STMT 70 ---
+SQL: INSERT INTO txn_test (val) VALUES ('autocommit2')
+OK: 1 rows affected
+--- STMT 71 ---
+SQL: SELECT COUNT(*) FROM txn_test
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 6
+--- STMT 72 ---
+SQL: -- === Deferred constraints === CREATE TABLE def_parent (id int PRIMARY KEY)
+OK: 0 rows affected
+--- STMT 73 ---
+SQL: CREATE TABLE def_child (id int PRIMARY KEY, pid int, CONSTRAINT fk_deferred FOREIGN KEY (pid) REFERENCES def_parent(id) DEFERRABLE INITIALLY DEFERRED)
+OK: 0 rows affected
+--- STMT 74 ---
+SQL: BEGIN
+OK: 0 rows affected
+--- STMT 75 ---
+SQL: INSERT INTO def_child (id, pid) VALUES (1, 100)
+OK: 1 rows affected
+--- STMT 76 ---
+SQL: INSERT INTO def_parent (id) VALUES (100)
+OK: 1 rows affected
+--- STMT 77 ---
+SQL: COMMIT
+OK: 0 rows affected
+--- STMT 78 ---
+SQL: SELECT * FROM def_child
+RESULT: 2 columns, 1 rows
+COLUMNS: id, pid
+ROW: 1 | 100
+--- STMT 79 ---
+SQL: SELECT * FROM def_parent
+RESULT: 1 columns, 1 rows
+COLUMNS: id
+ROW: 100
+--- STMT 80 ---
+SQL: DROP TABLE def_child
+OK: 0 rows affected
+--- STMT 81 ---
+SQL: DROP TABLE def_parent
+OK: 0 rows affected
+--- STMT 82 ---
+SQL: -- === ALTER TABLE ADD/DROP CONSTRAINT === CREATE TABLE alter_con (id serial PRIMARY KEY, val int, label text)
+OK: 0 rows affected
+--- STMT 83 ---
+SQL: ALTER TABLE alter_con ADD CONSTRAINT chk_val CHECK (val >= 0)
+OK: 0 rows affected
+--- STMT 84 ---
+SQL: INSERT INTO alter_con (val) VALUES (-1)
+ERROR [23514]: ERROR: new row violates check constraint "chk_val"
+--- STMT 85 ---
+SQL: INSERT INTO alter_con (val) VALUES (5)
+OK: 1 rows affected
+--- STMT 86 ---
+SQL: ALTER TABLE alter_con DROP CONSTRAINT chk_val
+OK: 0 rows affected
+--- STMT 87 ---
+SQL: INSERT INTO alter_con (val) VALUES (-1)
+OK: 1 rows affected
+--- STMT 88 ---
+SQL: SELECT val FROM alter_con ORDER BY val
+RESULT: 1 columns, 2 rows
+COLUMNS: val
+ROW: -1
+ROW: 5
+--- STMT 89 ---
+SQL: DROP TABLE alter_con
+OK: 0 rows affected
+--- STMT 90 ---
+SQL: -- Cleanup DROP TABLE txn_test
+OK: 0 rows affected
+--- STMT 91 ---
+SQL: DROP TABLE checked
+OK: 0 rows affected
+--- STMT 92 ---
+SQL: DROP TABLE multi_unique
+OK: 0 rows affected
+--- STMT 93 ---
+SQL: DROP TABLE child
+OK: 0 rows affected
+--- STMT 94 ---
+SQL: DROP TABLE parent
+OK: 0 rows affected
+
+=== FILE: 09_views_functions_triggers.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 09: Views, Functions, Triggers, and Sequences -- ============================================================ -- Setup CREATE TABLE p...
+OK: 0 rows affected
+--- STMT 2 ---
+SQL: INSERT INTO products (name, category, price) VALUES ('Widget', 'hardware', 9.99), ('Gadget', 'electronics', 19.99), ('Tool', 'hardware', 14.99), ('Service', 'services', 49.99), ('Gizmo', 'electronics'...
+OK: 6 rows affected
+--- STMT 3 ---
+SQL: -- === CREATE VIEW === CREATE VIEW active_products AS SELECT * FROM products WHERE active = true
+OK: 0 rows affected
+--- STMT 4 ---
+SQL: SELECT * FROM active_products ORDER BY name
+RESULT: 5 columns, 6 rows
+COLUMNS: id, name, category, price, active
+ROW: 2 | Gadget | electronics | 19.99 | t
+ROW: 5 | Gizmo | electronics | 29.99 | t
+ROW: 6 | Part | hardware | 4.99 | t
+ROW: 4 | Service | services | 49.99 | t
+ROW: 3 | Tool | hardware | 14.99 | t
+ROW: 1 | Widget | hardware | 9.99 | t
+--- STMT 5 ---
+SQL: SELECT COUNT(*) FROM active_products
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 6
+--- STMT 6 ---
+SQL: CREATE VIEW category_stats AS SELECT category, COUNT(*) AS cnt, AVG(price)::numeric(10,2) AS avg_price, SUM(price) AS total FROM products WHERE active = true GROUP BY category
+OK: 0 rows affected
+--- STMT 7 ---
+SQL: SELECT * FROM category_stats ORDER BY category
+RESULT: 4 columns, 3 rows
+COLUMNS: category, cnt, avg_price, total
+ROW: electronics | 2 | 24.99 | 49.98
+ROW: hardware | 3 | 9.99 | 29.97
+ROW: services | 1 | 49.99 | 49.99
+--- STMT 8 ---
+SQL: -- === CREATE OR REPLACE VIEW === CREATE OR REPLACE VIEW active_products AS SELECT id, name, price FROM products WHERE active = true
+ERROR [42P16]: ERROR: cannot drop columns from view
+--- STMT 9 ---
+SQL: SELECT * FROM active_products ORDER BY name
+RESULT: 5 columns, 6 rows
+COLUMNS: id, name, category, price, active
+ROW: 2 | Gadget | electronics | 19.99 | t
+ROW: 5 | Gizmo | electronics | 29.99 | t
+ROW: 6 | Part | hardware | 4.99 | t
+ROW: 4 | Service | services | 49.99 | t
+ROW: 3 | Tool | hardware | 14.99 | t
+ROW: 1 | Widget | hardware | 9.99 | t
+--- STMT 10 ---
+SQL: -- === DROP VIEW === CREATE VIEW temp_view AS SELECT 1 AS n
+OK: 0 rows affected
+--- STMT 11 ---
+SQL: DROP VIEW temp_view
+OK: 0 rows affected
+--- STMT 12 ---
+SQL: DROP VIEW IF EXISTS temp_view
+OK: 0 rows affected
+--- STMT 13 ---
+SQL: -- === Materialized view === CREATE MATERIALIZED VIEW product_summary AS SELECT category, COUNT(*) AS cnt, SUM(price) AS total FROM products GROUP BY category
+OK: 3 rows affected
+--- STMT 14 ---
+SQL: SELECT * FROM product_summary ORDER BY category
+RESULT: 3 columns, 3 rows
+COLUMNS: category, cnt, total
+ROW: electronics | 2 | 49.98
+ROW: hardware | 3 | 29.97
+ROW: services | 1 | 49.99
+--- STMT 15 ---
+SQL: INSERT INTO products (name, category, price) VALUES ('NewItem', 'hardware', 7.99)
+OK: 1 rows affected
+--- STMT 16 ---
+SQL: SELECT * FROM product_summary ORDER BY category
+RESULT: 3 columns, 3 rows
+COLUMNS: category, cnt, total
+ROW: electronics | 2 | 49.98
+ROW: hardware | 3 | 29.97
+ROW: services | 1 | 49.99
+--- STMT 17 ---
+SQL: REFRESH MATERIALIZED VIEW product_summary
+OK: 0 rows affected
+--- STMT 18 ---
+SQL: SELECT * FROM product_summary ORDER BY category
+RESULT: 3 columns, 3 rows
+COLUMNS: category, cnt, total
+ROW: electronics | 2 | 49.98
+ROW: hardware | 4 | 37.96
+ROW: services | 1 | 49.99
+--- STMT 19 ---
+SQL: DROP MATERIALIZED VIEW product_summary
+OK: 0 rows affected
+--- STMT 20 ---
+SQL: -- === Sequences === CREATE SEQUENCE my_counter START WITH 100 INCREMENT BY 5
+OK: 0 rows affected
+--- STMT 21 ---
+SQL: SELECT nextval('my_counter')
+RESULT: 1 columns, 1 rows
+COLUMNS: nextval
+ROW: 100
+--- STMT 22 ---
+SQL: SELECT nextval('my_counter')
+RESULT: 1 columns, 1 rows
+COLUMNS: nextval
+ROW: 105
+--- STMT 23 ---
+SQL: SELECT nextval('my_counter')
+RESULT: 1 columns, 1 rows
+COLUMNS: nextval
+ROW: 110
+--- STMT 24 ---
+SQL: SELECT currval('my_counter')
+RESULT: 1 columns, 1 rows
+COLUMNS: currval
+ROW: 110
+--- STMT 25 ---
+SQL: SELECT setval('my_counter', 200)
+RESULT: 1 columns, 1 rows
+COLUMNS: setval
+ROW: 200
+--- STMT 26 ---
+SQL: SELECT nextval('my_counter')
+RESULT: 1 columns, 1 rows
+COLUMNS: nextval
+ROW: 205
+--- STMT 27 ---
+SQL: SELECT setval('my_counter', 300, false)
+RESULT: 1 columns, 1 rows
+COLUMNS: setval
+ROW: 300
+--- STMT 28 ---
+SQL: SELECT nextval('my_counter')
+RESULT: 1 columns, 1 rows
+COLUMNS: nextval
+ROW: 300
+--- STMT 29 ---
+SQL: ALTER SEQUENCE my_counter RESTART WITH 1
+OK: 0 rows affected
+--- STMT 30 ---
+SQL: SELECT nextval('my_counter')
+RESULT: 1 columns, 1 rows
+COLUMNS: nextval
+ROW: 1
+--- STMT 31 ---
+SQL: DROP SEQUENCE my_counter
+OK: 0 rows affected
+--- STMT 32 ---
+SQL: -- === PL/pgSQL functions === CREATE FUNCTION add_numbers(a int, b int) RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN a + b; END; $$
+OK: 0 rows affected
+--- STMT 33 ---
+SQL: SELECT add_numbers(3, 7)
+RESULT: 1 columns, 1 rows
+COLUMNS: add_numbers
+ROW: 10
+--- STMT 34 ---
+SQL: SELECT add_numbers(0, 0)
+RESULT: 1 columns, 1 rows
+COLUMNS: add_numbers
+ROW: 0
+--- STMT 35 ---
+SQL: SELECT add_numbers(-5, 5)
+RESULT: 1 columns, 1 rows
+COLUMNS: add_numbers
+ROW: 0
+--- STMT 36 ---
+SQL: CREATE FUNCTION greet(name text, greeting text DEFAULT 'Hello') RETURNS text LANGUAGE plpgsql AS $$ BEGIN RETURN greeting || ', ' || name || '!'; END; $$
+OK: 0 rows affected
+--- STMT 37 ---
+SQL: SELECT greet('World')
+RESULT: 1 columns, 1 rows
+COLUMNS: greet
+ROW: Hello, World!
+--- STMT 38 ---
+SQL: SELECT greet('World', 'Hi')
+RESULT: 1 columns, 1 rows
+COLUMNS: greet
+ROW: Hi, World!
+--- STMT 39 ---
+SQL: CREATE FUNCTION factorial(n int) RETURNS bigint LANGUAGE plpgsql AS $$ DECLARE result bigint := 1; BEGIN FOR i IN 2..n LOOP result := result * i; END LOOP; RETURN result; END; $$
+OK: 0 rows affected
+--- STMT 40 ---
+SQL: SELECT factorial(0)
+RESULT: 1 columns, 1 rows
+COLUMNS: factorial
+ROW: 1
+--- STMT 41 ---
+SQL: SELECT factorial(1)
+RESULT: 1 columns, 1 rows
+COLUMNS: factorial
+ROW: 1
+--- STMT 42 ---
+SQL: SELECT factorial(5)
+RESULT: 1 columns, 1 rows
+COLUMNS: factorial
+ROW: 120
+--- STMT 43 ---
+SQL: SELECT factorial(10)
+RESULT: 1 columns, 1 rows
+COLUMNS: factorial
+ROW: 3628800
+--- STMT 44 ---
+SQL: -- === SQL language function === CREATE FUNCTION double_price(p numeric) RETURNS numeric LANGUAGE sql AS $$ SELECT p * 2; $$
+OK: 0 rows affected
+--- STMT 45 ---
+SQL: SELECT double_price(9.99)
+RESULT: 1 columns, 1 rows
+COLUMNS: double_price
+ROW: 19.98
+--- STMT 46 ---
+SQL: -- === Function returning SETOF === CREATE FUNCTION cheap_products(max_price numeric) RETURNS SETOF products LANGUAGE sql AS $$ SELECT * FROM products WHERE price <= max_price ORDER BY price; $$
+OK: 0 rows affected
+--- STMT 47 ---
+SQL: SELECT name, price FROM cheap_products(15.00)
+RESULT: 2 columns, 4 rows
+COLUMNS: name, price
+ROW: Part | 4.99
+ROW: NewItem | 7.99
+ROW: Widget | 9.99
+ROW: Tool | 14.99
+--- STMT 48 ---
+SQL: -- === Function returning TABLE === CREATE FUNCTION product_stats_fn() RETURNS TABLE(cat text, cnt bigint, avg_price numeric) LANGUAGE plpgsql AS $$ BEGIN RETURN QUERY SELECT category, COUNT(*), AVG(p...
+OK: 0 rows affected
+--- STMT 49 ---
+SQL: SELECT * FROM product_stats_fn()
+RESULT: 3 columns, 3 rows
+COLUMNS: cat, cnt, avg_price
+ROW: electronics | 2 | 24.99
+ROW: hardware | 4 | 9.49
+ROW: services | 1 | 49.99
+--- STMT 50 ---
+SQL: -- === DO blocks === DO $$ BEGIN RAISE NOTICE 'Hello from DO block'; END; $$
+OK: 0 rows affected
+--- STMT 51 ---
+SQL: DO $$ DECLARE cnt int; BEGIN SELECT COUNT(*) INTO cnt FROM products; IF cnt > 5 THEN RAISE NOTICE 'Many products: %', cnt; END IF; END; $$
+OK: 0 rows affected
+--- STMT 52 ---
+SQL: -- === Triggers === CREATE TABLE audit_log (id serial PRIMARY KEY, action text, table_name text, record_id int, ts timestamp DEFAULT now())
+OK: 0 rows affected
+--- STMT 53 ---
+SQL: CREATE FUNCTION log_product_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF TG_OP = 'INSERT' THEN INSERT INTO audit_log (action, table_name, record_id) VALUES ('INSERT', TG_TABLE_NAME, NEW.id...
+OK: 0 rows affected
+--- STMT 54 ---
+SQL: CREATE TRIGGER product_audit AFTER INSERT OR UPDATE OR DELETE ON products FOR EACH ROW EXECUTE FUNCTION log_product_change()
+OK: 0 rows affected
+--- STMT 55 ---
+SQL: INSERT INTO products (name, category, price) VALUES ('Triggered', 'test', 1.00)
+OK: 1 rows affected
+--- STMT 56 ---
+SQL: UPDATE products SET price = 2.00 WHERE name = 'Triggered'
+OK: 1 rows affected
+--- STMT 57 ---
+SQL: DELETE FROM products WHERE name = 'Triggered'
+OK: 1 rows affected
+--- STMT 58 ---
+SQL: SELECT action, record_id FROM audit_log ORDER BY id
+RESULT: 2 columns, 3 rows
+COLUMNS: action, record_id
+ROW: INSERT | 8
+ROW: UPDATE | 8
+ROW: DELETE | 8
+--- STMT 59 ---
+SQL: -- === Updated_at trigger === CREATE TABLE auto_updated (id serial PRIMARY KEY, val text, updated_at timestamp DEFAULT now())
+OK: 0 rows affected
+--- STMT 60 ---
+SQL: CREATE FUNCTION set_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.updated_at := now(); RETURN NEW; END; $$
+OK: 0 rows affected
+--- STMT 61 ---
+SQL: CREATE TRIGGER auto_update_trigger BEFORE UPDATE ON auto_updated FOR EACH ROW EXECUTE FUNCTION set_updated_at()
+OK: 0 rows affected
+--- STMT 62 ---
+SQL: INSERT INTO auto_updated (val) VALUES ('original')
+OK: 1 rows affected
+--- STMT 63 ---
+SQL: SELECT val FROM auto_updated
+RESULT: 1 columns, 1 rows
+COLUMNS: val
+ROW: original
+--- STMT 64 ---
+SQL: UPDATE auto_updated SET val = 'modified' WHERE id = 1
+OK: 1 rows affected
+--- STMT 65 ---
+SQL: SELECT val FROM auto_updated
+RESULT: 1 columns, 1 rows
+COLUMNS: val
+ROW: modified
+--- STMT 66 ---
+SQL: -- === ENUM types === CREATE TYPE status_type AS ENUM ('draft', 'published', 'archived')
+OK: 0 rows affected
+--- STMT 67 ---
+SQL: CREATE TABLE articles (id serial PRIMARY KEY, title text, status status_type DEFAULT 'draft')
+OK: 0 rows affected
+--- STMT 68 ---
+SQL: INSERT INTO articles (title) VALUES ('My Article')
+OK: 1 rows affected
+--- STMT 69 ---
+SQL: INSERT INTO articles (title, status) VALUES ('Published', 'published')
+OK: 1 rows affected
+--- STMT 70 ---
+SQL: SELECT * FROM articles ORDER BY id
+RESULT: 3 columns, 2 rows
+COLUMNS: id, title, status
+ROW: 1 | My Article | draft
+ROW: 2 | Published | published
+--- STMT 71 ---
+SQL: INSERT INTO articles (title, status) VALUES ('Bad Status', 'invalid_status')
+ERROR [22P02]: ERROR: invalid input value for enum status_type: "invalid_status"
+--- STMT 72 ---
+SQL: ALTER TYPE status_type ADD VALUE 'deleted'
+OK: 0 rows affected
+--- STMT 73 ---
+SQL: INSERT INTO articles (title, status) VALUES ('Deleted', 'deleted')
+OK: 1 rows affected
+--- STMT 74 ---
+SQL: SELECT * FROM articles ORDER BY id
+RESULT: 3 columns, 3 rows
+COLUMNS: id, title, status
+ROW: 1 | My Article | draft
+ROW: 2 | Published | published
+ROW: 3 | Deleted | deleted
+--- STMT 75 ---
+SQL: -- === DROP FUNCTION === DROP FUNCTION add_numbers(int, int)
+OK: 0 rows affected
+--- STMT 76 ---
+SQL: DROP FUNCTION IF EXISTS nonexistent_func()
+OK: 0 rows affected
+--- STMT 77 ---
+SQL: -- === INVALID === -- View referencing nonexistent table CREATE VIEW bad_view AS SELECT * FROM nonexistent_xyz
+ERROR [42P01]: ERROR: relation "nonexistent_xyz" does not exist
+--- STMT 78 ---
+SQL: -- Function with body error CREATE FUNCTION bad_fn() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 'not_a_number'; END; $$
+OK: 0 rows affected
+--- STMT 79 ---
+SQL: -- Cleanup DROP TRIGGER product_audit ON products
+OK: 0 rows affected
+--- STMT 80 ---
+SQL: DROP TRIGGER auto_update_trigger ON auto_updated
+OK: 0 rows affected
+--- STMT 81 ---
+SQL: DROP FUNCTION log_product_change()
+OK: 0 rows affected
+--- STMT 82 ---
+SQL: DROP FUNCTION set_updated_at()
+OK: 0 rows affected
+--- STMT 83 ---
+SQL: DROP FUNCTION greet(text, text)
+OK: 0 rows affected
+--- STMT 84 ---
+SQL: DROP FUNCTION factorial(int)
+OK: 0 rows affected
+--- STMT 85 ---
+SQL: DROP FUNCTION double_price(numeric)
+OK: 0 rows affected
+--- STMT 86 ---
+SQL: DROP FUNCTION cheap_products(numeric)
+OK: 0 rows affected
+--- STMT 87 ---
+SQL: DROP FUNCTION product_stats_fn()
+OK: 0 rows affected
+--- STMT 88 ---
+SQL: DROP TABLE audit_log
+OK: 0 rows affected
+--- STMT 89 ---
+SQL: DROP TABLE auto_updated
+OK: 0 rows affected
+--- STMT 90 ---
+SQL: DROP TABLE articles
+OK: 0 rows affected
+--- STMT 91 ---
+SQL: DROP TYPE status_type
+OK: 0 rows affected
+--- STMT 92 ---
+SQL: DROP VIEW active_products
+OK: 0 rows affected
+--- STMT 93 ---
+SQL: DROP VIEW category_stats
+OK: 0 rows affected
+--- STMT 94 ---
+SQL: DROP TABLE products
+OK: 0 rows affected
+
+=== FILE: 10_edge_cases.sql ===
+--- STMT 1 ---
+SQL: -- ============================================================ -- 10: Edge Cases, NULL Handling, Unicode, and Misc -- ============================================================ -- === SELECT withou...
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1
+--- STMT 2 ---
+SQL: SELECT 1, 2, 3
+RESULT: 3 columns, 1 rows
+COLUMNS: ?column?, ?column?, ?column?
+ROW: 1 | 2 | 3
+--- STMT 3 ---
+SQL: SELECT 'hello'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: hello
+--- STMT 4 ---
+SQL: SELECT true
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 5 ---
+SQL: SELECT NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 6 ---
+SQL: SELECT 1 + 2 * 3
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 7
+--- STMT 7 ---
+SQL: SELECT (1 + 2) * 3
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 9
+--- STMT 8 ---
+SQL: SELECT 1::text || '!'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 1!
+--- STMT 9 ---
+SQL: SELECT CURRENT_DATE
+RESULT: 1 columns, 1 rows
+COLUMNS: current_date
+ROW: 2026-04-02
+--- STMT 10 ---
+SQL: SELECT CURRENT_TIMESTAMP
+RESULT: 1 columns, 1 rows
+COLUMNS: current_timestamp
+ROW: 2026-04-02 16:51:11.588380+00
+--- STMT 11 ---
+SQL: SELECT GEN_RANDOM_UUID()
+RESULT: 1 columns, 1 rows
+COLUMNS: gen_random_uuid
+ROW: 0fdb7b7a-35c1-456f-96b5-8e89e24911e9
+--- STMT 12 ---
+SQL: SELECT ARRAY[1,2,3]
+RESULT: 1 columns, 1 rows
+COLUMNS: array
+ROW: {1,2,3}
+--- STMT 13 ---
+SQL: SELECT ROW(1, 'hello', true)
+RESULT: 1 columns, 1 rows
+COLUMNS: row
+ROW: (1,hello,t)
+--- STMT 14 ---
+SQL: SELECT GREATEST(1, 5, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: greatest
+ROW: 5
+--- STMT 15 ---
+SQL: SELECT LEAST(1, 5, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: least
+ROW: 1
+--- STMT 16 ---
+SQL: -- === NULL handling === SELECT NULL = NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 17 ---
+SQL: SELECT NULL <> NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 18 ---
+SQL: SELECT NULL < 1
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 19 ---
+SQL: SELECT NULL > 1
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 20 ---
+SQL: SELECT NULL AND true
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 21 ---
+SQL: SELECT NULL AND false
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 22 ---
+SQL: SELECT NULL OR true
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 23 ---
+SQL: SELECT NULL OR false
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 24 ---
+SQL: SELECT NOT NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 25 ---
+SQL: SELECT NULL IS NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 26 ---
+SQL: SELECT NULL IS NOT NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 27 ---
+SQL: SELECT 1 IS NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 28 ---
+SQL: SELECT 1 IS NOT NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 29 ---
+SQL: SELECT COALESCE(NULL, NULL, NULL)
+RESULT: 1 columns, 1 rows
+COLUMNS: coalesce
+ROW: NULL
+--- STMT 30 ---
+SQL: SELECT COALESCE(NULL, 42)
+RESULT: 1 columns, 1 rows
+COLUMNS: coalesce
+ROW: 42
+--- STMT 31 ---
+SQL: SELECT NULL IN (1, 2, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 32 ---
+SQL: SELECT 1 IN (1, NULL, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 33 ---
+SQL: SELECT NULL NOT IN (1, 2, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 34 ---
+SQL: SELECT NULL BETWEEN 1 AND 10
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 35 ---
+SQL: SELECT NULL LIKE '%'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 36 ---
+SQL: SELECT CASE NULL WHEN NULL THEN 'match' ELSE 'no match' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: no match
+--- STMT 37 ---
+SQL: SELECT CASE WHEN NULL THEN 'true' ELSE 'false' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: false
+--- STMT 38 ---
+SQL: SELECT CASE WHEN NULL IS NULL THEN 'null is null' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: null is null
+--- STMT 39 ---
+SQL: -- === Boolean edge cases === SELECT true AND true
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 40 ---
+SQL: SELECT true AND false
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 41 ---
+SQL: SELECT false OR false
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 42 ---
+SQL: SELECT true OR false
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 43 ---
+SQL: SELECT NOT true
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 44 ---
+SQL: SELECT NOT false
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 45 ---
+SQL: SELECT true IS TRUE
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 46 ---
+SQL: SELECT false IS TRUE
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 47 ---
+SQL: SELECT NULL IS TRUE
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 48 ---
+SQL: SELECT true IS FALSE
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 49 ---
+SQL: SELECT false IS FALSE
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 50 ---
+SQL: SELECT NULL IS FALSE
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 51 ---
+SQL: SELECT NULL IS UNKNOWN
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 52 ---
+SQL: SELECT true IS NOT UNKNOWN
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 53 ---
+SQL: SELECT true IS DISTINCT FROM false
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 54 ---
+SQL: SELECT true IS NOT DISTINCT FROM true
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 55 ---
+SQL: SELECT NULL IS DISTINCT FROM NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 56 ---
+SQL: SELECT NULL IS NOT DISTINCT FROM NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 57 ---
+SQL: -- === String edge cases === SELECT ''
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 
+--- STMT 58 ---
+SQL: SELECT LENGTH('')
+RESULT: 1 columns, 1 rows
+COLUMNS: length
+ROW: 0
+--- STMT 59 ---
+SQL: SELECT '' = ''
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 60 ---
+SQL: SELECT '' IS NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 61 ---
+SQL: SELECT '' <> NULL
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 62 ---
+SQL: SELECT COALESCE('', 'fallback')
+RESULT: 1 columns, 1 rows
+COLUMNS: coalesce
+ROW: 
+--- STMT 63 ---
+SQL: SELECT 'hello''world'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: hello'world
+--- STMT 64 ---
+SQL: SELECT E'tab\there'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: tab	here
+--- STMT 65 ---
+SQL: SELECT E'newline\nhere'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: newline\nhere
+--- STMT 66 ---
+SQL: SELECT E'backslash\\here'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: backslash\\here
+--- STMT 67 ---
+SQL: SELECT 'unicode: ' || U&'\0041'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: unicode: A
+--- STMT 68 ---
+SQL: -- === Numeric edge cases === SELECT 0
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0
+--- STMT 69 ---
+SQL: SELECT -0
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0
+--- STMT 70 ---
+SQL: SELECT 0.0
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0.0
+--- STMT 71 ---
+SQL: SELECT -0.0
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0.0
+--- STMT 72 ---
+SQL: SELECT 0 = -0
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 73 ---
+SQL: SELECT 0.0 = -0.0
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 74 ---
+SQL: SELECT 'NaN'::double precision = 'NaN'::double precision
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 75 ---
+SQL: SELECT 'NaN'::double precision <> 'NaN'::double precision
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 76 ---
+SQL: SELECT 'Infinity'::double precision > 999999999
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 77 ---
+SQL: SELECT '-Infinity'::double precision < -999999999
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 78 ---
+SQL: SELECT 1.0/3.0 * 3.0
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0.999999999999999999990
+--- STMT 79 ---
+SQL: SELECT 0.1 + 0.2
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 0.3
+--- STMT 80 ---
+SQL: SELECT 999999999999999999::bigint
+RESULT: 1 columns, 1 rows
+COLUMNS: int8
+ROW: 999999999999999999
+--- STMT 81 ---
+SQL: SELECT -999999999999999999::bigint
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: -999999999999999999
+--- STMT 82 ---
+SQL: -- === Date edge cases === SELECT DATE '2024-02-29'
+RESULT: 1 columns, 1 rows
+COLUMNS: date
+ROW: 2024-02-29
+--- STMT 83 ---
+SQL: SELECT DATE '2023-02-29'
+ERROR [22008]: ERROR: date/time field value out of range: "2023-02-29"
+--- STMT 84 ---
+SQL: SELECT DATE '2024-12-31' + 1
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 2025-01-01
+--- STMT 85 ---
+SQL: SELECT DATE '2024-01-01' - DATE '2023-01-01'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 365
+--- STMT 86 ---
+SQL: SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 second'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 2024-01-01 00:00:01
+--- STMT 87 ---
+SQL: SELECT TIMESTAMP '2024-01-01 00:00:00' - INTERVAL '1 second'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: 2023-12-31 23:59:59
+--- STMT 88 ---
+SQL: SELECT AGE(TIMESTAMP '2024-01-01', TIMESTAMP '2024-01-01')
+RESULT: 1 columns, 1 rows
+COLUMNS: age
+ROW: 00:00:00
+--- STMT 89 ---
+SQL: -- === Large/many values === CREATE TABLE many_cols (c1 int, c2 int, c3 int, c4 int, c5 int, c6 int, c7 int, c8 int, c9 int, c10 int, c11 int, c12 int, c13 int, c14 int, c15 int, c16 int, c17 int, c18...
+OK: 0 rows affected
+--- STMT 90 ---
+SQL: INSERT INTO many_cols VALUES (1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20)
+OK: 1 rows affected
+--- STMT 91 ---
+SQL: SELECT * FROM many_cols
+RESULT: 20 columns, 1 rows
+COLUMNS: c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20
+ROW: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20
+--- STMT 92 ---
+SQL: SELECT c1+c2+c3+c4+c5+c6+c7+c8+c9+c10+c11+c12+c13+c14+c15+c16+c17+c18+c19+c20 AS total FROM many_cols
+RESULT: 1 columns, 1 rows
+COLUMNS: total
+ROW: 210
+--- STMT 93 ---
+SQL: DROP TABLE many_cols
+OK: 0 rows affected
+--- STMT 94 ---
+SQL: -- Many rows insert CREATE TABLE many_rows (id serial PRIMARY KEY, val int)
+OK: 0 rows affected
+--- STMT 95 ---
+SQL: INSERT INTO many_rows (val) SELECT generate_series(1, 100)
+OK: 100 rows affected
+--- STMT 96 ---
+SQL: SELECT COUNT(*) FROM many_rows
+RESULT: 1 columns, 1 rows
+COLUMNS: count
+ROW: 100
+--- STMT 97 ---
+SQL: SELECT SUM(val) FROM many_rows
+RESULT: 1 columns, 1 rows
+COLUMNS: sum
+ROW: 5050
+--- STMT 98 ---
+SQL: SELECT AVG(val) FROM many_rows
+RESULT: 1 columns, 1 rows
+COLUMNS: avg
+ROW: 50.5000000000000000
+--- STMT 99 ---
+SQL: SELECT MIN(val), MAX(val) FROM many_rows
+RESULT: 2 columns, 1 rows
+COLUMNS: min, max
+ROW: 1 | 100
+--- STMT 100 ---
+SQL: DROP TABLE many_rows
+OK: 0 rows affected
+--- STMT 101 ---
+SQL: -- === Generate series === SELECT * FROM generate_series(1, 5)
+RESULT: 1 columns, 5 rows
+COLUMNS: generate_series
+ROW: 1
+ROW: 2
+ROW: 3
+ROW: 4
+ROW: 5
+--- STMT 102 ---
+SQL: SELECT * FROM generate_series(1, 10, 2)
+RESULT: 1 columns, 5 rows
+COLUMNS: generate_series
+ROW: 1
+ROW: 3
+ROW: 5
+ROW: 7
+ROW: 9
+--- STMT 103 ---
+SQL: SELECT * FROM generate_series(10, 1, -2)
+RESULT: 1 columns, 5 rows
+COLUMNS: generate_series
+ROW: 10
+ROW: 8
+ROW: 6
+ROW: 4
+ROW: 2
+--- STMT 104 ---
+SQL: SELECT * FROM generate_series('2024-01-01'::date, '2024-01-07'::date, '1 day'::interval)
+RESULT: 1 columns, 7 rows
+COLUMNS: generate_series
+ROW: 2023-12-31 23:00:00+00
+ROW: 2024-01-01 23:00:00+00
+ROW: 2024-01-02 23:00:00+00
+ROW: 2024-01-03 23:00:00+00
+ROW: 2024-01-04 23:00:00+00
+ROW: 2024-01-05 23:00:00+00
+ROW: 2024-01-06 23:00:00+00
+--- STMT 105 ---
+SQL: -- === CASE expression variants === SELECT CASE WHEN 1=1 THEN 'a' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: a
+--- STMT 106 ---
+SQL: SELECT CASE WHEN 1=2 THEN 'a' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: NULL
+--- STMT 107 ---
+SQL: SELECT CASE WHEN 1=2 THEN 'a' WHEN 1=1 THEN 'b' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: b
+--- STMT 108 ---
+SQL: SELECT CASE WHEN 1=2 THEN 'a' ELSE 'default' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: default
+--- STMT 109 ---
+SQL: SELECT CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 'two' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: one
+--- STMT 110 ---
+SQL: SELECT CASE 3 WHEN 1 THEN 'one' WHEN 2 THEN 'two' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: NULL
+--- STMT 111 ---
+SQL: SELECT CASE 3 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END
+RESULT: 1 columns, 1 rows
+COLUMNS: case
+ROW: other
+--- STMT 112 ---
+SQL: -- === IN with various types === SELECT 1 IN (1, 2, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 113 ---
+SQL: SELECT 4 IN (1, 2, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 114 ---
+SQL: SELECT 'a' IN ('a', 'b', 'c')
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 115 ---
+SQL: SELECT 'x' IN ('a', 'b', 'c')
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 116 ---
+SQL: SELECT NULL IN (1, 2, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 117 ---
+SQL: SELECT 1 IN (1, NULL, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 118 ---
+SQL: SELECT 1 NOT IN (2, 3, 4)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 119 ---
+SQL: SELECT 1 NOT IN (1, 2, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 120 ---
+SQL: SELECT NULL NOT IN (1, 2, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: NULL
+--- STMT 121 ---
+SQL: -- === BETWEEN === SELECT 5 BETWEEN 1 AND 10
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 122 ---
+SQL: SELECT 0 BETWEEN 1 AND 10
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 123 ---
+SQL: SELECT 10 BETWEEN 1 AND 10
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 124 ---
+SQL: SELECT 'b' BETWEEN 'a' AND 'c'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 125 ---
+SQL: SELECT DATE '2024-06-15' BETWEEN DATE '2024-01-01' AND DATE '2024-12-31'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 126 ---
+SQL: SELECT 5 NOT BETWEEN 1 AND 10
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 127 ---
+SQL: SELECT 0 NOT BETWEEN 1 AND 10
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 128 ---
+SQL: SELECT 5 BETWEEN SYMMETRIC 10 AND 1
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 129 ---
+SQL: -- === LIKE / pattern matching === SELECT 'hello' LIKE 'hel%'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 130 ---
+SQL: SELECT 'hello' LIKE '%llo'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 131 ---
+SQL: SELECT 'hello' LIKE 'h_llo'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 132 ---
+SQL: SELECT 'hello' LIKE 'HELLO'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 133 ---
+SQL: SELECT 'hello' ILIKE 'HELLO'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 134 ---
+SQL: SELECT 'hello' NOT LIKE 'xyz%'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 135 ---
+SQL: SELECT 'hello' SIMILAR TO '(hel|xyz)%'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 136 ---
+SQL: SELECT 'hello' NOT SIMILAR TO '(abc|xyz)%'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 137 ---
+SQL: SELECT 'hello' ~ '^h.*o$'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 138 ---
+SQL: SELECT 'HELLO' ~* '^h.*o$'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 139 ---
+SQL: SELECT 'hello' !~ '^x'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 140 ---
+SQL: SELECT 'HELLO' !~* '^x'
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 141 ---
+SQL: -- === Type checking === SELECT PG_TYPEOF(42)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: integer
+--- STMT 142 ---
+SQL: SELECT PG_TYPEOF(42.0)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: numeric
+--- STMT 143 ---
+SQL: SELECT PG_TYPEOF('hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: unknown
+--- STMT 144 ---
+SQL: SELECT PG_TYPEOF(true)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: boolean
+--- STMT 145 ---
+SQL: SELECT PG_TYPEOF(NULL)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: unknown
+--- STMT 146 ---
+SQL: SELECT PG_TYPEOF(ARRAY[1,2])
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: integer[]
+--- STMT 147 ---
+SQL: SELECT PG_TYPEOF('2024-01-01'::date)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: date
+--- STMT 148 ---
+SQL: SELECT PG_TYPEOF('{"a":1}'::jsonb)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_typeof
+ROW: jsonb
+--- STMT 149 ---
+SQL: -- === System info === SELECT CURRENT_USER
+RESULT: 1 columns, 1 rows
+COLUMNS: current_user
+ROW: memgres
+--- STMT 150 ---
+SQL: SELECT CURRENT_SCHEMA
+RESULT: 1 columns, 1 rows
+COLUMNS: current_schema
+ROW: public
+--- STMT 151 ---
+SQL: SELECT CURRENT_DATABASE()
+RESULT: 1 columns, 1 rows
+COLUMNS: current_database
+ROW: memgres
+--- STMT 152 ---
+SQL: SELECT CURRENT_SETTING('search_path')
+RESULT: 1 columns, 1 rows
+COLUMNS: current_setting
+ROW: "$user", public
+--- STMT 153 ---
+SQL: SELECT HAS_TABLE_PRIVILEGE(CURRENT_USER, 'pg_class', 'SELECT')
+RESULT: 1 columns, 1 rows
+COLUMNS: has_table_privilege
+ROW: t
+--- STMT 154 ---
+SQL: SELECT PG_TABLE_IS_VISIBLE('pg_class'::regclass)
+RESULT: 1 columns, 1 rows
+COLUMNS: pg_table_is_visible
+ROW: t
+--- STMT 155 ---
+SQL: -- === Unicode === CREATE TABLE unicode_test (id serial PRIMARY KEY, val text)
+OK: 0 rows affected
+--- STMT 156 ---
+SQL: INSERT INTO unicode_test (val) VALUES ('hello')
+OK: 1 rows affected
+--- STMT 157 ---
+SQL: INSERT INTO unicode_test (val) VALUES ('café')
+OK: 1 rows affected
+--- STMT 158 ---
+SQL: INSERT INTO unicode_test (val) VALUES ('日本語')
+OK: 1 rows affected
+--- STMT 159 ---
+SQL: INSERT INTO unicode_test (val) VALUES ('emoji: 🎉')
+OK: 1 rows affected
+--- STMT 160 ---
+SQL: INSERT INTO unicode_test (val) VALUES ('Ñoño')
+OK: 1 rows affected
+--- STMT 161 ---
+SQL: SELECT * FROM unicode_test ORDER BY id
+RESULT: 2 columns, 5 rows
+COLUMNS: id, val
+ROW: 1 | hello
+ROW: 2 | café
+ROW: 3 | 日本語
+ROW: 4 | emoji: 🎉
+ROW: 5 | Ñoño
+--- STMT 162 ---
+SQL: SELECT LENGTH(val), val FROM unicode_test ORDER BY id
+RESULT: 2 columns, 5 rows
+COLUMNS: length, val
+ROW: 5 | hello
+ROW: 4 | café
+ROW: 3 | 日本語
+ROW: 8 | emoji: 🎉
+ROW: 4 | Ñoño
+--- STMT 163 ---
+SQL: SELECT val FROM unicode_test WHERE val LIKE '%café%'
+RESULT: 1 columns, 1 rows
+COLUMNS: val
+ROW: café
+--- STMT 164 ---
+SQL: SELECT UPPER('café')
+RESULT: 1 columns, 1 rows
+COLUMNS: upper
+ROW: CAFÉ
+--- STMT 165 ---
+SQL: SELECT LOWER('CAFÉ')
+RESULT: 1 columns, 1 rows
+COLUMNS: lower
+ROW: café
+--- STMT 166 ---
+SQL: DROP TABLE unicode_test
+OK: 0 rows affected
+--- STMT 167 ---
+SQL: -- === Row value comparison === SELECT (1, 2) = (1, 2)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 168 ---
+SQL: SELECT (1, 2) = (1, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+--- STMT 169 ---
+SQL: SELECT (1, 2) < (1, 3)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 170 ---
+SQL: SELECT (1, 2) < (2, 1)
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 171 ---
+SQL: SELECT (1, 'a') = (1, 'a')
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 172 ---
+SQL: SELECT ROW(1, 'hello') = ROW(1, 'hello')
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: t
+--- STMT 173 ---
+SQL: SELECT ROW(1, 'hello') = ROW(1, 'world')
+RESULT: 1 columns, 1 rows
+COLUMNS: ?column?
+ROW: f
+

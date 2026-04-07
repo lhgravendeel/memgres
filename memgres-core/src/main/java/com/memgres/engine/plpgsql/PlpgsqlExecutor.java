@@ -1,0 +1,1179 @@
+package com.memgres.engine.plpgsql;
+
+import com.memgres.engine.util.Cols;
+
+import com.memgres.engine.*;
+import com.memgres.engine.*;
+import com.memgres.engine.parser.Lexer;
+import com.memgres.engine.parser.Token;
+import com.memgres.engine.parser.TokenType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.*;
+
+/**
+ * Executes PL/pgSQL function bodies.
+ * Manages variable scope, control flow, and delegates SQL to AstExecutor.
+ * Expressions are evaluated by substituting variables and using SELECT expr.
+ */
+public class PlpgsqlExecutor {
+
+    private static final Logger LOG = LoggerFactory.getLogger(PlpgsqlExecutor.class);
+
+    private final AstExecutor astExecutor;
+    private final Database database;
+    private final Session session; // may be null when no client connection
+
+    // Control flow signals
+    private static class ReturnSignal extends RuntimeException {
+        final Object value;
+        ReturnSignal(Object value) { super(null, null, true, false); this.value = value; }
+    }
+
+    private static class ExitSignal extends RuntimeException {
+        final String label;
+        ExitSignal(String label) { super(null, null, true, false); this.label = label; }
+    }
+
+    private static class ContinueSignal extends RuntimeException {
+        final String label;
+        ContinueSignal(String label) { super(null, null, true, false); this.label = label; }
+    }
+
+    // Variable scope
+    static class Scope {
+        final Map<String, Object> variables = new LinkedHashMap<>();
+        final Scope parent;
+        int lastRowCount = 0;
+
+        Scope(Scope parent) { this.parent = parent; }
+
+        Object get(String name) {
+            String key = name.toLowerCase();
+            if (variables.containsKey(key)) return variables.get(key);
+            if (parent != null) return parent.get(key);
+            return null;
+        }
+
+        void set(String name, Object value) {
+            String key = name.toLowerCase();
+            Scope s = this;
+            while (s != null) {
+                if (s.variables.containsKey(key)) { s.variables.put(key, value); return; }
+                s = s.parent;
+            }
+            variables.put(key, value);
+        }
+
+        boolean has(String name) {
+            String key = name.toLowerCase();
+            if (variables.containsKey(key)) return true;
+            return parent != null && parent.has(key);
+        }
+
+        void declare(String name, Object value) {
+            variables.put(name.toLowerCase(), value);
+        }
+    }
+
+    public PlpgsqlExecutor(AstExecutor astExecutor, Database database) {
+        this(astExecutor, database, null);
+    }
+
+    public PlpgsqlExecutor(AstExecutor astExecutor, Database database, Session session) {
+        this.astExecutor = astExecutor;
+        this.database = database;
+        this.session = session;
+    }
+
+    /**
+     * Execute a DO block (anonymous PL/pgSQL code block).
+     */
+    public void executeDoBlock(String body) {
+        PlpgsqlStatement.Block block;
+        try {
+            block = PlpgsqlParser.parse(body);
+        } catch (MemgresException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new MemgresException(e.getMessage() != null ? e.getMessage() : "syntax error in PL/pgSQL block", "42601");
+        }
+        Scope scope = new Scope(null);
+        scope.declare("found", false);
+        try {
+            executeBlock(block, scope);
+        } catch (ReturnSignal rs) {
+            // DO blocks can RETURN but the value is discarded
+        }
+    }
+
+    public Object executeFunction(PgFunction function, List<Object> args) {
+        PlpgsqlStatement.Block block;
+        String lang = function.getLanguage() != null ? function.getLanguage().toLowerCase() : "plpgsql";
+
+        if (lang.equals("sql")) {
+            // SQL language function: execute body as SQL with param substitution
+            return executeSqlFunction(function, args);
+        }
+
+        block = PlpgsqlParser.parse(function.getBody());
+        Scope scope = new Scope(null);
+
+        // Bind parameters: OUT params get null initial value, INOUT params get caller's value
+        List<PgFunction.Param> params = function.getParams();
+        List<PgFunction.Param> outParams = new ArrayList<>();
+        int argIdx = 0;
+        for (int i = 0; i < params.size(); i++) {
+            PgFunction.Param p = params.get(i);
+            String pName = p.name() != null ? p.name() : ("$" + (i + 1));
+            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            Object val;
+            if ("OUT".equals(mode)) {
+                val = null; // OUT params start as null
+                outParams.add(p);
+            } else if ("INOUT".equals(mode)) {
+                val = argIdx < args.size() ? args.get(argIdx++) : null;
+                outParams.add(p);
+            } else {
+                // IN (or default)
+                if (argIdx < args.size()) {
+                    val = args.get(argIdx++);
+                } else if (p.defaultExpr() != null) {
+                    QueryResult defaultResult = astExecutor.execute("SELECT " + p.defaultExpr());
+                    val = (!defaultResult.getRows().isEmpty() && defaultResult.getRows().get(0).length > 0)
+                            ? defaultResult.getRows().get(0)[0] : null;
+                } else {
+                    val = null;
+                }
+            }
+            val = coerceParamValue(val, p.typeName());
+            scope.declare(pName, val);
+        }
+        scope.declare("found", false);
+
+        String returnType = function.getReturnType();
+        boolean isSetof = returnType != null && returnType.toUpperCase().startsWith("SETOF");
+        boolean isTable = returnType != null && returnType.equalsIgnoreCase("TABLE");
+
+        if (isSetof || isTable) {
+            List<Object> results = new ArrayList<>();
+            scope.declare("__return_next_results__", results);
+            try {
+                executeBlock(block, scope);
+            } catch (ReturnSignal rs) { /* done */ }
+            return results;
+        }
+
+        try {
+            executeBlock(block, scope);
+        } catch (ReturnSignal rs) {
+            // Explicit RETURN; if we also have OUT params, prefer the OUT param values
+            if (outParams.isEmpty()) return rs.value;
+        }
+
+        // Collect OUT/INOUT param values as the return value
+        if (!outParams.isEmpty()) {
+            if (outParams.size() == 1) {
+                String pName = outParams.get(0).name() != null ? outParams.get(0).name()
+                        : ("$" + (params.indexOf(outParams.get(0)) + 1));
+                return scope.get(pName);
+            }
+            // Multiple OUT params: return as Object[] (record)
+            Object[] record = new Object[outParams.size()];
+            for (int i = 0; i < outParams.size(); i++) {
+                PgFunction.Param op = outParams.get(i);
+                String pName = op.name() != null ? op.name() : ("$" + (params.indexOf(op) + 1));
+                record[i] = scope.get(pName);
+            }
+            return record;
+        }
+
+        return null;
+    }
+
+    private Object executeSqlFunction(PgFunction function, List<Object> args) {
+        String body = function.getBody().trim();
+        // Substitute parameter names (with default support)
+        Scope scope = new Scope(null);
+        List<PgFunction.Param> params = function.getParams();
+        for (int i = 0; i < params.size(); i++) {
+            PgFunction.Param p = params.get(i);
+            String pName = p.name() != null ? p.name() : ("$" + (i + 1));
+            Object val;
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) {
+                // Collect all remaining args into a list (array)
+                List<Object> variadicArgs = new ArrayList<>();
+                for (int j = i; j < args.size(); j++) {
+                    variadicArgs.add(args.get(j));
+                }
+                val = variadicArgs;
+                scope.declare(pName, val);
+                break; // VARIADIC is always the last param
+            } else if (i < args.size()) {
+                val = args.get(i);
+            } else if (p.defaultExpr() != null) {
+                QueryResult defaultResult = astExecutor.execute("SELECT " + p.defaultExpr());
+                val = (!defaultResult.getRows().isEmpty() && defaultResult.getRows().get(0).length > 0)
+                        ? defaultResult.getRows().get(0)[0] : null;
+            } else {
+                val = null;
+            }
+            scope.declare(pName, val);
+        }
+        String substituted = substituteVariables(body, scope);
+
+        // Split body into individual statements (supports multi-statement SQL bodies)
+        List<String> stmts = splitSqlBody(substituted);
+        QueryResult result = null;
+        for (String sql : stmts) {
+            result = astExecutor.execute(sql);
+        }
+
+        if (result == null) return null;
+
+        // Check if this is a SETOF or TABLE-returning function
+        String returnType = function.getReturnType();
+        boolean isSetof = returnType != null && returnType.toUpperCase().startsWith("SETOF");
+        boolean isTable = returnType != null && returnType.equalsIgnoreCase("TABLE");
+        if (isSetof || isTable) {
+            // Return all rows as a List (each row as Object[] or single value)
+            List<Object> results = new ArrayList<>();
+            for (Object[] row : result.getRows()) {
+                results.add(row.length == 1 ? row[0] : row);
+            }
+            return results;
+        }
+
+        if (!result.getRows().isEmpty() && result.getRows().get(0).length > 0) {
+            return result.getRows().get(0)[0];
+        }
+        return null;
+    }
+
+    public Object[] executeTriggerFunction(PgFunction function, Object[] newRow, Object[] oldRow,
+                                           Table table, PgTrigger trigger) {
+        PlpgsqlStatement.Block block = PlpgsqlParser.parse(function.getBody());
+        Scope scope = new Scope(null);
+
+        Map<String, Object> newMap = new LinkedHashMap<>();
+        Map<String, Object> oldMap = new LinkedHashMap<>();
+        if (newRow != null) {
+            for (int i = 0; i < table.getColumns().size(); i++)
+                newMap.put(table.getColumns().get(i).getName().toLowerCase(), newRow[i]);
+        }
+        if (oldRow != null) {
+            for (int i = 0; i < table.getColumns().size(); i++)
+                oldMap.put(table.getColumns().get(i).getName().toLowerCase(), oldRow[i]);
+        }
+        scope.declare("new", newMap);
+        scope.declare("old", oldMap);
+        scope.declare("found", false);
+
+        if (trigger != null) {
+            scope.declare("tg_op", trigger.getEvent().name());
+            scope.declare("tg_table_name", trigger.getTableName());
+            scope.declare("tg_when", trigger.getTiming().name());
+            scope.declare("tg_nargs", 0);
+            scope.declare("tg_argv", new String[0]);
+        } else {
+            scope.declare("tg_op", "INSERT");
+            scope.declare("tg_table_name", table.getName());
+            scope.declare("tg_when", "BEFORE");
+            scope.declare("tg_nargs", 0);
+            scope.declare("tg_argv", new String[0]);
+        }
+
+        try {
+            executeBlock(block, scope);
+        } catch (ReturnSignal rs) {
+            Object retVal = rs.value;
+            if (retVal == null) return newRow;
+            if (retVal instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> retMap = (Map<String, Object>) retVal;
+                copyMapToRow(retMap, newRow, table);
+                return newRow;
+            }
+        }
+
+        // Copy NEW map back
+        @SuppressWarnings("unchecked")
+        Map<String, Object> finalNew = (Map<String, Object>) scope.get("new");
+        if (finalNew != null && newRow != null) {
+            copyMapToRow(finalNew, newRow, table);
+        }
+        return newRow;
+    }
+
+    private void copyMapToRow(Map<String, Object> map, Object[] row, Table table) {
+        for (int i = 0; i < table.getColumns().size(); i++) {
+            String colName = table.getColumns().get(i).getName().toLowerCase();
+            if (map.containsKey(colName)) {
+                row[i] = map.get(colName);
+            }
+        }
+    }
+
+    // ---- Block and statement execution ----
+
+    private void executeBlock(PlpgsqlStatement.Block block, Scope scope) {
+        for (PlpgsqlStatement.VarDeclaration decl : block.declarations()) {
+            Object defaultVal = null;
+            if (decl.defaultExpr() != null) {
+                defaultVal = evalExpr(decl.defaultExpr(), scope);
+            }
+            scope.declare(decl.name(), defaultVal);
+        }
+
+        if (block.exceptionHandlers().isEmpty()) {
+            executeStatements(block.body(), scope);
+        } else {
+            try {
+                executeStatements(block.body(), scope);
+            } catch (ReturnSignal rs) {
+                throw rs;
+            } catch (MemgresException e) {
+                String sqlState = e.getSqlState() != null ? e.getSqlState() : "P0001";
+                for (PlpgsqlStatement.ExceptionHandler handler : block.exceptionHandlers()) {
+                    if (matchesCondition(handler.conditionNames(), sqlState)) {
+                        Scope handlerScope = new Scope(scope);
+                        handlerScope.declare("sqlerrm", e.getMessage());
+                        handlerScope.declare("sqlstate", sqlState);
+                        executeStatements(handler.body(), handlerScope);
+                        return;
+                    }
+                }
+                throw e;
+            } catch (RuntimeException e) {
+                // Handle Java exceptions (like ArithmeticException for / by zero)
+                String sqlState = mapJavaExceptionToSqlState(e);
+                for (PlpgsqlStatement.ExceptionHandler handler : block.exceptionHandlers()) {
+                    if (matchesCondition(handler.conditionNames(), sqlState)) {
+                        Scope handlerScope = new Scope(scope);
+                        handlerScope.declare("sqlerrm", e.getMessage());
+                        handlerScope.declare("sqlstate", sqlState);
+                        executeStatements(handler.body(), handlerScope);
+                        return;
+                    }
+                }
+                throw e;
+            }
+        }
+    }
+
+    private void executeStatements(List<PlpgsqlStatement> stmts, Scope scope) {
+        for (PlpgsqlStatement stmt : stmts) {
+            executeStatement(stmt, scope);
+        }
+    }
+
+    private void executeStatement(PlpgsqlStatement stmt, Scope scope) {
+        if (stmt instanceof PlpgsqlStatement.Block) {
+            PlpgsqlStatement.Block b = (PlpgsqlStatement.Block) stmt;
+            executeBlock(b, new Scope(scope));
+        } else if (stmt instanceof PlpgsqlStatement.Assignment) {
+            PlpgsqlStatement.Assignment a = (PlpgsqlStatement.Assignment) stmt;
+            executeAssignment(a, scope);
+        } else if (stmt instanceof PlpgsqlStatement.IfStmt) {
+            PlpgsqlStatement.IfStmt i = (PlpgsqlStatement.IfStmt) stmt;
+            executeIf(i, scope);
+        } else if (stmt instanceof PlpgsqlStatement.LoopStmt) {
+            PlpgsqlStatement.LoopStmt l = (PlpgsqlStatement.LoopStmt) stmt;
+            executeLoop(l, scope);
+        } else if (stmt instanceof PlpgsqlStatement.WhileStmt) {
+            PlpgsqlStatement.WhileStmt w = (PlpgsqlStatement.WhileStmt) stmt;
+            executeWhile(w, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ForStmt) {
+            PlpgsqlStatement.ForStmt f = (PlpgsqlStatement.ForStmt) stmt;
+            executeFor(f, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ForQueryStmt) {
+            PlpgsqlStatement.ForQueryStmt fq = (PlpgsqlStatement.ForQueryStmt) stmt;
+            executeForQuery(fq, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ForeachStmt) {
+            PlpgsqlStatement.ForeachStmt fe = (PlpgsqlStatement.ForeachStmt) stmt;
+            executeForeach(fe, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ExitStmt) {
+            PlpgsqlStatement.ExitStmt e = (PlpgsqlStatement.ExitStmt) stmt;
+            executeExit(e, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ContinueStmt) {
+            PlpgsqlStatement.ContinueStmt c = (PlpgsqlStatement.ContinueStmt) stmt;
+            executeContinue(c, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ReturnStmt) {
+            PlpgsqlStatement.ReturnStmt r = (PlpgsqlStatement.ReturnStmt) stmt;
+            executeReturn(r, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ReturnNextStmt) {
+            PlpgsqlStatement.ReturnNextStmt rn = (PlpgsqlStatement.ReturnNextStmt) stmt;
+            executeReturnNext(rn, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ReturnQueryStmt) {
+            PlpgsqlStatement.ReturnQueryStmt rq = (PlpgsqlStatement.ReturnQueryStmt) stmt;
+            executeReturnQuery(rq, scope);
+        } else if (stmt instanceof PlpgsqlStatement.RaiseStmt) {
+            PlpgsqlStatement.RaiseStmt ra = (PlpgsqlStatement.RaiseStmt) stmt;
+            executeRaise(ra, scope);
+        } else if (stmt instanceof PlpgsqlStatement.PerformStmt) {
+            PlpgsqlStatement.PerformStmt p = (PlpgsqlStatement.PerformStmt) stmt;
+            executePerform(p, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ExecuteStmt) {
+            PlpgsqlStatement.ExecuteStmt ex = (PlpgsqlStatement.ExecuteStmt) stmt;
+            executeExecute(ex, scope);
+        } else if (stmt instanceof PlpgsqlStatement.SqlStmt) {
+            PlpgsqlStatement.SqlStmt s = (PlpgsqlStatement.SqlStmt) stmt;
+            executeSql(s, scope);
+        } else if (stmt instanceof PlpgsqlStatement.NullStmt) {
+            // no-op
+        } else if (stmt instanceof PlpgsqlStatement.GetDiagnosticsStmt) {
+            PlpgsqlStatement.GetDiagnosticsStmt gd = (PlpgsqlStatement.GetDiagnosticsStmt) stmt;
+            executeGetDiagnostics(gd, scope);
+        } else if (stmt instanceof PlpgsqlStatement.OpenCursorStmt) {
+            PlpgsqlStatement.OpenCursorStmt oc = (PlpgsqlStatement.OpenCursorStmt) stmt;
+            executeOpenCursor(oc, scope);
+        } else if (stmt instanceof PlpgsqlStatement.FetchStmt) {
+            PlpgsqlStatement.FetchStmt fs = (PlpgsqlStatement.FetchStmt) stmt;
+            executeFetch(fs, scope);
+        } else if (stmt instanceof PlpgsqlStatement.CloseCursorStmt) {
+            PlpgsqlStatement.CloseCursorStmt cc = (PlpgsqlStatement.CloseCursorStmt) stmt;
+            executeCloseCursor(cc, scope);
+        }
+    }
+
+    // ---- Control flow ----
+
+    private void executeIf(PlpgsqlStatement.IfStmt stmt, Scope scope) {
+        if (isTruthy(evalExpr(stmt.condition(), scope))) {
+            executeStatements(stmt.thenBody(), scope);
+            return;
+        }
+        for (PlpgsqlStatement.ElsifClause elsif : stmt.elsifClauses()) {
+            if (isTruthy(evalExpr(elsif.condition(), scope))) {
+                executeStatements(elsif.body(), scope);
+                return;
+            }
+        }
+        if (!stmt.elseBody().isEmpty()) {
+            executeStatements(stmt.elseBody(), scope);
+        }
+    }
+
+    private void executeLoop(PlpgsqlStatement.LoopStmt stmt, Scope scope) {
+        while (true) {
+            try {
+                executeStatements(stmt.body(), scope);
+            } catch (ExitSignal e) {
+                if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
+                throw e;
+            } catch (ContinueSignal c) {
+                if (c.label == null || c.label.equalsIgnoreCase(stmt.label())) continue;
+                throw c;
+            }
+        }
+    }
+
+    private void executeWhile(PlpgsqlStatement.WhileStmt stmt, Scope scope) {
+        while (isTruthy(evalExpr(stmt.condition(), scope))) {
+            try {
+                executeStatements(stmt.body(), scope);
+            } catch (ExitSignal e) {
+                if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
+                throw e;
+            } catch (ContinueSignal c) {
+                if (c.label == null || c.label.equalsIgnoreCase(stmt.label())) continue;
+                throw c;
+            }
+        }
+    }
+
+    private void executeFor(PlpgsqlStatement.ForStmt stmt, Scope scope) {
+        int lower = toInt(evalExpr(stmt.lower(), scope));
+        int upper = toInt(evalExpr(stmt.upper(), scope));
+        int step = stmt.step() != null ? toInt(evalExpr(stmt.step(), scope)) : 1;
+        if (stmt.reverse()) step = -Math.abs(step);
+
+        scope.declare(stmt.varName(), null);
+        boolean anyIteration = false;
+
+        for (int i = lower; stmt.reverse() ? i >= upper : i <= upper; i += step) {
+            anyIteration = true;
+            scope.set(stmt.varName(), i);
+            try {
+                executeStatements(stmt.body(), scope);
+            } catch (ExitSignal e) {
+                if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
+                throw e;
+            } catch (ContinueSignal c) {
+                if (c.label == null || c.label.equalsIgnoreCase(stmt.label())) continue;
+                throw c;
+            }
+        }
+        scope.set("found", anyIteration);
+    }
+
+    private void executeForQuery(PlpgsqlStatement.ForQueryStmt stmt, Scope scope) {
+        String sql = substituteVariables(stmt.sql(), scope);
+        QueryResult result = astExecutor.execute(sql);
+
+        scope.declare(stmt.varName(), null);
+        boolean anyIteration = false;
+
+        for (Object[] row : result.getRows()) {
+            anyIteration = true;
+            if (result.getColumns().size() == 1) {
+                scope.set(stmt.varName(), row[0]);
+            } else {
+                Map<String, Object> record = new LinkedHashMap<>();
+                for (int i = 0; i < result.getColumns().size(); i++) {
+                    record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
+                }
+                scope.set(stmt.varName(), record);
+            }
+            try {
+                executeStatements(stmt.body(), scope);
+            } catch (ExitSignal e) {
+                if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
+                throw e;
+            } catch (ContinueSignal c) {
+                if (c.label == null || c.label.equalsIgnoreCase(stmt.label())) continue;
+                throw c;
+            }
+        }
+        scope.set("found", anyIteration);
+    }
+
+    private void executeForeach(PlpgsqlStatement.ForeachStmt stmt, Scope scope) {
+        Object arrayObj = evalExpr(stmt.arrayExpr(), scope);
+        if (arrayObj == null) return;
+        List<?> list = arrayObj instanceof List ? (List<?>) arrayObj
+                : arrayObj instanceof Object[] ? Arrays.asList((Object[]) arrayObj) : Cols.listOf();
+
+        scope.declare(stmt.varName(), null);
+        for (Object element : list) {
+            scope.set(stmt.varName(), element);
+            try {
+                executeStatements(stmt.body(), scope);
+            } catch (ExitSignal e) {
+                if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
+                throw e;
+            } catch (ContinueSignal c) {
+                if (c.label == null || c.label.equalsIgnoreCase(stmt.label())) continue;
+                throw c;
+            }
+        }
+    }
+
+    private void executeExit(PlpgsqlStatement.ExitStmt stmt, Scope scope) {
+        if (stmt.whenCondition() != null && !isTruthy(evalExpr(stmt.whenCondition(), scope))) return;
+        throw new ExitSignal(stmt.label());
+    }
+
+    private void executeContinue(PlpgsqlStatement.ContinueStmt stmt, Scope scope) {
+        if (stmt.whenCondition() != null && !isTruthy(evalExpr(stmt.whenCondition(), scope))) return;
+        throw new ContinueSignal(stmt.label());
+    }
+
+    // ---- RETURN ----
+
+    private void executeReturn(PlpgsqlStatement.ReturnStmt stmt, Scope scope) {
+        if (stmt.valueExpr() == null) throw new ReturnSignal(null);
+        // Special cases: RETURN NEW / RETURN OLD
+        String trimmed = stmt.valueExpr().trim();
+        if (trimmed.equalsIgnoreCase("NEW")) throw new ReturnSignal(scope.get("new"));
+        if (trimmed.equalsIgnoreCase("OLD")) throw new ReturnSignal(scope.get("old"));
+        if (trimmed.equalsIgnoreCase("NULL")) throw new ReturnSignal(null);
+        throw new ReturnSignal(evalExpr(stmt.valueExpr(), scope));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeReturnNext(PlpgsqlStatement.ReturnNextStmt stmt, Scope scope) {
+        Object value = evalExpr(stmt.valueExpr(), scope);
+        List<Object> results = (List<Object>) scope.get("__return_next_results__");
+        if (results != null) results.add(value);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeReturnQuery(PlpgsqlStatement.ReturnQueryStmt stmt, Scope scope) {
+        String sql = substituteVariables(stmt.sql(), scope);
+        QueryResult result = astExecutor.execute(sql);
+        List<Object> results = (List<Object>) scope.get("__return_next_results__");
+        if (results != null) {
+            for (Object[] row : result.getRows()) {
+                results.add(row.length == 1 ? row[0] : row);
+            }
+        }
+    }
+
+    // ---- RAISE ----
+
+    private void executeRaise(PlpgsqlStatement.RaiseStmt stmt, Scope scope) {
+        String message = formatRaiseMessage(stmt.format(), stmt.argExprs(), scope);
+        String hint = stmt.hint();
+        switch (stmt.level()) {
+            case "NOTICE":
+            case "WARNING":
+            case "INFO":
+            case "LOG":
+                LOG.info("PL/pgSQL {}: {}", stmt.level(), message);
+                if (session != null) {
+                    String sqlState = stmt.errcode() != null ? conditionToSqlState(stmt.errcode()) : "00000";
+                    session.addNotice(stmt.level(), sqlState, message, hint);
+                }
+                break;
+            case "DEBUG":
+                LOG.debug("PL/pgSQL {}: {}", stmt.level(), message);
+                // DEBUG messages are below client_min_messages threshold, so do not send to client
+                break;
+            case "EXCEPTION":
+                String sqlState = "P0001";
+                if (stmt.errcode() != null) sqlState = conditionToSqlState(stmt.errcode());
+                throw new MemgresException(message != null ? message : "PL/pgSQL exception", sqlState);
+            default:
+                // Named condition: RAISE division_by_zero, RAISE unique_violation, etc.
+                String condState = conditionToSqlState(stmt.level().toLowerCase());
+                if (!condState.equals("P0001") || stmt.level().contains("_")) {
+                    // It's a known condition name; raise as exception with that SQLSTATE
+                    String msg = message != null ? message : stmt.level().replace("_", " ");
+                    if (stmt.errcode() != null) condState = conditionToSqlState(stmt.errcode());
+                    throw new MemgresException(msg, condState);
+                }
+                break;
+        }
+    }
+
+    private String formatRaiseMessage(String format, List<String> argExprs, Scope scope) {
+        if (format == null) return null;
+        StringBuilder sb = new StringBuilder();
+        int argIdx = 0;
+        for (int i = 0; i < format.length(); i++) {
+            char c = format.charAt(i);
+            if (c == '%' && argIdx < argExprs.size()) {
+                Object val = evalExpr(argExprs.get(argIdx), scope);
+                sb.append(val != null ? val.toString() : "NULL");
+                argIdx++;
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    // ---- PERFORM ----
+
+    private void executePerform(PlpgsqlStatement.PerformStmt stmt, Scope scope) {
+        String sql = substituteVariables(stmt.sql(), scope);
+        QueryResult result = astExecutor.execute(sql);
+        scope.set("found", !result.getRows().isEmpty());
+    }
+
+    // ---- EXECUTE dynamic SQL ----
+
+    private void executeExecute(PlpgsqlStatement.ExecuteStmt stmt, Scope scope) {
+        Object sqlVal = evalExpr(stmt.sqlExpr(), scope);
+        if (sqlVal == null) {
+            throw new MemgresException("query string argument of EXECUTE is null", "22004");
+        }
+        String sql = String.valueOf(sqlVal);
+        // Substitute USING parameters ($1, $2, ...) into the SQL string
+        if (stmt.usingExprs() != null && !stmt.usingExprs().isEmpty()) {
+            for (int i = stmt.usingExprs().size(); i >= 1; i--) {
+                Object paramVal = evalExpr(stmt.usingExprs().get(i - 1), scope);
+                String replacement;
+                if (paramVal == null) {
+                    replacement = "NULL";
+                } else if (paramVal instanceof Number) {
+                    replacement = paramVal.toString();
+                } else if (paramVal instanceof Boolean) {
+                    replacement = paramVal.toString();
+                } else {
+                    replacement = "'" + paramVal.toString().replace("'", "''") + "'";
+                }
+                sql = sql.replace("$" + i, replacement);
+            }
+        }
+        boolean prev = astExecutor.isStrictColumnRefs();
+        astExecutor.setStrictColumnRefs(true);
+        try {
+            QueryResult result = astExecutor.execute(sql);
+            scope.lastRowCount = result.getAffectedRows();
+
+            if (stmt.intoVars() != null && !result.getRows().isEmpty()) {
+                setFromRow(scope, stmt.intoVars(), result);
+                scope.set("found", true);
+            } else if (stmt.intoVars() != null) {
+                scope.set("found", false);
+            }
+        } finally {
+            astExecutor.setStrictColumnRefs(prev);
+        }
+    }
+
+    // ---- SQL statement execution ----
+
+    private void executeSql(PlpgsqlStatement.SqlStmt stmt, Scope scope) {
+        String sql = substituteVariables(stmt.sql(), scope);
+        QueryResult result = astExecutor.execute(sql);
+        scope.lastRowCount = result.getAffectedRows();
+
+        if (stmt.intoVars() != null && !result.getRows().isEmpty()) {
+            setFromRow(scope, stmt.intoVars(), result);
+            scope.set("found", true);
+        } else if (stmt.intoVars() != null) {
+            scope.set("found", false);
+        }
+    }
+
+    private void setFromRow(Scope scope, List<String> varNames, QueryResult result) {
+        Object[] row = result.getRows().get(0);
+        if (varNames.size() > 1) {
+            // Multiple INTO variables: assign each column to its corresponding variable
+            for (int i = 0; i < varNames.size() && i < row.length; i++) {
+                scope.set(varNames.get(i), row[i]);
+            }
+        } else if (varNames.size() == 1) {
+            String varName = varNames.get(0);
+            if (row.length == 1) {
+                scope.set(varName, row[0]);
+            } else {
+                Map<String, Object> record = new LinkedHashMap<>();
+                for (int i = 0; i < result.getColumns().size(); i++) {
+                    record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
+                }
+                scope.set(varName, record);
+            }
+        }
+    }
+
+    // ---- Assignment ----
+
+    private void executeAssignment(PlpgsqlStatement.Assignment stmt, Scope scope) {
+        Object value = evalExpr(stmt.valueExpr(), scope);
+        String target = stmt.target();
+
+        int dotIdx = target.indexOf('.');
+        if (dotIdx > 0) {
+            String qualifier = target.substring(0, dotIdx);
+            String field = target.substring(dotIdx + 1);
+            Object qualObj = scope.get(qualifier);
+            if (qualObj instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> map = (Map<String, Object>) qualObj;
+                map.put(field.toLowerCase(), value);
+                return;
+            }
+        }
+        // Check that the variable is declared; PG gives 42601 for undeclared variables
+        if (!scope.has(target)) {
+            throw new MemgresException("\"" + target + "\" is not a known variable", "42601");
+        }
+        scope.set(target, value);
+    }
+
+    // ---- GET DIAGNOSTICS ----
+
+    private void executeGetDiagnostics(PlpgsqlStatement.GetDiagnosticsStmt stmt, Scope scope) {
+        for (PlpgsqlStatement.DiagItem item : stmt.items()) {
+            Object value;
+            switch (item.itemName().toUpperCase()) {
+                case "ROW_COUNT":
+                    value = scope.lastRowCount;
+                    break;
+                case "FOUND":
+                    value = scope.get("found");
+                    break;
+                default:
+                    value = null;
+                    break;
+            }
+            scope.set(item.varName(), value);
+        }
+    }
+
+    // ---- Cursors ----
+
+    private void executeOpenCursor(PlpgsqlStatement.OpenCursorStmt stmt, Scope scope) {
+        String sql = stmt.sql();
+        if (sql == null) {
+            Object existing = scope.get(stmt.cursorName());
+            if (existing instanceof String) sql = (String) existing;
+        }
+        if (sql != null) {
+            sql = substituteVariables(sql, scope);
+            QueryResult result = astExecutor.execute(sql);
+            scope.set(stmt.cursorName(), new CursorState(result));
+        }
+    }
+
+    private void executeFetch(PlpgsqlStatement.FetchStmt stmt, Scope scope) {
+        Object cursorObj = scope.get(stmt.cursorName());
+        if (cursorObj instanceof CursorState) {
+            CursorState cursor = (CursorState) cursorObj;
+            if (cursor.position < cursor.result.getRows().size()) {
+                Object[] row = cursor.result.getRows().get(cursor.position++);
+                if (stmt.intoVars() != null) {
+                    if (stmt.intoVars().size() > 1) {
+                        // Multiple INTO variables: assign each column to its corresponding variable
+                        for (int i = 0; i < stmt.intoVars().size() && i < row.length; i++) {
+                            scope.set(stmt.intoVars().get(i), row[i]);
+                        }
+                    } else if (row.length == 1) {
+                        scope.set(stmt.intoVars().get(0), row[0]);
+                    } else {
+                        Map<String, Object> record = new LinkedHashMap<>();
+                        for (int i = 0; i < cursor.result.getColumns().size(); i++) {
+                            record.put(cursor.result.getColumns().get(i).getName().toLowerCase(), row[i]);
+                        }
+                        scope.set(stmt.intoVars().get(0), record);
+                    }
+                }
+                scope.set("found", true);
+            } else {
+                scope.set("found", false);
+            }
+        }
+    }
+
+    private void executeCloseCursor(PlpgsqlStatement.CloseCursorStmt stmt, Scope scope) {
+        scope.set(stmt.cursorName(), null);
+    }
+
+    private static class CursorState {
+        final QueryResult result;
+        int position = 0;
+        CursorState(QueryResult result) { this.result = result; }
+    }
+
+    // ---- Expression evaluation ----
+
+    /**
+     * Evaluate an expression string by substituting variables and using SELECT.
+     */
+    Object evalExpr(String exprText, Scope scope) {
+        if (exprText == null || exprText.trim().isEmpty()) return null;
+
+        String trimmed = exprText.trim();
+
+        // Quick check for simple variable reference
+        if (isSimpleIdentifier(trimmed) && scope.has(trimmed)) {
+            return scope.get(trimmed);
+        }
+
+        // Check for qualified variable reference like NEW.col or rec.field
+        if (trimmed.contains(".")) {
+            int dot = trimmed.indexOf('.');
+            String qualifier = trimmed.substring(0, dot).trim();
+            String field = trimmed.substring(dot + 1).trim();
+            if (isSimpleIdentifier(qualifier) && isSimpleIdentifier(field) && scope.has(qualifier)) {
+                Object qualObj = scope.get(qualifier);
+                if (qualObj instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> map = (Map<String, Object>) qualObj;
+                    return map.get(field.toLowerCase());
+                }
+            }
+        }
+
+        // Substitute variables and evaluate as SQL
+        String substituted = substituteVariables(trimmed, scope);
+        String sql = "SELECT " + substituted;
+        QueryResult result = astExecutor.execute(sql);
+        if (!result.getRows().isEmpty() && result.getRows().get(0).length > 0) {
+            return result.getRows().get(0)[0];
+        }
+        return null;
+    }
+
+    private boolean isSimpleIdentifier(String s) {
+        if (s.isEmpty()) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!Character.isLetterOrDigit(c) && c != '_') return false;
+        }
+        return true;
+    }
+
+    // ---- Multi-statement SQL body splitting ----
+
+    /** Split a SQL body (from a SQL-language function/procedure) into individual statements. */
+    private List<String> splitSqlBody(String body) {
+        List<String> result = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        int i = 0;
+        while (i < body.length()) {
+            char c = body.charAt(i);
+            if (c == '\'') {
+                // String literal: skip to closing quote
+                current.append(c);
+                i++;
+                while (i < body.length()) {
+                    current.append(body.charAt(i));
+                    if (body.charAt(i) == '\'' && (i + 1 >= body.length() || body.charAt(i + 1) != '\'')) {
+                        i++;
+                        break;
+                    }
+                    if (body.charAt(i) == '\'' && i + 1 < body.length() && body.charAt(i + 1) == '\'') {
+                        current.append(body.charAt(i + 1));
+                        i += 2;
+                        continue;
+                    }
+                    i++;
+                }
+            } else if (c == ';') {
+                String stmt = current.toString().trim();
+                if (!stmt.isEmpty()) result.add(stmt);
+                current.setLength(0);
+                i++;
+            } else {
+                current.append(c);
+                i++;
+            }
+        }
+        String last = current.toString().trim();
+        if (!last.isEmpty()) result.add(last);
+        return result.isEmpty() ? Cols.listOf(body.trim()) : result;
+    }
+
+    // ---- Variable substitution in SQL ----
+
+    String substituteVariables(String sql, Scope scope) {
+        if (sql == null) return null;
+        try {
+            List<Token> tokens = new Lexer(sql).tokenize();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < tokens.size(); i++) {
+                Token t = tokens.get(i);
+                if (t.type() == TokenType.EOF) break;
+
+                // Handle NEW.col / OLD.col / record.field
+                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
+                        && scope.has(t.value())
+                        && i + 2 < tokens.size()
+                        && tokens.get(i + 1).type() == TokenType.DOT) {
+                    Object qualObj = scope.get(t.value().toLowerCase());
+                    if (qualObj instanceof Map) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> map = (Map<String, Object>) qualObj;
+                        String field = tokens.get(i + 2).value().toLowerCase();
+                        Object val = map.get(field);
+                        appendValue(sb, val);
+                        i += 2;
+                        continue;
+                    }
+                }
+
+                // Handle positional parameter: $1, $2, etc.
+                if (t.type() == TokenType.PARAM && scope.has(t.value())) {
+                    Object val = scope.get(t.value());
+                    appendValue(sb, val);
+                    continue;
+                }
+
+                // Handle plain variable
+                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
+                        && scope.has(t.value())) {
+                    boolean isPrecededByDot = i > 0 && tokens.get(i - 1).type() == TokenType.DOT;
+                    // Don't substitute if preceded by dot (it's a field access like table.column)
+                    // Also don't substitute common SQL keywords that happen to match variable names
+                    if (!isPrecededByDot && isSubstitutableVariable(t.value(), scope)) {
+                        Object val = scope.get(t.value());
+                        if (val instanceof Map) {
+                            // Don't substitute maps as values
+                            appendTokenToSb(sb, t);
+                        } else {
+                            appendValue(sb, val);
+                        }
+                        continue;
+                    }
+                }
+
+                appendTokenToSb(sb, t);
+            }
+            return sb.toString().trim();
+        } catch (Exception e) {
+            return sql;
+        }
+    }
+
+    private boolean isSubstitutableVariable(String name, Scope scope) {
+        // Don't substitute certain SQL keywords even if they're in scope
+        String upper = name.toUpperCase();
+        if (upper.equals("NEW") || upper.equals("OLD")) return false;
+        if (upper.equals("FOUND")) return true;
+        return scope.has(name);
+    }
+
+    private void appendValue(StringBuilder sb, Object val) {
+        if (!sb.isEmpty() && sb.charAt(sb.length() - 1) != '(' && sb.charAt(sb.length() - 1) != ' ') {
+            sb.append(" ");
+        }
+        if (val == null) {
+            sb.append("NULL");
+        } else if (val instanceof Number || val instanceof Boolean) {
+            sb.append(val);
+        } else if (val instanceof byte[]) {
+            byte[] bytes = (byte[]) val;
+            // Format as bytea hex literal: '\x...'::bytea
+            sb.append("'\\x");
+            for (byte b : bytes) {
+                sb.append(String.format("%02x", b & 0xff));
+            }
+            sb.append("'::bytea");
+        } else if (val instanceof java.util.List<?>) {
+            java.util.List<?> list = (java.util.List<?>) val;
+            // Format as parenthesized PG array: (ARRAY['a','b','c'])
+            // Parens are required so that subscript like (ARRAY[...])[1] is valid PG syntax
+            // (bare ARRAY[...][1] is a syntax error in PG)
+            sb.append("(ARRAY[");
+            for (int i = 0; i < list.size(); i++) {
+                if (i > 0) sb.append(",");
+                Object elem = list.get(i);
+                if (elem == null) sb.append("NULL");
+                else if (elem instanceof Number || elem instanceof Boolean) sb.append(elem);
+                else sb.append("'").append(elem.toString().replace("'", "''")).append("'");
+            }
+            sb.append("])");
+        } else {
+            sb.append("'").append(val.toString().replace("'", "''")).append("'");
+        }
+    }
+
+    private void appendTokenToSb(StringBuilder sb, Token t) {
+        if (!sb.isEmpty() && sb.charAt(sb.length() - 1) != '('
+                && sb.charAt(sb.length() - 1) != '.'
+                && t.type() != TokenType.DOT
+                && t.type() != TokenType.COMMA
+                && t.type() != TokenType.RIGHT_PAREN
+                && t.type() != TokenType.SEMICOLON
+                && t.type() != TokenType.LEFT_BRACKET
+                && t.type() != TokenType.RIGHT_BRACKET) {
+            sb.append(" ");
+        }
+        if (t.type() == TokenType.STRING_LITERAL) {
+            sb.append("'").append(t.value().replace("'", "''")).append("'");
+        } else {
+            sb.append(t.value());
+        }
+    }
+
+    // ---- Helpers ----
+
+    private boolean isTruthy(Object val) {
+        if (val == null) return false;
+        if (val instanceof Boolean) return ((Boolean) val);
+        if (val instanceof Number) return ((Number) val).intValue() != 0;
+        if (val instanceof String) return ((String) val).equalsIgnoreCase("true") || ((String) val).equals("t");
+        return true;
+    }
+
+    private int toInt(Object val) {
+        if (val instanceof Number) return ((Number) val).intValue();
+        if (val instanceof String) return Integer.parseInt(((String) val));
+        return 0;
+    }
+
+    private Object coerceParamValue(Object val, String typeName) {
+        if (val == null || typeName == null) return val;
+        String type = typeName.toLowerCase().trim();
+        if (val instanceof String) {
+            String s = (String) val;
+            switch (type) {
+                case "int":
+                case "integer":
+                case "int4": {
+                    try { return Integer.parseInt(s); } catch (Exception e) { return val; } 
+                }
+                case "bigint":
+                case "int8": {
+                    try { return Long.parseLong(s); } catch (Exception e) { return val; } 
+                }
+                case "real":
+                case "float4": {
+                    try { return Float.parseFloat(s); } catch (Exception e) { return val; } 
+                }
+                case "double precision":
+                case "float8": {
+                    try { return Double.parseDouble(s); } catch (Exception e) { return val; } 
+                }
+                case "boolean":
+                case "bool":
+                    return Boolean.parseBoolean(s);
+                case "numeric":
+                case "decimal": {
+                    try { return new java.math.BigDecimal(s); } catch (Exception e) { return val; } 
+                }
+                default:
+                    return val;
+            }
+        }
+        return val;
+    }
+
+    private boolean matchesCondition(List<String> conditions, String sqlState) {
+        for (String cond : conditions) {
+            String condLower = cond.toLowerCase().trim();
+            if (condLower.equals("others")) return true;
+            if (condLower.startsWith("sqlstate ")) {
+                if (sqlState.equals(condLower.substring(9).trim().replace("'", ""))) return true;
+                continue;
+            }
+            if (conditionToSqlState(condLower).equals(sqlState)) return true;
+        }
+        return false;
+    }
+
+    private String conditionToSqlState(String condition) {
+        switch (condition.toLowerCase().replace("'", "").trim()) {
+            case "division_by_zero":
+                return "22012";
+            case "unique_violation":
+                return "23505";
+            case "not_null_violation":
+                return "23502";
+            case "foreign_key_violation":
+                return "23503";
+            case "check_violation":
+                return "23514";
+            case "no_data_found":
+                return "P0002";
+            case "too_many_rows":
+                return "P0003";
+            case "raise_exception":
+                return "P0001";
+            case "data_exception":
+                return "22000";
+            case "integrity_constraint_violation":
+                return "23000";
+            case "undefined_table":
+                return "42P01";
+            case "undefined_column":
+                return "42703";
+            case "duplicate_table":
+                return "42P07";
+            case "duplicate_object":
+                return "42710";
+            case "duplicate_schema":
+                return "42P06";
+            case "invalid_text_representation":
+                return "22P02";
+            case "string_data_right_truncation":
+                return "22001";
+            case "numeric_value_out_of_range":
+                return "22003";
+            case "syntax_error":
+                return "42601";
+            case "invalid_column_reference":
+                return "42P10";
+            case "undefined_function":
+                return "42883";
+            case "wrong_object_type":
+                return "42809";
+            case "dependent_objects_still_exist":
+                return "2BP01";
+            default:
+                return condition.length() == 5 ? condition : "P0001";
+        }
+    }
+
+    private String mapJavaExceptionToSqlState(RuntimeException e) {
+        if (e instanceof ArithmeticException) return "22012"; // division_by_zero
+        if (e instanceof NumberFormatException) return "22000"; // data_exception
+        return "P0001";
+    }
+}

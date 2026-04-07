@@ -1,0 +1,356 @@
+=== COPY: integers TEXT ===
+CMD: COPY copy_integers TO STDOUT
+TEXT_OUTPUT_START
+1	100	10000000000
+-32768	-2147483648	-9223372036854775808
+32767	2147483647	9223372036854775807
+0	0	0
+\N	\N	\N
+TEXT_OUTPUT_END
+=== COPY: integers CSV ===
+CMD: COPY copy_integers TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+1,100,10000000000
+-32768,-2147483648,-9223372036854775808
+32767,2147483647,9223372036854775807
+0,0,0
+,,
+TEXT_OUTPUT_END
+=== COPY: integers CSV+HEADER ===
+CMD: COPY copy_integers TO STDOUT (FORMAT csv, HEADER true)
+TEXT_OUTPUT_START
+a,b,c
+1,100,10000000000
+-32768,-2147483648,-9223372036854775808
+32767,2147483647,9223372036854775807
+0,0,0
+,,
+TEXT_OUTPUT_END
+=== COPY: floats TEXT ===
+CMD: COPY copy_floats TO STDOUT
+TEXT_OUTPUT_START
+1.5	2.5	123.45	99999999999999999.12345
+0	0	0.00	0
+-1.5	-2.5	-123.45	-1
+NaN	NaN	\N	\N
+Infinity	Infinity	\N	\N
+-Infinity	-Infinity	\N	\N
+\N	\N	\N	\N
+TEXT_OUTPUT_END
+=== COPY: floats CSV ===
+CMD: COPY copy_floats TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+1.5,2.5,123.45,99999999999999999.12345
+0,0,0.00,0
+-1.5,-2.5,-123.45,-1
+NaN,NaN,,
+Infinity,Infinity,,
+-Infinity,-Infinity,,
+,,,
+TEXT_OUTPUT_END
+=== COPY: strings TEXT ===
+CMD: COPY copy_strings TO STDOUT
+TEXT_OUTPUT_START
+hello	world	abc  
+		     
+tab\there	new\nline	bk\\sl
+single'quote	double"quote	combo
+\N	\N	\N
+emoji: 😀	CJK: 世界	ok   
+TEXT_OUTPUT_END
+=== COPY: strings CSV ===
+CMD: COPY copy_strings TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+hello,world,abc  
+"","",     
+tab	here,"new
+line",bk\sl
+single'quote,"double""quote",combo
+,,
+emoji: 😀,CJK: 世界,ok   
+TEXT_OUTPUT_END
+=== COPY: strings CSV custom quote ===
+CMD: COPY copy_strings TO STDOUT (FORMAT csv, QUOTE '''')
+TEXT_OUTPUT_START
+hello,world,abc  
+'','',     
+tab	here,'new
+line',bk\sl
+'single''quote',double"quote,combo
+,,
+emoji: 😀,CJK: 世界,ok   
+TEXT_OUTPUT_END
+=== COPY: temporal TEXT ===
+CMD: COPY copy_temporal TO STDOUT
+TEXT_OUTPUT_START
+2024-01-15	10:30:00	2024-01-15 10:30:00	2024-01-15 10:30:00+00	1 year 2 mons 3 days
+1970-01-01	00:00:00	1970-01-01 00:00:00	1970-01-01 00:00:00+00	00:00:00
+2099-12-31	23:59:59.999999	2099-12-31 23:59:59.999999	2099-12-31 23:59:59.999999+00	-1 days
+\N	\N	\N	\N	\N
+TEXT_OUTPUT_END
+=== COPY: temporal CSV ===
+CMD: COPY copy_temporal TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+2024-01-15,10:30:00,2024-01-15 10:30:00,2024-01-15 10:30:00+00,1 year 2 mons 3 days
+1970-01-01,00:00:00,1970-01-01 00:00:00,1970-01-01 00:00:00+00,00:00:00
+2099-12-31,23:59:59.999999,2099-12-31 23:59:59.999999,2099-12-31 23:59:59.999999+00,-1 days
+,,,,
+TEXT_OUTPUT_END
+=== COPY: bool TEXT ===
+CMD: COPY copy_bool TO STDOUT
+TEXT_OUTPUT_START
+t
+f
+\N
+TEXT_OUTPUT_END
+=== COPY: bool CSV ===
+CMD: COPY copy_bool TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+t
+f
+
+TEXT_OUTPUT_END
+=== COPY: uuid TEXT ===
+CMD: COPY copy_uuid TO STDOUT
+TEXT_OUTPUT_START
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+00000000-0000-0000-0000-000000000000
+\N
+TEXT_OUTPUT_END
+=== COPY: uuid CSV ===
+CMD: COPY copy_uuid TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+00000000-0000-0000-0000-000000000000
+
+TEXT_OUTPUT_END
+=== COPY: json TEXT ===
+CMD: COPY copy_json TO STDOUT
+TEXT_OUTPUT_START
+{"key": "value"}	{"key": "value"}
+[]	[]
+null	null
+{"nested": {"arr": [1,2,3]}}	{"nested": {"arr": [1, 2, 3]}}
+\N	\N
+TEXT_OUTPUT_END
+=== COPY: json CSV ===
+CMD: COPY copy_json TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+"{""key"": ""value""}","{""key"": ""value""}"
+[],[]
+null,null
+"{""nested"": {""arr"": [1,2,3]}}","{""nested"": {""arr"": [1, 2, 3]}}"
+,
+TEXT_OUTPUT_END
+=== COPY: arrays TEXT ===
+CMD: COPY copy_arrays TO STDOUT
+TEXT_OUTPUT_START
+{1,2,3}	{hello,world}	{t,f,t}
+{}	{}	{}
+{NULL,1,NULL}	{NULL,"has space",NULL}	{NULL}
+\N	\N	\N
+TEXT_OUTPUT_END
+=== COPY: arrays CSV ===
+CMD: COPY copy_arrays TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+"{1,2,3}","{hello,world}","{t,f,t}"
+{},{},{}
+"{NULL,1,NULL}","{NULL,""has space"",NULL}",{NULL}
+,,
+TEXT_OUTPUT_END
+=== COPY: bytea TEXT ===
+CMD: COPY copy_bytea TO STDOUT
+TEXT_OUTPUT_START
+\\x48656c6c6f
+\\x00ff01fe
+\\x
+\N
+TEXT_OUTPUT_END
+=== COPY: bytea CSV ===
+CMD: COPY copy_bytea TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+\x48656c6c6f
+\x00ff01fe
+\x
+
+TEXT_OUTPUT_END
+=== COPY: network TEXT ===
+CMD: COPY copy_network TO STDOUT
+TEXT_OUTPUT_START
+192.168.1.1	10.0.0.0/8
+::1	::ffff:0.0.0.0/96
+\N	\N
+TEXT_OUTPUT_END
+=== COPY: network CSV ===
+CMD: COPY copy_network TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+192.168.1.1,10.0.0.0/8
+::1,::ffff:0.0.0.0/96
+,
+TEXT_OUTPUT_END
+=== COPY: enum TEXT ===
+CMD: COPY copy_enum TO STDOUT
+TEXT_OUTPUT_START
+happy
+sad
+\N
+TEXT_OUTPUT_END
+=== COPY: enum CSV ===
+CMD: COPY copy_enum TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+happy
+sad
+
+TEXT_OUTPUT_END
+=== COPY: mixed TEXT ===
+CMD: COPY copy_mixed TO STDOUT
+TEXT_OUTPUT_START
+1	Alice	alice@test.com	95.50	t	2024-01-01 00:00:00+00	{admin,user}	{"role": "admin"}	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+2	Bob	\N	\N	f	2024-01-01 00:00:00+00	{}	null	\N
+3	Carol	carol@test.com	0.00	t	2024-01-01 00:00:00+00	\N	\N	\N
+TEXT_OUTPUT_END
+=== COPY: mixed CSV ===
+CMD: COPY copy_mixed TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+1,Alice,alice@test.com,95.50,t,2024-01-01 00:00:00+00,"{admin,user}","{""role"": ""admin""}",a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+2,Bob,,,f,2024-01-01 00:00:00+00,{},null,
+3,Carol,carol@test.com,0.00,t,2024-01-01 00:00:00+00,,,
+TEXT_OUTPUT_END
+=== COPY: mixed CSV+HEADER ===
+CMD: COPY copy_mixed TO STDOUT (FORMAT csv, HEADER true)
+TEXT_OUTPUT_START
+id,name,email,score,active,created_at,tags,metadata,uid
+1,Alice,alice@test.com,95.50,t,2024-01-01 00:00:00+00,"{admin,user}","{""role"": ""admin""}",a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+2,Bob,,,f,2024-01-01 00:00:00+00,{},null,
+3,Carol,carol@test.com,0.00,t,2024-01-01 00:00:00+00,,,
+TEXT_OUTPUT_END
+=== COPY: nulls TEXT default ===
+CMD: COPY copy_nulls TO STDOUT
+TEXT_OUTPUT_START
+\N	\N	\N	\N	\N
+	0	f	null	{}
+\\N	0	f	"\\\\N"	{"\\\\N"}
+TEXT_OUTPUT_END
+=== COPY: nulls TEXT custom NULL ===
+CMD: COPY copy_nulls TO STDOUT (NULL 'NULL')
+TEXT_OUTPUT_START
+NULL	NULL	NULL	NULL	NULL
+	0	f	null	{}
+\\N	0	f	"\\\\N"	{"\\\\N"}
+TEXT_OUTPUT_END
+=== COPY: nulls CSV ===
+CMD: COPY copy_nulls TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+,,,,
+"",0,f,null,{}
+\N,0,f,"""\\N""","{""\\N""}"
+TEXT_OUTPUT_END
+=== COPY: nulls CSV custom NULL ===
+CMD: COPY copy_nulls TO STDOUT (FORMAT csv, NULL 'NULL')
+TEXT_OUTPUT_START
+NULL,NULL,NULL,NULL,NULL
+,0,f,null,{}
+\N,0,f,"""\\N""","{""\\N""}"
+TEXT_OUTPUT_END
+=== COPY: integers pipe delimiter ===
+CMD: COPY copy_integers TO STDOUT (DELIMITER '|')
+TEXT_OUTPUT_START
+1|100|10000000000
+-32768|-2147483648|-9223372036854775808
+32767|2147483647|9223372036854775807
+0|0|0
+\N|\N|\N
+TEXT_OUTPUT_END
+=== COPY: strings FORCE_QUOTE * ===
+CMD: COPY copy_strings TO STDOUT (FORMAT csv, FORCE_QUOTE *)
+TEXT_OUTPUT_START
+"hello","world","abc  "
+"","","     "
+"tab	here","new
+line","bk\sl"
+"single'quote","double""quote","combo"
+,,
+"emoji: 😀","CJK: 世界","ok   "
+TEXT_OUTPUT_END
+=== COPY: strings FORCE_QUOTE (a) ===
+CMD: COPY copy_strings TO STDOUT (FORMAT csv, FORCE_QUOTE (a))
+TEXT_OUTPUT_START
+"hello",world,abc  
+"","",     
+"tab	here","new
+line",bk\sl
+"single'quote","double""quote",combo
+,,
+"emoji: 😀",CJK: 世界,ok   
+TEXT_OUTPUT_END
+=== COPY: integers HEADER ===
+CMD: COPY copy_integers TO STDOUT (FORMAT csv, HEADER true)
+TEXT_OUTPUT_START
+a,b,c
+1,100,10000000000
+-32768,-2147483648,-9223372036854775808
+32767,2147483647,9223372036854775807
+0,0,0
+,,
+TEXT_OUTPUT_END
+=== COPY: strings TEXT HEADER ===
+CMD: COPY copy_strings TO STDOUT (HEADER true)
+TEXT_OUTPUT_START
+a	b	c
+hello	world	abc  
+		     
+tab\there	new\nline	bk\\sl
+single'quote	double"quote	combo
+\N	\N	\N
+emoji: 😀	CJK: 世界	ok   
+TEXT_OUTPUT_END
+=== COPY: subquery TEXT ===
+CMD: COPY (SELECT a, b FROM copy_integers WHERE a IS NOT NULL ORDER BY a) TO STDOUT
+TEXT_OUTPUT_START
+-32768	-2147483648
+0	0
+1	100
+32767	2147483647
+TEXT_OUTPUT_END
+=== COPY: subquery CSV ===
+CMD: COPY (SELECT a, b FROM copy_integers WHERE a IS NOT NULL ORDER BY a) TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+-32768,-2147483648
+0,0
+1,100
+32767,2147483647
+TEXT_OUTPUT_END
+=== COPY: column list TEXT ===
+CMD: COPY copy_mixed (name, score) TO STDOUT
+TEXT_OUTPUT_START
+Alice	95.50
+Bob	\N
+Carol	0.00
+TEXT_OUTPUT_END
+=== COPY: column list CSV ===
+CMD: COPY copy_mixed (name, score) TO STDOUT (FORMAT csv)
+TEXT_OUTPUT_START
+Alice,95.50
+Bob,
+Carol,0.00
+TEXT_OUTPUT_END
+=== COPY: integers BINARY ===
+CMD: COPY copy_integers TO STDOUT (FORMAT binary)
+BINARY_OUTPUT_START
+UEdDT1BZCv8NCgAAAAAAAAAAAAADAAAAAgABAAAABAAAAGQAAAAIAAAAAlQL5AAAAwAAAAKAAAAAAASAAAAAAAAACIAAAAAAAAAAAAMAAAACf/8AAAAEf////wAAAAh//////////wADAAAAAgAAAAAABAAAAAAAAAAIAAAAAAAAAAAAA///////////////////
+BINARY_OUTPUT_END
+=== COPY: strings BINARY ===
+CMD: COPY copy_strings TO STDOUT (FORMAT binary)
+BINARY_OUTPUT_START
+UEdDT1BZCv8NCgAAAAAAAAAAAAADAAAABWhlbGxvAAAABXdvcmxkAAAABWFiYyAgAAMAAAAAAAAAAAAAAAUgICAgIAADAAAACHRhYgloZXJlAAAACG5ldwpsaW5lAAAABWJrXHNsAAMAAAAMc2luZ2xlJ3F1b3RlAAAADGRvdWJsZSJxdW90ZQAAAAVjb21ibwAD////////////////AAMAAAALZW1vamk6IPCfmIAAAAALQ0pLOiDkuJbnlYwAAAAFb2sgICD//w==
+BINARY_OUTPUT_END
+=== COPY: bool BINARY ===
+CMD: COPY copy_bool TO STDOUT (FORMAT binary)
+BINARY_OUTPUT_START
+UEdDT1BZCv8NCgAAAAAAAAAAAAABAAAAAQEAAQAAAAEAAAH///////8=
+BINARY_OUTPUT_END
+=== COPY: mixed BINARY ===
+CMD: COPY copy_mixed TO STDOUT (FORMAT binary)
+BINARY_OUTPUT_START
+UEdDT1BZCv8NCgAAAAAAAAAAAAAJAAAABAAAAAEAAAAFQWxpY2UAAAAOYWxpY2VAdGVzdC5jb20AAAAMAAIAAAAAAAIAXxOIAAAAAQEAAAAIAAKw1dTpQAAAAAAlAAAAAQAAAAAAAAAZAAAAAgAAAAEAAAAFYWRtaW4AAAAEdXNlcgAAABIBeyJyb2xlIjogImFkbWluIn0AAAAQoO68mZwLTvi7bWu5vTgKEQAJAAAABAAAAAIAAAADQm9i//////////8AAAABAAAAAAgAArDV1OlAAAAAAAwAAAAAAAAAAAAAABkAAAAFAW51bGz/////AAkAAAAEAAAAAwAAAAVDYXJvbAAAAA5jYXJvbEB0ZXN0LmNvbQAAAAgAAAAAAAAAAgAAAAEBAAAACAACsNXU6UAA//////////////////8=
+BINARY_OUTPUT_END
