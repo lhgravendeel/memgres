@@ -175,6 +175,43 @@ class MyIntegrationTest {
 }
 ```
 
+### Quarkus Integration
+
+Use a `QuarkusTestResourceLifecycleManager` to wire Memgres into Quarkus integration tests:
+
+```java
+public class MemgresResource implements QuarkusTestResourceLifecycleManager {
+
+    static MemgresExtension db = MemgresExtension.builder()
+        .isolation(IsolationMode.GLOBAL)
+        .build();
+
+    @Override
+    public Map<String, String> start() {
+        db.startGlobal();
+        return Map.of(
+            "quarkus.datasource.jdbc.url", db.getJdbcUrl(),
+            "quarkus.datasource.username", "memgres",
+            "quarkus.datasource.password", "memgres",
+            "quarkus.datasource.devservices.enabled", "false"
+        );
+    }
+
+    @Override
+    public void stop() {}
+}
+```
+
+```java
+@QuarkusTest
+@WithTestResource(MemgresResource.class)  // or @QuarkusTestResource on Quarkus < 3.13
+class MyIT {
+    // Quarkus runs Flyway/Liquibase migrations on startup against Memgres
+}
+```
+
+> **Note:** `devservices.enabled=false` prevents Quarkus Dev Services from starting a Testcontainers PostgreSQL alongside Memgres. See the [memgres-junit5 README](memgres-junit5/README.md) for snapshot/restore patterns.
+
 ### Standalone Usage
 
 Memgres can also be used without JUnit, for local development or prototyping:

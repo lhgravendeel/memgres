@@ -160,17 +160,18 @@ For Quarkus, where the framework controls app startup:
 public class MemgresResource implements QuarkusTestResourceLifecycleManager {
 
     static MemgresExtension db = MemgresExtension.builder()
-        .initScript("test-data.sql")
+        .isolation(IsolationMode.GLOBAL)
         .build();
 
     @Override
     public Map<String, String> start() {
         db.startGlobal();
-        // Quarkus starts the app, which runs Flyway migrations
+        // Quarkus starts the app, which runs Flyway/Liquibase migrations
         return Map.of(
             "quarkus.datasource.jdbc.url", db.getJdbcUrl(),
             "quarkus.datasource.username", "memgres",
-            "quarkus.datasource.password", "memgres"
+            "quarkus.datasource.password", "memgres",
+            "quarkus.datasource.devservices.enabled", "false"
         );
     }
 
@@ -181,11 +182,13 @@ public class MemgresResource implements QuarkusTestResourceLifecycleManager {
 }
 ```
 
+> **Note:** `devservices.enabled=false` prevents Quarkus Dev Services from starting a Testcontainers PostgreSQL alongside Memgres.
+
 Then in your test base class, snapshot after Quarkus finishes starting:
 
 ```java
 @QuarkusTest
-@QuarkusTestResource(MemgresResource.class)
+@WithTestResource(MemgresResource.class)  // or @QuarkusTestResource on Quarkus < 3.13
 class BaseIT {
     @BeforeAll
     static void snapshotAfterAppStart() {

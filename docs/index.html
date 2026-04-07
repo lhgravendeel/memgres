@@ -592,6 +592,28 @@
     </div>
 </section>
 
+<!-- Standalone -->
+<section>
+    <div class="container">
+        <div class="section-label">Beyond testing</div>
+        <div class="section-title">A PostgreSQL server in three lines</div>
+        <div class="section-desc">Start a full PostgreSQL-compatible server from plain Java. Connect with psql, DBeaver, your app — anything that speaks PostgreSQL.</div>
+
+        <div class="code-block">
+            <div class="code-header">
+                <span class="code-dot"></span>
+                <span class="code-dot"></span>
+                <span class="code-dot"></span>
+                <span>Standalone.java</span>
+            </div>
+<pre><span class="kw">try</span> (<span class="ty">Memgres</span> db = <span class="ty">Memgres</span>.builder().port(<span class="nr">5432</span>).build().start()) {
+    <span class="ty">System</span>.out.println(db.getJdbcUrl());  <span class="cm">// jdbc:postgresql://localhost:5432/memgres</span>
+    <span class="ty">Thread</span>.currentThread().join();         <span class="cm">// keep running</span>
+}</pre>
+        </div>
+    </div>
+</section>
+
 <!-- Comparison -->
 <section id="comparison">
     <div class="container">
