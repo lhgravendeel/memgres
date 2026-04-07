@@ -89,6 +89,7 @@ class PgDumpSchemaAccuracyTest {
 
     static void restoreDump(Connection c, String rawSql) throws Exception {
         CopyManager cm = new CopyManager(c.unwrap(BaseConnection.class));
+        rawSql = rawSql.replace("\r\n", "\n").replace("\r", "\n");
         String[] lines = rawSql.split("\n", -1);
         StringBuilder currentStmt = new StringBuilder();
         int errors = 0;
