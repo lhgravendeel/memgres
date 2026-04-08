@@ -408,7 +408,7 @@ class FromFunctionResolver {
                     }
                     if (c == ',' && depth == 0) current = new StringBuilder();
                 }
-                if (!current.isEmpty()) jsonObjects.add(current.toString().trim());
+                if (current.length() > 0) jsonObjects.add(current.toString().trim());
             } else {
                 jsonObjects.add(json);
             }

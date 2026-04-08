@@ -1182,7 +1182,7 @@ public class PlpgsqlExecutor {
     }
 
     private void appendValue(StringBuilder sb, Object val) {
-        if (!sb.isEmpty() && sb.charAt(sb.length() - 1) != '(' && sb.charAt(sb.length() - 1) != ' ') {
+        if (sb.length() > 0 && sb.charAt(sb.length() - 1) != '(' && sb.charAt(sb.length() - 1) != ' ') {
             sb.append(" ");
         }
         if (val == null) {
@@ -1217,7 +1217,7 @@ public class PlpgsqlExecutor {
     }
 
     private void appendTokenToSb(StringBuilder sb, Token t) {
-        if (!sb.isEmpty() && sb.charAt(sb.length() - 1) != '('
+        if (sb.length() > 0 && sb.charAt(sb.length() - 1) != '('
                 && sb.charAt(sb.length() - 1) != '.'
                 && t.type() != TokenType.DOT
                 && t.type() != TokenType.COMMA

@@ -266,12 +266,12 @@ class CatalogConstraintBuilder {
                         if (colIdx < 0) {
                             // Expression column (e.g., lower(email)); use 0 per PostgreSQL convention
                             hasExprCols = true;
-                            if (!indkey.isEmpty()) indkey.append(" ");
+                            if (indkey.length() > 0) indkey.append(" ");
                             indkey.append(0);
-                            if (!exprParts.isEmpty()) exprParts.append(", ");
+                            if (exprParts.length() > 0) exprParts.append(", ");
                             exprParts.append(colName);
                         } else {
-                            if (!indkey.isEmpty()) indkey.append(" ");
+                            if (indkey.length() > 0) indkey.append(" ");
                             indkey.append(colIdx + 1); // 1-based
                         }
                     }

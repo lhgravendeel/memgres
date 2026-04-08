@@ -884,7 +884,7 @@ public class PlpgsqlParser {
     }
 
     private void appendToken(StringBuilder sb, Token t) {
-        if (!sb.isEmpty()) sb.append(" ");
+        if (sb.length() > 0) sb.append(" ");
         if (t.type() == TokenType.STRING_LITERAL) {
             sb.append("'").append(t.value().replace("'", "''")).append("'");
         } else if (t.type() == TokenType.DOLLAR_STRING_LITERAL) {

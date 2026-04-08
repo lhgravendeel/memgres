@@ -89,7 +89,7 @@ class DdlIndexParser {
                     Token t = parser.advance();
                     if (t.type() == TokenType.LEFT_PAREN) depth++;
                     else if (t.type() == TokenType.RIGHT_PAREN) depth--;
-                    if (!expr.isEmpty()) expr.append(' ');
+                    if (expr.length() > 0) expr.append(' ');
                     expr.append(indexTokenValue(t));
                 } while (depth > 0 && !parser.isAtEnd());
                 col = expr.toString().trim();

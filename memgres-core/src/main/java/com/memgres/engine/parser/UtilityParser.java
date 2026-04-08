@@ -391,7 +391,7 @@ class UtilityParser {
                 Token tok = parser.advance();
                 hasTokens = true;
                 if (tok.type() == TokenType.COMMA) {
-                    if (!val.isEmpty() && val.charAt(val.length() - 1) == ' ') {
+                    if (val.length() > 0 && val.charAt(val.length() - 1) == ' ') {
                         val.setLength(val.length() - 1);
                     }
                     val.append(", ");
@@ -801,7 +801,7 @@ class UtilityParser {
             StringBuilder mode = new StringBuilder();
             // Read lock mode keywords until MODE keyword
             while (!parser.checkKeyword("MODE") && !parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-                if (!mode.isEmpty()) mode.append(" ");
+                if (mode.length() > 0) mode.append(" ");
                 mode.append(parser.advance().value());
             }
             parser.matchKeyword("MODE");

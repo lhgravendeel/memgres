@@ -19,6 +19,24 @@ class FunctionEvaluator {
 
     private static final Logger LOG = LoggerFactory.getLogger(FunctionEvaluator.class);
 
+    // CRC-32C (Castagnoli) lookup table — bit-reversed polynomial 0x82F63B78
+    private static final int[] CRC32C_TABLE = new int[256];
+    static {
+        for (int i = 0; i < 256; i++) {
+            int crc = i;
+            for (int j = 0; j < 8; j++)
+                crc = (crc >>> 1) ^ ((crc & 1) != 0 ? 0x82F63B78 : 0);
+            CRC32C_TABLE[i] = crc;
+        }
+    }
+
+    private static long crc32c(byte[] data) {
+        int crc = 0xFFFFFFFF;
+        for (byte b : data)
+            crc = (crc >>> 8) ^ CRC32C_TABLE[(crc ^ b) & 0xFF];
+        return (~crc) & 0xFFFFFFFFL;
+    }
+
     static final Object NOT_HANDLED = new Object();
 
 
@@ -184,9 +202,7 @@ class FunctionEvaluator {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 if (arg instanceof Number) throw new MemgresException("function crc32c(integer) does not exist", "42883");
-                java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
-                crc.update(arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                return crc.getValue();
+                return crc32c(arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
             }
             case "gen_random_bytes": {
                 requireArgs(fn, 1);

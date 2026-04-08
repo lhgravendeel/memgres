@@ -217,7 +217,7 @@ public class TsQuery {
                 sb.append(input.charAt(i));
                 i++;
             }
-            if (!sb.isEmpty()) tokens.add(sb.toString());
+            if (sb.length() > 0) tokens.add(sb.toString());
         }
         return tokens;
     }

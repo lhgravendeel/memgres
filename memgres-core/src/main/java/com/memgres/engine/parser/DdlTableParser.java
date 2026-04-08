@@ -480,7 +480,7 @@ class DdlTableParser {
                     Token et = parser.advance();
                     if (et.type() == TokenType.LEFT_PAREN) depth++;
                     else if (et.type() == TokenType.RIGHT_PAREN) depth--;
-                    if (!colExpr.isEmpty()) colExpr.append(" ");
+                    if (colExpr.length() > 0) colExpr.append(" ");
                     colExpr.append(et.value());
                 }
                 String col = colExpr.toString().trim();
@@ -568,7 +568,7 @@ class DdlTableParser {
                 depth--;
                 if (depth == 0) break;
             }
-            if (!text.isEmpty()) text.append(" ");
+            if (text.length() > 0) text.append(" ");
             if (t.type() == TokenType.STRING_LITERAL) {
                 text.append("'").append(t.value().replace("'", "''")).append("'");
             } else {

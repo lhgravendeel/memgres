@@ -210,7 +210,12 @@ class CatalogSystemFunctions {
             case "session_user":
                 return "memgres";
             case "pg_backend_pid":
-                return executor.session != null ? executor.session.getPid() : (int) ProcessHandle.current().pid();
+                if (executor.session != null) return executor.session.getPid();
+                try {
+                    return Integer.parseInt(java.lang.management.ManagementFactory.getRuntimeMXBean().getName().split("@")[0]);
+                } catch (Exception e) {
+                    return 0;
+                }
             case "inet_server_addr":
                 return "127.0.0.1";
             case "inet_server_port":
