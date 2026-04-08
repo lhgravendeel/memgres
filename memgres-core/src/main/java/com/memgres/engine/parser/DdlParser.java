@@ -84,10 +84,8 @@ class DdlParser {
 
         if (parser.matchKeyword("AGGREGATE")) return parseCreateAggregate();
 
-        // No-op CREATE targets
-        if (parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
-                || parser.matchKeyword("CONVERSION")
-                || parser.matchKeywords("OPERATOR", "CLASS") || parser.matchKeywords("OPERATOR", "FAMILY")
+        // No-op CREATE targets (accepted but not functionally implemented)
+        if (parser.matchKeywords("OPERATOR", "CLASS") || parser.matchKeywords("OPERATOR", "FAMILY")
                 || parser.matchKeyword("OPERATOR")
                 || parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
                 || parser.matchKeyword("CONVERSION")
