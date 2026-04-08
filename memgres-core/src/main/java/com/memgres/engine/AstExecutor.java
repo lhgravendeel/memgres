@@ -106,6 +106,7 @@ public class AstExecutor {
         if (stmt instanceof DropTableStmt) return ddlExecutor.executeDropTable(((DropTableStmt) stmt));
         if (stmt instanceof CreateTypeStmt) return ddlExecutor.executeCreateType(((CreateTypeStmt) stmt));
         if (stmt instanceof CreateFunctionStmt) return ddlExecutor.executeCreateFunction(((CreateFunctionStmt) stmt));
+        if (stmt instanceof CreateAggregateStmt) return ddlExecutor.executeCreateAggregate(((CreateAggregateStmt) stmt));
         if (stmt instanceof CreateTriggerStmt) return ddlExecutor.executeCreateTrigger(((CreateTriggerStmt) stmt));
         if (stmt instanceof CreateExtensionStmt) return QueryResult.message(QueryResult.Type.SET, "CREATE EXTENSION");
         if (stmt instanceof CreateRuleStmt) return ddlExecutor.executeCreateRule(((CreateRuleStmt) stmt));

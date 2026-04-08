@@ -41,9 +41,15 @@ class IndexComparisonTest {
             pgAvailable = false;
         }
 
-        // Clean PG state if available
+        // Clean PG state if available; if cleanup fails, fall back to Memgres-only
         if (pgAvailable) {
-            cleanPg();
+            try {
+                cleanPg();
+            } catch (Exception e) {
+                pgAvailable = false;
+                pgConn.close();
+                pgConn = null;
+            }
         }
     }
 

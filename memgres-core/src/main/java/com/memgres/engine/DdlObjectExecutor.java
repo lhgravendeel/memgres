@@ -93,6 +93,21 @@ class DdlObjectExecutor {
 
     // ---- CREATE FUNCTION ----
 
+    QueryResult executeCreateAggregate(CreateAggregateStmt stmt) {
+        PgAggregate agg = new PgAggregate(
+                stmt.name(),
+                stmt.sfunc(),
+                stmt.stype(),
+                stmt.initcond(),
+                stmt.finalfunc(),
+                stmt.combinefunc(),
+                stmt.sortop(),
+                stmt.argTypes() != null ? stmt.argTypes().toArray(new String[0]) : new String[0]
+        );
+        executor.database.addAggregate(agg);
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
     QueryResult executeCreateFunction(CreateFunctionStmt stmt) {
         if ("pg_catalog".equalsIgnoreCase(stmt.schema())) {
             throw new MemgresException("permission denied to create function in schema pg_catalog", "42501");
@@ -801,11 +816,14 @@ class DdlObjectExecutor {
             case RULE:
                 dropRule(stmt);
                 break;
+            case AGGREGATE: {
+                executor.database.removeAggregate(stmt.name());
+                break;
+            }
             case EXTENSION:
             case COLLATION:
             case CAST:
             case CONVERSION:
-            case AGGREGATE:
             case OPERATOR:
             case OPERATOR_CLASS:
             case OPERATOR_FAMILY: {

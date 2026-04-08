@@ -28,6 +28,7 @@ public class Database {
     private final Map<String, ViewDef> views = new ConcurrentHashMap<>();
     private final Map<String, DomainType> domains = new ConcurrentHashMap<>();
     private final Map<String, List<CreateTypeStmt.CompositeField>> compositeTypes = new ConcurrentHashMap<>();
+    private final Map<String, PgAggregate> userAggregates = new ConcurrentHashMap<>();
     private final Map<String, List<String>> indexColumns = new ConcurrentHashMap<>();
     private final Map<String, String> indexTableNames = new ConcurrentHashMap<>(); // index name → schema.table
     private final Map<String, Boolean> indexUniqueFlags = new ConcurrentHashMap<>(); // index name → is unique
@@ -287,6 +288,23 @@ public class Database {
 
     public void removeCompositeType(String name) {
         compositeTypes.remove(name.toLowerCase());
+    }
+
+    // User-defined aggregates
+    public void addAggregate(PgAggregate agg) {
+        userAggregates.put(agg.getName().toLowerCase(), agg);
+    }
+
+    public PgAggregate getAggregate(String name) {
+        return userAggregates.get(name.toLowerCase());
+    }
+
+    public boolean hasAggregate(String name) {
+        return userAggregates.containsKey(name.toLowerCase());
+    }
+
+    public void removeAggregate(String name) {
+        userAggregates.remove(name.toLowerCase());
     }
 
     // Functions, stored by name, supporting overloads with different parameter types

@@ -827,9 +827,83 @@ class SelectAggregateEvaluator {
                 BigDecimal r2Val = corrVal.pow(2).setScale(16, RoundingMode.HALF_UP);
                 return r2Val.stripTrailingZeros().toPlainString();
             }
-            default:
+            default: {
+                // Check for user-defined aggregate
+                PgAggregate agg = executor.database.getAggregate(name);
+                if (agg != null) {
+                    return evalUserDefinedAggregate(agg, fn, group);
+                }
                 return null;
+            }
         }
+    }
+
+    private Object evalUserDefinedAggregate(PgAggregate agg, FunctionCallExpr fn, List<RowContext> group) {
+        // Initialize state from INITCOND or null
+        Object state = null;
+        if (agg.getInitcond() != null) {
+            try {
+                QueryResult initResult = executor.execute("SELECT " + castLiteral(agg.getInitcond(), agg.getStype()));
+                if (!initResult.getRows().isEmpty() && initResult.getRows().get(0).length > 0) {
+                    state = initResult.getRows().get(0)[0];
+                }
+            } catch (Exception e) {
+                // fallback: use the raw string
+                state = agg.getInitcond();
+            }
+        }
+
+        // Resolve SFUNC once outside the loop
+        PgFunction sfunc = executor.database.getFunction(agg.getSfunc());
+
+        // For DISTINCT, track seen value tuples
+        Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
+
+        // For each row, call SFUNC(state, value[, ...])
+        for (RowContext ctx : group) {
+            List<Object> argValues = new ArrayList<>();
+            for (Expression arg : fn.args()) {
+                argValues.add(executor.evalExpr(arg, ctx));
+            }
+
+            // DISTINCT: skip duplicate value tuples
+            if (seen != null) {
+                String key = argValues.stream()
+                        .map(v -> v == null ? "\0" : v.toString())
+                        .collect(Collectors.joining("\1"));
+                if (!seen.add(key)) continue;
+            }
+
+            List<Object> args = new ArrayList<>();
+            args.add(state);
+            args.addAll(argValues);
+            // Call the state transition function
+            if (sfunc != null) {
+                com.memgres.engine.plpgsql.PlpgsqlExecutor plExec =
+                        new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
+                state = plExec.executeFunction(sfunc, args);
+            }
+        }
+
+        // If FINALFUNC is specified, call it on the final state.
+        // PG behavior: if no INITCOND and empty group, state is NULL and FINALFUNC is NOT called.
+        if (agg.getFinalfunc() != null && (agg.getInitcond() != null || !group.isEmpty())) {
+            PgFunction ffunc = executor.database.getFunction(agg.getFinalfunc());
+            if (ffunc != null) {
+                List<Object> args = new ArrayList<>();
+                args.add(state);
+                com.memgres.engine.plpgsql.PlpgsqlExecutor plExec =
+                        new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
+                state = plExec.executeFunction(ffunc, args);
+            }
+        }
+
+        return state;
+    }
+
+    private String castLiteral(String value, String type) {
+        // Quote the value and cast to the appropriate type
+        return "'" + value.replace("'", "''") + "'::" + type;
     }
 
     // ---- DRY helpers ----
