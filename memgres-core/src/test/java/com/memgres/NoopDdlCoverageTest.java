@@ -319,47 +319,60 @@ class NoopDdlCoverageTest {
     // ========================================================================
 
     @Test void testCreateDatabase() throws SQLException {
-        exec("CREATE DATABASE mydb");
+        exec("CREATE DATABASE IF NOT EXISTS testcreatedb");
+        exec("DROP DATABASE IF EXISTS testcreatedb");
     }
 
     @Test void testCreateDatabaseWithOptions() throws SQLException {
-        exec("CREATE DATABASE mydb OWNER test ENCODING 'UTF8' LC_COLLATE 'en_US.UTF-8'");
+        exec("CREATE DATABASE IF NOT EXISTS testcreateoptdb OWNER test ENCODING 'UTF8' LC_COLLATE 'en_US.UTF-8'");
+        exec("DROP DATABASE IF EXISTS testcreateoptdb");
     }
 
     @Test void testCreateDatabaseTemplate() throws SQLException {
-        exec("CREATE DATABASE mydb TEMPLATE template0");
+        exec("CREATE DATABASE IF NOT EXISTS testcreatetpldb TEMPLATE template0");
+        exec("DROP DATABASE IF EXISTS testcreatetpldb");
     }
 
     @Test void testCreateDatabaseConnectionLimit() throws SQLException {
-        exec("CREATE DATABASE mydb CONNECTION LIMIT 100");
+        exec("CREATE DATABASE IF NOT EXISTS testcreateconlimdb CONNECTION LIMIT 100");
+        exec("DROP DATABASE IF EXISTS testcreateconlimdb");
     }
 
     @Test void testAlterDatabase() throws SQLException {
-        exec("ALTER DATABASE mydb SET timezone TO 'UTC'");
+        exec("CREATE DATABASE IF NOT EXISTS testalterdb");
+        exec("ALTER DATABASE testalterdb SET timezone TO 'UTC'");
+        exec("DROP DATABASE IF EXISTS testalterdb");
     }
 
     @Test void testAlterDatabaseOwner() throws SQLException {
-        exec("ALTER DATABASE mydb OWNER TO newowner");
+        exec("CREATE DATABASE IF NOT EXISTS testalterownerdb");
+        exec("ALTER DATABASE testalterownerdb OWNER TO newowner");
+        exec("DROP DATABASE IF EXISTS testalterownerdb");
     }
 
     @Test void testAlterDatabaseRename() throws SQLException {
-        exec("ALTER DATABASE mydb RENAME TO newdb");
+        exec("CREATE DATABASE IF NOT EXISTS testalterrenamedb");
+        exec("ALTER DATABASE testalterrenamedb RENAME TO testalterrenamed2db");
+        exec("DROP DATABASE IF EXISTS testalterrenamed2db");
     }
 
     @Test void testAlterDatabaseConnectionLimit() throws SQLException {
-        exec("ALTER DATABASE mydb CONNECTION LIMIT 50");
+        exec("CREATE DATABASE IF NOT EXISTS testalterconlimdb");
+        exec("ALTER DATABASE testalterconlimdb CONNECTION LIMIT 50");
+        exec("DROP DATABASE IF EXISTS testalterconlimdb");
     }
 
     @Test void testDropDatabase() throws SQLException {
-        exec("DROP DATABASE mydb");
+        exec("CREATE DATABASE IF NOT EXISTS testdropdb");
+        exec("DROP DATABASE testdropdb");
     }
 
     @Test void testDropDatabaseIfExists() throws SQLException {
-        exec("DROP DATABASE IF EXISTS mydb");
+        exec("DROP DATABASE IF EXISTS testdropifexistsdb");
     }
 
     @Test void testDropDatabaseForce() throws SQLException {
-        exec("DROP DATABASE IF EXISTS mydb WITH (FORCE)");
+        exec("DROP DATABASE IF EXISTS testdropforcedb WITH (FORCE)");
     }
 
     // ========================================================================

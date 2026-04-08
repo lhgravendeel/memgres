@@ -246,6 +246,39 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, name.equals("analyze") ? "ANALYZE" : "VACUUM");
         }
 
+        // CREATE DATABASE / DROP DATABASE
+        if (name.equals("create_database") || name.equals("create_database_if_not_exists")) {
+            String dbName = stmt.value();
+            DatabaseRegistry reg = executor.session != null ? executor.session.getDatabaseRegistry() : null;
+            if (reg == null) {
+                // No registry — fall through as noop for backward compat
+            } else if (reg.exists(dbName)) {
+                if (name.equals("create_database")) {
+                    throw new MemgresException("database \"" + dbName + "\" already exists", "42P04");
+                }
+            } else {
+                reg.createDatabase(dbName);
+            }
+            return QueryResult.message(QueryResult.Type.SET, "CREATE DATABASE");
+        }
+        if (name.equals("drop_database") || name.equals("drop_database_if_exists")) {
+            String dbName = stmt.value();
+            DatabaseRegistry reg = executor.session != null ? executor.session.getDatabaseRegistry() : null;
+            if (reg == null) {
+                // No registry — fall through as noop for backward compat
+            } else if (!reg.exists(dbName)) {
+                if (name.equals("drop_database")) {
+                    throw new MemgresException("database \"" + dbName + "\" does not exist", "3D000");
+                }
+            } else {
+                if (dbName.equals(executor.session.getDatabaseName())) {
+                    throw new MemgresException("cannot drop the currently open database", "55006");
+                }
+                reg.dropDatabase(dbName);
+            }
+            return QueryResult.message(QueryResult.Type.SET, "DROP DATABASE");
+        }
+
         Set<String> internalNames = Cols.setOf("constraints", "transaction",
                 "create_noop", "alter_noop", "drop_noop",
                 "drop_owned", "reassign_owned", "do_block", "comment",

@@ -1,6 +1,7 @@
 package com.memgres.core;
 
 import com.memgres.engine.Database;
+import com.memgres.engine.DatabaseRegistry;
 import com.memgres.engine.DatabaseSnapshot;
 import com.memgres.pgwire.PgWireServer;
 import org.slf4j.Logger;
@@ -33,6 +34,7 @@ public class Memgres implements Closeable {
     private final int maxConnections;
     private final String bindAddress;
     private final boolean logStatements;
+    private final DatabaseRegistry registry;
     private final Database database;
     private PgWireServer server;
     private int actualPort;
@@ -43,14 +45,15 @@ public class Memgres implements Closeable {
         this.maxConnections = maxConnections;
         this.bindAddress = bindAddress;
         this.logStatements = logStatements;
-        this.database = new Database();
-        this.database.setMaxConnections(maxConnections);
+        this.registry = new DatabaseRegistry("memgres");
+        this.registry.setMaxConnections(maxConnections);
+        this.database = registry.getDefaultDatabase();
     }
 
     public Memgres start() {
         // Instance setting takes precedence; fall back to deprecated static field
         if (logStatements) logAllStatements = true;
-        server = new PgWireServer(database);
+        server = new PgWireServer(registry);
         actualPort = server.start(requestedPort, bindAddress);
         LOG.info("Memgres started on port {}", actualPort);
         return this;

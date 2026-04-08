@@ -365,7 +365,7 @@ class SystemCatalogTest {
         try (Statement stmt = conn.createStatement()) {
             ResultSet rs = stmt.executeQuery("SELECT current_database()");
             assertTrue(rs.next());
-            assertEquals("memgres", rs.getString(1));
+            assertEquals("test", rs.getString(1));
         }
     }
 

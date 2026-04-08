@@ -16,7 +16,7 @@ SELECT current_schema();
 
 -- begin-expected
 -- columns: current_database
--- row: memgres
+-- row: test
 -- end-expected
 SELECT current_database();
 

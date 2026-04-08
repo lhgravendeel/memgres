@@ -95,7 +95,6 @@ class DdlParser {
                 || parser.matchKeywords("FOREIGN", "TABLE")
                 || parser.matchKeyword("PUBLICATION")
                 || parser.matchKeyword("SUBSCRIPTION")
-                || parser.matchKeyword("DATABASE")
                 || parser.matchKeyword("TABLESPACE")
                 || parser.matchKeyword("LANGUAGE")
                 || parser.matchKeywords("EVENT", "TRIGGER")
@@ -104,6 +103,14 @@ class DdlParser {
                 || parser.matchKeyword("STATISTICS")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("create_noop", "ok");
+        }
+
+        // CREATE DATABASE [IF NOT EXISTS] dbname [options...]
+        if (parser.matchKeyword("DATABASE")) {
+            boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
+            String dbName = parser.readIdentifier();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt(ifNotExists ? "create_database_if_not_exists" : "create_database", dbName);
         }
 
         throw new ParseException("Unsupported CREATE statement", parser.peek());
@@ -184,8 +191,10 @@ class DdlParser {
             return new SetStmt("drop_noop", "ok");
         }
         else if (parser.matchKeyword("DATABASE")) {
+            boolean ifExists = parser.matchKeywords("IF", "EXISTS");
+            String dbName = parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return new SetStmt(ifExists ? "drop_database_if_exists" : "drop_database", dbName);
         }
         else if (parser.matchKeyword("TABLESPACE")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();

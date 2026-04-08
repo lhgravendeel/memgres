@@ -280,19 +280,19 @@ class ExprEvaluator {
                 }
                 case "current_database":
                 case "current_catalog": {
-                    return "memgres"; 
+                    return executor.session != null ? executor.session.getDatabaseName() : "memgres";
                 }
                 case "current_schema": {
-                    return "public"; 
+                    return "public";
                 }
                 case "current_schemas": {
-                    return new Object[]{"public"}; 
+                    return new Object[]{"public"};
                 }
                 case "pg_backend_pid": {
-                    return 12345; 
+                    return 12345;
                 }
                 case "inet_server_addr": {
-                    return "127.0.0.1"; 
+                    return "127.0.0.1";
                 }
             }
         }
@@ -306,7 +306,7 @@ class ExprEvaluator {
                     return "memgres";
                 case "current_database":
                 case "current_catalog":
-                    return "memgres";
+                    return executor.session != null ? executor.session.getDatabaseName() : "memgres";
                 case "current_schema":
                     return "public";
                 case "current_schemas":

@@ -4,6 +4,7 @@ import com.memgres.engine.util.Cols;
 
 import com.memgres.core.Memgres;
 import com.memgres.engine.*;
+import com.memgres.engine.DatabaseRegistry;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -25,14 +26,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     private static final Logger LOG = LoggerFactory.getLogger(PgWireHandler.class);
 
-    private final Database database;
-    private final Session session;
+    private final DatabaseRegistry registry;
+    private Database database;
+    private Session session;
     private final CancelRegistry cancelRegistry;
-    private final PgWireCopyHandler copyHandler;
-    private final PgWireDescribeHelper describeHelper;
+    private PgWireCopyHandler copyHandler;
+    private PgWireDescribeHelper describeHelper;
     private boolean connectionRegistered;
     private int backendPid;
     private int backendSecretKey;
+    private String databaseName;
 
     /** Prepared statement: stores the SQL and parameter OIDs from Parse. */
         private static final class PreparedStmt {
@@ -97,10 +100,17 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     private boolean rowDescSentByDescribe;
     private boolean errorPendingUntilSync;
 
-    public PgWireHandler(Database database, CancelRegistry cancelRegistry) {
-        this.database = database;
-        this.session = new Session(database);
+    public PgWireHandler(DatabaseRegistry registry, CancelRegistry cancelRegistry) {
+        this.registry = registry;
         this.cancelRegistry = cancelRegistry;
+        // database/session/copyHandler/describeHelper are initialized in handleStartup
+        // when we know which database the client wants to connect to.
+        // For safety, set defaults to the default database (handles edge cases).
+        this.database = registry.getDefaultDatabase();
+        this.databaseName = registry.getDefaultDatabaseName();
+        this.session = new Session(database);
+        this.session.setDatabaseName(databaseName);
+        this.session.setDatabaseRegistry(registry);
         this.copyHandler = new PgWireCopyHandler(session);
         this.describeHelper = new PgWireDescribeHelper(session, database);
     }
@@ -207,6 +217,24 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     private void handleStartup(ChannelHandlerContext ctx, PgWireMessage msg) {
         Map<String, String> params = msg.getParameters();
         if (params != null) {
+            // Resolve target database from startup parameters
+            String requestedDb = params.get("database");
+            if (requestedDb != null && !requestedDb.isEmpty()) {
+                Database resolved = registry.getDatabase(requestedDb);
+                if (resolved == null) {
+                    // Auto-create databases on connect for compatibility
+                    registry.createDatabase(requestedDb);
+                    resolved = registry.getDatabase(requestedDb);
+                }
+                this.database = resolved;
+                this.databaseName = requestedDb;
+                this.session = new Session(database);
+                this.session.setDatabaseName(requestedDb);
+                this.session.setDatabaseRegistry(registry);
+                this.copyHandler = new PgWireCopyHandler(session);
+                this.describeHelper = new PgWireDescribeHelper(session, database);
+            }
+
             String connectingUser = params.get("user");
             if (connectingUser != null && !connectingUser.isEmpty()) {
                 session.getGucSettings().set("session_authorization", connectingUser);

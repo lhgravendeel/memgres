@@ -1,6 +1,7 @@
 package com.memgres.pgwire;
 
 import com.memgres.engine.Database;
+import com.memgres.engine.DatabaseRegistry;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -19,14 +20,14 @@ public class PgWireServer {
 
     private static final Logger LOG = LoggerFactory.getLogger(PgWireServer.class);
 
-    private final Database database;
+    private final DatabaseRegistry registry;
     private final CancelRegistry cancelRegistry = new CancelRegistry();
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
-    public PgWireServer(Database database) {
-        this.database = database;
+    public PgWireServer(DatabaseRegistry registry) {
+        this.registry = registry;
     }
 
     public int start(int port, String bindAddress) {
@@ -42,7 +43,7 @@ public class PgWireServer {
                         protected void initChannel(SocketChannel ch) {
                             ch.pipeline().addLast(
                                     new PgWireDecoder(cancelRegistry),
-                                    new PgWireHandler(database, cancelRegistry)
+                                    new PgWireHandler(registry, cancelRegistry)
                             );
                         }
                     })

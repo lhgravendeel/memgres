@@ -177,7 +177,7 @@ class CatalogSystemFunctions {
             }
             case "current_database":
             case "current_catalog":
-                return "memgres";
+                return executor.session != null ? executor.session.getDatabaseName() : "memgres";
             case "current_schema":
                 return executor.session != null ? executor.session.getEffectiveSchema() : "public";
             case "current_schemas": {
