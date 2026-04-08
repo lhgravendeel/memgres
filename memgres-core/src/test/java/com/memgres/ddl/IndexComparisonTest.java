@@ -41,9 +41,15 @@ class IndexComparisonTest {
             pgAvailable = false;
         }
 
-        // Clean PG state if available
+        // Clean PG state if available; if cleanup fails, fall back to Memgres-only
         if (pgAvailable) {
-            cleanPg();
+            try {
+                cleanPg();
+            } catch (Exception e) {
+                pgAvailable = false;
+                pgConn.close();
+                pgConn = null;
+            }
         }
     }
 
@@ -62,8 +68,7 @@ class IndexComparisonTest {
         for (String t : tables) {
             execPg("DROP TABLE IF EXISTS " + t + " CASCADE");
         }
-        try { execPg("DROP EXTENSION IF EXISTS btree_gist CASCADE"); }
-        catch (SQLException e) { if (!e.getMessage().contains("must be owner")) throw e; }
+        execPg("DROP EXTENSION IF EXISTS btree_gist CASCADE");
     }
 
     // === Helpers =============================================================
