@@ -2301,9 +2301,9 @@ class MultipleDatabaseIsolationTest {
                     assertTrue(rs.next());
                     assertEquals("renamed", rs.getString(1));
                 }
-                // Cleanup
+                // Cleanup (use FORCE since ct's channel may not have fully closed yet)
                 try (Statement s1 = c1.createStatement()) {
-                    s1.execute("DROP DATABASE rename_target");
+                    s1.execute("DROP DATABASE rename_target WITH (FORCE)");
                 }
             }
         }

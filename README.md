@@ -66,6 +66,7 @@ Memgres targets PostgreSQL 18 compatibility with 9,500+ passing tests. Supported
 - **Security**: roles (CREATE / ALTER / DROP ROLE), GRANT / REVOKE, ALTER DEFAULT PRIVILEGES, row-level security policies
 - **EXPLAIN**: supports ANALYZE, VERBOSE, and output formats (TEXT, JSON, YAML, XML)
 - **LISTEN / NOTIFY**: channel-based notifications with transaction semantics (deferred until COMMIT, discarded on ROLLBACK)
+- **Multiple databases**: CREATE / DROP / ALTER DATABASE, database isolation, DROP DATABASE WITH (FORCE), ALTER DATABASE RENAME TO, pg_database catalog, configurable default database name and auto-create behavior
 - **Other**: triggers (BEFORE / AFTER / INSTEAD OF, transition tables), rules, prepared statements, cursors, full-text search (to_tsvector, to_tsquery, ts_rank, websearch_to_tsquery, @@)
 
 ### Protocol
@@ -235,7 +236,7 @@ try (Memgres db = Memgres.builder().port(5432).build().start()) {
 
 | Property | Value |
 |----------|-------|
-| JDBC URL | `jdbc:postgresql://localhost:{port}/memgres` |
+| JDBC URL | `jdbc:postgresql://localhost:{port}/memgres` (default; configurable via `defaultDatabaseName`) |
 | Username | `memgres` |
 | Password | `memgres` |
 | Driver | `org.postgresql.Driver` (standard PostgreSQL JDBC) |
@@ -250,9 +251,51 @@ Memgres db = Memgres.builder()
     .maxConnections(100)          // max concurrent connections (default: 100, 0 = unlimited)
     .bindAddress("localhost")     // listen address (default: localhost)
     .logAllStatements(false)      // log SQL at INFO level (default: false)
+    .defaultDatabaseName("mydb")  // name of the default database (default: "memgres")
+    .autoCreateDatabases(true)    // create databases on connect if they don't exist (default: true)
     .build()
     .start();
 ```
+
+### Multiple Databases
+
+Memgres supports multiple databases within a single server instance, just like PostgreSQL. Each database is fully isolated with its own tables, schemas, sequences, functions, views, and enums.
+
+```java
+try (Memgres db = Memgres.builder().port(0).build().start()) {
+    try (Connection conn = DriverManager.getConnection(db.getJdbcUrl())) {
+        conn.createStatement().execute("CREATE DATABASE analytics");
+        conn.createStatement().execute("CREATE DATABASE reporting");
+    }
+
+    // Connect to a specific database
+    try (Connection conn = DriverManager.getConnection(
+            "jdbc:postgresql://localhost:" + db.getPort() + "/analytics")) {
+        conn.createStatement().execute("CREATE TABLE events (id SERIAL, name TEXT)");
+    }
+}
+```
+
+By default, databases are auto-created when a client connects to a name that doesn't exist yet. To disable this and match strict PostgreSQL behavior (where the database must be created first), set `autoCreateDatabases(false)`:
+
+```java
+Memgres db = Memgres.builder()
+    .autoCreateDatabases(false)   // connecting to a non-existent database returns error 3D000
+    .build()
+    .start();
+```
+
+Supported database management commands:
+
+| Command | Description |
+|---------|-------------|
+| `CREATE DATABASE name` | Create a new database |
+| `DROP DATABASE name` | Drop a database (fails if other sessions are connected) |
+| `DROP DATABASE IF EXISTS name` | Drop if exists, no error if missing |
+| `DROP DATABASE name WITH (FORCE)` | Terminate all sessions and drop |
+| `ALTER DATABASE name RENAME TO newname` | Rename a database |
+| `ALTER DATABASE name SET ...` | Accepted (no-op) |
+| `ALTER DATABASE name OWNER TO ...` | Accepted (no-op) |
 
 ## Known Limitations
 
@@ -271,7 +314,7 @@ Memgres is designed for testing, not production. The following PostgreSQL featur
 | **Parallel queries** | No parallel query execution. Parallel pg_dump/pg_restore (`-j`) not yet supported. |
 | **Large objects** | `lo_*` functions are parsed but have minimal support. |
 | **Collations** | Basic collation only. No ICU or custom collation support. |
-| **Multi-database** | Single database per instance. No cross-database queries. |
+| **Cross-database queries** | Multiple databases are supported, but cross-database queries are not (same as PostgreSQL). |
 | **Event triggers** | DDL event triggers are not supported. |
 
 ## Comparison to Alternatives
