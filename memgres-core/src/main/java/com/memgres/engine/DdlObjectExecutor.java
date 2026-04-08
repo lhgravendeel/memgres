@@ -329,6 +329,14 @@ class DdlObjectExecutor {
             }
         }
 
+        // Recurse into UNION/INTERSECT/EXCEPT sub-statements
+        if (parsed instanceof com.memgres.engine.parser.ast.SetOpStmt) {
+            com.memgres.engine.parser.ast.SetOpStmt setOp = (com.memgres.engine.parser.ast.SetOpStmt) parsed;
+            validateSqlFunctionStatement(setOp.left(), stmt, params);
+            validateSqlFunctionStatement(setOp.right(), stmt, params);
+            return;
+        }
+
         validateTableRefsInStatement(parsed);
 
         if (parsed instanceof SelectStmt && ((SelectStmt) parsed).from() != null) {

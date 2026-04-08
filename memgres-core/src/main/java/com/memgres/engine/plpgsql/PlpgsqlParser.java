@@ -570,11 +570,27 @@ public class PlpgsqlParser {
         // Detect SELECT ... INTO [STRICT] var1[, var2, ...] ... FROM
         // Normalize whitespace for detection (newlines before INTO)
         String upper = sql.toUpperCase();
-        if (upper.startsWith("SELECT")) {
+        // For CTE queries (WITH ... SELECT ... INTO), find the final SELECT outside parens
+        int selectStart = 0;
+        if (upper.startsWith("WITH")) {
+            int depth = 0;
+            for (int ci = 0; ci < upper.length() - 6; ci++) {
+                char ch = upper.charAt(ci);
+                if (ch == '(') depth++;
+                else if (ch == ')') depth--;
+                else if (depth == 0 && upper.startsWith("SELECT", ci)
+                        && (ci == 0 || !Character.isLetterOrDigit(upper.charAt(ci - 1)))
+                        && (ci + 6 >= upper.length() || !Character.isLetterOrDigit(upper.charAt(ci + 6)))) {
+                    selectStart = ci;
+                }
+            }
+        }
+        if (upper.startsWith("SELECT") || (upper.startsWith("WITH") && selectStart > 0)) {
             int intoIdx = -1;
             int intoEnd = -1;
+            // Search for INTO only after the final SELECT (important for CTE queries)
             java.util.regex.Matcher intoMatcher = java.util.regex.Pattern.compile("\\sINTO\\s", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(sql);
-            if (intoMatcher.find()) { intoIdx = intoMatcher.start(); intoEnd = intoMatcher.end(); }
+            if (intoMatcher.find(selectStart)) { intoIdx = intoMatcher.start(); intoEnd = intoMatcher.end(); }
             if (intoIdx >= 0) {
                 String afterInto = sql.substring(intoEnd).trim();
                 if (afterInto.toUpperCase().startsWith("STRICT ")) {
