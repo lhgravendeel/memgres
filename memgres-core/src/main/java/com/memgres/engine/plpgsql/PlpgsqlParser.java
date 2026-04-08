@@ -167,6 +167,9 @@ public class PlpgsqlParser {
             if (check(TokenType.LEFT_BRACKET)) {
                 advance(); match(TokenType.RIGHT_BRACKET); sb.append("[]"); continue;
             }
+            if (check(TokenType.DOT)) {
+                advance(); sb.append(".").append(readIdent()); continue;
+            }
             if (check(TokenType.PERCENT)) {
                 advance(); sb.append("%").append(readIdent()); continue;
             }
@@ -640,6 +643,41 @@ public class PlpgsqlParser {
                             intoVars = Cols.listOf(trimmedAfter);
                             sql = sql.substring(0, intoIdx);
                         }
+                    }
+                }
+            }
+        }
+
+        // Handle INSERT/UPDATE/DELETE ... RETURNING col1[, col2] INTO var1[, var2]
+        if (intoVars == null) {
+            String upperSql = sql.toUpperCase();
+            if (upperSql.startsWith("INSERT") || upperSql.startsWith("UPDATE") || upperSql.startsWith("DELETE")
+                    || upperSql.startsWith("WITH")) {
+                // Look for RETURNING ... INTO pattern
+                java.util.regex.Matcher retIntoMatcher = java.util.regex.Pattern.compile(
+                        "\\bRETURNING\\b(.+?)\\bINTO\\b(.+)$",
+                        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL).matcher(sql);
+                if (retIntoMatcher.find()) {
+                    String returningCols = retIntoMatcher.group(1).trim();
+                    String intoTargets = retIntoMatcher.group(2).trim();
+                    // Check for STRICT
+                    if (intoTargets.toUpperCase().startsWith("STRICT ")) {
+                        strict = true;
+                        intoTargets = intoTargets.substring(7).trim();
+                    }
+                    // Parse into variable list
+                    String[] parts = intoTargets.split(",");
+                    List<String> varNames = new ArrayList<>();
+                    for (String part : parts) {
+                        String trimmed = part.trim();
+                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+                            varNames.add(trimmed);
+                        }
+                    }
+                    if (!varNames.isEmpty()) {
+                        intoVars = varNames;
+                        // Remove the INTO ... part, keep RETURNING clause in SQL
+                        sql = sql.substring(0, retIntoMatcher.start()) + "RETURNING " + returningCols;
                     }
                 }
             }

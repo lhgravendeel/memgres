@@ -121,7 +121,7 @@ FROM queue_servers;
 -------------------------------------------------------------------------------
 -- P04: DO block dynamic EXECUTE defers syntax errors until execution
 -------------------------------------------------------------------------------
--- expect-error: 42601
+-- expect-error: 42P01
 DO $do$
 BEGIN
   EXECUTE 'SELECT FROM definitely_bad_syntax';

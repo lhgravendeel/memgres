@@ -420,6 +420,15 @@ public class AstExecutor {
 
     Table resolveTable(String schemaName, String tableName) {
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
+        // Resolve pg_temp alias to the actual session temp schema
+        if ("pg_temp".equalsIgnoreCase(schemaName)) {
+            Schema pgTemp = database.getSchema(tempSchemaName);
+            if (pgTemp != null) {
+                Table tempTable = pgTemp.getTable(tableName);
+                if (tempTable != null) return tempTable;
+            }
+            throw new MemgresException("relation \"" + schemaName + "." + tableName + "\" does not exist", "42P01");
+        }
         Schema pgTemp = database.getSchema(tempSchemaName);
         if (pgTemp != null) {
             Table tempTable = pgTemp.getTable(tableName);

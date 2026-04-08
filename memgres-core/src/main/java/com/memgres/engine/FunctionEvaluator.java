@@ -950,6 +950,11 @@ class FunctionEvaluator {
                         // Resolve by evaluating argument types
                         List<String> argTypeHints = new ArrayList<>();
                         for (Expression arg : fn.args()) {
+                            // Check for explicit cast (e.g., ROW(...)::typename) - use cast type as hint
+                            if (arg instanceof CastExpr) {
+                                argTypeHints.add(((CastExpr) arg).typeName());
+                                continue;
+                            }
                             try {
                                 Object v = executor.evalExpr(arg, ctx);
                                 if (v instanceof Integer) argTypeHints.add("integer");

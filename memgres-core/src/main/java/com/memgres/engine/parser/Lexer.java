@@ -51,7 +51,7 @@ public class Lexer {
             "ISOLATION", "LEVEL", "READ", "COMMITTED", "UNCOMMITTED", "REPEATABLE",
             "SERIALIZABLE", "ABORT", "WORK",
             // Prepared statements & Cursors
-            "PREPARE", "DEALLOCATE", "CURSOR", "MOVE", "CLOSE",
+            "PREPARE", "DEALLOCATE", "CURSOR", "OPEN", "MOVE", "CLOSE",
             "SCROLL", "HOLD", "INSENSITIVE", "PRIOR", "FORWARD", "BACKWARD", "ABSOLUTE", "RELATIVE",
             // Locking
             "NOWAIT", "SKIP", "LOCKED", "SHARE", "ACCESS", "EXCLUSIVE", "MODE",

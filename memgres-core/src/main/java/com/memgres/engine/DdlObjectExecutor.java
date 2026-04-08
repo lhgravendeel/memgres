@@ -110,11 +110,34 @@ class DdlObjectExecutor {
             }
         }
 
+        // Validate return type exists (PG validates at CREATE time)
+        if (stmt.returnType() != null && !stmt.returnType().isEmpty()) {
+            String retType = stmt.returnType();
+            String baseRetType = retType;
+            if (baseRetType.toUpperCase().startsWith("SETOF ")) {
+                baseRetType = baseRetType.substring(6).trim();
+            }
+            validateTypeExists(baseRetType);
+        }
+
         List<PgFunction.Param> params = new ArrayList<>();
         if (stmt.parsedParams() != null) {
             for (CreateFunctionStmt.FuncParam fp : stmt.parsedParams()) {
+                // Validate parameter types exist (PG validates at CREATE time)
+                if (fp.typeName() != null) {
+                    validateTypeExists(fp.typeName());
+                }
+                // Validate default expression function references
+                if (fp.defaultExpr() != null) {
+                    validateDefaultExpr(fp.defaultExpr());
+                }
                 params.add(new PgFunction.Param(fp.name(), fp.typeName(), fp.mode(), fp.defaultExpr()));
             }
+        }
+
+        // Validate PL/pgSQL declared variable types (PG validates at CREATE time)
+        if ("plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
+            validatePlpgsqlDeclarations(stmt.body());
         }
 
         // Validate SQL language function bodies
@@ -172,11 +195,14 @@ class DdlObjectExecutor {
         executor.database.addFunction(pgFunc);
         executor.database.registerSchemaObject(executor.defaultSchema(), "function", stmt.name());
         executor.database.setObjectOwner("function:" + stmt.name(), executor.sessionUser());
+        executor.recordUndo(new Session.CreateFunctionUndo(stmt.name()));
         return QueryResult.command(QueryResult.Type.CREATE_FUNCTION, 0);
     }
 
     private void validateSqlFunctionBody(CreateFunctionStmt stmt, List<PgFunction.Param> params) {
         try {
+            // Validate type casts, function calls, and sequences in SQL body text
+            validateSqlBodyReferences(stmt.body());
             List<String> bodyStmts = splitSqlStatements(stmt.body());
             for (String bodyStr : bodyStmts) {
                 Statement parsed = com.memgres.engine.parser.Parser.parse(bodyStr);
@@ -197,6 +223,68 @@ class DdlObjectExecutor {
             String msg = e.getMessage();
             throw new MemgresException(msg != null ? msg : "syntax error in function body", "42601");
         }
+    }
+
+    /**
+     * Validate references in SQL function body text: type casts, function calls, sequences.
+     * SQL-language functions in PG eagerly validate all object references at CREATE time.
+     */
+    private void validateSqlBodyReferences(String body) {
+        // Check type casts: ::type_name
+        java.util.regex.Matcher castMatcher = java.util.regex.Pattern.compile(
+                "::\\s*([a-zA-Z_][a-zA-Z0-9_]*)").matcher(body);
+        while (castMatcher.find()) {
+            String typeName = castMatcher.group(1);
+            if (!isKnownType(typeName)) {
+                throw new MemgresException("type \"" + typeName + "\" does not exist", "42704");
+            }
+        }
+        // Check function calls: name(...) that aren't table refs like INSERT INTO table(col)
+        java.util.regex.Matcher fnMatcher = java.util.regex.Pattern.compile(
+                "(?:^|\\s)([a-zA-Z_][a-zA-Z0-9_]*)\\s*\\(").matcher(body);
+        while (fnMatcher.find()) {
+            String fnName = fnMatcher.group(1).toLowerCase();
+            if (isKnownSqlKeyword(fnName)) continue;
+            if (isBuiltinFunction(fnName)) continue;
+            // Skip if preceded by INTO, FROM, TABLE, UPDATE, JOIN (table reference, not function call)
+            int start = fnMatcher.start(1);
+            String before = body.substring(0, start).trim().toLowerCase();
+            if (before.endsWith("into") || before.endsWith("from") || before.endsWith("table")
+                    || before.endsWith("update") || before.endsWith("join")
+                    || before.endsWith("on")) continue;
+            if (executor.database.getFunction(fnName) == null) {
+                throw new MemgresException("function " + fnName + "() does not exist", "42883");
+            }
+        }
+        // Check sequence references: nextval('seq_name'), currval('seq_name'), setval('seq_name', ...)
+        java.util.regex.Matcher seqMatcher = java.util.regex.Pattern.compile(
+                "(?:nextval|currval|setval)\\s*\\(\\s*'([^']+)'").matcher(body);
+        while (seqMatcher.find()) {
+            String seqName = seqMatcher.group(1);
+            if (executor.database.getSequence(seqName) == null) {
+                throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
+            }
+        }
+    }
+
+    private boolean isKnownType(String typeName) {
+        if (BUILTIN_TYPES.contains(typeName.toLowerCase())) return true;
+        if (DataType.fromPgName(typeName) != null) return true;
+        if (executor.database.isCustomEnum(typeName)) return true;
+        if (executor.database.isDomain(typeName)) return true;
+        if (executor.database.isCompositeType(typeName)) return true;
+        return false;
+    }
+
+    private static boolean isKnownSqlKeyword(String name) {
+        return Cols.setOf("select", "from", "where", "insert", "update", "delete",
+                "values", "into", "set", "create", "alter", "drop", "table",
+                "index", "view", "function", "procedure", "trigger",
+                "if", "case", "when", "then", "else", "end", "and", "or", "not",
+                "in", "exists", "between", "like", "is", "as", "on", "join",
+                "left", "right", "inner", "outer", "cross", "full",
+                "group", "order", "having", "limit", "offset", "union",
+                "except", "intersect", "with", "returning", "row").contains(name);
     }
 
     private void validateSqlFunctionStatement(Statement parsed, CreateFunctionStmt stmt,
@@ -281,6 +369,156 @@ class DdlObjectExecutor {
                     if ("42P01".equals(e.getSqlState())) throw e;
                 }
             }
+        }
+    }
+
+    private static final Set<String> BUILTIN_TYPES = Cols.setOf(
+            "void", "trigger", "record", "anyelement", "anyarray", "anynonarray", "anyenum",
+            "anyrange", "anymultirange", "anycompatible", "anycompatiblearray",
+            "anycompatiblenonarray", "anycompatiblerange", "cstring", "internal",
+            "opaque", "refcursor", "unknown", "event_trigger",
+            "int", "int2", "int4", "int8", "integer", "bigint", "smallint",
+            "serial", "bigserial", "smallserial",
+            "numeric", "decimal", "real", "float", "float4", "float8",
+            "double precision", "money",
+            "text", "varchar", "character varying", "char", "character", "bpchar", "name",
+            "boolean", "bool",
+            "bytea", "uuid", "json", "jsonb", "xml",
+            "date", "time", "timestamp", "timestamptz",
+            "timestamp with time zone", "timestamp without time zone",
+            "time with time zone", "time without time zone",
+            "interval",
+            "inet", "cidr", "macaddr", "macaddr8",
+            "bit", "varbit", "bit varying",
+            "tsvector", "tsquery",
+            "point", "line", "lseg", "box", "path", "polygon", "circle",
+            "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+            "int4multirange", "int8multirange", "nummultirange", "datemultirange",
+            "tsmultirange", "tstzmultirange",
+            "oid", "regproc", "regtype", "regclass", "regoper", "regprocedure",
+            "regoperator", "regconfig", "regdictionary", "regnamespace", "regrole",
+            "pg_lsn", "pg_snapshot", "txid_snapshot", "xid", "xid8", "cid", "tid",
+            "aclitem");
+
+    /**
+     * Validate that a type name exists (built-in, enum, domain, composite, or table-as-type).
+     * Used for validating return types and parameter types at CREATE FUNCTION time.
+     */
+    private void validateTypeExists(String typeName) {
+        if (typeName == null || typeName.isEmpty()) return;
+        String base = typeName.replaceAll("\\(.*\\)", "").replace("[]", "").trim();
+        if (base.isEmpty()) return;
+        // TABLE return type with column list is validated separately
+        if (base.equalsIgnoreCase("TABLE")) return;
+        if (BUILTIN_TYPES.contains(base.toLowerCase())) return;
+        if (DataType.fromPgName(base) != null) return;
+        if (executor.database.isCustomEnum(base)) return;
+        if (executor.database.isDomain(base)) return;
+        if (executor.database.isCompositeType(base)) return;
+        // Check if it's a table used as a composite type
+        String schema = executor.defaultSchema();
+        if (schema != null) {
+            Schema s = executor.database.getSchema(schema);
+            if (s != null && s.getTable(base) != null) return;
+        }
+        // Also check public schema
+        Schema pub = executor.database.getSchema("public");
+        if (pub != null && pub.getTable(base) != null) return;
+        throw new MemgresException("type \"" + base + "\" does not exist", "42704");
+    }
+
+    /**
+     * Validate default expression for function parameters.
+     * Checks that function calls in defaults reference existing functions.
+     */
+    private void validateDefaultExpr(String defaultExpr) {
+        if (defaultExpr == null) return;
+        // Check for function call pattern: name()
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("([a-zA-Z_][a-zA-Z0-9_]*)\\s*\\(").matcher(defaultExpr);
+        while (m.find()) {
+            String fnName = m.group(1).toLowerCase();
+            // Skip built-in functions
+            if (isBuiltinFunction(fnName)) continue;
+            if (executor.database.getFunction(fnName) == null) {
+                throw new MemgresException("function " + fnName + "() does not exist", "42883");
+            }
+        }
+    }
+
+    private static boolean isBuiltinFunction(String name) {
+        // Common built-in functions that don't need validation
+        return Cols.setOf("now", "current_timestamp", "current_date", "current_time",
+                "current_user", "session_user", "localtime", "localtimestamp",
+                "clock_timestamp", "statement_timestamp", "transaction_timestamp",
+                "gen_random_uuid", "random", "nextval", "currval", "setval",
+                "coalesce", "nullif", "greatest", "least", "cast",
+                "array_agg", "string_agg", "count", "sum", "avg", "min", "max",
+                "row_number", "rank", "dense_rank", "lag", "lead",
+                "upper", "lower", "trim", "btrim", "ltrim", "rtrim",
+                "length", "char_length", "octet_length", "bit_length",
+                "substring", "position", "overlay", "replace", "translate",
+                "concat", "concat_ws", "format", "quote_ident", "quote_literal",
+                "quote_nullable", "regexp_match", "regexp_matches", "regexp_replace",
+                "to_char", "to_number", "to_date", "to_timestamp",
+                "abs", "ceil", "ceiling", "floor", "round", "trunc", "sign", "sqrt",
+                "power", "exp", "ln", "log", "mod", "div",
+                "array_length", "array_upper", "array_lower", "unnest",
+                "generate_series", "pg_typeof", "pg_sleep").contains(name);
+    }
+
+    /**
+     * Validate PL/pgSQL DECLARE variable types at CREATE FUNCTION time.
+     * PG 18 validates that declared variable types exist immediately.
+     */
+    private void validatePlpgsqlDeclarations(String body) {
+        try {
+            com.memgres.engine.plpgsql.PlpgsqlStatement.Block block =
+                    com.memgres.engine.plpgsql.PlpgsqlParser.parse(body);
+            for (com.memgres.engine.plpgsql.PlpgsqlStatement.VarDeclaration decl : block.declarations()) {
+                String typeName = decl.typeName();
+                if (typeName == null || typeName.isEmpty()) continue;
+                if ("REFCURSOR".equalsIgnoreCase(typeName) || "refcursor".equals(typeName)) continue;
+                if ("record".equalsIgnoreCase(typeName)) continue;
+
+                // Handle %ROWTYPE
+                if (typeName.toUpperCase().endsWith("%ROWTYPE")) {
+                    String tableName = typeName.substring(0, typeName.length() - 8); // remove %ROWTYPE
+                    if (tableName.endsWith(".")) tableName = tableName.substring(0, tableName.length() - 1);
+                    // Validate table exists
+                    try {
+                        executor.resolveTable(executor.defaultSchema(), tableName);
+                    } catch (MemgresException e) {
+                        if ("42P01".equals(e.getSqlState())) throw e;
+                    }
+                    continue;
+                }
+
+                // Handle %TYPE
+                if (typeName.toUpperCase().endsWith("%TYPE")) {
+                    String ref = typeName.substring(0, typeName.length() - 5); // remove %TYPE
+                    int dotIdx = ref.lastIndexOf('.');
+                    if (dotIdx > 0) {
+                        String tableName = ref.substring(0, dotIdx);
+                        String colName = ref.substring(dotIdx + 1);
+                        try {
+                            Table table = executor.resolveTable(executor.defaultSchema(), tableName);
+                            if (table.getColumnIndex(colName) < 0) {
+                                throw new MemgresException("column \"" + colName + "\" does not exist", "42703");
+                            }
+                        } catch (MemgresException e) {
+                            if ("42P01".equals(e.getSqlState()) || "42703".equals(e.getSqlState())) throw e;
+                        }
+                    }
+                    continue;
+                }
+
+                // Regular type - validate existence
+                validateTypeExists(typeName);
+            }
+        } catch (MemgresException e) {
+            throw e;
+        } catch (Exception ignored) {
+            // Parse errors in the body are not validation errors at CREATE time
         }
     }
 

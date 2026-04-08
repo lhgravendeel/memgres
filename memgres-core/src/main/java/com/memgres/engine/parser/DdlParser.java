@@ -82,11 +82,16 @@ class DdlParser {
         if (parser.matchKeyword("GROUP")) return roleParser.parseCreateRole(false);
         if (parser.matchKeyword("RULE")) return parseCreateRule();
 
+        // CREATE OPERATOR is not supported
+        if (parser.matchKeywords("OPERATOR", "CLASS") || parser.matchKeywords("OPERATOR", "FAMILY")
+                || parser.matchKeyword("OPERATOR")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("create_operator", "unsupported");
+        }
+
         // No-op CREATE targets
         if (parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
                 || parser.matchKeyword("CONVERSION") || parser.matchKeyword("AGGREGATE")
-                || parser.matchKeywords("OPERATOR", "CLASS") || parser.matchKeywords("OPERATOR", "FAMILY")
-                || parser.matchKeyword("OPERATOR")
                 || parser.matchKeywords("DEFAULT", "CONVERSION")
                 || parser.matchKeywords("TEXT", "SEARCH")
                 || parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")

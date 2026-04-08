@@ -44,6 +44,7 @@ public class PlpgsqlExecutor {
     // Variable scope
     static class Scope {
         final Map<String, Object> variables = new LinkedHashMap<>();
+        final java.util.Set<String> outputOnlyVars = new java.util.HashSet<>();
         final Scope parent;
         int lastRowCount = 0;
 
@@ -60,7 +61,11 @@ public class PlpgsqlExecutor {
             String key = name.toLowerCase();
             Scope s = this;
             while (s != null) {
-                if (s.variables.containsKey(key)) { s.variables.put(key, value); return; }
+                if (s.variables.containsKey(key)) {
+                    s.variables.put(key, value);
+                    s.outputOnlyVars.remove(key); // once explicitly assigned, it's no longer output-only
+                    return;
+                }
                 s = s.parent;
             }
             variables.put(key, value);
@@ -72,8 +77,20 @@ public class PlpgsqlExecutor {
             return parent != null && parent.has(key);
         }
 
+        boolean isOutputOnly(String name) {
+            String key = name.toLowerCase();
+            if (outputOnlyVars.contains(key)) return true;
+            return parent != null && parent.isOutputOnly(key);
+        }
+
         void declare(String name, Object value) {
             variables.put(name.toLowerCase(), value);
+        }
+
+        void declareOutputOnly(String name, Object value) {
+            String key = name.toLowerCase();
+            variables.put(key, value);
+            outputOnlyVars.add(key);
         }
     }
 
@@ -155,6 +172,15 @@ public class PlpgsqlExecutor {
         String returnType = function.getReturnType();
         boolean isSetof = returnType != null && returnType.toUpperCase().startsWith("SETOF");
         boolean isTable = returnType != null && returnType.equalsIgnoreCase("TABLE");
+
+        // Mark OUT params of RETURNS TABLE functions as output-only to prevent
+        // substituteVariables from replacing column names that match OUT param names
+        if (isTable) {
+            for (PgFunction.Param p : outParams) {
+                String pName = p.name() != null ? p.name() : ("$" + (params.indexOf(p) + 1));
+                scope.declareOutputOnly(pName, null);
+            }
+        }
 
         if (isSetof || isTable) {
             List<Object> results = new ArrayList<>();
@@ -517,15 +543,12 @@ public class PlpgsqlExecutor {
 
         for (Object[] row : result.getRows()) {
             anyIteration = true;
-            if (result.getColumns().size() == 1) {
-                scope.set(stmt.varName(), row[0]);
-            } else {
-                Map<String, Object> record = new LinkedHashMap<>();
-                for (int i = 0; i < result.getColumns().size(); i++) {
-                    record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
-                }
-                scope.set(stmt.varName(), record);
+            // Always create a record (Map) so that field access (r.col) works, matching PG behavior
+            Map<String, Object> record = new LinkedHashMap<>();
+            for (int i = 0; i < result.getColumns().size(); i++) {
+                record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
             }
+            scope.set(stmt.varName(), record);
             try {
                 executeStatements(stmt.body(), scope);
             } catch (ExitSignal e) {
@@ -865,7 +888,16 @@ public class PlpgsqlExecutor {
                 if (qualObj instanceof Map) {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> map = (Map<String, Object>) qualObj;
-                    return map.get(field.toLowerCase());
+                    String lowerField = field.toLowerCase();
+                    if (!map.containsKey(lowerField)) {
+                        String upperQ = qualifier.toUpperCase();
+                        if (upperQ.equals("NEW") || upperQ.equals("OLD")) {
+                            throw new MemgresException(
+                                    "record \"" + qualifier.toLowerCase() + "\" has no field \"" + lowerField + "\"",
+                                    "42703");
+                        }
+                    }
+                    return map.get(lowerField);
                 }
             }
         }
@@ -937,6 +969,34 @@ public class PlpgsqlExecutor {
         try {
             List<Token> tokens = new Lexer(sql).tokenize();
             StringBuilder sb = new StringBuilder();
+
+            // Track INSERT column list context to avoid substituting column names
+            // INSERT INTO tablename(col1, col2, ...) - identifiers inside are column names, not variables
+            boolean inInsertColList = false;
+            int insertColListDepth = 0;
+            // Pre-scan to find INSERT INTO tablename( positions
+            java.util.Set<Integer> insertColListRanges = new java.util.HashSet<>();
+            for (int k = 0; k < tokens.size() - 3; k++) {
+                Token tk = tokens.get(k);
+                if (tk.type() == TokenType.KEYWORD && "INTO".equalsIgnoreCase(tk.value())
+                        && k > 0 && "INSERT".equalsIgnoreCase(tokens.get(k - 1).value())) {
+                    int tblIdx = k + 1;
+                    if (tblIdx < tokens.size() && (tokens.get(tblIdx).type() == TokenType.IDENTIFIER
+                            || tokens.get(tblIdx).type() == TokenType.KEYWORD)) {
+                        int parenIdx = tblIdx + 1;
+                        if (parenIdx < tokens.size() && tokens.get(parenIdx).type() == TokenType.LEFT_PAREN) {
+                            // Mark all tokens inside the parens as column list
+                            int depth = 1;
+                            for (int j = parenIdx + 1; j < tokens.size() && depth > 0; j++) {
+                                if (tokens.get(j).type() == TokenType.LEFT_PAREN) depth++;
+                                else if (tokens.get(j).type() == TokenType.RIGHT_PAREN) depth--;
+                                if (depth > 0) insertColListRanges.add(j);
+                            }
+                        }
+                    }
+                }
+            }
+
             for (int i = 0; i < tokens.size(); i++) {
                 Token t = tokens.get(i);
                 if (t.type() == TokenType.EOF) break;
@@ -951,6 +1011,14 @@ public class PlpgsqlExecutor {
                         @SuppressWarnings("unchecked")
                         Map<String, Object> map = (Map<String, Object>) qualObj;
                         String field = tokens.get(i + 2).value().toLowerCase();
+                        if (!map.containsKey(field)) {
+                            String qualifier = t.value().toUpperCase();
+                            if (qualifier.equals("NEW") || qualifier.equals("OLD")) {
+                                throw new MemgresException(
+                                        "record \"" + t.value().toLowerCase() + "\" has no field \"" + field + "\"",
+                                        "42703");
+                            }
+                        }
                         Object val = map.get(field);
                         appendValue(sb, val);
                         i += 2;
@@ -961,6 +1029,24 @@ public class PlpgsqlExecutor {
                 // Handle positional parameter: $1, $2, etc.
                 if (t.type() == TokenType.PARAM && scope.has(t.value())) {
                     Object val = scope.get(t.value());
+                    // Check for composite field access pattern: ($param).field
+                    if (val instanceof Map && i + 2 < tokens.size()
+                            && tokens.get(i + 1).type() == TokenType.RIGHT_PAREN
+                            && tokens.get(i + 2).type() == TokenType.DOT
+                            && i + 3 < tokens.size()) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> map = (Map<String, Object>) val;
+                        String field = tokens.get(i + 3).value().toLowerCase();
+                        // Remove the opening '(' we already appended to sb
+                        int lastParen = sb.length() - 1;
+                        while (lastParen >= 0 && sb.charAt(lastParen) == ' ') lastParen--;
+                        if (lastParen >= 0 && sb.charAt(lastParen) == '(') {
+                            sb.setLength(lastParen);
+                        }
+                        appendValue(sb, map.get(field));
+                        i += 3; // skip ), ., field
+                        continue;
+                    }
                     appendValue(sb, val);
                     continue;
                 }
@@ -969,13 +1055,25 @@ public class PlpgsqlExecutor {
                 if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
                         && scope.has(t.value())) {
                     boolean isPrecededByDot = i > 0 && tokens.get(i - 1).type() == TokenType.DOT;
+                    boolean isInInsertColList = insertColListRanges.contains(i);
+                    boolean isOutputOnly = scope.isOutputOnly(t.value());
                     // Don't substitute if preceded by dot (it's a field access like table.column)
+                    // Don't substitute if inside INSERT column list (these are column names, not variables)
+                    // Don't substitute output-only variables (OUT params of RETURNS TABLE functions)
                     // Also don't substitute common SQL keywords that happen to match variable names
-                    if (!isPrecededByDot && isSubstitutableVariable(t.value(), scope)) {
+                    if (!isPrecededByDot && !isInInsertColList && !isOutputOnly && isSubstitutableVariable(t.value(), scope)) {
                         Object val = scope.get(t.value());
                         if (val instanceof Map) {
-                            // Don't substitute maps as values
-                            appendTokenToSb(sb, t);
+                            // For single-entry maps not followed by DOT, substitute with the value
+                            // This handles FOR loop variables used as scalars: total := total + r
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> mapVal = (Map<String, Object>) val;
+                            boolean followedByDot = i + 1 < tokens.size() && tokens.get(i + 1).type() == TokenType.DOT;
+                            if (!followedByDot && mapVal.size() == 1) {
+                                appendValue(sb, mapVal.values().iterator().next());
+                            } else {
+                                appendTokenToSb(sb, t);
+                            }
                         } else {
                             appendValue(sb, val);
                         }
@@ -986,6 +1084,8 @@ public class PlpgsqlExecutor {
                 appendTokenToSb(sb, t);
             }
             return sb.toString().trim();
+        } catch (MemgresException e) {
+            throw e;
         } catch (Exception e) {
             return sql;
         }
@@ -1071,6 +1171,19 @@ public class PlpgsqlExecutor {
     private Object coerceParamValue(Object val, String typeName) {
         if (val == null || typeName == null) return val;
         String type = typeName.toLowerCase().trim();
+        // Convert PgRow to a Map when the parameter type is a composite type
+        if (val instanceof AstExecutor.PgRow) {
+            List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = database.getCompositeType(type);
+            if (fields != null) {
+                AstExecutor.PgRow row = (AstExecutor.PgRow) val;
+                Map<String, Object> record = new LinkedHashMap<>();
+                for (int i = 0; i < fields.size(); i++) {
+                    record.put(fields.get(i).name().toLowerCase(),
+                            i < row.values().size() ? row.values().get(i) : null);
+                }
+                return record;
+            }
+        }
         if (val instanceof String) {
             String s = (String) val;
             switch (type) {
