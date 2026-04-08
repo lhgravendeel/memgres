@@ -72,7 +72,7 @@ class SystemInfoCoverageTest {
     @Test
     void testCurrentDatabaseReturnsMemgres() throws SQLException {
         String result = query1("SELECT current_database()");
-        assertEquals("memgres", result);
+        assertEquals("test", result);
     }
 
     // --- current_schema() ---

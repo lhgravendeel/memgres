@@ -97,20 +97,46 @@ class CatalogSecurityBuilder {
         );
         Table table = new Table("pg_database", cols);
         int tsOid = oids.oid("tablespace:pg_default");
+
+        // Add template databases (always present in PostgreSQL)
         table.insertRow(new Object[]{
-                oids.oid("db:memgres"), "memgres", 10, 6,
-                "c", false, true, -1,
-                722, 1,     // datfrozenxid, datminmxid
-                tsOid, "en_US.UTF-8", "en_US.UTF-8",
-                null, null, null, null
-        });
-        table.insertRow(new Object[]{
-                oids.oid("db:postgres"), "postgres", 10, 6,
-                "c", false, true, -1,
+                oids.oid("db:template0"), "template0", 10, 6,
+                "c", true, false, -1,
                 722, 1, tsOid,
                 "en_US.UTF-8", "en_US.UTF-8",
                 null, null, null, null
         });
+        table.insertRow(new Object[]{
+                oids.oid("db:template1"), "template1", 10, 6,
+                "c", true, true, -1,
+                722, 1, tsOid,
+                "en_US.UTF-8", "en_US.UTF-8",
+                null, null, null, null
+        });
+
+        // Dynamically list all databases from the registry
+        DatabaseRegistry reg = database.getDatabaseRegistry();
+        if (reg != null) {
+            for (String dbName : reg.getDatabaseNames()) {
+                table.insertRow(new Object[]{
+                        oids.oid("db:" + dbName), dbName, 10, 6,
+                        "c", false, true, -1,
+                        722, 1, tsOid,
+                        "en_US.UTF-8", "en_US.UTF-8",
+                        null, null, null, null
+                });
+            }
+        } else {
+            // Fallback when no registry is available
+            table.insertRow(new Object[]{
+                    oids.oid("db:memgres"), "memgres", 10, 6,
+                    "c", false, true, -1,
+                    722, 1, tsOid,
+                    "en_US.UTF-8", "en_US.UTF-8",
+                    null, null, null, null
+            });
+        }
+
         return table;
     }
 
@@ -346,12 +372,13 @@ class CatalogSecurityBuilder {
                 col("backend_type", DataType.TEXT)
         );
         Table table = new Table("pg_stat_activity", cols);
-        int dbOid = oids.oid("db:memgres");
         for (Session s : database.getActiveSessions()) {
+            String dbName = s.getDatabaseName();
+            int dbOid = oids.oid("db:" + dbName);
             String user = s.getConnectingUser();
             int usesysid = user != null ? oids.oid("role:" + user) : 10;
             table.insertRow(new Object[]{
-                    dbOid, "memgres", s.getPid(),
+                    dbOid, dbName, s.getPid(),
                     null,       // leader_pid
                     usesysid, user,
                     s.getApplicationName(),

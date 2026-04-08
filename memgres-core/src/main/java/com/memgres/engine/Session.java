@@ -18,6 +18,8 @@ public class Session {
 
     private final Database database;
     private final AstExecutor executor;
+    private String databaseName = "memgres";
+    private DatabaseRegistry databaseRegistry;
     private TransactionStatus status = TransactionStatus.IDLE;
     private final List<UndoEntry> undoLog = new ArrayList<>();
     private final LinkedHashMap<String, Integer> savepoints = new LinkedHashMap<>();
@@ -196,6 +198,22 @@ public class Session {
         gucSettings.set("max_connections", String.valueOf(database.getMaxConnections()));
         // Register with database for MVCC visibility
         database.registerSession(this);
+    }
+
+    public String getDatabaseName() {
+        return databaseName;
+    }
+
+    public void setDatabaseName(String name) {
+        this.databaseName = name;
+    }
+
+    public DatabaseRegistry getDatabaseRegistry() {
+        return databaseRegistry;
+    }
+
+    public void setDatabaseRegistry(DatabaseRegistry registry) {
+        this.databaseRegistry = registry;
     }
 
     public TransactionStatus getStatus() {
@@ -614,10 +632,13 @@ public class Session {
     public void setXactStart(java.time.OffsetDateTime t) { this.xactStart = t; }
     public void clearXactStart() { this.xactStart = null; }
 
-    /** Drop all temp objects owned by this session (called on disconnect). */
+    /** Clean up session on disconnect: rollback uncommitted work, drop temp objects, unregister. */
     public void close() {
-        database.unregisterSession(this);
+        if (isInTransaction()) {
+            rollback();
+        }
         dropTempObjects();
+        database.unregisterSession(this);
     }
 
     public void dropTempObjects() {

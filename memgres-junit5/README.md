@@ -243,3 +243,5 @@ class MyIntegrationTest {
 | `restoreBeforeEach(true)` | Restore snapshot before each test method |
 | `systemProperty(name)` | Publish JDBC URL as a system property |
 | `port(n)` | Fixed port (default: `0` = random) |
+| `defaultDatabaseName(name)` | Name of the default database (default: `"memgres"`) |
+| `autoCreateDatabases(bool)` | Auto-create databases when a client connects to a non-existent name (default: `true`). Set to `false` for strict PostgreSQL behavior. |

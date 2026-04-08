@@ -584,6 +584,11 @@
                 <p>80+ pg_catalog tables and 13+ information_schema views. Compatible with ORMs, Flyway, Liquibase, and introspection tools.</p>
             </div>
             <div class="feature">
+                <div class="feature-icon">M</div>
+                <h3>Multiple Databases</h3>
+                <p>CREATE, DROP, ALTER DATABASE with full isolation. DROP WITH (FORCE), RENAME TO, auto-create on connect, configurable defaults.</p>
+            </div>
+            <div class="feature">
                 <div class="feature-icon">N</div>
                 <h3>LISTEN / NOTIFY</h3>
                 <p>Channel-based notifications with full transaction semantics. Deferred until COMMIT, discarded on ROLLBACK.</p>
@@ -721,7 +726,7 @@
             <div class="limitation">No parallel query execution</div>
             <div class="limitation">Parallel pg_dump/pg_restore not yet supported</div>
             <div class="limitation">Basic collation only (no ICU)</div>
-            <div class="limitation">Single database per instance</div>
+            <div class="limitation">No cross-database queries (same as PostgreSQL)</div>
         </div>
     </div>
 </section>
