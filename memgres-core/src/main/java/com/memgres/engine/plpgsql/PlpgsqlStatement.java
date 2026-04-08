@@ -813,29 +813,36 @@ public interface PlpgsqlStatement {
 
         public static final class GetDiagnosticsStmt implements PlpgsqlStatement {
         public final List<DiagItem> items;
+        public final boolean stacked;
 
         public GetDiagnosticsStmt(List<DiagItem> items) {
+            this(items, false);
+        }
+
+        public GetDiagnosticsStmt(List<DiagItem> items, boolean stacked) {
             this.items = items;
+            this.stacked = stacked;
         }
 
         public List<DiagItem> items() { return items; }
+        public boolean stacked() { return stacked; }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             GetDiagnosticsStmt that = (GetDiagnosticsStmt) o;
-            return java.util.Objects.equals(items, that.items);
+            return stacked == that.stacked && java.util.Objects.equals(items, that.items);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(items);
+            return java.util.Objects.hash(items, stacked);
         }
 
         @Override
         public String toString() {
-            return "GetDiagnosticsStmt[items=" + items + "]";
+            return "GetDiagnosticsStmt[items=" + items + ", stacked=" + stacked + "]";
         }
     }
 

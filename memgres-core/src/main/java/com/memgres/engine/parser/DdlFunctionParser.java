@@ -116,25 +116,29 @@ class DdlFunctionParser {
         String body = null;
         String language = "sql";
         boolean[] secDefRef = {false};
+        boolean[] strictRef = {false};
+        String[] volatilityRef = {"VOLATILE"};
+        java.util.Map<String, String> setClauses = new java.util.LinkedHashMap<>();
 
         if (parser.matchKeyword("AS")) {
             body = readFunctionBody();
-            parseFunctionAttributes(secDefRef);
+            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, setClauses);
             if (parser.matchKeyword("LANGUAGE")) {
                 language = parser.readIdentifierOrString();
             }
         } else if (parser.matchKeyword("LANGUAGE")) {
             language = parser.readIdentifierOrString();
-            parseFunctionAttributes(secDefRef);
+            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, setClauses);
             if (parser.matchKeyword("AS")) {
                 body = readFunctionBody();
             }
         }
 
-        parseFunctionAttributes(secDefRef);
+        parseFunctionAttributes(secDefRef, strictRef, volatilityRef, setClauses);
 
         return new CreateFunctionStmt(name, schema, rawParams.toString().trim(), parsedParams,
-                returnType, body != null ? body : "", language, orReplace, isProcedure, secDefRef[0]);
+                returnType, body != null ? body : "", language, orReplace, isProcedure, secDefRef[0], strictRef[0],
+                volatilityRef[0], setClauses.isEmpty() ? null : setClauses);
     }
 
     CallStmt parseCall() {
@@ -180,7 +184,8 @@ class DdlFunctionParser {
         return typeName;
     }
 
-    private void parseFunctionAttributes(boolean[] securityDefinerRef) {
+    private void parseFunctionAttributes(boolean[] securityDefinerRef, boolean[] strictRef,
+                                          String[] volatilityRef, java.util.Map<String, String> setClauses) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
             Token t = parser.peek();
             if (t.type() == TokenType.KEYWORD) {
@@ -190,6 +195,10 @@ class DdlFunctionParser {
                         kw.equals("PARALLEL") || kw.equals("CALLED") || kw.equals("RETURNS") ||
                         kw.equals("ROWS")) {
                     parser.advance();
+                    if (kw.equals("IMMUTABLE") || kw.equals("STABLE") || kw.equals("VOLATILE")) {
+                        volatilityRef[0] = kw;
+                    }
+                    if (kw.equals("STRICT")) strictRef[0] = true;
                     if (kw.equals("SECURITY")) {
                         String defOrInvoker = parser.readIdentifier();
                         if ("DEFINER".equalsIgnoreCase(defOrInvoker)) securityDefinerRef[0] = true;
@@ -198,20 +207,24 @@ class DdlFunctionParser {
                     if (kw.equals("COST")) parser.advance();
                     if (kw.equals("ROWS")) parser.advance();
                     if (kw.equals("PARALLEL")) parser.readIdentifier();
-                    if (kw.equals("CALLED")) { parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); }
-                    if (kw.equals("RETURNS")) { parser.matchKeyword("NULL"); parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); }
+                    if (kw.equals("CALLED")) { parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = false; }
+                    if (kw.equals("RETURNS")) { parser.matchKeyword("NULL"); parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = true; }
                     continue;
                 }
                 if (kw.equals("SET")) {
                     parser.advance();
-                    parser.readIdentifier();
+                    String paramName = parser.readIdentifier();
                     if (parser.matchKeyword("TO") || parser.match(TokenType.EQUALS)) {
+                        StringBuilder valBuf = new StringBuilder();
                         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
                             Token next = parser.peek();
                             if (next.type() == TokenType.KEYWORD && isFunctionAttributeKeyword(next.value())) break;
                             if (next.type() == TokenType.KEYWORD && next.value().equals("AS")) break;
+                            if (valBuf.length() > 0) valBuf.append(" ");
+                            valBuf.append(next.value());
                             parser.advance();
                         }
+                        setClauses.put(paramName.toLowerCase(), valBuf.toString().trim());
                     }
                     continue;
                 }

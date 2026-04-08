@@ -740,7 +740,17 @@ class FromFunctionResolver {
                     contexts.add(new RowContext(virtualTable, alias, rowArr));
                 }
             } else {
-                cols.add(new Column(alias, DataType.TEXT, true, false, null));
+                // For RETURNS TABLE with single-column results, use OUT param name
+                String colName = alias;
+                if ("TABLE".equalsIgnoreCase(returnType)) {
+                    for (PgFunction.Param p : params) {
+                        if ("OUT".equalsIgnoreCase(p.mode()) && p.name() != null) {
+                            colName = p.name();
+                            break;
+                        }
+                    }
+                }
+                cols.add(new Column(colName, DataType.TEXT, true, false, null));
                 virtualTable = new Table(alias, cols);
                 for (Object val : resultList) {
                     Object[] row = new Object[]{val};
@@ -775,6 +785,28 @@ class FromFunctionResolver {
             }
             virtualTable.insertRow(row);
             contexts.add(new RowContext(virtualTable, alias, row));
+            return contexts;
+        }
+        // For RETURNS record with caller-provided column aliases, expand the record
+        if ("record".equalsIgnoreCase(userFunc.getReturnType()) && colAliases != null && !colAliases.isEmpty()) {
+            Object[] rowArr;
+            if (result instanceof Object[]) {
+                rowArr = (Object[]) result;
+            } else if (result instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> map = (Map<String, Object>) result;
+                rowArr = map.values().toArray();
+            } else {
+                rowArr = new Object[]{result};
+            }
+            List<Column> cols = new ArrayList<>();
+            for (int i = 0; i < colAliases.size(); i++) {
+                cols.add(new Column(colAliases.get(i), DataType.TEXT, true, false, null));
+            }
+            Table virtualTable = new Table(alias, cols);
+            List<RowContext> contexts = new ArrayList<>();
+            virtualTable.insertRow(rowArr);
+            contexts.add(new RowContext(virtualTable, alias, rowArr));
             return contexts;
         }
         // Scalar function in FROM

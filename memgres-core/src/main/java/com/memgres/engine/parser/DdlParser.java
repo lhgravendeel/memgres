@@ -89,6 +89,8 @@ class DdlParser {
                 || parser.matchKeyword("CONVERSION")
                 || parser.matchKeywords("OPERATOR", "CLASS") || parser.matchKeywords("OPERATOR", "FAMILY")
                 || parser.matchKeyword("OPERATOR")
+                || parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
+                || parser.matchKeyword("CONVERSION")
                 || parser.matchKeywords("DEFAULT", "CONVERSION")
                 || parser.matchKeywords("TEXT", "SEARCH")
                 || parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")

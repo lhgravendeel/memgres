@@ -167,6 +167,9 @@ public class PlpgsqlParser {
             if (check(TokenType.LEFT_BRACKET)) {
                 advance(); match(TokenType.RIGHT_BRACKET); sb.append("[]"); continue;
             }
+            if (check(TokenType.DOT)) {
+                advance(); sb.append(".").append(readIdent()); continue;
+            }
             if (check(TokenType.PERCENT)) {
                 advance(); sb.append("%").append(readIdent()); continue;
             }
@@ -567,11 +570,27 @@ public class PlpgsqlParser {
         // Detect SELECT ... INTO [STRICT] var1[, var2, ...] ... FROM
         // Normalize whitespace for detection (newlines before INTO)
         String upper = sql.toUpperCase();
-        if (upper.startsWith("SELECT")) {
+        // For CTE queries (WITH ... SELECT ... INTO), find the final SELECT outside parens
+        int selectStart = 0;
+        if (upper.startsWith("WITH")) {
+            int depth = 0;
+            for (int ci = 0; ci < upper.length() - 6; ci++) {
+                char ch = upper.charAt(ci);
+                if (ch == '(') depth++;
+                else if (ch == ')') depth--;
+                else if (depth == 0 && upper.startsWith("SELECT", ci)
+                        && (ci == 0 || !Character.isLetterOrDigit(upper.charAt(ci - 1)))
+                        && (ci + 6 >= upper.length() || !Character.isLetterOrDigit(upper.charAt(ci + 6)))) {
+                    selectStart = ci;
+                }
+            }
+        }
+        if (upper.startsWith("SELECT") || (upper.startsWith("WITH") && selectStart > 0)) {
             int intoIdx = -1;
             int intoEnd = -1;
+            // Search for INTO only after the final SELECT (important for CTE queries)
             java.util.regex.Matcher intoMatcher = java.util.regex.Pattern.compile("\\sINTO\\s", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(sql);
-            if (intoMatcher.find()) { intoIdx = intoMatcher.start(); intoEnd = intoMatcher.end(); }
+            if (intoMatcher.find(selectStart)) { intoIdx = intoMatcher.start(); intoEnd = intoMatcher.end(); }
             if (intoIdx >= 0) {
                 String afterInto = sql.substring(intoEnd).trim();
                 if (afterInto.toUpperCase().startsWith("STRICT ")) {
@@ -645,6 +664,41 @@ public class PlpgsqlParser {
             }
         }
 
+        // Handle INSERT/UPDATE/DELETE ... RETURNING col1[, col2] INTO var1[, var2]
+        if (intoVars == null) {
+            String upperSql = sql.toUpperCase();
+            if (upperSql.startsWith("INSERT") || upperSql.startsWith("UPDATE") || upperSql.startsWith("DELETE")
+                    || upperSql.startsWith("WITH")) {
+                // Look for RETURNING ... INTO pattern
+                java.util.regex.Matcher retIntoMatcher = java.util.regex.Pattern.compile(
+                        "\\bRETURNING\\b(.+?)\\bINTO\\b(.+)$",
+                        java.util.regex.Pattern.CASE_INSENSITIVE | java.util.regex.Pattern.DOTALL).matcher(sql);
+                if (retIntoMatcher.find()) {
+                    String returningCols = retIntoMatcher.group(1).trim();
+                    String intoTargets = retIntoMatcher.group(2).trim();
+                    // Check for STRICT
+                    if (intoTargets.toUpperCase().startsWith("STRICT ")) {
+                        strict = true;
+                        intoTargets = intoTargets.substring(7).trim();
+                    }
+                    // Parse into variable list
+                    String[] parts = intoTargets.split(",");
+                    List<String> varNames = new ArrayList<>();
+                    for (String part : parts) {
+                        String trimmed = part.trim();
+                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+                            varNames.add(trimmed);
+                        }
+                    }
+                    if (!varNames.isEmpty()) {
+                        intoVars = varNames;
+                        // Remove the INTO ... part, keep RETURNING clause in SQL
+                        sql = sql.substring(0, retIntoMatcher.start()) + "RETURNING " + returningCols;
+                    }
+                }
+            }
+        }
+
         return new PlpgsqlStatement.SqlStmt(sql, intoVars, strict);
     }
 
@@ -652,6 +706,7 @@ public class PlpgsqlParser {
 
     private PlpgsqlStatement parseGetDiagnostics() {
         matchKw("GET");
+        boolean stacked = matchKw("STACKED");
         matchKw("DIAGNOSTICS");
         List<PlpgsqlStatement.DiagItem> items = new ArrayList<>();
         do {
@@ -659,16 +714,22 @@ public class PlpgsqlParser {
             if (!match(TokenType.EQUALS)) match(TokenType.COLON_EQUALS);
             String itemName = readIdent();
             if (peek().type() == TokenType.IDENTIFIER || peek().type() == TokenType.KEYWORD) {
-                // Handle multi-word like ROW_COUNT, but it's typically one token: ROW_COUNT
-                // Actually ROW is a keyword and COUNT is a keyword, so this might be two tokens
+                // Handle multi-word like ROW_COUNT, PG_EXCEPTION_DETAIL, etc.
                 if (!check(TokenType.COMMA) && !check(TokenType.SEMICOLON) && !isAtEnd()) {
                     itemName += "_" + readIdent();
+                    // Handle triple-word items like PG_EXCEPTION_DETAIL -> already two-word after underscore join
+                    // But PG_EXCEPTION_CONTEXT is also possible via PG + EXCEPTION + CONTEXT
+                    if (peek().type() == TokenType.IDENTIFIER || peek().type() == TokenType.KEYWORD) {
+                        if (!check(TokenType.COMMA) && !check(TokenType.SEMICOLON) && !isAtEnd()) {
+                            itemName += "_" + readIdent();
+                        }
+                    }
                 }
             }
             items.add(new PlpgsqlStatement.DiagItem(varName, itemName.toUpperCase()));
         } while (match(TokenType.COMMA));
         match(TokenType.SEMICOLON);
-        return new PlpgsqlStatement.GetDiagnosticsStmt(items);
+        return new PlpgsqlStatement.GetDiagnosticsStmt(items, stacked);
     }
 
     // ---- Cursors ----

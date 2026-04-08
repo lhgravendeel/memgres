@@ -338,9 +338,15 @@ public class Database {
         // Try to match by argument count and type hints
         for (PgFunction f : overloads) {
             List<PgFunction.Param> inputParams = f.getParams().stream()
-                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
+                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
                     .collect(Collectors.toList());
-            if (inputParams.size() != argCount) continue;
+            boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
+            if (hasVariadic) {
+                // VARIADIC: argCount must be >= non-variadic input count
+                if (argCount < inputParams.size()) continue;
+            } else {
+                if (inputParams.size() != argCount) continue;
+            }
             if (argTypeHints != null && !argTypeHints.isEmpty()) {
                 boolean match = true;
                 for (int i = 0; i < argTypeHints.size() && i < inputParams.size(); i++) {
@@ -357,9 +363,14 @@ public class Database {
         // Fallback: match by arg count only
         for (PgFunction f : overloads) {
             long inputCount = f.getParams().stream()
-                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
+                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
                     .count();
-            if (inputCount == argCount) return f;
+            boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
+            if (hasVariadic) {
+                if (argCount >= inputCount) return f;
+            } else {
+                if (inputCount == argCount) return f;
+            }
         }
         return overloads.get(0); // fallback to first
     }

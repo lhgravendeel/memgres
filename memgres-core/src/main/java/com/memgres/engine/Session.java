@@ -1622,4 +1622,38 @@ public class Session {
             return "CreateIndexUndo[indexName=" + indexName + "]";
         }
     }
+
+    /** Undo a CREATE FUNCTION by removing it. */
+        public static final class CreateFunctionUndo implements UndoEntry {
+        public final String funcName;
+
+        public CreateFunctionUndo(String funcName) {
+            this.funcName = funcName;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.removeFunction(funcName);
+        }
+
+        public String funcName() { return funcName; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            CreateFunctionUndo that = (CreateFunctionUndo) o;
+            return java.util.Objects.equals(funcName, that.funcName);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(funcName);
+        }
+
+        @Override
+        public String toString() {
+            return "CreateFunctionUndo[funcName=" + funcName + "]";
+        }
+    }
 }
