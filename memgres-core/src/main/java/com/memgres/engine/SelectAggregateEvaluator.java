@@ -855,6 +855,8 @@ class SelectAggregateEvaluator {
 
         // Resolve SFUNC once outside the loop
         PgFunction sfunc = executor.database.getFunction(agg.getSfunc());
+        boolean sfuncStrict = sfunc != null && sfunc.isStrict();
+        boolean needsFirstNonNull = sfuncStrict && agg.getInitcond() == null;
 
         // For DISTINCT, track seen value tuples
         Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
@@ -864,6 +866,24 @@ class SelectAggregateEvaluator {
             List<Object> argValues = new ArrayList<>();
             for (Expression arg : fn.args()) {
                 argValues.add(executor.evalExpr(arg, ctx));
+            }
+
+            // STRICT SFUNC: skip rows where any input value is NULL
+            if (sfuncStrict && argValues.stream().anyMatch(v -> v == null)) {
+                continue;
+            }
+
+            // STRICT SFUNC with no INITCOND: use first non-NULL input as initial state
+            if (needsFirstNonNull && state == null) {
+                // For single-arg aggregates, first value becomes state; for multi-arg, use first arg
+                state = argValues.get(0);
+                needsFirstNonNull = false;
+                continue; // skip calling SFUNC for this row (PG behavior)
+            }
+
+            // STRICT SFUNC: skip if state is NULL (can happen if SFUNC returned NULL)
+            if (sfuncStrict && state == null) {
+                continue;
             }
 
             // DISTINCT: skip duplicate value tuples
