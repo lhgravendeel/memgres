@@ -48,6 +48,15 @@ public class DatabaseRegistry {
         return databases.remove(name) != null;
     }
 
+    /** Rename a database. Returns false if old doesn't exist or new already exists. */
+    public boolean renameDatabase(String oldName, String newName) {
+        Database db = databases.get(oldName);
+        if (db == null) return false;
+        if (databases.putIfAbsent(newName, db) != null) return false;
+        databases.remove(oldName);
+        return true;
+    }
+
     /** Check if a database exists. */
     public boolean exists(String name) {
         return databases.containsKey(name);

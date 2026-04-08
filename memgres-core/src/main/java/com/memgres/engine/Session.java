@@ -632,10 +632,13 @@ public class Session {
     public void setXactStart(java.time.OffsetDateTime t) { this.xactStart = t; }
     public void clearXactStart() { this.xactStart = null; }
 
-    /** Drop all temp objects owned by this session (called on disconnect). */
+    /** Clean up session on disconnect: rollback uncommitted work, drop temp objects, unregister. */
     public void close() {
-        database.unregisterSession(this);
+        if (isInTransaction()) {
+            rollback();
+        }
         dropTempObjects();
+        database.unregisterSession(this);
     }
 
     public void dropTempObjects() {

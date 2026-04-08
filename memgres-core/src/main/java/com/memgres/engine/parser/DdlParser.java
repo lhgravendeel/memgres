@@ -192,8 +192,24 @@ class DdlParser {
         else if (parser.matchKeyword("DATABASE")) {
             boolean ifExists = parser.matchKeywords("IF", "EXISTS");
             String dbName = parser.readIdentifier();
+            boolean force = false;
+            // WITH (FORCE) or (FORCE)
+            if (parser.matchKeyword("WITH")) {
+                // WITH (FORCE)
+            }
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                if (parser.matchKeyword("FORCE")) {
+                    force = true;
+                }
+                parser.match(TokenType.RIGHT_PAREN);
+            } else if (parser.matchKeyword("FORCE")) {
+                force = true;
+            }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt(ifExists ? "drop_database_if_exists" : "drop_database", dbName);
+            String action = "drop_database";
+            if (ifExists) action += "_if_exists";
+            if (force) action += "_force";
+            return new SetStmt(action, dbName);
         }
         else if (parser.matchKeyword("TABLESPACE")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
@@ -312,6 +328,17 @@ class DdlParser {
             return new SetStmt("alter_noop", "ok");
         }
 
+        if (parser.matchKeyword("DATABASE")) {
+            String dbName = parser.readIdentifier();
+            if (parser.matchKeywords("RENAME", "TO")) {
+                String newName = parser.readIdentifier();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new SetStmt("alter_database_rename", dbName + "\0" + newName);
+            }
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_noop", "ok");
+        }
+
         if (parser.matchKeyword("SCHEMA")) {
             String schemaName = parser.readIdentifier();
             if (parser.matchKeywords("OWNER", "TO")) {
@@ -335,7 +362,6 @@ class DdlParser {
                 || parser.matchKeywords("FOREIGN", "TABLE")
                 || parser.matchKeyword("PUBLICATION")
                 || parser.matchKeyword("SUBSCRIPTION")
-                || parser.matchKeyword("DATABASE")
                 || parser.matchKeyword("TABLESPACE")
                 || parser.matchKeyword("LANGUAGE")
                 || parser.matchKeywords("EVENT", "TRIGGER")

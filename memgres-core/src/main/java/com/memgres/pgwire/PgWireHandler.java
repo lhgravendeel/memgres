@@ -231,6 +231,10 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                         return;
                     }
                 }
+                // Close the default session created in the constructor before switching
+                if (this.session != null) {
+                    this.session.close();
+                }
                 this.database = resolved;
                 this.databaseName = requestedDb;
                 this.session = new Session(database);
@@ -1010,7 +1014,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        if (session != null) session.dropTempObjects();
+        if (session != null) session.close();
         if (connectionRegistered) {
             database.unregisterConnection();
             connectionRegistered = false;

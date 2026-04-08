@@ -947,6 +947,9 @@ class MultipleDatabaseIsolationTest {
                 s.execute("CREATE DATABASE other_db");
             }
 
+            // Wait for the first connection's channel to fully close
+            Thread.sleep(100);
+
             // Connect to other_db and drop the default database
             try (Connection conn = connect(base, "other_db", memgres);
                  Statement s = conn.createStatement()) {
@@ -1149,25 +1152,27 @@ class MultipleDatabaseIsolationTest {
                     s.execute("INSERT INTO survivor VALUES (1)");
                 }
 
-                // Drop the database from another connection
+                // Without FORCE, dropping should fail because victim is connected
                 try (Connection killer = connect(memgres);
                      Statement s = killer.createStatement()) {
-                    // This will succeed because the protection is only
-                    // "cannot drop the currently open database" per-session
-                    // The victim connection's Session references the Database object directly
-                    // so it may still work (the Java object is still in memory)
-                    s.execute("DROP DATABASE doomed_db");
+                    SQLException ex = assertThrows(SQLException.class,
+                            () -> s.execute("DROP DATABASE doomed_db"));
+                    assertEquals("55006", ex.getSQLState());
                 }
 
-                // The victim connection still holds a reference to the Database object.
-                // Queries may still work since the in-memory data is not garbage collected.
-                // This is an implementation detail, not a strict requirement.
-                // Just verify no crash occurs.
-                try (Statement s = victim.createStatement();
-                     ResultSet rs = s.executeQuery("SELECT count(*) FROM survivor")) {
+                // With FORCE, dropping should succeed and terminate victim's session
+                try (Connection killer = connect(memgres);
+                     Statement s = killer.createStatement()) {
+                    s.execute("DROP DATABASE doomed_db WITH (FORCE)");
+                }
+
+                // Verify database is gone
+                try (Connection c = connect(memgres);
+                     Statement s = c.createStatement();
+                     ResultSet rs = s.executeQuery(
+                             "SELECT count(*) FROM pg_database WHERE datname = 'doomed_db'")) {
                     assertTrue(rs.next());
-                    // Data is still accessible through the existing reference
-                    assertEquals(1, rs.getInt(1));
+                    assertEquals(0, rs.getInt(1));
                 }
             }
         }
@@ -1745,8 +1750,354 @@ class MultipleDatabaseIsolationTest {
     }
 
     // -----------------------------------------------------------
+    // 39. has_database_privilege()
+    // -----------------------------------------------------------
+
+    @Test
+    void hasDatabasePrivilege_returnsTrue() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE priv_db");
+
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT has_database_privilege('memgres', 'priv_db', 'CONNECT')")) {
+                    assertTrue(rs.next());
+                    assertTrue(rs.getBoolean(1));
+                }
+
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT has_database_privilege('priv_db', 'CREATE')")) {
+                    assertTrue(rs.next());
+                    assertTrue(rs.getBoolean(1));
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 40. Database ownership in pg_database
+    // -----------------------------------------------------------
+
+    @Test
+    void pgDatabase_ownerColumn() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE owned_db");
+
+                // datdba should be set (10 = default superuser OID)
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT datdba FROM pg_database WHERE datname = 'owned_db'")) {
+                    assertTrue(rs.next());
+                    assertEquals(10, rs.getInt(1));
+                }
+
+                // pg_get_userbyid should resolve the owner
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT pg_catalog.pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'owned_db'")) {
+                    assertTrue(rs.next());
+                    assertNotNull(rs.getString(1));
+                }
+            }
+        }
+    }
+
+    @Test
+    void createDatabaseWithOwner_parsesWithoutError() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                // OWNER clause is parsed but the value is not stored
+                s.execute("CREATE DATABASE owner_db OWNER memgres");
+                assertDbExists(s, "owner_db");
+                s.execute("DROP DATABASE owner_db");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 41. Snapshot/restore only affects the default database
+    // -----------------------------------------------------------
+
+    @Test
+    void snapshotRestore_defaultDbOnly() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            String base = "jdbc:postgresql://localhost:" + memgres.getPort();
+
+            // Set up data in default database
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE TABLE snap_tbl (id int)");
+                s.execute("INSERT INTO snap_tbl VALUES (1)");
+            }
+
+            // Take snapshot
+            memgres.snapshot();
+
+            // Add more data to default database
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("INSERT INTO snap_tbl VALUES (2)");
+                s.execute("INSERT INTO snap_tbl VALUES (3)");
+            }
+
+            // Create another database and add data
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE snap_other");
+            }
+            try (Connection conn = connect(base, "snap_other", memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE TABLE other_tbl (val text)");
+                s.execute("INSERT INTO other_tbl VALUES ('keep_me')");
+            }
+
+            // Restore
+            memgres.restore();
+
+            // Default database should be restored to 1 row
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT count(*) FROM snap_tbl")) {
+                assertTrue(rs.next());
+                assertEquals(1, rs.getInt(1));
+            }
+
+            // snap_other's data should be unaffected by restore
+            try (Connection conn = connect(base, "snap_other", memgres);
+                 Statement s = conn.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT count(*) FROM other_tbl")) {
+                assertTrue(rs.next());
+                assertEquals(1, rs.getInt(1));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 42. Embedded double quotes in database name
+    // -----------------------------------------------------------
+
+    @Test
+    void quotedDbName_withEmbeddedDoubleQuote() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                // In SQL, "" inside a quoted identifier represents a literal "
+                s.execute("CREATE DATABASE \"my\"\"db\"");
+
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT count(*) FROM pg_database WHERE datname = 'my\"db'")) {
+                    assertTrue(rs.next());
+                    assertEquals(1, rs.getInt(1));
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 43. Unicode in database name
+    // -----------------------------------------------------------
+
+    @Test
+    void quotedDbName_withUnicode() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            String base = "jdbc:postgresql://localhost:" + memgres.getPort();
+
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE \"caf\u00e9_db\"");
+            }
+
+            try (Connection conn = connect(base, "caf\u00e9_db", memgres);
+                 Statement s = conn.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT current_database()")) {
+                assertTrue(rs.next());
+                assertEquals("caf\u00e9_db", rs.getString(1));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 44. Case sensitivity: unquoted vs quoted
+    // -----------------------------------------------------------
+
+    @Test
+    void caseSensitivity_quotedPreservesCase() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                // Quoted: preserves exact case
+                s.execute("CREATE DATABASE \"CaseSensitive\"");
+                // Unquoted: lowercased by parser
+                s.execute("CREATE DATABASE CaseSensitive2");
+
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT datname FROM pg_database WHERE datname = 'CaseSensitive'")) {
+                    assertTrue(rs.next(), "Quoted name should preserve case");
+                }
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT datname FROM pg_database WHERE datname = 'casesensitive2'")) {
+                    assertTrue(rs.next(), "Unquoted name should be lowercased");
+                }
+                // Verify the uppercase version does NOT exist for unquoted
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT count(*) FROM pg_database WHERE datname = 'CaseSensitive2'")) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1), "Unquoted CaseSensitive2 should not exist in original case");
+                }
+            }
+        }
+    }
+
+    @Test
+    void caseSensitivity_dropUsesParserCasing() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE \"KeepCase\"");
+
+                // Unquoted DROP lowercases, so it will not match "KeepCase"
+                SQLException ex = assertThrows(SQLException.class,
+                        () -> s.execute("DROP DATABASE KeepCase"));
+                assertEquals("3D000", ex.getSQLState());
+
+                // Quoted DROP matches exactly
+                s.execute("DROP DATABASE \"KeepCase\"");
+                assertDbGone(s, "KeepCase");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 45. ALTER DATABASE SET (noop persistence test)
+    // -----------------------------------------------------------
+
+    @Test
+    void alterDatabaseSet_doesNotAffectSession() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            String base = "jdbc:postgresql://localhost:" + memgres.getPort();
+
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE alter_set_db");
+                // This is a noop, but should parse without error
+                s.execute("ALTER DATABASE alter_set_db SET work_mem TO '64MB'");
+                s.execute("ALTER DATABASE alter_set_db RESET ALL");
+            }
+
+            // Connect to the database and verify settings are default
+            try (Connection conn = connect(base, "alter_set_db", memgres);
+                 Statement s = conn.createStatement();
+                 ResultSet rs = s.executeQuery("SELECT current_setting('work_mem')")) {
+                assertTrue(rs.next());
+                // Should be default, not 64MB (since ALTER DATABASE SET is a noop)
+                assertNotEquals("64MB", rs.getString(1));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 46. Numeric-only database name (must be quoted)
+    // -----------------------------------------------------------
+
+    @Test
+    void numericDbName_requiresQuoting() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                // Unquoted number should fail to parse as identifier
+                assertThrows(SQLException.class,
+                        () -> s.execute("CREATE DATABASE 123"));
+
+                // Quoted number should work
+                s.execute("CREATE DATABASE \"123\"");
+                assertDbExists(s, "123");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 47. Database with WITH keyword before options
+    // -----------------------------------------------------------
+
+    @Test
+    void createDatabaseWithKeyword_beforeOptions() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                // PG supports optional WITH before option list
+                s.execute("CREATE DATABASE with_kw_db WITH OWNER = memgres ENCODING = 'UTF8'");
+                assertDbExists(s, "with_kw_db");
+
+                // Also without WITH
+                s.execute("CREATE DATABASE no_with_kw_db OWNER = memgres ENCODING = 'UTF8'");
+                assertDbExists(s, "no_with_kw_db");
+
+                // Also without = sign
+                s.execute("CREATE DATABASE no_eq_db OWNER memgres ENCODING 'UTF8'");
+                assertDbExists(s, "no_eq_db");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 48. Rapid create/drop cycles
+    // -----------------------------------------------------------
+
+    @Test
+    void rapidCreateDropCycles() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                for (int i = 0; i < 20; i++) {
+                    s.execute("CREATE DATABASE rapid_db");
+                    s.execute("DROP DATABASE rapid_db");
+                }
+                // Final creation should work
+                s.execute("CREATE DATABASE rapid_db");
+                assertDbExists(s, "rapid_db");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
+    // 49. Multiple databases in pg_database have distinct OIDs
+    // -----------------------------------------------------------
+
+    @Test
+    void pgDatabase_distinctOids() throws Exception {
+        try (Memgres memgres = Memgres.builder().port(0).build().start()) {
+            try (Connection conn = connect(memgres);
+                 Statement s = conn.createStatement()) {
+                s.execute("CREATE DATABASE oid_db_1");
+                s.execute("CREATE DATABASE oid_db_2");
+
+                try (ResultSet rs = s.executeQuery(
+                        "SELECT oid, datname FROM pg_database " +
+                        "WHERE datname IN ('oid_db_1', 'oid_db_2', 'memgres') " +
+                        "ORDER BY datname")) {
+                    java.util.Set<Integer> oids = new java.util.HashSet<>();
+                    while (rs.next()) {
+                        oids.add(rs.getInt("oid"));
+                    }
+                    assertEquals(3, oids.size(), "Each database should have a distinct OID");
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------
+
+    private static void assertDbExists(Statement s, String dbName) throws SQLException {
+        try (ResultSet rs = s.executeQuery(
+                "SELECT count(*) FROM pg_database WHERE datname = '" + dbName + "'")) {
+            assertTrue(rs.next());
+            assertEquals(1, rs.getInt(1), "Database '" + dbName + "' should exist");
+        }
+    }
 
     private static void assertDbGone(Statement s, String dbName) throws SQLException {
         try (ResultSet rs = s.executeQuery(
@@ -1771,5 +2122,301 @@ class MultipleDatabaseIsolationTest {
     private static Connection connect(String base, String dbName, Memgres memgres) throws SQLException {
         return DriverManager.getConnection(
                 base + "/" + dbName, memgres.getUser(), memgres.getPassword());
+    }
+
+    // ---- Section 50: DROP DATABASE rejects when other sessions are connected ----
+    @Test
+    void dropDatabase_failsWhenOtherSessionsConnected() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE target_db");
+                }
+                // Open a connection to target_db (creates an active session)
+                try (Connection c2 = connect(base, "target_db", m)) {
+                    try (Statement s2 = c2.createStatement()) {
+                        s2.execute("SELECT 1"); // ensure session is active
+                    }
+                    // Try to drop target_db from c1 -- should fail with 55006
+                    try (Statement s1 = c1.createStatement()) {
+                        SQLException ex = assertThrows(SQLException.class,
+                                () -> s1.execute("DROP DATABASE target_db"));
+                        assertEquals("55006", ex.getSQLState());
+                        assertTrue(ex.getMessage().contains("being accessed by other users"));
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Section 51: DROP DATABASE FORCE terminates other sessions ----
+    @Test
+    void dropDatabase_forceTerminatesOtherSessions() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE force_target");
+                }
+                // Open a connection and create data in force_target
+                Connection c2 = connect(base, "force_target", m);
+                try (Statement s2 = c2.createStatement()) {
+                    s2.execute("CREATE TABLE data(id int)");
+                    s2.execute("INSERT INTO data VALUES (1)");
+                }
+                // Force drop from c1 -- should succeed
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE force_target WITH (FORCE)");
+                }
+                // Verify it's gone
+                try (Statement s1 = c1.createStatement();
+                     ResultSet rs = s1.executeQuery(
+                             "SELECT count(*) FROM pg_database WHERE datname = 'force_target'")) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1));
+                }
+                // The old connection's session has been closed by FORCE
+                c2.close(); // cleanup (may already be invalidated)
+            }
+        }
+    }
+
+    // ---- Section 52: DROP DATABASE IF EXISTS FORCE ----
+    @Test
+    void dropDatabase_ifExistsForce() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE ie_force_db");
+                }
+                Connection c2 = connect(base, "ie_force_db", m);
+                try (Statement s2 = c2.createStatement()) {
+                    s2.execute("SELECT 1");
+                }
+                // IF EXISTS + FORCE should work
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE IF EXISTS ie_force_db WITH (FORCE)");
+                }
+                // Non-existent + IF EXISTS + FORCE should be silent
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE IF EXISTS ie_force_db WITH (FORCE)");
+                }
+                c2.close();
+            }
+        }
+    }
+
+    // ---- Section 53: DROP DATABASE (FORCE) without WITH keyword terminates sessions ----
+    @Test
+    void dropDatabase_forceWithoutWith_terminatesSessions() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE paren_force_db");
+                }
+                Connection c2 = connect(base, "paren_force_db", m);
+                try (Statement s2 = c2.createStatement()) {
+                    s2.execute("SELECT 1");
+                }
+                // (FORCE) without WITH should also work
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE paren_force_db (FORCE)");
+                }
+                try (Statement s1 = c1.createStatement();
+                     ResultSet rs = s1.executeQuery(
+                             "SELECT count(*) FROM pg_database WHERE datname = 'paren_force_db'")) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1));
+                }
+                c2.close();
+            }
+        }
+    }
+
+    // ---- Section 54: DROP DATABASE without FORCE still fails with other sessions ----
+    @Test
+    void dropDatabase_noForce_failsWithActiveSessions() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE no_force_db");
+                }
+                Connection c2 = connect(base, "no_force_db", m);
+                try (Statement s2 = c2.createStatement()) {
+                    s2.execute("SELECT 1");
+                }
+                // Without FORCE, should fail
+                try (Statement s1 = c1.createStatement()) {
+                    SQLException ex = assertThrows(SQLException.class,
+                            () -> s1.execute("DROP DATABASE no_force_db"));
+                    assertEquals("55006", ex.getSQLState());
+                }
+                // After closing the other connection, should succeed
+                c2.close();
+                // Give the channel a moment to become inactive
+                Thread.sleep(100);
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE no_force_db");
+                }
+            }
+        }
+    }
+
+    // ---- Section 55: ALTER DATABASE RENAME TO ----
+    @Test
+    void alterDatabase_renameActuallyRenames() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE rename_source");
+                }
+                // Put data in the source database
+                try (Connection cs = connect(base, "rename_source", m);
+                     Statement ss = cs.createStatement()) {
+                    ss.execute("CREATE TABLE marker(v text)");
+                    ss.execute("INSERT INTO marker VALUES ('renamed')");
+                }
+                // Close all connections to rename_source before renaming
+                Thread.sleep(100);
+                // Rename it
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("ALTER DATABASE rename_source RENAME TO rename_target");
+                }
+                // Old name should not exist
+                try (Statement s1 = c1.createStatement();
+                     ResultSet rs = s1.executeQuery(
+                             "SELECT count(*) FROM pg_database WHERE datname = 'rename_source'")) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1));
+                }
+                // New name should exist and have the data
+                try (Connection ct = connect(base, "rename_target", m);
+                     Statement st = ct.createStatement();
+                     ResultSet rs = st.executeQuery("SELECT v FROM marker")) {
+                    assertTrue(rs.next());
+                    assertEquals("renamed", rs.getString(1));
+                }
+                // Cleanup
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE rename_target");
+                }
+            }
+        }
+    }
+
+    // ---- Section 56: ALTER DATABASE RENAME errors ----
+    @Test
+    void alterDatabase_rename_errors() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                // Rename non-existent database
+                try (Statement s1 = c1.createStatement()) {
+                    SQLException ex = assertThrows(SQLException.class,
+                            () -> s1.execute("ALTER DATABASE nonexistent RENAME TO newname"));
+                    assertEquals("3D000", ex.getSQLState());
+                }
+                // Rename to existing name
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE rename_a");
+                    s1.execute("CREATE DATABASE rename_b");
+                }
+                try (Statement s1 = c1.createStatement()) {
+                    SQLException ex = assertThrows(SQLException.class,
+                            () -> s1.execute("ALTER DATABASE rename_a RENAME TO rename_b"));
+                    assertEquals("42P04", ex.getSQLState());
+                }
+                // Cannot rename current database
+                try (Statement s1 = c1.createStatement()) {
+                    SQLException ex = assertThrows(SQLException.class,
+                            () -> s1.execute("ALTER DATABASE main RENAME TO other"));
+                    assertEquals("55006", ex.getSQLState());
+                }
+                // Cannot rename while other sessions are connected
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE rename_busy");
+                }
+                Connection c2 = connect(base, "rename_busy", m);
+                try (Statement s2 = c2.createStatement()) {
+                    s2.execute("SELECT 1");
+                }
+                try (Statement s1 = c1.createStatement()) {
+                    SQLException ex = assertThrows(SQLException.class,
+                            () -> s1.execute("ALTER DATABASE rename_busy RENAME TO rename_free"));
+                    assertEquals("55006", ex.getSQLState());
+                    assertTrue(ex.getMessage().contains("being accessed by other users"));
+                }
+                c2.close();
+                // Cleanup
+                Thread.sleep(100);
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE rename_a");
+                    s1.execute("DROP DATABASE rename_b");
+                    s1.execute("DROP DATABASE rename_busy");
+                }
+            }
+        }
+    }
+
+    // ---- Section 57: ALTER DATABASE RENAME in transaction block fails ----
+    @Test
+    void alterDatabase_rename_inTransactionBlock_fails() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE txn_rename_db");
+                }
+                c1.setAutoCommit(false);
+                try (Statement s1 = c1.createStatement()) {
+                    SQLException ex = assertThrows(SQLException.class,
+                            () -> s1.execute("ALTER DATABASE txn_rename_db RENAME TO txn_rename_new"));
+                    assertEquals("25001", ex.getSQLState());
+                }
+                c1.rollback();
+                c1.setAutoCommit(true);
+                // Cleanup
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE txn_rename_db");
+                }
+            }
+        }
+    }
+
+    // ---- Section 58: DROP succeeds after all sessions disconnect ----
+    @Test
+    void dropDatabase_succeedsAfterAllSessionsDisconnect() throws Exception {
+        try (Memgres m = Memgres.builder().port(0).defaultDatabaseName("main").build().start()) {
+            String base = "jdbc:postgresql://localhost:" + m.getPort();
+            try (Connection c1 = connect(base, "main", m)) {
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("CREATE DATABASE sess_test_db");
+                }
+                // Open multiple connections
+                Connection c2 = connect(base, "sess_test_db", m);
+                Connection c3 = connect(base, "sess_test_db", m);
+                try (Statement s2 = c2.createStatement()) { s2.execute("SELECT 1"); }
+                try (Statement s3 = c3.createStatement()) { s3.execute("SELECT 1"); }
+                // Should fail while sessions active
+                try (Statement s1 = c1.createStatement()) {
+                    SQLException ex = assertThrows(SQLException.class,
+                            () -> s1.execute("DROP DATABASE sess_test_db"));
+                    assertEquals("55006", ex.getSQLState());
+                }
+                // Close all connections
+                c2.close();
+                c3.close();
+                Thread.sleep(100);
+                // Now should succeed
+                try (Statement s1 = c1.createStatement()) {
+                    s1.execute("DROP DATABASE sess_test_db");
+                }
+            }
+        }
     }
 }

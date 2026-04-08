@@ -262,25 +262,67 @@ class SessionExecutor {
             }
             return QueryResult.message(QueryResult.Type.SET, "CREATE DATABASE");
         }
-        if (name.equals("drop_database") || name.equals("drop_database_if_exists")) {
+        if (name.startsWith("drop_database")) {
             if (executor.session != null && executor.session.isInTransaction()) {
                 throw new MemgresException("DROP DATABASE cannot run inside a transaction block", "25001");
             }
+            boolean ifExists = name.contains("if_exists");
+            boolean force = name.contains("force");
             String dbName = stmt.value();
             DatabaseRegistry reg = executor.session != null ? executor.session.getDatabaseRegistry() : null;
             if (reg == null) {
                 // No registry -- fall through as noop for backward compat
             } else if (!reg.exists(dbName)) {
-                if (name.equals("drop_database")) {
+                if (!ifExists) {
                     throw new MemgresException("database \"" + dbName + "\" does not exist", "3D000");
                 }
             } else {
                 if (dbName.equals(executor.session.getDatabaseName())) {
                     throw new MemgresException("cannot drop the currently open database", "55006");
                 }
+                Database targetDb = reg.getDatabase(dbName);
+                if (targetDb != null) {
+                    java.util.Set<Session> otherSessions = targetDb.getActiveSessions();
+                    if (!otherSessions.isEmpty()) {
+                        if (force) {
+                            for (Session s : new java.util.ArrayList<>(otherSessions)) {
+                                s.close();
+                            }
+                        } else {
+                            throw new MemgresException(
+                                "database \"" + dbName + "\" is being accessed by other users", "55006");
+                        }
+                    }
+                }
                 reg.dropDatabase(dbName);
             }
             return QueryResult.message(QueryResult.Type.SET, "DROP DATABASE");
+        }
+        if (name.equals("alter_database_rename")) {
+            if (executor.session != null && executor.session.isInTransaction()) {
+                throw new MemgresException("ALTER DATABASE cannot run inside a transaction block", "25001");
+            }
+            String[] parts = stmt.value().split("\0");
+            String oldName = parts[0];
+            String newName = parts[1];
+            DatabaseRegistry reg = executor.session != null ? executor.session.getDatabaseRegistry() : null;
+            if (reg == null) {
+                // noop
+            } else if (!reg.exists(oldName)) {
+                throw new MemgresException("database \"" + oldName + "\" does not exist", "3D000");
+            } else if (reg.exists(newName)) {
+                throw new MemgresException("database \"" + newName + "\" already exists", "42P04");
+            } else if (oldName.equals(executor.session.getDatabaseName())) {
+                throw new MemgresException("current database cannot be renamed", "55006");
+            } else {
+                Database targetDb = reg.getDatabase(oldName);
+                if (targetDb != null && !targetDb.getActiveSessions().isEmpty()) {
+                    throw new MemgresException(
+                        "database \"" + oldName + "\" is being accessed by other users", "55006");
+                }
+                reg.renameDatabase(oldName, newName);
+            }
+            return QueryResult.message(QueryResult.Type.SET, "ALTER DATABASE");
         }
 
         Set<String> internalNames = Cols.setOf("constraints", "transaction",
