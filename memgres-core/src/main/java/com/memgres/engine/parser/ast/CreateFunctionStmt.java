@@ -17,6 +17,7 @@ public final class CreateFunctionStmt implements Statement {
     public final boolean orReplace;
     public final boolean isProcedure;
     public final boolean securityDefiner;     // false = SECURITY INVOKER (default)
+    public final boolean strict;              // STRICT or RETURNS NULL ON NULL INPUT
 
     public CreateFunctionStmt(
             String name,
@@ -28,7 +29,8 @@ public final class CreateFunctionStmt implements Statement {
             String language,
             boolean orReplace,
             boolean isProcedure,
-            boolean securityDefiner
+            boolean securityDefiner,
+            boolean strict
     ) {
         this.name = name;
         this.schema = schema;
@@ -40,6 +42,7 @@ public final class CreateFunctionStmt implements Statement {
         this.orReplace = orReplace;
         this.isProcedure = isProcedure;
         this.securityDefiner = securityDefiner;
+        this.strict = strict;
     }
 
     public static final class FuncParam {
@@ -96,6 +99,7 @@ public final class CreateFunctionStmt implements Statement {
     public boolean orReplace() { return orReplace; }
     public boolean isProcedure() { return isProcedure; }
     public boolean securityDefiner() { return securityDefiner; }
+    public boolean strict() { return strict; }
 
     @Override
     public boolean equals(Object o) {
@@ -105,6 +109,7 @@ public final class CreateFunctionStmt implements Statement {
         return orReplace == that.orReplace
             && isProcedure == that.isProcedure
             && securityDefiner == that.securityDefiner
+            && strict == that.strict
             && Objects.equals(name, that.name)
             && Objects.equals(schema, that.schema)
             && Objects.equals(params, that.params)
@@ -116,11 +121,11 @@ public final class CreateFunctionStmt implements Statement {
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, schema, params, parsedParams, returnType, body, language, orReplace, isProcedure, securityDefiner);
+        return Objects.hash(name, schema, params, parsedParams, returnType, body, language, orReplace, isProcedure, securityDefiner, strict);
     }
 
     @Override
     public String toString() {
-        return "CreateFunctionStmt[name=" + name + ", " + "schema=" + schema + ", " + "params=" + params + ", " + "parsedParams=" + parsedParams + ", " + "returnType=" + returnType + ", " + "body=" + body + ", " + "language=" + language + ", " + "orReplace=" + orReplace + ", " + "isProcedure=" + isProcedure + ", " + "securityDefiner=" + securityDefiner + "]";
+        return "CreateFunctionStmt[name=" + name + ", " + "schema=" + schema + ", " + "params=" + params + ", " + "parsedParams=" + parsedParams + ", " + "returnType=" + returnType + ", " + "body=" + body + ", " + "language=" + language + ", " + "orReplace=" + orReplace + ", " + "isProcedure=" + isProcedure + ", " + "securityDefiner=" + securityDefiner + ", " + "strict=" + strict + "]";
     }
 }

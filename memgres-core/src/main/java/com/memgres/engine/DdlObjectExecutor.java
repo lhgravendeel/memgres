@@ -191,6 +191,7 @@ class DdlObjectExecutor {
                 stmt.language(), params, stmt.isProcedure());
         pgFunc.setSchemaName(executor.defaultSchema());
         pgFunc.setSecurityDefiner(stmt.securityDefiner());
+        pgFunc.setStrict(stmt.strict());
         pgFunc.setOwner(executor.sessionUser());
         executor.database.addFunction(pgFunc);
         executor.database.registerSchemaObject(executor.defaultSchema(), "function", stmt.name());
@@ -368,15 +369,59 @@ class DdlObjectExecutor {
     private void validateTableRefsInStatement(Statement parsed) {
         if (parsed instanceof InsertStmt) {
             InsertStmt ins = (InsertStmt) parsed;
-            String tableName = ins.table();
-            if (tableName != null) {
-                String schema = ins.schema() != null ? ins.schema() : executor.defaultSchema();
-                try {
-                    executor.resolveTable(schema, tableName);
-                } catch (MemgresException e) {
-                    if ("42P01".equals(e.getSqlState())) throw e;
+            resolveTableIfPresent(ins.schema(), ins.table());
+            // Validate subquery in INSERT ... SELECT
+            if (ins.selectStmt() != null) {
+                validateTableRefsInStatement(ins.selectStmt());
+            }
+        } else if (parsed instanceof UpdateStmt) {
+            UpdateStmt upd = (UpdateStmt) parsed;
+            resolveTableIfPresent(upd.schema(), upd.table());
+            if (upd.from() != null) {
+                for (SelectStmt.FromItem fi : upd.from()) {
+                    validateFromItem(fi);
                 }
             }
+        } else if (parsed instanceof DeleteStmt) {
+            DeleteStmt del = (DeleteStmt) parsed;
+            resolveTableIfPresent(del.schema(), del.table());
+            if (del.using() != null) {
+                for (SelectStmt.FromItem fi : del.using()) {
+                    validateFromItem(fi);
+                }
+            }
+        } else if (parsed instanceof SelectStmt) {
+            SelectStmt sel = (SelectStmt) parsed;
+            if (sel.from() != null) {
+                for (SelectStmt.FromItem fi : sel.from()) {
+                    validateFromItem(fi);
+                }
+            }
+        }
+    }
+
+    private void resolveTableIfPresent(String schema, String tableName) {
+        if (tableName != null) {
+            String s = schema != null ? schema : executor.defaultSchema();
+            try {
+                executor.resolveTable(s, tableName);
+            } catch (MemgresException e) {
+                if ("42P01".equals(e.getSqlState())) throw e;
+            }
+        }
+    }
+
+    private void validateFromItem(SelectStmt.FromItem fi) {
+        if (fi instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef tr = (SelectStmt.TableRef) fi;
+            resolveTableIfPresent(tr.schema(), tr.table());
+        } else if (fi instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) fi;
+            validateFromItem(join.left());
+            validateFromItem(join.right());
+        } else if (fi instanceof SelectStmt.SubqueryFrom) {
+            SelectStmt.SubqueryFrom sub = (SelectStmt.SubqueryFrom) fi;
+            validateTableRefsInStatement(sub.subquery());
         }
     }
 
@@ -471,6 +516,15 @@ class DdlObjectExecutor {
                 "abs", "ceil", "ceiling", "floor", "round", "trunc", "sign", "sqrt",
                 "power", "exp", "ln", "log", "mod", "div",
                 "array_length", "array_upper", "array_lower", "unnest",
+                "array_append", "array_prepend", "array_cat", "array_remove",
+                "array_to_string", "string_to_array", "array_position", "array_positions",
+                "array_ndims", "array_dims", "array_fill", "array_replace",
+                "current_setting", "set_config",
+                "split_part", "left", "right", "repeat", "reverse", "lpad", "rpad",
+                "starts_with", "encode", "decode", "md5",
+                "date_part", "date_trunc", "extract", "age", "make_interval",
+                "row_to_json", "json_build_object", "json_build_array",
+                "jsonb_build_object", "jsonb_build_array",
                 "generate_series", "pg_typeof", "pg_sleep").contains(name);
     }
 

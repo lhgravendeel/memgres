@@ -366,4 +366,129 @@ class FunctionAdvancedCompatTest {
             AS $$ SELECT a = b; $$
         """);
     }
+
+    // =========================================================================
+    // STRICT / RETURNS NULL ON NULL INPUT
+    // =========================================================================
+
+    @Test
+    void testStrictFunctionReturnsNullOnNullArg() throws SQLException {
+        exec("""
+            CREATE FUNCTION strict_add(a int, b int)
+            RETURNS int
+            LANGUAGE sql
+            STRICT
+            AS $$ SELECT a + b; $$
+        """);
+        assertEquals("5", query1("SELECT strict_add(2, 3)"));
+        // With NULL argument, STRICT function returns NULL without executing body
+        assertNull(query1("SELECT strict_add(2, NULL)"));
+        assertNull(query1("SELECT strict_add(NULL, 3)"));
+    }
+
+    @Test
+    void testReturnsNullOnNullInput() throws SQLException {
+        exec("""
+            CREATE FUNCTION rnoni_fn(x text)
+            RETURNS text
+            LANGUAGE sql
+            RETURNS NULL ON NULL INPUT
+            AS $$ SELECT 'got: ' || x; $$
+        """);
+        assertEquals("got: hi", query1("SELECT rnoni_fn('hi')"));
+        assertNull(query1("SELECT rnoni_fn(NULL)"));
+    }
+
+    @Test
+    void testCalledOnNullInput() throws SQLException {
+        // CALLED ON NULL INPUT is the default — function body IS executed even with NULL args
+        exec("""
+            CREATE FUNCTION called_fn(x text)
+            RETURNS text
+            LANGUAGE sql
+            CALLED ON NULL INPUT
+            AS $$ SELECT COALESCE(x, 'was null'); $$
+        """);
+        assertEquals("was null", query1("SELECT called_fn(NULL)"));
+    }
+
+    @Test
+    void testStrictPlpgsqlFunction() throws SQLException {
+        exec("""
+            CREATE FUNCTION strict_plpgsql(a int, b int)
+            RETURNS int
+            LANGUAGE plpgsql
+            STRICT
+            AS $$
+            BEGIN
+                RETURN a + b;
+            END;
+            $$
+        """);
+        assertEquals("7", query1("SELECT strict_plpgsql(3, 4)"));
+        assertNull(query1("SELECT strict_plpgsql(NULL, 4)"));
+    }
+
+    // =========================================================================
+    // VARIADIC with plpgsql
+    // =========================================================================
+
+    @Test
+    void testVariadicPlpgsql() throws SQLException {
+        exec("""
+            CREATE FUNCTION variadic_sum(VARIADIC nums int[])
+            RETURNS int
+            LANGUAGE plpgsql
+            AS $$
+            DECLARE
+                total int := 0;
+                n int;
+            BEGIN
+                FOREACH n IN ARRAY nums LOOP
+                    total := total + n;
+                END LOOP;
+                RETURN total;
+            END;
+            $$
+        """);
+        assertEquals("10", query1("SELECT variadic_sum(1, 2, 3, 4)"));
+    }
+
+    // =========================================================================
+    // SQL function validation: UPDATE/DELETE with missing tables
+    // =========================================================================
+
+    @Test
+    void testSqlFunctionRejectsUpdateMissingTable() throws SQLException {
+        // SQL function referencing a non-existent table in UPDATE should fail at CREATE
+        try {
+            exec("""
+                CREATE FUNCTION bad_update()
+                RETURNS void
+                LANGUAGE sql
+                AS $$ UPDATE nonexistent_tbl SET x = 1; $$
+            """);
+            fail("Expected error for missing table in UPDATE");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("42P01") || e.getMessage().contains("does not exist"),
+                    "Expected 42P01 error, got: " + e.getMessage());
+        }
+    }
+
+    @Test
+    void testSqlFunctionRejectsDeleteMissingTable() throws SQLException {
+        // SQL function referencing a non-existent table in DELETE should fail at CREATE
+        try {
+            exec("""
+                CREATE FUNCTION bad_delete()
+                RETURNS void
+                LANGUAGE sql
+                AS $$ DELETE FROM nonexistent_tbl WHERE id = 1; $$
+            """);
+            fail("Expected error for missing table in DELETE");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("42P01") || e.getMessage().contains("does not exist"),
+                    "Expected 42P01 error, got: " + e.getMessage());
+        }
+    }
 }

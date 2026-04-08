@@ -246,9 +246,9 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, name.equals("analyze") ? "ANALYZE" : "VACUUM");
         }
 
-        // CREATE OPERATOR is not supported
+        // CREATE OPERATOR - silently accepted as no-op
         if (name.equals("create_operator")) {
-            throw new MemgresException("CREATE OPERATOR is not supported", "0A000");
+            return QueryResult.command(QueryResult.Type.SET, 0);
         }
 
         // CREATE DATABASE / DROP DATABASE

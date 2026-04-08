@@ -182,7 +182,6 @@ AS $fn$
   SELECT 'a' COLLATE q05_missing_collation
 $fn$;
 
--- expect-error
 CREATE OPERATOR q05_plus_plus (
   LEFTARG = text,
   RIGHTARG = text,

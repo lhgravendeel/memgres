@@ -57,6 +57,7 @@ public class PgFunction {
     private final boolean procedure;
     private String schemaName;
     private boolean securityDefiner;
+    private boolean strict;
     private String owner;
 
     public PgFunction(String name, String returnType, String body, String language) {
@@ -83,6 +84,8 @@ public class PgFunction {
     public void setSchemaName(String schema) { this.schemaName = schema; }
     public boolean isSecurityDefiner() { return securityDefiner; }
     public void setSecurityDefiner(boolean securityDefiner) { this.securityDefiner = securityDefiner; }
+    public boolean isStrict() { return strict; }
+    public void setStrict(boolean strict) { this.strict = strict; }
     public String getOwner() { return owner; }
     public void setOwner(String owner) { this.owner = owner; }
 }

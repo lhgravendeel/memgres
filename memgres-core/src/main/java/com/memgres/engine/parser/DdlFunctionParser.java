@@ -116,25 +116,26 @@ class DdlFunctionParser {
         String body = null;
         String language = "sql";
         boolean[] secDefRef = {false};
+        boolean[] strictRef = {false};
 
         if (parser.matchKeyword("AS")) {
             body = readFunctionBody();
-            parseFunctionAttributes(secDefRef);
+            parseFunctionAttributes(secDefRef, strictRef);
             if (parser.matchKeyword("LANGUAGE")) {
                 language = parser.readIdentifierOrString();
             }
         } else if (parser.matchKeyword("LANGUAGE")) {
             language = parser.readIdentifierOrString();
-            parseFunctionAttributes(secDefRef);
+            parseFunctionAttributes(secDefRef, strictRef);
             if (parser.matchKeyword("AS")) {
                 body = readFunctionBody();
             }
         }
 
-        parseFunctionAttributes(secDefRef);
+        parseFunctionAttributes(secDefRef, strictRef);
 
         return new CreateFunctionStmt(name, schema, rawParams.toString().trim(), parsedParams,
-                returnType, body != null ? body : "", language, orReplace, isProcedure, secDefRef[0]);
+                returnType, body != null ? body : "", language, orReplace, isProcedure, secDefRef[0], strictRef[0]);
     }
 
     CallStmt parseCall() {
@@ -180,7 +181,7 @@ class DdlFunctionParser {
         return typeName;
     }
 
-    private void parseFunctionAttributes(boolean[] securityDefinerRef) {
+    private void parseFunctionAttributes(boolean[] securityDefinerRef, boolean[] strictRef) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
             Token t = parser.peek();
             if (t.type() == TokenType.KEYWORD) {
@@ -190,6 +191,7 @@ class DdlFunctionParser {
                         kw.equals("PARALLEL") || kw.equals("CALLED") || kw.equals("RETURNS") ||
                         kw.equals("ROWS")) {
                     parser.advance();
+                    if (kw.equals("STRICT")) strictRef[0] = true;
                     if (kw.equals("SECURITY")) {
                         String defOrInvoker = parser.readIdentifier();
                         if ("DEFINER".equalsIgnoreCase(defOrInvoker)) securityDefinerRef[0] = true;
@@ -198,8 +200,8 @@ class DdlFunctionParser {
                     if (kw.equals("COST")) parser.advance();
                     if (kw.equals("ROWS")) parser.advance();
                     if (kw.equals("PARALLEL")) parser.readIdentifier();
-                    if (kw.equals("CALLED")) { parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); }
-                    if (kw.equals("RETURNS")) { parser.matchKeyword("NULL"); parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); }
+                    if (kw.equals("CALLED")) { parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = false; }
+                    if (kw.equals("RETURNS")) { parser.matchKeyword("NULL"); parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = true; }
                     continue;
                 }
                 if (kw.equals("SET")) {

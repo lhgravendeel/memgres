@@ -152,6 +152,13 @@ public class PlpgsqlExecutor {
             } else if ("INOUT".equals(mode)) {
                 val = argIdx < args.size() ? args.get(argIdx++) : null;
                 outParams.add(p);
+            } else if ("VARIADIC".equals(mode)) {
+                // Collect all remaining args into an array
+                List<Object> variadicArgs = new ArrayList<>();
+                while (argIdx < args.size()) {
+                    variadicArgs.add(args.get(argIdx++));
+                }
+                val = variadicArgs;
             } else {
                 // IN (or default)
                 if (argIdx < args.size()) {
