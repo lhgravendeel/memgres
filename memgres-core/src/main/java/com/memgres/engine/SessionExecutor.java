@@ -246,6 +246,11 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, name.equals("analyze") ? "ANALYZE" : "VACUUM");
         }
 
+        // CREATE OPERATOR - silently accepted as no-op
+        if (name.equals("create_operator")) {
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+
         // CREATE DATABASE / DROP DATABASE
         if (name.equals("create_database")) {
             if (executor.session != null && executor.session.isInTransaction()) {

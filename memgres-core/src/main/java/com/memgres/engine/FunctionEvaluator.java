@@ -950,6 +950,11 @@ class FunctionEvaluator {
                         // Resolve by evaluating argument types
                         List<String> argTypeHints = new ArrayList<>();
                         for (Expression arg : fn.args()) {
+                            // Check for explicit cast (e.g., ROW(...)::typename) - use cast type as hint
+                            if (arg instanceof CastExpr) {
+                                argTypeHints.add(((CastExpr) arg).typeName());
+                                continue;
+                            }
                             try {
                                 Object v = executor.evalExpr(arg, ctx);
                                 if (v instanceof Integer) argTypeHints.add("integer");
@@ -975,8 +980,14 @@ class FunctionEvaluator {
                     // Collect input params (excluding OUT)
                     List<PgFunction.Param> inputParams = new ArrayList<>();
                     boolean funcHasVariadic = false;
+                    PgFunction.Param variadicParam = null;
                     for (PgFunction.Param p : userFunc.getParams()) {
-                        if ("VARIADIC".equalsIgnoreCase(p.mode())) { funcHasVariadic = true; continue; }
+                        if ("VARIADIC".equalsIgnoreCase(p.mode())) {
+                            funcHasVariadic = true;
+                            variadicParam = p;
+                            inputParams.add(p);
+                            continue;
+                        }
                         if (!"OUT".equalsIgnoreCase(p.mode())) {
                             inputParams.add(p);
                         }
@@ -1058,6 +1069,12 @@ class FunctionEvaluator {
                             }
                         }
 
+                        // STRICT: return NULL immediately if any argument is NULL
+                        if (userFunc.isStrict()) {
+                            for (Object arg : args) {
+                                if (arg == null) return null;
+                            }
+                        }
                         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
                         Object result = plExec.executeFunction(userFunc, args);
                         if (result instanceof List<?>) return (List<?>) result;
@@ -1078,14 +1095,21 @@ class FunctionEvaluator {
                     List<Object> args = new ArrayList<>();
                     for (int i = 0; i < fn.args().size(); i++) {
                         Object val = executor.evalExpr(fn.args().get(i), ctx);
-                        // Coerce argument to declared parameter type (e.g., text -> int gives 22P02)
-                        if (val != null && i < inputParams.size()) {
+                        // Coerce argument to declared parameter type (skip VARIADIC array type)
+                        if (val != null && i < inputParams.size()
+                                && !"VARIADIC".equalsIgnoreCase(inputParams.get(i).mode())) {
                             String declaredType = inputParams.get(i).typeName();
                             if (declaredType != null) {
                                 val = executor.castEvaluator.applyCast(val, declaredType);
                             }
                         }
                         args.add(val);
+                    }
+                    // STRICT: return NULL immediately if any argument is NULL
+                    if (userFunc.isStrict()) {
+                        for (Object arg : args) {
+                            if (arg == null) return null;
+                        }
                     }
                     PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
                     Object result = plExec.executeFunction(userFunc, args);

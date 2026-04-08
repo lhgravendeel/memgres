@@ -366,4 +366,251 @@ class FunctionAdvancedCompatTest {
             AS $$ SELECT a = b; $$
         """);
     }
+
+    // =========================================================================
+    // STRICT / RETURNS NULL ON NULL INPUT
+    // =========================================================================
+
+    @Test
+    void testStrictFunctionReturnsNullOnNullArg() throws SQLException {
+        exec("""
+            CREATE FUNCTION strict_add(a int, b int)
+            RETURNS int
+            LANGUAGE sql
+            STRICT
+            AS $$ SELECT a + b; $$
+        """);
+        assertEquals("5", query1("SELECT strict_add(2, 3)"));
+        // With NULL argument, STRICT function returns NULL without executing body
+        assertNull(query1("SELECT strict_add(2, NULL)"));
+        assertNull(query1("SELECT strict_add(NULL, 3)"));
+    }
+
+    @Test
+    void testReturnsNullOnNullInput() throws SQLException {
+        exec("""
+            CREATE FUNCTION rnoni_fn(x text)
+            RETURNS text
+            LANGUAGE sql
+            RETURNS NULL ON NULL INPUT
+            AS $$ SELECT 'got: ' || x; $$
+        """);
+        assertEquals("got: hi", query1("SELECT rnoni_fn('hi')"));
+        assertNull(query1("SELECT rnoni_fn(NULL)"));
+    }
+
+    @Test
+    void testCalledOnNullInput() throws SQLException {
+        // CALLED ON NULL INPUT is the default — function body IS executed even with NULL args
+        exec("""
+            CREATE FUNCTION called_fn(x text)
+            RETURNS text
+            LANGUAGE sql
+            CALLED ON NULL INPUT
+            AS $$ SELECT COALESCE(x, 'was null'); $$
+        """);
+        assertEquals("was null", query1("SELECT called_fn(NULL)"));
+    }
+
+    @Test
+    void testStrictPlpgsqlFunction() throws SQLException {
+        exec("""
+            CREATE FUNCTION strict_plpgsql(a int, b int)
+            RETURNS int
+            LANGUAGE plpgsql
+            STRICT
+            AS $$
+            BEGIN
+                RETURN a + b;
+            END;
+            $$
+        """);
+        assertEquals("7", query1("SELECT strict_plpgsql(3, 4)"));
+        assertNull(query1("SELECT strict_plpgsql(NULL, 4)"));
+    }
+
+    // =========================================================================
+    // VARIADIC with plpgsql
+    // =========================================================================
+
+    @Test
+    void testVariadicPlpgsql() throws SQLException {
+        exec("""
+            CREATE FUNCTION variadic_sum(VARIADIC nums int[])
+            RETURNS int
+            LANGUAGE plpgsql
+            AS $$
+            DECLARE
+                total int := 0;
+                n int;
+            BEGIN
+                FOREACH n IN ARRAY nums LOOP
+                    total := total + n;
+                END LOOP;
+                RETURN total;
+            END;
+            $$
+        """);
+        assertEquals("10", query1("SELECT variadic_sum(1, 2, 3, 4)"));
+    }
+
+    // =========================================================================
+    // SQL function validation: UPDATE/DELETE with missing tables
+    // =========================================================================
+
+    @Test
+    void testSqlFunctionRejectsUpdateMissingTable() throws SQLException {
+        // SQL function referencing a non-existent table in UPDATE should fail at CREATE
+        try {
+            exec("""
+                CREATE FUNCTION bad_update()
+                RETURNS void
+                LANGUAGE sql
+                AS $$ UPDATE nonexistent_tbl SET x = 1; $$
+            """);
+            fail("Expected error for missing table in UPDATE");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("42P01") || e.getMessage().contains("does not exist"),
+                    "Expected 42P01 error, got: " + e.getMessage());
+        }
+    }
+
+    @Test
+    void testSqlFunctionRejectsDeleteMissingTable() throws SQLException {
+        // SQL function referencing a non-existent table in DELETE should fail at CREATE
+        try {
+            exec("""
+                CREATE FUNCTION bad_delete()
+                RETURNS void
+                LANGUAGE sql
+                AS $$ DELETE FROM nonexistent_tbl WHERE id = 1; $$
+            """);
+            fail("Expected error for missing table in DELETE");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("42P01") || e.getMessage().contains("does not exist"),
+                    "Expected 42P01 error, got: " + e.getMessage());
+        }
+    }
+
+    // =========================================================================
+    // Function SET clauses (GUC override during execution)
+    // =========================================================================
+
+    @Test
+    void testFunctionSetSearchPath() throws SQLException {
+        exec("CREATE SCHEMA set_test_schema");
+        exec("SET search_path = set_test_schema");
+        exec("CREATE TABLE items (id int, name text)");
+        exec("INSERT INTO items VALUES (1, 'found')");
+        // Create function with SET search_path — uses plpgsql to avoid SQL body validation
+        // against the wrong schema at CREATE time
+        exec("""
+            CREATE FUNCTION fn_with_set_path()
+            RETURNS text
+            LANGUAGE plpgsql
+            SET search_path = set_test_schema
+            AS $$
+            DECLARE result text;
+            BEGIN
+                SELECT name INTO result FROM items WHERE id = 1;
+                RETURN result;
+            END;
+            $$
+        """);
+        exec("SET search_path = public");
+        assertEquals("found", query1("SELECT fn_with_set_path()"));
+    }
+
+    // =========================================================================
+    // GET STACKED DIAGNOSTICS
+    // =========================================================================
+
+    @Test
+    void testGetStackedDiagnostics() throws SQLException {
+        exec("""
+            CREATE FUNCTION test_stacked_diag()
+            RETURNS text
+            LANGUAGE plpgsql AS $$
+            DECLARE
+                v_state text;
+                v_msg text;
+            BEGIN
+                BEGIN
+                    RAISE EXCEPTION 'test error' USING ERRCODE = '22000';
+                EXCEPTION WHEN OTHERS THEN
+                    GET STACKED DIAGNOSTICS
+                        v_state = RETURNED_SQLSTATE,
+                        v_msg = MESSAGE_TEXT;
+                    RETURN v_state || ':' || v_msg;
+                END;
+            END;
+            $$
+        """);
+        assertEquals("22000:test error", query1("SELECT test_stacked_diag()"));
+    }
+
+    @Test
+    void testGetDiagnosticsRowCount() throws SQLException {
+        exec("CREATE TABLE diag_test (id int)");
+        exec("INSERT INTO diag_test VALUES (1), (2), (3)");
+        exec("""
+            CREATE FUNCTION test_row_count_diag()
+            RETURNS int
+            LANGUAGE plpgsql AS $$
+            DECLARE
+                rc int;
+            BEGIN
+                DELETE FROM diag_test WHERE id > 1;
+                GET DIAGNOSTICS rc = ROW_COUNT;
+                RETURN rc;
+            END;
+            $$
+        """);
+        assertEquals("2", query1("SELECT test_row_count_diag()"));
+    }
+
+    // =========================================================================
+    // check_function_bodies GUC
+    // =========================================================================
+
+    @Test
+    void testCheckFunctionBodiesOff() throws SQLException {
+        // With check_function_bodies=off, plpgsql functions with unknown types should be accepted
+        exec("SET check_function_bodies = off");
+        exec("""
+            CREATE FUNCTION fn_with_unknown_type()
+            RETURNS text
+            LANGUAGE plpgsql AS $$
+            DECLARE
+                v nonexistent_type;
+            BEGIN
+                RETURN 'ok';
+            END;
+            $$
+        """);
+        // Restore default
+        exec("SET check_function_bodies = on");
+    }
+
+    @Test
+    void testCheckFunctionBodiesOnRejectsUnknownType() throws SQLException {
+        // With check_function_bodies=on (default), plpgsql functions with unknown types should be rejected
+        try {
+            exec("""
+                CREATE FUNCTION fn_bad_type()
+                RETURNS text
+                LANGUAGE plpgsql AS $$
+                DECLARE
+                    v nonexistent_type;
+                BEGIN
+                    RETURN 'ok';
+                END;
+                $$
+            """);
+            fail("Expected error for unknown declared type");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("42704") || e.getMessage().contains("does not exist"),
+                    "Expected type error, got: " + e.getMessage());
+        }
+    }
 }

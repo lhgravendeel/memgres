@@ -468,6 +468,33 @@ class DdlTableExecutor {
                             throw new MemgresException("cannot drop table " + name + " because other objects depend on it", "2BP01");
                         }
                     }
+                    // Check function dependencies (%ROWTYPE, %TYPE, RETURNS table_type, SETOF table_type)
+                    for (PgFunction fn : executor.database.getFunctions().values()) {
+                        String body = fn.getBody();
+                        String retType = fn.getReturnType();
+                        boolean depends = false;
+                        if (retType != null) {
+                            String rt = retType.toLowerCase().replace("setof ", "").trim();
+                            if (rt.equals(name.toLowerCase())) depends = true;
+                        }
+                        if (!depends && body != null) {
+                            String lBody = body.toLowerCase();
+                            if (lBody.contains(name.toLowerCase() + "%rowtype")
+                                    || lBody.contains(name.toLowerCase() + ".")) {
+                                // Check for %ROWTYPE or %TYPE references in DECLARE
+                                java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                                        "\\b" + java.util.regex.Pattern.quote(name.toLowerCase()) + "\\s*(%rowtype|\\.[a-z_][a-z0-9_]*\\s*%type)",
+                                        java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body);
+                                if (m.find()) depends = true;
+                            }
+                        }
+                        if (depends) {
+                            throw new MemgresException(
+                                    "cannot drop table " + name + " because other objects depend on it\n"
+                                    + "  Detail: function " + fn.getName() + " depends on table " + name,
+                                    "2BP01");
+                        }
+                    }
                 } else {
                     List<String> viewsToDrop = new ArrayList<>();
                     for (Map.Entry<String, Database.ViewDef> entry : executor.database.getViews().entrySet()) {
