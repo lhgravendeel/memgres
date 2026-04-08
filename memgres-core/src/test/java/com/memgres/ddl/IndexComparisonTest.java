@@ -62,7 +62,8 @@ class IndexComparisonTest {
         for (String t : tables) {
             execPg("DROP TABLE IF EXISTS " + t + " CASCADE");
         }
-        execPg("DROP EXTENSION IF EXISTS btree_gist CASCADE");
+        try { execPg("DROP EXTENSION IF EXISTS btree_gist CASCADE"); }
+        catch (SQLException e) { if (!e.getMessage().contains("must be owner")) throw e; }
     }
 
     // === Helpers =============================================================
