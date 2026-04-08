@@ -34,19 +34,25 @@ public class Memgres implements Closeable {
     private final int maxConnections;
     private final String bindAddress;
     private final boolean logStatements;
+    private final String defaultDatabaseName;
+    private final boolean autoCreateDatabases;
     private final DatabaseRegistry registry;
     private final Database database;
     private PgWireServer server;
     private int actualPort;
     private DatabaseSnapshot snapshot;
 
-    private Memgres(int port, int maxConnections, String bindAddress, boolean logStatements) {
+    private Memgres(int port, int maxConnections, String bindAddress, boolean logStatements,
+                    String defaultDatabaseName, boolean autoCreateDatabases) {
         this.requestedPort = port;
         this.maxConnections = maxConnections;
         this.bindAddress = bindAddress;
         this.logStatements = logStatements;
-        this.registry = new DatabaseRegistry("memgres");
+        this.defaultDatabaseName = defaultDatabaseName;
+        this.autoCreateDatabases = autoCreateDatabases;
+        this.registry = new DatabaseRegistry(defaultDatabaseName);
         this.registry.setMaxConnections(maxConnections);
+        this.registry.setAutoCreateDatabases(autoCreateDatabases);
         this.database = registry.getDefaultDatabase();
     }
 
@@ -64,7 +70,7 @@ public class Memgres implements Closeable {
     }
 
     public String getJdbcUrl() {
-        return "jdbc:postgresql://localhost:" + actualPort + "/memgres";
+        return "jdbc:postgresql://localhost:" + actualPort + "/" + defaultDatabaseName;
     }
 
     public String getUser() {
@@ -117,6 +123,8 @@ public class Memgres implements Closeable {
         private int maxConnections = 100;
         private String bindAddress = "localhost";
         private boolean logAllStatements = false;
+        private String defaultDatabaseName = "memgres";
+        private boolean autoCreateDatabases = true;
 
         public Builder port(int port) {
             this.port = port;
@@ -151,8 +159,29 @@ public class Memgres implements Closeable {
             return this;
         }
 
+        /**
+         * Set the name of the default database created on startup.
+         * Default is {@code "memgres"}.
+         */
+        public Builder defaultDatabaseName(String defaultDatabaseName) {
+            this.defaultDatabaseName = defaultDatabaseName;
+            return this;
+        }
+
+        /**
+         * If true, databases are automatically created when a client connects
+         * to a database name that does not yet exist. This is convenient for
+         * testing but diverges from standard PostgreSQL behavior.
+         * Default is true.
+         */
+        public Builder autoCreateDatabases(boolean autoCreateDatabases) {
+            this.autoCreateDatabases = autoCreateDatabases;
+            return this;
+        }
+
         public Memgres build() {
-            return new Memgres(port, maxConnections, bindAddress, logAllStatements);
+            return new Memgres(port, maxConnections, bindAddress, logAllStatements,
+                    defaultDatabaseName, autoCreateDatabases);
         }
     }
 }

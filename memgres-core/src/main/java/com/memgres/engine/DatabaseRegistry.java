@@ -11,11 +11,13 @@ public class DatabaseRegistry {
     private final ConcurrentHashMap<String, Database> databases = new ConcurrentHashMap<>();
     private final String defaultDbName;
     private int maxConnections = 100;
+    private boolean autoCreateDatabases = true;
 
     public DatabaseRegistry(String defaultDbName) {
         this.defaultDbName = defaultDbName;
         Database defaultDb = new Database();
         defaultDb.setMaxConnections(maxConnections);
+        defaultDb.setDatabaseRegistry(this);
         databases.put(defaultDbName, defaultDb);
     }
 
@@ -37,12 +39,12 @@ public class DatabaseRegistry {
     public boolean createDatabase(String name) {
         Database db = new Database();
         db.setMaxConnections(maxConnections);
+        db.setDatabaseRegistry(this);
         return databases.putIfAbsent(name, db) == null;
     }
 
-    /** Drop a database. Returns false if it doesn't exist or is the default. */
+    /** Drop a database. Returns false if it doesn't exist. */
     public boolean dropDatabase(String name) {
-        if (name.equals(defaultDbName)) return false;
         return databases.remove(name) != null;
     }
 
@@ -61,5 +63,13 @@ public class DatabaseRegistry {
         for (Database db : databases.values()) {
             db.setMaxConnections(max);
         }
+    }
+
+    public boolean isAutoCreateDatabases() {
+        return autoCreateDatabases;
+    }
+
+    public void setAutoCreateDatabases(boolean autoCreateDatabases) {
+        this.autoCreateDatabases = autoCreateDatabases;
     }
 }

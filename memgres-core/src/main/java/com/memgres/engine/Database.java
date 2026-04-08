@@ -34,6 +34,7 @@ public class Database {
     private final Map<String, String> indexWhereClauses = new ConcurrentHashMap<>(); // index name → WHERE predicate
     private final Map<String, String> indexMethods = new ConcurrentHashMap<>(); // index name → access method (btree, hash, etc.)
     private final NotificationManager notificationManager = new NotificationManager();
+    private DatabaseRegistry databaseRegistry;
 
     // Row locks: maps table name to (row identity -> list of lock entries)
     private final Map<String, Map<Object[], List<LockEntry>>> rowLocks = new ConcurrentHashMap<>();
@@ -236,6 +237,14 @@ public class Database {
 
     public NotificationManager getNotificationManager() {
         return notificationManager;
+    }
+
+    public DatabaseRegistry getDatabaseRegistry() {
+        return databaseRegistry;
+    }
+
+    public void setDatabaseRegistry(DatabaseRegistry databaseRegistry) {
+        this.databaseRegistry = databaseRegistry;
     }
 
     // Custom ENUM types

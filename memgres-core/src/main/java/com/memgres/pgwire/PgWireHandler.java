@@ -222,9 +222,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             if (requestedDb != null && !requestedDb.isEmpty()) {
                 Database resolved = registry.getDatabase(requestedDb);
                 if (resolved == null) {
-                    // Auto-create databases on connect for compatibility
-                    registry.createDatabase(requestedDb);
-                    resolved = registry.getDatabase(requestedDb);
+                    if (registry.isAutoCreateDatabases()) {
+                        registry.createDatabase(requestedDb);
+                        resolved = registry.getDatabase(requestedDb);
+                    } else {
+                        sendErrorSimple(ctx, "3D000", "database \"" + requestedDb + "\" does not exist");
+                        ctx.writeAndFlush(ctx.alloc().buffer(0)).addListener(future -> ctx.close());
+                        return;
+                    }
                 }
                 this.database = resolved;
                 this.databaseName = requestedDb;

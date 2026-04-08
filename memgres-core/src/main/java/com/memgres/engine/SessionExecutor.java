@@ -247,25 +247,29 @@ class SessionExecutor {
         }
 
         // CREATE DATABASE / DROP DATABASE
-        if (name.equals("create_database") || name.equals("create_database_if_not_exists")) {
+        if (name.equals("create_database")) {
+            if (executor.session != null && executor.session.isInTransaction()) {
+                throw new MemgresException("CREATE DATABASE cannot run inside a transaction block", "25001");
+            }
             String dbName = stmt.value();
             DatabaseRegistry reg = executor.session != null ? executor.session.getDatabaseRegistry() : null;
             if (reg == null) {
-                // No registry — fall through as noop for backward compat
+                // No registry -- fall through as noop for backward compat
             } else if (reg.exists(dbName)) {
-                if (name.equals("create_database")) {
-                    throw new MemgresException("database \"" + dbName + "\" already exists", "42P04");
-                }
+                throw new MemgresException("database \"" + dbName + "\" already exists", "42P04");
             } else {
                 reg.createDatabase(dbName);
             }
             return QueryResult.message(QueryResult.Type.SET, "CREATE DATABASE");
         }
         if (name.equals("drop_database") || name.equals("drop_database_if_exists")) {
+            if (executor.session != null && executor.session.isInTransaction()) {
+                throw new MemgresException("DROP DATABASE cannot run inside a transaction block", "25001");
+            }
             String dbName = stmt.value();
             DatabaseRegistry reg = executor.session != null ? executor.session.getDatabaseRegistry() : null;
             if (reg == null) {
-                // No registry — fall through as noop for backward compat
+                // No registry -- fall through as noop for backward compat
             } else if (!reg.exists(dbName)) {
                 if (name.equals("drop_database")) {
                     throw new MemgresException("database \"" + dbName + "\" does not exist", "3D000");

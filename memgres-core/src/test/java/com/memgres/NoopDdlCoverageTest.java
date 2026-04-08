@@ -319,60 +319,70 @@ class NoopDdlCoverageTest {
     // ========================================================================
 
     @Test void testCreateDatabase() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testcreatedb");
-        exec("DROP DATABASE IF EXISTS testcreatedb");
+        exec("DROP DATABASE IF EXISTS noop_createdb");
+        exec("CREATE DATABASE noop_createdb");
+        exec("DROP DATABASE IF EXISTS noop_createdb");
     }
 
     @Test void testCreateDatabaseWithOptions() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testcreateoptdb OWNER test ENCODING 'UTF8' LC_COLLATE 'en_US.UTF-8'");
-        exec("DROP DATABASE IF EXISTS testcreateoptdb");
+        exec("DROP DATABASE IF EXISTS noop_createoptdb");
+        exec("CREATE DATABASE noop_createoptdb OWNER test ENCODING 'UTF8' LC_COLLATE 'en_US.UTF-8'");
+        exec("DROP DATABASE IF EXISTS noop_createoptdb");
     }
 
     @Test void testCreateDatabaseTemplate() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testcreatetpldb TEMPLATE template0");
-        exec("DROP DATABASE IF EXISTS testcreatetpldb");
+        exec("DROP DATABASE IF EXISTS noop_createtpldb");
+        exec("CREATE DATABASE noop_createtpldb TEMPLATE template0");
+        exec("DROP DATABASE IF EXISTS noop_createtpldb");
     }
 
     @Test void testCreateDatabaseConnectionLimit() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testcreateconlimdb CONNECTION LIMIT 100");
-        exec("DROP DATABASE IF EXISTS testcreateconlimdb");
+        exec("DROP DATABASE IF EXISTS noop_createconlimdb");
+        exec("CREATE DATABASE noop_createconlimdb CONNECTION LIMIT 100");
+        exec("DROP DATABASE IF EXISTS noop_createconlimdb");
     }
 
     @Test void testAlterDatabase() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testalterdb");
-        exec("ALTER DATABASE testalterdb SET timezone TO 'UTC'");
-        exec("DROP DATABASE IF EXISTS testalterdb");
+        exec("DROP DATABASE IF EXISTS noop_alterdb");
+        exec("CREATE DATABASE noop_alterdb");
+        exec("ALTER DATABASE noop_alterdb SET timezone TO 'UTC'");
+        exec("DROP DATABASE IF EXISTS noop_alterdb");
     }
 
     @Test void testAlterDatabaseOwner() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testalterownerdb");
-        exec("ALTER DATABASE testalterownerdb OWNER TO newowner");
-        exec("DROP DATABASE IF EXISTS testalterownerdb");
+        exec("DROP DATABASE IF EXISTS noop_alterownerdb");
+        exec("CREATE DATABASE noop_alterownerdb");
+        exec("ALTER DATABASE noop_alterownerdb OWNER TO newowner");
+        exec("DROP DATABASE IF EXISTS noop_alterownerdb");
     }
 
     @Test void testAlterDatabaseRename() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testalterrenamedb");
-        exec("ALTER DATABASE testalterrenamedb RENAME TO testalterrenamed2db");
-        exec("DROP DATABASE IF EXISTS testalterrenamed2db");
+        exec("DROP DATABASE IF EXISTS noop_alterrenamedb");
+        exec("DROP DATABASE IF EXISTS noop_alterrenamed2db");
+        exec("CREATE DATABASE noop_alterrenamedb");
+        exec("ALTER DATABASE noop_alterrenamedb RENAME TO noop_alterrenamed2db");
+        exec("DROP DATABASE IF EXISTS noop_alterrenamed2db");
     }
 
     @Test void testAlterDatabaseConnectionLimit() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testalterconlimdb");
-        exec("ALTER DATABASE testalterconlimdb CONNECTION LIMIT 50");
-        exec("DROP DATABASE IF EXISTS testalterconlimdb");
+        exec("DROP DATABASE IF EXISTS noop_alterconlimdb");
+        exec("CREATE DATABASE noop_alterconlimdb");
+        exec("ALTER DATABASE noop_alterconlimdb CONNECTION LIMIT 50");
+        exec("DROP DATABASE IF EXISTS noop_alterconlimdb");
     }
 
     @Test void testDropDatabase() throws SQLException {
-        exec("CREATE DATABASE IF NOT EXISTS testdropdb");
-        exec("DROP DATABASE testdropdb");
+        exec("DROP DATABASE IF EXISTS noop_dropdb");
+        exec("CREATE DATABASE noop_dropdb");
+        exec("DROP DATABASE noop_dropdb");
     }
 
     @Test void testDropDatabaseIfExists() throws SQLException {
-        exec("DROP DATABASE IF EXISTS testdropifexistsdb");
+        exec("DROP DATABASE IF EXISTS noop_dropifexistsdb");
     }
 
     @Test void testDropDatabaseForce() throws SQLException {
-        exec("DROP DATABASE IF EXISTS testdropforcedb WITH (FORCE)");
+        exec("DROP DATABASE IF EXISTS noop_dropforcedb WITH (FORCE)");
     }
 
     // ========================================================================

@@ -105,12 +105,11 @@ class DdlParser {
             return new SetStmt("create_noop", "ok");
         }
 
-        // CREATE DATABASE [IF NOT EXISTS] dbname [options...]
+        // CREATE DATABASE dbname [options...]
         if (parser.matchKeyword("DATABASE")) {
-            boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
             String dbName = parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt(ifNotExists ? "create_database_if_not_exists" : "create_database", dbName);
+            return new SetStmt("create_database", dbName);
         }
 
         throw new ParseException("Unsupported CREATE statement", parser.peek());
