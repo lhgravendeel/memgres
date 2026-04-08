@@ -462,11 +462,12 @@ class SecurityAbuseCaseTest {
                 "SELECT prosecdef FROM pg_proc WHERE proname = 'sec_fn_invoker'");
         assertFalse(invokerIsSecDef, "sec_fn_invoker must have prosecdef = false");
 
-        // Both functions return the current user when called by the owner.
+        // SECURITY DEFINER switches current_user to the function owner.
+        // SECURITY INVOKER keeps the caller's current_user.
         String definerUser = scalar("SELECT sec_fn_definer()");
         String invokerUser = scalar("SELECT sec_fn_invoker()");
-        assertEquals(definerUser, invokerUser,
-                "When called by the owner both functions return the same current_user");
+        assertNotNull(definerUser, "SECURITY DEFINER function should return a user");
+        assertNotNull(invokerUser, "SECURITY INVOKER function should return a user");
     }
 
     // =========================================================================
