@@ -568,4 +568,49 @@ class FunctionAdvancedCompatTest {
         """);
         assertEquals("2", query1("SELECT test_row_count_diag()"));
     }
+
+    // =========================================================================
+    // check_function_bodies GUC
+    // =========================================================================
+
+    @Test
+    void testCheckFunctionBodiesOff() throws SQLException {
+        // With check_function_bodies=off, plpgsql functions with unknown types should be accepted
+        exec("SET check_function_bodies = off");
+        exec("""
+            CREATE FUNCTION fn_with_unknown_type()
+            RETURNS text
+            LANGUAGE plpgsql AS $$
+            DECLARE
+                v nonexistent_type;
+            BEGIN
+                RETURN 'ok';
+            END;
+            $$
+        """);
+        // Restore default
+        exec("SET check_function_bodies = on");
+    }
+
+    @Test
+    void testCheckFunctionBodiesOnRejectsUnknownType() throws SQLException {
+        // With check_function_bodies=on (default), plpgsql functions with unknown types should be rejected
+        try {
+            exec("""
+                CREATE FUNCTION fn_bad_type()
+                RETURNS text
+                LANGUAGE plpgsql AS $$
+                DECLARE
+                    v nonexistent_type;
+                BEGIN
+                    RETURN 'ok';
+                END;
+                $$
+            """);
+            fail("Expected error for unknown declared type");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("42704") || e.getMessage().contains("does not exist"),
+                    "Expected type error, got: " + e.getMessage());
+        }
+    }
 }

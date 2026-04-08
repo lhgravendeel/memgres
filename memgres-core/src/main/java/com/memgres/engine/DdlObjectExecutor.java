@@ -135,8 +135,10 @@ class DdlObjectExecutor {
             }
         }
 
-        // Validate PL/pgSQL declared variable types (PG validates at CREATE time)
-        if ("plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
+        // Validate PL/pgSQL declared variable types (PG validates at CREATE time when check_function_bodies=on)
+        boolean checkBodies = executor.session == null || !"off".equalsIgnoreCase(
+                executor.session.getGucSettings().get("check_function_bodies"));
+        if (checkBodies && "plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
             validatePlpgsqlDeclarations(stmt.body());
         }
 
@@ -145,8 +147,8 @@ class DdlObjectExecutor {
             validateSqlFunctionBody(stmt, params);
         }
 
-        // Validate plpgsql function bodies
-        if ("plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
+        // Validate plpgsql function bodies (only when check_function_bodies=on)
+        if (checkBodies && "plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
             String retType = stmt.returnType();
             boolean needsReturnValue = retType != null && !retType.isEmpty()
                     && !"void".equalsIgnoreCase(retType) && !"trigger".equalsIgnoreCase(retType)
