@@ -58,6 +58,8 @@ public class PgFunction {
     private String schemaName;
     private boolean securityDefiner;
     private boolean strict;
+    private String volatility; // "VOLATILE" (default), "STABLE", or "IMMUTABLE"
+    private java.util.Map<String, String> setClauses; // function-level GUC overrides
     private String owner;
 
     public PgFunction(String name, String returnType, String body, String language) {
@@ -86,6 +88,10 @@ public class PgFunction {
     public void setSecurityDefiner(boolean securityDefiner) { this.securityDefiner = securityDefiner; }
     public boolean isStrict() { return strict; }
     public void setStrict(boolean strict) { this.strict = strict; }
+    public String getVolatility() { return volatility; }
+    public void setVolatility(String volatility) { this.volatility = volatility; }
+    public java.util.Map<String, String> getSetClauses() { return setClauses; }
+    public void setSetClauses(java.util.Map<String, String> setClauses) { this.setClauses = setClauses; }
     public String getOwner() { return owner; }
     public void setOwner(String owner) { this.owner = owner; }
 }

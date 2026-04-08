@@ -1,6 +1,7 @@
 package com.memgres.engine.parser.ast;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -18,6 +19,8 @@ public final class CreateFunctionStmt implements Statement {
     public final boolean isProcedure;
     public final boolean securityDefiner;     // false = SECURITY INVOKER (default)
     public final boolean strict;              // STRICT or RETURNS NULL ON NULL INPUT
+    public final String volatility;           // "VOLATILE" (default), "STABLE", or "IMMUTABLE"
+    public final Map<String, String> setClauses; // function-level GUC overrides (may be null)
 
     public CreateFunctionStmt(
             String name,
@@ -30,7 +33,9 @@ public final class CreateFunctionStmt implements Statement {
             boolean orReplace,
             boolean isProcedure,
             boolean securityDefiner,
-            boolean strict
+            boolean strict,
+            String volatility,
+            Map<String, String> setClauses
     ) {
         this.name = name;
         this.schema = schema;
@@ -43,6 +48,8 @@ public final class CreateFunctionStmt implements Statement {
         this.isProcedure = isProcedure;
         this.securityDefiner = securityDefiner;
         this.strict = strict;
+        this.volatility = volatility;
+        this.setClauses = setClauses;
     }
 
     public static final class FuncParam {
@@ -100,6 +107,8 @@ public final class CreateFunctionStmt implements Statement {
     public boolean isProcedure() { return isProcedure; }
     public boolean securityDefiner() { return securityDefiner; }
     public boolean strict() { return strict; }
+    public String volatility() { return volatility; }
+    public Map<String, String> setClauses() { return setClauses; }
 
     @Override
     public boolean equals(Object o) {
@@ -116,16 +125,18 @@ public final class CreateFunctionStmt implements Statement {
             && Objects.equals(parsedParams, that.parsedParams)
             && Objects.equals(returnType, that.returnType)
             && Objects.equals(body, that.body)
-            && Objects.equals(language, that.language);
+            && Objects.equals(language, that.language)
+            && Objects.equals(volatility, that.volatility)
+            && Objects.equals(setClauses, that.setClauses);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, schema, params, parsedParams, returnType, body, language, orReplace, isProcedure, securityDefiner, strict);
+        return Objects.hash(name, schema, params, parsedParams, returnType, body, language, orReplace, isProcedure, securityDefiner, strict, volatility, setClauses);
     }
 
     @Override
     public String toString() {
-        return "CreateFunctionStmt[name=" + name + ", " + "schema=" + schema + ", " + "params=" + params + ", " + "parsedParams=" + parsedParams + ", " + "returnType=" + returnType + ", " + "body=" + body + ", " + "language=" + language + ", " + "orReplace=" + orReplace + ", " + "isProcedure=" + isProcedure + ", " + "securityDefiner=" + securityDefiner + ", " + "strict=" + strict + "]";
+        return "CreateFunctionStmt[name=" + name + ", schema=" + schema + ", params=" + params + ", parsedParams=" + parsedParams + ", returnType=" + returnType + ", body=" + body + ", language=" + language + ", orReplace=" + orReplace + ", isProcedure=" + isProcedure + ", securityDefiner=" + securityDefiner + ", strict=" + strict + ", volatility=" + volatility + ", setClauses=" + setClauses + "]";
     }
 }

@@ -192,6 +192,8 @@ class DdlObjectExecutor {
         pgFunc.setSchemaName(executor.defaultSchema());
         pgFunc.setSecurityDefiner(stmt.securityDefiner());
         pgFunc.setStrict(stmt.strict());
+        pgFunc.setVolatility(stmt.volatility());
+        pgFunc.setSetClauses(stmt.setClauses());
         pgFunc.setOwner(executor.sessionUser());
         executor.database.addFunction(pgFunc);
         executor.database.registerSchemaObject(executor.defaultSchema(), "function", stmt.name());

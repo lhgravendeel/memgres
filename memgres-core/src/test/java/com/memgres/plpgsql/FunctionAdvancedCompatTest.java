@@ -491,4 +491,81 @@ class FunctionAdvancedCompatTest {
                     "Expected 42P01 error, got: " + e.getMessage());
         }
     }
+
+    // =========================================================================
+    // Function SET clauses (GUC override during execution)
+    // =========================================================================
+
+    @Test
+    void testFunctionSetSearchPath() throws SQLException {
+        exec("CREATE SCHEMA set_test_schema");
+        exec("SET search_path = set_test_schema");
+        exec("CREATE TABLE items (id int, name text)");
+        exec("INSERT INTO items VALUES (1, 'found')");
+        // Create function with SET search_path — uses plpgsql to avoid SQL body validation
+        // against the wrong schema at CREATE time
+        exec("""
+            CREATE FUNCTION fn_with_set_path()
+            RETURNS text
+            LANGUAGE plpgsql
+            SET search_path = set_test_schema
+            AS $$
+            DECLARE result text;
+            BEGIN
+                SELECT name INTO result FROM items WHERE id = 1;
+                RETURN result;
+            END;
+            $$
+        """);
+        exec("SET search_path = public");
+        assertEquals("found", query1("SELECT fn_with_set_path()"));
+    }
+
+    // =========================================================================
+    // GET STACKED DIAGNOSTICS
+    // =========================================================================
+
+    @Test
+    void testGetStackedDiagnostics() throws SQLException {
+        exec("""
+            CREATE FUNCTION test_stacked_diag()
+            RETURNS text
+            LANGUAGE plpgsql AS $$
+            DECLARE
+                v_state text;
+                v_msg text;
+            BEGIN
+                BEGIN
+                    RAISE EXCEPTION 'test error' USING ERRCODE = '22000';
+                EXCEPTION WHEN OTHERS THEN
+                    GET STACKED DIAGNOSTICS
+                        v_state = RETURNED_SQLSTATE,
+                        v_msg = MESSAGE_TEXT;
+                    RETURN v_state || ':' || v_msg;
+                END;
+            END;
+            $$
+        """);
+        assertEquals("22000:test error", query1("SELECT test_stacked_diag()"));
+    }
+
+    @Test
+    void testGetDiagnosticsRowCount() throws SQLException {
+        exec("CREATE TABLE diag_test (id int)");
+        exec("INSERT INTO diag_test VALUES (1), (2), (3)");
+        exec("""
+            CREATE FUNCTION test_row_count_diag()
+            RETURNS int
+            LANGUAGE plpgsql AS $$
+            DECLARE
+                rc int;
+            BEGIN
+                DELETE FROM diag_test WHERE id > 1;
+                GET DIAGNOSTICS rc = ROW_COUNT;
+                RETURN rc;
+            END;
+            $$
+        """);
+        assertEquals("2", query1("SELECT test_row_count_diag()"));
+    }
 }

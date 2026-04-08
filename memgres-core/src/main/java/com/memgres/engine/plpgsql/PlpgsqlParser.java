@@ -706,6 +706,7 @@ public class PlpgsqlParser {
 
     private PlpgsqlStatement parseGetDiagnostics() {
         matchKw("GET");
+        boolean stacked = matchKw("STACKED");
         matchKw("DIAGNOSTICS");
         List<PlpgsqlStatement.DiagItem> items = new ArrayList<>();
         do {
@@ -713,16 +714,22 @@ public class PlpgsqlParser {
             if (!match(TokenType.EQUALS)) match(TokenType.COLON_EQUALS);
             String itemName = readIdent();
             if (peek().type() == TokenType.IDENTIFIER || peek().type() == TokenType.KEYWORD) {
-                // Handle multi-word like ROW_COUNT, but it's typically one token: ROW_COUNT
-                // Actually ROW is a keyword and COUNT is a keyword, so this might be two tokens
+                // Handle multi-word like ROW_COUNT, PG_EXCEPTION_DETAIL, etc.
                 if (!check(TokenType.COMMA) && !check(TokenType.SEMICOLON) && !isAtEnd()) {
                     itemName += "_" + readIdent();
+                    // Handle triple-word items like PG_EXCEPTION_DETAIL -> already two-word after underscore join
+                    // But PG_EXCEPTION_CONTEXT is also possible via PG + EXCEPTION + CONTEXT
+                    if (peek().type() == TokenType.IDENTIFIER || peek().type() == TokenType.KEYWORD) {
+                        if (!check(TokenType.COMMA) && !check(TokenType.SEMICOLON) && !isAtEnd()) {
+                            itemName += "_" + readIdent();
+                        }
+                    }
                 }
             }
             items.add(new PlpgsqlStatement.DiagItem(varName, itemName.toUpperCase()));
         } while (match(TokenType.COMMA));
         match(TokenType.SEMICOLON);
-        return new PlpgsqlStatement.GetDiagnosticsStmt(items);
+        return new PlpgsqlStatement.GetDiagnosticsStmt(items, stacked);
     }
 
     // ---- Cursors ----

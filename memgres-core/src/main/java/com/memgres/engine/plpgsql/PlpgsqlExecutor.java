@@ -126,6 +126,34 @@ public class PlpgsqlExecutor {
     }
 
     public Object executeFunction(PgFunction function, List<Object> args) {
+        // Apply function-level SET clauses (save current values, apply overrides)
+        java.util.Map<String, String> savedGuc = null;
+        if (function.getSetClauses() != null && !function.getSetClauses().isEmpty() && session != null) {
+            GucSettings guc = session.getGucSettings();
+            savedGuc = new java.util.LinkedHashMap<>();
+            for (java.util.Map.Entry<String, String> entry : function.getSetClauses().entrySet()) {
+                savedGuc.put(entry.getKey(), guc.get(entry.getKey()));
+                guc.set(entry.getKey(), entry.getValue());
+            }
+        }
+        try {
+            return executeFunctionBody(function, args);
+        } finally {
+            // Restore GUC settings after function returns
+            if (savedGuc != null) {
+                GucSettings guc = session.getGucSettings();
+                for (java.util.Map.Entry<String, String> entry : savedGuc.entrySet()) {
+                    if (entry.getValue() != null) {
+                        guc.set(entry.getKey(), entry.getValue());
+                    } else {
+                        guc.reset(entry.getKey());
+                    }
+                }
+            }
+        }
+    }
+
+    private Object executeFunctionBody(PgFunction function, List<Object> args) {
         PlpgsqlStatement.Block block;
         String lang = function.getLanguage() != null ? function.getLanguage().toLowerCase() : "plpgsql";
 
@@ -801,16 +829,40 @@ public class PlpgsqlExecutor {
     private void executeGetDiagnostics(PlpgsqlStatement.GetDiagnosticsStmt stmt, Scope scope) {
         for (PlpgsqlStatement.DiagItem item : stmt.items()) {
             Object value;
-            switch (item.itemName().toUpperCase()) {
-                case "ROW_COUNT":
-                    value = scope.lastRowCount;
-                    break;
-                case "FOUND":
-                    value = scope.get("found");
-                    break;
-                default:
-                    value = null;
-                    break;
+            String itemName = item.itemName().toUpperCase();
+            if (stmt.stacked()) {
+                // GET STACKED DIAGNOSTICS — retrieve exception info from handler scope
+                switch (itemName) {
+                    case "RETURNED_SQLSTATE":
+                        value = scope.has("sqlstate") ? scope.get("sqlstate") : null;
+                        break;
+                    case "MESSAGE_TEXT":
+                    case "PG_EXCEPTION_DETAIL":
+                        value = scope.has("sqlerrm") ? scope.get("sqlerrm") : null;
+                        break;
+                    case "PG_EXCEPTION_HINT":
+                        value = "";
+                        break;
+                    case "PG_EXCEPTION_CONTEXT":
+                    case "PG_CONTEXT":
+                        value = "PL/pgSQL function";
+                        break;
+                    default:
+                        value = null;
+                        break;
+                }
+            } else {
+                switch (itemName) {
+                    case "ROW_COUNT":
+                        value = scope.lastRowCount;
+                        break;
+                    case "FOUND":
+                        value = scope.get("found");
+                        break;
+                    default:
+                        value = null;
+                        break;
+                }
             }
             scope.set(item.varName(), value);
         }
