@@ -136,9 +136,32 @@ public class PlpgsqlExecutor {
                 guc.set(entry.getKey(), entry.getValue());
             }
         }
+
+        // SECURITY DEFINER: switch current_user to function owner during execution
+        boolean roleWasOverridden = false;
+        String savedRole = null;
+        if (function.isSecurityDefiner() && session != null && function.getOwner() != null) {
+            GucSettings guc = session.getGucSettings();
+            roleWasOverridden = guc.hasSessionOverride("role");
+            if (roleWasOverridden) {
+                savedRole = guc.get("role");
+            }
+            guc.set("role", function.getOwner());
+        }
+
         try {
             return executeFunctionBody(function, args);
         } finally {
+            // Restore SECURITY DEFINER role
+            if (function.isSecurityDefiner() && session != null && function.getOwner() != null) {
+                GucSettings guc = session.getGucSettings();
+                if (roleWasOverridden) {
+                    guc.set("role", savedRole);
+                } else {
+                    guc.reset("role");
+                }
+            }
+
             // Restore GUC settings after function returns
             if (savedGuc != null) {
                 GucSettings guc = session.getGucSettings();
