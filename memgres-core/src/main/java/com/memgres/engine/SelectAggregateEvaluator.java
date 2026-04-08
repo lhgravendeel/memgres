@@ -853,15 +853,31 @@ class SelectAggregateEvaluator {
             }
         }
 
+        // Resolve SFUNC once outside the loop
+        PgFunction sfunc = executor.database.getFunction(agg.getSfunc());
+
+        // For DISTINCT, track seen value tuples
+        Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
+
         // For each row, call SFUNC(state, value[, ...])
         for (RowContext ctx : group) {
+            List<Object> argValues = new ArrayList<>();
+            for (Expression arg : fn.args()) {
+                argValues.add(executor.evalExpr(arg, ctx));
+            }
+
+            // DISTINCT: skip duplicate value tuples
+            if (seen != null) {
+                String key = argValues.stream()
+                        .map(v -> v == null ? "\0" : v.toString())
+                        .collect(Collectors.joining("\1"));
+                if (!seen.add(key)) continue;
+            }
+
             List<Object> args = new ArrayList<>();
             args.add(state);
-            for (Expression arg : fn.args()) {
-                args.add(executor.evalExpr(arg, ctx));
-            }
+            args.addAll(argValues);
             // Call the state transition function
-            PgFunction sfunc = executor.database.getFunction(agg.getSfunc());
             if (sfunc != null) {
                 com.memgres.engine.plpgsql.PlpgsqlExecutor plExec =
                         new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
@@ -869,8 +885,9 @@ class SelectAggregateEvaluator {
             }
         }
 
-        // If FINALFUNC is specified, call it on the final state
-        if (agg.getFinalfunc() != null) {
+        // If FINALFUNC is specified, call it on the final state.
+        // PG behavior: if no INITCOND and empty group, state is NULL and FINALFUNC is NOT called.
+        if (agg.getFinalfunc() != null && (agg.getInitcond() != null || !group.isEmpty())) {
             PgFunction ffunc = executor.database.getFunction(agg.getFinalfunc());
             if (ffunc != null) {
                 List<Object> args = new ArrayList<>();
