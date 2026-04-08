@@ -51,6 +51,7 @@ class DdlExecutor {
     QueryResult executeCreateDomain(CreateDomainStmt stmt) { return objectExecutor.executeCreateDomain(stmt); }
     QueryResult executeAlterDomain(AlterDomainStmt stmt) { return objectExecutor.executeAlterDomain(stmt); }
     QueryResult executeCreateIndex(CreateIndexStmt stmt) { return objectExecutor.executeCreateIndex(stmt); }
+    QueryResult executeCreateAggregate(CreateAggregateStmt stmt) { return objectExecutor.executeCreateAggregate(stmt); }
 
     QueryResult executeCreateView(CreateViewStmt stmt) { return viewExecutor.executeCreateView(stmt); }
     QueryResult executeAlterView(AlterViewStmt stmt) { return viewExecutor.executeAlterView(stmt); }

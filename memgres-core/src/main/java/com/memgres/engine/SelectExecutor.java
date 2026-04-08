@@ -461,7 +461,8 @@ class SelectExecutor {
     // ---- Expression analysis helpers (shared across delegates) ----
 
     boolean isAggregateFunction(String name) {
-        return AGGREGATE_FUNCTIONS.contains(name.toLowerCase());
+        return AGGREGATE_FUNCTIONS.contains(name.toLowerCase())
+                || executor.database.hasAggregate(name);
     }
 
     boolean containsAggregate(Expression expr) {

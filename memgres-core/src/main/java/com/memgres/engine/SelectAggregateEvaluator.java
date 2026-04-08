@@ -827,9 +827,66 @@ class SelectAggregateEvaluator {
                 BigDecimal r2Val = corrVal.pow(2).setScale(16, RoundingMode.HALF_UP);
                 return r2Val.stripTrailingZeros().toPlainString();
             }
-            default:
+            default: {
+                // Check for user-defined aggregate
+                PgAggregate agg = executor.database.getAggregate(name);
+                if (agg != null) {
+                    return evalUserDefinedAggregate(agg, fn, group);
+                }
                 return null;
+            }
         }
+    }
+
+    private Object evalUserDefinedAggregate(PgAggregate agg, FunctionCallExpr fn, List<RowContext> group) {
+        // Initialize state from INITCOND or null
+        Object state = null;
+        if (agg.getInitcond() != null) {
+            try {
+                QueryResult initResult = executor.execute("SELECT " + castLiteral(agg.getInitcond(), agg.getStype()));
+                if (!initResult.getRows().isEmpty() && initResult.getRows().get(0).length > 0) {
+                    state = initResult.getRows().get(0)[0];
+                }
+            } catch (Exception e) {
+                // fallback: use the raw string
+                state = agg.getInitcond();
+            }
+        }
+
+        // For each row, call SFUNC(state, value[, ...])
+        for (RowContext ctx : group) {
+            List<Object> args = new ArrayList<>();
+            args.add(state);
+            for (Expression arg : fn.args()) {
+                args.add(executor.evalExpr(arg, ctx));
+            }
+            // Call the state transition function
+            PgFunction sfunc = executor.database.getFunction(agg.getSfunc());
+            if (sfunc != null) {
+                com.memgres.engine.plpgsql.PlpgsqlExecutor plExec =
+                        new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
+                state = plExec.executeFunction(sfunc, args);
+            }
+        }
+
+        // If FINALFUNC is specified, call it on the final state
+        if (agg.getFinalfunc() != null) {
+            PgFunction ffunc = executor.database.getFunction(agg.getFinalfunc());
+            if (ffunc != null) {
+                List<Object> args = new ArrayList<>();
+                args.add(state);
+                com.memgres.engine.plpgsql.PlpgsqlExecutor plExec =
+                        new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
+                state = plExec.executeFunction(ffunc, args);
+            }
+        }
+
+        return state;
+    }
+
+    private String castLiteral(String value, String type) {
+        // Quote the value and cast to the appropriate type
+        return "'" + value.replace("'", "''") + "'::" + type;
     }
 
     // ---- DRY helpers ----

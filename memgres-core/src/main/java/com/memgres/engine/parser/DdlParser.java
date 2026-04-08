@@ -82,9 +82,11 @@ class DdlParser {
         if (parser.matchKeyword("GROUP")) return roleParser.parseCreateRole(false);
         if (parser.matchKeyword("RULE")) return parseCreateRule();
 
+        if (parser.matchKeyword("AGGREGATE")) return parseCreateAggregate();
+
         // No-op CREATE targets
         if (parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
-                || parser.matchKeyword("CONVERSION") || parser.matchKeyword("AGGREGATE")
+                || parser.matchKeyword("CONVERSION")
                 || parser.matchKeywords("OPERATOR", "CLASS") || parser.matchKeywords("OPERATOR", "FAMILY")
                 || parser.matchKeyword("OPERATOR")
                 || parser.matchKeywords("DEFAULT", "CONVERSION")
@@ -562,6 +564,103 @@ class DdlParser {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String name = parser.readIdentifierOrString();
         return new CreateExtensionStmt(name, ifNotExists);
+    }
+
+    Statement parseCreateAggregate() {
+        String name = parser.readIdentifier();
+        // Parse argument types: CREATE AGGREGATE name ( argtype [, ...] ) ( ... )
+        // or CREATE AGGREGATE name ( ORDER BY argtype ) for ordered-set aggregates
+        List<String> argTypes = new ArrayList<>();
+        if (parser.match(TokenType.LEFT_PAREN)) {
+            // Check for ORDER BY (ordered-set aggregate) or * or type list
+            if (parser.matchKeyword("ORDER")) {
+                parser.matchKeyword("BY");
+            }
+            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                if (parser.check(TokenType.STAR)) {
+                    parser.advance();
+                    argTypes.add("*");
+                } else {
+                    argTypes.add(parser.parseTypeName());
+                }
+                parser.match(TokenType.COMMA);
+            }
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
+
+        // Parse aggregate definition body: ( SFUNC = ..., STYPE = ..., ... )
+        String sfunc = null, stype = null, initcond = null, finalfunc = null, combinefunc = null, sortop = null;
+        if (parser.match(TokenType.LEFT_PAREN)) {
+            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                String key = parser.readIdentifier().toUpperCase();
+                parser.match(TokenType.EQUALS);
+                switch (key) {
+                    case "SFUNC":
+                    case "BASETYPE":
+                        if (key.equals("SFUNC")) sfunc = parser.readIdentifier();
+                        else parser.readIdentifier(); // BASETYPE consumed but not used (old syntax)
+                        break;
+                    case "STYPE":
+                        stype = parser.parseTypeName();
+                        break;
+                    case "FINALFUNC":
+                        finalfunc = parser.readIdentifier();
+                        break;
+                    case "INITCOND":
+                        // INITCOND can be a string literal, number literal, or identifier
+                        if (parser.check(TokenType.STRING_LITERAL)) {
+                            initcond = parser.advance().value();
+                        } else if (parser.check(TokenType.INTEGER_LITERAL) || parser.check(TokenType.FLOAT_LITERAL)) {
+                            initcond = parser.advance().value();
+                        } else {
+                            initcond = parser.readIdentifier();
+                        }
+                        break;
+                    case "COMBINEFUNC":
+                        combinefunc = parser.readIdentifier();
+                        break;
+                    case "SORTOP":
+                        // Sort operator can be = , < , > etc.
+                        sortop = parser.advance().value();
+                        break;
+                    case "FINALFUNC_EXTRA":
+                    case "FINALFUNC_MODIFY":
+                    case "PARALLEL":
+                    case "HYPOTHETICAL":
+                    case "MSFUNC":
+                    case "MINVFUNC":
+                    case "MSTYPE":
+                    case "MFINALFUNC":
+                    case "MFINALFUNC_EXTRA":
+                    case "MFINALFUNC_MODIFY":
+                    case "MINITCOND":
+                    case "MSSPACE":
+                    case "SERIALFUNC":
+                    case "DESERIALFUNC":
+                        // Consume value(s) — parsed but not stored
+                        if (parser.check(TokenType.STRING_LITERAL)) {
+                            parser.advance();
+                        } else if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                            parser.advance();
+                        }
+                        break;
+                    default:
+                        // Unknown key — skip value
+                        if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                            parser.advance();
+                        }
+                        break;
+                }
+                parser.match(TokenType.COMMA);
+            }
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
+
+        if (sfunc == null || stype == null) {
+            // Incomplete aggregate — treat as no-op (some dumps have partial aggregates)
+            return new SetStmt("create_noop", "ok");
+        }
+        return new CreateAggregateStmt(name, argTypes, sfunc, stype, initcond, finalfunc, combinefunc, sortop);
     }
 
     CreateRuleStmt parseCreateRule() {
