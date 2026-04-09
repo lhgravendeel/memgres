@@ -26,11 +26,11 @@ class FromFunctionResolver {
         String fname = rawFname.contains(".") ? rawFname.substring(rawFname.lastIndexOf('.') + 1) : rawFname;
         String alias = funcFrom.alias() != null ? funcFrom.alias() : fname;
         List<String> colAliases = funcFrom.columnAliases();
+        if (fname.equals("__json_table__")) return resolveJsonTable(funcFrom, alias);
         List<Object> evalArgs = new ArrayList<>();
         for (Expression arg : funcFrom.args()) {
             evalArgs.add(executor.evalExpr(arg, null));
         }
-
         if (fname.equals("generate_series")) return resolveGenerateSeries(alias, colAliases, evalArgs);
         if (fname.equals("generate_subscripts")) return resolveGenerateSubscripts(alias, colAliases, evalArgs);
         if (fname.equals("pg_indexam_has_property")) return resolvePgIndexamHasProperty(alias, evalArgs);
@@ -895,5 +895,176 @@ class FromFunctionResolver {
             result.set(i, new Column(aliases.get(i), orig.getType(), orig.isNullable(), orig.isPrimaryKey(), orig.getDefaultValue()));
         }
         return result;
+    }
+
+    // ---- JSON_TABLE ----
+
+    private List<RowContext> resolveJsonTable(SelectStmt.FunctionFrom funcFrom, String alias) {
+        if (funcFrom.args().isEmpty() || !(funcFrom.args().get(0) instanceof JsonTableExpr)) {
+            throw new MemgresException("Invalid JSON_TABLE expression");
+        }
+        JsonTableExpr jt = (JsonTableExpr) funcFrom.args().get(0);
+
+        // Evaluate input and path
+        Object inputVal = executor.evalExpr(jt.input, null);
+        if (inputVal == null) return new ArrayList<>();
+        Object pathVal = executor.evalExpr(jt.path, null);
+        if (pathVal == null) return new ArrayList<>();
+        String json = inputVal.toString();
+        String path = pathVal.toString();
+
+        // Build column definitions
+        List<Column> cols = new ArrayList<>();
+        collectColumnDefs(jt.columns, cols);
+
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+
+        // Validate JSON input
+        if (!ExprEvaluator.isValidJson(json)) {
+            if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
+                throw new MemgresException("invalid JSON input for JSON_TABLE", "22032");
+            }
+            return contexts; // EMPTY ON ERROR (default)
+        }
+
+        // Extract rows using the root path
+        try {
+            List<String> rowJsons = executor.functionEvaluator.evaluateJsonPathAll(json, path);
+            for (int rowIdx = 0; rowIdx < rowJsons.size(); rowIdx++) {
+                String rowJson = rowJsons.get(rowIdx);
+                // Build rows — nested paths cause row multiplication
+                List<List<Object>> expandedRows = buildJsonTableRows(jt.columns, rowJson, rowIdx);
+                for (List<Object> rowValues : expandedRows) {
+                    Object[] row = rowValues.toArray();
+                    virtualTable.insertRow(row);
+                    contexts.add(new RowContext(virtualTable, alias, row));
+                }
+            }
+        } catch (Exception e) {
+            if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
+                throw new MemgresException("invalid JSON input for JSON_TABLE", "22032");
+            }
+            // Default: EMPTY ON ERROR — return empty result
+        }
+
+        return contexts;
+    }
+
+    private void collectColumnDefs(List<JsonTableExpr.JsonTableColumn> columns, List<Column> cols) {
+        for (JsonTableExpr.JsonTableColumn col : columns) {
+            if (col.nestedColumns != null) {
+                collectColumnDefs(col.nestedColumns, cols);
+            } else {
+                cols.add(new Column(col.name, col.forOrdinality ? DataType.INTEGER : DataType.TEXT, true, false, null));
+            }
+        }
+    }
+
+    private List<List<Object>> buildJsonTableRows(List<JsonTableExpr.JsonTableColumn> columns,
+                                                    String rowJson, int rowIdx) {
+        // Check if there's a nested column — if so, we need row multiplication
+        int nestedIdx = -1;
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i).nestedColumns != null) {
+                nestedIdx = i;
+                break;
+            }
+        }
+
+        if (nestedIdx < 0) {
+            // No nested columns — produce a single row
+            List<Object> row = new ArrayList<>();
+            for (JsonTableExpr.JsonTableColumn col : columns) {
+                row.add(extractColumnValue(col, rowJson, rowIdx));
+            }
+            return Cols.listOf(row);
+        }
+
+        // Has nested column — extract non-nested values first, then multiply by nested rows
+        List<Object> parentValues = new ArrayList<>();
+        for (int i = 0; i < columns.size(); i++) {
+            if (i == nestedIdx) continue;
+            parentValues.add(extractColumnValue(columns.get(i), rowJson, rowIdx));
+        }
+
+        // Evaluate nested path and expand
+        JsonTableExpr.JsonTableColumn nestedCol = columns.get(nestedIdx);
+        String nestedPath = nestedCol.nestedPath != null ? executor.evalExpr(nestedCol.nestedPath, null).toString() : "$";
+        List<String> nestedJsons = executor.functionEvaluator.evaluateJsonPathAll(rowJson, nestedPath);
+
+        List<List<Object>> result = new ArrayList<>();
+        for (int ni = 0; ni < nestedJsons.size(); ni++) {
+            String nestedJson = nestedJsons.get(ni);
+            List<Object> row = new ArrayList<>();
+            int parentIdx = 0;
+            for (int i = 0; i < columns.size(); i++) {
+                if (i == nestedIdx) {
+                    // Add nested column values
+                    for (JsonTableExpr.JsonTableColumn nc : nestedCol.nestedColumns) {
+                        row.add(extractColumnValue(nc, nestedJson, ni));
+                    }
+                } else {
+                    row.add(parentValues.get(parentIdx++));
+                }
+            }
+            result.add(row);
+        }
+
+        if (result.isEmpty()) {
+            // No nested results — produce one row with nulls for nested columns
+            List<Object> row = new ArrayList<>();
+            int parentIdx = 0;
+            for (int i = 0; i < columns.size(); i++) {
+                if (i == nestedIdx) {
+                    for (int nc = 0; nc < nestedCol.nestedColumns.size(); nc++) {
+                        row.add(null);
+                    }
+                } else {
+                    row.add(parentValues.get(parentIdx++));
+                }
+            }
+            result.add(row);
+        }
+
+        return result;
+    }
+
+    private Object extractColumnValue(JsonTableExpr.JsonTableColumn col, String rowJson, int rowIdx) {
+        if (col.forOrdinality) {
+            return rowIdx + 1;
+        }
+        if (col.existsPath) {
+            String ep = col.pathExpr != null ? executor.evalExpr(col.pathExpr, null).toString() : "$";
+            List<String> vals = executor.functionEvaluator.evaluateJsonPathAll(rowJson, ep);
+            return !vals.isEmpty();
+        }
+        // Regular column: extract value via path
+        String colPath = col.pathExpr != null ? executor.evalExpr(col.pathExpr, null).toString() : ("$." + col.name);
+        try {
+            List<String> vals = executor.functionEvaluator.evaluateJsonPathAll(rowJson, colPath);
+            if (vals.isEmpty()) {
+                if (col.defaultOnEmpty != null) {
+                    return executor.evalExpr(col.defaultOnEmpty, null);
+                }
+                return null;
+            }
+            return unquoteJsonString(vals.get(0));
+        } catch (Exception e) {
+            if (col.defaultOnError != null) {
+                return executor.evalExpr(col.defaultOnError, null);
+            }
+            return null;
+        }
+    }
+
+    private String unquoteJsonString(String val) {
+        if (val == null) return null;
+        val = val.trim();
+        if (val.startsWith("\"") && val.endsWith("\"") && val.length() >= 2) {
+            return val.substring(1, val.length() - 1);
+        }
+        if ("null".equals(val)) return null;
+        return val;
     }
 }

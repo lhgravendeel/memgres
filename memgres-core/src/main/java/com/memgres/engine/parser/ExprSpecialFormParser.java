@@ -5,7 +5,9 @@ import com.memgres.engine.util.Cols;
 import com.memgres.engine.parser.ast.*;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Parses special SQL syntax forms: CASE, CAST, ARRAY, SUBSTRING, TRIM, POSITION,
@@ -693,6 +695,305 @@ class ExprSpecialFormParser {
         Expression xml = ep.parseExpression();
         ep.expect(TokenType.RIGHT_PAREN);
         return new FunctionCallExpr("xmlexists", Cols.listOf(xpath, xml));
+    }
+
+    // ---- SQL/JSON standard functions (PG 16+) ----
+
+    Expression parseJsonExists() {
+        ep.advance(); // consume JSON_EXISTS
+        ep.expect(TokenType.LEFT_PAREN);
+        Expression input = ep.parseExpression();
+        ep.expect(TokenType.COMMA);
+        Expression path = ep.parseExpression();
+        Map<String, Expression> passing = null;
+        if (ep.matchKeyword("PASSING")) {
+            passing = parsePassingVars();
+        }
+        JsonExistsExpr.OnBehavior onError = null;
+        if (ep.matchKeyword("TRUE")) { ep.expectKeyword("ON"); ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.TRUE_VAL; }
+        else if (ep.matchKeyword("FALSE")) { ep.expectKeyword("ON"); ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.FALSE_VAL; }
+        else if (ep.matchKeyword("UNKNOWN")) { ep.expectKeyword("ON"); ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.UNKNOWN_VAL; }
+        else if (ep.matchKeyword("ERROR")) { ep.expectKeyword("ON"); ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.ERROR; }
+        ep.expect(TokenType.RIGHT_PAREN);
+        return new JsonExistsExpr(input, path, passing, onError);
+    }
+
+    Expression parseJsonValue() {
+        ep.advance(); // consume JSON_VALUE
+        ep.expect(TokenType.LEFT_PAREN);
+        Expression input = ep.parseExpression();
+        ep.expect(TokenType.COMMA);
+        Expression path = ep.parseExpression();
+        Map<String, Expression> passing = null;
+        if (ep.matchKeyword("PASSING")) {
+            passing = parsePassingVars();
+        }
+        String returningType = null;
+        if (ep.matchKeyword("RETURNING")) {
+            returningType = ep.parseTypeName();
+        }
+        JsonExistsExpr.OnBehavior onEmpty = null;
+        Expression defaultOnEmpty = null;
+        JsonExistsExpr.OnBehavior onError = null;
+        Expression defaultOnError = null;
+        // Parse ON EMPTY and ON ERROR clauses (can appear in any order, at most once each)
+        for (int i = 0; i < 2; i++) {
+            if (ep.checkKeyword("DEFAULT")) {
+                ep.advance();
+                Expression defVal = ep.parseExpression();
+                ep.expectKeyword("ON");
+                if (ep.matchKeyword("EMPTY")) { onEmpty = null; defaultOnEmpty = defVal; }
+                else { ep.expectKeyword("ERROR"); onError = null; defaultOnError = defVal; }
+            } else if (ep.checkKeyword("NULL")) {
+                ep.advance();
+                ep.expectKeyword("ON");
+                if (ep.matchKeyword("EMPTY")) { onEmpty = JsonExistsExpr.OnBehavior.NULL_VAL; }
+                else { ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.NULL_VAL; }
+            } else if (ep.checkKeyword("ERROR")) {
+                ep.advance();
+                ep.expectKeyword("ON");
+                if (ep.matchKeyword("EMPTY")) { onEmpty = JsonExistsExpr.OnBehavior.ERROR; }
+                else { ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.ERROR; }
+            } else {
+                break;
+            }
+        }
+        ep.expect(TokenType.RIGHT_PAREN);
+        return new JsonValueExpr(input, path, returningType, passing, onEmpty, defaultOnEmpty, onError, defaultOnError);
+    }
+
+    Expression parseJsonQuery() {
+        ep.advance(); // consume JSON_QUERY
+        ep.expect(TokenType.LEFT_PAREN);
+        Expression input = ep.parseExpression();
+        ep.expect(TokenType.COMMA);
+        Expression path = ep.parseExpression();
+        Map<String, Expression> passing = null;
+        if (ep.matchKeyword("PASSING")) {
+            passing = parsePassingVars();
+        }
+        String returningType = null;
+        if (ep.matchKeyword("RETURNING")) {
+            returningType = ep.parseTypeName();
+        }
+        JsonQueryExpr.WrapperBehavior wrapper = JsonQueryExpr.WrapperBehavior.NONE;
+        if (ep.matchKeyword("WITH")) {
+            if (ep.matchKeyword("CONDITIONAL")) {
+                ep.expectKeyword("WRAPPER");
+                wrapper = JsonQueryExpr.WrapperBehavior.WITH_CONDITIONAL_WRAPPER;
+            } else if (ep.matchKeyword("UNCONDITIONAL")) {
+                ep.expectKeyword("WRAPPER");
+                wrapper = JsonQueryExpr.WrapperBehavior.WITH_WRAPPER;
+            } else {
+                ep.expectKeyword("WRAPPER");
+                wrapper = JsonQueryExpr.WrapperBehavior.WITH_WRAPPER;
+            }
+        } else if (ep.matchKeyword("WITHOUT")) {
+            ep.expectKeyword("WRAPPER");
+            wrapper = JsonQueryExpr.WrapperBehavior.NONE;
+        }
+        JsonQueryExpr.QuotesBehavior quotes = JsonQueryExpr.QuotesBehavior.KEEP;
+        if (ep.matchKeyword("KEEP")) { ep.expectKeyword("QUOTES"); quotes = JsonQueryExpr.QuotesBehavior.KEEP; }
+        else if (ep.matchKeyword("OMIT")) { ep.expectKeyword("QUOTES"); quotes = JsonQueryExpr.QuotesBehavior.OMIT; }
+        JsonExistsExpr.OnBehavior onEmpty = null;
+        JsonExistsExpr.OnBehavior onError = null;
+        for (int i = 0; i < 2; i++) {
+            if (ep.checkKeyword("NULL")) {
+                ep.advance(); ep.expectKeyword("ON");
+                if (ep.matchKeyword("EMPTY")) onEmpty = JsonExistsExpr.OnBehavior.NULL_VAL;
+                else { ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.NULL_VAL; }
+            } else if (ep.checkKeyword("ERROR")) {
+                ep.advance(); ep.expectKeyword("ON");
+                if (ep.matchKeyword("EMPTY")) onEmpty = JsonExistsExpr.OnBehavior.ERROR;
+                else { ep.expectKeyword("ERROR"); onError = JsonExistsExpr.OnBehavior.ERROR; }
+            } else if (ep.checkKeyword("EMPTY")) {
+                ep.advance();
+                if (ep.matchKeyword("ARRAY")) { ep.expectKeyword("ON"); ep.expectKeyword("EMPTY"); onEmpty = JsonExistsExpr.OnBehavior.EMPTY_ARRAY; }
+                else if (ep.matchKeyword("OBJECT")) { ep.expectKeyword("ON"); ep.expectKeyword("EMPTY"); onEmpty = JsonExistsExpr.OnBehavior.EMPTY_OBJECT; }
+            } else {
+                break;
+            }
+        }
+        ep.expect(TokenType.RIGHT_PAREN);
+        return new JsonQueryExpr(input, path, returningType, passing, wrapper, quotes, onEmpty, onError);
+    }
+
+    Expression parseJsonScalar() {
+        ep.advance(); // consume JSON_SCALAR
+        ep.expect(TokenType.LEFT_PAREN);
+        Expression arg = ep.parseExpression();
+        ep.expect(TokenType.RIGHT_PAREN);
+        return new FunctionCallExpr("json_scalar", Cols.listOf(arg));
+    }
+
+    Expression parseJsonSerialize() {
+        ep.advance(); // consume JSON_SERIALIZE
+        ep.expect(TokenType.LEFT_PAREN);
+        Expression arg = ep.parseExpression();
+        String returningType = null;
+        if (ep.matchKeyword("RETURNING")) {
+            returningType = ep.parseTypeName();
+        }
+        ep.expect(TokenType.RIGHT_PAREN);
+        // normalize to function call with optional type hint
+        if (returningType != null) {
+            return new CastExpr(new FunctionCallExpr("json_serialize", Cols.listOf(arg)), returningType);
+        }
+        return new FunctionCallExpr("json_serialize", Cols.listOf(arg));
+    }
+
+    Expression parseJsonArray() {
+        ep.advance(); // consume JSON_ARRAY
+        ep.expect(TokenType.LEFT_PAREN);
+        // Check for subquery: JSON_ARRAY(SELECT ...)
+        if (ep.checkKeyword("SELECT") || ep.checkKeyword("WITH")) {
+            Statement subquery = ep.parseSubqueryWithSetOps();
+            ep.expect(TokenType.RIGHT_PAREN);
+            // Wrap as json_array_subquery function call
+            return new FunctionCallExpr("json_array_subquery", Cols.listOf(new SubqueryExpr(subquery)));
+        }
+        // Empty: JSON_ARRAY()
+        if (ep.check(TokenType.RIGHT_PAREN)) {
+            ep.advance();
+            return new FunctionCallExpr("json_array_constructor", Cols.listOf());
+        }
+        List<Expression> args = new ArrayList<>();
+        boolean nullOnNull = false;
+        boolean absentOnNull = true; // default
+        do {
+            args.add(ep.parseExpression());
+        } while (ep.match(TokenType.COMMA) && !isNullOnNullLookahead() && !ep.checkKeyword("ABSENT") && !ep.checkKeyword("RETURNING"));
+        // NULL ON NULL / ABSENT ON NULL
+        if (ep.checkKeyword("NULL") && ep.checkKeywordAt(1, "ON")) {
+            ep.advance(); ep.advance(); ep.expectKeyword("NULL"); nullOnNull = true; absentOnNull = false;
+        } else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
+        // RETURNING type
+        if (ep.matchKeyword("RETURNING")) { ep.parseTypeName(); } // consume but ignore for now
+        ep.expect(TokenType.RIGHT_PAREN);
+        // Pack nullOnNull flag as an extra Literal arg
+        args.add(Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
+        return new FunctionCallExpr("json_array_constructor", args);
+    }
+
+    Expression parseJsonObject() {
+        ep.advance(); // consume JSON_OBJECT
+        ep.expect(TokenType.LEFT_PAREN);
+        // Empty: JSON_OBJECT()
+        if (ep.check(TokenType.RIGHT_PAREN)) {
+            ep.advance();
+            return new FunctionCallExpr("json_object_constructor", Cols.listOf());
+        }
+        List<Expression> args = new ArrayList<>();
+        boolean nullOnNull = false;
+        boolean keyValueSyntax = ep.checkKeyword("KEY");
+        do {
+            Expression key;
+            Expression val;
+            if (ep.matchKeyword("KEY")) {
+                key = ep.parseExpression();
+                ep.expectKeyword("VALUE");
+                val = ep.parseExpression();
+            } else {
+                key = ep.parseExpression();
+                ep.expect(TokenType.COLON);
+                val = ep.parseExpression();
+            }
+            args.add(key);
+            args.add(val);
+        } while (ep.match(TokenType.COMMA) && !isNullOnNullLookahead() && !ep.checkKeyword("ABSENT")
+                && !ep.checkKeyword("WITH") && !ep.checkKeyword("WITHOUT") && !ep.checkKeyword("RETURNING"));
+        // NULL ON NULL / ABSENT ON NULL
+        if (ep.checkKeyword("NULL") && ep.checkKeywordAt(1, "ON")) {
+            ep.advance(); ep.advance(); ep.expectKeyword("NULL"); nullOnNull = true;
+        } else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
+        // WITH UNIQUE KEYS / WITHOUT UNIQUE KEYS
+        boolean uniqueKeys = false;
+        if (ep.matchKeyword("WITH")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); uniqueKeys = true; }
+        else if (ep.matchKeyword("WITHOUT")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); }
+        // RETURNING type
+        if (ep.matchKeyword("RETURNING")) { ep.parseTypeName(); }
+        ep.expect(TokenType.RIGHT_PAREN);
+        // Pack flags as extra args
+        args.add(Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
+        args.add(Literal.ofString(uniqueKeys ? "unique_keys" : "no_unique_keys"));
+        return new FunctionCallExpr("json_object_constructor", args);
+    }
+
+    Expression parseJsonArrayagg() {
+        ep.advance(); // consume JSON_ARRAYAGG
+        ep.expect(TokenType.LEFT_PAREN);
+        Expression arg = ep.parseExpression();
+        List<SelectStmt.OrderByItem> orderBy = null;
+        if (ep.matchKeywords("ORDER", "BY")) {
+            orderBy = new ArrayList<>();
+            do {
+                Expression oExpr = ep.parseExpression();
+                boolean desc = false;
+                Boolean nullsFirst = null;
+                if (ep.matchKeyword("DESC")) desc = true;
+                else ep.matchKeyword("ASC");
+                if (ep.matchKeywords("NULLS", "FIRST")) nullsFirst = true;
+                else if (ep.matchKeywords("NULLS", "LAST")) nullsFirst = false;
+                orderBy.add(new SelectStmt.OrderByItem(oExpr, desc, nullsFirst));
+            } while (ep.match(TokenType.COMMA));
+        }
+        boolean nullOnNull = false;
+        if (ep.matchKeyword("NULL")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); nullOnNull = true; }
+        else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
+        if (ep.matchKeyword("RETURNING")) { ep.parseTypeName(); }
+        ep.expect(TokenType.RIGHT_PAREN);
+        // Create as special aggregate function call
+        List<Expression> args = Cols.listOf(arg,
+                Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
+        return new FunctionCallExpr("json_arrayagg", args, false, false, orderBy, null);
+    }
+
+    Expression parseJsonObjectagg() {
+        ep.advance(); // consume JSON_OBJECTAGG
+        ep.expect(TokenType.LEFT_PAREN);
+        Expression key;
+        Expression val;
+        if (ep.matchKeyword("KEY")) {
+            key = ep.parseExpression();
+            ep.expectKeyword("VALUE");
+            val = ep.parseExpression();
+        } else {
+            key = ep.parseExpression();
+            ep.expect(TokenType.COLON);
+            val = ep.parseExpression();
+        }
+        boolean nullOnNull = false;
+        if (ep.matchKeyword("NULL")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); nullOnNull = true; }
+        else if (ep.matchKeyword("ABSENT")) { ep.expectKeyword("ON"); ep.expectKeyword("NULL"); }
+        boolean uniqueKeys = false;
+        if (ep.matchKeyword("WITH")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); uniqueKeys = true; }
+        else if (ep.matchKeyword("WITHOUT")) { ep.expectKeyword("UNIQUE"); ep.expectKeyword("KEYS"); }
+        if (ep.matchKeyword("RETURNING")) { ep.parseTypeName(); }
+        ep.expect(TokenType.RIGHT_PAREN);
+        List<Expression> args = new ArrayList<>();
+        args.add(key);
+        args.add(val);
+        args.add(Literal.ofString(nullOnNull ? "null_on_null" : "absent_on_null"));
+        args.add(Literal.ofString(uniqueKeys ? "unique_keys" : "no_unique_keys"));
+        return new FunctionCallExpr("json_objectagg", args, false, false, null, null);
+    }
+
+    /** Check if current position is NULL ON (i.e., NULL ON NULL clause, not a null value) */
+    private boolean isNullOnNullLookahead() {
+        return ep.checkKeyword("NULL") && ep.checkKeywordAt(1, "ON");
+    }
+
+    private Map<String, Expression> parsePassingVars() {
+        Map<String, Expression> passing = new LinkedHashMap<>();
+        do {
+            Expression val = ep.parseExpression();
+            ep.expectKeyword("AS");
+            String name = ep.readIdentifier();
+            passing.put(name.toLowerCase(), val);
+        } while (ep.match(TokenType.COMMA) && !ep.checkKeyword("RETURNING") && !ep.checkKeyword("TRUE")
+                && !ep.checkKeyword("FALSE") && !ep.checkKeyword("ERROR") && !ep.checkKeyword("UNKNOWN")
+                && !ep.check(TokenType.RIGHT_PAREN));
+        return passing;
     }
 
     static String inferName(Expression expr) {

@@ -114,8 +114,15 @@ public class Lexer {
             "XMLROOT", "XMLCONCAT", "XMLEXISTS", "XMLAGG", "XMLATTRIBUTES",
             "XMLTEXT", "XMLCOMMENT", "DOCUMENT", "CONTENT", "STANDALONE",
             "PASSING", "NAME", "VERSION",
+            // SQL/JSON standard keywords
+            "JSON_TABLE", "JSON_EXISTS", "JSON_VALUE", "JSON_QUERY",
+            "JSON_ARRAY", "JSON_OBJECT", "JSON_ARRAYAGG", "JSON_OBJECTAGG",
+            "JSON_SCALAR", "JSON_SERIALIZE",
+            "SCALAR", "WRAPPER", "CONDITIONAL", "UNCONDITIONAL",
+            "KEEP", "OMIT", "QUOTES", "KEYS", "EMPTY",
+            "COLUMNS", "ERROR", "PATH", "NESTED", "ABSENT",
             // No-op DDL targets
-            "SERVER", "WRAPPER", "MAPPING", "IMPORT",
+            "SERVER", "MAPPING", "IMPORT",
             "PUBLICATION", "SUBSCRIPTION",
             "TABLESPACE",
             "TRANSFORM",

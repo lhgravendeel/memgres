@@ -740,6 +740,73 @@ class SelectAggregateEvaluator {
                 }
                 return result;
             }
+            case "json_arrayagg": {
+                if (group.isEmpty()) return null;
+                // json_arrayagg(expr, null_behavior_flag)
+                List<RowContext> orderedGroup2 = sortGroupForAggregate(group, fn);
+                int exprIdx = 0;
+                String nullBeh = "absent";
+                if (fn.args().size() >= 2) {
+                    Expression lastA = fn.args().get(fn.args().size() - 1);
+                    if (lastA instanceof Literal) {
+                        String flag = ((Literal) lastA).value();
+                        if ("null_on_null".equals(flag)) nullBeh = "null";
+                        else if ("absent_on_null".equals(flag)) nullBeh = "absent";
+                    }
+                }
+                StringBuilder sb3 = new StringBuilder("[");
+                boolean first3 = true;
+                for (RowContext r : orderedGroup2) {
+                    Object v = executor.evalExpr(fn.args().get(exprIdx), r);
+                    if (v == null && "absent".equals(nullBeh)) continue;
+                    if (!first3) sb3.append(", ");
+                    first3 = false;
+                    appendJsonVal(sb3, v);
+                }
+                sb3.append("]");
+                return sb3.toString();
+            }
+            case "json_objectagg": {
+                if (group.isEmpty()) return null;
+                // json_objectagg(key, value, null_behavior_flag, unique_flag)
+                int argCount2 = fn.args().size();
+                String nullBeh2 = "absent";
+                boolean uniqueKeys2 = false;
+                // Parse trailing flags (packed as "absent_on_null"/"null_on_null" and "unique_keys"/"no_unique_keys")
+                if (argCount2 >= 4) {
+                    Expression la = fn.args().get(argCount2 - 1);
+                    Expression sla = fn.args().get(argCount2 - 2);
+                    if (la instanceof Literal && sla instanceof Literal) {
+                        String f1 = ((Literal) sla).value();
+                        String f2 = ((Literal) la).value();
+                        if (("absent_on_null".equals(f1) || "null_on_null".equals(f1)) &&
+                            ("unique_keys".equals(f2) || "no_unique_keys".equals(f2))) {
+                            nullBeh2 = f1.startsWith("null") ? "null" : "absent";
+                            uniqueKeys2 = "unique_keys".equals(f2);
+                            argCount2 -= 2;
+                        }
+                    }
+                }
+                StringBuilder sb4 = new StringBuilder("{");
+                boolean first4 = true;
+                Set<String> seenKeys2 = uniqueKeys2 ? new HashSet<>() : null;
+                for (RowContext r : group) {
+                    Object k = executor.evalExpr(fn.args().get(0), r);
+                    Object v = executor.evalExpr(fn.args().get(1), r);
+                    if (k == null) continue;
+                    if (v == null && "absent".equals(nullBeh2)) continue;
+                    String ks = k.toString();
+                    if (uniqueKeys2 && seenKeys2 != null && !seenKeys2.add(ks)) {
+                        throw new MemgresException("duplicate JSON object key value", "22030");
+                    }
+                    if (!first4) sb4.append(", ");
+                    first4 = false;
+                    sb4.append("\"").append(ks.replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+                    appendJsonVal(sb4, v);
+                }
+                sb4.append("}");
+                return sb4.toString();
+            }
             case "xmlagg": {
                 StringBuilder sb = new StringBuilder();
                 for (RowContext r : group) {
@@ -1053,6 +1120,17 @@ class SelectAggregateEvaluator {
         @Override
         public String toString() {
             return "RegressionData[xMean=" + xMean + ", " + "yMean=" + yMean + ", " + "sumXYDiff=" + sumXYDiff + ", " + "sumXDiffSq=" + sumXDiffSq + ", " + "sumYDiffSq=" + sumYDiffSq + "]";
+        }
+    }
+
+    private void appendJsonVal(StringBuilder sb, Object val) {
+        if (val == null) { sb.append("null"); return; }
+        if (val instanceof Number || val instanceof Boolean) { sb.append(val); return; }
+        String s = val.toString().trim();
+        if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+            sb.append(s);
+        } else {
+            sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
         }
     }
 }

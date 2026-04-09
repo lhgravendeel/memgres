@@ -921,6 +921,111 @@ class FunctionEvaluator {
                 if (ce == null) return null;
                 return "{" + String.join(",", ce.getLabels()) + "}";
             }
+            case "json_scalar": {
+                if (fn.args().isEmpty()) throw new MemgresException("function json_scalar requires one argument", "42883");
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return "null";
+                if (val instanceof Number) return val.toString();
+                if (val instanceof Boolean) return val.toString();
+                // strings get quoted
+                return "\"" + val.toString().replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+            }
+            case "json_serialize": {
+                if (fn.args().isEmpty()) throw new MemgresException("function json_serialize requires one argument", "42883");
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                // JSON_SERIALIZE converts a JSON value to text — return as-is (preserves formatting)
+                return val.toString();
+            }
+            case "json_array_subquery": {
+                // JSON_ARRAY(SELECT ...) — execute subquery and build JSON array from results
+                if (fn.args().isEmpty()) throw new MemgresException("json_array_subquery requires a subquery argument", "42883");
+                Expression subqExpr = fn.args().get(0);
+                if (!(subqExpr instanceof SubqueryExpr)) {
+                    throw new MemgresException("json_array_subquery requires a subquery argument", "42883");
+                }
+                SubqueryExpr sq = (SubqueryExpr) subqExpr;
+                QueryResult result = executor.executeStatement(sq.subquery());
+                StringBuilder sb = new StringBuilder("[");
+                boolean first = true;
+                for (Object[] row : result.getRows()) {
+                    if (row.length > 0 && row[0] != null) {
+                        if (!first) sb.append(", ");
+                        first = false;
+                        appendJsonValue(sb, row[0]);
+                    }
+                }
+                sb.append("]");
+                return sb.toString();
+            }
+            case "json_array_constructor": {
+                // Last arg is the null behavior flag: "absent_on_null" or "null_on_null"
+                int argCount = fn.args().size();
+                String nullBehavior = "absent"; // default: ABSENT ON NULL
+                if (argCount > 0) {
+                    Expression lastArg = fn.args().get(argCount - 1);
+                    if (lastArg instanceof Literal) {
+                        String flag = ((Literal) lastArg).value();
+                        if ("absent_on_null".equals(flag) || "null_on_null".equals(flag)) {
+                            nullBehavior = flag.startsWith("null") ? "null" : "absent";
+                            argCount--;
+                        }
+                    }
+                }
+                StringBuilder sb = new StringBuilder("[");
+                boolean first = true;
+                for (int i = 0; i < argCount; i++) {
+                    Object val = executor.evalExpr(fn.args().get(i), ctx);
+                    if (val == null && "absent".equals(nullBehavior)) continue;
+                    if (!first) sb.append(", ");
+                    first = false;
+                    appendJsonValue(sb, val);
+                }
+                sb.append("]");
+                return sb.toString();
+            }
+            case "json_object_constructor": {
+                // Args are key-value pairs, last two args are flags: nullBehavior, uniqueKeys
+                int argCount = fn.args().size();
+                String nullBehavior = "absent";
+                boolean uniqueKeys = false;
+                // Parse trailing flags (packed as "absent_on_null"/"null_on_null" and "unique_keys"/"no_unique_keys")
+                if (argCount >= 2) {
+                    Expression lastArg = fn.args().get(argCount - 1);
+                    Expression secondLastArg = fn.args().get(argCount - 2);
+                    if (lastArg instanceof Literal && secondLastArg instanceof Literal) {
+                        String f1 = ((Literal) secondLastArg).value();
+                        String f2 = ((Literal) lastArg).value();
+                        if (("absent_on_null".equals(f1) || "null_on_null".equals(f1)) &&
+                            ("unique_keys".equals(f2) || "no_unique_keys".equals(f2))) {
+                            nullBehavior = f1.startsWith("null") ? "null" : "absent";
+                            uniqueKeys = "unique_keys".equals(f2);
+                            argCount -= 2;
+                        }
+                    }
+                }
+                StringBuilder sb = new StringBuilder("{");
+                boolean first = true;
+                Set<String> seenKeys = uniqueKeys ? new HashSet<>() : null;
+                for (int i = 0; i + 1 < argCount; i += 2) {
+                    Object key = executor.evalExpr(fn.args().get(i), ctx);
+                    Object val = executor.evalExpr(fn.args().get(i + 1), ctx);
+                    if (key == null) throw new MemgresException("null value not allowed for object key", "22023");
+                    if (val == null && "absent".equals(nullBehavior)) continue;
+                    String keyStr = key.toString();
+                    if (uniqueKeys && seenKeys != null) {
+                        if (!seenKeys.add(keyStr)) {
+                            throw new MemgresException("duplicate JSON object key value", "22030");
+                        }
+                    }
+                    if (!first) sb.append(", ");
+                    first = false;
+                    sb.append("\"").append(keyStr.replace("\\", "\\\\").replace("\"", "\\\"")).append("\" : ");
+                    appendJsonValue(sb, val);
+                }
+                sb.append("}");
+                return sb.toString();
+            }
             case "text": {
                 if (fn.args().size() != 1) {
                     throw new MemgresException("function text() requires exactly one argument", "42883");
@@ -1141,7 +1246,8 @@ class FunctionEvaluator {
                 Set<String> AGGREGATES = Cols.setOf("count", "sum", "avg", "min", "max",
                         "string_agg", "array_agg", "bool_and", "bool_or", "every",
                         "bit_and", "bit_or", "json_agg", "jsonb_agg",
-                        "json_object_agg", "jsonb_object_agg", "xmlagg");
+                        "json_object_agg", "jsonb_object_agg", "xmlagg",
+                        "json_arrayagg", "json_objectagg");
                 if (AGGREGATES.contains(name)) {
                     return null; // Will be handled by aggregate executor
                 }
@@ -1180,6 +1286,17 @@ class FunctionEvaluator {
 
     String extractJsonKey(String json, String key) {
         return jsonFunctions.extractJsonKey(json, key);
+    }
+
+    private void appendJsonValue(StringBuilder sb, Object val) {
+        if (val == null) { sb.append("null"); return; }
+        if (val instanceof Number || val instanceof Boolean) { sb.append(val); return; }
+        String s = val.toString().trim();
+        if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+            sb.append(s); // already JSON
+        } else {
+            sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+        }
     }
 
     List<String> evaluateJsonPathAll(String json, String path) {
