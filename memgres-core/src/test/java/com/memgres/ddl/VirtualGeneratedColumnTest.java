@@ -726,4 +726,203 @@ class VirtualGeneratedColumnTest {
                      "b int GENERATED ALWAYS AS (no_such_col * 2) VIRTUAL)"));
         assertEquals("42703", ex.getSQLState());
     }
+
+    // ========================================================================
+    // CHECK constraint referencing virtual column
+    // ========================================================================
+
+    @Test
+    void check_constraint_references_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL, " +
+             "CHECK (b > 0))");
+        // a=5 → b=10, passes CHECK
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");
+        assertEquals("10", scalar("SELECT b FROM t1 WHERE id = 1"));
+
+        // a=-1 → b=-2, fails CHECK
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("INSERT INTO t1(id, a) VALUES (2, -1)"));
+        assertEquals("23514", ex.getSQLState());
+    }
+
+    @Test
+    void check_constraint_on_virtual_column_update() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL, " +
+             "CHECK (b <= 100))");
+        exec("INSERT INTO t1(id, a) VALUES (1, 10)");
+        // a=10 → b=20, passes CHECK
+
+        // Update a=60 → b=120, should fail CHECK
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("UPDATE t1 SET a = 60 WHERE id = 1"));
+        assertEquals("23514", ex.getSQLState());
+    }
+
+    // ========================================================================
+    // CTE with virtual columns
+    // ========================================================================
+
+    @Test
+    void cte_reads_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 3) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 10), (2, 20)");
+
+        List<List<String>> rows = query(
+                "WITH doubled AS (SELECT id, b * 2 AS b2 FROM t1) " +
+                "SELECT id, b2 FROM doubled ORDER BY id");
+        assertEquals(2, rows.size());
+        assertEquals("60", rows.get(0).get(1));  // 10*3*2
+        assertEquals("120", rows.get(1).get(1)); // 20*3*2
+    }
+
+    @Test
+    void cte_with_virtual_column_in_join() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a + 100) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 15)");
+
+        List<List<String>> rows = query(
+                "WITH src AS (SELECT id, b FROM t1 WHERE b > 110) " +
+                "SELECT s.id, s.b FROM src s ORDER BY s.id");
+        assertEquals(1, rows.size());
+        assertEquals("2", rows.get(0).get(0));
+        assertEquals("115", rows.get(0).get(1));
+    }
+
+    // ========================================================================
+    // HAVING clause with virtual column
+    // ========================================================================
+
+    @Test
+    void having_clause_on_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, category text, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, category, a) VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 5)");
+
+        // GROUP BY category, HAVING on sum of virtual column
+        List<List<String>> rows = query(
+                "SELECT category, SUM(b) AS total FROM t1 GROUP BY category HAVING SUM(b) > 15 ORDER BY category");
+        assertEquals(1, rows.size());
+        assertEquals("x", rows.get(0).get(0));
+        assertEquals("60", rows.get(0).get(1)); // (10*2)+(20*2) = 60
+    }
+
+    // ========================================================================
+    // Window function over virtual column
+    // ========================================================================
+
+    @Test
+    void window_function_over_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 10) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 1), (2, 2), (3, 3)");
+
+        List<List<String>> rows = query(
+                "SELECT id, b, SUM(b) OVER (ORDER BY id) AS running FROM t1 ORDER BY id");
+        assertEquals(3, rows.size());
+        assertEquals("10", rows.get(0).get(1));
+        assertEquals("10", rows.get(0).get(2));
+        assertEquals("20", rows.get(1).get(1));
+        assertEquals("30", rows.get(1).get(2));
+        assertEquals("30", rows.get(2).get(1));
+        assertEquals("60", rows.get(2).get(2));
+    }
+
+    // ========================================================================
+    // INSERT without column list
+    // ========================================================================
+
+    @Test
+    void insert_without_column_list_rejects_virtual_column_value() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        // INSERT with all columns explicitly — virtual col value should be rejected
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("INSERT INTO t1 VALUES (1, 5, 99)"));
+        assertTrue(ex.getMessage().contains("generated") || ex.getSQLState().equals("428C9"),
+                "Expected rejection of explicit value for generated column, got: " + ex.getMessage());
+    }
+
+    // ========================================================================
+    // Subquery referencing virtual column
+    // ========================================================================
+
+    @Test
+    void subquery_in_where_references_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 10), (2, 20), (3, 30)");
+
+        List<List<String>> rows = query(
+                "SELECT id FROM t1 WHERE b > (SELECT MIN(b) FROM t1) ORDER BY id");
+        assertEquals(2, rows.size());
+        assertEquals("2", rows.get(0).get(0));
+        assertEquals("3", rows.get(1).get(0));
+    }
+
+    @Test
+    void exists_subquery_with_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("CREATE TABLE t2(id int PRIMARY KEY, val int)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 10), (2, 20)");
+        exec("INSERT INTO t2(id, val) VALUES (1, 20)");
+
+        // Find rows where virtual column matches a value in t2
+        List<List<String>> rows = query(
+                "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.val = t1.b)");
+        assertEquals(1, rows.size());
+        assertEquals("1", rows.get(0).get(0)); // a=10, b=20, matches t2.val=20
+    }
+
+    // ========================================================================
+    // ORDER BY virtual column
+    // ========================================================================
+
+    @Test
+    void order_by_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * -1) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 30), (2, 10), (3, 20)");
+
+        List<List<String>> rows = query("SELECT id, b FROM t1 ORDER BY b");
+        assertEquals("1", rows.get(0).get(0)); // b=-30
+        assertEquals("3", rows.get(1).get(0)); // b=-20
+        assertEquals("2", rows.get(2).get(0)); // b=-10
+    }
+
+    // ========================================================================
+    // CASE expression in virtual column definition
+    // ========================================================================
+
+    @Test
+    void virtual_column_with_case_expression() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, score int, " +
+             "grade text GENERATED ALWAYS AS (CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END) VIRTUAL)");
+        exec("INSERT INTO t1(id, score) VALUES (1, 95), (2, 85), (3, 70)");
+
+        List<List<String>> rows = query("SELECT id, grade FROM t1 ORDER BY id");
+        assertEquals("A", rows.get(0).get(1));
+        assertEquals("B", rows.get(1).get(1));
+        assertEquals("C", rows.get(2).get(1));
+
+        // Update score and verify grade changes
+        exec("UPDATE t1 SET score = 50 WHERE id = 1");
+        assertEquals("C", scalar("SELECT grade FROM t1 WHERE id = 1"));
+    }
+
+    // ========================================================================
+    // Virtual column with NULL base values
+    // ========================================================================
+
+    @Test
+    void virtual_column_null_propagation() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a + 1) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, NULL)");
+        assertNull(scalar("SELECT b FROM t1 WHERE id = 1"));
+    }
 }

@@ -187,7 +187,9 @@ class ConstraintValidator {
     }
 
     private void validateCheck(Table table, Object[] row, StoredConstraint sc) {
-        RowContext ctx = new RowContext(table, null, row);
+        // Compute virtual column values so CHECK expressions can reference them
+        Object[] evalRow = executor.dmlExecutor.hasVirtualColumns(table) ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+        RowContext ctx = new RowContext(table, null, evalRow);
         Object result = executor.evalExpr(sc.getCheckExpr(), ctx);
         if (result instanceof Boolean && !((Boolean) result)) {
             Boolean b = (Boolean) result;
