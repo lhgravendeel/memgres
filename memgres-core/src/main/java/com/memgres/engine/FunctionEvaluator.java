@@ -148,6 +148,13 @@ class FunctionEvaluator {
         if (delegated != NOT_HANDLED) return delegated;
 
         switch (name) {
+            case "merge_action": {
+                // merge_action() returns 'INSERT', 'UPDATE', or 'DELETE' in MERGE RETURNING (PG 17+)
+                if (executor.currentMergeAction == null) {
+                    throw new MemgresException("merge_action() can only be used in a MERGE RETURNING clause", "42P20");
+                }
+                return executor.currentMergeAction;
+            }
             case "row": {
                 // ROW(a, b, c) -> List of evaluated values
                 List<Object> row = new ArrayList<>();

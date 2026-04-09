@@ -579,8 +579,10 @@ class SelectParser {
                     return parser.parseUpdate(ctes);
                 case "DELETE":
                     return parser.parseDelete(ctes);
+                case "MERGE":
+                    return parser.parseMerge(ctes);
                 default:
-                    throw new ParseException("Expected SELECT, INSERT, UPDATE, or DELETE after WITH clause", next);
+                    throw new ParseException("Expected SELECT, INSERT, UPDATE, DELETE, or MERGE after WITH clause", next);
             }
         }
         throw new ParseException("Expected SELECT, INSERT, UPDATE, or DELETE after WITH clause", next);
@@ -826,9 +828,11 @@ class SelectParser {
             return new SelectStmt.SelectTarget(new WildcardExpr(), null);
         }
 
-        // Handle table.*, but only if it's identifier DOT STAR
+        // Handle table.*, but only if it's identifier/keyword DOT STAR
+        // Keywords OLD and NEW are valid qualifiers for RETURNING OLD.*/NEW.* (PG 18)
         int saved = parser.pos;
-        if ((parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER) &&
+        if ((parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
+                || parser.peek().type() == TokenType.KEYWORD) &&
                 parser.pos + 2 < parser.tokens.size()) {
             String name = parser.peek().value();
             parser.advance();

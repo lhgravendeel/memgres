@@ -284,6 +284,10 @@ class DmlParser {
     }
 
     MergeStmt parseMerge() {
+        return parseMerge(null);
+    }
+
+    MergeStmt parseMerge(List<SelectStmt.CommonTableExpr> withClauses) {
         parser.expectKeyword("MERGE");
         parser.expectKeyword("INTO");
 
@@ -334,34 +338,62 @@ class DmlParser {
                 }
             } else if (parser.matchKeyword("NOT")) {
                 parser.expectKeyword("MATCHED");
-                // WHEN NOT MATCHED [AND condition] THEN INSERT ... | DO NOTHING
+
+                // Check for BY SOURCE / BY TARGET (PG 17+)
+                boolean bySource = false;
+                if (parser.matchKeyword("BY")) {
+                    if (parser.matchIdentifier("SOURCE")) {
+                        bySource = true;
+                    } else if (parser.matchIdentifier("TARGET")) {
+                        // BY TARGET is the default for NOT MATCHED, explicit is allowed
+                    } else {
+                        throw new ParseException("Expected SOURCE or TARGET after BY", parser.peek());
+                    }
+                }
+
                 Expression andCondition = null;
                 if (parser.matchKeyword("AND")) {
                     andCondition = parser.parseExpression();
                 }
                 parser.expectKeyword("THEN");
 
-                if (parser.matchKeywords("DO", "NOTHING")) {
-                    whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, true, null, null));
-                } else if (parser.matchKeyword("INSERT")) {
-                    List<String> columns = null;
-                    if (parser.match(TokenType.LEFT_PAREN)) {
-                        columns = new ArrayList<>();
+                if (bySource) {
+                    // WHEN NOT MATCHED BY SOURCE: UPDATE SET ... / DELETE / DO NOTHING
+                    if (parser.matchKeyword("UPDATE")) {
+                        parser.expectKeyword("SET");
+                        List<InsertStmt.SetClause> setClauses = parseSetClauses();
+                        whenClauses.add(new MergeStmt.WhenNotMatchedBySource(andCondition, false, setClauses));
+                    } else if (parser.matchKeyword("DELETE")) {
+                        whenClauses.add(new MergeStmt.WhenNotMatchedBySource(andCondition, true, null));
+                    } else if (parser.matchKeywords("DO", "NOTHING")) {
+                        whenClauses.add(new MergeStmt.WhenNotMatchedBySource(andCondition, false, Cols.listOf()));
+                    } else {
+                        throw new ParseException("Expected UPDATE, DELETE, or DO NOTHING after WHEN NOT MATCHED BY SOURCE THEN", parser.peek());
+                    }
+                } else {
+                    // WHEN NOT MATCHED [BY TARGET]: INSERT ... | DO NOTHING
+                    if (parser.matchKeywords("DO", "NOTHING")) {
+                        whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, true, null, null));
+                    } else if (parser.matchKeyword("INSERT")) {
+                        List<String> columns = null;
+                        if (parser.match(TokenType.LEFT_PAREN)) {
+                            columns = new ArrayList<>();
+                            do {
+                                columns.add(parser.readIdentifier());
+                            } while (parser.match(TokenType.COMMA));
+                            parser.expect(TokenType.RIGHT_PAREN);
+                        }
+                        parser.expectKeyword("VALUES");
+                        parser.expect(TokenType.LEFT_PAREN);
+                        List<Expression> values = new ArrayList<>();
                         do {
-                            columns.add(parser.readIdentifier());
+                            values.add(parser.parseExpression());
                         } while (parser.match(TokenType.COMMA));
                         parser.expect(TokenType.RIGHT_PAREN);
+                        whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, false, columns, values));
+                    } else {
+                        throw new ParseException("Expected INSERT or DO NOTHING after WHEN NOT MATCHED THEN", parser.peek());
                     }
-                    parser.expectKeyword("VALUES");
-                    parser.expect(TokenType.LEFT_PAREN);
-                    List<Expression> values = new ArrayList<>();
-                    do {
-                        values.add(parser.parseExpression());
-                    } while (parser.match(TokenType.COMMA));
-                    parser.expect(TokenType.RIGHT_PAREN);
-                    whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, false, columns, values));
-                } else {
-                    throw new ParseException("Expected INSERT or DO NOTHING after WHEN NOT MATCHED THEN", parser.peek());
                 }
             } else {
                 throw new ParseException("Expected MATCHED or NOT MATCHED after WHEN", parser.peek());
@@ -372,6 +404,13 @@ class DmlParser {
             throw new ParseException("MERGE statement requires at least one WHEN clause", parser.peek());
         }
 
-        return new MergeStmt(schema, table, targetAlias, source, onCondition, whenClauses);
+        // RETURNING
+        List<SelectStmt.SelectTarget> returning = null;
+        if (parser.matchKeyword("RETURNING")) {
+            returning = parser.parseSelectTargets();
+            if (returning.isEmpty()) throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"", parser.peek());
+        }
+
+        return new MergeStmt(schema, table, targetAlias, source, onCondition, whenClauses, returning, withClauses);
     }
 }

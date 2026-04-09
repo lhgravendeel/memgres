@@ -364,6 +364,10 @@ public class Parser extends ExpressionParser {
         return dmlParser.parseDelete(withClauses);
     }
 
+    MergeStmt parseMerge(List<SelectStmt.CommonTableExpr> withClauses) {
+        return dmlParser.parseMerge(withClauses);
+    }
+
     List<InsertStmt.SetClause> parseSetClauses() {
         return dmlParser.parseSetClauses();
     }

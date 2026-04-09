@@ -51,6 +51,8 @@ public class AstExecutor {
     List<Object> boundParameters = new ArrayList<>();
     // Statement timestamp: frozen at statement start for now()/statement_timestamp()
     OffsetDateTime currentStatementTimestamp = null;
+    // Current MERGE action for merge_action() function in RETURNING clause (PG 17+)
+    String currentMergeAction = null;
     // When true, column references with no context throw instead of returning column name as string
     private boolean strictColumnRefs = false;
 
