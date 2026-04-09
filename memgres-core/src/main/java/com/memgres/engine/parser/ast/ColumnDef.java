@@ -15,6 +15,7 @@ public final class ColumnDef {
     public final String referencesTable;
     public final String referencesColumn;
     public final String generatedExpr;
+    public final boolean generatedVirtual;       // PG 18: VIRTUAL generated column (computed on read)
     public final String identity;                // stored as string, null otherwise
     public final String refOnDelete;
     public final String refOnUpdate;
@@ -37,6 +38,7 @@ public final class ColumnDef {
             String referencesTable,
             String referencesColumn,
             String generatedExpr,
+            boolean generatedVirtual,
             String identity,
             String refOnDelete,
             String refOnUpdate,
@@ -58,6 +60,7 @@ public final class ColumnDef {
         this.referencesTable = referencesTable;
         this.referencesColumn = referencesColumn;
         this.generatedExpr = generatedExpr;
+        this.generatedVirtual = generatedVirtual;
         this.identity = identity;
         this.refOnDelete = refOnDelete;
         this.refOnUpdate = refOnUpdate;
@@ -76,7 +79,7 @@ public final class ColumnDef {
                      String generatedExpr, String identity, String refOnDelete, String refOnUpdate,
                      Long identityStart, Long identityIncrement, boolean deferrable, boolean initiallyDeferred) {
         this(name, typeName, precision, scale, notNull, primaryKey, unique,
-                defaultExpr, referencesTable, referencesColumn, generatedExpr, identity,
+                defaultExpr, referencesTable, referencesColumn, generatedExpr, false, identity,
                 refOnDelete, refOnUpdate, identityStart, identityIncrement, deferrable, initiallyDeferred, false, null);
     }
 
@@ -88,7 +91,7 @@ public final class ColumnDef {
                      Long identityStart, Long identityIncrement, boolean deferrable, boolean initiallyDeferred,
                      Expression checkConstraintExpr) {
         this(name, typeName, precision, scale, notNull, primaryKey, unique,
-                defaultExpr, referencesTable, referencesColumn, generatedExpr, identity,
+                defaultExpr, referencesTable, referencesColumn, generatedExpr, false, identity,
                 refOnDelete, refOnUpdate, identityStart, identityIncrement, deferrable, initiallyDeferred, false, checkConstraintExpr);
     }
 
@@ -98,8 +101,8 @@ public final class ColumnDef {
                      Expression defaultExpr, String referencesTable, String referencesColumn,
                      String generatedExpr, String identity, String refOnDelete, String refOnUpdate) {
         this(name, typeName, precision, scale, notNull, primaryKey, unique,
-                defaultExpr, referencesTable, referencesColumn, generatedExpr, identity,
-                refOnDelete, refOnUpdate, null, null, false, false, null);
+                defaultExpr, referencesTable, referencesColumn, generatedExpr, false, identity,
+                refOnDelete, refOnUpdate, null, null, false, false, false, null);
     }
 
     /** Backward-compatible constructor without FK actions. */
@@ -108,8 +111,8 @@ public final class ColumnDef {
                      Expression defaultExpr, String referencesTable, String referencesColumn,
                      String generatedExpr, String identity) {
         this(name, typeName, precision, scale, notNull, primaryKey, unique,
-                defaultExpr, referencesTable, referencesColumn, generatedExpr, identity,
-                null, null, null, null, false, false, null);
+                defaultExpr, referencesTable, referencesColumn, generatedExpr, false, identity,
+                null, null, null, null, false, false, false, null);
     }
 
     /** Backward-compatible constructor without generatedExpr. */
@@ -117,8 +120,8 @@ public final class ColumnDef {
                      boolean notNull, boolean primaryKey, boolean unique,
                      Expression defaultExpr, String referencesTable, String referencesColumn) {
         this(name, typeName, precision, scale, notNull, primaryKey, unique,
-                defaultExpr, referencesTable, referencesColumn, null, null,
-                null, null, null, null, false, false, null);
+                defaultExpr, referencesTable, referencesColumn, null, false, null,
+                null, null, null, null, false, false, false, null);
     }
 
     /** Backward-compatible constructor without identity. */
@@ -127,8 +130,8 @@ public final class ColumnDef {
                      Expression defaultExpr, String referencesTable, String referencesColumn,
                      String generatedExpr) {
         this(name, typeName, precision, scale, notNull, primaryKey, unique,
-                defaultExpr, referencesTable, referencesColumn, generatedExpr, null,
-                null, null, null, null, false, false, null);
+                defaultExpr, referencesTable, referencesColumn, generatedExpr, false, null,
+                null, null, null, null, false, false, false, null);
     }
 
     public String name() { return name; }
@@ -142,6 +145,7 @@ public final class ColumnDef {
     public String referencesTable() { return referencesTable; }
     public String referencesColumn() { return referencesColumn; }
     public String generatedExpr() { return generatedExpr; }
+    public boolean generatedVirtual() { return generatedVirtual; }
     public String identity() { return identity; }
     public String refOnDelete() { return refOnDelete; }
     public String refOnUpdate() { return refOnUpdate; }

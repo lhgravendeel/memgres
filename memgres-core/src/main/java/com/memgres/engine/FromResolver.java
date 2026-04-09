@@ -382,23 +382,28 @@ class FromResolver {
         Session currentSession = executor.session;
         if (currentSession != null && currentSession.hasRRSnapshot(schemaTableKey)) {
             List<Object[]> snapshot = currentSession.getRRSnapshot(schemaTableKey);
+            boolean snapshotHasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
             List<RowContext> contexts = new ArrayList<>();
             for (Object[] row : snapshot) {
-                contexts.add(new RowContext(table, alias, row));
+                Object[] r = snapshotHasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+                contexts.add(new RowContext(table, alias, r));
             }
             return contexts;
         }
 
         // Use getAllRowsWithSource for inheritance/partitioning
+        boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
         List<RowContext> contexts = new ArrayList<>();
         if (tableRef.only()) {
             for (Object[] row : table.getRows()) {
-                contexts.add(new RowContext(table, alias, row));
+                Object[] r = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+                contexts.add(new RowContext(table, alias, r));
             }
         } else {
             for (Table.RowWithSource rws : table.getAllRowsWithSource()) {
+                Object[] r = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, rws.row()) : rws.row();
                 contexts.add(new RowContext(Cols.listOf(
-                        new RowContext.TableBinding(table, alias, rws.row(), rws.source()))));
+                        new RowContext.TableBinding(table, alias, r, rws.source()))));
             }
         }
 

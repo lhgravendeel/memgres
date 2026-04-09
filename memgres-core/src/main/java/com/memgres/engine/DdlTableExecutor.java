@@ -166,8 +166,8 @@ class DdlTableExecutor {
             }
 
             Column col = new Column(def.name(), dataType, !notNull, def.primaryKey(), defaultVal,
-                    enumTypeName, def.precision(), def.scale(), def.generatedExpr(), domainTypeName,
-                    compositeTypeName, arrayElementType);
+                    enumTypeName, def.precision(), def.scale(), def.generatedExpr(), def.generatedVirtual(),
+                    domainTypeName, compositeTypeName, arrayElementType);
             if (def.defaultExpr() != null) {
                 col.setParsedDefaultExpr(def.defaultExpr());
             }

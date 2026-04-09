@@ -199,6 +199,7 @@ class DdlTableParser {
         String refOnDelete = null;
         String refOnUpdate = null;
         String generatedExpr = null;
+        boolean generatedVirtual = false;
         String identity = null;
         Long identityStart = null;
         Long identityIncrement = null;
@@ -309,7 +310,14 @@ class DdlTableParser {
                         parser.expect(TokenType.LEFT_PAREN);
                         generatedExpr = buildRawSqlUntilCloseParen();
                         parser.expect(TokenType.RIGHT_PAREN);
-                        parser.matchKeyword("STORED");
+                        // PG 18: VIRTUAL is default if neither STORED nor VIRTUAL specified
+                        if (parser.matchKeyword("STORED")) {
+                            generatedVirtual = false;
+                        } else if (parser.matchKeyword("VIRTUAL")) {
+                            generatedVirtual = true;
+                        } else {
+                            generatedVirtual = true; // PG 18 default
+                        }
                     }
                 } else {
                     parser.matchKeyword("BY");
@@ -351,7 +359,7 @@ class DdlTableParser {
         }
 
         return new ColumnDef(colName, typeName, precision, scale, notNull, pk, unique,
-                defaultExpr, refTable, refColumn, generatedExpr, identity, refOnDelete, refOnUpdate,
+                defaultExpr, refTable, refColumn, generatedExpr, generatedVirtual, identity, refOnDelete, refOnUpdate,
                 identityStart, identityIncrement, deferrable, initiallyDeferred, colNotEnforced, columnCheckExpr);
     }
 

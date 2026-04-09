@@ -521,11 +521,13 @@ class DmlExecutor {
                 columns = table.getColumns();
                 for (int i = 0; i < columns.size(); i++) colIndices.add(i);
             }
+            boolean copyHasVirtual = hasVirtualColumns(table);
             List<Object[]> rows = new ArrayList<>();
             for (Object[] tableRow : table.getRows()) {
+                Object[] srcRow = copyHasVirtual ? computeVirtualColumns(table, tableRow) : tableRow;
                 Object[] row = new Object[colIndices.size()];
                 for (int i = 0; i < colIndices.size(); i++) {
-                    row[i] = tableRow[colIndices.get(i)];
+                    row[i] = srcRow[colIndices.get(i)];
                 }
                 rows.add(row);
             }
@@ -781,13 +783,15 @@ class DmlExecutor {
             rows.addAll(table.getRows());
         }
 
+        boolean fromUpdateHasVirtual = hasVirtualColumns(table);
         if (fromContexts != null) {
             // Multi-table UPDATE: join main table with FROM tables
             List<Object[]> matchedRows = new ArrayList<>();
             List<RowContext> matchedContexts = new ArrayList<>();
             for (Object[] row : rows) {
                 for (RowContext fromCtx : fromContexts) {
-                    RowContext mainCtx = new RowContext(table, stmt.alias(), row);
+                    Object[] evalRow = fromUpdateHasVirtual ? computeVirtualColumns(table, row) : row;
+                    RowContext mainCtx = new RowContext(table, stmt.alias(), evalRow);
                     RowContext combined = mainCtx.merge(fromCtx);
                     if (stmt.where() == null || executor.isTruthy(executor.evalExpr(stmt.where(), combined))) {
                         matchedRows.add(row);
@@ -830,9 +834,13 @@ class DmlExecutor {
 
         // Simple UPDATE (no FROM clause)
         String updateAlias = stmt.alias();
+        boolean updateHasVirtual = hasVirtualColumns(table);
         if (stmt.where() != null) {
             rows = rows.stream()
-                    .filter(row -> executor.isTruthy(executor.evalExpr(stmt.where(), new RowContext(table, updateAlias, row))))
+                    .filter(row -> {
+                        Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
+                        return executor.isTruthy(executor.evalExpr(stmt.where(), new RowContext(table, updateAlias, evalRow)));
+                    })
                     .collect(Collectors.toList());
         }
 
@@ -845,7 +853,8 @@ class DmlExecutor {
             // BEFORE UPDATE triggers
             newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, table, updatedColumnNames);
 
-            applySetClauses(stmt.setClauses(), table, newRow, new RowContext(table, updateAlias, row));
+            Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
+            applySetClauses(stmt.setClauses(), table, newRow, new RowContext(table, updateAlias, evalRow));
 
             // Recompute generated columns after setting new values
             computeGeneratedColumns(table, newRow);
@@ -998,11 +1007,13 @@ class DmlExecutor {
 
         Set<Object[]> toDelete = Collections.newSetFromMap(new IdentityHashMap<>());
 
+        boolean deleteHasVirtual = hasVirtualColumns(table);
         if (stmt.using() != null && !stmt.using().isEmpty()) {
             // DELETE ... USING: join main table with USING tables, delete matching main rows
             List<RowContext> usingContexts = executor.fromResolver.resolveFromClause(stmt.using());
             for (Object[] row : allRows) {
-                RowContext mainCtx = new RowContext(table, stmt.alias(), row);
+                Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
+                RowContext mainCtx = new RowContext(table, stmt.alias(), evalRow);
                 for (RowContext usingCtx : usingContexts) {
                     // Merge bindings: main table + using table
                     RowContext merged = mainCtx.merge(usingCtx);
@@ -1014,7 +1025,8 @@ class DmlExecutor {
             }
         } else {
             for (Object[] row : allRows) {
-                if (executor.isTruthy(executor.evalExpr(stmt.where(), new RowContext(table, stmt.alias(), row)))) {
+                Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
+                if (executor.isTruthy(executor.evalExpr(stmt.where(), new RowContext(table, stmt.alias(), evalRow)))) {
                     toDelete.add(row);
                 }
             }
@@ -1408,7 +1420,7 @@ class DmlExecutor {
     private void computeGeneratedColumns(Table table, Object[] row) {
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
-            if (col.isGenerated()) {
+            if (col.isGenerated() && !col.isVirtual()) {
                 row[i] = evalGeneratedColumn(table, row, col);
             }
         }
@@ -1433,6 +1445,31 @@ class DmlExecutor {
             }
         } catch (Exception e) { /* ignore */ }
         return null;
+    }
+
+    // ---- Helper: compute virtual generated columns on read ----
+
+    /** Check if a table has any VIRTUAL generated columns. */
+    boolean hasVirtualColumns(Table table) {
+        for (Column col : table.getColumns()) {
+            if (col.isVirtual()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Clone a row and fill in VIRTUAL generated column values.
+     * The original row is not modified (virtual columns are not stored).
+     */
+    Object[] computeVirtualColumns(Table table, Object[] row) {
+        Object[] result = row.clone();
+        for (int i = 0; i < table.getColumns().size(); i++) {
+            Column col = table.getColumns().get(i);
+            if (col.isVirtual()) {
+                result[i] = evalGeneratedColumn(table, result, col);
+            }
+        }
+        return result;
     }
 
     // ---- Read-only transaction check ----
@@ -1491,6 +1528,12 @@ class DmlExecutor {
      */
     private Object[] evalReturning(List<SelectStmt.SelectTarget> returning, Table table, String alias,
                                     Object[] row, Object[] oldRow, Object[] newRow) {
+        // Compute virtual generated column values for RETURNING evaluation
+        if (hasVirtualColumns(table)) {
+            row = computeVirtualColumns(table, row);
+            if (oldRow != null) oldRow = computeVirtualColumns(table, oldRow);
+            if (newRow != null) newRow = computeVirtualColumns(table, newRow);
+        }
         // Check if RETURNING references OLD or NEW (qualified column refs or wildcards)
         boolean usesOldNew = false;
         for (SelectStmt.SelectTarget target : returning) {

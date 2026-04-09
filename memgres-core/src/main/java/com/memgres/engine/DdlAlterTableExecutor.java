@@ -163,7 +163,7 @@ class DdlAlterTableExecutor {
         }
 
         Column col = new Column(def.name(), dt, !def.notNull(), def.primaryKey(), defaultVal,
-                enumTypeName, def.precision(), def.scale(), genExpr, domainTypeName);
+                enumTypeName, def.precision(), def.scale(), genExpr, def.generatedVirtual(), domainTypeName, null, null);
         Object evaluatedDefault = defaultVal != null ? executor.evaluateDefault(defaultVal, dt) : null;
 
         // Validate default type compatibility
@@ -213,8 +213,8 @@ class DdlAlterTableExecutor {
         table.addColumn(col, evaluatedDefault);
         executor.recordUndo(new Session.AddColumnUndo(schemaName, stmt.table(), def.name()));
 
-        // Compute generated column values for existing rows
-        if (genExpr != null) {
+        // Compute STORED generated column values for existing rows (VIRTUAL columns are computed on read)
+        if (genExpr != null && !def.generatedVirtual()) {
             int colIdx = table.getColumnIndex(def.name());
             if (colIdx >= 0) {
                 for (Object[] row : table.getRows()) {
