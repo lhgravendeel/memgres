@@ -30,6 +30,8 @@ class ConstraintValidator {
 
         // 2. Constraint checks
         for (StoredConstraint sc : table.getConstraints()) {
+            // PG 18: NOT ENFORCED constraints are stored but not validated
+            if (sc.isNotEnforced()) continue;
             switch (sc.getType()) {
                 case PRIMARY_KEY:
                     validateUniqueness(table, row, sc.getColumns(), excludeRow, true, sc.getName(), false, null, null);
@@ -364,6 +366,7 @@ class ConstraintValidator {
             for (Table childTable : schema.getTables().values()) {
                 for (StoredConstraint sc : childTable.getConstraints()) {
                     if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                    if (sc.isNotEnforced()) continue;
                     if (!sc.getReferencesTable().equalsIgnoreCase(parentTable.getName())) continue;
 
                     List<String> refColNames = sc.getReferencesColumns();
@@ -489,6 +492,7 @@ class ConstraintValidator {
             for (Table childTable : schema.getTables().values()) {
                 for (StoredConstraint sc : childTable.getConstraints()) {
                     if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                    if (sc.isNotEnforced()) continue;
                     if (!sc.getReferencesTable().equalsIgnoreCase(parentTable.getName())) continue;
 
                     List<String> refColNames = sc.getReferencesColumns();

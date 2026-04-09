@@ -38,6 +38,7 @@ class CatalogConstraintBuilder {
                 col("confupdtype", DataType.CHAR),
                 col("confdeltype", DataType.CHAR),
                 col("connoinherit", DataType.BOOLEAN),
+                col("conenforced", DataType.BOOLEAN),
                 col("conbin", DataType.TEXT),
                 col("conexclop", DataType.TEXT),
                 col("conperiod", DataType.BOOLEAN),
@@ -126,6 +127,7 @@ class CatalogConstraintBuilder {
                             confupdtype,
                             confdeltype,
                             connoinherit,
+                            !sc.isNotEnforced(), // conenforced: true = enforced (default), false = not enforced
                             null, null, false, 0, 0, 1 // conbin, conexclop, conperiod, conparentid, contypid, xmin
                     });
                 }
@@ -155,7 +157,9 @@ class CatalogConstraintBuilder {
                                 null,
                                 false, false, true,
                                 true, 0,
-                                " ", " ", false, null, null, false, 0, 0, 1
+                                " ", " ", false,
+                                true, // conenforced
+                                null, null, false, 0, 0, 1
                         });
                     }
                 }
@@ -180,6 +184,7 @@ class CatalogConstraintBuilder {
                         false, false, true,
                         true, 0,
                         " ", " ", true, // connoinherit = true for domain constraints
+                        true, // conenforced
                         dom.getCheckExpression(), null, false, 0, domTypeOid, 1
                 });
             }
@@ -195,6 +200,7 @@ class CatalogConstraintBuilder {
                         false, false, true,
                         true, 0,
                         " ", " ", true,
+                        true, // conenforced
                         nc.rawCheckExpr(), null, false, 0, domTypeOid, 1
                 });
             }
@@ -211,6 +217,7 @@ class CatalogConstraintBuilder {
                         false, false, true,
                         true, 0,
                         " ", " ", true,
+                        true, // conenforced
                         null, null, false, 0, domTypeOid, 1
                 });
             }

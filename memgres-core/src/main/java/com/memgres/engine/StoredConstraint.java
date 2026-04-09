@@ -59,6 +59,7 @@ public class StoredConstraint {
     private boolean nullsNotDistinct;
     private boolean deferrable;
     private boolean initiallyDeferred;
+    private boolean notEnforced; // PG 18: NOT ENFORCED constraints are stored but not validated
     private boolean fromIndex; // true if this constraint was created via CREATE UNIQUE INDEX (not ADD CONSTRAINT)
     private boolean promotedFromIndex; // true if created via ADD CONSTRAINT ... UNIQUE USING INDEX
     private Expression whereExpr; // partial index predicate
@@ -116,6 +117,8 @@ public class StoredConstraint {
     public void setDeferrable(boolean deferrable) { this.deferrable = deferrable; }
     public boolean isInitiallyDeferred() { return initiallyDeferred; }
     public void setInitiallyDeferred(boolean initiallyDeferred) { this.initiallyDeferred = initiallyDeferred; }
+    public boolean isNotEnforced() { return notEnforced; }
+    public void setNotEnforced(boolean notEnforced) { this.notEnforced = notEnforced; }
     public boolean isFromIndex() { return fromIndex; }
     public void setFromIndex(boolean fromIndex) { this.fromIndex = fromIndex; }
     public boolean isPromotedFromIndex() { return promotedFromIndex; }

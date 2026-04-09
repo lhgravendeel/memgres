@@ -17,6 +17,7 @@ public final class TableConstraint {
     public final boolean nullsNotDistinct;
     public final boolean deferrable;
     public final boolean initiallyDeferred;
+    public final boolean notEnforced;
     public final List<ExcludeElement> excludeElements;
 
     public TableConstraint(
@@ -31,6 +32,7 @@ public final class TableConstraint {
             boolean nullsNotDistinct,
             boolean deferrable,
             boolean initiallyDeferred,
+            boolean notEnforced,
             List<ExcludeElement> excludeElements
     ) {
         this.name = name;
@@ -44,6 +46,7 @@ public final class TableConstraint {
         this.nullsNotDistinct = nullsNotDistinct;
         this.deferrable = deferrable;
         this.initiallyDeferred = initiallyDeferred;
+        this.notEnforced = notEnforced;
         this.excludeElements = excludeElements;
     }
 
@@ -85,7 +88,7 @@ public final class TableConstraint {
                            List<String> referencesColumns, String onDelete, String onUpdate,
                            boolean nullsNotDistinct, boolean deferrable, boolean initiallyDeferred) {
         this(name, type, columns, checkExpr, referencesTable, referencesColumns,
-                onDelete, onUpdate, nullsNotDistinct, deferrable, initiallyDeferred, null);
+                onDelete, onUpdate, nullsNotDistinct, deferrable, initiallyDeferred, false, null);
     }
 
     // Constructor without deferrable fields
@@ -94,7 +97,7 @@ public final class TableConstraint {
                            List<String> referencesColumns, String onDelete, String onUpdate,
                            boolean nullsNotDistinct) {
         this(name, type, columns, checkExpr, referencesTable, referencesColumns,
-                onDelete, onUpdate, nullsNotDistinct, false, false, null);
+                onDelete, onUpdate, nullsNotDistinct, false, false, false, null);
     }
 
     // Backwards-compatible constructor without nullsNotDistinct
@@ -102,7 +105,7 @@ public final class TableConstraint {
                            Expression checkExpr, String referencesTable,
                            List<String> referencesColumns, String onDelete, String onUpdate) {
         this(name, type, columns, checkExpr, referencesTable, referencesColumns,
-                onDelete, onUpdate, false, false, false, null);
+                onDelete, onUpdate, false, false, false, false, null);
     }
 
     public enum ConstraintType {
@@ -120,6 +123,7 @@ public final class TableConstraint {
     public boolean nullsNotDistinct() { return nullsNotDistinct; }
     public boolean deferrable() { return deferrable; }
     public boolean initiallyDeferred() { return initiallyDeferred; }
+    public boolean notEnforced() { return notEnforced; }
     public List<ExcludeElement> excludeElements() { return excludeElements; }
 
     @Override
@@ -138,12 +142,13 @@ public final class TableConstraint {
             && nullsNotDistinct == that.nullsNotDistinct
             && deferrable == that.deferrable
             && initiallyDeferred == that.initiallyDeferred
+            && notEnforced == that.notEnforced
             && java.util.Objects.equals(excludeElements, that.excludeElements);
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(name, type, columns, checkExpr, referencesTable, referencesColumns, onDelete, onUpdate, nullsNotDistinct, deferrable, initiallyDeferred, excludeElements);
+        return java.util.Objects.hash(name, type, columns, checkExpr, referencesTable, referencesColumns, onDelete, onUpdate, nullsNotDistinct, deferrable, initiallyDeferred, notEnforced, excludeElements);
     }
 
     @Override
