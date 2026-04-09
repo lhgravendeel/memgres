@@ -29,6 +29,9 @@ public class Database {
     private final Map<String, DomainType> domains = new ConcurrentHashMap<>();
     private final Map<String, List<CreateTypeStmt.CompositeField>> compositeTypes = new ConcurrentHashMap<>();
     private final Map<String, PgAggregate> userAggregates = new ConcurrentHashMap<>();
+    private final Map<String, PgOperator> userOperators = new ConcurrentHashMap<>();
+    private final Map<String, PgOperatorFamily> userOperatorFamilies = new ConcurrentHashMap<>();
+    private final Map<String, PgOperatorClass> userOperatorClasses = new ConcurrentHashMap<>();
     private final Map<String, List<String>> indexColumns = new ConcurrentHashMap<>();
     private final Map<String, String> indexTableNames = new ConcurrentHashMap<>(); // index name → schema.table
     private final Map<String, Boolean> indexUniqueFlags = new ConcurrentHashMap<>(); // index name → is unique
@@ -305,6 +308,84 @@ public class Database {
 
     public void removeAggregate(String name) {
         userAggregates.remove(name.toLowerCase());
+    }
+
+    // User-defined operators (keyed by name+argtypes for overloading)
+    public void addOperator(PgOperator op) {
+        userOperators.put(op.getKey().toLowerCase(), op);
+    }
+
+    public PgOperator getOperator(String key) {
+        return userOperators.get(key.toLowerCase());
+    }
+
+    public boolean hasOperator(String key) {
+        return userOperators.containsKey(key.toLowerCase());
+    }
+
+    public void removeOperator(String key) {
+        userOperators.remove(key.toLowerCase());
+    }
+
+    public Map<String, PgOperator> getUserOperators() {
+        return userOperators;
+    }
+
+    /** Find all operators with a given name (across all arg type combinations). */
+    public java.util.List<PgOperator> getOperatorsByName(String name) {
+        java.util.List<PgOperator> result = new java.util.ArrayList<>();
+        for (PgOperator op : userOperators.values()) {
+            if (op.getName().equals(name)) result.add(op);
+        }
+        return result;
+    }
+
+    // User-defined operator families
+    public void addOperatorFamily(PgOperatorFamily fam) {
+        userOperatorFamilies.put(fam.getKey(), fam);
+    }
+
+    public PgOperatorFamily getOperatorFamily(String key) {
+        return userOperatorFamilies.get(key);
+    }
+
+    public boolean hasOperatorFamily(String key) {
+        return userOperatorFamilies.containsKey(key);
+    }
+
+    public void removeOperatorFamily(String key) {
+        userOperatorFamilies.remove(key);
+    }
+
+    public Map<String, PgOperatorFamily> getUserOperatorFamilies() {
+        return userOperatorFamilies;
+    }
+
+    // User-defined operator classes
+    public void addOperatorClass(PgOperatorClass cls) {
+        userOperatorClasses.put(cls.getKey(), cls);
+    }
+
+    public PgOperatorClass getOperatorClass(String key) {
+        return userOperatorClasses.get(key);
+    }
+
+    public boolean hasOperatorClass(String key) {
+        return userOperatorClasses.containsKey(key);
+    }
+
+    public void removeOperatorClass(String key) {
+        userOperatorClasses.remove(key);
+    }
+
+    public Map<String, PgOperatorClass> getUserOperatorClasses() {
+        return userOperatorClasses;
+    }
+
+    /** Remove all operator classes belonging to a given family. */
+    public void removeOperatorClassesByFamily(String familyName) {
+        userOperatorClasses.entrySet().removeIf(e ->
+                familyName.equalsIgnoreCase(e.getValue().getFamilyName()));
     }
 
     // Functions, stored by name, supporting overloads with different parameter types

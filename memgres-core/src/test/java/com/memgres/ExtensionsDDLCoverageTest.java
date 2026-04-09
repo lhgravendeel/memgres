@@ -414,7 +414,7 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void operator_drop() {
-        assertNoError("DROP OPERATOR === (INTEGER, INTEGER)");
+        assertNoError("DROP OPERATOR IF EXISTS === (INTEGER, INTEGER)");
     }
 
     @Test
@@ -463,7 +463,7 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void opclass_drop() {
-        assertNoError("DROP OPERATOR CLASS my_ops USING btree");
+        assertNoError("DROP OPERATOR CLASS IF EXISTS my_ops USING btree");
     }
 
     @Test
@@ -478,7 +478,7 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void opfamily_drop() {
-        assertNoError("DROP OPERATOR FAMILY my_fam USING btree");
+        assertNoError("DROP OPERATOR FAMILY IF EXISTS my_fam USING btree");
     }
 
     @Test

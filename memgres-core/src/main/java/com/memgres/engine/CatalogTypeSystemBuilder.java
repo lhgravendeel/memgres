@@ -316,7 +316,72 @@ class CatalogTypeSystemBuilder {
                 col("oprjoin", DataType.INTEGER), col("oprcom", DataType.INTEGER),
                 col("oprnegate", DataType.INTEGER), col("oprcanmerge", DataType.BOOLEAN),
                 col("oprcanhash", DataType.BOOLEAN), col("xmin", DataType.INTEGER));
-        return new Table("pg_operator", cols);
+        Table table = new Table("pg_operator", cols);
+        int pgCatalogNs = oids.oid("ns:pg_catalog");
+        int publicNs = oids.oid("ns:public");
+
+        // Bootstrap built-in binary operators
+        String[][] builtinBinary = {
+                {"+", "b"}, {"-", "b"}, {"*", "b"}, {"/", "b"}, {"%", "b"},
+                {"=", "b"}, {"<>", "b"}, {"!=", "b"}, {"<", "b"}, {">", "b"},
+                {"<=", "b"}, {">=", "b"}, {"||", "b"}, {"&&", "b"},
+                {"~~", "b"}, {"!~~", "b"}, {"~~*", "b"}, {"!~~*", "b"},
+                {"~", "b"}, {"!~", "b"}, {"~*", "b"}, {"!~*", "b"},
+                {"@>", "b"}, {"<@", "b"}, {"?", "b"}, {"?|", "b"}, {"?&", "b"},
+                {"->", "b"}, {"->>", "b"}, {"#>", "b"}, {"#>>", "b"},
+                {"IS", "b"}, {"^", "b"}, {"&", "b"}, {"|", "b"},
+                {"<<", "b"}, {">>", "b"},
+        };
+        for (String[] op : builtinBinary) {
+            int opOid = oids.oid("operator:pg_catalog." + op[0]);
+            table.insertRow(new Object[]{opOid, op[0], pgCatalogNs, 10,
+                    op[1], 0, 0, 0, 0, 0, 0, 0, 0, false, false, 1});
+        }
+
+        // User-defined operators
+        for (Map.Entry<String, PgOperator> entry : database.getUserOperators().entrySet()) {
+            PgOperator op = entry.getValue();
+            String schemaName = op.getSchemaName() != null ? op.getSchemaName() : "public";
+            int ns = "pg_catalog".equals(schemaName) ? pgCatalogNs : oids.oid("ns:" + schemaName);
+            int ownerOid = op.getOwner() != null ? oids.oid("role:" + op.getOwner()) : 10;
+            int opOid = oids.oid("operator:" + schemaName + "." + op.getKey());
+            int leftOid = resolveTypeOid(op.getLeftArg());
+            int rightOid = resolveTypeOid(op.getRightArg());
+            int comOid = 0;
+            if (op.getCommutator() != null) {
+                // Self-referencing commutator: use own OID
+                if (op.getCommutator().equals(op.getName())) {
+                    comOid = opOid;
+                }
+            }
+            table.insertRow(new Object[]{opOid, op.getName(), ns, ownerOid,
+                    op.getKind(), leftOid, rightOid, 0, 0, 0, 0, comOid, 0,
+                    op.isMerges(), op.isHashes(), 1});
+        }
+
+        return table;
+    }
+
+    private int resolveTypeOid(String typeName) {
+        if (typeName == null) return 0;
+        try {
+            DataType dt = DataType.fromPgName(typeName);
+            if (dt != null) return dt.getOid();
+        } catch (Exception ignored) {}
+        return oids.oid("type:" + typeName.toLowerCase());
+    }
+
+    private int resolveAccessMethodOid(String method) {
+        if (method == null) return 0;
+        switch (method.toLowerCase()) {
+            case "btree": return 403;
+            case "hash": return 405;
+            case "gist": return 783;
+            case "gin": return 2742;
+            case "spgist": return 4000;
+            case "brin": return 3580;
+            default: return oids.oid("am:" + method.toLowerCase());
+        }
     }
 
     Table buildPgOpclass() {
@@ -362,6 +427,26 @@ class CatalogTypeSystemBuilder {
                 oids.oid("opfamily:hash_text_ops"), DataType.TEXT.getOid(), 0, true, 405, 1});
         table.insertRow(new Object[]{oids.oid("opclass:hash_bool_ops"), "bool_ops", pgCatalogNs, 10,
                 oids.oid("opfamily:hash_bool_ops"), DataType.BOOLEAN.getOid(), 0, true, 405, 1});
+
+        // User-defined operator classes
+        int publicNsOpc = oids.oid("ns:public");
+        for (Map.Entry<String, PgOperatorClass> entry : database.getUserOperatorClasses().entrySet()) {
+            PgOperatorClass cls = entry.getValue();
+            String schemaName = cls.getSchemaName() != null ? cls.getSchemaName() : "public";
+            int ns = "pg_catalog".equals(schemaName) ? pgCatalogNs : oids.oid("ns:" + schemaName);
+            int ownerOid = cls.getOwner() != null ? oids.oid("role:" + cls.getOwner()) : 10;
+            int clsOid = oids.oid("opclass:" + cls.getKey());
+            int typeOid = resolveTypeOid(cls.getForType());
+            int methodOid = resolveAccessMethodOid(cls.getMethod());
+            int familyOid = 0;
+            if (cls.getFamilyName() != null) {
+                String famKey = cls.getFamilyName().toLowerCase() + ":" + cls.getMethod().toLowerCase();
+                familyOid = oids.oid("opfamily:" + famKey);
+            }
+            table.insertRow(new Object[]{clsOid, cls.getName(), ns, ownerOid,
+                    familyOid, typeOid, 0, cls.isDefault(), methodOid, 1});
+        }
+
         return table;
     }
 
@@ -384,6 +469,19 @@ class CatalogTypeSystemBuilder {
         table.insertRow(new Object[]{oids.oid("opfamily:hash_integer_ops"), "integer_ops", pgCatalogNs, 10, 405, 1});
         table.insertRow(new Object[]{oids.oid("opfamily:hash_text_ops"), "text_ops", pgCatalogNs, 10, 405, 1});
         table.insertRow(new Object[]{oids.oid("opfamily:hash_bool_ops"), "bool_ops", pgCatalogNs, 10, 405, 1});
+
+        // User-defined operator families
+        int publicNsOpf = oids.oid("ns:public");
+        for (Map.Entry<String, PgOperatorFamily> entry : database.getUserOperatorFamilies().entrySet()) {
+            PgOperatorFamily fam = entry.getValue();
+            String schemaName = fam.getSchemaName() != null ? fam.getSchemaName() : "public";
+            int ns = "pg_catalog".equals(schemaName) ? pgCatalogNs : oids.oid("ns:" + schemaName);
+            int ownerOid = fam.getOwner() != null ? oids.oid("role:" + fam.getOwner()) : 10;
+            int famOid = oids.oid("opfamily:" + fam.getKey());
+            int methodOid = resolveAccessMethodOid(fam.getMethod());
+            table.insertRow(new Object[]{famOid, fam.getName(), ns, ownerOid, methodOid, 1});
+        }
+
         return table;
     }
 
