@@ -491,4 +491,239 @@ class VirtualGeneratedColumnTest {
         assertEquals(1, rows.size());
         assertEquals(2, rows.get(0).size()); // only id and a
     }
+
+    // ========================================================================
+    // MERGE with virtual columns
+    // ========================================================================
+
+    @Test
+    void merge_on_condition_sees_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("CREATE TABLE t2(id int, val int)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");
+        exec("INSERT INTO t2 VALUES (10, 99)");
+        // MERGE ON condition references virtual column
+        exec("MERGE INTO t1 USING t2 ON t1.doubled = t2.id " +
+             "WHEN MATCHED THEN UPDATE SET a = t2.val " +
+             "WHEN NOT MATCHED THEN INSERT VALUES (t2.id, t2.val)");
+        // doubled=10 matches t2.id=10, so UPDATE a=99
+        assertEquals("99", scalar("SELECT a FROM t1 WHERE id = 1"));
+    }
+
+    @Test
+    void merge_update_recomputes_stored_generated() throws SQLException {
+        // Tests the computeGeneratedColumns fix for MERGE WHEN MATCHED UPDATE
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, computed int GENERATED ALWAYS AS (a + 100) STORED)");
+        exec("CREATE TABLE t2(id int, val int)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");
+        exec("INSERT INTO t2 VALUES (1, 20)");
+        exec("MERGE INTO t1 USING t2 ON t1.id = t2.id " +
+             "WHEN MATCHED THEN UPDATE SET a = t2.val");
+        // computed should be recomputed: 20 + 100 = 120
+        assertEquals("120", scalar("SELECT computed FROM t1 WHERE id = 1"));
+    }
+
+    @Test
+    void merge_update_recomputes_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("CREATE TABLE t2(id int, val int)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");
+        exec("INSERT INTO t2 VALUES (1, 20)");
+        exec("MERGE INTO t1 USING t2 ON t1.id = t2.id " +
+             "WHEN MATCHED THEN UPDATE SET a = t2.val");
+        assertEquals("40", scalar("SELECT doubled FROM t1 WHERE id = 1"));
+    }
+
+    @Test
+    void merge_not_matched_by_source_sees_virtual() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("CREATE TABLE t2(id int, val int)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 10)");
+        exec("INSERT INTO t2 VALUES (1, 99)");
+        // Row id=2 is not matched by source. Use virtual column in AND condition
+        exec("MERGE INTO t1 USING t2 ON t1.id = t2.id " +
+             "WHEN MATCHED THEN UPDATE SET a = t2.val " +
+             "WHEN NOT MATCHED BY SOURCE AND doubled > 15 THEN DELETE");
+        // id=1: matched, updated to 99
+        assertEquals("99", scalar("SELECT a FROM t1 WHERE id = 1"));
+        // id=2: not matched, doubled=20 > 15, should be deleted
+        assertEquals("1", scalar("SELECT count(*) FROM t1"));
+    }
+
+    // ========================================================================
+    // ON CONFLICT with virtual columns
+    // ========================================================================
+
+    @Test
+    void on_conflict_do_update_sees_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");
+        // DO UPDATE SET references the virtual column of the existing row
+        exec("INSERT INTO t1(id, a) VALUES (1, 99) ON CONFLICT (id) DO UPDATE SET a = t1.doubled + 1");
+        // t1.doubled was 10 at conflict time, so a = 10 + 1 = 11
+        assertEquals("11", scalar("SELECT a FROM t1 WHERE id = 1"));
+    }
+
+    @Test
+    void on_conflict_recomputes_stored_generated() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, computed int GENERATED ALWAYS AS (a + 100) STORED)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 20) ON CONFLICT (id) DO UPDATE SET a = EXCLUDED.a");
+        // computed should be recomputed: 20 + 100 = 120
+        assertEquals("120", scalar("SELECT computed FROM t1 WHERE id = 1"));
+    }
+
+    // ========================================================================
+    // Validation: DEFAULT + GENERATED rejected
+    // ========================================================================
+
+    @Test
+    void reject_default_plus_generated() {
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, a int DEFAULT 1 GENERATED ALWAYS AS (a + 1) VIRTUAL)"));
+        assertTrue(ex.getMessage().contains("generated column") || ex.getMessage().contains("default value"),
+                "Expected error about generated column + default, got: " + ex.getMessage());
+    }
+
+    @Test
+    void reject_default_plus_stored_generated() {
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, a int DEFAULT 1 GENERATED ALWAYS AS (a + 1) STORED)"));
+        assertTrue(ex.getMessage().contains("generated column") || ex.getMessage().contains("default value"),
+                "Expected error about generated column + default, got: " + ex.getMessage());
+    }
+
+    // ========================================================================
+    // Virtual column with multiple base columns
+    // ========================================================================
+
+    @Test
+    void virtual_column_referencing_multiple_columns() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, x int, y int, " +
+             "sum_xy int GENERATED ALWAYS AS (x + y) VIRTUAL)");
+        exec("INSERT INTO t1(id, x, y) VALUES (1, 3, 7)");
+        assertEquals("10", scalar("SELECT sum_xy FROM t1 WHERE id = 1"));
+        exec("UPDATE t1 SET x = 10 WHERE id = 1");
+        assertEquals("17", scalar("SELECT sum_xy FROM t1 WHERE id = 1"));
+    }
+
+    @Test
+    void multiple_virtual_columns_same_base() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL, " +
+             "tripled int GENERATED ALWAYS AS (a * 3) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 4)");
+        assertEquals("8", scalar("SELECT doubled FROM t1 WHERE id = 1"));
+        assertEquals("12", scalar("SELECT tripled FROM t1 WHERE id = 1"));
+    }
+
+    // ========================================================================
+    // Virtual column with empty table
+    // ========================================================================
+
+    @Test
+    void virtual_column_empty_table() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        List<List<String>> rows = query("SELECT * FROM t1");
+        assertEquals(0, rows.size());
+        assertEquals("0", scalar("SELECT count(*) FROM t1"));
+    }
+
+    // ========================================================================
+    // INSERT ... SELECT with virtual column source
+    // ========================================================================
+
+    @Test
+    void insert_select_from_table_with_virtual_columns() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("CREATE TABLE t2(id int, val int)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 10)");
+        // SELECT virtual column from t1 and insert into t2
+        exec("INSERT INTO t2 SELECT id, doubled FROM t1");
+        List<List<String>> rows = query("SELECT * FROM t2 ORDER BY id");
+        assertEquals(2, rows.size());
+        assertEquals("10", rows.get(0).get(1)); // 5*2
+        assertEquals("20", rows.get(1).get(1)); // 10*2
+    }
+
+    // ========================================================================
+    // RETURNING * with virtual column
+    // ========================================================================
+
+    @Test
+    void insert_returning_star_includes_virtual() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        List<List<String>> rows = query("INSERT INTO t1(id, a) VALUES (1, 7) RETURNING *");
+        assertEquals(1, rows.size());
+        assertEquals("1", rows.get(0).get(0));
+        assertEquals("7", rows.get(0).get(1));
+        assertEquals("14", rows.get(0).get(2));
+    }
+
+    @Test
+    void update_returning_star_includes_virtual() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");
+        List<List<String>> rows = query("UPDATE t1 SET a = 20 RETURNING *");
+        assertEquals(1, rows.size());
+        assertEquals("20", rows.get(0).get(1));
+        assertEquals("40", rows.get(0).get(2));
+    }
+
+    // ========================================================================
+    // Virtual column with boolean expression
+    // ========================================================================
+
+    @Test
+    void virtual_column_boolean_expression() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, age int, " +
+             "is_adult boolean GENERATED ALWAYS AS (age >= 18) VIRTUAL)");
+        exec("INSERT INTO t1(id, age) VALUES (1, 20), (2, 15)");
+        assertEquals("t", scalar("SELECT is_adult FROM t1 WHERE id = 1"));
+        assertEquals("f", scalar("SELECT is_adult FROM t1 WHERE id = 2"));
+    }
+
+    // ========================================================================
+    // DISTINCT on virtual column
+    // ========================================================================
+
+    @Test
+    void distinct_on_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, doubled int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 5), (3, 10)");
+        List<List<String>> rows = query("SELECT DISTINCT doubled FROM t1 ORDER BY doubled");
+        assertEquals(2, rows.size());
+        assertEquals("10", rows.get(0).get(0));
+        assertEquals("20", rows.get(1).get(0));
+    }
+
+    // ========================================================================
+    // GROUP BY virtual column
+    // ========================================================================
+
+    @Test
+    void group_by_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, bucket int GENERATED ALWAYS AS (a / 10) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 15), (3, 25), (4, 12)");
+        List<List<String>> rows = query("SELECT bucket, count(*) FROM t1 GROUP BY bucket ORDER BY bucket");
+        assertEquals(3, rows.size());
+        assertEquals("0", rows.get(0).get(0));  // a=5 → bucket=0
+        assertEquals("1", rows.get(0).get(1));
+        assertEquals("1", rows.get(1).get(0));  // a=15,12 → bucket=1
+        assertEquals("2", rows.get(1).get(1));
+        assertEquals("2", rows.get(2).get(0));  // a=25 → bucket=2
+        assertEquals("1", rows.get(2).get(1));
+    }
+
+    // ========================================================================
+    // Virtual column with nonexistent column reference
+    // ========================================================================
+
+    @Test
+    void virtual_column_rejects_nonexistent_column() {
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+                     "b int GENERATED ALWAYS AS (no_such_col * 2) VIRTUAL)"));
+        assertEquals("42703", ex.getSQLState());
+    }
 }

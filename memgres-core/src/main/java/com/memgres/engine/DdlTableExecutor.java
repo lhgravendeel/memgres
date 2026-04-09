@@ -154,6 +154,10 @@ class DdlTableExecutor {
 
             // Validate generated column expression
             if (def.generatedExpr() != null) {
+                // PG rejects DEFAULT + GENERATED ALWAYS AS on same column
+                if (def.defaultExpr() != null) {
+                    throw new MemgresException("a generated column is not allowed to have a default value", "42601");
+                }
                 String genNorm = def.generatedExpr().toLowerCase().replaceAll("\\s+", "");
                 if (genNorm.contains("now(") || genNorm.contains("random(") || genNorm.contains("clock_timestamp(")
                         || genNorm.contains("current_timestamp") || genNorm.contains("timeofday(")

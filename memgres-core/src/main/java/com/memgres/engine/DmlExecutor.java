@@ -340,7 +340,8 @@ class DmlExecutor {
                         Object[] oldRow = Arrays.copyOf(conflictRow, conflictRow.length);
                         table.beforeRowUpdate(conflictRow, oldRow);
                         try {
-                            RowContext conflictCtx = new RowContext(table, null, conflictRow);
+                            Object[] evalConflict = hasVirtualColumns(table) ? computeVirtualColumns(table, conflictRow) : conflictRow;
+                            RowContext conflictCtx = new RowContext(table, null, evalConflict);
                             for (InsertStmt.SetClause set : stmt.onConflict().doUpdate()) {
                                 int colIdx = table.getColumnIndex(set.column());
                                 if (colIdx < 0) {
@@ -351,6 +352,7 @@ class DmlExecutor {
                                 Object val = conflictHelper.evalExprWithExcluded(set.value(), conflictCtx, table, row);
                                 conflictRow[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
                             }
+                            computeGeneratedColumns(table, conflictRow);
                             table.afterRowUpdate(conflictRow);
                         } catch (Exception e) {
                             // Restore old values and re-add to index on failure
@@ -1175,13 +1177,15 @@ class DmlExecutor {
         // Use snapshot rows for ON-condition matching (PG matches against pre-MERGE state)
         List<Object[]> originalTargetRows = new ArrayList<>(targetTable.getRows());
 
+        boolean mergeTargetHasVirtual = hasVirtualColumns(targetTable);
         try {
         for (RowContext sourceCtx : sourceRows) {
             // Find matching target rows for this source row using the original snapshot
             List<Object[]> matchedTargetRows = new ArrayList<>();
             for (Object[] targetRow : originalTargetRows) {
                 if (processedTargetRows.contains(targetRow)) continue;
-                RowContext targetCtx = new RowContext(targetTable, targetAlias, targetRow);
+                Object[] evalRow = mergeTargetHasVirtual ? computeVirtualColumns(targetTable, targetRow) : targetRow;
+                RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
                 RowContext combined = targetCtx.merge(sourceCtx);
                 if (executor.isTruthy(executor.evalExpr(stmt.onCondition(), combined))) {
                     matchedTargetRows.add(targetRow);
@@ -1192,7 +1196,8 @@ class DmlExecutor {
                 // WHEN MATCHED clauses
                 for (Object[] targetRow : matchedTargetRows) {
                     if (processedTargetRows.contains(targetRow)) continue;
-                    RowContext targetCtx = new RowContext(targetTable, targetAlias, targetRow);
+                    Object[] evalRow = mergeTargetHasVirtual ? computeVirtualColumns(targetTable, targetRow) : targetRow;
+                    RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
                     RowContext combined = targetCtx.merge(sourceCtx);
 
                     for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
@@ -1223,6 +1228,7 @@ class DmlExecutor {
                                     Object val = executor.evalExpr(set.value(), combined);
                                     targetRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
                                 }
+                                computeGeneratedColumns(targetTable, targetRow);
                                 executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
@@ -1327,7 +1333,8 @@ class DmlExecutor {
                 for (Object[] targetRow : originalTargetRows) {
                     if (processedTargetRows.contains(targetRow)) continue;
                     if (rowsToDelete.contains(targetRow)) continue;
-                    RowContext targetCtx = new RowContext(targetTable, targetAlias, targetRow);
+                    Object[] evalRow = mergeTargetHasVirtual ? computeVirtualColumns(targetTable, targetRow) : targetRow;
+                    RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
                     for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
                         if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
                             MergeStmt.WhenNotMatchedBySource wnmbs = (MergeStmt.WhenNotMatchedBySource) clause;
@@ -1351,6 +1358,7 @@ class DmlExecutor {
                                     Object val = executor.evalExpr(set.value(), targetCtx);
                                     targetRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
                                 }
+                                computeGeneratedColumns(targetTable, targetRow);
                                 executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
