@@ -16,6 +16,7 @@ public final class MergeStmt implements Statement {
     public final SelectStmt.FromItem source;
     public final Expression onCondition;
     public final List<WhenClause> whenClauses;
+    public final List<SelectStmt.SelectTarget> returning;
 
     public MergeStmt(
             String schema,
@@ -23,7 +24,8 @@ public final class MergeStmt implements Statement {
             String targetAlias,
             SelectStmt.FromItem source,
             Expression onCondition,
-            List<WhenClause> whenClauses
+            List<WhenClause> whenClauses,
+            List<SelectStmt.SelectTarget> returning
     ) {
         this.schema = schema;
         this.targetTable = targetTable;
@@ -31,6 +33,7 @@ public final class MergeStmt implements Statement {
         this.source = source;
         this.onCondition = onCondition;
         this.whenClauses = whenClauses;
+        this.returning = returning;
     }
 
     public interface WhenClause {}
@@ -111,12 +114,53 @@ public final class MergeStmt implements Statement {
         }
     }
 
+    /**
+     * WHEN NOT MATCHED BY SOURCE [AND condition] THEN UPDATE SET ... / DELETE / DO NOTHING
+     * (PG 17+) — fires for target rows with no matching source row.
+     */
+    public static final class WhenNotMatchedBySource implements WhenClause {
+        public final Expression andCondition;
+        public final boolean isDelete;
+        public final List<InsertStmt.SetClause> setClauses;
+
+        public WhenNotMatchedBySource(Expression andCondition, boolean isDelete, List<InsertStmt.SetClause> setClauses) {
+            this.andCondition = andCondition;
+            this.isDelete = isDelete;
+            this.setClauses = setClauses;
+        }
+
+        public Expression andCondition() { return andCondition; }
+        public boolean isDelete() { return isDelete; }
+        public List<InsertStmt.SetClause> setClauses() { return setClauses; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            WhenNotMatchedBySource that = (WhenNotMatchedBySource) o;
+            return isDelete == that.isDelete
+                && Objects.equals(andCondition, that.andCondition)
+                && Objects.equals(setClauses, that.setClauses);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(andCondition, isDelete, setClauses);
+        }
+
+        @Override
+        public String toString() {
+            return "WhenNotMatchedBySource[andCondition=" + andCondition + ", isDelete=" + isDelete + ", setClauses=" + setClauses + "]";
+        }
+    }
+
     public String schema() { return schema; }
     public String targetTable() { return targetTable; }
     public String targetAlias() { return targetAlias; }
     public SelectStmt.FromItem source() { return source; }
     public Expression onCondition() { return onCondition; }
     public List<WhenClause> whenClauses() { return whenClauses; }
+    public List<SelectStmt.SelectTarget> returning() { return returning; }
 
     @Override
     public boolean equals(Object o) {
@@ -128,17 +172,19 @@ public final class MergeStmt implements Statement {
             && Objects.equals(targetAlias, that.targetAlias)
             && Objects.equals(source, that.source)
             && Objects.equals(onCondition, that.onCondition)
-            && Objects.equals(whenClauses, that.whenClauses);
+            && Objects.equals(whenClauses, that.whenClauses)
+            && Objects.equals(returning, that.returning);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(schema, targetTable, targetAlias, source, onCondition, whenClauses);
+        return Objects.hash(schema, targetTable, targetAlias, source, onCondition, whenClauses, returning);
     }
 
     @Override
     public String toString() {
         return "MergeStmt[schema=" + schema + ", targetTable=" + targetTable + ", targetAlias=" + targetAlias
-            + ", source=" + source + ", onCondition=" + onCondition + ", whenClauses=" + whenClauses + "]";
+            + ", source=" + source + ", onCondition=" + onCondition + ", whenClauses=" + whenClauses
+            + ", returning=" + returning + "]";
     }
 }

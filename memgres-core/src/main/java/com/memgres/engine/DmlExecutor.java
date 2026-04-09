@@ -1091,6 +1091,7 @@ class DmlExecutor {
         // Validate: cannot have more than one unconditional WHEN MATCHED clause
         int unconditionalMatched = 0;
         int unconditionalNotMatched = 0;
+        int unconditionalNotMatchedBySource = 0;
         for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
             if (clause instanceof MergeStmt.WhenMatched) {
                 MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
@@ -1098,6 +1099,9 @@ class DmlExecutor {
             } else if (clause instanceof MergeStmt.WhenNotMatched) {
                 MergeStmt.WhenNotMatched wnm = (MergeStmt.WhenNotMatched) clause;
                 if (wnm.andCondition() == null) unconditionalNotMatched++;
+            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                MergeStmt.WhenNotMatchedBySource wnmbs = (MergeStmt.WhenNotMatchedBySource) clause;
+                if (wnmbs.andCondition() == null) unconditionalNotMatchedBySource++;
             }
         }
         if (unconditionalMatched > 1) {
@@ -1106,12 +1110,20 @@ class DmlExecutor {
         if (unconditionalNotMatched > 1) {
             throw new MemgresException("MERGE command cannot have more than one unconditional WHEN NOT MATCHED clause", "42601");
         }
+        if (unconditionalNotMatchedBySource > 1) {
+            throw new MemgresException("MERGE command cannot have more than one unconditional WHEN NOT MATCHED BY SOURCE clause", "42601");
+        }
 
         // Validate UPDATE SET columns exist in target table before executing
         for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            List<InsertStmt.SetClause> setsToValidate = null;
             if (clause instanceof MergeStmt.WhenMatched && !((MergeStmt.WhenMatched) clause).isDelete()) {
-                MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
-                for (InsertStmt.SetClause set : wm.setClauses()) {
+                setsToValidate = ((MergeStmt.WhenMatched) clause).setClauses();
+            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource && !((MergeStmt.WhenNotMatchedBySource) clause).isDelete()) {
+                setsToValidate = ((MergeStmt.WhenNotMatchedBySource) clause).setClauses();
+            }
+            if (setsToValidate != null) {
+                for (InsertStmt.SetClause set : setsToValidate) {
                     int colIdx = targetTable.getColumnIndex(set.column());
                     if (colIdx < 0) {
                         throw new MemgresException("column \"" + set.column() + "\" of relation \"" + stmt.targetTable() + "\" does not exist", "42703");
@@ -1119,6 +1131,9 @@ class DmlExecutor {
                 }
             }
         }
+
+        // Validate RETURNING columns
+        validateReturning(stmt.returning(), targetTable);
 
         // Resolve source rows
         List<RowContext> sourceRows = executor.fromResolver.resolveFromItem(stmt.source());
@@ -1130,6 +1145,8 @@ class DmlExecutor {
         }
 
         int mergeCount = 0;
+        boolean hasReturning = stmt.returning() != null && !stmt.returning().isEmpty();
+        List<Object[]> returningRows = hasReturning ? new ArrayList<>() : null;
         List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.targetTable());
 
         // Track rows to delete (we must not modify the row list while iterating)
@@ -1170,10 +1187,15 @@ class DmlExecutor {
                                 continue;
                             }
                             if (wm.isDelete()) {
-                                // DELETE
+                                // DELETE — collect RETURNING before marking for deletion
+                                if (hasReturning) {
+                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow));
+                                }
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
-                            } else {
+                                processedTargetRows.add(targetRow);
+                                mergeCount++;
+                            } else if (wm.setClauses() != null && !wm.setClauses().isEmpty()) {
                                 // UPDATE
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
                                 for (InsertStmt.SetClause set : wm.setClauses()) {
@@ -1189,9 +1211,16 @@ class DmlExecutor {
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
                                 // Fire AFTER UPDATE triggers for MERGE
                                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable);
+                                // Collect RETURNING after update (uses new values)
+                                if (hasReturning) {
+                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow));
+                                }
+                                processedTargetRows.add(targetRow);
+                                mergeCount++;
+                            } else {
+                                // DO NOTHING — no action, no RETURNING, no count
+                                processedTargetRows.add(targetRow);
                             }
-                            processedTargetRows.add(targetRow);
-                            mergeCount++;
                             break; // first matching WHEN clause wins
                         }
                     }
@@ -1261,12 +1290,63 @@ class DmlExecutor {
                         rowsToInsert.add(newRow);
                         // Fire AFTER INSERT triggers for MERGE
                         triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, newRow, null, targetTable);
+                        // Collect RETURNING after insert
+                        if (hasReturning) {
+                            returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, newRow));
+                        }
                         mergeCount++;
                         break; // first matching WHEN clause wins
                     }
                 }
             }
         }
+
+            // WHEN NOT MATCHED BY SOURCE: process target rows that had no source match
+            boolean hasNotMatchedBySource = stmt.whenClauses().stream()
+                    .anyMatch(c -> c instanceof MergeStmt.WhenNotMatchedBySource);
+            if (hasNotMatchedBySource) {
+                for (Object[] targetRow : originalTargetRows) {
+                    if (processedTargetRows.contains(targetRow)) continue;
+                    if (rowsToDelete.contains(targetRow)) continue;
+                    RowContext targetCtx = new RowContext(targetTable, targetAlias, targetRow);
+                    for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+                        if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                            MergeStmt.WhenNotMatchedBySource wnmbs = (MergeStmt.WhenNotMatchedBySource) clause;
+                            if (wnmbs.andCondition() != null && !executor.isTruthy(executor.evalExpr(wnmbs.andCondition(), targetCtx))) {
+                                continue;
+                            }
+                            if (wnmbs.isDelete()) {
+                                if (hasReturning) {
+                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow));
+                                }
+                                executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
+                                rowsToDelete.add(targetRow);
+                            } else if (wnmbs.setClauses() != null && !wnmbs.setClauses().isEmpty()) {
+                                Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
+                                for (InsertStmt.SetClause set : wnmbs.setClauses()) {
+                                    int colIdx = targetTable.getColumnIndex(set.column());
+                                    if (colIdx < 0) {
+                                        throw new MemgresException("Column not found: " + set.column());
+                                    }
+                                    Object val = executor.evalExpr(set.value(), targetCtx);
+                                    targetRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
+                                }
+                                executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
+                                recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
+                                executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
+                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable);
+                                if (hasReturning) {
+                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow));
+                                }
+                            }
+                            // DO NOTHING: empty setClauses, no action
+                            processedTargetRows.add(targetRow);
+                            mergeCount++;
+                            break;
+                        }
+                    }
+                }
+            }
 
             // Apply deletes
             if (!rowsToDelete.isEmpty()) {
@@ -1305,6 +1385,10 @@ class DmlExecutor {
             throw e;
         }
 
+        if (hasReturning) {
+            List<Column> retCols = buildReturningColumns(stmt.returning(), targetTable);
+            return QueryResult.returning(QueryResult.Type.MERGE, retCols, returningRows, mergeCount);
+        }
         return QueryResult.command(QueryResult.Type.MERGE, mergeCount);
     }
 
