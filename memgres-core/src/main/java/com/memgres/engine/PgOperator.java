@@ -55,11 +55,12 @@ public class PgOperator {
     }
 
     /**
-     * Returns a key that uniquely identifies this operator (name + arg types).
+     * Returns a key that uniquely identifies this operator (schema + name + arg types).
      */
     public String getKey() {
         String l = leftArg != null ? leftArg.toLowerCase() : "NONE";
         String r = rightArg != null ? rightArg.toLowerCase() : "NONE";
-        return name + "(" + l + "," + r + ")";
+        String s = schemaName != null ? schemaName.toLowerCase() : "public";
+        return s + "." + name + "(" + l + "," + r + ")";
     }
 }

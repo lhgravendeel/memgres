@@ -185,10 +185,14 @@ class DdlObjectExecutor {
     }
 
     private QueryResult executeAlterOperatorObj(AlterOperatorStmt stmt) {
-        // Build key from name + arg types
+        // Build key from schema + name + arg types
         String l = stmt.leftArg() != null ? stmt.leftArg().toLowerCase() : "NONE";
         String r = stmt.rightArg() != null ? stmt.rightArg().toLowerCase() : "NONE";
-        String key = stmt.name() + "(" + l + "," + r + ")";
+        String schema = "public";
+        String opName = stmt.name();
+        int dotIdx = opName.indexOf('.');
+        if (dotIdx > 0) { schema = opName.substring(0, dotIdx); opName = opName.substring(dotIdx + 1); }
+        String key = schema.toLowerCase() + "." + opName + "(" + l + "," + r + ")";
 
         PgOperator op = executor.database.getOperator(key);
         if (op == null) {

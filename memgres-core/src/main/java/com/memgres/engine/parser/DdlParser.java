@@ -287,8 +287,16 @@ class DdlParser {
             String rightArg = parts.length > 1 ? parts[1].trim() : "NONE";
             if ("NONE".equalsIgnoreCase(leftArg)) leftArg = "NONE";
             if ("NONE".equalsIgnoreCase(rightArg)) rightArg = "NONE";
-            // Encode as operator key: name(leftarg,rightarg)
-            name = name + "(" + leftArg.toLowerCase() + "," + rightArg.toLowerCase() + ")";
+            // Encode as operator key: schema.name(leftarg,rightarg)
+            // Parse schema from operator name if present (e.g., "s1.+++" -> schema=s1, op=+++)
+            String opSchema = "public";
+            String opName = name;
+            int dotIdx = name.indexOf('.');
+            if (dotIdx > 0) {
+                opSchema = name.substring(0, dotIdx);
+                opName = name.substring(dotIdx + 1);
+            }
+            name = opSchema.toLowerCase() + "." + opName + "(" + leftArg.toLowerCase() + "," + rightArg.toLowerCase() + ")";
         }
         if ((objectType == DropStmt.ObjectType.OPERATOR_CLASS
                 || objectType == DropStmt.ObjectType.OPERATOR_FAMILY) && parser.check(TokenType.LEFT_PAREN)) {
