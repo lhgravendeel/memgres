@@ -199,7 +199,7 @@ public class PgInterval implements Comparable<PgInterval> {
         if (days != 0) sb.append(days).append(days == 1 ? " day " : " days ");
 
         long absMicros = Math.abs(microseconds);
-        if (absMicros > 0 || sb.isEmpty()) {
+        if (absMicros > 0 || sb.length() == 0) {
             long totalSecs = absMicros / 1_000_000;
             long fracMicros = absMicros % 1_000_000;
             long hours = totalSecs / 3600;
@@ -256,13 +256,13 @@ public class PgInterval implements Comparable<PgInterval> {
         }
 
         if (days != 0) {
-            if (!sb.isEmpty()) sb.append(" ");
+            if (sb.length() > 0) sb.append(" ");
             sb.append(days);
         }
 
         long absMicros = Math.abs(microseconds);
-        if (absMicros > 0 || sb.isEmpty()) {
-            if (!sb.isEmpty()) sb.append(" ");
+        if (absMicros > 0 || sb.length() == 0) {
+            if (sb.length() > 0) sb.append(" ");
             long totalSecs = absMicros / 1_000_000;
             long fracMicros = absMicros % 1_000_000;
             long hours = totalSecs / 3600;

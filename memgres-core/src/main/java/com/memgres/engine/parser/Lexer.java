@@ -714,7 +714,7 @@ public class Lexer {
                     hasDecimal = true;
                     sb.append(c);
                     pos++;
-                } else if (sb.isEmpty()) {
+                } else if (sb.length() == 0) {
                     // Leading dot like .5
                     hasDecimal = true;
                     sb.append(c);
@@ -722,7 +722,7 @@ public class Lexer {
                 } else {
                     break;
                 }
-            } else if ((c == 'e' || c == 'E') && !sb.isEmpty()) {
+            } else if ((c == 'e' || c == 'E') && sb.length() > 0) {
                 // Scientific notation
                 hasDecimal = true;
                 sb.append(c);

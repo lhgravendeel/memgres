@@ -125,18 +125,18 @@ class DdlAdminExecutor {
             StringBuilder json = new StringBuilder("[\n  {\n    \"Plan\": {\n");
             json.append("      \"Node Type\": \"").append(planLines.get(0).trim()).append("\"\n");
             json.append("    }\n  }\n]");
-            return QueryResult.select(planCols, List.<Object[]>of(new Object[]{json.toString()}));
+            return QueryResult.select(planCols, Collections.singletonList(new Object[]{json.toString()}));
         }
         if (stmt.format().equals("XML")) {
             StringBuilder xml = new StringBuilder("<explain xmlns=\"http://www.postgresql.org/2009/explain\">\n");
             xml.append("  <Query>\n    <Plan>\n      <Node-Type>").append(planLines.get(0).trim())
                     .append("</Node-Type>\n    </Plan>\n  </Query>\n</explain>");
-            return QueryResult.select(planCols, List.<Object[]>of(new Object[]{xml.toString()}));
+            return QueryResult.select(planCols, Collections.singletonList(new Object[]{xml.toString()}));
         }
         if (stmt.format().equals("YAML")) {
             StringBuilder yaml = new StringBuilder("- Plan:\n");
             yaml.append("    Node Type: \"").append(planLines.get(0).trim()).append("\"\n");
-            return QueryResult.select(planCols, List.<Object[]>of(new Object[]{yaml.toString()}));
+            return QueryResult.select(planCols, Collections.singletonList(new Object[]{yaml.toString()}));
         }
 
         List<Column> cols = Cols.listOf(new Column("QUERY PLAN", DataType.TEXT, true, false, null));

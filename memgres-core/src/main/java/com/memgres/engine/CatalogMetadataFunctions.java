@@ -356,8 +356,13 @@ class CatalogMetadataFunctions {
                            .replaceAll("\\s+,", ",")
                            .replaceAll(",\\s+", ", ");
             nc = nc.replaceAll("('(?:[^']*(?:'')*[^']*)*')(?!::)", "$1::text");
-            nc = java.util.regex.Pattern.compile("\\b([a-z_][a-z0-9_]*)\\(")
-                    .matcher(nc).replaceAll(m -> m.group(1).toUpperCase() + "(");
+            java.util.regex.Matcher fnMatcher = java.util.regex.Pattern.compile("\\b([a-z_][a-z0-9_]*)\\(").matcher(nc);
+            StringBuffer fnBuf = new StringBuffer();
+            while (fnMatcher.find()) {
+                fnMatcher.appendReplacement(fnBuf, fnMatcher.group(1).toUpperCase() + "(");
+            }
+            fnMatcher.appendTail(fnBuf);
+            nc = fnBuf.toString();
             if (nc.startsWith("(") && nc.endsWith(")")) {
                 int depth = 0;
                 boolean outerMatched = false;

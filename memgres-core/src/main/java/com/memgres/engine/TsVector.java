@@ -365,7 +365,7 @@ public class TsVector {
     public String toString() {
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
-            if (!sb.isEmpty()) sb.append(" ");
+            if (sb.length() > 0) sb.append(" ");
             sb.append("'").append(entry.getKey()).append("'");
             List<PosEntry> positions = entry.getValue();
             if (!positions.isEmpty() && !(positions.size() == 1 && positions.get(0).position() == 0)) {

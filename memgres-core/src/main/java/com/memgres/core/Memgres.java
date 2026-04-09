@@ -27,7 +27,7 @@ public class Memgres implements Closeable {
     /**
      * @deprecated Use {@link Builder#logAllStatements(boolean)} instead.
      */
-    @Deprecated(forRemoval = true)
+    @Deprecated
     public static boolean logAllStatements = false;
 
     private final int requestedPort;

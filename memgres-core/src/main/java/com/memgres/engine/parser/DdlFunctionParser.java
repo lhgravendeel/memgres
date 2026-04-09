@@ -76,7 +76,7 @@ class DdlFunctionParser {
                         }
                         if (parser.check(TokenType.COMMA) && depth == 0) break;
                         Token dt = parser.advance();
-                        if (!defaultText.isEmpty()) defaultText.append(" ");
+                        if (defaultText.length() > 0) defaultText.append(" ");
                         if (dt.type() == TokenType.STRING_LITERAL) {
                             defaultText.append("'").append(dt.value().replace("'", "''")).append("'");
                         } else {

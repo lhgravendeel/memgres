@@ -203,7 +203,7 @@ class PgWireCopyHandler {
             if (isBinary) {
                 parseBinaryCopyData(insertedRows);
             } else {
-                String data = copyBuffer.toString(StandardCharsets.UTF_8);
+                String data = new String(copyBuffer.toByteArray(), StandardCharsets.UTF_8);
                 boolean isCsv = "csv".equalsIgnoreCase(activeCopyStmt.format());
                 String delimiter = activeCopyStmt.delimiter();
                 if (delimiter == null) delimiter = isCsv ? "," : "\t";
@@ -501,7 +501,7 @@ class PgWireCopyHandler {
                 inQuote = !inQuote;
                 current.append(c);
             } else if (c == '\n' && !inQuote) {
-                if (!current.isEmpty()) {
+                if (current.length() > 0) {
                     lines.add(current.toString());
                     current.setLength(0);
                 }
@@ -511,7 +511,7 @@ class PgWireCopyHandler {
                 current.append(c);
             }
         }
-        if (!current.isEmpty()) {
+        if (current.length() > 0) {
             lines.add(current.toString());
         }
         return lines.toArray(new String[0]);
