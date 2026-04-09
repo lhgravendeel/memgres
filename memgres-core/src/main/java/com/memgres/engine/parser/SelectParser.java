@@ -4,7 +4,9 @@ import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * SELECT statement parsing, extracted from Parser to reduce class size.
@@ -1107,6 +1109,11 @@ class SelectParser {
             }
         }
 
+        // JSON_TABLE(expr, path COLUMNS (...)) AS alias
+        if (parser.checkKeyword("JSON_TABLE")) {
+            return parseJsonTableFromItem(lateral);
+        }
+
         // ONLY table_name
         boolean only = parser.matchKeyword("ONLY");
 
@@ -1384,5 +1391,114 @@ class SelectParser {
                     (next.value().equals("SELECT") || next.value().equals("WITH"));
         }
         return false;
+    }
+
+    // ---- JSON_TABLE FROM item ----
+
+    private SelectStmt.FromItem parseJsonTableFromItem(boolean lateral) {
+        parser.advance(); // consume JSON_TABLE
+        parser.expect(TokenType.LEFT_PAREN);
+        Expression input = parser.parseExpression();
+        parser.expect(TokenType.COMMA);
+        Expression path = parser.parseExpression();
+        // Optional PASSING
+        Map<String, Expression> passing = null;
+        if (parser.matchKeyword("PASSING")) {
+            passing = parsePassingClause();
+        }
+        parser.expectKeyword("COLUMNS");
+        parser.expect(TokenType.LEFT_PAREN);
+        List<JsonTableExpr.JsonTableColumn> columns = parseJsonTableColumns();
+        parser.expect(TokenType.RIGHT_PAREN);
+        // Optional ERROR ON ERROR
+        JsonExistsExpr.OnBehavior onError = null;
+        if (parser.matchKeyword("ERROR")) {
+            parser.expectKeyword("ON"); parser.expectKeyword("ERROR");
+            onError = JsonExistsExpr.OnBehavior.ERROR;
+        }
+        parser.expect(TokenType.RIGHT_PAREN);
+        // Alias
+        String alias = null;
+        if (parser.matchKeyword("AS")) {
+            alias = parser.readIdentifier();
+        } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER) {
+            alias = parser.readIdentifier();
+        }
+        JsonTableExpr jtExpr = new JsonTableExpr(input, path, columns, passing, onError);
+        // Store as FunctionFrom with the JsonTableExpr packed into args
+        return new SelectStmt.FunctionFrom("__json_table__", Cols.listOf(jtExpr), alias, null);
+    }
+
+    private List<JsonTableExpr.JsonTableColumn> parseJsonTableColumns() {
+        List<JsonTableExpr.JsonTableColumn> cols = new ArrayList<>();
+        do {
+            // NESTED PATH ...
+            if (parser.matchKeyword("NESTED")) {
+                parser.matchKeyword("PATH"); // optional
+                Expression nestedPath = parser.parseExpression();
+                parser.expectKeyword("COLUMNS");
+                parser.expect(TokenType.LEFT_PAREN);
+                List<JsonTableExpr.JsonTableColumn> nestedCols = parseJsonTableColumns();
+                parser.expect(TokenType.RIGHT_PAREN);
+                cols.add(JsonTableExpr.JsonTableColumn.nested(nestedPath, nestedCols));
+                continue;
+            }
+            String colName = parser.readIdentifier();
+            // FOR ORDINALITY
+            if (parser.matchKeywords("FOR", "ORDINALITY")) {
+                cols.add(JsonTableExpr.JsonTableColumn.ordinality(colName));
+                continue;
+            }
+            // type [EXISTS] PATH 'expr'
+            String typeName = parser.parseTypeName();
+            boolean existsPath = false;
+            if (parser.matchKeyword("EXISTS")) {
+                existsPath = true;
+            }
+            Expression pathExpr = null;
+            if (parser.matchKeyword("PATH")) {
+                pathExpr = parser.parseExpression();
+            }
+            Expression defaultOnEmpty = null;
+            Expression defaultOnError = null;
+            // DEFAULT val ON EMPTY / DEFAULT val ON ERROR
+            while (parser.checkKeyword("DEFAULT") || parser.checkKeyword("NULL") || parser.checkKeyword("ERROR")) {
+                if (parser.matchKeyword("DEFAULT")) {
+                    Expression defVal = parser.parseExpression();
+                    parser.expectKeyword("ON");
+                    if (parser.matchKeyword("EMPTY")) {
+                        defaultOnEmpty = defVal;
+                    } else {
+                        parser.expectKeyword("ERROR");
+                        defaultOnError = defVal;
+                    }
+                } else if (parser.matchKeyword("NULL")) {
+                    parser.expectKeyword("ON"); parser.expectKeyword("EMPTY");
+                    // null on empty is default, nothing to set
+                } else if (parser.matchKeyword("ERROR")) {
+                    parser.expectKeyword("ON"); parser.expectKeyword("ERROR");
+                    // error on error
+                } else {
+                    break;
+                }
+            }
+            if (existsPath) {
+                cols.add(JsonTableExpr.JsonTableColumn.exists(colName, typeName, pathExpr));
+            } else {
+                cols.add(JsonTableExpr.JsonTableColumn.typed(colName, typeName, pathExpr, defaultOnEmpty, defaultOnError));
+            }
+        } while (parser.match(TokenType.COMMA));
+        return cols;
+    }
+
+    private Map<String, Expression> parsePassingClause() {
+        Map<String, Expression> passing = new LinkedHashMap<>();
+        do {
+            Expression val = parser.parseExpression();
+            parser.expectKeyword("AS");
+            String name = parser.readIdentifier();
+            passing.put(name.toLowerCase(), val);
+        } while (parser.match(TokenType.COMMA));
+        return passing;
     }
 }

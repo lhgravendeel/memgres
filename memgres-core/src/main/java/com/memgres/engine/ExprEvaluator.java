@@ -31,6 +31,10 @@ class ExprEvaluator {
         if (expr instanceof FunctionCallExpr) return executor.functionEvaluator.evalFunction(((FunctionCallExpr) expr), ctx);
         if (expr instanceof CastExpr) return evalCast(((CastExpr) expr), ctx);
         if (expr instanceof IsNullExpr) return evalIsNull(((IsNullExpr) expr), ctx);
+        if (expr instanceof IsJsonExpr) return evalIsJson(((IsJsonExpr) expr), ctx);
+        if (expr instanceof JsonExistsExpr) return evalJsonExists(((JsonExistsExpr) expr), ctx);
+        if (expr instanceof JsonValueExpr) return evalJsonValue(((JsonValueExpr) expr), ctx);
+        if (expr instanceof JsonQueryExpr) return evalJsonQuery(((JsonQueryExpr) expr), ctx);
         if (expr instanceof InExpr) return evalIn(((InExpr) expr), ctx);
         if (expr instanceof BetweenExpr) return evalBetween(((BetweenExpr) expr), ctx);
         if (expr instanceof LikeExpr) return evalLike(((LikeExpr) expr), ctx);
@@ -606,6 +610,208 @@ class ExprEvaluator {
         }
         boolean isNull = val == null;
         return isn.negated() ? !isNull : isNull;
+    }
+
+    private Object evalIsJson(IsJsonExpr ij, RowContext ctx) {
+        Object val = evalExpr(ij.expr(), ctx);
+        if (val == null) return null; // SQL NULL IS JSON is NULL
+        String s = val.toString().trim();
+        boolean valid = isValidJson(s);
+        if (valid && ij.jsonType() != null) {
+            switch (ij.jsonType()) {
+                case OBJECT: valid = s.startsWith("{"); break;
+                case ARRAY: valid = s.startsWith("["); break;
+                case SCALAR: valid = !s.startsWith("{") && !s.startsWith("["); break;
+                case VALUE: break; // any JSON
+            }
+        }
+        if (valid && ij.uniqueKeys()) {
+            valid = hasUniqueKeys(s);
+        }
+        return ij.negated() ? !valid : valid;
+    }
+
+    static boolean isValidJson(String s) {
+        if (s == null || s.isEmpty()) return false;
+        s = s.trim();
+        if (s.startsWith("{") || s.startsWith("[")) {
+            try {
+                String normalized = JsonOperations.normalizeJsonb(s);
+                // Additional validation: check for nested braces without proper key structure
+                // e.g. "{{invalid}}" would normalize to "{}" incorrectly
+                if (s.startsWith("{") && s.length() > 2) {
+                    String inner = s.substring(1, s.length() - 1).trim();
+                    if (!inner.isEmpty() && !inner.contains("\"") && !inner.contains(":")) {
+                        return false; // object must have quoted keys with colons
+                    }
+                }
+                return true;
+            } catch (Exception e) { return false; }
+        }
+        // scalar values
+        if (s.equals("true") || s.equals("false") || s.equals("null")) return true;
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) return true;
+        try { Double.parseDouble(s); return true; } catch (NumberFormatException e) {}
+        return false;
+    }
+
+    private boolean hasUniqueKeys(String s) {
+        s = s.trim();
+        if (!s.startsWith("{")) return true;
+        // Parse keys manually and check for duplicates
+        Map<String, String> keys = JsonOperations.parseObjectKeys(s);
+        // parseObjectKeys deduplicates, so count raw keys instead
+        return countRawKeys(s) == keys.size();
+    }
+
+    private int countRawKeys(String s) {
+        int count = 0;
+        int depth = 0;
+        boolean inString = false;
+        boolean escaped = false;
+        boolean expectKey = true;
+        for (int i = 1; i < s.length() - 1; i++) {
+            char c = s.charAt(i);
+            if (escaped) { escaped = false; continue; }
+            if (c == '\\') { escaped = true; continue; }
+            if (c == '"') {
+                if (!inString && depth == 0 && expectKey) {
+                    // opening quote of a key
+                    count++;
+                }
+                inString = !inString;
+                continue;
+            }
+            if (inString) continue;
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') depth--;
+            else if (c == ':' && depth == 0) expectKey = false;
+            else if (c == ',' && depth == 0) expectKey = true;
+        }
+        return count;
+    }
+
+    // ---- SQL/JSON standard expression evaluation ----
+
+    private Object evalJsonExists(JsonExistsExpr je, RowContext ctx) {
+        Object inputVal = evalExpr(je.input(), ctx);
+        if (inputVal == null) return null;
+        Object pathVal = evalExpr(je.path(), ctx);
+        if (pathVal == null) return null;
+        String json = inputVal.toString();
+        String path = pathVal.toString().trim();
+        try {
+            if (!isValidJson(json)) {
+                if (je.onError() == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("invalid input for JSON_EXISTS", "22032");
+                return je.onError() == JsonExistsExpr.OnBehavior.TRUE_VAL ? true : false;
+            }
+            // Substitute PASSING variables into path
+            if (je.passing() != null && !je.passing().isEmpty()) {
+                for (Map.Entry<String, Expression> e : je.passing().entrySet()) {
+                    Object v = evalExpr(e.getValue(), ctx);
+                    if (v != null) path = path.replace("$" + e.getKey(), v.toString());
+                }
+            }
+            List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
+            return !results.isEmpty();
+        } catch (MemgresException e) {
+            if (je.onError() == JsonExistsExpr.OnBehavior.ERROR) throw e;
+            return je.onError() == JsonExistsExpr.OnBehavior.TRUE_VAL ? true : false;
+        }
+    }
+
+    private Object evalJsonValue(JsonValueExpr jv, RowContext ctx) {
+        Object inputVal = evalExpr(jv.input(), ctx);
+        if (inputVal == null) return null;
+        Object pathVal = evalExpr(jv.path(), ctx);
+        if (pathVal == null) return null;
+        String json = inputVal.toString();
+        String path = pathVal.toString().trim();
+        try {
+            // Substitute PASSING variables
+            if (jv.passing != null && !jv.passing.isEmpty()) {
+                for (Map.Entry<String, Expression> e : jv.passing.entrySet()) {
+                    Object v = evalExpr(e.getValue(), ctx);
+                    if (v != null) path = path.replace("$" + e.getKey(), v.toString());
+                }
+            }
+            List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
+            if (results.isEmpty()) {
+                // ON EMPTY behavior
+                if (jv.defaultOnEmpty != null) return evalExpr(jv.defaultOnEmpty, ctx);
+                return null; // NULL ON EMPTY is default
+            }
+            String result = results.get(0);
+            // JSON_VALUE extracts scalars only — objects/arrays are errors
+            String trimmed = result.trim();
+            if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                if (jv.onError == JsonExistsExpr.OnBehavior.ERROR) {
+                    throw new MemgresException("JSON_VALUE: non-scalar result", "22032");
+                }
+                if (jv.defaultOnError != null) return evalExpr(jv.defaultOnError, ctx);
+                return null;
+            }
+            // Unquote strings
+            if (trimmed.startsWith("\"") && trimmed.endsWith("\"")) {
+                trimmed = trimmed.substring(1, trimmed.length() - 1);
+            }
+            if (trimmed.equals("null")) return null;
+            // RETURNING type cast
+            if (jv.returningType != null) {
+                return executor.castEvaluator.applyCast(trimmed, jv.returningType);
+            }
+            return trimmed;
+        } catch (MemgresException e) {
+            if (jv.onError == JsonExistsExpr.OnBehavior.ERROR) throw e;
+            if (jv.defaultOnError != null) return evalExpr(jv.defaultOnError, ctx);
+            return null;
+        }
+    }
+
+    private Object evalJsonQuery(JsonQueryExpr jq, RowContext ctx) {
+        Object inputVal = evalExpr(jq.input(), ctx);
+        if (inputVal == null) return null;
+        Object pathVal = evalExpr(jq.path(), ctx);
+        if (pathVal == null) return null;
+        String json = inputVal.toString();
+        String path = pathVal.toString().trim();
+        try {
+            if (!isValidJson(json)) {
+                if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("invalid input for JSON_QUERY", "22032");
+                return handleJsonQueryOnEmpty(jq);
+            }
+            List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
+            if (results.isEmpty()) return handleJsonQueryOnEmpty(jq);
+            String result = results.get(0);
+            // Wrapper behavior
+            if (jq.wrapper == JsonQueryExpr.WrapperBehavior.WITH_WRAPPER) {
+                if (results.size() == 1) result = "[" + result + "]";
+                else result = "[" + String.join(", ", results) + "]";
+            } else if (jq.wrapper == JsonQueryExpr.WrapperBehavior.WITH_CONDITIONAL_WRAPPER) {
+                String t = result.trim();
+                if (!t.startsWith("{") && !t.startsWith("[")) {
+                    result = "[" + result + "]";
+                }
+            }
+            // Quotes behavior
+            if (jq.quotes == JsonQueryExpr.QuotesBehavior.OMIT) {
+                String t = result.trim();
+                if (t.startsWith("\"") && t.endsWith("\"")) {
+                    result = t.substring(1, t.length() - 1);
+                }
+            }
+            return result;
+        } catch (MemgresException e) {
+            if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) throw e;
+            return null;
+        }
+    }
+
+    private Object handleJsonQueryOnEmpty(JsonQueryExpr jq) {
+        if (jq.onEmpty == JsonExistsExpr.OnBehavior.EMPTY_ARRAY) return "[]";
+        if (jq.onEmpty == JsonExistsExpr.OnBehavior.EMPTY_OBJECT) return "{}";
+        if (jq.onEmpty == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("no SQL/JSON item found for specified path", "22034");
+        return null;
     }
 
     private Object evalIn(InExpr in, RowContext ctx) {

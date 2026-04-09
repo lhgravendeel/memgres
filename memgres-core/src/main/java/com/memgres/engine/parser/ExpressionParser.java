@@ -410,6 +410,20 @@ public class ExpressionParser {
             if (matchKeyword("DOCUMENT")) {
                 return new IsBooleanExpr(left, negated ? IsBooleanExpr.BooleanTest.IS_NOT_DOCUMENT : IsBooleanExpr.BooleanTest.IS_DOCUMENT);
             }
+            // IS [NOT] JSON [VALUE | OBJECT | ARRAY | SCALAR] [WITH UNIQUE KEYS]
+            if (matchKeyword("JSON")) {
+                IsJsonExpr.JsonType jt = null;
+                if (matchKeyword("OBJECT")) jt = IsJsonExpr.JsonType.OBJECT;
+                else if (matchKeyword("ARRAY")) jt = IsJsonExpr.JsonType.ARRAY;
+                else if (matchKeyword("SCALAR")) jt = IsJsonExpr.JsonType.SCALAR;
+                else if (matchKeyword("VALUE")) jt = IsJsonExpr.JsonType.VALUE;
+                boolean uniqueKeys = false;
+                if (matchKeywords("WITH", "UNIQUE")) {
+                    expectKeyword("KEYS");
+                    uniqueKeys = true;
+                }
+                return new IsJsonExpr(left, negated, jt, uniqueKeys);
+            }
         }
 
         // [NOT] IN (...)
@@ -1013,6 +1027,16 @@ public class ExpressionParser {
                 case "LEAST": {
                     return specialFormParser.parseBuiltinFunction();
                 }
+                // SQL/JSON standard functions (PG 16+)
+                case "JSON_EXISTS": return specialFormParser.parseJsonExists();
+                case "JSON_VALUE": return specialFormParser.parseJsonValue();
+                case "JSON_QUERY": return specialFormParser.parseJsonQuery();
+                case "JSON_SCALAR": return specialFormParser.parseJsonScalar();
+                case "JSON_SERIALIZE": return specialFormParser.parseJsonSerialize();
+                case "JSON_ARRAY": return specialFormParser.parseJsonArray();
+                case "JSON_OBJECT": return specialFormParser.parseJsonObject();
+                case "JSON_ARRAYAGG": return specialFormParser.parseJsonArrayagg();
+                case "JSON_OBJECTAGG": return specialFormParser.parseJsonObjectagg();
                 case "NEW":
                 case "OLD": {
                     // Trigger variable: NEW.column or OLD.column
