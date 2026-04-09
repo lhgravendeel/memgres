@@ -108,6 +108,170 @@ class DdlObjectExecutor {
         return QueryResult.command(QueryResult.Type.SET, 0);
     }
 
+    // ---- CREATE/ALTER/DROP OPERATOR ----
+
+    QueryResult executeCreateOperator(CreateOperatorStmt stmt) {
+        PgOperator op = new PgOperator(stmt.name(), stmt.leftArg(), stmt.rightArg(), stmt.function());
+        op.setCommutator(stmt.commutator());
+        op.setNegator(stmt.negator());
+        op.setRestrict(stmt.restrict());
+        op.setJoin(stmt.join());
+        op.setHashes(stmt.hashes());
+        op.setMerges(stmt.merges());
+        if (stmt.schema() != null) op.setSchemaName(stmt.schema());
+        // Set owner to current user
+        if (executor.session != null) {
+            String role = executor.session.getGucSettings().get("role");
+            op.setOwner(role != null ? role : "memgres");
+        }
+
+        // Check for duplicate
+        if (executor.database.hasOperator(op.getKey())) {
+            throw new MemgresException("operator " + stmt.name() + " already exists", "42710");
+        }
+
+        executor.database.addOperator(op);
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    QueryResult executeCreateOperatorFamily(CreateOperatorFamilyStmt stmt) {
+        PgOperatorFamily fam = new PgOperatorFamily(stmt.name(), stmt.method());
+        if (stmt.schema() != null) fam.setSchemaName(stmt.schema());
+        if (executor.session != null) {
+            String role = executor.session.getGucSettings().get("role");
+            fam.setOwner(role != null ? role : "memgres");
+        }
+
+        // Check for duplicate
+        if (executor.database.hasOperatorFamily(fam.getKey())) {
+            throw new MemgresException("operator family \"" + stmt.name() + "\" for access method \""
+                    + stmt.method() + "\" already exists", "42710");
+        }
+
+        executor.database.addOperatorFamily(fam);
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    QueryResult executeCreateOperatorClass(CreateOperatorClassStmt stmt) {
+        PgOperatorClass cls = new PgOperatorClass(stmt.name(), stmt.forType(), stmt.method(), stmt.isDefault());
+        if (stmt.schema() != null) cls.setSchemaName(stmt.schema());
+        cls.setFamilyName(stmt.familyName());
+        if (executor.session != null) {
+            String role = executor.session.getGucSettings().get("role");
+            cls.setOwner(role != null ? role : "memgres");
+        }
+
+        // Check for duplicate
+        if (executor.database.hasOperatorClass(cls.getKey())) {
+            throw new MemgresException("operator class \"" + stmt.name() + "\" for access method \""
+                    + stmt.method() + "\" already exists", "42710");
+        }
+
+        executor.database.addOperatorClass(cls);
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    QueryResult executeAlterOperator(AlterOperatorStmt stmt) {
+        switch (stmt.objectKind()) {
+            case OPERATOR:
+                return executeAlterOperatorObj(stmt);
+            case OPERATOR_FAMILY:
+                return executeAlterOperatorFamilyObj(stmt);
+            case OPERATOR_CLASS:
+                return executeAlterOperatorClassObj(stmt);
+            default:
+                return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+    }
+
+    private QueryResult executeAlterOperatorObj(AlterOperatorStmt stmt) {
+        // Build key from name + arg types
+        String l = stmt.leftArg() != null ? stmt.leftArg().toLowerCase() : "NONE";
+        String r = stmt.rightArg() != null ? stmt.rightArg().toLowerCase() : "NONE";
+        String key = stmt.name() + "(" + l + "," + r + ")";
+
+        PgOperator op = executor.database.getOperator(key);
+        if (op == null) {
+            throw new MemgresException("operator does not exist: " + stmt.name(), "42704");
+        }
+
+        switch (stmt.action()) {
+            case OWNER_TO:
+                op.setOwner(stmt.value());
+                break;
+            case SET_SCHEMA:
+                op.setSchemaName(stmt.value());
+                break;
+            case SET_PROPERTIES:
+                // Properties already consumed by parser; no further action needed
+                break;
+            default:
+                break;
+        }
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    private QueryResult executeAlterOperatorFamilyObj(AlterOperatorStmt stmt) {
+        String key = stmt.name().toLowerCase() + ":" + stmt.method().toLowerCase();
+        PgOperatorFamily fam = executor.database.getOperatorFamily(key);
+        if (fam == null && stmt.action() != AlterOperatorStmt.AlterAction.ADD_MEMBER
+                && stmt.action() != AlterOperatorStmt.AlterAction.DROP_MEMBER) {
+            throw new MemgresException("operator family \"" + stmt.name()
+                    + "\" does not exist for access method \"" + stmt.method() + "\"", "42704");
+        }
+        if (fam == null) {
+            // ADD/DROP MEMBER on non-existent family — just accept
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+
+        switch (stmt.action()) {
+            case OWNER_TO:
+                fam.setOwner(stmt.value());
+                break;
+            case RENAME_TO:
+                executor.database.removeOperatorFamily(key);
+                fam.setName(stmt.value());
+                executor.database.addOperatorFamily(fam);
+                break;
+            case SET_SCHEMA:
+                fam.setSchemaName(stmt.value());
+                break;
+            case ADD_MEMBER:
+            case DROP_MEMBER:
+                // Members are tracked conceptually but we don't maintain a member list
+                break;
+            default:
+                break;
+        }
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    private QueryResult executeAlterOperatorClassObj(AlterOperatorStmt stmt) {
+        String key = stmt.name().toLowerCase() + ":" + stmt.method().toLowerCase();
+        PgOperatorClass cls = executor.database.getOperatorClass(key);
+        if (cls == null) {
+            throw new MemgresException("operator class \"" + stmt.name()
+                    + "\" does not exist for access method \"" + stmt.method() + "\"", "42704");
+        }
+
+        switch (stmt.action()) {
+            case OWNER_TO:
+                cls.setOwner(stmt.value());
+                break;
+            case RENAME_TO:
+                executor.database.removeOperatorClass(key);
+                cls.setName(stmt.value());
+                executor.database.addOperatorClass(cls);
+                break;
+            case SET_SCHEMA:
+                cls.setSchemaName(stmt.value());
+                break;
+            default:
+                break;
+        }
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
     QueryResult executeCreateFunction(CreateFunctionStmt stmt) {
         if ("pg_catalog".equalsIgnoreCase(stmt.schema())) {
             throw new MemgresException("permission denied to create function in schema pg_catalog", "42501");
@@ -823,10 +987,47 @@ class DdlObjectExecutor {
             case EXTENSION:
             case COLLATION:
             case CAST:
-            case CONVERSION:
-            case OPERATOR:
-            case OPERATOR_CLASS:
+            case CONVERSION: {
+                break; // no-op
+            }
+            case OPERATOR: {
+                // name is encoded as "opname(leftarg,rightarg)" by the parser
+                String opKey = stmt.name();
+                if (!executor.database.hasOperator(opKey)) {
+                    if (!stmt.ifExists()) {
+                        throw new MemgresException("operator does not exist: " + stmt.name(), "42704");
+                    }
+                }
+                executor.database.removeOperator(opKey);
+                break;
+            }
             case OPERATOR_FAMILY: {
+                String famMethod = stmt.onTable() != null ? stmt.onTable() : "btree";
+                String famKey = stmt.name().toLowerCase() + ":" + famMethod.toLowerCase();
+                if (!executor.database.hasOperatorFamily(famKey)) {
+                    if (!stmt.ifExists()) {
+                        throw new MemgresException("operator family \"" + stmt.name()
+                                + "\" does not exist for access method \"" + famMethod + "\"", "42704");
+                    }
+                } else {
+                    // CASCADE: also drop operator classes in this family
+                    if (stmt.cascade()) {
+                        executor.database.removeOperatorClassesByFamily(stmt.name());
+                    }
+                    executor.database.removeOperatorFamily(famKey);
+                }
+                break;
+            }
+            case OPERATOR_CLASS: {
+                String clsMethod = stmt.onTable() != null ? stmt.onTable() : "btree";
+                String clsKey = stmt.name().toLowerCase() + ":" + clsMethod.toLowerCase();
+                if (!executor.database.hasOperatorClass(clsKey)) {
+                    if (!stmt.ifExists()) {
+                        throw new MemgresException("operator class \"" + stmt.name()
+                                + "\" does not exist for access method \"" + clsMethod + "\"", "42704");
+                    }
+                }
+                executor.database.removeOperatorClass(clsKey);
                 break;
             }
         }

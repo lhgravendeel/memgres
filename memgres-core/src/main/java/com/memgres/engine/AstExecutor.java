@@ -107,6 +107,10 @@ public class AstExecutor {
         if (stmt instanceof CreateTypeStmt) return ddlExecutor.executeCreateType(((CreateTypeStmt) stmt));
         if (stmt instanceof CreateFunctionStmt) return ddlExecutor.executeCreateFunction(((CreateFunctionStmt) stmt));
         if (stmt instanceof CreateAggregateStmt) return ddlExecutor.executeCreateAggregate(((CreateAggregateStmt) stmt));
+        if (stmt instanceof CreateOperatorStmt) return ddlExecutor.executeCreateOperator(((CreateOperatorStmt) stmt));
+        if (stmt instanceof CreateOperatorFamilyStmt) return ddlExecutor.executeCreateOperatorFamily(((CreateOperatorFamilyStmt) stmt));
+        if (stmt instanceof CreateOperatorClassStmt) return ddlExecutor.executeCreateOperatorClass(((CreateOperatorClassStmt) stmt));
+        if (stmt instanceof AlterOperatorStmt) return ddlExecutor.executeAlterOperator(((AlterOperatorStmt) stmt));
         if (stmt instanceof CreateTriggerStmt) return ddlExecutor.executeCreateTrigger(((CreateTriggerStmt) stmt));
         if (stmt instanceof CreateExtensionStmt) return QueryResult.message(QueryResult.Type.SET, "CREATE EXTENSION");
         if (stmt instanceof CreateRuleStmt) return ddlExecutor.executeCreateRule(((CreateRuleStmt) stmt));

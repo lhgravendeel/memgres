@@ -84,10 +84,12 @@ class DdlParser {
 
         if (parser.matchKeyword("AGGREGATE")) return parseCreateAggregate();
 
+        if (parser.matchKeywords("OPERATOR", "CLASS")) return parseCreateOperatorClass();
+        if (parser.matchKeywords("OPERATOR", "FAMILY")) return parseCreateOperatorFamily();
+        if (parser.matchKeyword("OPERATOR")) return parseCreateOperator();
+
         // No-op CREATE targets (accepted but not functionally implemented)
-        if (parser.matchKeywords("OPERATOR", "CLASS") || parser.matchKeywords("OPERATOR", "FAMILY")
-                || parser.matchKeyword("OPERATOR")
-                || parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
+        if (parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
                 || parser.matchKeyword("CONVERSION")
                 || parser.matchKeywords("DEFAULT", "CONVERSION")
                 || parser.matchKeywords("TEXT", "SEARCH")
@@ -267,19 +269,45 @@ class DdlParser {
                 && parser.check(TokenType.LEFT_PAREN)) {
             DdlTableParser.consumeUntilParen(parser);
         }
-        if ((objectType == DropStmt.ObjectType.OPERATOR || objectType == DropStmt.ObjectType.OPERATOR_CLASS
+        if (objectType == DropStmt.ObjectType.OPERATOR && parser.check(TokenType.LEFT_PAREN)) {
+            // Capture arg types for operator overload resolution
+            parser.expect(TokenType.LEFT_PAREN);
+            StringBuilder argKey = new StringBuilder();
+            int depth = 1;
+            while (!parser.isAtEnd() && depth > 0) {
+                Token t = parser.peek();
+                if (t.type() == TokenType.LEFT_PAREN) depth++;
+                else if (t.type() == TokenType.RIGHT_PAREN) { depth--; if (depth == 0) break; }
+                argKey.append(parser.advance().value());
+            }
+            parser.expect(TokenType.RIGHT_PAREN);
+            // Parse arg types from "integer, integer" or "NONE, integer"
+            String[] parts = argKey.toString().split(",");
+            String leftArg = parts.length > 0 ? parts[0].trim() : "NONE";
+            String rightArg = parts.length > 1 ? parts[1].trim() : "NONE";
+            if ("NONE".equalsIgnoreCase(leftArg)) leftArg = "NONE";
+            if ("NONE".equalsIgnoreCase(rightArg)) rightArg = "NONE";
+            // Encode as operator key: name(leftarg,rightarg)
+            name = name + "(" + leftArg.toLowerCase() + "," + rightArg.toLowerCase() + ")";
+        }
+        if ((objectType == DropStmt.ObjectType.OPERATOR_CLASS
                 || objectType == DropStmt.ObjectType.OPERATOR_FAMILY) && parser.check(TokenType.LEFT_PAREN)) {
             DdlTableParser.consumeUntilParen(parser);
         }
+        String opMethod = null;
         if ((objectType == DropStmt.ObjectType.OPERATOR_CLASS || objectType == DropStmt.ObjectType.OPERATOR_FAMILY)
                 && parser.matchKeyword("USING")) {
-            parser.readIdentifier();
+            opMethod = parser.readIdentifier();
         }
 
         String onTable = null;
         if ((objectType == DropStmt.ObjectType.TRIGGER || objectType == DropStmt.ObjectType.RULE)
                 && parser.matchKeyword("ON")) {
             onTable = parser.readIdentifier();
+        }
+        // For OPERATOR CLASS/FAMILY, store the USING method in onTable
+        if (opMethod != null) {
+            onTable = opMethod;
         }
 
         boolean cascade = parser.matchKeyword("CASCADE");
@@ -353,9 +381,14 @@ class DdlParser {
             return new SetStmt("alter_noop", "ok");
         }
 
+        // Operator ALTER targets — parse into AlterOperatorStmt
+        if (parser.matchKeywords("OPERATOR", "CLASS")) return parseAlterOperatorClass();
+        if (parser.matchKeywords("OPERATOR", "FAMILY")) return parseAlterOperatorFamily();
+        if (parser.matchKeyword("OPERATOR")) return parseAlterOperator();
+
         // No-op ALTER targets
         if (parser.matchKeyword("PROCEDURE") || parser.matchKeyword("EXTENSION")
-                || parser.matchKeyword("AGGREGATE") || parser.matchKeyword("OPERATOR") || parser.matchKeyword("COLLATION")
+                || parser.matchKeyword("AGGREGATE") || parser.matchKeyword("COLLATION")
                 || parser.matchKeyword("RULE") || parser.matchKeyword("CONVERSION")
                 || parser.matchKeyword("INDEX")
                 || parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")
@@ -905,6 +938,307 @@ class DdlParser {
         if (parser.checkKeyword("MINVALUE")) { parser.advance(); return "MINVALUE"; }
         if (parser.checkKeyword("MAXVALUE")) { parser.advance(); return "MAXVALUE"; }
         return parser.advance().value();
+    }
+
+    // ---- CREATE OPERATOR ----
+
+    private Statement parseCreateOperator() {
+        // Read operator name (may be schema-qualified)
+        String schema = null;
+        StringBuilder opName = new StringBuilder();
+        // Operator names can be symbol tokens
+        while (!parser.isAtEnd() && !parser.check(TokenType.LEFT_PAREN)) {
+            String tok = parser.advance().value();
+            if (tok.equals(".") && opName.length() > 0 && schema == null) {
+                schema = opName.toString();
+                opName.setLength(0);
+            } else {
+                opName.append(tok);
+            }
+        }
+        String name = opName.toString().trim();
+
+        parser.expect(TokenType.LEFT_PAREN);
+
+        String leftArg = null, rightArg = null, function = null;
+        String commutator = null, negator = null, restrict = null, join = null;
+        boolean hashes = false, merges = false;
+
+        while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+            if (parser.match(TokenType.COMMA)) continue;
+            String kw = parser.advance().value().toUpperCase();
+            switch (kw) {
+                case "LEFTARG":
+                    parser.match(TokenType.EQUALS);
+                    leftArg = readTypeName();
+                    break;
+                case "RIGHTARG":
+                    parser.match(TokenType.EQUALS);
+                    rightArg = readTypeName();
+                    break;
+                case "FUNCTION":
+                case "PROCEDURE":
+                    parser.match(TokenType.EQUALS);
+                    function = readDottedIdentifier();
+                    break;
+                case "COMMUTATOR":
+                    parser.match(TokenType.EQUALS);
+                    commutator = readOperatorName();
+                    break;
+                case "NEGATOR":
+                    parser.match(TokenType.EQUALS);
+                    negator = readOperatorName();
+                    break;
+                case "RESTRICT":
+                    parser.match(TokenType.EQUALS);
+                    restrict = readDottedIdentifier();
+                    break;
+                case "JOIN":
+                    parser.match(TokenType.EQUALS);
+                    join = readDottedIdentifier();
+                    break;
+                case "HASHES":
+                    hashes = true;
+                    break;
+                case "MERGES":
+                    merges = true;
+                    break;
+                default:
+                    // skip unknown attributes
+                    if (parser.check(TokenType.EQUALS)) {
+                        parser.advance();
+                        parser.advance();
+                    }
+                    break;
+            }
+        }
+        parser.expect(TokenType.RIGHT_PAREN);
+
+        return new CreateOperatorStmt(schema, name, leftArg, rightArg, function,
+                commutator, negator, restrict, join, hashes, merges);
+    }
+
+    /** Read an operator name (may be multi-symbol, e.g. ===, !==). */
+    private String readOperatorName() {
+        StringBuilder sb = new StringBuilder();
+        // Handle OPERATOR(schema.op) syntax
+        if (parser.checkKeyword("OPERATOR")) {
+            parser.advance();
+            parser.expect(TokenType.LEFT_PAREN);
+            while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                sb.append(parser.advance().value());
+            }
+            parser.expect(TokenType.RIGHT_PAREN);
+            return sb.toString();
+        }
+        // Simple operator name: consume symbol tokens
+        while (!parser.isAtEnd() && !parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)
+                && !parser.check(TokenType.SEMICOLON)) {
+            Token t = parser.peek();
+            // Stop if we hit a keyword that's a new attribute
+            if (t.type() == TokenType.IDENTIFIER && isOperatorAttribute(t.value().toUpperCase())) break;
+            sb.append(parser.advance().value());
+        }
+        return sb.toString().trim();
+    }
+
+    private boolean isOperatorAttribute(String val) {
+        return "LEFTARG".equals(val) || "RIGHTARG".equals(val) || "FUNCTION".equals(val)
+                || "PROCEDURE".equals(val) || "COMMUTATOR".equals(val) || "NEGATOR".equals(val)
+                || "RESTRICT".equals(val) || "JOIN".equals(val) || "HASHES".equals(val) || "MERGES".equals(val);
+    }
+
+    private String readDottedIdentifier() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(parser.readIdentifier());
+        while (parser.check(TokenType.DOT)) {
+            sb.append(parser.advance().value());
+            sb.append(parser.readIdentifier());
+        }
+        return sb.toString();
+    }
+
+    private String readTypeName() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(parser.readIdentifier());
+        // Handle multi-word types like "double precision", "character varying"
+        if (parser.checkKeyword("PRECISION") || parser.checkKeyword("VARYING")
+                || parser.checkKeyword("WITHOUT") || parser.checkKeyword("WITH")
+                || parser.checkKeyword("ZONE")) {
+            sb.append(" ").append(parser.advance().value());
+            if (parser.checkKeyword("TIME") || parser.checkKeyword("ZONE")) {
+                sb.append(" ").append(parser.advance().value());
+            }
+        }
+        // Handle array type
+        if (parser.check(TokenType.LEFT_BRACKET)) {
+            sb.append(parser.advance().value());
+            if (parser.check(TokenType.RIGHT_BRACKET)) sb.append(parser.advance().value());
+        }
+        return sb.toString();
+    }
+
+    // ---- CREATE OPERATOR FAMILY ----
+
+    private Statement parseCreateOperatorFamily() {
+        String schema = null;
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            schema = name;
+            name = parser.readIdentifier();
+        }
+        parser.expectKeyword("USING");
+        String method = parser.readIdentifier();
+        return new CreateOperatorFamilyStmt(schema, name, method);
+    }
+
+    // ---- CREATE OPERATOR CLASS ----
+
+    private Statement parseCreateOperatorClass() {
+        String schema = null;
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            schema = name;
+            name = parser.readIdentifier();
+        }
+        boolean isDefault = parser.matchKeyword("DEFAULT");
+        parser.expectKeyword("FOR");
+        parser.expectKeyword("TYPE");
+        String forType = readTypeName();
+        parser.expectKeyword("USING");
+        String method = parser.readIdentifier();
+        String familyName = null;
+        if (parser.matchKeyword("FAMILY")) {
+            familyName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) {
+                // schema.family — just use the family name
+                familyName = parser.readIdentifier();
+            }
+        }
+        // Consume AS clause (operator/function definitions) — stored in the opclass itself
+        if (parser.matchKeyword("AS")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+                parser.advance();
+            }
+        }
+        return new CreateOperatorClassStmt(schema, name, isDefault, forType, method, familyName);
+    }
+
+    // ---- ALTER OPERATOR ----
+
+    private Statement parseAlterOperator() {
+        // Read operator name
+        StringBuilder opName = new StringBuilder();
+        while (!parser.isAtEnd() && !parser.check(TokenType.LEFT_PAREN)) {
+            opName.append(parser.advance().value());
+        }
+        String name = opName.toString().trim();
+
+        // Read (left_type, right_type)
+        parser.expect(TokenType.LEFT_PAREN);
+        String leftArg = readTypeOrNone();
+        parser.expect(TokenType.COMMA);
+        String rightArg = readTypeOrNone();
+        parser.expect(TokenType.RIGHT_PAREN);
+
+        // Parse action
+        if (parser.matchKeywords("OWNER", "TO")) {
+            String owner = parser.readIdentifier();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR,
+                    name, leftArg, rightArg, null, AlterOperatorStmt.AlterAction.OWNER_TO, owner);
+        }
+        if (parser.matchKeywords("SET", "SCHEMA")) {
+            String schema = parser.readIdentifier();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR,
+                    name, leftArg, rightArg, null, AlterOperatorStmt.AlterAction.SET_SCHEMA, schema);
+        }
+        if (parser.matchKeyword("SET")) {
+            // SET (RESTRICT = ..., JOIN = ...)
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR,
+                    name, leftArg, rightArg, null, AlterOperatorStmt.AlterAction.SET_PROPERTIES, null);
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR,
+                name, leftArg, rightArg, null, AlterOperatorStmt.AlterAction.SET_PROPERTIES, null);
+    }
+
+    private String readTypeOrNone() {
+        if (parser.checkKeyword("NONE")) {
+            parser.advance();
+            return null;
+        }
+        return readTypeName();
+    }
+
+    // ---- ALTER OPERATOR FAMILY ----
+
+    private Statement parseAlterOperatorFamily() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            name = parser.readIdentifier(); // skip schema for now
+        }
+        parser.expectKeyword("USING");
+        String method = parser.readIdentifier();
+
+        if (parser.matchKeywords("OWNER", "TO")) {
+            String owner = parser.readIdentifier();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
+                    name, null, null, method, AlterOperatorStmt.AlterAction.OWNER_TO, owner);
+        }
+        if (parser.matchKeywords("RENAME", "TO")) {
+            String newName = parser.readIdentifier();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
+                    name, null, null, method, AlterOperatorStmt.AlterAction.RENAME_TO, newName);
+        }
+        if (parser.matchKeywords("SET", "SCHEMA")) {
+            String schema = parser.readIdentifier();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
+                    name, null, null, method, AlterOperatorStmt.AlterAction.SET_SCHEMA, schema);
+        }
+        if (parser.matchKeyword("ADD")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
+                    name, null, null, method, AlterOperatorStmt.AlterAction.ADD_MEMBER, null);
+        }
+        if (parser.matchKeyword("DROP")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
+                    name, null, null, method, AlterOperatorStmt.AlterAction.DROP_MEMBER, null);
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_FAMILY,
+                name, null, null, method, AlterOperatorStmt.AlterAction.SET_PROPERTIES, null);
+    }
+
+    // ---- ALTER OPERATOR CLASS ----
+
+    private Statement parseAlterOperatorClass() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            name = parser.readIdentifier(); // skip schema for now
+        }
+        parser.expectKeyword("USING");
+        String method = parser.readIdentifier();
+
+        if (parser.matchKeywords("OWNER", "TO")) {
+            String owner = parser.readIdentifier();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_CLASS,
+                    name, null, null, method, AlterOperatorStmt.AlterAction.OWNER_TO, owner);
+        }
+        if (parser.matchKeywords("RENAME", "TO")) {
+            String newName = parser.readIdentifier();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_CLASS,
+                    name, null, null, method, AlterOperatorStmt.AlterAction.RENAME_TO, newName);
+        }
+        if (parser.matchKeywords("SET", "SCHEMA")) {
+            String schema = parser.readIdentifier();
+            return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_CLASS,
+                    name, null, null, method, AlterOperatorStmt.AlterAction.SET_SCHEMA, schema);
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new AlterOperatorStmt(AlterOperatorStmt.ObjectKind.OPERATOR_CLASS,
+                name, null, null, method, AlterOperatorStmt.AlterAction.SET_PROPERTIES, null);
     }
 
     private String buildRawSqlFromTokens(int startPos, int endPos) {
