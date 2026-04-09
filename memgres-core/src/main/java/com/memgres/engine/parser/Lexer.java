@@ -80,7 +80,7 @@ public class Lexer {
             "CACHE", "CYCLE", "OWNED",
             "DOMAIN", "EXTRACT", "VALUE", "FILTER", "ESCAPE",
             "EXCLUDE", "NO", "ACTION",
-            "DEFERRABLE", "INITIALLY", "DEFERRED", "IMMEDIATE",
+            "DEFERRABLE", "INITIALLY", "DEFERRED", "IMMEDIATE", "ENFORCED",
             "VALID", "VALIDATE", "HANDLER", "INLINE", "TRUSTED",
             "COMMENT", "SECURITY", "DEFINER", "INVOKER",
             "CALLED", "INPUT", "STRICT", "IMMUTABLE", "STABLE", "VOLATILE",

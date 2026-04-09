@@ -284,7 +284,7 @@ public class InfoSchemaBuilder {
                     table.insertRow(new Object[]{
                             "memgres", schemaEntry.getKey(), sc.getName(),
                             "memgres", schemaEntry.getKey(), t.getName(),
-                            type, "NO", "NO", "YES"
+                            type, "NO", "NO", sc.isNotEnforced() ? "NO" : "YES"
                     });
                 }
                 // PG 18: NOT NULL constraints appear in information_schema.table_constraints

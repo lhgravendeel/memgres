@@ -60,6 +60,22 @@ class DdlAlterActionParser {
             String col = parser.readIdentifier();
             return new AlterTableStmt.AlterColumn(col, parseAlterColumnAction());
         }
+        if (parser.matchKeywords("ALTER", "CONSTRAINT")) {
+            String constraintName = parser.readIdentifier();
+            // PG 18: ALTER CONSTRAINT ... [NOT] ENFORCED
+            if (parser.matchKeyword("ENFORCED")) {
+                return new AlterTableStmt.AlterConstraintEnforced(constraintName, false);
+            }
+            if (parser.matchKeywords("NOT", "ENFORCED")) {
+                return new AlterTableStmt.AlterConstraintEnforced(constraintName, true);
+            }
+            // PG also supports ALTER CONSTRAINT ... [NOT] DEFERRABLE [INITIALLY ...]
+            // Consume remaining tokens for forward compatibility
+            while (!parser.isAtEnd() && !parser.check(TokenType.COMMA) && !parser.check(TokenType.SEMICOLON)) {
+                parser.advance();
+            }
+            return new AlterTableStmt.AlterConstraintEnforced(constraintName, false);
+        }
         // ALTER colname (without COLUMN keyword): shorthand for ALTER COLUMN colname
         if (parser.matchKeyword("ALTER")) {
             String col = parser.readIdentifier();

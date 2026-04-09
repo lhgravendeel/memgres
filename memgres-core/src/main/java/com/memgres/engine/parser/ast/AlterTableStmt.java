@@ -553,6 +553,38 @@ public final class AlterTableStmt implements Statement {
         }
     }
 
+        public static final class AlterConstraintEnforced implements AlterAction {
+        public final String constraintName;
+        public final boolean notEnforced;
+
+        public AlterConstraintEnforced(String constraintName, boolean notEnforced) {
+            this.constraintName = constraintName;
+            this.notEnforced = notEnforced;
+        }
+
+        public String constraintName() { return constraintName; }
+        public boolean notEnforced() { return notEnforced; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            AlterConstraintEnforced that = (AlterConstraintEnforced) o;
+            return java.util.Objects.equals(constraintName, that.constraintName)
+                && notEnforced == that.notEnforced;
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(constraintName, notEnforced);
+        }
+
+        @Override
+        public String toString() {
+            return "AlterConstraintEnforced[constraintName=" + constraintName + ", notEnforced=" + notEnforced + "]";
+        }
+    }
+
     public interface AlterColumnAction {}
 
         public static final class SetType implements AlterColumnAction {

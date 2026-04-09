@@ -133,7 +133,9 @@ class DdlExecutor {
             }
             case CHECK: {
                 if (name == null) name = tableName + "_check";
-                return StoredConstraint.check(name, tc.checkExpr());
+                StoredConstraint chk = StoredConstraint.check(name, tc.checkExpr());
+                if (tc.notEnforced()) chk.setNotEnforced(true);
+                return chk;
             }
             case FOREIGN_KEY: {
                 if (name == null) name = tableName + "_" + String.join("_", tc.columns()) + "_fkey";
@@ -145,6 +147,7 @@ class DdlExecutor {
                     fk.setDeferrable(true);
                     fk.setInitiallyDeferred(tc.initiallyDeferred());
                 }
+                if (tc.notEnforced()) fk.setNotEnforced(true);
                 return fk;
             }
             case EXCLUDE: {

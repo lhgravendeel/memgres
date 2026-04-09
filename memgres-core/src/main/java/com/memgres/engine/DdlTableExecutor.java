@@ -394,6 +394,7 @@ class DdlTableExecutor {
             fk.setDeferrable(true);
             fk.setInitiallyDeferred(def.initiallyDeferred());
         }
+        if (def.notEnforced()) fk.setNotEnforced(true);
         table.addConstraint(fk);
     }
 

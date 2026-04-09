@@ -22,6 +22,7 @@ public final class ColumnDef {
     public final Long identityIncrement;         // INCREMENT BY value for identity columns
     public final boolean deferrable;             // DEFERRABLE on column-level FK
     public final boolean initiallyDeferred;      // INITIALLY DEFERRED on column-level FK
+    public final boolean notEnforced;            // PG 18: NOT ENFORCED on column-level FK
     public final Expression checkConstraintExpr; // or null
 
     public ColumnDef(
@@ -43,6 +44,7 @@ public final class ColumnDef {
             Long identityIncrement,
             boolean deferrable,
             boolean initiallyDeferred,
+            boolean notEnforced,
             Expression checkConstraintExpr
     ) {
         this.name = name;
@@ -63,10 +65,11 @@ public final class ColumnDef {
         this.identityIncrement = identityIncrement;
         this.deferrable = deferrable;
         this.initiallyDeferred = initiallyDeferred;
+        this.notEnforced = notEnforced;
         this.checkConstraintExpr = checkConstraintExpr;
     }
 
-    /** Full constructor without checkConstraintExpr (backwards compatible). */
+    /** Full constructor without notEnforced and checkConstraintExpr (backwards compatible). */
     public ColumnDef(String name, String typeName, Integer precision, Integer scale,
                      boolean notNull, boolean primaryKey, boolean unique,
                      Expression defaultExpr, String referencesTable, String referencesColumn,
@@ -74,7 +77,19 @@ public final class ColumnDef {
                      Long identityStart, Long identityIncrement, boolean deferrable, boolean initiallyDeferred) {
         this(name, typeName, precision, scale, notNull, primaryKey, unique,
                 defaultExpr, referencesTable, referencesColumn, generatedExpr, identity,
-                refOnDelete, refOnUpdate, identityStart, identityIncrement, deferrable, initiallyDeferred, null);
+                refOnDelete, refOnUpdate, identityStart, identityIncrement, deferrable, initiallyDeferred, false, null);
+    }
+
+    /** Constructor with checkConstraintExpr but not notEnforced (backwards compatible). */
+    public ColumnDef(String name, String typeName, Integer precision, Integer scale,
+                     boolean notNull, boolean primaryKey, boolean unique,
+                     Expression defaultExpr, String referencesTable, String referencesColumn,
+                     String generatedExpr, String identity, String refOnDelete, String refOnUpdate,
+                     Long identityStart, Long identityIncrement, boolean deferrable, boolean initiallyDeferred,
+                     Expression checkConstraintExpr) {
+        this(name, typeName, precision, scale, notNull, primaryKey, unique,
+                defaultExpr, referencesTable, referencesColumn, generatedExpr, identity,
+                refOnDelete, refOnUpdate, identityStart, identityIncrement, deferrable, initiallyDeferred, false, checkConstraintExpr);
     }
 
     /** Constructor with identity options and deferrable. */
@@ -134,6 +149,7 @@ public final class ColumnDef {
     public Long identityIncrement() { return identityIncrement; }
     public boolean deferrable() { return deferrable; }
     public boolean initiallyDeferred() { return initiallyDeferred; }
+    public boolean notEnforced() { return notEnforced; }
     public Expression checkConstraintExpr() { return checkConstraintExpr; }
 
     @Override
