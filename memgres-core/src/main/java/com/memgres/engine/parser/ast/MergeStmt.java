@@ -17,6 +17,7 @@ public final class MergeStmt implements Statement {
     public final Expression onCondition;
     public final List<WhenClause> whenClauses;
     public final List<SelectStmt.SelectTarget> returning;
+    public final List<SelectStmt.CommonTableExpr> withClauses;
 
     public MergeStmt(
             String schema,
@@ -25,7 +26,8 @@ public final class MergeStmt implements Statement {
             SelectStmt.FromItem source,
             Expression onCondition,
             List<WhenClause> whenClauses,
-            List<SelectStmt.SelectTarget> returning
+            List<SelectStmt.SelectTarget> returning,
+            List<SelectStmt.CommonTableExpr> withClauses
     ) {
         this.schema = schema;
         this.targetTable = targetTable;
@@ -34,6 +36,7 @@ public final class MergeStmt implements Statement {
         this.onCondition = onCondition;
         this.whenClauses = whenClauses;
         this.returning = returning;
+        this.withClauses = withClauses;
     }
 
     public interface WhenClause {}
@@ -161,6 +164,7 @@ public final class MergeStmt implements Statement {
     public Expression onCondition() { return onCondition; }
     public List<WhenClause> whenClauses() { return whenClauses; }
     public List<SelectStmt.SelectTarget> returning() { return returning; }
+    public List<SelectStmt.CommonTableExpr> withClauses() { return withClauses; }
 
     @Override
     public boolean equals(Object o) {
@@ -173,12 +177,13 @@ public final class MergeStmt implements Statement {
             && Objects.equals(source, that.source)
             && Objects.equals(onCondition, that.onCondition)
             && Objects.equals(whenClauses, that.whenClauses)
-            && Objects.equals(returning, that.returning);
+            && Objects.equals(returning, that.returning)
+            && Objects.equals(withClauses, that.withClauses);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(schema, targetTable, targetAlias, source, onCondition, whenClauses, returning);
+        return Objects.hash(schema, targetTable, targetAlias, source, onCondition, whenClauses, returning, withClauses);
     }
 
     @Override

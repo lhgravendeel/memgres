@@ -284,6 +284,10 @@ class DmlParser {
     }
 
     MergeStmt parseMerge() {
+        return parseMerge(null);
+    }
+
+    MergeStmt parseMerge(List<SelectStmt.CommonTableExpr> withClauses) {
         parser.expectKeyword("MERGE");
         parser.expectKeyword("INTO");
 
@@ -407,6 +411,6 @@ class DmlParser {
             if (returning.isEmpty()) throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"", parser.peek());
         }
 
-        return new MergeStmt(schema, table, targetAlias, source, onCondition, whenClauses, returning);
+        return new MergeStmt(schema, table, targetAlias, source, onCondition, whenClauses, returning, withClauses);
     }
 }
