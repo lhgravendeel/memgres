@@ -344,7 +344,8 @@ class CatalogCoreBuilder {
                     DataType colType = c.getType();
                     boolean hasDefault = c.getDefaultValue() != null
                             || colType == DataType.SERIAL || colType == DataType.BIGSERIAL || colType == DataType.SMALLSERIAL
-                            || !identity.isEmpty();
+                            || !identity.isEmpty()
+                            || c.isGenerated();
                     // Determine attlen from the type's typlen
                     short attlen;
                     switch (colType) {

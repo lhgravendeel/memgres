@@ -433,13 +433,13 @@ class DdlExecutor {
     }
 
     // Built-in volatile function names (these don't have PgFunction entries in the database)
-    private static final Set<String> BUILTIN_VOLATILE_FUNCTIONS = Set.of(
+    private static final Set<String> BUILTIN_VOLATILE_FUNCTIONS = Cols.setOf(
             "random", "now", "clock_timestamp", "timeofday", "gen_random_uuid",
             "nextval", "currval", "setval", "txid_current", "statement_timestamp"
     );
 
     // Built-in volatile identifiers that appear as bare names (not function calls)
-    private static final Set<String> BUILTIN_VOLATILE_IDENTIFIERS = Set.of(
+    private static final Set<String> BUILTIN_VOLATILE_IDENTIFIERS = Cols.setOf(
             "current_timestamp", "current_time", "current_date", "localtimestamp", "localtime"
     );
 

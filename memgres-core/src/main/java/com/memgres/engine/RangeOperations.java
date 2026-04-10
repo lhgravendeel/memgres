@@ -404,10 +404,15 @@ public class RangeOperations {
         // Check that inner content starts with a range literal bracket
         if (inner.charAt(0) != '[' && inner.charAt(0) != '(') return false;
         // Extract the first element and validate it's actually a range (not a record like "(1)")
-        // Find the closing bracket of the first element
-        char open = inner.charAt(0);
-        char expectedClose = (open == '[') ? ']' : ')';
-        int closeIdx = inner.indexOf(expectedClose, 1);
+        // Ranges can use mixed brackets (e.g. [1,5) or (1,5]), so find the first ']' or ')' after a comma
+        int commaIdx = inner.indexOf(',');
+        if (commaIdx < 0) return false; // ranges require a comma between bounds
+        int closeSquare = inner.indexOf(']', commaIdx);
+        int closeParen = inner.indexOf(')', commaIdx);
+        int closeIdx;
+        if (closeSquare < 0) closeIdx = closeParen;
+        else if (closeParen < 0) closeIdx = closeSquare;
+        else closeIdx = Math.min(closeSquare, closeParen);
         if (closeIdx < 0) return false;
         String firstElem = inner.substring(0, closeIdx + 1);
         return isRangeString(firstElem);
