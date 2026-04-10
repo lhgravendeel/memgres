@@ -874,8 +874,26 @@ class DdlObjectExecutor {
         for (Expression arg : stmt.args()) {
             args.add(executor.evalExpr(arg, null));
         }
+        // Start implicit transaction for procedure (PG behavior: CALL in autocommit starts a txn)
+        boolean implicitTxn = false;
+        if (executor.session != null && executor.session.getStatus() == Session.TransactionStatus.IDLE) {
+            executor.session.begin();
+            implicitTxn = true;
+        }
         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
-        plExec.executeFunction(function, args);
+        try {
+            plExec.executeFunction(function, args);
+        } finally {
+            // After procedure returns, commit any trailing implicit transaction
+            if (executor.session != null) {
+                Session.TransactionStatus st = executor.session.getStatus();
+                if (st == Session.TransactionStatus.IN_TRANSACTION) {
+                    executor.session.commit();
+                } else if (st == Session.TransactionStatus.FAILED) {
+                    executor.session.rollback();
+                }
+            }
+        }
         return QueryResult.command(QueryResult.Type.CALL, 0);
     }
 

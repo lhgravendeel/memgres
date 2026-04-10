@@ -9,12 +9,18 @@ public final class TransactionStmt implements Statement {
     public final String savepointName;
     public final String isolationLevel;
     public final Boolean readOnly;
+    public final boolean chain; // AND CHAIN (PG 11+)
 
     public TransactionStmt(TransactionAction action, String savepointName, String isolationLevel, Boolean readOnly) {
+        this(action, savepointName, isolationLevel, readOnly, false);
+    }
+
+    public TransactionStmt(TransactionAction action, String savepointName, String isolationLevel, Boolean readOnly, boolean chain) {
         this.action = action;
         this.savepointName = savepointName;
         this.isolationLevel = isolationLevel;
         this.readOnly = readOnly;
+        this.chain = chain;
     }
 
     public enum TransactionAction {
@@ -31,6 +37,7 @@ public final class TransactionStmt implements Statement {
     public String savepointName() { return savepointName; }
     public String isolationLevel() { return isolationLevel; }
     public Boolean readOnly() { return readOnly; }
+    public boolean chain() { return chain; }
 
     @Override
     public boolean equals(Object o) {

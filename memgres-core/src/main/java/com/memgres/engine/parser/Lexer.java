@@ -89,7 +89,7 @@ public class Lexer {
             "WORK", "ABORT",
             "PROCEDURE",  // used in EXECUTE PROCEDURE
             "CALL", "SETOF", "INOUT", "VARIADIC", "SLICE", "ROUTINE",
-            "ATOMIC",
+            "ATOMIC", "CHAIN",
             "ATTACH", "DETACH", "STATEMENT", "REFERENCING",
             "MERGE", "MATCHED", "RESTART",
             "TRIM", "LEADING", "TRAILING", "BOTH",

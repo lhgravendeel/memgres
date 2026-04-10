@@ -937,4 +937,52 @@ public interface PlpgsqlStatement {
             return "CloseCursorStmt[cursorName=" + cursorName + "]";
         }
     }
+
+    /** COMMIT [AND CHAIN] inside a procedure body (PG 11+). */
+        public static final class CommitStmt implements PlpgsqlStatement {
+        public final boolean chain;
+
+        public CommitStmt(boolean chain) {
+            this.chain = chain;
+        }
+
+        public boolean chain() { return chain; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            return chain == ((CommitStmt) o).chain;
+        }
+
+        @Override
+        public int hashCode() { return Boolean.hashCode(chain); }
+
+        @Override
+        public String toString() { return "CommitStmt[chain=" + chain + "]"; }
+    }
+
+    /** ROLLBACK [AND CHAIN] inside a procedure body (PG 11+). */
+        public static final class RollbackStmt implements PlpgsqlStatement {
+        public final boolean chain;
+
+        public RollbackStmt(boolean chain) {
+            this.chain = chain;
+        }
+
+        public boolean chain() { return chain; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            return chain == ((RollbackStmt) o).chain;
+        }
+
+        @Override
+        public int hashCode() { return Boolean.hashCode(chain); }
+
+        @Override
+        public String toString() { return "RollbackStmt[chain=" + chain + "]"; }
+    }
 }
