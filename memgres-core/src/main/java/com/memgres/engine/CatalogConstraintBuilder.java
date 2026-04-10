@@ -122,7 +122,7 @@ class CatalogConstraintBuilder {
                             confrelid,
                             conkey,
                             confkey,
-                            false, false, true,
+                            sc.isDeferrable(), sc.isInitiallyDeferred(), sc.isConvalidated(), // condeferrable, condeferred, convalidated
                             true, conindid,
                             confupdtype,
                             confdeltype,

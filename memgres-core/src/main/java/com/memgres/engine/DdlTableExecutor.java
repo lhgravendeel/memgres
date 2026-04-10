@@ -154,10 +154,18 @@ class DdlTableExecutor {
 
             // Validate generated column expression
             if (def.generatedExpr() != null) {
+                // PG rejects DEFAULT + GENERATED ALWAYS AS on same column
+                if (def.defaultExpr() != null) {
+                    throw new MemgresException("a generated column is not allowed to have a default value", "42601");
+                }
                 String genNorm = def.generatedExpr().toLowerCase().replaceAll("\\s+", "");
                 if (genNorm.contains("now(") || genNorm.contains("random(") || genNorm.contains("clock_timestamp(")
                         || genNorm.contains("current_timestamp") || genNorm.contains("timeofday(")
-                        || genNorm.contains("current_time") || genNorm.contains("current_date")) {
+                        || genNorm.contains("current_time") || genNorm.contains("current_date")
+                        || genNorm.contains("gen_random_uuid(") || genNorm.contains("nextval(")
+                        || genNorm.contains("txid_current(") || genNorm.contains("statement_timestamp(")
+                        || genNorm.contains("currval(") || genNorm.contains("setval(")
+                        || genNorm.contains("localtimestamp") || genNorm.contains("localtime")) {
                     throw new MemgresException("generation expression is not immutable", "42P17");
                 }
                 if (genNorm.contains("select")) {
@@ -166,8 +174,8 @@ class DdlTableExecutor {
             }
 
             Column col = new Column(def.name(), dataType, !notNull, def.primaryKey(), defaultVal,
-                    enumTypeName, def.precision(), def.scale(), def.generatedExpr(), domainTypeName,
-                    compositeTypeName, arrayElementType);
+                    enumTypeName, def.precision(), def.scale(), def.generatedExpr(), def.generatedVirtual(),
+                    domainTypeName, compositeTypeName, arrayElementType);
             if (def.defaultExpr() != null) {
                 col.setParsedDefaultExpr(def.defaultExpr());
             }

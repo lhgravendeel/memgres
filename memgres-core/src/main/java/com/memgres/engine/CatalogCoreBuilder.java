@@ -417,7 +417,7 @@ class CatalogCoreBuilder {
                             false,
                             hasDefault,
                             identity,  // attidentity
-                            "",        // attgenerated
+                            c.isVirtual() ? "v" : c.isGenerated() ? "s" : "",  // attgenerated
                             0,         // attcollation
                             1, true, 0, null, 0, null,  // xmin, attislocal, attinhcount, attfdwoptions, attndims, attacl
                             null,      // attoptions

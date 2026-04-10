@@ -21,7 +21,7 @@ public class Lexer {
             "MODULUS", "REMAINDER",
             // Column constraints
             "PRIMARY", "KEY", "UNIQUE", "CHECK", "REFERENCES", "CONSTRAINT", "CONSTRAINTS", "FOREIGN",
-            "DEFAULT", "NULL", "GENERATED", "ALWAYS", "STORED", "IDENTITY",
+            "DEFAULT", "NULL", "GENERATED", "ALWAYS", "STORED", "VIRTUAL", "IDENTITY",
             // Data types (keywords, not all; many are identifiers)
             "INTEGER", "INT", "SMALLINT", "BIGINT", "REAL", "FLOAT", "DOUBLE", "PRECISION",
             "NUMERIC", "DECIMAL", "BOOLEAN", "BOOL", "SERIAL", "BIGSERIAL", "SMALLSERIAL",

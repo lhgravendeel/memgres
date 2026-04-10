@@ -1375,7 +1375,12 @@ class DdlObjectExecutor {
                         String colLower = exprStr.toLowerCase().replaceAll("\\s+", "");
                         if (colLower.contains("random(") || colLower.contains("now(")
                                 || colLower.contains("clock_timestamp(") || colLower.contains("timeofday(")
-                                || colLower.contains("current_timestamp") || colLower.contains("gen_random_uuid(")) {
+                                || colLower.contains("current_timestamp") || colLower.contains("gen_random_uuid(")
+                                || colLower.contains("nextval(") || colLower.contains("txid_current(")
+                                || colLower.contains("statement_timestamp(") || colLower.contains("currval(")
+                                || colLower.contains("setval(") || colLower.contains("localtimestamp")
+                                || colLower.contains("localtime") || colLower.contains("current_time")
+                                || colLower.contains("current_date")) {
                             throw new MemgresException("functions in index expression must be marked IMMUTABLE", "42P17");
                         }
                         // Try to evaluate the expression against a dummy row to catch type errors
@@ -1422,6 +1427,11 @@ class DdlObjectExecutor {
                                         dummyRow[di] = "dummy";
                                         break;
                                 }
+                            }
+                            // Compute virtual columns on the dummy row so expression
+                            // indexes referencing virtual columns evaluate correctly
+                            if (executor.dmlExecutor.hasVirtualColumns(idxTable)) {
+                                dummyRow = executor.dmlExecutor.computeVirtualColumns(idxTable, dummyRow);
                             }
                             RowContext dummyCtx = new RowContext(idxTable, idxTable.getName(), dummyRow);
                             executor.evalExpr(idxExpr, dummyCtx);
@@ -1493,7 +1503,9 @@ class DdlObjectExecutor {
                         } catch (Exception ignored) {}
                     }
                     // Parse expression columns if any
-                    boolean hasExprCols = s.columns().stream().anyMatch(c -> c.contains("("));
+                    boolean hasExprCols = s.columns().stream().anyMatch(c ->
+                            c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
+                            || c.contains("*") || c.contains("/") || c.contains("||"));
                     List<Expression> parsedExprs = null;
                     if (hasExprCols) {
                         parsedExprs = new ArrayList<>();
@@ -1508,8 +1520,10 @@ class DdlObjectExecutor {
                     }
                     // Collect key values for rows that pass the WHERE predicate
                     Set<String> seenKeys = new HashSet<>();
+                    boolean idxHasVirtual = executor.dmlExecutor.hasVirtualColumns(valTable);
                     for (Object[] row : existingRows) {
-                        RowContext rowCtx = new RowContext(valTable, valTable.getName(), row);
+                        Object[] evalRow = idxHasVirtual ? executor.dmlExecutor.computeVirtualColumns(valTable, row) : row;
+                        RowContext rowCtx = new RowContext(valTable, valTable.getName(), evalRow);
                         // Check WHERE predicate and skip rows that don't match
                         if (wherePred != null) {
                             try {
@@ -1534,7 +1548,7 @@ class DdlObjectExecutor {
                             for (String col : s.columns()) {
                                 int ci = valTable.getColumnIndex(col);
                                 if (ci >= 0) {
-                                    Object val = row[ci];
+                                    Object val = evalRow[ci];
                                     keyBuilder.append(val == null ? "\0NULL\0" : val.toString()).append('\1');
                                 }
                             }
@@ -1561,6 +1575,39 @@ class DdlObjectExecutor {
                     s.method(), s.whereClause());
             executor.database.registerSchemaObject(idxSchemaForMeta, "index", s.name());
             executor.recordUndo(new Session.CreateIndexUndo(s.name()));
+            // Build a real TableIndex for simple column indexes (non-expression, non-partial)
+            // so they can be used for index scans in SELECT queries
+            if (s.table() != null && s.whereClause() == null) {
+                boolean hasExprCols = s.columns().stream().anyMatch(c ->
+                        c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
+                        || c.contains("*") || c.contains("/") || c.contains("||"));
+                if (!hasExprCols) {
+                    try {
+                        Table idxTable2 = executor.resolveTable(idxSchemaForMeta, s.table());
+                        int[] colIndices = new int[s.columns().size()];
+                        boolean allFound = true;
+                        for (int ci = 0; ci < s.columns().size(); ci++) {
+                            int idx = idxTable2.getColumnIndex(s.columns().get(ci));
+                            if (idx < 0) { allFound = false; break; }
+                            colIndices[ci] = idx;
+                        }
+                        // Skip building index on virtual columns (computed on read, not stored)
+                        boolean hasVirtualCol = false;
+                        if (allFound) {
+                            for (int ci : colIndices) {
+                                if (idxTable2.getColumns().get(ci).isVirtual()) {
+                                    hasVirtualCol = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (allFound && !hasVirtualCol && idxTable2.getIndex(s.name()) == null) {
+                            TableIndex tableIdx = new TableIndex(s.name(), colIndices, s.unique());
+                            idxTable2.buildIndex(tableIdx);
+                        }
+                    } catch (MemgresException ignored) {}
+                }
+            }
         }
         // For UNIQUE indexes, also add a UNIQUE constraint to enforce uniqueness
         if (s.unique() && s.table() != null && s.columns() != null) {

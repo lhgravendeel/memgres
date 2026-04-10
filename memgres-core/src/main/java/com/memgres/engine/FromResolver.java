@@ -154,6 +154,11 @@ class FromResolver {
      */
     List<RowContext> resolveFromClause(List<SelectStmt.FromItem> fromItems, Expression where) {
         if (fromItems.size() == 1) {
+            // For single-table queries, try index scan optimization
+            if (where != null && fromItems.get(0) instanceof SelectStmt.TableRef) {
+                List<RowContext> indexed = tryIndexScan((SelectStmt.TableRef) fromItems.get(0), where);
+                if (indexed != null) return indexed;
+            }
             return resolveFromItem(fromItems.get(0));
         }
 
@@ -382,23 +387,28 @@ class FromResolver {
         Session currentSession = executor.session;
         if (currentSession != null && currentSession.hasRRSnapshot(schemaTableKey)) {
             List<Object[]> snapshot = currentSession.getRRSnapshot(schemaTableKey);
+            boolean snapshotHasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
             List<RowContext> contexts = new ArrayList<>();
             for (Object[] row : snapshot) {
-                contexts.add(new RowContext(table, alias, row));
+                Object[] r = snapshotHasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+                contexts.add(new RowContext(table, alias, r));
             }
             return contexts;
         }
 
         // Use getAllRowsWithSource for inheritance/partitioning
+        boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
         List<RowContext> contexts = new ArrayList<>();
         if (tableRef.only()) {
             for (Object[] row : table.getRows()) {
-                contexts.add(new RowContext(table, alias, row));
+                Object[] r = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+                contexts.add(new RowContext(table, alias, r));
             }
         } else {
             for (Table.RowWithSource rws : table.getAllRowsWithSource()) {
+                Object[] r = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, rws.row()) : rws.row();
                 contexts.add(new RowContext(Cols.listOf(
-                        new RowContext.TableBinding(table, alias, rws.row(), rws.source()))));
+                        new RowContext.TableBinding(table, alias, r, rws.source()))));
             }
         }
 
@@ -412,6 +422,149 @@ class FromResolver {
             contexts = applyRlsFiltering(contexts, table);
         }
         return contexts;
+    }
+
+    /**
+     * Try to use an index scan for a single-table query with equality predicates in WHERE.
+     * Returns null if no suitable index is found and we should fall back to sequential scan.
+     */
+    private List<RowContext> tryIndexScan(SelectStmt.TableRef tableRef, Expression where) {
+        // Only optimize regular user tables (skip CTEs, views, system catalogs)
+        if (executor.selectExecutor.lookupCte(tableRef.table()) != null) return null;
+        if (executor.database.getView(tableRef.table()) != null) return null;
+        String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
+        Table table;
+        try {
+            table = executor.resolveTable(schemaName, tableRef.table());
+        } catch (MemgresException e) {
+            return null;
+        }
+        // Skip if table has partitions/inheritance (complex row sources)
+        if (!table.getPartitions().isEmpty() || table.getParentTable() != null) return null;
+        // Skip ONLY queries (rare, let normal path handle)
+        if (tableRef.only()) return null;
+
+        // Extract equality predicates: flatten ANDs and look for col = literal patterns
+        List<Expression> predicates = flattenAndPredicates(where);
+        Map<String, Object> equalityMap = new LinkedHashMap<>();
+        List<Expression> remainingPredicates = new ArrayList<>();
+
+        for (Expression pred : predicates) {
+            String colName = null;
+            Object value = null;
+            if (pred instanceof BinaryExpr) {
+                BinaryExpr bin = (BinaryExpr) pred;
+                if ("=".equals(bin.op())) {
+                    if (bin.left() instanceof ColumnRef && isLiteralOrParam(bin.right())) {
+                        colName = ((ColumnRef) bin.left()).column();
+                        if (((ColumnRef) bin.left()).table() != null) {
+                            String tRef = ((ColumnRef) bin.left()).table();
+                            String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+                            if (!tRef.equalsIgnoreCase(alias) && !tRef.equalsIgnoreCase(tableRef.table())) {
+                                remainingPredicates.add(pred);
+                                continue;
+                            }
+                        }
+                        value = extractLiteralValue(bin.right());
+                    } else if (bin.right() instanceof ColumnRef && isLiteralOrParam(bin.left())) {
+                        colName = ((ColumnRef) bin.right()).column();
+                        if (((ColumnRef) bin.right()).table() != null) {
+                            String tRef = ((ColumnRef) bin.right()).table();
+                            String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+                            if (!tRef.equalsIgnoreCase(alias) && !tRef.equalsIgnoreCase(tableRef.table())) {
+                                remainingPredicates.add(pred);
+                                continue;
+                            }
+                        }
+                        value = extractLiteralValue(bin.left());
+                    }
+                }
+            }
+            if (colName != null && value != null && table.getColumnIndex(colName) >= 0) {
+                equalityMap.put(colName.toLowerCase(), value);
+            } else {
+                remainingPredicates.add(pred);
+            }
+        }
+
+        if (equalityMap.isEmpty()) return null;
+
+        // Find a matching index
+        for (Map.Entry<String, TableIndex> entry : table.getIndexes().entrySet()) {
+            TableIndex idx = entry.getValue();
+            int[] colIndices = idx.getColumnIndices();
+            // Check if all index columns have equality predicates
+            boolean allMatch = true;
+            Object[] keyValues = new Object[colIndices.length];
+            for (int i = 0; i < colIndices.length; i++) {
+                Column col = table.getColumns().get(colIndices[i]);
+                Object val = equalityMap.get(col.getName().toLowerCase());
+                if (val == null && !equalityMap.containsKey(col.getName().toLowerCase())) {
+                    allMatch = false;
+                    break;
+                }
+                keyValues[i] = val;
+            }
+            if (!allMatch) continue;
+
+            // Found a matching index — do the lookup
+            List<Object[]> matchedRows = idx.findAll(keyValues);
+
+            String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+            lastResolvedRightTable = table;
+            lastResolvedRightAlias = alias;
+            boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
+            List<RowContext> contexts = new ArrayList<>();
+            for (Object[] row : matchedRows) {
+                Object[] r = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+                contexts.add(new RowContext(table, alias, r));
+            }
+
+            // Apply remaining WHERE predicates that weren't covered by the index
+            if (!remainingPredicates.isEmpty()) {
+                contexts = contexts.stream()
+                        .filter(ctx -> {
+                            for (Expression rp : remainingPredicates) {
+                                if (!executor.isTruthy(executor.evalExpr(rp, ctx))) return false;
+                            }
+                            return true;
+                        })
+                        .collect(java.util.stream.Collectors.toList());
+            }
+
+            // MVCC visibility
+            String schemaTableKey = schemaName + "." + tableRef.table();
+            Session currentSession = executor.session;
+            if (currentSession != null) {
+                contexts = applyMvccVisibility(contexts, table, alias, schemaTableKey, currentSession);
+            }
+            // RLS
+            if (table.isRlsEnabled() && !table.getRlsPolicies().isEmpty()) {
+                contexts = applyRlsFiltering(contexts, table);
+            }
+            return contexts;
+        }
+        return null; // no matching index
+    }
+
+    private boolean isLiteralOrParam(Expression expr) {
+        return expr instanceof Literal || expr instanceof ParamRef;
+    }
+
+    private Object extractLiteralValue(Expression expr) {
+        if (expr instanceof Literal) {
+            // Evaluate literal to get typed value (Integer, BigDecimal, String, Boolean, etc.)
+            try {
+                return executor.evalExpr(expr, null);
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        if (expr instanceof ParamRef) {
+            // Parameters need runtime resolution, can't extract statically
+            return null;
+        }
+        return null;
     }
 
     private List<RowContext> applyRlsFiltering(List<RowContext> contexts, Table table) {

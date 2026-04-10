@@ -60,6 +60,7 @@ public class StoredConstraint {
     private boolean deferrable;
     private boolean initiallyDeferred;
     private boolean notEnforced; // PG 18: NOT ENFORCED constraints are stored but not validated
+    private boolean convalidated = true; // pg_constraint.convalidated: false when added with NOT VALID
     private boolean fromIndex; // true if this constraint was created via CREATE UNIQUE INDEX (not ADD CONSTRAINT)
     private boolean promotedFromIndex; // true if created via ADD CONSTRAINT ... UNIQUE USING INDEX
     private Expression whereExpr; // partial index predicate
@@ -123,6 +124,8 @@ public class StoredConstraint {
     public void setFromIndex(boolean fromIndex) { this.fromIndex = fromIndex; }
     public boolean isPromotedFromIndex() { return promotedFromIndex; }
     public void setPromotedFromIndex(boolean promotedFromIndex) { this.promotedFromIndex = promotedFromIndex; }
+    public boolean isConvalidated() { return convalidated; }
+    public void setConvalidated(boolean convalidated) { this.convalidated = convalidated; }
 
     /** Returns true if this constraint should be deferred (checked at commit time). */
     public boolean isCurrentlyDeferred() {

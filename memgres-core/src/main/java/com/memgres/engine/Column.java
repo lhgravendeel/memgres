@@ -17,6 +17,7 @@ public class Column {
     private final Integer precision;
     private final Integer scale;
     private final String generatedExpr;
+    private final boolean virtual;          // PG 18: VIRTUAL generated column (computed on read)
     private final String domainTypeName;
     private final String compositeTypeName;  // For composite type columns (e.g., "pair")
     private final DataType arrayElementType; // For array columns, the element type (e.g., INTEGER for integer[])
@@ -49,6 +50,12 @@ public class Column {
     public Column(String name, DataType type, boolean nullable, boolean primaryKey, String defaultValue,
                   String enumTypeName, Integer precision, Integer scale, String generatedExpr, String domainTypeName,
                   String compositeTypeName, DataType arrayElementType) {
+        this(name, type, nullable, primaryKey, defaultValue, enumTypeName, precision, scale, generatedExpr, false, domainTypeName, compositeTypeName, arrayElementType);
+    }
+
+    public Column(String name, DataType type, boolean nullable, boolean primaryKey, String defaultValue,
+                  String enumTypeName, Integer precision, Integer scale, String generatedExpr, boolean virtual,
+                  String domainTypeName, String compositeTypeName, DataType arrayElementType) {
         this.name = name;
         this.type = type;
         this.nullable = nullable;
@@ -58,6 +65,7 @@ public class Column {
         this.precision = precision;
         this.scale = scale;
         this.generatedExpr = generatedExpr;
+        this.virtual = virtual;
         this.domainTypeName = domainTypeName;
         this.compositeTypeName = compositeTypeName;
         this.arrayElementType = arrayElementType;
@@ -86,6 +94,7 @@ public class Column {
     public Integer getScale() { return scale; }
     public String getGeneratedExpr() { return generatedExpr; }
     public boolean isGenerated() { return generatedExpr != null; }
+    public boolean isVirtual() { return virtual; }
     public String getDomainTypeName() { return domainTypeName; }
     public String getCompositeTypeName() { return compositeTypeName; }
     public DataType getArrayElementType() { return arrayElementType; }

@@ -65,6 +65,9 @@ class DdlAlterTableExecutor {
         } else if (action instanceof AlterTableStmt.AddConstraint) {
             AlterTableStmt.AddConstraint addConstraint = (AlterTableStmt.AddConstraint) action;
             executeAddConstraint(addConstraint, table, stmt);
+        } else if (action instanceof AlterTableStmt.ValidateConstraint) {
+            AlterTableStmt.ValidateConstraint vc = (AlterTableStmt.ValidateConstraint) action;
+            executeValidateConstraint(vc, table, stmt);
         } else if (action instanceof AlterTableStmt.DropConstraint) {
             AlterTableStmt.DropConstraint dropConstraint = (AlterTableStmt.DropConstraint) action;
             if (!dropConstraint.ifExists() && table.getConstraint(dropConstraint.name()) == null) {
@@ -147,8 +150,22 @@ class DdlAlterTableExecutor {
         String defaultVal = def.defaultExpr() != null ? DdlExecutor.exprToDefaultString(def.defaultExpr()) : null;
         String genExpr = def.generatedExpr();
 
-        // Validate generated column expression references valid columns
+        // Validate generated column expression references valid columns and is immutable
         if (genExpr != null) {
+            // Reject volatile/stable functions in generated column expressions
+            String genNorm = genExpr.toLowerCase().replaceAll("\\s+", "");
+            if (genNorm.contains("now(") || genNorm.contains("random(") || genNorm.contains("clock_timestamp(")
+                    || genNorm.contains("current_timestamp") || genNorm.contains("timeofday(")
+                    || genNorm.contains("current_time") || genNorm.contains("current_date")
+                    || genNorm.contains("gen_random_uuid(") || genNorm.contains("nextval(")
+                    || genNorm.contains("txid_current(") || genNorm.contains("statement_timestamp(")
+                    || genNorm.contains("currval(") || genNorm.contains("setval(")
+                    || genNorm.contains("localtimestamp") || genNorm.contains("localtime")) {
+                throw new MemgresException("generation expression is not immutable", "42P17");
+            }
+            if (genNorm.contains("select")) {
+                throw new MemgresException("cannot use subquery in column generation expression", "0A000");
+            }
             try {
                 Expression genParsed = com.memgres.engine.parser.Parser.parseExpression(genExpr);
                 ddl.validateExprColumnRefs(genParsed, table, def.name());
@@ -163,7 +180,7 @@ class DdlAlterTableExecutor {
         }
 
         Column col = new Column(def.name(), dt, !def.notNull(), def.primaryKey(), defaultVal,
-                enumTypeName, def.precision(), def.scale(), genExpr, domainTypeName);
+                enumTypeName, def.precision(), def.scale(), genExpr, def.generatedVirtual(), domainTypeName, null, null);
         Object evaluatedDefault = defaultVal != null ? executor.evaluateDefault(defaultVal, dt) : null;
 
         // Validate default type compatibility
@@ -213,8 +230,8 @@ class DdlAlterTableExecutor {
         table.addColumn(col, evaluatedDefault);
         executor.recordUndo(new Session.AddColumnUndo(schemaName, stmt.table(), def.name()));
 
-        // Compute generated column values for existing rows
-        if (genExpr != null) {
+        // Compute STORED generated column values for existing rows (VIRTUAL columns are computed on read)
+        if (genExpr != null && !def.generatedVirtual()) {
             int colIdx = table.getColumnIndex(def.name());
             if (colIdx >= 0) {
                 for (Object[] row : table.getRows()) {
@@ -568,23 +585,15 @@ class DdlAlterTableExecutor {
             if (sc.getName() != null && table.getConstraint(sc.getName()) != null) {
                 throw new MemgresException("constraint \"" + sc.getName() + "\" for relation \"" + stmt.table() + "\" already exists", "42710");
             }
-            if (!sc.isNotEnforced()) {
+            if (addConstraint.notValid()) {
+                sc.setConvalidated(false);
+            }
+            if (!sc.isNotEnforced() && !addConstraint.notValid()) {
                 if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
                     validateForeignKeyData(sc, table, stmt.table());
                 }
                 if (sc.getType() == StoredConstraint.Type.CHECK && sc.getCheckExpr() != null) {
-                    ddl.validateExprColumnRefs(sc.getCheckExpr(), table, null);
-                    for (Object[] row : table.getRows()) {
-                        RowContext checkCtx = new RowContext(table, null, row);
-                        try {
-                            Object result = executor.evalExpr(sc.getCheckExpr(), checkCtx);
-                            if (result instanceof Boolean && !((Boolean) result)) {
-                                throw new MemgresException("check constraint \"" + sc.getName() + "\" of relation \"" + stmt.table() + "\" is violated by some row", "23514");
-                            }
-                        } catch (MemgresException me) {
-                            if ("23514".equals(me.getSqlState())) throw me;
-                        }
-                    }
+                    validateCheckConstraintData(sc, table);
                 }
             }
             table.addConstraint(sc);
@@ -628,6 +637,42 @@ class DdlAlterTableExecutor {
                 }
             }
         }
+    }
+
+    private void validateCheckConstraintData(StoredConstraint sc, Table table) {
+        ddl.validateExprColumnRefs(sc.getCheckExpr(), table, null);
+        boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
+        for (Object[] row : table.getRows()) {
+            Object[] evalRow = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+            RowContext checkCtx = new RowContext(table, null, evalRow);
+            try {
+                Object result = executor.evalExpr(sc.getCheckExpr(), checkCtx);
+                if (result instanceof Boolean && !((Boolean) result)) {
+                    throw new MemgresException("check constraint \"" + sc.getName() + "\" of relation \"" + table.getName() + "\" is violated by some row", "23514");
+                }
+            } catch (MemgresException me) {
+                if ("23514".equals(me.getSqlState())) throw me;
+            }
+        }
+    }
+
+    private void executeValidateConstraint(AlterTableStmt.ValidateConstraint vc, Table table,
+                                            AlterTableStmt stmt) {
+        StoredConstraint sc = table.getConstraint(vc.constraintName());
+        if (sc == null) {
+            throw new MemgresException("constraint \"" + vc.constraintName() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
+        }
+        if (sc.isConvalidated()) {
+            return; // already validated, no-op
+        }
+        // Validate existing data
+        if (sc.getType() == StoredConstraint.Type.CHECK && sc.getCheckExpr() != null) {
+            validateCheckConstraintData(sc, table);
+        }
+        if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
+            validateForeignKeyData(sc, table, stmt.table());
+        }
+        sc.setConvalidated(true);
     }
 
     private void executeAttachPartition(AlterTableStmt.AttachPartition attach, Table table,
