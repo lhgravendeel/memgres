@@ -1,6 +1,7 @@
 package com.memgres.engine;
 
 import com.memgres.engine.util.Cols;
+import com.memgres.engine.plpgsql.PlpgsqlExecutor;
 
 import com.memgres.engine.parser.ast.*;
 
@@ -234,6 +235,7 @@ class ExprEvaluator {
         if (expr instanceof CollateExpr) return evalExpr(((CollateExpr) expr).expr(), ctx);
         if (expr instanceof CompositeStarExpr) return evalExpr(((CompositeStarExpr) expr).expr(), ctx); // expansion handled by SelectExecutor
         if (expr instanceof QualifiedOperatorExpr) return evalQualifiedOperator(((QualifiedOperatorExpr) expr), ctx);
+        if (expr instanceof CustomOperatorExpr) return evalCustomOperator(((CustomOperatorExpr) expr), ctx);
         throw new UnsupportedOperationException("Unsupported expression type: " + expr.getClass().getSimpleName());
     }
 
@@ -503,6 +505,148 @@ class ExprEvaluator {
             }
         }
         return evalExpr(qop.inner(), ctx);
+    }
+
+    /**
+     * Evaluate a user-defined operator expression (CustomOperatorExpr).
+     * Looks up the PgOperator by name, resolves its backing function, and calls it.
+     */
+    private Object evalCustomOperator(CustomOperatorExpr cop, RowContext ctx) {
+        Object leftVal = cop.left() != null ? evalExpr(cop.left(), ctx) : null;
+        Object rightVal = evalExpr(cop.right(), ctx);
+
+        // Determine arg type names for operator lookup
+        String leftType = cop.left() != null ? AstExecutor.pgTypeNameOf(leftVal) : "NONE";
+        String rightType = AstExecutor.pgTypeNameOf(rightVal);
+
+        // Try to find matching operator in database
+        PgOperator pgOp = resolveOperator(cop.schema(), cop.opSymbol(), leftType, rightType);
+        if (pgOp == null) {
+            // Error message matching PG format
+            if (cop.isUnary()) {
+                throw new MemgresException(
+                    "operator does not exist: " + cop.opSymbol() + " " + rightType, "42883");
+            }
+            throw new MemgresException(
+                "operator does not exist: " + leftType + " " + cop.opSymbol() + " " + rightType, "42883");
+        }
+
+        // Resolve the backing function
+        String funcName = pgOp.getFunction();
+        PgFunction func = executor.database.getFunction(funcName);
+        if (func == null) {
+            throw new MemgresException(
+                "function " + funcName + " referenced by operator " + cop.opSymbol() + " does not exist", "42883");
+        }
+
+        // STRICT: return NULL if any arg is NULL
+        if (func.isStrict()) {
+            if (leftVal == null && cop.left() != null) return null;
+            if (rightVal == null) return null;
+        }
+
+        // Build argument list and call
+        java.util.List<Object> args = new java.util.ArrayList<>();
+        if (cop.left() != null) args.add(leftVal);
+        args.add(rightVal);
+
+        PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
+        return plExec.executeFunction(func, args);
+    }
+
+    /**
+     * Resolve a PgOperator by schema, name, and argument types.
+     * Tries exact match first, then fuzzy matching on arg types.
+     */
+    PgOperator resolveOperator(String schema, String opSymbol, String leftType, String rightType) {
+        // Search schemas: explicit schema, or search_path
+        java.util.List<String> schemas = new java.util.ArrayList<>();
+        if (schema != null) {
+            schemas.add(schema.toLowerCase());
+        } else {
+            schemas.add("pg_catalog");
+            schemas.add("public");
+            if (executor.session != null) {
+                String sp = executor.session.getGucSettings().get("search_path");
+                if (sp != null) {
+                    for (String s : sp.split(",")) {
+                        String trimmed = s.trim().replace("\"", "").replace("'", "");
+                        if (!trimmed.isEmpty() && !"$user".equals(trimmed)
+                                && !schemas.contains(trimmed.toLowerCase())) {
+                            schemas.add(trimmed.toLowerCase());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try to find operator with matching arg types
+        java.util.List<PgOperator> candidates = executor.database.getOperatorsByName(opSymbol);
+        if (candidates.isEmpty()) return null;
+
+        // Exact schema + type match
+        for (PgOperator op : candidates) {
+            String opSchema = op.getSchemaName() != null ? op.getSchemaName().toLowerCase() : "public";
+            if (!schemas.contains(opSchema)) continue;
+            String opLeft = op.getLeftArg() != null ? op.getLeftArg().toLowerCase() : "NONE";
+            String opRight = op.getRightArg() != null ? op.getRightArg().toLowerCase() : "NONE";
+            if (typeMatches(opLeft, leftType.toLowerCase()) && typeMatches(opRight, rightType.toLowerCase())) {
+                return op;
+            }
+        }
+
+        // Fallback: match if operator uses polymorphic / "any" types
+        for (PgOperator op : candidates) {
+            String opSchema = op.getSchemaName() != null ? op.getSchemaName().toLowerCase() : "public";
+            if (!schemas.contains(opSchema)) continue;
+            String opLeft = op.getLeftArg() != null ? op.getLeftArg().toLowerCase() : "NONE";
+            String opRight = op.getRightArg() != null ? op.getRightArg().toLowerCase() : "NONE";
+            // For unary, check left is NONE
+            if ("NONE".equalsIgnoreCase(leftType)) {
+                if ("NONE".equalsIgnoreCase(opLeft) || opLeft.isEmpty()) {
+                    if ("any".equalsIgnoreCase(opRight) || "anyelement".equalsIgnoreCase(opRight)
+                            || typeMatches(opRight, rightType.toLowerCase())) {
+                        return op;
+                    }
+                }
+            } else {
+                // Only match if at least one arg is polymorphic/"any"
+                boolean leftOk = "any".equalsIgnoreCase(opLeft) || "anyelement".equalsIgnoreCase(opLeft);
+                boolean rightOk = "any".equalsIgnoreCase(opRight) || "anyelement".equalsIgnoreCase(opRight);
+                if (leftOk || rightOk) return op;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Check if operator declared type matches the actual value type,
+     * with fuzzy matching for numeric types and "any" types.
+     */
+    private static boolean typeMatches(String declaredType, String actualType) {
+        if (declaredType.equals(actualType)) return true;
+        if ("NONE".equals(declaredType) && "NONE".equals(actualType)) return true;
+        // "any" type matches anything
+        if ("any".equals(declaredType) || "anyelement".equals(declaredType) || "\"any\"".equals(declaredType)) return true;
+        // "unknown" is the type of NULL — matches any declared type (PG implicit coercion)
+        if ("unknown".equals(actualType)) return true;
+        // Numeric type aliases
+        if (isNumericType(declaredType) && isNumericType(actualType)) return true;
+        // Text type aliases
+        if (isTextType(declaredType) && isTextType(actualType)) return true;
+        return false;
+    }
+
+    private static boolean isNumericType(String t) {
+        return "integer".equals(t) || "int".equals(t) || "int4".equals(t)
+            || "bigint".equals(t) || "int8".equals(t) || "smallint".equals(t) || "int2".equals(t)
+            || "numeric".equals(t) || "decimal".equals(t) || "real".equals(t) || "float4".equals(t)
+            || "double precision".equals(t) || "float8".equals(t) || "float".equals(t) || "double".equals(t);
+    }
+
+    private static boolean isTextType(String t) {
+        return "text".equals(t) || "varchar".equals(t) || "character varying".equals(t) || "char".equals(t);
     }
 
     private Object evalCast(CastExpr cast, RowContext ctx) {
@@ -1451,6 +1595,9 @@ class ExprEvaluator {
             }
             return "?column?";
         }
+        if (expr instanceof CustomOperatorExpr) {
+            return "?column?";
+        }
         if (expr instanceof CaseExpr) return "case";
         if (expr instanceof ArrayExpr) return ((ArrayExpr) expr).isRow() ? "row" : "array";
         if (expr instanceof ExistsExpr) return "exists";
@@ -1523,6 +1670,10 @@ class ExprEvaluator {
                 DataType inner = inferTypeFromContext(un.operand(), bindings);
                 return inner;
             }
+            return DataType.TEXT;
+        }
+        if (expr instanceof CustomOperatorExpr) {
+            // Custom operators - can't infer return type without looking up the operator definition
             return DataType.TEXT;
         }
         if (expr instanceof BinaryExpr) {

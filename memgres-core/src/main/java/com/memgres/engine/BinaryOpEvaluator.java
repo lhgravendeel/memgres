@@ -105,7 +105,33 @@ class BinaryOpEvaluator {
             }
         }
 
-        switch (bin.op()) {
+        // Try built-in operator handling; if it fails due to unsupported types,
+        // fall back to user-defined operator lookup
+        try {
+            return evalBuiltinBinary(bin.op(), left, right);
+        } catch (ClassCastException | NumberFormatException e) {
+            // Built-in handling doesn't support these types — try user-defined operator
+            String opSymbol = binOpToSymbol(bin.op());
+            if (opSymbol != null) {
+                Object result = tryUserDefinedOperator(opSymbol, left, right);
+                if (result != null || (left == null || right == null)) return result;
+            }
+            throw e; // No user-defined operator either, rethrow
+        } catch (MemgresException e) {
+            // Only try fallback for "operator does not exist" errors
+            if ("42883".equals(e.getSqlState())) {
+                String opSymbol = binOpToSymbol(bin.op());
+                if (opSymbol != null) {
+                    Object result = tryUserDefinedOperator(opSymbol, left, right);
+                    if (result != null || (left == null || right == null)) return result;
+                }
+            }
+            throw e;
+        }
+    }
+
+    private Object evalBuiltinBinary(BinaryExpr.BinOp op, Object left, Object right) {
+        switch (op) {
             case ADD:
                 return executor.dateTimeAdd(left, right);
             case SUBTRACT:
@@ -829,6 +855,64 @@ class BinaryOpEvaluator {
             }
             default:
                 return null;
+        }
+    }
+
+    /**
+     * Try to dispatch a built-in operator token to a user-defined operator function.
+     * This handles the case where a built-in operator symbol (like +) is overloaded
+     * for custom types.
+     */
+    Object tryUserDefinedOperator(String opSymbol, Object left, Object right) {
+        String leftType = AstExecutor.pgTypeNameOf(left);
+        String rightType = AstExecutor.pgTypeNameOf(right);
+        ExprEvaluator exprEval = executor.exprEvaluator;
+        PgOperator op = exprEval.resolveOperator(null, opSymbol, leftType, rightType);
+        if (op == null) return null;
+
+        PgFunction func = executor.database.getFunction(op.getFunction());
+        if (func == null) return null;
+
+        if (func.isStrict()) {
+            if (left == null || right == null) return null;
+        }
+
+        java.util.List<Object> args = new java.util.ArrayList<>();
+        args.add(left);
+        args.add(right);
+
+        com.memgres.engine.plpgsql.PlpgsqlExecutor plExec =
+            new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
+        return plExec.executeFunction(func, args);
+    }
+
+    /**
+     * Map a BinaryExpr.BinOp to its operator symbol string for user-defined operator lookup.
+     */
+    private static String binOpToSymbol(BinaryExpr.BinOp op) {
+        switch (op) {
+            case ADD: return "+";
+            case SUBTRACT: return "-";
+            case MULTIPLY: return "*";
+            case DIVIDE: return "/";
+            case MODULO: return "%";
+            case POWER: return "^";
+            case EQUAL: return "=";
+            case NOT_EQUAL: return "<>";
+            case LESS_THAN: return "<";
+            case GREATER_THAN: return ">";
+            case LESS_EQUAL: return "<=";
+            case GREATER_EQUAL: return ">=";
+            case CONCAT: return "||";
+            case BIT_AND: return "&";
+            case BIT_OR: return "|";
+            case BIT_XOR: return "#";
+            case SHIFT_LEFT: return "<<";
+            case SHIFT_RIGHT: return ">>";
+            case CONTAINS: return "@>";
+            case CONTAINED_BY: return "<@";
+            case OVERLAP: return "&&";
+            default: return null;
         }
     }
 

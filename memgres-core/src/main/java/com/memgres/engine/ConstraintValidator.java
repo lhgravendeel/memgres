@@ -735,6 +735,12 @@ class ConstraintValidator {
      * that PG would catch at plan time, even on empty tables.
      */
     void validateWhereTypesAgainstTable(Expression where, Table table) {
+        if (where instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) where;
+            if (cop.left() != null) validateWhereTypesAgainstTable(cop.left(), table);
+            validateWhereTypesAgainstTable(cop.right(), table);
+            return;
+        }
         if (where instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) where;
             if (bin.op() == BinaryExpr.BinOp.AND || bin.op() == BinaryExpr.BinOp.OR) {

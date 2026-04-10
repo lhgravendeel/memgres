@@ -673,6 +673,11 @@ class SessionExecutor {
             validateAnonymousRowAccess(b.left());
             validateAnonymousRowAccess(b.right());
         }
+        if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr c = (CustomOperatorExpr) expr;
+            if (c.left() != null) validateAnonymousRowAccess(c.left());
+            validateAnonymousRowAccess(c.right());
+        }
         if (expr instanceof CastExpr) {
             CastExpr ce = (CastExpr) expr;
             validateAnonymousRowAccess(ce.expr());
@@ -737,6 +742,15 @@ class SessionExecutor {
             boolean rightTyped = !(b.right() instanceof ParamRef);
             checkForUntypedParams(b.left(), paramTypes, hasTypeContext || rightTyped);
             checkForUntypedParams(b.right(), paramTypes, hasTypeContext || leftTyped);
+            return;
+        }
+        // CustomOperatorExpr with typed operand provides context
+        if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr c = (CustomOperatorExpr) expr;
+            boolean leftTyped = c.left() != null && !(c.left() instanceof ParamRef);
+            boolean rightTyped = !(c.right() instanceof ParamRef);
+            if (c.left() != null) checkForUntypedParams(c.left(), paramTypes, hasTypeContext || rightTyped);
+            checkForUntypedParams(c.right(), paramTypes, hasTypeContext || leftTyped);
             return;
         }
         // IS NULL / IS NOT NULL - does NOT provide type context
@@ -866,6 +880,11 @@ class SessionExecutor {
             validateExpressionTree(b.left(), paramTypes);
             validateExpressionTree(b.right(), paramTypes);
         }
+        if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr c = (CustomOperatorExpr) expr;
+            if (c.left() != null) validateExpressionTree(c.left(), paramTypes);
+            validateExpressionTree(c.right(), paramTypes);
+        }
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
             for (CaseExpr.WhenClause w : c.whenClauses()) {
@@ -975,6 +994,10 @@ class SessionExecutor {
             BinaryExpr b = (BinaryExpr) node;
             walkExpressions(b.left(), max);
             walkExpressions(b.right(), max);
+        } else if (node instanceof CustomOperatorExpr) {
+            CustomOperatorExpr c = (CustomOperatorExpr) node;
+            if (c.left() != null) walkExpressions(c.left(), max);
+            walkExpressions(c.right(), max);
         } else if (node instanceof UnaryExpr) {
             UnaryExpr u = (UnaryExpr) node;
             walkExpressions(u.operand(), max);

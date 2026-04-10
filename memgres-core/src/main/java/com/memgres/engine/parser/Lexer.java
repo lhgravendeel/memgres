@@ -268,194 +268,13 @@ public class Lexer {
             return new Token(TokenType.COLON, ":", start);
         }
 
-        if (c == '|') {
-            if (pos + 2 < length && sql.charAt(pos + 1) == '>' && sql.charAt(pos + 2) == '>') {
-                pos += 3;
-                return new Token(TokenType.GEO_ABOVE, "|>>", start);
-            }
-            if (pos + 2 < length && sql.charAt(pos + 1) == '&' && sql.charAt(pos + 2) == '>') {
-                pos += 3;
-                return new Token(TokenType.GEO_NOT_EXTEND_BELOW, "|&>", start);
-            }
-            if (pos + 1 < length && sql.charAt(pos + 1) == '|') {
-                pos += 2;
-                return new Token(TokenType.CONCAT, "||", start);
-            }
-            pos++;
-            return new Token(TokenType.PIPE, "|", start);
+        // Operator characters: PG-compatible greedy scanning
+        // PG operator chars: + - * / < > = ~ ! @ # % ^ & | ?
+        if (isOperatorChar(c)) {
+            return scanAndClassifyOperator(start);
         }
 
-        if (c == '-') {
-            // -|- range adjacency operator
-            if (pos + 2 < length && sql.charAt(pos + 1) == '|' && sql.charAt(pos + 2) == '-') {
-                pos += 3;
-                return new Token(TokenType.RANGE_ADJACENT, "-|-", start);
-            }
-            // -> and ->> JSON operators
-            if (pos + 1 < length && sql.charAt(pos + 1) == '>') {
-                if (pos + 2 < length && sql.charAt(pos + 2) == '>') {
-                    pos += 3;
-                    return new Token(TokenType.JSON_ARROW_TEXT, "->>", start);
-                }
-                pos += 2;
-                return new Token(TokenType.JSON_ARROW, "->", start);
-            }
-        }
-
-        // Geometric distance operator: <->
-        if (c == '<' && pos + 2 < length && sql.charAt(pos + 1) == '-' && sql.charAt(pos + 2) == '>') {
-            pos += 3;
-            return new Token(TokenType.DISTANCE, "<->", start);
-        }
-
-        if (c == '#') {
-            if (pos + 1 < length && sql.charAt(pos + 1) == '>') {
-                if (pos + 2 < length && sql.charAt(pos + 2) == '>') {
-                    pos += 3;
-                    return new Token(TokenType.JSON_HASH_ARROW_TEXT, "#>>", start);
-                }
-                pos += 2;
-                return new Token(TokenType.JSON_HASH_ARROW, "#>", start);
-            }
-            if (pos + 1 < length && sql.charAt(pos + 1) == '-') {
-                pos += 2;
-                return new Token(TokenType.JSON_DELETE_PATH, "#-", start);
-            }
-            pos++;
-            return new Token(TokenType.HASH, "#", start);
-        }
-
-        if (c == '?') {
-            if (pos + 1 < length && sql.charAt(pos + 1) == '|') {
-                pos += 2;
-                return new Token(TokenType.JSONB_EXISTS_ANY, "?|", start);
-            }
-            if (pos + 1 < length && sql.charAt(pos + 1) == '&') {
-                pos += 2;
-                return new Token(TokenType.JSONB_EXISTS_ALL, "?&", start);
-            }
-            pos++;
-            return new Token(TokenType.JSONB_EXISTS, "?", start);
-        }
-
-        if (c == '<') {
-            if (pos + 1 < length) {
-                char next = sql.charAt(pos + 1);
-                if (next == '<' && pos + 2 < length && sql.charAt(pos + 2) == '=') {
-                    pos += 3; return new Token(TokenType.INET_CONTAINED_BY_EQUALS, "<<=", start);
-                }
-                if (next == '<' && pos + 2 < length && sql.charAt(pos + 2) == '|') {
-                    pos += 3; return new Token(TokenType.GEO_BELOW, "<<|", start);
-                }
-                if (next == '<') { pos += 2; return new Token(TokenType.SHIFT_LEFT, "<<", start); }
-                if (next == '=') { pos += 2; return new Token(TokenType.LESS_EQUALS, "<=", start); }
-                if (next == '>') { pos += 2; return new Token(TokenType.NOT_EQUALS, "<>", start); }
-                if (next == '@') { pos += 2; return new Token(TokenType.CONTAINED_BY, "<@", start); }
-            }
-            pos++;
-            return new Token(TokenType.LESS_THAN, "<", start);
-        }
-
-        if (c == '>') {
-            if (pos + 1 < length) {
-                char next = sql.charAt(pos + 1);
-                if (next == '>' && pos + 2 < length && sql.charAt(pos + 2) == '=') {
-                    pos += 3; return new Token(TokenType.INET_CONTAINS_EQUALS, ">>=", start);
-                }
-                if (next == '>') { pos += 2; return new Token(TokenType.SHIFT_RIGHT, ">>", start); }
-                if (next == '=') { pos += 2; return new Token(TokenType.GREATER_EQUALS, ">=", start); }
-            }
-            pos++;
-            return new Token(TokenType.GREATER_THAN, ">", start);
-        }
-
-        if (c == '!' && pos + 1 < length) {
-            // !! is the removed factorial operator (PG 14+); tokenize as ERROR "!!" so parser reports 42883
-            if (sql.charAt(pos + 1) == '!') {
-                pos += 2;
-                return new Token(TokenType.ERROR, "!!", start);
-            }
-            if (sql.charAt(pos + 1) == '~') {
-                // !~~* (NOT ILIKE operator form), !~~ (NOT LIKE operator form)
-                if (pos + 2 < length && sql.charAt(pos + 2) == '~') {
-                    if (pos + 3 < length && sql.charAt(pos + 3) == '*') {
-                        pos += 4;
-                        return new Token(TokenType.NOT_DOUBLE_TILDE_STAR, "!~~*", start);
-                    }
-                    pos += 3;
-                    return new Token(TokenType.NOT_DOUBLE_TILDE, "!~~", start);
-                }
-                if (pos + 2 < length && sql.charAt(pos + 2) == '*') {
-                    pos += 3;
-                    return new Token(TokenType.EXCL_TILDE_STAR, "!~*", start);
-                }
-                pos += 2;
-                return new Token(TokenType.EXCL_TILDE, "!~", start);
-            }
-            if (sql.charAt(pos + 1) == '=') {
-                pos += 2;
-                return new Token(TokenType.NOT_EQUALS, "!=", start);
-            }
-        }
-
-        if (c == '&') {
-            if (pos + 2 < length && sql.charAt(pos + 1) == '<' && sql.charAt(pos + 2) == '|') {
-                pos += 3;
-                return new Token(TokenType.GEO_NOT_EXTEND_ABOVE, "&<|", start);
-            }
-            if (pos + 1 < length && sql.charAt(pos + 1) == '<') {
-                pos += 2;
-                return new Token(TokenType.GEO_NOT_EXTEND_RIGHT, "&<", start);
-            }
-            if (pos + 1 < length && sql.charAt(pos + 1) == '>') {
-                pos += 2;
-                return new Token(TokenType.GEO_NOT_EXTEND_LEFT, "&>", start);
-            }
-            if (pos + 1 < length && sql.charAt(pos + 1) == '&') {
-                pos += 2;
-                return new Token(TokenType.OVERLAP, "&&", start);
-            }
-            pos++;
-            return new Token(TokenType.AMPERSAND, "&", start);
-        }
-
-        // Regex and geometric tilde operators
-        if (c == '~' && pos + 1 < length) {
-            // ~~* (ILIKE operator), ~~ (LIKE operator)
-            if (sql.charAt(pos + 1) == '~') {
-                if (pos + 2 < length && sql.charAt(pos + 2) == '*') {
-                    pos += 3;
-                    return new Token(TokenType.DOUBLE_TILDE_STAR, "~~*", start);
-                }
-                pos += 2;
-                return new Token(TokenType.DOUBLE_TILDE, "~~", start);
-            }
-            if (sql.charAt(pos + 1) == '*') {
-                pos += 2;
-                return new Token(TokenType.TILDE_STAR, "~*", start);
-            }
-            if (sql.charAt(pos + 1) == '=') {
-                pos += 2;
-                return new Token(TokenType.APPROX_EQUAL, "~=", start);
-            }
-        }
-
-        if (c == '@' && pos + 1 < length) {
-            if (sql.charAt(pos + 1) == '>') {
-                pos += 2;
-                return new Token(TokenType.CONTAINS, "@>", start);
-            }
-            if (sql.charAt(pos + 1) == '@') {
-                pos += 2;
-                return new Token(TokenType.TS_MATCH, "@@", start);
-            }
-            if (sql.charAt(pos + 1) == '?') {
-                pos += 2;
-                return new Token(TokenType.JSONB_PATH_EXISTS_OP, "@?", start);
-            }
-        }
-
-        // Single-character tokens
+        // Non-operator punctuation
         pos++;
         switch (c) {
             case '(':
@@ -472,31 +291,158 @@ public class Lexer {
                 return new Token(TokenType.SEMICOLON, ";", start);
             case '.':
                 return new Token(TokenType.DOT, ".", start);
-            case '=': {
-                if (pos < length && sql.charAt(pos) == '>') {
-                    pos++;
-                    return new Token(TokenType.FAT_ARROW, "=>", start);
-                }
-                return new Token(TokenType.EQUALS, "=", start);
-            }
-            case '+':
-                return new Token(TokenType.PLUS, "+", start);
-            case '-':
-                return new Token(TokenType.MINUS, "-", start);
-            case '*':
-                return new Token(TokenType.STAR, "*", start);
-            case '/':
-                return new Token(TokenType.SLASH, "/", start);
-            case '%':
-                return new Token(TokenType.PERCENT, "%", start);
-            case '^':
-                return new Token(TokenType.CARET, "^", start);
-            case '~':
-                return new Token(TokenType.TILDE, "~", start);
-            case '@':
-                return new Token(TokenType.AT_SIGN, "@", start);
             default:
                 return new Token(TokenType.ERROR, String.valueOf(c), start);
+        }
+    }
+
+    /**
+     * Scans an operator token using PG-compatible greedy scanning.
+     * 1. Greedily consume all consecutive operator characters
+     * 2. Truncate if the sequence contains -- or /* (comment syntax)
+     * 3. Apply PG trailing +/- rule: if the operator ends with + or -,
+     *    and does NOT also contain ~ ! @ # % ^ & | ?, give back trailing +/- chars
+     * 4. Map to known token type or CUSTOM_OPERATOR
+     */
+    private Token scanAndClassifyOperator(int start) {
+        // Step 1: greedily consume operator characters
+        pos++; // consume first char
+        while (pos < length && isOperatorChar(sql.charAt(pos))) {
+            pos++;
+        }
+        String op = sql.substring(start, pos);
+
+        // Step 2: truncate at -- or /* (comment syntax takes precedence)
+        int dashDash = op.indexOf("--");
+        int slashStar = op.indexOf("/*");
+        int truncAt = -1;
+        if (dashDash >= 0) truncAt = dashDash;
+        if (slashStar >= 0 && (truncAt < 0 || slashStar < truncAt)) truncAt = slashStar;
+        if (truncAt > 0) {
+            pos = start + truncAt;
+            op = op.substring(0, truncAt);
+        } else if (truncAt == 0) {
+            // Operator starts with -- or /* — should not happen (comments are stripped earlier)
+            // but handle defensively: return just the first char
+            pos = start + 1;
+            op = op.substring(0, 1);
+        }
+
+        // Step 3: PG trailing +/- rule
+        // If operator ends with + or - and does NOT contain ~ ! @ # % ^ & | ?,
+        // give back trailing +/- chars until it no longer ends with them or is 1 char.
+        while (op.length() > 1) {
+            char last = op.charAt(op.length() - 1);
+            if (last != '+' && last != '-') break;
+            boolean hasSpecial = false;
+            for (int i = 0; i < op.length(); i++) {
+                char ch = op.charAt(i);
+                if (ch == '~' || ch == '!' || ch == '@' || ch == '#' || ch == '%'
+                        || ch == '^' || ch == '&' || ch == '|' || ch == '?') {
+                    hasSpecial = true;
+                    break;
+                }
+            }
+            if (hasSpecial) break;
+            // Give back trailing +/- chars one at a time
+            op = op.substring(0, op.length() - 1);
+            pos--;
+        }
+
+        // Step 4: classify
+        return classifyOperator(op, start);
+    }
+
+    /**
+     * Maps an operator string to the appropriate token type.
+     * Known operators get their specific token types; unknown multi-char sequences
+     * get CUSTOM_OPERATOR.
+     */
+    private Token classifyOperator(String op, int start) {
+        switch (op) {
+            // Single-char operators
+            case "+": return new Token(TokenType.PLUS, "+", start);
+            case "-": return new Token(TokenType.MINUS, "-", start);
+            case "*": return new Token(TokenType.STAR, "*", start);
+            case "/": return new Token(TokenType.SLASH, "/", start);
+            case "%": return new Token(TokenType.PERCENT, "%", start);
+            case "^": return new Token(TokenType.CARET, "^", start);
+            case "&": return new Token(TokenType.AMPERSAND, "&", start);
+            case "|": return new Token(TokenType.PIPE, "|", start);
+            case "~": return new Token(TokenType.TILDE, "~", start);
+            case "#": return new Token(TokenType.HASH, "#", start);
+            case "?": return new Token(TokenType.JSONB_EXISTS, "?", start);
+            case "<": return new Token(TokenType.LESS_THAN, "<", start);
+            case ">": return new Token(TokenType.GREATER_THAN, ">", start);
+            case "=": return new Token(TokenType.EQUALS, "=", start);
+            case "@": return new Token(TokenType.AT_SIGN, "@", start);
+            case "!": return new Token(TokenType.ERROR, "!", start);
+
+            // 2-char operators
+            case "||": return new Token(TokenType.CONCAT, "||", start);
+            case "->": return new Token(TokenType.JSON_ARROW, "->", start);
+            case "<<": return new Token(TokenType.SHIFT_LEFT, "<<", start);
+            case ">>": return new Token(TokenType.SHIFT_RIGHT, ">>", start);
+            case "<=": return new Token(TokenType.LESS_EQUALS, "<=", start);
+            case ">=": return new Token(TokenType.GREATER_EQUALS, ">=", start);
+            case "<>": return new Token(TokenType.NOT_EQUALS, "<>", start);
+            case "!=": return new Token(TokenType.NOT_EQUALS, "!=", start);
+            case "<@": return new Token(TokenType.CONTAINED_BY, "<@", start);
+            case "@>": return new Token(TokenType.CONTAINS, "@>", start);
+            case "@@": return new Token(TokenType.TS_MATCH, "@@", start);
+            case "@?": return new Token(TokenType.JSONB_PATH_EXISTS_OP, "@?", start);
+            case "&&": return new Token(TokenType.OVERLAP, "&&", start);
+            case "?|": return new Token(TokenType.JSONB_EXISTS_ANY, "?|", start);
+            case "?&": return new Token(TokenType.JSONB_EXISTS_ALL, "?&", start);
+            case "#>": return new Token(TokenType.JSON_HASH_ARROW, "#>", start);
+            case "#-": return new Token(TokenType.JSON_DELETE_PATH, "#-", start);
+            case "&<": return new Token(TokenType.GEO_NOT_EXTEND_RIGHT, "&<", start);
+            case "&>": return new Token(TokenType.GEO_NOT_EXTEND_LEFT, "&>", start);
+            case "!~": return new Token(TokenType.EXCL_TILDE, "!~", start);
+            case "~~": return new Token(TokenType.DOUBLE_TILDE, "~~", start);
+            case "~*": return new Token(TokenType.TILDE_STAR, "~*", start);
+            case "~=": return new Token(TokenType.APPROX_EQUAL, "~=", start);
+            case "!!": return new Token(TokenType.ERROR, "!!", start);
+            case "=>": return new Token(TokenType.FAT_ARROW, "=>", start);
+
+            // 3-char operators
+            case "->>": return new Token(TokenType.JSON_ARROW_TEXT, "->>", start);
+            case "-|-": return new Token(TokenType.RANGE_ADJACENT, "-|-", start);
+            case ">>=": return new Token(TokenType.INET_CONTAINS_EQUALS, ">>=", start);
+            case "<<=": return new Token(TokenType.INET_CONTAINED_BY_EQUALS, "<<=", start);
+            case "<<|": return new Token(TokenType.GEO_BELOW, "<<|", start);
+            case "|>>": return new Token(TokenType.GEO_ABOVE, "|>>", start);
+            case "|&>": return new Token(TokenType.GEO_NOT_EXTEND_BELOW, "|&>", start);
+            case "#>>": return new Token(TokenType.JSON_HASH_ARROW_TEXT, "#>>", start);
+            case "!~~": return new Token(TokenType.NOT_DOUBLE_TILDE, "!~~", start);
+            case "!~*": return new Token(TokenType.EXCL_TILDE_STAR, "!~*", start);
+            case "&<|": return new Token(TokenType.GEO_NOT_EXTEND_ABOVE, "&<|", start);
+            case "~~*": return new Token(TokenType.DOUBLE_TILDE_STAR, "~~*", start);
+            case "<->": return new Token(TokenType.DISTANCE, "<->", start);
+
+            // 4-char operators
+            case "!~~*": return new Token(TokenType.NOT_DOUBLE_TILDE_STAR, "!~~*", start);
+
+            default:
+                if (op.length() > 1) {
+                    return new Token(TokenType.CUSTOM_OPERATOR, op, start);
+                }
+                return new Token(TokenType.ERROR, op, start);
+        }
+    }
+
+    /**
+     * Returns true if the character is a valid PostgreSQL operator character.
+     * PG operator chars: + - * / < > = ~ ! @ # % ^ & | ?
+     */
+    private static boolean isOperatorChar(char c) {
+        switch (c) {
+            case '+': case '-': case '*': case '/': case '<': case '>':
+            case '=': case '~': case '!': case '@': case '#': case '%':
+            case '^': case '&': case '|': case '?':
+                return true;
+            default:
+                return false;
         }
     }
 

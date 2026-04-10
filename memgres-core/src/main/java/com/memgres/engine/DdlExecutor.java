@@ -198,6 +198,10 @@ class DdlExecutor {
             BinaryExpr bin = (BinaryExpr) expr;
             validateExprColumnRefs(bin.left(), table, newColName);
             validateExprColumnRefs(bin.right(), table, newColName);
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            if (cop.left() != null) validateExprColumnRefs(cop.left(), table, newColName);
+            validateExprColumnRefs(cop.right(), table, newColName);
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
             validateExprColumnRefs(un.operand(), table, newColName);
@@ -345,6 +349,13 @@ class DdlExecutor {
         } else if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
             return exprToDefaultString(cast.expr()) + "::" + cast.typeName();
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            if (cop.left() != null) {
+                return exprToDefaultString(cop.left()) + " " + cop.opSymbol() + " " + exprToDefaultString(cop.right());
+            } else {
+                return cop.opSymbol() + " " + exprToDefaultString(cop.right());
+            }
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
             String op;
@@ -419,6 +430,146 @@ class DdlExecutor {
             return op + exprToDefaultString(un.operand());
         }
         return "null";
+    }
+
+    // Built-in volatile function names (these don't have PgFunction entries in the database)
+    private static final Set<String> BUILTIN_VOLATILE_FUNCTIONS = Set.of(
+            "random", "now", "clock_timestamp", "timeofday", "gen_random_uuid",
+            "nextval", "currval", "setval", "txid_current", "statement_timestamp"
+    );
+
+    // Built-in volatile identifiers that appear as bare names (not function calls)
+    private static final Set<String> BUILTIN_VOLATILE_IDENTIFIERS = Set.of(
+            "current_timestamp", "current_time", "current_date", "localtimestamp", "localtime"
+    );
+
+    /**
+     * Check that an expression is immutable — rejects VOLATILE and STABLE functions/operators.
+     * Used for CREATE INDEX expressions and VIRTUAL generated columns.
+     * Walks the expression AST recursively, checking:
+     * - FunctionCallExpr: looks up PgFunction.getVolatility()
+     * - CustomOperatorExpr: resolves operator → backing function → checks volatility
+     * - Built-in volatile functions by name (hardcoded list, no PgFunction entries)
+     *
+     * PG trusts declared volatility (no transitive checking of function bodies).
+     *
+     * @throws MemgresException with sqlState 42P17 if expression is not immutable
+     */
+    static void checkExpressionImmutability(Expression expr, Database db, String errorMsg) {
+        if (expr == null) return;
+
+        if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            String fnName = fn.name().toLowerCase();
+            // Check built-in volatile functions
+            if (BUILTIN_VOLATILE_FUNCTIONS.contains(fnName)) {
+                throw new MemgresException(errorMsg, "42P17");
+            }
+            // Check user-defined function volatility
+            PgFunction pgFunc = db.getFunction(fn.name());
+            if (pgFunc != null) {
+                String vol = pgFunc.getVolatility();
+                if (vol == null || "VOLATILE".equalsIgnoreCase(vol) || "STABLE".equalsIgnoreCase(vol)) {
+                    throw new MemgresException(errorMsg, "42P17");
+                }
+            }
+            // Recurse into function arguments
+            if (fn.args() != null) {
+                for (Expression arg : fn.args()) {
+                    checkExpressionImmutability(arg, db, errorMsg);
+                }
+            }
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            // Resolve operator → backing function → check volatility
+            java.util.List<PgOperator> ops = db.getOperatorsByName(cop.opSymbol());
+            for (PgOperator op : ops) {
+                if (op.getFunction() != null) {
+                    PgFunction pgFunc = db.getFunction(op.getFunction());
+                    if (pgFunc != null) {
+                        String vol = pgFunc.getVolatility();
+                        if (vol == null || "VOLATILE".equalsIgnoreCase(vol) || "STABLE".equalsIgnoreCase(vol)) {
+                            throw new MemgresException(errorMsg, "42P17");
+                        }
+                    }
+                    break; // Only check the first matching operator
+                }
+            }
+            // Recurse into operands
+            if (cop.left() != null) checkExpressionImmutability(cop.left(), db, errorMsg);
+            if (cop.right() != null) checkExpressionImmutability(cop.right(), db, errorMsg);
+        } else if (expr instanceof ColumnRef) {
+            ColumnRef cr = (ColumnRef) expr;
+            // Check bare volatile identifiers like current_timestamp, localtime, etc.
+            if (cr.table() == null && BUILTIN_VOLATILE_IDENTIFIERS.contains(cr.column().toLowerCase())) {
+                throw new MemgresException(errorMsg, "42P17");
+            }
+        } else if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            checkExpressionImmutability(bin.left(), db, errorMsg);
+            checkExpressionImmutability(bin.right(), db, errorMsg);
+        } else if (expr instanceof UnaryExpr) {
+            UnaryExpr un = (UnaryExpr) expr;
+            checkExpressionImmutability(un.operand(), db, errorMsg);
+        } else if (expr instanceof CastExpr) {
+            CastExpr cast = (CastExpr) expr;
+            checkExpressionImmutability(cast.expr(), db, errorMsg);
+        } else if (expr instanceof CaseExpr) {
+            CaseExpr ce = (CaseExpr) expr;
+            if (ce.operand() != null) checkExpressionImmutability(ce.operand(), db, errorMsg);
+            if (ce.whenClauses() != null) {
+                for (CaseExpr.WhenClause wc : ce.whenClauses()) {
+                    checkExpressionImmutability(wc.condition, db, errorMsg);
+                    checkExpressionImmutability(wc.result, db, errorMsg);
+                }
+            }
+            if (ce.elseExpr() != null) checkExpressionImmutability(ce.elseExpr(), db, errorMsg);
+        } else if (expr instanceof IsNullExpr) {
+            checkExpressionImmutability(((IsNullExpr) expr).expr(), db, errorMsg);
+        } else if (expr instanceof BetweenExpr) {
+            BetweenExpr be = (BetweenExpr) expr;
+            checkExpressionImmutability(be.expr(), db, errorMsg);
+            checkExpressionImmutability(be.low(), db, errorMsg);
+            checkExpressionImmutability(be.high(), db, errorMsg);
+        } else if (expr instanceof InExpr) {
+            InExpr ie = (InExpr) expr;
+            checkExpressionImmutability(ie.expr(), db, errorMsg);
+            if (ie.values() != null) {
+                for (Expression v : ie.values()) {
+                    checkExpressionImmutability(v, db, errorMsg);
+                }
+            }
+        }
+        // Literals, parameters, etc. are always immutable — no action needed
+    }
+
+    /**
+     * Check immutability using string-based expression (parses first, then walks AST).
+     * Falls back to string matching if parsing fails.
+     */
+    static void checkExpressionImmutability(String exprStr, Database db, String errorMsg) {
+        // Fast path: check for built-in volatile names in the raw string
+        String norm = exprStr.toLowerCase().replaceAll("\\s+", "");
+        for (String fn : BUILTIN_VOLATILE_FUNCTIONS) {
+            if (norm.contains(fn + "(")) {
+                throw new MemgresException(errorMsg, "42P17");
+            }
+        }
+        for (String id : BUILTIN_VOLATILE_IDENTIFIERS) {
+            if (norm.contains(id)) {
+                throw new MemgresException(errorMsg, "42P17");
+            }
+        }
+
+        // Parse expression and do AST-based checking for user-defined functions/operators
+        try {
+            Expression parsed = com.memgres.engine.parser.Parser.parseExpression(exprStr);
+            checkExpressionImmutability(parsed, db, errorMsg);
+        } catch (MemgresException e) {
+            throw e; // Re-throw volatility errors
+        } catch (Exception ignored) {
+            // If parsing fails, the string-based check above is sufficient
+        }
     }
 
     /** Parse a partition bound value string to an appropriate type. */
