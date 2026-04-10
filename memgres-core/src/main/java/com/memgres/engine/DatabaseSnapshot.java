@@ -121,10 +121,11 @@ public class DatabaseSnapshot {
         }
 
         void restore(Table table) {
-            table.getRows().clear();
+            List<Object[]> cloned = new ArrayList<>(rows.size());
             for (Object[] row : rows) {
-                table.getRows().add(row.clone());
+                cloned.add(row.clone());
             }
+            table.replaceAllRows(cloned);
             table.rebuildAllIndexes();
             table.resetSerialCounter(serialCounter);
         }

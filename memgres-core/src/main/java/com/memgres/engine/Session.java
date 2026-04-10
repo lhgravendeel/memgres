@@ -468,7 +468,7 @@ public class Session {
             Schema s = database.getSchema(pair[0]);
             if (s != null) {
                 Table t = s.getTable(pair[1]);
-                if (t != null) t.getRows().clear();
+                if (t != null) t.clearRows();
             }
         }
         // Note: don't clear onCommitDeleteRowsTables because the table persists across transactions
