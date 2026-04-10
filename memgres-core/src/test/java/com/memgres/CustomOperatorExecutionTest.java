@@ -3,6 +3,7 @@ package com.memgres;
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+
 import org.junit.jupiter.api.Test;
 
 import java.sql.*;
@@ -1553,6 +1554,195 @@ class CustomOperatorExecutionTest {
                 assertTrue(rs.getBoolean("oprcanhash"));
                 assertTrue(rs.getBoolean("oprcanmerge"));
             }
+        }
+    }
+
+    // =====================================================================
+    // Volatility detection tests — operators and indirect volatility
+    // These tests verify that volatile operators/functions are rejected
+    // in contexts that require immutability (indexes, generated columns).
+    // PG 18 rejects all of these.
+    // =====================================================================
+
+    @Test
+
+    void indexRejectsVolatileOperator() throws SQLException {
+        // An operator whose backing function is VOLATILE should be rejected in index expressions
+        // PG 18: ERROR 42P17 "functions in index expression must be marked IMMUTABLE"
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE vol_idx (x int)");
+            stmt.execute("INSERT INTO vol_idx VALUES (1)");
+            stmt.execute("CREATE FUNCTION vol_add(a integer, b integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql VOLATILE");
+            stmt.execute("CREATE OPERATOR <+> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = vol_add)");
+
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("CREATE INDEX ON vol_idx ((x <+> 1))"));
+            assertEquals("42P17", ex.getSQLState());
+        }
+    }
+
+    @Test
+
+    void indexRejectsStableOperator() throws SQLException {
+        // An operator whose backing function is STABLE should also be rejected in index expressions
+        // PG 18: ERROR 42P17 "functions in index expression must be marked IMMUTABLE"
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE stab_idx (x int)");
+            stmt.execute("INSERT INTO stab_idx VALUES (1)");
+            stmt.execute("CREATE FUNCTION stab_add(a integer, b integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql STABLE");
+            stmt.execute("CREATE OPERATOR <+> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = stab_add)");
+
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("CREATE INDEX ON stab_idx ((x <+> 1))"));
+            assertEquals("42P17", ex.getSQLState());
+        }
+    }
+
+    @Test
+    void indexAcceptsImmutableOperator() throws SQLException {
+        // An operator whose backing function is IMMUTABLE should be accepted in index expressions
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE imm_idx (x int)");
+            stmt.execute("INSERT INTO imm_idx VALUES (1)");
+            stmt.execute("CREATE FUNCTION imm_add(a integer, b integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql IMMUTABLE");
+            stmt.execute("CREATE OPERATOR <+> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = imm_add)");
+
+            // Should succeed
+            stmt.execute("CREATE INDEX ON imm_idx ((x <+> 1))");
+        }
+    }
+
+    @Test
+
+    void virtualColumnRejectsVolatileOperator() throws SQLException {
+        // A virtual generated column using a VOLATILE operator should be rejected
+        // PG 18: ERROR 42P17 "generation expression is not immutable"
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE FUNCTION vol_mul(a integer, b integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a * b; END; $$ LANGUAGE plpgsql VOLATILE");
+            stmt.execute("CREATE OPERATOR |*| (LEFTARG = integer, RIGHTARG = integer, FUNCTION = vol_mul)");
+
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("CREATE TABLE vol_gen (x int, y int GENERATED ALWAYS AS (x |*| 2) VIRTUAL)"));
+            assertEquals("42P17", ex.getSQLState());
+        }
+    }
+
+    @Test
+    void virtualColumnAcceptsImmutableOperator() throws SQLException {
+        // A virtual generated column using an IMMUTABLE operator should be accepted
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE FUNCTION imm_mul(a integer, b integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a * b; END; $$ LANGUAGE plpgsql IMMUTABLE");
+            stmt.execute("CREATE OPERATOR |*| (LEFTARG = integer, RIGHTARG = integer, FUNCTION = imm_mul)");
+
+            // Should succeed
+            stmt.execute("CREATE TABLE imm_gen (x int, y int GENERATED ALWAYS AS (x |*| 2) VIRTUAL)");
+            stmt.execute("INSERT INTO imm_gen (x) VALUES (5)");
+
+            try (ResultSet rs = stmt.executeQuery("SELECT y FROM imm_gen")) {
+                assertTrue(rs.next());
+                assertEquals(10, rs.getInt(1));
+            }
+        }
+    }
+
+    @Test
+
+    void indexRejectsVolatileUserFunction() throws SQLException {
+        // A user-defined function declared VOLATILE should be rejected in index expressions
+        // PG 18: ERROR 42P17 "functions in index expression must be marked IMMUTABLE"
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE vol_fn_idx (x int)");
+            stmt.execute("INSERT INTO vol_fn_idx VALUES (1)");
+            stmt.execute("CREATE FUNCTION my_volatile_fn(a integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a + 1; END; $$ LANGUAGE plpgsql VOLATILE");
+
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("CREATE INDEX ON vol_fn_idx ((my_volatile_fn(x)))"));
+            assertEquals("42P17", ex.getSQLState());
+        }
+    }
+
+    @Test
+
+    void indexRejectsStableUserFunction() throws SQLException {
+        // A user-defined function declared STABLE should be rejected in index expressions
+        // PG 18: ERROR 42P17 "functions in index expression must be marked IMMUTABLE"
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE stab_fn_idx (x int)");
+            stmt.execute("INSERT INTO stab_fn_idx VALUES (1)");
+            stmt.execute("CREATE FUNCTION my_stable_fn(a integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a + 1; END; $$ LANGUAGE plpgsql STABLE");
+
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("CREATE INDEX ON stab_fn_idx ((my_stable_fn(x)))"));
+            assertEquals("42P17", ex.getSQLState());
+        }
+    }
+
+    @Test
+    void indexAcceptsImmutableUserFunction() throws SQLException {
+        // A user-defined function declared IMMUTABLE should be accepted in index expressions
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE imm_fn_idx (x int)");
+            stmt.execute("INSERT INTO imm_fn_idx VALUES (1)");
+            stmt.execute("CREATE FUNCTION my_immutable_fn(a integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a + 1; END; $$ LANGUAGE plpgsql IMMUTABLE");
+
+            // Should succeed
+            stmt.execute("CREATE INDEX ON imm_fn_idx ((my_immutable_fn(x)))");
+        }
+    }
+
+    @Test
+
+    void virtualColumnRejectsVolatileUserFunction() throws SQLException {
+        // A virtual generated column using a VOLATILE user function should be rejected
+        // PG 18: ERROR 42P17 "generation expression is not immutable"
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE FUNCTION my_vol_fn(a integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a * 2; END; $$ LANGUAGE plpgsql VOLATILE");
+
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("CREATE TABLE vol_fn_gen (x int, y int GENERATED ALWAYS AS (my_vol_fn(x)) VIRTUAL)"));
+            assertEquals("42P17", ex.getSQLState());
+        }
+    }
+
+    @Test
+
+    void virtualColumnRejectsStableUserFunction() throws SQLException {
+        // A virtual generated column using a STABLE user function should be rejected
+        // PG 18: ERROR 42P17 "generation expression is not immutable"
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE FUNCTION my_stab_fn(a integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a * 2; END; $$ LANGUAGE plpgsql STABLE");
+
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("CREATE TABLE stab_fn_gen (x int, y int GENERATED ALWAYS AS (my_stab_fn(x)) VIRTUAL)"));
+            assertEquals("42P17", ex.getSQLState());
+        }
+    }
+
+    @Test
+
+    void defaultVolatilityIsVolatile() throws SQLException {
+        // PG default function volatility is VOLATILE — function without explicit
+        // IMMUTABLE/STABLE should be rejected in index expressions
+        try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE def_vol_idx (x int)");
+            stmt.execute("INSERT INTO def_vol_idx VALUES (1)");
+            // No VOLATILE/STABLE/IMMUTABLE specified — defaults to VOLATILE
+            stmt.execute("CREATE FUNCTION default_vol_fn(a integer) RETURNS integer AS $$ "
+                    + "BEGIN RETURN a + 1; END; $$ LANGUAGE plpgsql");
+
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("CREATE INDEX ON def_vol_idx ((default_vol_fn(x)))"));
+            assertEquals("42P17", ex.getSQLState());
         }
     }
 }

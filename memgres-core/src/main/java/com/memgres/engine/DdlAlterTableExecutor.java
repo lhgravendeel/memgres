@@ -152,18 +152,10 @@ class DdlAlterTableExecutor {
 
         // Validate generated column expression references valid columns and is immutable
         if (genExpr != null) {
-            // Reject volatile/stable functions in generated column expressions
-            String genNorm = genExpr.toLowerCase().replaceAll("\\s+", "");
-            if (genNorm.contains("now(") || genNorm.contains("random(") || genNorm.contains("clock_timestamp(")
-                    || genNorm.contains("current_timestamp") || genNorm.contains("timeofday(")
-                    || genNorm.contains("current_time") || genNorm.contains("current_date")
-                    || genNorm.contains("gen_random_uuid(") || genNorm.contains("nextval(")
-                    || genNorm.contains("txid_current(") || genNorm.contains("statement_timestamp(")
-                    || genNorm.contains("currval(") || genNorm.contains("setval(")
-                    || genNorm.contains("localtimestamp") || genNorm.contains("localtime")) {
-                throw new MemgresException("generation expression is not immutable", "42P17");
-            }
-            if (genNorm.contains("select")) {
+            // Reject volatile/stable functions and operators in generated column expressions
+            DdlExecutor.checkExpressionImmutability(genExpr, ddl.executor.database,
+                    "generation expression is not immutable");
+            if (genExpr.toLowerCase().replaceAll("\\s+", "").contains("select")) {
                 throw new MemgresException("cannot use subquery in column generation expression", "0A000");
             }
             try {

@@ -1371,18 +1371,9 @@ class DdlObjectExecutor {
                             || col.contains("+") || col.contains("*") || col.contains("/") || col.contains("||")) {
                         // Expression-based index column; try to evaluate against a dummy row to catch type errors
                         String exprStr = col.trim();
-                        // Reject volatile functions in indexes
-                        String colLower = exprStr.toLowerCase().replaceAll("\\s+", "");
-                        if (colLower.contains("random(") || colLower.contains("now(")
-                                || colLower.contains("clock_timestamp(") || colLower.contains("timeofday(")
-                                || colLower.contains("current_timestamp") || colLower.contains("gen_random_uuid(")
-                                || colLower.contains("nextval(") || colLower.contains("txid_current(")
-                                || colLower.contains("statement_timestamp(") || colLower.contains("currval(")
-                                || colLower.contains("setval(") || colLower.contains("localtimestamp")
-                                || colLower.contains("localtime") || colLower.contains("current_time")
-                                || colLower.contains("current_date")) {
-                            throw new MemgresException("functions in index expression must be marked IMMUTABLE", "42P17");
-                        }
+                        // Reject volatile/stable functions and operators in indexes
+                        DdlExecutor.checkExpressionImmutability(exprStr, executor.database,
+                                "functions in index expression must be marked IMMUTABLE");
                         // Try to evaluate the expression against a dummy row to catch type errors
                         try {
                             // Strip outer wrapper parens like ((a + b)) → a + b, but NOT function call parens
