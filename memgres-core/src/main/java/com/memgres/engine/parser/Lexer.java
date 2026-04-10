@@ -85,10 +85,10 @@ public class Lexer {
             "COMMENT", "SECURITY", "DEFINER", "INVOKER",
             "CALLED", "INPUT", "STRICT", "IMMUTABLE", "STABLE", "VOLATILE",
             "PARALLEL", "SAFE", "UNSAFE", "RESTRICTED",
-            "COST", "SUPPORT",
+            "COST", "SUPPORT", "LEAKPROOF",
             "WORK", "ABORT",
             "PROCEDURE",  // used in EXECUTE PROCEDURE
-            "CALL", "SETOF", "INOUT", "VARIADIC", "SLICE",
+            "CALL", "SETOF", "INOUT", "VARIADIC", "SLICE", "ROUTINE",
             "ATTACH", "DETACH", "STATEMENT", "REFERENCING",
             "MERGE", "MATCHED", "RESTART",
             "TRIM", "LEADING", "TRAILING", "BOTH",

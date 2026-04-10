@@ -166,6 +166,7 @@ public class AstExecutor {
         if (stmt instanceof AlterViewStmt) return ddlExecutor.executeAlterView(((AlterViewStmt) stmt));
         if (stmt instanceof AlterDomainStmt) return ddlExecutor.executeAlterDomain(((AlterDomainStmt) stmt));
         if (stmt instanceof AlterFunctionOwnerStmt) {
+            // Legacy path — kept for backward compatibility with any code that creates this node directly
             AlterFunctionOwnerStmt s = (AlterFunctionOwnerStmt) stmt;
             String newOwner = ddlExecutor.resolveOwnerName(s.newOwner());
             if (!database.hasRole(newOwner)) {
@@ -173,6 +174,12 @@ public class AstExecutor {
             }
             database.setObjectOwner("function:" + s.name(), newOwner);
             return QueryResult.message(QueryResult.Type.SET, "ALTER FUNCTION");
+        }
+        if (stmt instanceof AlterFunctionStmt) {
+            return executeAlterFunction((AlterFunctionStmt) stmt);
+        }
+        if (stmt instanceof AlterIndexStmt) {
+            return executeAlterIndex((AlterIndexStmt) stmt);
         }
         if (stmt instanceof AlterSchemaOwnerStmt) {
             AlterSchemaOwnerStmt s = (AlterSchemaOwnerStmt) stmt;
@@ -618,5 +625,126 @@ public class AstExecutor {
 
     List<String> parseJsonPathArg(Object right) {
         return exprEvaluator.parseJsonPathArg(right);
+    }
+
+    // ---- ALTER FUNCTION / ALTER PROCEDURE ----
+
+    private PgFunction resolveAlterFunction(AlterFunctionStmt stmt) {
+        return stmt.schema() != null
+            ? database.getFunction(stmt.schema(), stmt.name())
+            : database.getFunction(stmt.name());
+    }
+
+    private QueryResult executeAlterFunction(AlterFunctionStmt stmt) {
+        String tag = stmt.commandTag();
+        String kind = stmt.isProcedure() ? "procedure" : "function";
+
+        switch (stmt.action()) {
+            case RENAME_TO: {
+                PgFunction func = resolveAlterFunction(stmt);
+                if (func == null) {
+                    if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
+                    throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
+                }
+                if (database.getFunction(stmt.targetValue()) != null) {
+                    throw new MemgresException(kind + " " + stmt.targetValue() + " already exists", "42723");
+                }
+                database.renameFunction(stmt.name(), stmt.targetValue());
+                return QueryResult.message(QueryResult.Type.SET, tag);
+            }
+            case SET_SCHEMA: {
+                PgFunction func = resolveAlterFunction(stmt);
+                if (func == null) {
+                    if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
+                    throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
+                }
+                String oldSchema = func.getSchemaName() != null ? func.getSchemaName() : "public";
+                String newSchema = stmt.targetValue();
+                if (database.getSchema(newSchema) == null) {
+                    throw new MemgresException("schema \"" + newSchema + "\" does not exist", "3F000");
+                }
+                func.setSchemaName(newSchema);
+                // Update schema registry
+                Set<String> oldObjects = database.getSchemaObjects(oldSchema);
+                oldObjects.remove("function:" + stmt.name().toLowerCase());
+                database.registerSchemaObject(newSchema, "function", stmt.name());
+                return QueryResult.message(QueryResult.Type.SET, tag);
+            }
+            case OWNER_TO: {
+                PgFunction func = resolveAlterFunction(stmt);
+                if (func == null) {
+                    if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
+                    throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
+                }
+                String newOwner = ddlExecutor.resolveOwnerName(stmt.targetValue());
+                if (!database.hasRole(newOwner)) {
+                    throw new MemgresException("role \"" + stmt.targetValue() + "\" does not exist", "42704");
+                }
+                database.setObjectOwner("function:" + stmt.name(), newOwner);
+                func.setOwner(newOwner);
+                return QueryResult.message(QueryResult.Type.SET, tag);
+            }
+            case SET_ATTRIBUTES: {
+                PgFunction func = resolveAlterFunction(stmt);
+                if (func == null) {
+                    if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
+                    throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
+                }
+                if (stmt.volatility() != null) func.setVolatility(stmt.volatility());
+                if (stmt.strict() != null) func.setStrict(stmt.strict());
+                if (stmt.securityDefiner() != null) func.setSecurityDefiner(stmt.securityDefiner());
+                if (stmt.leakproof() != null) func.setLeakproof(stmt.leakproof());
+                if (stmt.cost() != null) func.setCost(stmt.cost());
+                if (stmt.rows() != null) func.setRows(stmt.rows());
+                if (stmt.parallel() != null) func.setParallel(stmt.parallel());
+                if (stmt.setClauses() != null) {
+                    java.util.Map<String, String> existing = func.getSetClauses();
+                    if (existing == null) existing = new java.util.LinkedHashMap<>();
+                    existing.putAll(stmt.setClauses());
+                    func.setSetClauses(existing);
+                }
+                if (stmt.resetParams() != null) {
+                    java.util.Map<String, String> existing = func.getSetClauses();
+                    if (existing != null) {
+                        for (String p : stmt.resetParams()) {
+                            if ("ALL".equals(p)) {
+                                existing.clear();
+                            } else {
+                                existing.remove(p);
+                            }
+                        }
+                        func.setSetClauses(existing.isEmpty() ? null : existing);
+                    }
+                }
+                return QueryResult.message(QueryResult.Type.SET, tag);
+            }
+            default:
+                return QueryResult.message(QueryResult.Type.SET, tag);
+        }
+    }
+
+    // ---- ALTER INDEX ----
+
+    private QueryResult executeAlterIndex(AlterIndexStmt stmt) {
+        switch (stmt.action()) {
+            case RENAME_TO: {
+                if (!database.hasIndex(stmt.name())) {
+                    if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+                    throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
+                }
+                if (database.hasIndex(stmt.targetValue())) {
+                    throw new MemgresException("relation \"" + stmt.targetValue() + "\" already exists", "42P07");
+                }
+                database.renameIndex(stmt.name(), stmt.targetValue());
+                return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+            }
+            default:
+                // All other actions (SET TABLESPACE, ATTACH PARTITION, etc.) are accepted no-ops
+                if (stmt.action() != AlterIndexStmt.Action.NO_OP
+                        && !database.hasIndex(stmt.name()) && !stmt.ifExists()) {
+                    throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
+                }
+                return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+        }
     }
 }

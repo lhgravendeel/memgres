@@ -19,6 +19,7 @@ public final class CreateFunctionStmt implements Statement {
     public final boolean isProcedure;
     public final boolean securityDefiner;     // false = SECURITY INVOKER (default)
     public final boolean strict;              // STRICT or RETURNS NULL ON NULL INPUT
+    public final boolean leakproof;           // LEAKPROOF
     public final String volatility;           // "VOLATILE" (default), "STABLE", or "IMMUTABLE"
     public final Map<String, String> setClauses; // function-level GUC overrides (may be null)
 
@@ -37,6 +38,26 @@ public final class CreateFunctionStmt implements Statement {
             String volatility,
             Map<String, String> setClauses
     ) {
+        this(name, schema, params, parsedParams, returnType, body, language, orReplace,
+                isProcedure, securityDefiner, strict, false, volatility, setClauses);
+    }
+
+    public CreateFunctionStmt(
+            String name,
+            String schema,
+            String params,
+            List<FuncParam> parsedParams,
+            String returnType,
+            String body,
+            String language,
+            boolean orReplace,
+            boolean isProcedure,
+            boolean securityDefiner,
+            boolean strict,
+            boolean leakproof,
+            String volatility,
+            Map<String, String> setClauses
+    ) {
         this.name = name;
         this.schema = schema;
         this.params = params;
@@ -48,6 +69,7 @@ public final class CreateFunctionStmt implements Statement {
         this.isProcedure = isProcedure;
         this.securityDefiner = securityDefiner;
         this.strict = strict;
+        this.leakproof = leakproof;
         this.volatility = volatility;
         this.setClauses = setClauses;
     }
@@ -107,6 +129,7 @@ public final class CreateFunctionStmt implements Statement {
     public boolean isProcedure() { return isProcedure; }
     public boolean securityDefiner() { return securityDefiner; }
     public boolean strict() { return strict; }
+    public boolean leakproof() { return leakproof; }
     public String volatility() { return volatility; }
     public Map<String, String> setClauses() { return setClauses; }
 

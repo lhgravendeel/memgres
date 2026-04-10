@@ -404,6 +404,21 @@ public class Database {
         return functions.get(key);
     }
 
+    /** Returns a function matching both name and schema, or null. */
+    public PgFunction getFunction(String schema, String name) {
+        if (schema == null) return getFunction(name);
+        String key = name.toLowerCase();
+        List<PgFunction> overloads = functionOverloads.get(key);
+        if (overloads != null) {
+            for (PgFunction f : overloads) {
+                if (schema.equalsIgnoreCase(f.getSchemaName())) return f;
+            }
+        }
+        PgFunction single = functions.get(key);
+        if (single != null && schema.equalsIgnoreCase(single.getSchemaName())) return single;
+        return null;
+    }
+
     /** Returns all overloads for the given function name. */
     public List<PgFunction> getFunctionOverloads(String name) {
         List<PgFunction> overloads = functionOverloads.get(name.toLowerCase());
@@ -498,6 +513,31 @@ public class Database {
         } else {
             functions.put(key, overloads.get(0));
         }
+    }
+
+    /** Rename a function/procedure: re-key in all maps, update the PgFunction name field. */
+    public void renameFunction(String oldName, String newName) {
+        String oldKey = oldName.toLowerCase();
+        String newKey = newName.toLowerCase();
+        List<PgFunction> overloads = functionOverloads.remove(oldKey);
+        PgFunction single = functions.remove(oldKey);
+        if (overloads != null) {
+            for (PgFunction f : overloads) f.setName(newName);
+            functionOverloads.put(newKey, overloads);
+        }
+        if (single != null) {
+            single.setName(newName);
+            functions.put(newKey, single);
+        }
+        // Update schema registry
+        for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
+            if (entry.getValue().remove("function:" + oldKey)) {
+                entry.getValue().add("function:" + newKey);
+            }
+        }
+        // Update object ownership key
+        String oldOwner = objectOwners.remove("function:" + oldKey);
+        if (oldOwner != null) objectOwners.put("function:" + newKey, oldOwner);
     }
 
     public Map<String, PgFunction> getFunctions() {
@@ -629,6 +669,31 @@ public class Database {
         indexUniqueFlags.remove(name.toLowerCase());
         indexWhereClauses.remove(name.toLowerCase());
         indexMethods.remove(name.toLowerCase());
+    }
+
+    /** Rename an index: re-key across all index maps and update schema registry. */
+    public void renameIndex(String oldName, String newName) {
+        String oldKey = oldName.toLowerCase();
+        String newKey = newName.toLowerCase();
+        List<String> cols = indexColumns.remove(oldKey);
+        if (cols != null) indexColumns.put(newKey, cols);
+        String tbl = indexTableNames.remove(oldKey);
+        if (tbl != null) indexTableNames.put(newKey, tbl);
+        Boolean uniq = indexUniqueFlags.remove(oldKey);
+        if (uniq != null) indexUniqueFlags.put(newKey, uniq);
+        String where = indexWhereClauses.remove(oldKey);
+        if (where != null) indexWhereClauses.put(newKey, where);
+        String method = indexMethods.remove(oldKey);
+        if (method != null) indexMethods.put(newKey, method);
+        // Update schema registry
+        for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
+            if (entry.getValue().remove("index:" + oldKey)) {
+                entry.getValue().add("index:" + newKey);
+            }
+        }
+        // Update object ownership key
+        String oldOwner = objectOwners.remove("index:" + oldKey);
+        if (oldOwner != null) objectOwners.put("index:" + newKey, oldOwner);
     }
 
     public Map<String, List<String>> getIndexColumns() {

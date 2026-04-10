@@ -49,7 +49,7 @@ public class PgFunction {
         }
     }
 
-    private final String name;
+    private String name;
     private final String returnType;
     private final String body;
     private final String language;
@@ -61,6 +61,10 @@ public class PgFunction {
     private String volatility; // "VOLATILE" (default), "STABLE", or "IMMUTABLE"
     private java.util.Map<String, String> setClauses; // function-level GUC overrides
     private String owner;
+    private boolean leakproof;
+    private double cost = 100;       // default COST for PL/pgSQL; SQL functions default to 1 in PG
+    private double rows;             // estimated rows for set-returning functions
+    private String parallel;         // "UNSAFE" (default), "RESTRICTED", or "SAFE"
 
     public PgFunction(String name, String returnType, String body, String language) {
         this(name, returnType, body, language, Cols.listOf(), false);
@@ -94,4 +98,13 @@ public class PgFunction {
     public void setSetClauses(java.util.Map<String, String> setClauses) { this.setClauses = setClauses; }
     public String getOwner() { return owner; }
     public void setOwner(String owner) { this.owner = owner; }
+    public void setName(String name) { this.name = name; }
+    public boolean isLeakproof() { return leakproof; }
+    public void setLeakproof(boolean leakproof) { this.leakproof = leakproof; }
+    public double getCost() { return cost; }
+    public void setCost(double cost) { this.cost = cost; }
+    public double getRows() { return rows; }
+    public void setRows(double rows) { this.rows = rows; }
+    public String getParallel() { return parallel; }
+    public void setParallel(String parallel) { this.parallel = parallel; }
 }

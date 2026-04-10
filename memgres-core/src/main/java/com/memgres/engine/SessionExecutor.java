@@ -99,13 +99,19 @@ class SessionExecutor {
                         // Store with bare table.column name for consistent lookup
                         bareName = colTable + "." + colPart;
                     }
+                } else if (objType.equals("FUNCTION") || objType.equals("PROCEDURE") || objType.equals("ROUTINE")) {
+                    // Normalize PROCEDURE/ROUTINE to FUNCTION for comment storage
+                    objType = "FUNCTION";
+                    if (executor.database.getFunction(bareName) == null) {
+                        throw new MemgresException("function " + bareName + " does not exist", "42883");
+                    }
                 } else if (objType.equals("SCHEMA")) {
                     String schemaN = bareName;
                     if (executor.database.getSchema(schemaN) == null) {
                         throw new MemgresException("schema \"" + schemaN + "\" does not exist", "3F000");
                     }
                 }
-                executor.database.addComment(parts[1].toLowerCase(), bareName.toLowerCase(), stmt.value());
+                executor.database.addComment(objType.toLowerCase(), bareName.toLowerCase(), stmt.value());
             }
             return QueryResult.message(QueryResult.Type.SET, "COMMENT");
         }

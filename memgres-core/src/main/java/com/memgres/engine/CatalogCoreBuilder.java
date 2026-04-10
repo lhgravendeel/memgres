@@ -926,7 +926,10 @@ class CatalogCoreBuilder {
             int fnOwnerOid = (fnOwner != null && !fnOwner.isEmpty()) ? oids.oid("role:" + fnOwner) : 10;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + fn.getName()), fn.getName(), funcNs, fnOwnerOid,
-                    langOid, 100.0, 0.0, 0, "-", kind, fn.isSecurityDefiner(), false, false, false, "v", "u",
+                    langOid, fn.getCost(), fn.getRows(), 0, "-", kind,
+                    fn.isSecurityDefiner(), fn.isLeakproof(), fn.isStrict(), false,
+                    fn.getVolatility() != null ? fn.getVolatility().substring(0, 1).toLowerCase() : "v",
+                    fn.getParallel() != null ? fn.getParallel().substring(0, 1).toLowerCase() : "u",
                     nargs, (short) 0, 0,
                     argTypes, null, null, null, null, null,
                     fn.getBody(), null, null, null, null, 1

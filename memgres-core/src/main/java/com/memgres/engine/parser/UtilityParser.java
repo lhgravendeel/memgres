@@ -892,7 +892,7 @@ class UtilityParser {
         } else if (parser.matchKeyword("SEQUENCE")) {
             objectType = "SEQUENCE";
             objectName = parser.readIdentifier();
-        } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE")) {
+        } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE") || parser.matchKeyword("ROUTINE")) {
             objectType = "FUNCTION";
             objectName = parser.readIdentifier();
             if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
@@ -986,7 +986,7 @@ class UtilityParser {
         } else if (parser.matchKeyword("SEQUENCE")) {
             objectType = "SEQUENCE";
             objectName = parser.readIdentifier();
-        } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE")) {
+        } else if (parser.matchKeyword("FUNCTION") || parser.matchKeyword("PROCEDURE") || parser.matchKeyword("ROUTINE")) {
             objectType = "FUNCTION";
             objectName = parser.readIdentifier();
             if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
