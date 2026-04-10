@@ -684,27 +684,35 @@ public class Database {
     // Advisory locks
     public boolean tryAdvisoryLock(long key, Session session) {
         Set<Session> holders = advisoryLocks.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
-        // If another session already holds this lock, deny it (mutual exclusion)
-        for (Session holder : holders) {
-            if (holder != session) {
-                return false;
+        // Synchronize on the holder set to make check-then-add atomic.
+        // Without this, two sessions could both see an empty set, both pass
+        // the check, and both add themselves — violating mutual exclusion.
+        synchronized (holders) {
+            for (Session holder : holders) {
+                if (holder != session) {
+                    return false;
+                }
             }
+            holders.add(session);
+            return true;
         }
-        holders.add(session);
-        return true;
     }
 
     public boolean advisoryUnlock(long key, Session session) {
         Set<Session> holders = advisoryLocks.get(key);
         if (holders != null) {
-            return holders.remove(session);
+            synchronized (holders) {
+                return holders.remove(session);
+            }
         }
         return false;
     }
 
     public void advisoryUnlockAll(Session session) {
         for (Set<Session> holders : advisoryLocks.values()) {
-            holders.remove(session);
+            synchronized (holders) {
+                holders.remove(session);
+            }
         }
     }
 

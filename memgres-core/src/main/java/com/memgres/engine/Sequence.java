@@ -55,14 +55,14 @@ public class Sequence {
         return next;
     }
 
-    public long currVal() {
+    public synchronized long currVal() {
         if (!called) {
             throw new MemgresException("currval of sequence \"" + name + "\" is not yet defined in this session", "55000");
         }
         return currentValue.get();
     }
 
-    public long setVal(long value) {
+    public synchronized long setVal(long value) {
         if (value > maxValue) {
             throw new MemgresException("setval: value " + value + " is out of bounds for sequence (max=" + maxValue + ")", "22003");
         }
@@ -74,7 +74,7 @@ public class Sequence {
         return value;
     }
 
-    public long setVal(long value, boolean isCalled) {
+    public synchronized long setVal(long value, boolean isCalled) {
         if (value > maxValue) {
             throw new MemgresException("setval: value " + value + " is out of bounds for sequence (max=" + maxValue + ")", "22003");
         }
@@ -98,12 +98,12 @@ public class Sequence {
     public long getMaxValue() { return maxValue; }
     public boolean isCycle() { return cycle; }
 
-    public void restart() {
+    public synchronized void restart() {
         currentValue.set(startWith);
         called = false;
     }
 
-    public void restart(long value) {
+    public synchronized void restart(long value) {
         currentValue.set(value);
         called = false;
     }
@@ -120,9 +120,9 @@ public class Sequence {
         return called;
     }
 
-    public void setIncrementBy(long inc) { this.incrementBy = inc; }
-    public void setMinValue(long min) { this.minValue = min; }
-    public void setMaxValue(long max) { this.maxValue = max; }
-    public void setStartWith(long start) { this.startWith = start; }
-    public void setCycle(boolean cycle) { this.cycle = cycle; }
+    public synchronized void setIncrementBy(long inc) { this.incrementBy = inc; }
+    public synchronized void setMinValue(long min) { this.minValue = min; }
+    public synchronized void setMaxValue(long max) { this.maxValue = max; }
+    public synchronized void setStartWith(long start) { this.startWith = start; }
+    public synchronized void setCycle(boolean cycle) { this.cycle = cycle; }
 }

@@ -14,8 +14,10 @@ public class NotificationManager {
 
     public void listen(Session session, String channel) {
         List<Session> sessions = listeners.computeIfAbsent(channel.toLowerCase(), k -> new CopyOnWriteArrayList<>());
-        if (!sessions.contains(session)) {
-            sessions.add(session);
+        synchronized (sessions) {
+            if (!sessions.contains(session)) {
+                sessions.add(session);
+            }
         }
     }
 

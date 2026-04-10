@@ -510,11 +510,11 @@ class ConstraintValidator {
                                 }
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
-                                    childTable.beforeRowUpdate(childRow, oldVals);
+                                    Object[] newVals = Arrays.copyOf(childRow, childRow.length);
                                     for (int idx : childColIndices) {
-                                        childRow[idx] = null;
+                                        newVals[idx] = null;
                                     }
-                                    childTable.afterRowUpdate(childRow);
+                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
                                 }
                             }
                             break;
@@ -530,14 +530,14 @@ class ConstraintValidator {
                                 }
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
-                                    childTable.beforeRowUpdate(childRow, oldVals);
+                                    Object[] newVals = Arrays.copyOf(childRow, childRow.length);
                                     for (int i = 0; i < childColIndices.length; i++) {
                                         Column col = childTable.getColumns().get(childColIndices[i]);
-                                        childRow[childColIndices[i]] = col.getDefaultValue() != null
+                                        newVals[childColIndices[i]] = col.getDefaultValue() != null
                                                 ? executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr())
                                                 : null;
                                     }
-                                    childTable.afterRowUpdate(childRow);
+                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
                                 }
                             }
                             break;
@@ -628,11 +628,11 @@ class ConstraintValidator {
                                 }
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
-                                    childTable.beforeRowUpdate(childRow, oldVals);
+                                    Object[] newVals = Arrays.copyOf(childRow, childRow.length);
                                     for (int i = 0; i < childColIndices.length; i++) {
-                                        childRow[childColIndices[i]] = newParentVals[i];
+                                        newVals[childColIndices[i]] = newParentVals[i];
                                     }
-                                    childTable.afterRowUpdate(childRow);
+                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
                                 }
                             }
                             break;
@@ -648,11 +648,11 @@ class ConstraintValidator {
                                 }
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
-                                    childTable.beforeRowUpdate(childRow, oldVals);
+                                    Object[] newVals = Arrays.copyOf(childRow, childRow.length);
                                     for (int idx : childColIndices) {
-                                        childRow[idx] = null;
+                                        newVals[idx] = null;
                                     }
-                                    childTable.afterRowUpdate(childRow);
+                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
                                 }
                             }
                             break;
@@ -668,14 +668,14 @@ class ConstraintValidator {
                                 }
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
-                                    childTable.beforeRowUpdate(childRow, oldVals);
+                                    Object[] newVals = Arrays.copyOf(childRow, childRow.length);
                                     for (int i = 0; i < childColIndices.length; i++) {
                                         Column col = childTable.getColumns().get(childColIndices[i]);
-                                        childRow[childColIndices[i]] = col.getDefaultValue() != null
+                                        newVals[childColIndices[i]] = col.getDefaultValue() != null
                                                 ? executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr())
                                                 : null;
                                     }
-                                    childTable.afterRowUpdate(childRow);
+                                    childTable.updateRowInPlace(childRow, oldVals, newVals);
                                 }
                             }
                             break;

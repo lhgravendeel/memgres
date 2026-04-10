@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -13,10 +14,12 @@ import java.util.concurrent.locks.ReentrantLock;
 public class Table {
 
     private final String name;
+    // CopyOnWriteArrayList: safe for concurrent reads (getColumnIndex from DML threads)
+    // while DDL methods (renameColumn, alterColumnType, etc.) modify via set().
     private final List<Column> columns;
     private volatile List<Object[]> rows = new ArrayList<>();
     private final AtomicLong serialCounter = new AtomicLong(1);
-    private final List<StoredConstraint> constraints = new ArrayList<>();
+    private final List<StoredConstraint> constraints = new CopyOnWriteArrayList<>();
     private final ReentrantLock writeLock = new ReentrantLock();
 
     // Hash indexes keyed by constraint name (for PK, UNIQUE constraints)
@@ -24,12 +27,12 @@ public class Table {
 
     // Inheritance
     private Table parentTable;
-    private final List<Table> children = new ArrayList<>();
+    private final List<Table> children = new CopyOnWriteArrayList<>();
 
     // Partitioning
     private String partitionStrategy; // RANGE, LIST, HASH (null if not partitioned)
     private String partitionColumn;
-    private final List<Table> partitions = new ArrayList<>();
+    private final List<Table> partitions = new CopyOnWriteArrayList<>();
     private Table partitionParent;
     private Object partitionLower;     // for RANGE
     private Object partitionUpper;     // for RANGE
@@ -41,11 +44,11 @@ public class Table {
     // Row-level security
     private boolean rlsEnabled;
     private boolean rlsForced;
-    private final List<RlsPolicy> rlsPolicies = new ArrayList<>();
+    private final List<RlsPolicy> rlsPolicies = new CopyOnWriteArrayList<>();
 
     public Table(String name, List<Column> columns) {
         this.name = name;
-        this.columns = new ArrayList<>(columns);
+        this.columns = new CopyOnWriteArrayList<>(columns);
     }
 
     public String getName() {
@@ -66,13 +69,18 @@ public class Table {
     }
 
     public void insertRow(Object[] row) {
-        List<Object[]> current = rows;
-        List<Object[]> newRows = new ArrayList<>(current.size() + 1);
-        newRows.addAll(current);
-        newRows.add(row);
-        rows = newRows;
-        for (TableIndex idx : indexes.values()) {
-            idx.put(row);
+        writeLock.lock();
+        try {
+            List<Object[]> current = rows;
+            List<Object[]> newRows = new ArrayList<>(current.size() + 1);
+            newRows.addAll(current);
+            newRows.add(row);
+            rows = newRows;
+            for (TableIndex idx : indexes.values()) {
+                idx.put(row);
+            }
+        } finally {
+            writeLock.unlock();
         }
     }
 
@@ -86,12 +94,40 @@ public class Table {
 
     /** Atomically replace all rows (used by snapshot restore and temp table truncation). */
     public void replaceAllRows(List<Object[]> newRows) {
-        rows = new ArrayList<>(newRows);
+        writeLock.lock();
+        try {
+            rows = new ArrayList<>(newRows);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** Atomically replace all rows AND rebuild all indexes under a single lock acquisition.
+     *  Used by snapshot restore to prevent a concurrent DML from slipping in between
+     *  the row swap and the index rebuild. */
+    public void replaceAllRowsAndRebuildIndexes(List<Object[]> newRows) {
+        writeLock.lock();
+        try {
+            rows = new ArrayList<>(newRows);
+            for (TableIndex idx : indexes.values()) {
+                idx.clear();
+                for (Object[] row : rows) {
+                    idx.put(row);
+                }
+            }
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     /** Atomically clear all rows without touching indexes (used by ON COMMIT DELETE ROWS). */
     public void clearRows() {
-        rows = new ArrayList<>();
+        writeLock.lock();
+        try {
+            rows = new ArrayList<>();
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     /**
@@ -239,50 +275,60 @@ public class Table {
     }
 
     public void addColumn(Column column, Object defaultValue) {
-        columns.add(column);
-        int newColIdx = columns.size() - 1;
-        List<Object[]> current = rows;
-        List<Object[]> newRows = new ArrayList<>(current.size());
-        for (Object[] oldRow : current) {
-            Object[] newRow = new Object[columns.size()];
-            System.arraycopy(oldRow, 0, newRow, 0, oldRow.length);
-            if (defaultValue != null) {
-                newRow[newColIdx] = defaultValue;
+        writeLock.lock();
+        try {
+            columns.add(column);
+            int newColIdx = columns.size() - 1;
+            List<Object[]> current = rows;
+            List<Object[]> newRows = new ArrayList<>(current.size());
+            for (Object[] oldRow : current) {
+                Object[] newRow = new Object[columns.size()];
+                System.arraycopy(oldRow, 0, newRow, 0, oldRow.length);
+                if (defaultValue != null) {
+                    newRow[newColIdx] = defaultValue;
+                }
+                newRows.add(newRow);
             }
-            newRows.add(newRow);
+            rows = newRows;
+            rebuildAllIndexes();
+        } finally {
+            writeLock.unlock();
         }
-        rows = newRows;
-        rebuildAllIndexes();
     }
 
     public void removeColumn(String columnName) {
-        int idx = getColumnIndex(columnName);
-        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
-        columns.remove(idx);
-        List<Object[]> current = rows;
-        List<Object[]> newRows = new ArrayList<>(current.size());
-        for (Object[] oldRow : current) {
-            Object[] newRow = new Object[columns.size()];
-            for (int j = 0, k = 0; j < oldRow.length; j++) {
-                if (j != idx) newRow[k++] = oldRow[j];
+        writeLock.lock();
+        try {
+            int idx = getColumnIndex(columnName);
+            if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+            columns.remove(idx);
+            List<Object[]> current = rows;
+            List<Object[]> newRows = new ArrayList<>(current.size());
+            for (Object[] oldRow : current) {
+                Object[] newRow = new Object[columns.size()];
+                for (int j = 0, k = 0; j < oldRow.length; j++) {
+                    if (j != idx) newRow[k++] = oldRow[j];
+                }
+                newRows.add(newRow);
             }
-            newRows.add(newRow);
-        }
-        rows = newRows;
-        // Column indices changed, so rebuild index column mappings
-        // Remove indexes referencing the dropped column, rebuild the rest
-        List<String> toRemove = new ArrayList<>();
-        for (Map.Entry<String, TableIndex> entry : indexes.entrySet()) {
-            for (int ci : entry.getValue().getColumnIndices()) {
-                if (ci == idx) {
-                    toRemove.add(entry.getKey());
-                    break;
+            rows = newRows;
+            // Column indices changed, so rebuild index column mappings
+            // Remove indexes referencing the dropped column, rebuild the rest
+            List<String> toRemove = new ArrayList<>();
+            for (Map.Entry<String, TableIndex> entry : indexes.entrySet()) {
+                for (int ci : entry.getValue().getColumnIndices()) {
+                    if (ci == idx) {
+                        toRemove.add(entry.getKey());
+                        break;
+                    }
                 }
             }
+            toRemove.forEach(indexes::remove);
+            // Remaining indexes need column index remapping; simplest to rebuild from constraints
+            rebuildIndexesFromConstraints();
+        } finally {
+            writeLock.unlock();
         }
-        toRemove.forEach(indexes::remove);
-        // Remaining indexes need column index remapping; simplest to rebuild from constraints
-        rebuildIndexesFromConstraints();
     }
 
     /** Rebuild all indexes from current constraints (after column layout changes). */
@@ -314,19 +360,24 @@ public class Table {
     }
 
     public void addColumnAt(Column column, int position, List<Object> values) {
-        columns.add(position, column);
-        List<Object[]> current = rows;
-        List<Object[]> newRows = new ArrayList<>(current.size());
-        for (int i = 0; i < current.size(); i++) {
-            Object[] oldRow = current.get(i);
-            Object[] newRow = new Object[oldRow.length + 1];
-            System.arraycopy(oldRow, 0, newRow, 0, position);
-            newRow[position] = values != null && i < values.size() ? values.get(i) : null;
-            System.arraycopy(oldRow, position, newRow, position + 1, oldRow.length - position);
-            newRows.add(newRow);
+        writeLock.lock();
+        try {
+            columns.add(position, column);
+            List<Object[]> current = rows;
+            List<Object[]> newRows = new ArrayList<>(current.size());
+            for (int i = 0; i < current.size(); i++) {
+                Object[] oldRow = current.get(i);
+                Object[] newRow = new Object[oldRow.length + 1];
+                System.arraycopy(oldRow, 0, newRow, 0, position);
+                newRow[position] = values != null && i < values.size() ? values.get(i) : null;
+                System.arraycopy(oldRow, position, newRow, position + 1, oldRow.length - position);
+                newRows.add(newRow);
+            }
+            rows = newRows;
+            rebuildIndexesFromConstraints();
+        } finally {
+            writeLock.unlock();
         }
-        rows = newRows;
-        rebuildIndexesFromConstraints();
     }
 
     public void renameColumn(String oldName, String newName) {
@@ -372,6 +423,7 @@ public class Table {
     /**
      * Notify indexes that a row's values are about to change (UPDATE).
      * Must be called BEFORE the in-place arraycopy with the old values.
+     * @deprecated Use {@link #updateRowInPlace(Object[], Object[], Object[])} instead for atomic index+data update.
      */
     public void beforeRowUpdate(Object[] row, Object[] oldValues) {
         for (TableIndex idx : indexes.values()) {
@@ -382,6 +434,7 @@ public class Table {
     /**
      * Notify indexes that a row's values have changed (UPDATE).
      * Must be called AFTER the in-place arraycopy with new values.
+     * @deprecated Use {@link #updateRowInPlace(Object[], Object[], Object[])} instead for atomic index+data update.
      */
     public void afterRowUpdate(Object[] row) {
         for (TableIndex idx : indexes.values()) {
@@ -389,17 +442,43 @@ public class Table {
         }
     }
 
+    /**
+     * Atomically update a row's data in-place under writeLock: remove old index entries,
+     * copy new values into the row, then add new index entries.
+     * This ensures concurrent readers never see partially-updated row data and
+     * all index mutations are serialized.
+     */
+    public void updateRowInPlace(Object[] row, Object[] oldValues, Object[] newValues) {
+        writeLock.lock();
+        try {
+            for (TableIndex idx : indexes.values()) {
+                idx.removeByOldValues(oldValues, row);
+            }
+            System.arraycopy(newValues, 0, row, 0, row.length);
+            for (TableIndex idx : indexes.values()) {
+                idx.put(row);
+            }
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     /** Remove a single row from the table and its indexes. */
     public void removeRow(Object[] row) {
-        for (TableIndex idx : indexes.values()) {
-            idx.remove(row);
+        writeLock.lock();
+        try {
+            for (TableIndex idx : indexes.values()) {
+                idx.remove(row);
+            }
+            List<Object[]> current = rows;
+            List<Object[]> newRows = new ArrayList<>(current.size());
+            for (Object[] r : current) {
+                if (r != row) newRows.add(r);
+            }
+            rows = newRows;
+        } finally {
+            writeLock.unlock();
         }
-        List<Object[]> current = rows;
-        List<Object[]> newRows = new ArrayList<>(current.size());
-        for (Object[] r : current) {
-            if (r != row) newRows.add(r);
-        }
-        rows = newRows;
     }
 
     // Index management
@@ -419,23 +498,38 @@ public class Table {
 
     /**
      * Build an index from existing rows (used when adding a constraint to a populated table).
+     * Acquires writeLock to ensure the index captures a consistent snapshot of rows
+     * and is registered atomically — preventing concurrent INSERTs from being missed.
      */
     public void buildIndex(TableIndex index) {
-        for (Object[] row : rows) {
-            index.put(row);
+        writeLock.lock();
+        try {
+            for (Object[] row : rows) {
+                index.put(row);
+            }
+            indexes.put(index.getConstraintName(), index);
+        } finally {
+            writeLock.unlock();
         }
-        indexes.put(index.getConstraintName(), index);
     }
 
     /**
-     * Rebuild all indexes (used after column add/remove which changes row layout).
+     * Rebuild all indexes (used after column add/remove or snapshot restore).
+     * Acquires writeLock to serialize with concurrent DML index mutations.
+     * ReentrantLock handles re-entrance when called from addColumn/addColumnAt
+     * which already hold the lock.
      */
     void rebuildAllIndexes() {
-        for (TableIndex idx : indexes.values()) {
-            idx.clear();
-            for (Object[] row : rows) {
-                idx.put(row);
+        writeLock.lock();
+        try {
+            for (TableIndex idx : indexes.values()) {
+                idx.clear();
+                for (Object[] row : rows) {
+                    idx.put(row);
+                }
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 
