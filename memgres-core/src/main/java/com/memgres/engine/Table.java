@@ -4,7 +4,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -15,7 +14,7 @@ public class Table {
 
     private final String name;
     private final List<Column> columns;
-    private final List<Object[]> rows = new CopyOnWriteArrayList<>();
+    private volatile List<Object[]> rows = new ArrayList<>();
     private final AtomicLong serialCounter = new AtomicLong(1);
     private final List<StoredConstraint> constraints = new ArrayList<>();
     private final ReentrantLock writeLock = new ReentrantLock();
@@ -67,7 +66,11 @@ public class Table {
     }
 
     public void insertRow(Object[] row) {
-        rows.add(row);
+        List<Object[]> current = rows;
+        List<Object[]> newRows = new ArrayList<>(current.size() + 1);
+        newRows.addAll(current);
+        newRows.add(row);
+        rows = newRows;
         for (TableIndex idx : indexes.values()) {
             idx.put(row);
         }
@@ -79,6 +82,16 @@ public class Table {
 
     public List<Object[]> getRows() {
         return rows;
+    }
+
+    /** Atomically replace all rows (used by snapshot restore and temp table truncation). */
+    public void replaceAllRows(List<Object[]> newRows) {
+        rows = new ArrayList<>(newRows);
+    }
+
+    /** Atomically clear all rows without touching indexes (used by ON COMMIT DELETE ROWS). */
+    public void clearRows() {
+        rows = new ArrayList<>();
     }
 
     /**
@@ -183,7 +196,7 @@ public class Table {
         writeLock.lock();
         try {
             int count = rows.size();
-            rows.clear();
+            rows = new ArrayList<>();
             for (TableIndex idx : indexes.values()) {
                 idx.clear();
             }
@@ -195,24 +208,26 @@ public class Table {
 
     /**
      * Atomically remove specific rows from the table using identity comparison.
-     * This is thread-safe for concurrent deletes from different sessions.
+     * Builds a new list and swaps the volatile reference so concurrent readers
+     * never observe a partially-rebuilt intermediate state.
      */
     public int deleteRows(java.util.Set<Object[]> toDelete) {
         writeLock.lock();
         try {
+            List<Object[]> current = rows;
+            List<Object[]> surviving = new ArrayList<>(current.size());
             int deleted = 0;
-            List<Object[]> snapshot = new ArrayList<>(rows);
-            rows.clear();
-            for (Object[] row : snapshot) {
+            for (Object[] row : current) {
                 if (toDelete.contains(row)) {
                     for (TableIndex idx : indexes.values()) {
                         idx.remove(row);
                     }
                     deleted++;
                 } else {
-                    rows.add(row);
+                    surviving.add(row);
                 }
             }
+            rows = surviving;
             return deleted;
         } finally {
             writeLock.unlock();
@@ -226,16 +241,17 @@ public class Table {
     public void addColumn(Column column, Object defaultValue) {
         columns.add(column);
         int newColIdx = columns.size() - 1;
-        for (int i = 0; i < rows.size(); i++) {
-            Object[] oldRow = rows.get(i);
+        List<Object[]> current = rows;
+        List<Object[]> newRows = new ArrayList<>(current.size());
+        for (Object[] oldRow : current) {
             Object[] newRow = new Object[columns.size()];
             System.arraycopy(oldRow, 0, newRow, 0, oldRow.length);
             if (defaultValue != null) {
                 newRow[newColIdx] = defaultValue;
             }
-            rows.set(i, newRow);
+            newRows.add(newRow);
         }
-        // Column indices haven't changed for existing columns, but row references changed
+        rows = newRows;
         rebuildAllIndexes();
     }
 
@@ -243,14 +259,16 @@ public class Table {
         int idx = getColumnIndex(columnName);
         if (idx < 0) throw new MemgresException("Column not found: " + columnName);
         columns.remove(idx);
-        for (int i = 0; i < rows.size(); i++) {
-            Object[] oldRow = rows.get(i);
+        List<Object[]> current = rows;
+        List<Object[]> newRows = new ArrayList<>(current.size());
+        for (Object[] oldRow : current) {
             Object[] newRow = new Object[columns.size()];
             for (int j = 0, k = 0; j < oldRow.length; j++) {
                 if (j != idx) newRow[k++] = oldRow[j];
             }
-            rows.set(i, newRow);
+            newRows.add(newRow);
         }
+        rows = newRows;
         // Column indices changed, so rebuild index column mappings
         // Remove indexes referencing the dropped column, rebuild the rest
         List<String> toRemove = new ArrayList<>();
@@ -297,14 +315,17 @@ public class Table {
 
     public void addColumnAt(Column column, int position, List<Object> values) {
         columns.add(position, column);
-        for (int i = 0; i < rows.size(); i++) {
-            Object[] oldRow = rows.get(i);
+        List<Object[]> current = rows;
+        List<Object[]> newRows = new ArrayList<>(current.size());
+        for (int i = 0; i < current.size(); i++) {
+            Object[] oldRow = current.get(i);
             Object[] newRow = new Object[oldRow.length + 1];
             System.arraycopy(oldRow, 0, newRow, 0, position);
             newRow[position] = values != null && i < values.size() ? values.get(i) : null;
             System.arraycopy(oldRow, position, newRow, position + 1, oldRow.length - position);
-            rows.set(i, newRow);
+            newRows.add(newRow);
         }
+        rows = newRows;
         rebuildIndexesFromConstraints();
     }
 
@@ -373,7 +394,12 @@ public class Table {
         for (TableIndex idx : indexes.values()) {
             idx.remove(row);
         }
-        rows.remove(row);
+        List<Object[]> current = rows;
+        List<Object[]> newRows = new ArrayList<>(current.size());
+        for (Object[] r : current) {
+            if (r != row) newRows.add(r);
+        }
+        rows = newRows;
     }
 
     // Index management

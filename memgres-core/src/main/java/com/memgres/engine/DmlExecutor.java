@@ -1308,7 +1308,7 @@ class DmlExecutor {
                         try {
                             executor.constraintValidator.validateConstraints(routedTable, newRow, newRow);
                         } catch (MemgresException e) {
-                            routedTable.getRows().remove(newRow);
+                            routedTable.removeRow(newRow);
                             throw e;
                         }
                         rowsToInsert.add(newRow);
@@ -1400,7 +1400,7 @@ class DmlExecutor {
                     executor.constraintValidator.validateConstraints(routedTable, newRow, newRow);
                 } catch (MemgresException e) {
                     // Roll back the row we just inserted before re-throwing
-                    routedTable.getRows().remove(newRow);
+                    routedTable.removeRow(newRow);
                     throw e;
                 }
                 recordInsertUndo(stmt.schema(), routedTable.getName(), newRow);
