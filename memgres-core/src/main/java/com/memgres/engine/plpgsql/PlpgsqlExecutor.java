@@ -25,6 +25,10 @@ public class PlpgsqlExecutor {
     private final Database database;
     private final Session session; // may be null when no client connection
 
+    // Procedure transaction control context (PG 11+)
+    private boolean isProcedureExecution;
+    private int exceptionBlockDepth;
+
     // Control flow signals
     private static class ReturnSignal extends RuntimeException {
         final Object value;
@@ -126,6 +130,7 @@ public class PlpgsqlExecutor {
     }
 
     public Object executeFunction(PgFunction function, List<Object> args) {
+        this.isProcedureExecution = function.isProcedure();
         // Apply function-level SET clauses (save current values, apply overrides)
         java.util.Map<String, String> savedGuc = null;
         if (function.getSetClauses() != null && !function.getSetClauses().isEmpty() && session != null) {
@@ -413,6 +418,8 @@ public class PlpgsqlExecutor {
         if (block.exceptionHandlers().isEmpty()) {
             executeStatements(block.body(), scope);
         } else {
+            // PG uses a subtransaction for exception blocks — COMMIT/ROLLBACK forbidden inside
+            exceptionBlockDepth++;
             try {
                 executeStatements(block.body(), scope);
             } catch (ReturnSignal rs) {
@@ -442,6 +449,8 @@ public class PlpgsqlExecutor {
                     }
                 }
                 throw e;
+            } finally {
+                exceptionBlockDepth--;
             }
         }
     }
@@ -518,6 +527,64 @@ public class PlpgsqlExecutor {
         } else if (stmt instanceof PlpgsqlStatement.CloseCursorStmt) {
             PlpgsqlStatement.CloseCursorStmt cc = (PlpgsqlStatement.CloseCursorStmt) stmt;
             executeCloseCursor(cc, scope);
+        } else if (stmt instanceof PlpgsqlStatement.CommitStmt) {
+            executeCommit((PlpgsqlStatement.CommitStmt) stmt);
+        } else if (stmt instanceof PlpgsqlStatement.RollbackStmt) {
+            executeRollback((PlpgsqlStatement.RollbackStmt) stmt);
+        }
+    }
+
+    // ---- Procedure transaction control (PG 11+) ----
+
+    private void executeCommit(PlpgsqlStatement.CommitStmt stmt) {
+        validateTransactionControl("COMMIT");
+        if (session != null) {
+            String savedIsolation = null;
+            String savedReadOnly = null;
+            if (stmt.chain) {
+                savedIsolation = session.getGucSettings().get("transaction_isolation");
+                savedReadOnly = session.getGucSettings().get("transaction_read_only");
+            }
+            session.commit();
+            // Start a new implicit transaction for remaining procedure statements
+            session.begin();
+            if (stmt.chain && savedIsolation != null) {
+                session.getGucSettings().set("transaction_isolation", savedIsolation);
+            }
+            if (stmt.chain && savedReadOnly != null) {
+                session.getGucSettings().set("transaction_read_only", savedReadOnly);
+            }
+        }
+    }
+
+    private void executeRollback(PlpgsqlStatement.RollbackStmt stmt) {
+        validateTransactionControl("ROLLBACK");
+        if (session != null) {
+            String savedIsolation = null;
+            String savedReadOnly = null;
+            if (stmt.chain) {
+                savedIsolation = session.getGucSettings().get("transaction_isolation");
+                savedReadOnly = session.getGucSettings().get("transaction_read_only");
+            }
+            session.rollback();
+            // Start a new implicit transaction for remaining procedure statements
+            session.begin();
+            if (stmt.chain && savedIsolation != null) {
+                session.getGucSettings().set("transaction_isolation", savedIsolation);
+            }
+            if (stmt.chain && savedReadOnly != null) {
+                session.getGucSettings().set("transaction_read_only", savedReadOnly);
+            }
+        }
+    }
+
+    private void validateTransactionControl(String command) {
+        if (!isProcedureExecution) {
+            throw new MemgresException("invalid transaction termination", "2D000");
+        }
+        if (exceptionBlockDepth > 0) {
+            throw new MemgresException(
+                    "cannot commit while a subtransaction is active", "2D000");
         }
     }
 

@@ -266,6 +266,11 @@ public class PlpgsqlParser {
                     return parseFetch();
                 case "CLOSE":
                     return parseCloseCursor();
+                case "COMMIT":
+                    return parseCommit();
+                case "ROLLBACK":
+                case "ABORT":
+                    return parseRollback();
                 case "SELECT":
                 case "INSERT":
                 case "UPDATE":
@@ -764,6 +769,40 @@ public class PlpgsqlParser {
         String cursorName = readIdent();
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.CloseCursorStmt(cursorName);
+    }
+
+    // ---- Transaction control (PG 11+ procedures) ----
+
+    private PlpgsqlStatement parseCommit() {
+        advance(); // consume COMMIT
+        boolean chain = parseAndChain();
+        match(TokenType.SEMICOLON);
+        return new PlpgsqlStatement.CommitStmt(chain);
+    }
+
+    private PlpgsqlStatement parseRollback() {
+        advance(); // consume ROLLBACK or ABORT
+        boolean chain = parseAndChain();
+        match(TokenType.SEMICOLON);
+        return new PlpgsqlStatement.RollbackStmt(chain);
+    }
+
+    private boolean parseAndChain() {
+        if (checkKw("AND")) {
+            advance();
+            if (checkKw("CHAIN")) {
+                advance();
+                return true;
+            }
+            // AND NO CHAIN is the default — PG accepts it explicitly
+            if (checkKw("NO")) {
+                advance();
+                matchKw("CHAIN");
+            }
+        }
+        // Skip optional WORK/TRANSACTION keyword
+        if (checkKw("WORK") || checkKw("TRANSACTION")) advance();
+        return false;
     }
 
     // ---- Assignment ----

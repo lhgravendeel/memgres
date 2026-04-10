@@ -35,12 +35,28 @@ class DdlAdminExecutor {
                     }
                     break;
                 }
-                case COMMIT:
+                case COMMIT: {
+                    String savedIso = stmt.chain() ? executor.session.getGucSettings().get("transaction_isolation") : null;
+                    String savedRo = stmt.chain() ? executor.session.getGucSettings().get("transaction_read_only") : null;
                     executor.session.commit();
+                    if (stmt.chain()) {
+                        executor.session.begin();
+                        if (savedIso != null) executor.session.getGucSettings().set("transaction_isolation", savedIso);
+                        if (savedRo != null) executor.session.getGucSettings().set("transaction_read_only", savedRo);
+                    }
                     break;
-                case ROLLBACK:
+                }
+                case ROLLBACK: {
+                    String savedIso = stmt.chain() ? executor.session.getGucSettings().get("transaction_isolation") : null;
+                    String savedRo = stmt.chain() ? executor.session.getGucSettings().get("transaction_read_only") : null;
                     executor.session.rollback();
+                    if (stmt.chain()) {
+                        executor.session.begin();
+                        if (savedIso != null) executor.session.getGucSettings().set("transaction_isolation", savedIso);
+                        if (savedRo != null) executor.session.getGucSettings().set("transaction_read_only", savedRo);
+                    }
                     break;
+                }
                 case SAVEPOINT:
                     executor.session.savepoint(stmt.savepointName());
                     break;

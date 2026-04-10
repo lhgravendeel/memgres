@@ -487,7 +487,8 @@ class UtilityParser {
             parser.matchKeyword("TRANSACTION");
             parser.matchKeyword("WORK");
         }
-        return new TransactionStmt(TransactionStmt.TransactionAction.COMMIT, null);
+        boolean chain = parseAndChain();
+        return new TransactionStmt(TransactionStmt.TransactionAction.COMMIT, null, null, null, chain);
     }
 
     TransactionStmt parseTransactionRollback() {
@@ -504,7 +505,17 @@ class UtilityParser {
         }
         parser.matchKeyword("TRANSACTION");
         parser.matchKeyword("WORK");
-        return new TransactionStmt(TransactionStmt.TransactionAction.ROLLBACK, null);
+        boolean chain = parseAndChain();
+        return new TransactionStmt(TransactionStmt.TransactionAction.ROLLBACK, null, null, null, chain);
+    }
+
+    /** Parse optional AND [NO] CHAIN clause (PG 11+). */
+    private boolean parseAndChain() {
+        if (parser.matchKeyword("AND")) {
+            if (parser.matchKeyword("CHAIN")) return true;
+            if (parser.matchKeyword("NO")) parser.matchKeyword("CHAIN");
+        }
+        return false;
     }
 
     TransactionStmt parseSavepoint() {
