@@ -294,8 +294,20 @@ class FromFunctionResolver {
         if (evalArgs.size() > 1) {
             return resolveMultiUnnest(alias, colAliases, evalArgs);
         }
-        // Single array unnest
+        // Single array/multirange unnest
         Object arr = evalArgs.get(0);
+        // Multirange unnest: convert to list of range strings
+        if (arr instanceof String) {
+            String s = ((String) arr).trim();
+            if (RangeOperations.isMultirangeOrEmpty(s)) {
+                java.util.List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(s);
+                List<Object> mrElements = new ArrayList<>();
+                for (RangeOperations.PgRange r : ranges) {
+                    mrElements.add(r.toString());
+                }
+                arr = mrElements;
+            }
+        }
         List<Object> elements = toElementList(arr);
 
         String colName = firstColAlias(colAliases, alias);

@@ -814,11 +814,11 @@ class ConstraintValidator {
             String rs2 = right.toString().trim();
             String opSym2 = op == BinaryExpr.BinOp.MULTIPLY ? "*" : "/";
             if ((ls2.startsWith("{") || ls2.startsWith("[")) && !leftIsGeometric && !(left instanceof List<?>)
-                    && !RangeOperations.isRangeString(ls2)) {
+                    && !RangeOperations.isRangeString(ls2) && !RangeOperations.isMultirangeOrEmpty(ls2)) {
                 throw new MemgresException("operator does not exist: jsonb " + opSym2 + " integer", "42883");
             }
             if ((rs2.startsWith("{") || rs2.startsWith("[")) && !rightIsGeometric && !(right instanceof List<?>)
-                    && !RangeOperations.isRangeString(rs2)) {
+                    && !RangeOperations.isRangeString(rs2) && !RangeOperations.isMultirangeOrEmpty(rs2)) {
                 throw new MemgresException("operator does not exist: integer " + opSym2 + " jsonb", "42883");
             }
         }

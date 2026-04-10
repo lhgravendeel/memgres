@@ -54,7 +54,15 @@ class CatalogTypeSystemBuilder {
                 col("rngcanonical", DataType.INTEGER),
                 col("rngsubdiff", DataType.INTEGER)
         );
-        return new Table("pg_range", cols);
+        Table table = new Table("pg_range", cols);
+        // PG built-in range types: rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff
+        table.insertRow(new Object[]{3904, 23,   4451, 0, 0, 0, 0}); // int4range   → int4,    int4multirange
+        table.insertRow(new Object[]{3926, 20,   4532, 0, 0, 0, 0}); // int8range   → int8,    int8multirange
+        table.insertRow(new Object[]{3906, 1700, 4533, 0, 0, 0, 0}); // numrange    → numeric, nummultirange
+        table.insertRow(new Object[]{3912, 1082, 4534, 0, 0, 0, 0}); // daterange   → date,    datemultirange
+        table.insertRow(new Object[]{3908, 1114, 4535, 0, 0, 0, 0}); // tsrange     → timestamp, tsmultirange
+        table.insertRow(new Object[]{3910, 1184, 4536, 0, 0, 0, 0}); // tstzrange   → timestamptz, tstzmultirange
+        return table;
     }
 
     Table buildPgExtension() {
@@ -174,6 +182,7 @@ class CatalogTypeSystemBuilder {
         int POINT = 600, LINE_T = 628, LSEG_T = 601, PG_BOX = 603, PG_PATH = 602, POLYGON_T = 604, CIRCLE_T = 718;
         int TSVECTOR = 3614, TSQUERY = 3615;
         int INT4RANGE = 3904, INT8RANGE = 3926, NUMRANGE = 3906, DATERANGE = 3912, TSRANGE = 3908, TSTZRANGE = 3910;
+        int INT4MULTIRANGE = 4451, INT8MULTIRANGE = 4532, NUMMULTIRANGE = 4533, DATEMULTIRANGE = 4534, TSMULTIRANGE = 4535, TSTZMULTIRANGE = 4536;
         int REGCONFIG = 3734, REGDICTIONARY = 3769, REGNAMESPACE = 4089, REGROLE = 4096;
         int XID = 28, CID = 29, TID = 27, MACADDR = 829, MACADDR8 = 774;
         int INT2VECTOR = 22, OIDVECTOR = 30, REFCURSOR = 1790;
@@ -184,6 +193,10 @@ class CatalogTypeSystemBuilder {
             {FLOAT4, NUMERIC}, {FLOAT8, NUMERIC},
             {TIME, TIMETZ},
             {TIMESTAMP, TIMESTAMPTZ},
+            // Range → Multirange implicit casts (PG 14+)
+            {INT4RANGE, INT4MULTIRANGE}, {INT8RANGE, INT8MULTIRANGE},
+            {NUMRANGE, NUMMULTIRANGE}, {DATERANGE, DATEMULTIRANGE},
+            {TSRANGE, TSMULTIRANGE}, {TSTZRANGE, TSTZMULTIRANGE},
             {DATE, TIMESTAMPTZ},
             {DATE, TIMESTAMP},
             {BIT_T, VARBIT_T},

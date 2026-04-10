@@ -80,8 +80,13 @@ public enum DataType {
     TSRANGE(3908, "tsrange"),
     TSTZRANGE(3910, "tstzrange"),
 
-    // Multirange types
+    // Multirange types (PG 14+)
     INT4MULTIRANGE(4451, "int4multirange"),
+    INT8MULTIRANGE(4532, "int8multirange"),
+    NUMMULTIRANGE(4533, "nummultirange"),
+    DATEMULTIRANGE(4534, "datemultirange"),
+    TSMULTIRANGE(4535, "tsmultirange"),
+    TSTZMULTIRANGE(4536, "tstzmultirange"),
 
     // Array types (used for system catalog columns and array expressions)
     TEXT_ARRAY(1009, "_text"),
@@ -223,6 +228,16 @@ public enum DataType {
                 return TSTZRANGE;
             case "int4multirange":
                 return INT4MULTIRANGE;
+            case "int8multirange":
+                return INT8MULTIRANGE;
+            case "nummultirange":
+                return NUMMULTIRANGE;
+            case "datemultirange":
+                return DATEMULTIRANGE;
+            case "tsmultirange":
+                return TSMULTIRANGE;
+            case "tstzmultirange":
+                return TSTZMULTIRANGE;
             case "text[]":
             case "_text":
                 return TEXT_ARRAY;

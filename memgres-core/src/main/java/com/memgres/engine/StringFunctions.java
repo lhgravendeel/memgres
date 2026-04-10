@@ -74,6 +74,12 @@ class StringFunctions {
                 }
                 Object arg = executor.evalExpr(argExpr, ctx);
                 if (arg == null) return null;
+                if (arg instanceof String && RangeOperations.isMultirangeOrEmpty(((String) arg))) {
+                    java.util.List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(((String) arg));
+                    if (ranges.isEmpty()) return null;
+                    RangeOperations.PgRange last = ranges.get(ranges.size() - 1);
+                    return last.isEmpty() ? null : last.upper();
+                }
                 if (arg instanceof String && RangeOperations.isRangeString(((String) arg))) {
                     String s = (String) arg;
                     RangeOperations.PgRange r = RangeOperations.parse(s);
@@ -102,6 +108,13 @@ class StringFunctions {
                 }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
+                // Multirange lower() function — returns lower bound of the first sub-range
+                if (arg instanceof String && RangeOperations.isMultirangeOrEmpty(((String) arg))) {
+                    java.util.List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(((String) arg));
+                    if (ranges.isEmpty()) return null;
+                    RangeOperations.PgRange first = ranges.get(0);
+                    return first.isEmpty() ? null : first.lower();
+                }
                 // Range lower() function
                 if (arg instanceof String && RangeOperations.isRangeString(((String) arg))) {
                     String s = (String) arg;

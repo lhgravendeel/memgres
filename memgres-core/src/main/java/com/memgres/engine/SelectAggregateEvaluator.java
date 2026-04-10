@@ -663,6 +663,38 @@ class SelectAggregateEvaluator {
                 sb.append("}");
                 return sb.toString();
             }
+            case "range_agg": {
+                // range_agg(anyrange) → multirange containing all input ranges, merged
+                if (group.isEmpty()) return null;
+                Expression arg = fn.args().get(0);
+                List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
+                java.util.List<RangeOperations.PgRange> allRanges = new java.util.ArrayList<>();
+                for (RowContext ctx : orderedGroup) {
+                    Object val = executor.evalExpr(arg, ctx);
+                    if (val == null) continue;
+                    String s = val.toString().trim();
+                    if (s.equalsIgnoreCase("empty")) continue;
+                    if (RangeOperations.isRangeString(s)) {
+                        RangeOperations.PgRange r = RangeOperations.parse(s);
+                        if (!r.isEmpty()) allRanges.add(r);
+                    }
+                }
+                if (allRanges.isEmpty()) return null;
+                // Sort and merge overlapping/adjacent ranges
+                allRanges.sort((a, b) -> Long.compare(a.effectiveLower(), b.effectiveLower()));
+                java.util.List<RangeOperations.PgRange> merged = new java.util.ArrayList<>();
+                merged.add(allRanges.get(0));
+                for (int mi = 1; mi < allRanges.size(); mi++) {
+                    RangeOperations.PgRange last = merged.get(merged.size() - 1);
+                    RangeOperations.PgRange curr = allRanges.get(mi);
+                    if (last.effectiveUpper() >= curr.effectiveLower()) {
+                        merged.set(merged.size() - 1, RangeOperations.merge(last, curr));
+                    } else {
+                        merged.add(curr);
+                    }
+                }
+                return RangeOperations.formatMultirange(merged);
+            }
             case "bool_and":
             case "every": {
                 if (group.isEmpty()) return null;

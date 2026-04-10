@@ -29,7 +29,8 @@ class SelectExecutor {
             "xmlagg", "grouping",
             "var_pop", "var_samp", "stddev_pop", "stddev_samp", "stddev", "variance",
             "corr", "regr_slope", "regr_intercept", "regr_r2",
-            "json_arrayagg", "json_objectagg"
+            "json_arrayagg", "json_objectagg",
+            "range_agg"
     );
 
     static final Set<String> SRF_FUNCTION_NAMES = Cols.setOf("generate_series", "unnest", "regexp_matches",

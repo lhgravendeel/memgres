@@ -728,6 +728,15 @@ class FunctionEvaluator {
                 if (arr instanceof List<?>) {
                     return new ArrayList<>((List<?>) arr); // Return as List for SRF expansion
                 }
+                // Multirange unnest: expand into individual range strings
+                if (arr instanceof String && RangeOperations.isMultirangeOrEmpty(((String) arr))) {
+                    java.util.List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(((String) arr));
+                    List<Object> result = new ArrayList<>();
+                    for (RangeOperations.PgRange r : ranges) {
+                        result.add(r.toString());
+                    }
+                    return result;
+                }
                 if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
                     String s = (String) arr;
                     List<Object> parsed = new ArrayList<>(parseSimplePgArray(s));
