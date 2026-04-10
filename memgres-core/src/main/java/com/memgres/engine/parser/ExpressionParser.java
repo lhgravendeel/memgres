@@ -687,21 +687,31 @@ public class ExpressionParser {
         if (match(TokenType.TILDE)) {
             return new UnaryExpr(UnaryExpr.UnaryOp.BIT_NOT, parseUnary());
         }
-        // Custom multi-char prefix operator (user-defined): ~~> expr
-        if (check(TokenType.CUSTOM_OPERATOR)) {
-            String opSymbol = advance().value();
-            Expression right = parseUnary();
-            return new CustomOperatorExpr(null, opSymbol, null, right);
-        }
-        // ||/ (cube root) prefix operator; || is lexed as CONCAT token
+        // ||/ (cube root) prefix operator; may be lexed as CONCAT+SLASH or CUSTOM_OPERATOR
         if (check(TokenType.CONCAT) && pos + 1 < tokens.size() && tokens.get(pos + 1).type() == TokenType.SLASH) {
             advance(); advance(); // consume || /
             return new UnaryExpr(UnaryExpr.UnaryOp.CBRT, parseUnary());
         }
-        // |/ (square root) prefix operator
+        // |/ (square root) prefix operator; may be lexed as PIPE+SLASH or CUSTOM_OPERATOR
         if (check(TokenType.PIPE) && pos + 1 < tokens.size() && tokens.get(pos + 1).type() == TokenType.SLASH) {
             advance(); advance(); // consume | /
             return new UnaryExpr(UnaryExpr.UnaryOp.SQRT, parseUnary());
+        }
+        // Custom multi-char prefix operator (user-defined): ~~> expr
+        // Must check after ||/ and |/ to avoid intercepting built-in prefix operators
+        if (check(TokenType.CUSTOM_OPERATOR)) {
+            String opSymbol = peek().value();
+            if (opSymbol.equals("||/")) {
+                advance();
+                return new UnaryExpr(UnaryExpr.UnaryOp.CBRT, parseUnary());
+            }
+            if (opSymbol.equals("|/")) {
+                advance();
+                return new UnaryExpr(UnaryExpr.UnaryOp.SQRT, parseUnary());
+            }
+            advance();
+            Expression right = parseUnary();
+            return new CustomOperatorExpr(null, opSymbol, null, right);
         }
         return parsePostfix();
     }
