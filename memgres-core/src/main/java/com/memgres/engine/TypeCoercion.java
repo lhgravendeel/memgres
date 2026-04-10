@@ -955,8 +955,16 @@ public final class TypeCoercion {
             String sb = (String) b;
             boolean aIsRange = RangeOperations.isRangeString(sa);
             boolean bIsRange = RangeOperations.isRangeString(sb);
+            // Use strict isMultirangeString first; if at least one side is a range/multirange,
+            // also accept "{}" as empty multirange on the other side
             boolean aIsMr = !aIsRange && RangeOperations.isMultirangeString(sa);
             boolean bIsMr = !bIsRange && RangeOperations.isMultirangeString(sb);
+            boolean anyRangeLike = aIsRange || bIsRange || aIsMr || bIsMr;
+            if (anyRangeLike) {
+                // Accept "{}" as empty multirange when the other side is confirmed range/multirange
+                if (!aIsRange && !aIsMr && sa.equals("{}")) aIsMr = true;
+                if (!bIsRange && !bIsMr && sb.equals("{}")) bIsMr = true;
+            }
             if ((aIsRange || aIsMr) && (bIsRange || bIsMr)) {
                 return compareRangeOrMultirange(sa, aIsRange, sb, bIsRange);
             }

@@ -1036,7 +1036,9 @@ class ExprEvaluator {
                 continue;
             }
             // If elem is a PG-format array string like {1,5,10} (from array parameters), parse and check
-            if (elem instanceof String && ((String) elem).startsWith("{") && ((String) elem).endsWith("}")) {
+            // But NOT multirange strings like {[1,5),[10,20)} — those should be compared directly
+            if (elem instanceof String && ((String) elem).startsWith("{") && ((String) elem).endsWith("}")
+                    && !RangeOperations.isMultirangeOrEmpty(((String) elem).trim())) {
                 String s = (String) elem;
                 List<Object> parsed = executor.arrayOperationHandler.parsePostgresArrayLiteral(s);
                 for (Object ae : parsed) {

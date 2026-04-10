@@ -677,12 +677,16 @@ class BinaryOpEvaluator {
                     try { return RangeOperations.multirangeContains(ls, Long.parseLong(rs)); } catch (NumberFormatException ignore) {}
                     return false;
                 }
-                // Range containment: range @> value or range @> range
+                // Range containment: range @> value or range @> range or range @> multirange
                 if (RangeOperations.isRangeString(ls)) {
                     RangeOperations.PgRange range = RangeOperations.parse(ls);
                     if (right instanceof Number) return range.contains(((Number) right));
                     if (right instanceof java.time.LocalDateTime) return range.contains(((java.time.LocalDateTime) right).toEpochSecond(java.time.ZoneOffset.UTC));
                     if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
+                    // range @> multirange: true if range contains every sub-range
+                    if (RangeOperations.isMultirangeOrEmpty(rs)) {
+                        return RangeOperations.multirangeContainsMultirange("{" + ls + "}", rs);
+                    }
                     if (RangeOperations.isRangeString(rs)) return range.containsRange(RangeOperations.parse(rs));
                     // PG: range @> non-range-non-number -> try parsing
                     try {
@@ -745,6 +749,10 @@ class BinaryOpEvaluator {
                 }
                 if (RangeOperations.isRangeString(rs)) {
                     RangeOperations.PgRange range = RangeOperations.parse(rs);
+                    // multirange <@ range: true if range contains every sub-range
+                    if (RangeOperations.isMultirangeOrEmpty(ls)) {
+                        return RangeOperations.multirangeContainsMultirange("{" + rs + "}", ls);
+                    }
                     if (RangeOperations.isRangeString(ls)) return range.containsRange(RangeOperations.parse(ls));
                     if (left instanceof Number) return range.contains(((Number) left));
                     try { return range.contains(Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
@@ -1287,6 +1295,10 @@ class BinaryOpEvaluator {
                     RangeOperations.PgRange range = RangeOperations.parse(lStr);
                     if (right instanceof Number) return range.contains(((Number) right));
                     if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
+                    // range @> multirange: true if range contains every sub-range
+                    if (RangeOperations.isMultirangeOrEmpty(rStr)) {
+                        return RangeOperations.multirangeContainsMultirange("{" + lStr + "}", rStr);
+                    }
                     if (RangeOperations.isRangeString(rStr)) return range.containsRange(RangeOperations.parse(rStr));
                     if (rStr.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
                         return range.contains(java.time.LocalDate.parse(rStr.substring(0, 10)).toEpochDay());
@@ -1318,6 +1330,10 @@ class BinaryOpEvaluator {
                 }
                 if (RangeOperations.isRangeString(rStr)) {
                     RangeOperations.PgRange range = RangeOperations.parse(rStr);
+                    // multirange <@ range: true if range contains every sub-range
+                    if (RangeOperations.isMultirangeOrEmpty(lStr)) {
+                        return RangeOperations.multirangeContainsMultirange("{" + rStr + "}", lStr);
+                    }
                     if (RangeOperations.isRangeString(lStr)) return range.containsRange(RangeOperations.parse(lStr));
                     if (left instanceof Number) return range.contains(((Number) left));
                     try { return range.contains(Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}

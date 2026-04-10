@@ -123,6 +123,11 @@ class DateTimeArithmetic {
                 && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isRangeString(((String) right))) {
             return RangeOperations.multirangeSubtract((String) left, "{" + right + "}");
         }
+        // Range - Multirange → subtract multirange from range
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isRangeString(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
+            return RangeOperations.multirangeSubtract("{" + left + "}", (String) right);
+        }
         // Range - Range → set difference
         // Exclude geometric strings (which also match range-like patterns)
         if (left instanceof String && right instanceof String
