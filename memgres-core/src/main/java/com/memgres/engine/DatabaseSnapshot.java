@@ -125,8 +125,9 @@ public class DatabaseSnapshot {
             for (Object[] row : rows) {
                 cloned.add(row.clone());
             }
-            table.replaceAllRows(cloned);
-            table.rebuildAllIndexes();
+            // Atomically replace rows AND rebuild indexes under a single lock acquisition
+            // to prevent concurrent DML from slipping in between the row swap and rebuild.
+            table.replaceAllRowsAndRebuildIndexes(cloned);
             table.resetSerialCounter(serialCounter);
         }
 

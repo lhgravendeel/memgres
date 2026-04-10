@@ -459,6 +459,7 @@ public class Session {
         }
         deferredNotifications.clear();
         savepointNotifCounts.clear();
+        savepointMvccSnapshots.clear();
         // Drop temp tables with ON COMMIT DROP
         for (String[] pair : onCommitDropTables) {
             Schema s = database.getSchema(pair[0]);
@@ -505,6 +506,7 @@ public class Session {
         // Discard deferred notifications; transaction was rolled back
         deferredNotifications.clear();
         savepointNotifCounts.clear();
+        savepointMvccSnapshots.clear();
         onCommitDropTables.clear();
         // Release transaction-scoped advisory locks
         releaseXactAdvisoryLocks();
@@ -514,13 +516,62 @@ public class Session {
         status = TransactionStatus.IDLE;
     }
 
+    // MVCC map snapshots per savepoint — used to restore MVCC state on ROLLBACK TO SAVEPOINT
+    private final Map<String, MvccSnapshot> savepointMvccSnapshots = new LinkedHashMap<>();
+
     public void savepoint(String name) {
         if (status != TransactionStatus.IN_TRANSACTION) {
             // Implicit BEGIN
             begin();
         }
-        savepoints.put(name.toLowerCase(), undoLog.size());
-        savepointNotifCounts.put(name.toLowerCase(), deferredNotifications.size());
+        String key = name.toLowerCase();
+        savepoints.put(key, undoLog.size());
+        savepointNotifCounts.put(key, deferredNotifications.size());
+        // Snapshot current MVCC maps so we can restore on ROLLBACK TO SAVEPOINT.
+        // Deep-copy the outer maps; inner collections are identity-based.
+        savepointMvccSnapshots.put(key, MvccSnapshot.capture(uncommittedInserts, uncommittedUpdates, uncommittedDeletes));
+    }
+
+    /** Snapshot of MVCC tracking maps at savepoint creation time. */
+    private static class MvccSnapshot {
+        final Map<String, Set<Object[]>> inserts;
+        final Map<String, Map<Object[], Object[]>> updates;
+        final Map<String, List<Object[]>> deletes;
+
+        MvccSnapshot(Map<String, Set<Object[]>> inserts,
+                     Map<String, Map<Object[], Object[]>> updates,
+                     Map<String, List<Object[]>> deletes) {
+            this.inserts = inserts;
+            this.updates = updates;
+            this.deletes = deletes;
+        }
+
+        static MvccSnapshot capture(Map<String, Set<Object[]>> inserts,
+                                     Map<String, Map<Object[], Object[]>> updates,
+                                     Map<String, List<Object[]>> deletes) {
+            // Deep-copy: new CHM with copies of inner synchronized collections
+            Map<String, Set<Object[]>> iCopy = new ConcurrentHashMap<>();
+            for (Map.Entry<String, Set<Object[]>> e : inserts.entrySet()) {
+                Set<Object[]> copy = Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()));
+                synchronized (e.getValue()) {
+                    copy.addAll(e.getValue());
+                }
+                iCopy.put(e.getKey(), copy);
+            }
+            Map<String, Map<Object[], Object[]>> uCopy = new ConcurrentHashMap<>();
+            for (Map.Entry<String, Map<Object[], Object[]>> e : updates.entrySet()) {
+                synchronized (e.getValue()) {
+                    uCopy.put(e.getKey(), Collections.synchronizedMap(new IdentityHashMap<>(e.getValue())));
+                }
+            }
+            Map<String, List<Object[]>> dCopy = new ConcurrentHashMap<>();
+            for (Map.Entry<String, List<Object[]>> e : deletes.entrySet()) {
+                synchronized (e.getValue()) {
+                    dCopy.put(e.getKey(), Collections.synchronizedList(new ArrayList<>(e.getValue())));
+                }
+            }
+            return new MvccSnapshot(iCopy, uCopy, dCopy);
+        }
     }
 
     public void releaseSavepoint(String name) {
@@ -543,6 +594,18 @@ public class Session {
             throw new MemgresException("savepoint \"" + name + "\" does not exist", "3B001");
         }
         int position = savepoints.get(key);
+
+        // Restore MVCC maps to their state at savepoint creation time.
+        // This must happen BEFORE applyUndo so that concurrent readers see consistent
+        // MVCC visibility during the undo process. The volatile swap is atomic from
+        // the perspective of cross-session reads.
+        MvccSnapshot snapshot = savepointMvccSnapshots.get(key);
+        if (snapshot != null) {
+            uncommittedInserts = snapshot.inserts;
+            uncommittedUpdates = snapshot.updates;
+            uncommittedDeletes = snapshot.deletes;
+        }
+
         applyUndo(position);
 
         // Truncate deferred notifications to the savepoint's count
@@ -565,6 +628,7 @@ public class Session {
         for (String sp : toRemove) {
             savepoints.remove(sp);
             savepointNotifCounts.remove(sp);
+            savepointMvccSnapshots.remove(sp);
         }
 
         // Transaction is no longer in FAILED state after rolling back to savepoint
@@ -572,6 +636,7 @@ public class Session {
             status = TransactionStatus.IN_TRANSACTION;
         }
     }
+
 
     public boolean isInTransaction() {
         return status == TransactionStatus.IN_TRANSACTION || status == TransactionStatus.FAILED;
@@ -890,14 +955,29 @@ public class Session {
         }
     }
 
-    /** Get uncommitted inserts for a table. */
+    /** Get uncommitted inserts for a table.
+     *  Returns a snapshot copy safe for cross-thread iteration.
+     *  Collections.synchronizedSet.iterator() is NOT synchronized, so iterating
+     *  the live set from another thread while the owning session adds entries would
+     *  race on the underlying IdentityHashMap. We copy under the set's monitor. */
     public Set<Object[]> getUncommittedInserts(String schemaTable) {
-        return uncommittedInserts.getOrDefault(schemaTable, Collections.emptySet());
+        Set<Object[]> live = uncommittedInserts.get(schemaTable);
+        if (live == null) return Collections.emptySet();
+        Set<Object[]> copy = Collections.newSetFromMap(new IdentityHashMap<>());
+        synchronized (live) {
+            copy.addAll(live);
+        }
+        return copy;
     }
 
-    /** Get uncommitted updates for a table (current row -> old values). */
+    /** Get uncommitted updates for a table (current row -> old values).
+     *  Returns a snapshot copy safe for cross-thread iteration. */
     public Map<Object[], Object[]> getUncommittedUpdates(String schemaTable) {
-        return uncommittedUpdates.getOrDefault(schemaTable, Collections.emptyMap());
+        Map<Object[], Object[]> live = uncommittedUpdates.get(schemaTable);
+        if (live == null) return Collections.emptyMap();
+        synchronized (live) {
+            return new IdentityHashMap<>(live);
+        }
     }
 
     /** Get all uncommitted updates across all tables (schemaTable -> (current row -> old values)). */
@@ -905,9 +985,14 @@ public class Session {
         return uncommittedUpdates;
     }
 
-    /** Get uncommitted deletes for a table. */
+    /** Get uncommitted deletes for a table.
+     *  Returns a snapshot copy safe for cross-thread iteration. */
     public List<Object[]> getUncommittedDeletes(String schemaTable) {
-        return uncommittedDeletes.getOrDefault(schemaTable, Collections.emptyList());
+        List<Object[]> live = uncommittedDeletes.get(schemaTable);
+        if (live == null) return Collections.emptyList();
+        synchronized (live) {
+            return new ArrayList<>(live);
+        }
     }
 
     /** Get or create a REPEATABLE READ snapshot for a table. Returns null if not in RR mode. */

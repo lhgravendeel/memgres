@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -13,10 +14,12 @@ import java.util.concurrent.locks.ReentrantLock;
 public class Table {
 
     private final String name;
+    // CopyOnWriteArrayList: safe for concurrent reads (getColumnIndex from DML threads)
+    // while DDL methods (renameColumn, alterColumnType, etc.) modify via set().
     private final List<Column> columns;
     private volatile List<Object[]> rows = new ArrayList<>();
     private final AtomicLong serialCounter = new AtomicLong(1);
-    private final List<StoredConstraint> constraints = new ArrayList<>();
+    private final List<StoredConstraint> constraints = new CopyOnWriteArrayList<>();
     private final ReentrantLock writeLock = new ReentrantLock();
 
     // Hash indexes keyed by constraint name (for PK, UNIQUE constraints)
@@ -24,12 +27,12 @@ public class Table {
 
     // Inheritance
     private Table parentTable;
-    private final List<Table> children = new ArrayList<>();
+    private final List<Table> children = new CopyOnWriteArrayList<>();
 
     // Partitioning
     private String partitionStrategy; // RANGE, LIST, HASH (null if not partitioned)
     private String partitionColumn;
-    private final List<Table> partitions = new ArrayList<>();
+    private final List<Table> partitions = new CopyOnWriteArrayList<>();
     private Table partitionParent;
     private Object partitionLower;     // for RANGE
     private Object partitionUpper;     // for RANGE
@@ -41,11 +44,11 @@ public class Table {
     // Row-level security
     private boolean rlsEnabled;
     private boolean rlsForced;
-    private final List<RlsPolicy> rlsPolicies = new ArrayList<>();
+    private final List<RlsPolicy> rlsPolicies = new CopyOnWriteArrayList<>();
 
     public Table(String name, List<Column> columns) {
         this.name = name;
-        this.columns = new ArrayList<>(columns);
+        this.columns = new CopyOnWriteArrayList<>(columns);
     }
 
     public String getName() {
@@ -94,6 +97,24 @@ public class Table {
         writeLock.lock();
         try {
             rows = new ArrayList<>(newRows);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
+    /** Atomically replace all rows AND rebuild all indexes under a single lock acquisition.
+     *  Used by snapshot restore to prevent a concurrent DML from slipping in between
+     *  the row swap and the index rebuild. */
+    public void replaceAllRowsAndRebuildIndexes(List<Object[]> newRows) {
+        writeLock.lock();
+        try {
+            rows = new ArrayList<>(newRows);
+            for (TableIndex idx : indexes.values()) {
+                idx.clear();
+                for (Object[] row : rows) {
+                    idx.put(row);
+                }
+            }
         } finally {
             writeLock.unlock();
         }
@@ -477,23 +498,38 @@ public class Table {
 
     /**
      * Build an index from existing rows (used when adding a constraint to a populated table).
+     * Acquires writeLock to ensure the index captures a consistent snapshot of rows
+     * and is registered atomically — preventing concurrent INSERTs from being missed.
      */
     public void buildIndex(TableIndex index) {
-        for (Object[] row : rows) {
-            index.put(row);
+        writeLock.lock();
+        try {
+            for (Object[] row : rows) {
+                index.put(row);
+            }
+            indexes.put(index.getConstraintName(), index);
+        } finally {
+            writeLock.unlock();
         }
-        indexes.put(index.getConstraintName(), index);
     }
 
     /**
-     * Rebuild all indexes (used after column add/remove which changes row layout).
+     * Rebuild all indexes (used after column add/remove or snapshot restore).
+     * Acquires writeLock to serialize with concurrent DML index mutations.
+     * ReentrantLock handles re-entrance when called from addColumn/addColumnAt
+     * which already hold the lock.
      */
     void rebuildAllIndexes() {
-        for (TableIndex idx : indexes.values()) {
-            idx.clear();
-            for (Object[] row : rows) {
-                idx.put(row);
+        writeLock.lock();
+        try {
+            for (TableIndex idx : indexes.values()) {
+                idx.clear();
+                for (Object[] row : rows) {
+                    idx.put(row);
+                }
             }
+        } finally {
+            writeLock.unlock();
         }
     }
 

@@ -734,4 +734,271 @@ class TableRowConcurrencyTest {
             st.execute("DROP TABLE t_upd_del");
         }
     }
+
+    // =========================================================================
+    // 14. Savepoint rollback MVCC visibility (A3 — ghost entries after rollback)
+    // =========================================================================
+
+    @RepeatedTest(10)
+    void testSavepointRollbackMvccVisibility() throws Exception {
+        try (Connection setup = connect(); Statement st = setup.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS t_sp_mvcc");
+            st.execute("CREATE TABLE t_sp_mvcc (id int PRIMARY KEY, val text)");
+            st.execute("INSERT INTO t_sp_mvcc VALUES (1, 'original')");
+        }
+
+        CyclicBarrier writerReady = new CyclicBarrier(2);
+        CyclicBarrier readerCheck = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        // Thread 1: begin txn, insert rows, savepoint, insert more, rollback to savepoint
+        Future<?> writer = pool.submit(() -> {
+            try (Connection c = connectTx()) {
+                Statement st = c.createStatement();
+                // Phase 1: insert rows before savepoint
+                st.execute("INSERT INTO t_sp_mvcc VALUES (2, 'before_sp')");
+                st.execute("SAVEPOINT sp1");
+                // Phase 2: insert rows after savepoint
+                st.execute("INSERT INTO t_sp_mvcc VALUES (3, 'after_sp')");
+                st.execute("INSERT INTO t_sp_mvcc VALUES (4, 'after_sp')");
+                // Rollback to savepoint — rows 3 and 4 should be undone
+                st.execute("ROLLBACK TO sp1");
+                // Signal reader to check
+                writerReady.await(5, TimeUnit.SECONDS);
+                readerCheck.await(5, TimeUnit.SECONDS);
+                // Commit — row 2 should persist, rows 3 and 4 should not
+                c.commit();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        // Thread 2: read while writer has rolled back to savepoint but hasn't committed
+        Future<?> reader = pool.submit(() -> {
+            try (Connection c = connect()) {
+                Statement st = c.createStatement();
+                // Wait for writer to rollback to savepoint
+                writerReady.await(5, TimeUnit.SECONDS);
+                // Reader should see: row 1 (committed), NOT see rows 2 (uncommitted),
+                // NOT see rows 3, 4 (rolled back to savepoint and also uncommitted)
+                int count = queryInt(st, "SELECT COUNT(*) FROM t_sp_mvcc");
+                // Only the originally committed row should be visible
+                assertEquals(1, count,
+                        "Reader should only see committed rows, not uncommitted or savepoint-rolled-back rows");
+                // Specifically, rolled-back rows should NOT be visible
+                int rolledBack = queryInt(st, "SELECT COUNT(*) FROM t_sp_mvcc WHERE val = 'after_sp'");
+                assertEquals(0, rolledBack,
+                        "Savepoint-rolled-back rows must not be visible to other sessions");
+                readerCheck.await(5, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        writer.get(15, TimeUnit.SECONDS);
+        reader.get(15, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        try (Connection verify = connect(); Statement st = verify.createStatement()) {
+            // After commit: row 1 (original) + row 2 (before savepoint, committed)
+            assertEquals(2, queryInt(st, "SELECT COUNT(*) FROM t_sp_mvcc"),
+                    "Should have original row + row inserted before savepoint");
+            assertEquals(0, queryInt(st, "SELECT COUNT(*) FROM t_sp_mvcc WHERE val = 'after_sp'"),
+                    "Rows inserted after savepoint should not exist after commit");
+            st.execute("DROP TABLE t_sp_mvcc");
+        }
+    }
+
+    // =========================================================================
+    // 15. Concurrent advisory lock acquisition (B1 — mutual exclusion)
+    // =========================================================================
+
+    @RepeatedTest(10)
+    void testConcurrentAdvisoryLockMutualExclusion() throws Exception {
+        // Track how many sessions hold the lock concurrently (should never exceed 1)
+        AtomicInteger concurrentHolders = new AtomicInteger(0);
+        AtomicInteger maxConcurrent = new AtomicInteger(0);
+        int numThreads = 8;
+        CyclicBarrier barrier = new CyclicBarrier(numThreads);
+        ExecutorService pool = Executors.newFixedThreadPool(numThreads);
+        List<Future<?>> futures = new ArrayList<>();
+
+        for (int t = 0; t < numThreads; t++) {
+            futures.add(pool.submit(() -> {
+                try (Connection c = connectTx(); Statement st = c.createStatement()) {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    ResultSet rs = st.executeQuery("SELECT pg_try_advisory_xact_lock(99999)");
+                    rs.next();
+                    if (rs.getBoolean(1)) {
+                        int current = concurrentHolders.incrementAndGet();
+                        maxConcurrent.accumulateAndGet(current, Math::max);
+                        Thread.sleep(50); // hold lock briefly
+                        concurrentHolders.decrementAndGet();
+                    }
+                    c.commit();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+        for (Future<?> f : futures) f.get(15, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // Mutual exclusion: at most 1 session should hold the lock at any time
+        assertTrue(maxConcurrent.get() <= 1,
+                "At most 1 session should hold the advisory lock at a time, but saw " + maxConcurrent.get());
+    }
+
+    // =========================================================================
+    // 16. MVCC visibility with concurrent inserts and reads (A1 — defensive copies)
+    // =========================================================================
+
+    @RepeatedTest(10)
+    void testMvccConcurrentInsertAndRead() throws Exception {
+        try (Connection setup = connect(); Statement st = setup.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS t_mvcc_ir");
+            st.execute("CREATE TABLE t_mvcc_ir (id serial, val int)");
+        }
+
+        // Stress: multiple writers inserting inside transactions while readers query
+        int numWriters = 4;
+        int numReaders = 4;
+        int insertsPerWriter = 20;
+        CyclicBarrier barrier = new CyclicBarrier(numWriters + numReaders);
+        ExecutorService pool = Executors.newFixedThreadPool(numWriters + numReaders);
+        List<Future<?>> futures = new ArrayList<>();
+        AtomicInteger readErrors = new AtomicInteger(0);
+
+        // Writers: insert inside transactions, then commit
+        for (int w = 0; w < numWriters; w++) {
+            final int wid = w;
+            futures.add(pool.submit(() -> {
+                try (Connection c = connectTx()) {
+                    Statement st = c.createStatement();
+                    barrier.await(5, TimeUnit.SECONDS);
+                    for (int i = 0; i < insertsPerWriter; i++) {
+                        st.execute("INSERT INTO t_mvcc_ir (val) VALUES (" + (wid * 100 + i) + ")");
+                    }
+                    c.commit();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+
+        // Readers: query count repeatedly — should never get errors
+        for (int r = 0; r < numReaders; r++) {
+            futures.add(pool.submit(() -> {
+                try (Connection c = connect(); Statement st = c.createStatement()) {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    for (int i = 0; i < 30; i++) {
+                        try {
+                            ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM t_mvcc_ir");
+                            rs.next();
+                            int count = rs.getInt(1);
+                            // Count should be non-negative (sanity)
+                            assertTrue(count >= 0, "Row count should never be negative");
+                        } catch (SQLException e) {
+                            readErrors.incrementAndGet();
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+        for (Future<?> f : futures) f.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        assertEquals(0, readErrors.get(), "No errors should occur during concurrent MVCC reads");
+
+        try (Connection verify = connect(); Statement st = verify.createStatement()) {
+            int total = queryInt(st, "SELECT COUNT(*) FROM t_mvcc_ir");
+            assertEquals(numWriters * insertsPerWriter, total,
+                    "All committed inserts should be visible");
+            st.execute("DROP TABLE t_mvcc_ir");
+        }
+    }
+
+    // =========================================================================
+    // 17. Savepoint rollback + concurrent read stress (A3 stress)
+    // =========================================================================
+
+    @RepeatedTest(5)
+    void testSavepointRollbackConcurrentReadStress() throws Exception {
+        try (Connection setup = connect(); Statement st = setup.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS t_sp_stress");
+            st.execute("CREATE TABLE t_sp_stress (id serial, session_id int)");
+            // Pre-populate
+            for (int i = 0; i < 10; i++) {
+                st.execute("INSERT INTO t_sp_stress (session_id) VALUES (0)");
+            }
+        }
+
+        int numWriters = 4;
+        int numReaders = 4;
+        CyclicBarrier barrier = new CyclicBarrier(numWriters + numReaders);
+        ExecutorService pool = Executors.newFixedThreadPool(numWriters + numReaders);
+        List<Future<?>> futures = new ArrayList<>();
+        AtomicInteger readErrors = new AtomicInteger(0);
+
+        // Writers: insert, savepoint, insert more, rollback to savepoint, commit
+        for (int w = 0; w < numWriters; w++) {
+            final int wid = w + 1;
+            futures.add(pool.submit(() -> {
+                try (Connection c = connectTx()) {
+                    Statement st = c.createStatement();
+                    barrier.await(5, TimeUnit.SECONDS);
+                    // Insert before savepoint
+                    for (int i = 0; i < 5; i++) {
+                        st.execute("INSERT INTO t_sp_stress (session_id) VALUES (" + wid + ")");
+                    }
+                    st.execute("SAVEPOINT sp1");
+                    // Insert after savepoint (will be rolled back)
+                    for (int i = 0; i < 5; i++) {
+                        st.execute("INSERT INTO t_sp_stress (session_id) VALUES (" + (wid + 100) + ")");
+                    }
+                    st.execute("ROLLBACK TO sp1");
+                    c.commit();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+
+        // Readers: query count repeatedly — should never crash or throw CME
+        for (int r = 0; r < numReaders; r++) {
+            futures.add(pool.submit(() -> {
+                try (Connection c = connect(); Statement st = c.createStatement()) {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    for (int i = 0; i < 20; i++) {
+                        try {
+                            ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM t_sp_stress");
+                            rs.next();
+                            int count = rs.getInt(1);
+                            assertTrue(count >= 0, "Row count should be non-negative");
+                        } catch (SQLException e) {
+                            readErrors.incrementAndGet();
+                        }
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+
+        for (Future<?> f : futures) f.get(30, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        assertEquals(0, readErrors.get(), "No errors during concurrent savepoint stress test");
+
+        try (Connection verify = connect(); Statement st = verify.createStatement()) {
+            // 10 original + 4 writers × 5 rows each = 30
+            assertEquals(30, queryInt(st, "SELECT COUNT(*) FROM t_sp_stress"),
+                    "Original rows + committed pre-savepoint inserts");
+            assertEquals(0, queryInt(st, "SELECT COUNT(*) FROM t_sp_stress WHERE session_id > 100"),
+                    "No ghost rows from savepoint rollbacks");
+            st.execute("DROP TABLE t_sp_stress");
+        }
+    }
 }
