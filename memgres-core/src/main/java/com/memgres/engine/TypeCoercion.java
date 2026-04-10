@@ -88,6 +88,11 @@ public final class TypeCoercion {
             case TSRANGE:
             case TSTZRANGE:
             case INT4MULTIRANGE:
+            case INT8MULTIRANGE:
+            case NUMMULTIRANGE:
+            case DATEMULTIRANGE:
+            case TSMULTIRANGE:
+            case TSTZMULTIRANGE:
                 return TypeCategory.UNKNOWN;
             case XML:
                 return TypeCategory.STRING;
@@ -943,6 +948,28 @@ public final class TypeCoercion {
             if (coerced instanceof byte[]) return compareBytes((byte[]) coerced, bb);
         }
 
+        // Range/multirange comparison: compare by lower bound, then upper bound
+        // Only trigger when BOTH sides are range-like (avoids false positives with tuple/array strings)
+        if (a instanceof String && b instanceof String) {
+            String sa = (String) a;
+            String sb = (String) b;
+            boolean aIsRange = RangeOperations.isRangeString(sa);
+            boolean bIsRange = RangeOperations.isRangeString(sb);
+            // Use strict isMultirangeString first; if at least one side is a range/multirange,
+            // also accept "{}" as empty multirange on the other side
+            boolean aIsMr = !aIsRange && RangeOperations.isMultirangeString(sa);
+            boolean bIsMr = !bIsRange && RangeOperations.isMultirangeString(sb);
+            boolean anyRangeLike = aIsRange || bIsRange || aIsMr || bIsMr;
+            if (anyRangeLike) {
+                // Accept "{}" as empty multirange when the other side is confirmed range/multirange
+                if (!aIsRange && !aIsMr && sa.equals("{}")) aIsMr = true;
+                if (!bIsRange && !bIsMr && sb.equals("{}")) bIsMr = true;
+            }
+            if ((aIsRange || aIsMr) && (bIsRange || bIsMr)) {
+                return compareRangeOrMultirange(sa, aIsRange, sb, bIsRange);
+            }
+        }
+
         // Cross-type date/time: coerce to common type
         if (isDateTime(a) && isDateTime(b)) {
             return toLocalDateTime(a).compareTo(toLocalDateTime(b));
@@ -1155,5 +1182,62 @@ public final class TypeCoercion {
             if (cmp != 0) return cmp;
         }
         return Integer.compare(a.length, b.length);
+    }
+
+    /**
+     * Compare two range or multirange strings.
+     * PG ordering: empty < non-empty; then by lower bound, then by upper bound.
+     * For multiranges, compare element-by-element (first sub-range, then second, etc.).
+     */
+    private static int compareRangeOrMultirange(String sa, boolean aIsRange, String sb, boolean bIsRange) {
+        // Convert both to lists of PgRange for uniform comparison
+        java.util.List<RangeOperations.PgRange> aRanges;
+        java.util.List<RangeOperations.PgRange> bRanges;
+        if (aIsRange) {
+            RangeOperations.PgRange r = RangeOperations.parse(sa);
+            aRanges = r.isEmpty() ? java.util.Collections.emptyList() : java.util.Collections.singletonList(r);
+        } else {
+            aRanges = RangeOperations.parseMultirange(sa);
+        }
+        if (bIsRange) {
+            RangeOperations.PgRange r = RangeOperations.parse(sb);
+            bRanges = r.isEmpty() ? java.util.Collections.emptyList() : java.util.Collections.singletonList(r);
+        } else {
+            bRanges = RangeOperations.parseMultirange(sb);
+        }
+        // Compare element by element
+        int minLen = Math.min(aRanges.size(), bRanges.size());
+        for (int i = 0; i < minLen; i++) {
+            int cmp = compareSingleRange(aRanges.get(i), bRanges.get(i));
+            if (cmp != 0) return cmp;
+        }
+        return Integer.compare(aRanges.size(), bRanges.size());
+    }
+
+    /** Compare two individual PgRange values. PG: by lower bound, then upper bound. */
+    private static int compareSingleRange(RangeOperations.PgRange a, RangeOperations.PgRange b) {
+        if (a.isEmpty() && b.isEmpty()) return 0;
+        if (a.isEmpty()) return -1;
+        if (b.isEmpty()) return 1;
+        // Compare lower bounds
+        int cmp = compareBound(a.lower(), a.lowerInclusive(), b.lower(), b.lowerInclusive(), true);
+        if (cmp != 0) return cmp;
+        // Compare upper bounds
+        return compareBound(a.upper(), a.upperInclusive(), b.upper(), b.upperInclusive(), false);
+    }
+
+    /** Compare two range bounds. null = unbounded (negative infinity for lower, positive infinity for upper). */
+    private static int compareBound(Number a, boolean aInc, Number b, boolean bInc, boolean isLower) {
+        if (a == null && b == null) return 0;
+        if (a == null) return isLower ? -1 : 1;  // unbounded lower is smallest, unbounded upper is largest
+        if (b == null) return isLower ? 1 : -1;
+        int cmp = Long.compare(a.longValue(), b.longValue());
+        if (cmp != 0) return cmp;
+        // Same value: inclusive vs exclusive matters
+        // For lower: inclusive < exclusive (inclusive starts earlier)
+        // For upper: exclusive < inclusive (exclusive ends earlier)
+        if (aInc == bInc) return 0;
+        if (isLower) return aInc ? -1 : 1;
+        return aInc ? 1 : -1;
     }
 }

@@ -386,7 +386,15 @@ class CatalogConstraintBuilder {
                 int relOid = oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName());
                 for (int i = 0; i < t.getColumns().size(); i++) {
                     Column c = t.getColumns().get(i);
-                    if (c.getDefaultValue() != null || c.getType() == DataType.SERIAL
+                    if (c.isGenerated()) {
+                        // Generated columns: store the generation expression in pg_attrdef
+                        // pg_dump reads this to emit GENERATED ALWAYS AS (...) STORED/VIRTUAL
+                        String genExpr = c.getGeneratedExpr();
+                        table.insertRow(new Object[]{
+                                oids.oid("attrdef:" + t.getName() + "." + c.getName()),
+                                relOid, (short) (i + 1), genExpr, genExpr
+                        });
+                    } else if (c.getDefaultValue() != null || c.getType() == DataType.SERIAL
                             || c.getType() == DataType.BIGSERIAL || c.getType() == DataType.SMALLSERIAL) {
                         String formatted = formatColumnDefault(c);
                         String defaultExpr = formatted != null ? formatted

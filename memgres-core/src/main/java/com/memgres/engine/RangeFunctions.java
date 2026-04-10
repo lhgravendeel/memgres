@@ -102,6 +102,11 @@ class RangeFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String s = arg.toString().trim();
+                if (RangeOperations.isMultirangeOrEmpty(s)) {
+                    List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(s);
+                    if (ranges.isEmpty()) return false;
+                    return ranges.get(0).lowerInclusive();
+                }
                 if (s.equalsIgnoreCase("empty")) return false;
                 return s.charAt(0) == '[';
             }
@@ -109,6 +114,11 @@ class RangeFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String s = arg.toString().trim();
+                if (RangeOperations.isMultirangeOrEmpty(s)) {
+                    List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(s);
+                    if (ranges.isEmpty()) return false;
+                    return ranges.get(ranges.size() - 1).upperInclusive();
+                }
                 if (s.equalsIgnoreCase("empty")) return false;
                 return s.charAt(s.length() - 1) == ']';
             }
@@ -116,6 +126,12 @@ class RangeFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String s = arg.toString().trim();
+                if (RangeOperations.isMultirangeOrEmpty(s)) {
+                    List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(s);
+                    if (ranges.isEmpty()) return false;
+                    RangeOperations.PgRange last = ranges.get(ranges.size() - 1);
+                    return last.upper() == null;
+                }
                 if (s.equalsIgnoreCase("empty")) return false;
                 RangeOperations.PgRange r = RangeOperations.parse(s);
                 return r.upper() == null;
@@ -124,11 +140,32 @@ class RangeFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String s = arg.toString().trim();
+                if (RangeOperations.isMultirangeOrEmpty(s)) {
+                    List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(s);
+                    if (ranges.isEmpty()) return false;
+                    return ranges.get(0).lower() == null;
+                }
                 if (s.equalsIgnoreCase("empty")) return false;
                 RangeOperations.PgRange r = RangeOperations.parse(s);
                 return r.lower() == null;
             }
             case "range_merge": {
+                // range_merge(multirange) → single range spanning all sub-ranges
+                if (fn.args().size() == 1) {
+                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                    if (arg == null) return null;
+                    String s = arg.toString().trim();
+                    if (RangeOperations.isMultirangeOrEmpty(s)) {
+                        List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(s);
+                        if (ranges.isEmpty()) return "empty";
+                        RangeOperations.PgRange result = ranges.get(0);
+                        for (int i = 1; i < ranges.size(); i++) {
+                            result = RangeOperations.merge(result, ranges.get(i));
+                        }
+                        return result.toString();
+                    }
+                }
+                // range_merge(range, range) → smallest range containing both
                 // Check for cross-type range arguments (e.g., int4range vs numrange)
                 if (fn.args().size() == 2) {
                     String lt = getRangeTypeName(fn.args().get(0));
@@ -152,11 +189,45 @@ class RangeFunctions {
             }
             case "isempty": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                if (arg instanceof String && RangeOperations.isMultirangeOrEmpty(((String) arg))) {
+                    List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(((String) arg));
+                    // A multirange is empty if it has no sub-ranges or all are empty
+                    if (ranges.isEmpty()) return true;
+                    for (RangeOperations.PgRange r : ranges) {
+                        if (!r.isEmpty()) return false;
+                    }
+                    return true;
+                }
                 if (arg instanceof String && RangeOperations.isRangeString(((String) arg))) {
                     String s = (String) arg;
                     return RangeOperations.parse(s).isEmpty();
                 }
                 return false;
+            }
+            case "unnest": {
+                // unnest(multirange) → set of ranges (returns as a list for SRF processing)
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String s = arg.toString().trim();
+                if (RangeOperations.isMultirangeOrEmpty(s)) {
+                    List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(s);
+                    List<Object> result = new ArrayList<>();
+                    for (RangeOperations.PgRange r : ranges) {
+                        result.add(r.toString());
+                    }
+                    return result;
+                }
+                return NOT_HANDLED;
+            }
+            case "multirange": {
+                // multirange(range) → wraps a single range into a multirange
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return "{}";
+                String s = arg.toString().trim();
+                if (s.equalsIgnoreCase("empty")) return "{}";
+                if (RangeOperations.isRangeString(s)) return "{" + s + "}";
+                return "{" + s + "}";
             }
             case "int4multirange":
             case "int8multirange":

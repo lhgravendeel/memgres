@@ -669,18 +669,24 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 String ls = left.toString().trim();
                 String rs = right.toString().trim();
-                // Multirange containment: multirange @> value
-                if (RangeOperations.isMultirangeString(ls)) {
+                // Multirange containment: multirange @> value/range/multirange
+                if (RangeOperations.isMultirangeOrEmpty(ls)) {
+                    if (RangeOperations.isMultirangeOrEmpty(rs)) return RangeOperations.multirangeContainsMultirange(ls, rs);
+                    if (RangeOperations.isRangeString(rs)) return RangeOperations.multirangeContainsRange(ls, RangeOperations.parse(rs));
                     if (right instanceof Number) return RangeOperations.multirangeContains(ls, ((Number) right));
                     try { return RangeOperations.multirangeContains(ls, Long.parseLong(rs)); } catch (NumberFormatException ignore) {}
                     return false;
                 }
-                // Range containment: range @> value or range @> range
+                // Range containment: range @> value or range @> range or range @> multirange
                 if (RangeOperations.isRangeString(ls)) {
                     RangeOperations.PgRange range = RangeOperations.parse(ls);
                     if (right instanceof Number) return range.contains(((Number) right));
                     if (right instanceof java.time.LocalDateTime) return range.contains(((java.time.LocalDateTime) right).toEpochSecond(java.time.ZoneOffset.UTC));
                     if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
+                    // range @> multirange: true if range contains every sub-range
+                    if (RangeOperations.isMultirangeOrEmpty(rs)) {
+                        return RangeOperations.multirangeContainsMultirange("{" + ls + "}", rs);
+                    }
                     if (RangeOperations.isRangeString(rs)) return range.containsRange(RangeOperations.parse(rs));
                     // PG: range @> non-range-non-number -> try parsing
                     try {
@@ -733,6 +739,24 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 String ls = left.toString().trim();
                 String rs = right.toString().trim();
+                // Multirange/range containment: a <@ b means b @> a
+                if (RangeOperations.isMultirangeOrEmpty(rs)) {
+                    if (RangeOperations.isMultirangeOrEmpty(ls)) return RangeOperations.multirangeContainsMultirange(rs, ls);
+                    if (RangeOperations.isRangeString(ls)) return RangeOperations.multirangeContainsRange(rs, RangeOperations.parse(ls));
+                    if (left instanceof Number) return RangeOperations.multirangeContains(rs, ((Number) left));
+                    try { return RangeOperations.multirangeContains(rs, Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
+                    return false;
+                }
+                if (RangeOperations.isRangeString(rs)) {
+                    RangeOperations.PgRange range = RangeOperations.parse(rs);
+                    // multirange <@ range: true if range contains every sub-range
+                    if (RangeOperations.isMultirangeOrEmpty(ls)) {
+                        return RangeOperations.multirangeContainsMultirange("{" + rs + "}", ls);
+                    }
+                    if (RangeOperations.isRangeString(ls)) return range.containsRange(RangeOperations.parse(ls));
+                    if (left instanceof Number) return range.contains(((Number) left));
+                    try { return range.contains(Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
+                }
                 if ((ls.startsWith("{") || ls.startsWith("[")) && (rs.startsWith("{") || rs.startsWith("["))) {
                     return JsonOperations.contains(rs, ls);
                 }
@@ -778,6 +802,16 @@ class BinaryOpEvaluator {
                 // Convert Lists to PG format for uniform handling
                 String oLs = (left instanceof List) ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
                 String oRs = (right instanceof List) ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
+                // Multirange overlap checks
+                if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
+                    return RangeOperations.multirangeOverlapsMultirange(oLs, oRs);
+                }
+                if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isRangeString(oRs)) {
+                    return RangeOperations.multirangeOverlapsRange(oLs, RangeOperations.parse(oRs));
+                }
+                if (RangeOperations.isRangeString(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
+                    return RangeOperations.multirangeOverlapsRange(oRs, RangeOperations.parse(oLs));
+                }
                 if (RangeOperations.isRangeString(oLs) && RangeOperations.isRangeString(oRs)) {
                     return RangeOperations.parse(oLs).overlaps(RangeOperations.parse(oRs));
                 }
@@ -848,6 +882,15 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 String ls = left.toString().trim();
                 String rs = right.toString().trim();
+                if (RangeOperations.isMultirangeOrEmpty(ls) && RangeOperations.isMultirangeOrEmpty(rs)) {
+                    return RangeOperations.multirangeAdjacentMultirange(ls, rs);
+                }
+                if (RangeOperations.isMultirangeOrEmpty(ls) && RangeOperations.isRangeString(rs)) {
+                    return RangeOperations.multirangeAdjacentRange(ls, RangeOperations.parse(rs));
+                }
+                if (RangeOperations.isRangeString(ls) && RangeOperations.isMultirangeOrEmpty(rs)) {
+                    return RangeOperations.multirangeAdjacentRange(rs, RangeOperations.parse(ls));
+                }
                 if (RangeOperations.isRangeString(ls) && RangeOperations.isRangeString(rs)) {
                     return RangeOperations.areAdjacent(RangeOperations.parse(ls), RangeOperations.parse(rs));
                 }
@@ -1242,7 +1285,7 @@ class BinaryOpEvaluator {
                 String lStr = left.toString().trim();
                 String rStr = right.toString().trim();
                 // Multirange containment
-                if (RangeOperations.isMultirangeString(lStr)) {
+                if (RangeOperations.isMultirangeOrEmpty(lStr)) {
                     if (right instanceof Number) return RangeOperations.multirangeContains(lStr, ((Number) right));
                     try { return RangeOperations.multirangeContains(lStr, Long.parseLong(rStr)); } catch (NumberFormatException ignore) {}
                     return false;
@@ -1252,6 +1295,10 @@ class BinaryOpEvaluator {
                     RangeOperations.PgRange range = RangeOperations.parse(lStr);
                     if (right instanceof Number) return range.contains(((Number) right));
                     if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
+                    // range @> multirange: true if range contains every sub-range
+                    if (RangeOperations.isMultirangeOrEmpty(rStr)) {
+                        return RangeOperations.multirangeContainsMultirange("{" + lStr + "}", rStr);
+                    }
                     if (RangeOperations.isRangeString(rStr)) return range.containsRange(RangeOperations.parse(rStr));
                     if (rStr.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
                         return range.contains(java.time.LocalDate.parse(rStr.substring(0, 10)).toEpochDay());
@@ -1273,6 +1320,24 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 String lStr = left.toString().trim();
                 String rStr = right.toString().trim();
+                // Multirange/range containment: a <@ b means b @> a
+                if (RangeOperations.isMultirangeOrEmpty(rStr)) {
+                    if (RangeOperations.isMultirangeOrEmpty(lStr)) return RangeOperations.multirangeContainsMultirange(rStr, lStr);
+                    if (RangeOperations.isRangeString(lStr)) return RangeOperations.multirangeContainsRange(rStr, RangeOperations.parse(lStr));
+                    if (left instanceof Number) return RangeOperations.multirangeContains(rStr, ((Number) left));
+                    try { return RangeOperations.multirangeContains(rStr, Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
+                    return false;
+                }
+                if (RangeOperations.isRangeString(rStr)) {
+                    RangeOperations.PgRange range = RangeOperations.parse(rStr);
+                    // multirange <@ range: true if range contains every sub-range
+                    if (RangeOperations.isMultirangeOrEmpty(lStr)) {
+                        return RangeOperations.multirangeContainsMultirange("{" + rStr + "}", lStr);
+                    }
+                    if (RangeOperations.isRangeString(lStr)) return range.containsRange(RangeOperations.parse(lStr));
+                    if (left instanceof Number) return range.contains(((Number) left));
+                    try { return range.contains(Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
+                }
                 if ((lStr.startsWith("{") || lStr.startsWith("[")) && (rStr.startsWith("{") || rStr.startsWith("["))) {
                     return JsonOperations.contains(rStr, lStr);
                 }
@@ -1318,6 +1383,16 @@ class BinaryOpEvaluator {
                 // Convert Lists to PG format for uniform handling
                 String oLs = (left instanceof List) ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
                 String oRs = (right instanceof List) ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
+                // Multirange overlap checks
+                if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
+                    return RangeOperations.multirangeOverlapsMultirange(oLs, oRs);
+                }
+                if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isRangeString(oRs)) {
+                    return RangeOperations.multirangeOverlapsRange(oLs, RangeOperations.parse(oRs));
+                }
+                if (RangeOperations.isRangeString(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
+                    return RangeOperations.multirangeOverlapsRange(oRs, RangeOperations.parse(oLs));
+                }
                 if (RangeOperations.isRangeString(oLs) && RangeOperations.isRangeString(oRs)) {
                     return RangeOperations.parse(oLs).overlaps(RangeOperations.parse(oRs));
                 }
@@ -1388,6 +1463,15 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 String ls = left.toString().trim();
                 String rs = right.toString().trim();
+                if (RangeOperations.isMultirangeOrEmpty(ls) && RangeOperations.isMultirangeOrEmpty(rs)) {
+                    return RangeOperations.multirangeAdjacentMultirange(ls, rs);
+                }
+                if (RangeOperations.isMultirangeOrEmpty(ls) && RangeOperations.isRangeString(rs)) {
+                    return RangeOperations.multirangeAdjacentRange(ls, RangeOperations.parse(rs));
+                }
+                if (RangeOperations.isRangeString(ls) && RangeOperations.isMultirangeOrEmpty(rs)) {
+                    return RangeOperations.multirangeAdjacentRange(rs, RangeOperations.parse(ls));
+                }
                 if (RangeOperations.isRangeString(ls) && RangeOperations.isRangeString(rs)) {
                     return RangeOperations.areAdjacent(RangeOperations.parse(ls), RangeOperations.parse(rs));
                 }

@@ -118,6 +118,16 @@ public final class CatalogHelper {
                 return "tstzrange";
             case INT4MULTIRANGE:
                 return "int4multirange";
+            case INT8MULTIRANGE:
+                return "int8multirange";
+            case NUMMULTIRANGE:
+                return "nummultirange";
+            case DATEMULTIRANGE:
+                return "datemultirange";
+            case TSMULTIRANGE:
+                return "tsmultirange";
+            case TSTZMULTIRANGE:
+                return "tstzmultirange";
             case TEXT_ARRAY:
                 return "text[]";
             case INT4_ARRAY:

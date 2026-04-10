@@ -70,6 +70,20 @@ class DateTimeArithmetic {
             return GeometricOperations.add(ls, rs);
         }
 
+        // Multirange + Multirange → union
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
+            return RangeOperations.multirangeUnion((String) left, (String) right);
+        }
+        // Multirange + Range → add range to multirange
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isRangeString(((String) right))) {
+            return RangeOperations.multirangeUnion((String) left, "{" + right + "}");
+        }
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isRangeString(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
+            return RangeOperations.multirangeUnion("{" + left + "}", (String) right);
+        }
         // Range + Range → union
         if (left instanceof String && right instanceof String
                 && RangeOperations.isRangeString(((String) left)) && RangeOperations.isRangeString(((String) right))) {
@@ -99,6 +113,21 @@ class DateTimeArithmetic {
     Object dateTimeSubtract(Object left, Object right) {
         if (left == null || right == null) return null;
 
+        // Multirange - Multirange → set difference
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
+            return RangeOperations.multirangeSubtract((String) left, (String) right);
+        }
+        // Multirange - Range → subtract range from multirange
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isRangeString(((String) right))) {
+            return RangeOperations.multirangeSubtract((String) left, "{" + right + "}");
+        }
+        // Range - Multirange → subtract multirange from range
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isRangeString(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
+            return RangeOperations.multirangeSubtract("{" + left + "}", (String) right);
+        }
         // Range - Range → set difference
         // Exclude geometric strings (which also match range-like patterns)
         if (left instanceof String && right instanceof String
@@ -176,6 +205,20 @@ class DateTimeArithmetic {
             String rs = (String) right;
             String ls = (String) left;
             return GeometricOperations.multiply(ls, rs);
+        }
+        // Multirange * Multirange → intersection
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
+            return RangeOperations.multirangeIntersect((String) left, (String) right);
+        }
+        // Multirange * Range → intersection
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isRangeString(((String) right))) {
+            return RangeOperations.multirangeIntersect((String) left, "{" + right + "}");
+        }
+        if (left instanceof String && right instanceof String
+                && RangeOperations.isRangeString(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
+            return RangeOperations.multirangeIntersect("{" + left + "}", (String) right);
         }
         // Range * Range → intersection
         if (left instanceof String && right instanceof String

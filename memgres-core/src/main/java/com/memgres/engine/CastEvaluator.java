@@ -307,17 +307,39 @@ class CastEvaluator {
             case "datemultirange":
             case "tsmultirange":
             case "tstzmultirange": {
-                // Basic multirange validation
                 String s = val.toString().trim();
+                // Implicit cast: range → multirange (wrap single range)
+                if (RangeOperations.isRangeString(s)) {
+                    RangeOperations.PgRange parsed = RangeOperations.parse(s);
+                    if (parsed.isEmpty()) return "{}";
+                    return "{" + parsed.toString() + "}";
+                }
+                if (s.equalsIgnoreCase("empty")) return "{}";
+                // Multirange literal validation and canonicalization
                 if (!s.startsWith("{") || !s.endsWith("}")) throw new MemgresException("malformed multirange literal: \"" + s + "\"", "22P02");
-                // Check each sub-range
                 String inner = s.substring(1, s.length() - 1);
-                if (!inner.isEmpty()) {
-                    for (String part : inner.split(",(?=[\\[\\(])")) {
-                        RangeOperations.parse(part.trim()); // validates each range
+                if (inner.isEmpty()) return "{}";
+                // Parse, validate, and canonicalize (sort + merge overlapping)
+                java.util.List<RangeOperations.PgRange> parsed = new java.util.ArrayList<>();
+                for (String part : inner.split(",(?=[\\[\\(])")) {
+                    RangeOperations.PgRange r = RangeOperations.parse(part.trim());
+                    if (!r.isEmpty()) parsed.add(r);
+                }
+                if (parsed.isEmpty()) return "{}";
+                // Sort and merge overlapping/adjacent
+                parsed.sort((a, b) -> Long.compare(a.effectiveLower(), b.effectiveLower()));
+                java.util.List<RangeOperations.PgRange> merged = new java.util.ArrayList<>();
+                merged.add(parsed.get(0));
+                for (int mi = 1; mi < parsed.size(); mi++) {
+                    RangeOperations.PgRange last = merged.get(merged.size() - 1);
+                    RangeOperations.PgRange curr = parsed.get(mi);
+                    if (last.effectiveUpper() >= curr.effectiveLower()) {
+                        merged.set(merged.size() - 1, RangeOperations.merge(last, curr));
+                    } else {
+                        merged.add(curr);
                     }
                 }
-                return s;
+                return RangeOperations.formatMultirange(merged);
             }
             case "uuid": {
                 if (val instanceof java.util.UUID) return val;

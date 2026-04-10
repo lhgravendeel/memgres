@@ -137,7 +137,7 @@ public class RangeOperations {
         long lo = Math.min(aLo, bLo);
         long hi = Math.max(aHi, bHi);
         if (lo == hi) return new PgRange(null, null, true, false, true);
-        return new PgRange((int) lo, (int) hi, true, false, false);
+        return new PgRange(lo, hi, true, false, false);
     }
 
     /** Intersection of two ranges (PG * operator). Returns empty if no overlap. */
@@ -150,7 +150,7 @@ public class RangeOperations {
         long lo = Math.max(aLo, bLo);
         long hi = Math.min(aHi, bHi);
         if (lo >= hi) return new PgRange(null, null, true, false, true);
-        return new PgRange((int) lo, (int) hi, true, false, false);
+        return new PgRange(lo, hi, true, false, false);
     }
 
     /** Merge two ranges: smallest range containing both (does not require adjacency). */
@@ -164,7 +164,7 @@ public class RangeOperations {
         long lo = Math.min(aLo, bLo);
         long hi = Math.max(aHi, bHi);
         if (lo == hi) return new PgRange(null, null, true, false, true);
-        return new PgRange((int) lo, (int) hi, true, false, false);
+        return new PgRange(lo, hi, true, false, false);
     }
 
     /**
@@ -187,12 +187,12 @@ public class RangeOperations {
 
         // b overlaps left side: result is [b.hi, a.hi)
         if (bLo <= aLo && bHi < aHi) {
-            return new PgRange((int) bHi, (int) aHi, true, false, false);
+            return new PgRange(bHi, aHi, true, false, false);
         }
 
         // b overlaps right side: result is [a.lo, b.lo)
         if (bLo > aLo && bHi >= aHi) {
-            return new PgRange((int) aLo, (int) bLo, true, false, false);
+            return new PgRange(aLo, bLo, true, false, false);
         }
 
         // b is in the middle of a: result would be two disjoint ranges, which is an error
@@ -402,7 +402,50 @@ public class RangeOperations {
         // Exclude JSON objects (contain quoted keys with colons)
         if (inner.contains("\"")) return false;
         // Check that inner content starts with a range literal bracket
-        return inner.charAt(0) == '[' || inner.charAt(0) == '(';
+        if (inner.charAt(0) != '[' && inner.charAt(0) != '(') return false;
+        // Extract the first element and validate it's actually a range (not a record like "(1)")
+        // Ranges can use mixed brackets (e.g. [1,5) or (1,5]), so find the first ']' or ')' after a comma
+        int commaIdx = inner.indexOf(',');
+        if (commaIdx < 0) return false; // ranges require a comma between bounds
+        int closeSquare = inner.indexOf(']', commaIdx);
+        int closeParen = inner.indexOf(')', commaIdx);
+        int closeIdx;
+        if (closeSquare < 0) closeIdx = closeParen;
+        else if (closeParen < 0) closeIdx = closeSquare;
+        else closeIdx = Math.min(closeSquare, closeParen);
+        if (closeIdx < 0) return false;
+        String firstElem = inner.substring(0, closeIdx + 1);
+        return isRangeString(firstElem);
+    }
+
+    /** Check if a multirange is adjacent to a range (last sub-range -|- range or range -|- first sub-range). */
+    public static boolean multirangeAdjacentRange(String multirangeStr, PgRange range) {
+        java.util.List<PgRange> ranges = parseMultirange(multirangeStr);
+        if (ranges.isEmpty() || range.empty) return false;
+        // Check last sub-range adjacent to the given range, or first sub-range
+        PgRange last = ranges.get(ranges.size() - 1);
+        PgRange first = ranges.get(0);
+        return areAdjacent(last, range) || areAdjacent(first, range);
+    }
+
+    /** Check if two multiranges are adjacent (last of one -|- first of other). */
+    public static boolean multirangeAdjacentMultirange(String mr1, String mr2) {
+        java.util.List<PgRange> ranges1 = parseMultirange(mr1);
+        java.util.List<PgRange> ranges2 = parseMultirange(mr2);
+        if (ranges1.isEmpty() || ranges2.isEmpty()) return false;
+        PgRange last1 = ranges1.get(ranges1.size() - 1);
+        PgRange first2 = ranges2.get(0);
+        PgRange first1 = ranges1.get(0);
+        PgRange last2 = ranges2.get(ranges2.size() - 1);
+        return areAdjacent(last1, first2) || areAdjacent(last2, first1);
+    }
+
+    /** Like isMultirangeString but also accepts '{}' as an empty multirange. */
+    public static boolean isMultirangeOrEmpty(String s) {
+        if (s == null) return false;
+        s = s.trim();
+        if (s.equals("{}")) return true;
+        return isMultirangeString(s);
     }
 
     /**
@@ -466,5 +509,127 @@ public class RangeOperations {
         }
         sb.append("}");
         return sb.toString();
+    }
+
+    /** Check if a multirange overlaps with a range. */
+    public static boolean multirangeOverlapsRange(String multirangeStr, PgRange range) {
+        java.util.List<PgRange> ranges = parseMultirange(multirangeStr);
+        for (PgRange r : ranges) {
+            if (r.overlaps(range)) return true;
+        }
+        return false;
+    }
+
+    /** Check if two multiranges overlap. */
+    public static boolean multirangeOverlapsMultirange(String mr1, String mr2) {
+        java.util.List<PgRange> ranges1 = parseMultirange(mr1);
+        java.util.List<PgRange> ranges2 = parseMultirange(mr2);
+        for (PgRange r1 : ranges1) {
+            for (PgRange r2 : ranges2) {
+                if (r1.overlaps(r2)) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Check if a multirange contains a range. */
+    public static boolean multirangeContainsRange(String multirangeStr, PgRange range) {
+        if (range.empty) return true;
+        java.util.List<PgRange> ranges = parseMultirange(multirangeStr);
+        for (PgRange r : ranges) {
+            if (r.containsRange(range)) return true;
+        }
+        return false;
+    }
+
+    /** Check if a multirange contains another multirange. */
+    public static boolean multirangeContainsMultirange(String mr1, String mr2) {
+        java.util.List<PgRange> ranges2 = parseMultirange(mr2);
+        for (PgRange r2 : ranges2) {
+            if (!multirangeContainsRange(mr1, r2)) return false;
+        }
+        return true;
+    }
+
+    /** Union two multiranges, merging overlapping/adjacent ranges. */
+    public static String multirangeUnion(String mr1, String mr2) {
+        java.util.List<PgRange> all = new java.util.ArrayList<>();
+        all.addAll(parseMultirange(mr1));
+        all.addAll(parseMultirange(mr2));
+        return formatMultirange(mergeAndSort(all));
+    }
+
+    /** Intersect two multiranges. */
+    public static String multirangeIntersect(String mr1, String mr2) {
+        java.util.List<PgRange> ranges1 = parseMultirange(mr1);
+        java.util.List<PgRange> ranges2 = parseMultirange(mr2);
+        java.util.List<PgRange> result = new java.util.ArrayList<>();
+        for (PgRange r1 : ranges1) {
+            for (PgRange r2 : ranges2) {
+                PgRange inter = intersection(r1, r2);
+                if (!inter.isEmpty()) result.add(inter);
+            }
+        }
+        return formatMultirange(mergeAndSort(result));
+    }
+
+    /** Subtract a multirange from another multirange. */
+    public static String multirangeSubtract(String mr1, String mr2) {
+        java.util.List<PgRange> result = new java.util.ArrayList<>(parseMultirange(mr1));
+        for (PgRange sub : parseMultirange(mr2)) {
+            java.util.List<PgRange> next = new java.util.ArrayList<>();
+            for (PgRange r : result) {
+                subtractSingle(r, sub, next);
+            }
+            result = next;
+        }
+        return formatMultirange(mergeAndSort(result));
+    }
+
+    /** Subtract single range from a range, adding results to output list. */
+    private static void subtractSingle(PgRange a, PgRange b, java.util.List<PgRange> out) {
+        if (a.empty) return;
+        if (b.empty) { out.add(a); return; }
+        long aLo = a.effectiveLower();
+        long aHi = a.effectiveUpper();
+        long bLo = b.effectiveLower();
+        long bHi = b.effectiveUpper();
+        if (aHi <= bLo || bHi <= aLo) { out.add(a); return; }
+        if (bLo <= aLo && bHi >= aHi) return; // fully subtracted
+        if (bLo <= aLo && bHi < aHi) {
+            out.add(new PgRange(bHi, aHi, true, false, false));
+            return;
+        }
+        if (bLo > aLo && bHi >= aHi) {
+            out.add(new PgRange(aLo, bLo, true, false, false));
+            return;
+        }
+        // b is in the middle — two pieces
+        out.add(new PgRange(aLo, bLo, true, false, false));
+        out.add(new PgRange(bHi, aHi, true, false, false));
+    }
+
+    /** Sort and merge overlapping/adjacent ranges. */
+    private static java.util.List<PgRange> mergeAndSort(java.util.List<PgRange> ranges) {
+        if (ranges.isEmpty()) return ranges;
+        // Remove empty ranges
+        java.util.List<PgRange> nonEmpty = new java.util.ArrayList<>();
+        for (PgRange r : ranges) {
+            if (!r.isEmpty()) nonEmpty.add(r);
+        }
+        if (nonEmpty.isEmpty()) return nonEmpty;
+        nonEmpty.sort((a, b) -> Long.compare(a.effectiveLower(), b.effectiveLower()));
+        java.util.List<PgRange> merged = new java.util.ArrayList<>();
+        merged.add(nonEmpty.get(0));
+        for (int i = 1; i < nonEmpty.size(); i++) {
+            PgRange last = merged.get(merged.size() - 1);
+            PgRange curr = nonEmpty.get(i);
+            if (last.effectiveUpper() >= curr.effectiveLower()) {
+                merged.set(merged.size() - 1, merge(last, curr));
+            } else {
+                merged.add(curr);
+            }
+        }
+        return merged;
     }
 }
