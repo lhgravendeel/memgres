@@ -122,19 +122,32 @@ class DdlExecutor {
         switch (tc.type()) {
             case PRIMARY_KEY: {
                 if (name == null) name = tableName + "_pkey";
-                return StoredConstraint.primaryKey(name, resolveConstraintColumns(tc.columns()));
+                StoredConstraint pk = StoredConstraint.primaryKey(name, resolveConstraintColumns(tc.columns()));
+                if (tc.deferrable()) {
+                    pk.setDeferrable(true);
+                    pk.setInitiallyDeferred(tc.initiallyDeferred());
+                }
+                return pk;
             }
             case UNIQUE: {
                 List<String> cols = resolveConstraintColumns(tc.columns());
                 if (name == null) name = tableName + "_" + String.join("_", cols) + "_key";
                 StoredConstraint sc = StoredConstraint.unique(name, cols);
                 if (tc.nullsNotDistinct()) sc.setNullsNotDistinct(true);
+                if (tc.deferrable()) {
+                    sc.setDeferrable(true);
+                    sc.setInitiallyDeferred(tc.initiallyDeferred());
+                }
                 return sc;
             }
             case CHECK: {
                 if (name == null) name = tableName + "_check";
                 StoredConstraint chk = StoredConstraint.check(name, tc.checkExpr());
                 if (tc.notEnforced()) chk.setNotEnforced(true);
+                if (tc.deferrable()) {
+                    chk.setDeferrable(true);
+                    chk.setInitiallyDeferred(tc.initiallyDeferred());
+                }
                 return chk;
             }
             case FOREIGN_KEY: {
@@ -158,6 +171,10 @@ class DdlExecutor {
                     excl.setExcludeElements(tc.excludeElements().stream()
                             .map(e -> new StoredConstraint.ExcludeElement(e.column(), e.operator()))
                             .collect(Collectors.toList()));
+                }
+                if (tc.deferrable()) {
+                    excl.setDeferrable(true);
+                    excl.setInitiallyDeferred(tc.initiallyDeferred());
                 }
                 return excl;
             }

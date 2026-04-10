@@ -409,8 +409,18 @@ class DdlTableParser {
             parser.expect(TokenType.LEFT_PAREN);
             List<String> cols = parser.parseIdentifierList();
             parser.expect(TokenType.RIGHT_PAREN);
+            boolean pkDeferrable = false, pkInitiallyDeferred = false;
+            if (parser.matchKeyword("DEFERRABLE")) {
+                pkDeferrable = true;
+                if (parser.matchKeyword("INITIALLY")) {
+                    if (parser.matchKeyword("DEFERRED")) pkInitiallyDeferred = true;
+                    else parser.matchKeyword("IMMEDIATE");
+                }
+            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
+                parser.advance(); parser.advance();
+            }
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.PRIMARY_KEY,
-                    cols, null, null, null, null, null);
+                    cols, null, null, null, null, null, false, pkDeferrable, pkInitiallyDeferred, false, null);
         }
 
         if (parser.matchKeyword("UNIQUE")) {
@@ -430,8 +440,18 @@ class DdlTableParser {
             parser.expect(TokenType.LEFT_PAREN);
             List<String> cols = parser.parseIdentifierList();
             parser.expect(TokenType.RIGHT_PAREN);
+            boolean uqDeferrable = false, uqInitiallyDeferred = false;
+            if (parser.matchKeyword("DEFERRABLE")) {
+                uqDeferrable = true;
+                if (parser.matchKeyword("INITIALLY")) {
+                    if (parser.matchKeyword("DEFERRED")) uqInitiallyDeferred = true;
+                    else parser.matchKeyword("IMMEDIATE");
+                }
+            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
+                parser.advance(); parser.advance();
+            }
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.UNIQUE,
-                    cols, null, null, null, null, null, nullsNotDistinct);
+                    cols, null, null, null, null, null, nullsNotDistinct, uqDeferrable, uqInitiallyDeferred, false, null);
         }
 
         if (parser.matchKeyword("CHECK")) {
@@ -439,9 +459,19 @@ class DdlTableParser {
             Expression checkExpr = parser.parseExpression();
             parser.expect(TokenType.RIGHT_PAREN);
             parser.matchKeywords("NO", "INHERIT");
+            boolean chkDeferrable = false, chkInitiallyDeferred = false;
+            if (parser.matchKeyword("DEFERRABLE")) {
+                chkDeferrable = true;
+                if (parser.matchKeyword("INITIALLY")) {
+                    if (parser.matchKeyword("DEFERRED")) chkInitiallyDeferred = true;
+                    else parser.matchKeyword("IMMEDIATE");
+                }
+            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
+                parser.advance(); parser.advance();
+            }
             boolean checkNotEnforced = parseNotEnforced();
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.CHECK,
-                    null, checkExpr, null, null, null, null, false, false, false, checkNotEnforced, null);
+                    null, checkExpr, null, null, null, null, false, chkDeferrable, chkInitiallyDeferred, checkNotEnforced, null);
         }
 
         if (parser.matchKeywords("FOREIGN", "KEY")) {
@@ -515,15 +545,18 @@ class DdlTableParser {
                 parser.advance();
                 consumeUntilParen(parser);
             }
+            boolean exDeferrable = false, exInitiallyDeferred = false;
             if (parser.matchKeyword("DEFERRABLE")) {
+                exDeferrable = true;
                 if (parser.matchKeyword("INITIALLY")) {
-                    if (!parser.matchKeyword("DEFERRED")) parser.matchKeyword("IMMEDIATE");
+                    if (parser.matchKeyword("DEFERRED")) exInitiallyDeferred = true;
+                    else parser.matchKeyword("IMMEDIATE");
                 }
-            } else if (parser.matchKeyword("NOT")) {
-                parser.matchKeyword("DEFERRABLE");
+            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
+                parser.advance(); parser.advance();
             }
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.EXCLUDE,
-                    excludeCols, null, null, null, null, null, false, false, false, false, excludeElements);
+                    excludeCols, null, null, null, null, null, false, exDeferrable, exInitiallyDeferred, false, excludeElements);
         }
 
         throw new ParseException("Expected constraint type", parser.peek());

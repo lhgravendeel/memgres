@@ -425,8 +425,18 @@ public class Table {
                 && constraint.getWhereExpr() == null) {
             int[] colIndices = resolveColumnIndices(constraint.getColumns());
             if (colIndices != null) {
-                TableIndex idx = new TableIndex(constraint.getName(), colIndices, true);
-                buildIndex(idx);
+                // Skip building index on virtual columns (computed on read, not stored in row)
+                boolean hasVirtualCol = false;
+                for (int ci : colIndices) {
+                    if (ci < columns.size() && columns.get(ci).isVirtual()) {
+                        hasVirtualCol = true;
+                        break;
+                    }
+                }
+                if (!hasVirtualCol) {
+                    TableIndex idx = new TableIndex(constraint.getName(), colIndices, true);
+                    buildIndex(idx);
+                }
             }
         }
     }

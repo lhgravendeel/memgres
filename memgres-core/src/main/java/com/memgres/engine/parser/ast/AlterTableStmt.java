@@ -125,29 +125,63 @@ public final class AlterTableStmt implements Statement {
     }
         public static final class AddConstraint implements AlterAction {
         public final TableConstraint constraint;
+        public final boolean notValid;
 
         public AddConstraint(TableConstraint constraint) {
+            this(constraint, false);
+        }
+
+        public AddConstraint(TableConstraint constraint, boolean notValid) {
             this.constraint = constraint;
+            this.notValid = notValid;
         }
 
         public TableConstraint constraint() { return constraint; }
+        public boolean notValid() { return notValid; }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             AddConstraint that = (AddConstraint) o;
-            return java.util.Objects.equals(constraint, that.constraint);
+            return notValid == that.notValid && java.util.Objects.equals(constraint, that.constraint);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(constraint);
+            return java.util.Objects.hash(constraint, notValid);
         }
 
         @Override
         public String toString() {
-            return "AddConstraint[constraint=" + constraint + "]";
+            return "AddConstraint[constraint=" + constraint + ", notValid=" + notValid + "]";
+        }
+    }
+    public static final class ValidateConstraint implements AlterAction {
+        public final String constraintName;
+
+        public ValidateConstraint(String constraintName) {
+            this.constraintName = constraintName;
+        }
+
+        public String constraintName() { return constraintName; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            ValidateConstraint that = (ValidateConstraint) o;
+            return java.util.Objects.equals(constraintName, that.constraintName);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(constraintName);
+        }
+
+        @Override
+        public String toString() {
+            return "ValidateConstraint[constraintName=" + constraintName + "]";
         }
     }
         public static final class DropConstraint implements AlterAction {

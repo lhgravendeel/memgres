@@ -28,8 +28,8 @@ class DdlAlterActionParser {
         if (parser.matchKeyword("ADD")) {
             if (tableParser.isTableConstraintStart()) {
                 TableConstraint tc = tableParser.parseTableConstraint();
-                parser.matchKeywords("NOT", "VALID"); // optional NOT VALID, accepted since constraint is added anyway
-                return new AlterTableStmt.AddConstraint(tc);
+                boolean notValid = parser.matchKeywords("NOT", "VALID");
+                return new AlterTableStmt.AddConstraint(tc, notValid);
             }
             // ADD COLUMN without the COLUMN keyword
             return new AlterTableStmt.AddColumn(tableParser.parseColumnDef());
@@ -179,8 +179,7 @@ class DdlAlterActionParser {
         if (parser.matchKeyword("VALIDATE")) {
             parser.expectKeyword("CONSTRAINT");
             String constraintName = parser.readIdentifier();
-            // No-op: we always validate immediately
-            return new AlterTableStmt.RenameTable(null);
+            return new AlterTableStmt.ValidateConstraint(constraintName);
         }
         // REPLICA IDENTITY { DEFAULT | USING INDEX indexname | FULL | NOTHING }, no-op for in-memory db
         if (parser.peek().value().equalsIgnoreCase("REPLICA")

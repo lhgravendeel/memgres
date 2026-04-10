@@ -24,6 +24,10 @@ public class Session {
     private final List<UndoEntry> undoLog = new ArrayList<>();
     private final LinkedHashMap<String, Integer> savepoints = new LinkedHashMap<>();
     private final List<DeferredFkCheck> deferredFkChecks = new ArrayList<>();
+    private boolean allConstraintsDeferred = false; // SET CONSTRAINTS ALL DEFERRED
+    private boolean allConstraintsImmediate = false; // SET CONSTRAINTS ALL IMMEDIATE
+    private final Set<String> immediateConstraintNames = new java.util.HashSet<>();
+    private final Set<String> deferredConstraintNames = new java.util.HashSet<>(); // per-name overrides
     private final java.util.Queue<Notification> pendingNotifications = new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final List<Notification> deferredNotifications = new ArrayList<>(); // notifications pending COMMIT
 
@@ -406,8 +410,23 @@ public class Session {
     public void commit() {
         // Validate deferred constraints before committing
         try {
+            // First, validate deferred PK/UNIQUE constraints (whole-table scan, deduplicated)
+            Set<String> validatedUnique = new java.util.HashSet<>();
             for (DeferredFkCheck check : deferredFkChecks) {
-                executor.constraintValidator.validateForeignKeyDeferred(check.table(), check.row(), check.constraint());
+                StoredConstraint sc = check.constraint();
+                if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
+                    String key = System.identityHashCode(check.table()) + ":" + sc.getName();
+                    if (validatedUnique.add(key)) {
+                        executor.constraintValidator.validateDeferredUniqueness(check.table(), sc);
+                    }
+                }
+            }
+            // Then validate other deferred constraints (CHECK, FK, EXCLUDE)
+            for (DeferredFkCheck check : deferredFkChecks) {
+                StoredConstraint sc = check.constraint();
+                if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) {
+                    executor.constraintValidator.validateDeferredConstraint(check.table(), check.row(), sc);
+                }
             }
         } catch (MemgresException e) {
             // Deferred constraint failed, rollback
@@ -428,6 +447,10 @@ public class Session {
         undoLog.clear();
         savepoints.clear();
         deferredFkChecks.clear();
+        allConstraintsDeferred = false;
+        allConstraintsImmediate = false;
+        deferredConstraintNames.clear();
+        immediateConstraintNames.clear();
         // Flush deferred notifications; they are now committed
         for (Notification n : deferredNotifications) {
             database.getNotificationManager().notify(n.channel(), n.payload(), n.pid());
@@ -473,6 +496,10 @@ public class Session {
         undoLog.clear();
         savepoints.clear();
         deferredFkChecks.clear();
+        allConstraintsDeferred = false;
+        allConstraintsImmediate = false;
+        deferredConstraintNames.clear();
+        immediateConstraintNames.clear();
         // Discard deferred notifications; transaction was rolled back
         deferredNotifications.clear();
         savepointNotifCounts.clear();
@@ -791,6 +818,46 @@ public class Session {
 
     public void addDeferredCheck(Table table, Object[] row, StoredConstraint constraint) {
         deferredFkChecks.add(new DeferredFkCheck(table, row, constraint));
+    }
+
+    public void setAllConstraintsDeferred(boolean deferred) {
+        if (deferred) {
+            this.allConstraintsDeferred = true;
+            this.allConstraintsImmediate = false;
+            immediateConstraintNames.clear();
+        } else {
+            // SET CONSTRAINTS ALL IMMEDIATE
+            this.allConstraintsImmediate = true;
+            this.allConstraintsDeferred = false;
+            deferredConstraintNames.clear();
+        }
+    }
+
+    public void setConstraintDeferred(String constraintName, boolean deferred) {
+        String lcName = constraintName.toLowerCase();
+        if (deferred) {
+            deferredConstraintNames.add(lcName);
+            immediateConstraintNames.remove(lcName);
+        } else {
+            immediateConstraintNames.add(lcName);
+            deferredConstraintNames.remove(lcName);
+        }
+    }
+
+    /** Check if a constraint should be deferred right now (SET CONSTRAINTS overrides). */
+    public boolean isConstraintCurrentlyDeferred(StoredConstraint sc) {
+        if (!sc.isDeferrable()) return false;
+        // Per-constraint explicit override takes priority
+        if (sc.getName() != null) {
+            String lcName = sc.getName().toLowerCase();
+            if (deferredConstraintNames.contains(lcName)) return true;
+            if (immediateConstraintNames.contains(lcName)) return false;
+        }
+        // SET CONSTRAINTS ALL overrides
+        if (allConstraintsDeferred) return true;
+        if (allConstraintsImmediate) return false;
+        // Fall back to constraint's own INITIALLY DEFERRED setting
+        return sc.isInitiallyDeferred();
     }
 
     // ---- MVCC visibility tracking ----

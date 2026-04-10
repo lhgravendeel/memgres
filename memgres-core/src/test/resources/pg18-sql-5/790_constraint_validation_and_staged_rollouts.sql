@@ -20,7 +20,7 @@ FOREIGN KEY (parent_id) REFERENCES parent(parent_id) NOT VALID;
 
 -- begin-expected
 -- columns: conname,convalidated
--- row: child_parent_fk|t
+-- row: child_parent_fk|f
 -- end-expected
 SELECT conname, convalidated
 FROM pg_constraint

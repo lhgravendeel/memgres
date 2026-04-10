@@ -344,8 +344,23 @@ class UtilityParser {
         // SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }
         if (parser.checkKeyword("CONSTRAINTS")) {
             parser.advance();
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("constraints", "");
+            List<String> constraintNames = new ArrayList<>();
+            if (parser.matchKeyword("ALL")) {
+                constraintNames.add("ALL");
+            } else {
+                constraintNames.add(parser.readIdentifier());
+                while (parser.match(TokenType.COMMA)) {
+                    constraintNames.add(parser.readIdentifier());
+                }
+            }
+            String mode = "IMMEDIATE";
+            if (parser.matchKeyword("DEFERRED")) {
+                mode = "DEFERRED";
+            } else {
+                parser.matchKeyword("IMMEDIATE");
+            }
+            // Encode as "constraints:ALL:DEFERRED" or "constraints:name1,name2:IMMEDIATE"
+            return new SetStmt("constraints", String.join(",", constraintNames) + ":" + mode);
         }
 
         // SET TRANSACTION [ISOLATION LEVEL ...] [READ ONLY|WRITE] [NOT DEFERRABLE|DEFERRABLE]

@@ -32,18 +32,35 @@ class ConstraintValidator {
         for (StoredConstraint sc : table.getConstraints()) {
             // PG 18: NOT ENFORCED constraints are stored but not validated
             if (sc.isNotEnforced()) continue;
+
+            // Deferred constraint handling: defer to COMMIT if currently deferred
+            boolean shouldDefer = sc.isDeferrable() && executor.session != null && executor.session.isInTransaction()
+                    && executor.session.isConstraintCurrentlyDeferred(sc);
+
             switch (sc.getType()) {
                 case PRIMARY_KEY:
-                    validateUniqueness(table, row, sc.getColumns(), excludeRow, true, sc.getName(), false, null, null);
+                    if (shouldDefer) {
+                        executor.session.addDeferredCheck(table, row, sc);
+                    } else {
+                        validateUniqueness(table, row, sc.getColumns(), excludeRow, true, sc.getName(), false, null, null);
+                    }
                     break;
                 case UNIQUE:
-                    validateUniqueness(table, row, sc.getColumns(), excludeRow, false, sc.getName(), sc.isNullsNotDistinct(), sc.getWhereExpr(), sc.getExpressionColumns());
+                    if (shouldDefer) {
+                        executor.session.addDeferredCheck(table, row, sc);
+                    } else {
+                        validateUniqueness(table, row, sc.getColumns(), excludeRow, false, sc.getName(), sc.isNullsNotDistinct(), sc.getWhereExpr(), sc.getExpressionColumns());
+                    }
                     break;
                 case CHECK:
-                    validateCheck(table, row, sc);
+                    if (shouldDefer) {
+                        executor.session.addDeferredCheck(table, row, sc);
+                    } else {
+                        validateCheck(table, row, sc);
+                    }
                     break;
                 case FOREIGN_KEY: {
-                    if (sc.isCurrentlyDeferred() && executor.session != null && executor.session.isInTransaction()) {
+                    if (shouldDefer) {
                         executor.session.addDeferredCheck(table, row, sc);
                     } else {
                         validateForeignKey(table, row, sc);
@@ -51,7 +68,11 @@ class ConstraintValidator {
                     break;
                 }
                 case EXCLUDE:
-                    validateExclude(table, row, sc, excludeRow);
+                    if (shouldDefer) {
+                        executor.session.addDeferredCheck(table, row, sc);
+                    } else {
+                        validateExclude(table, row, sc, excludeRow);
+                    }
                     break;
             }
         }
@@ -61,6 +82,11 @@ class ConstraintValidator {
                                     Object[] excludeRow, boolean isPK, String constraintName,
                                     boolean nullsNotDistinct, com.memgres.engine.parser.ast.Expression whereExpr,
                                     java.util.List<com.memgres.engine.parser.ast.Expression> exprColumns) {
+        // Compute virtual column values so uniqueness checks work on virtual columns
+        boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
+        if (hasVirtual) {
+            newRow = executor.dmlExecutor.computeVirtualColumns(table, newRow);
+        }
         // For partial unique indexes, check if the new row satisfies the WHERE predicate
         if (whereExpr != null) {
             RowContext newCtx = new RowContext(table, null, newRow);
@@ -88,15 +114,17 @@ class ConstraintValidator {
             for (Object[] existingRow : table.getRows()) {
                 if (excludeRow != null && existingRow == excludeRow) continue;
 
+                Object[] evalExisting = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, existingRow) : existingRow;
+
                 if (whereExpr != null) {
-                    RowContext existingCtx = new RowContext(table, null, existingRow);
+                    RowContext existingCtx = new RowContext(table, null, evalExisting);
                     Object existingResult = executor.evalExpr(whereExpr, existingCtx);
                     if (!(existingResult instanceof Boolean && ((Boolean) existingResult))) {
                         continue;
                     }
                 }
 
-                RowContext existingCtx = new RowContext(table, null, existingRow);
+                RowContext existingCtx = new RowContext(table, null, evalExisting);
                 boolean allMatch = true;
                 for (int i = 0; i < exprColumns.size(); i++) {
                     Object existingVal = executor.evalExpr(exprColumns.get(i), existingCtx);
@@ -161,9 +189,11 @@ class ConstraintValidator {
         for (Object[] existingRow : table.getRows()) {
             if (excludeRow != null && existingRow == excludeRow) continue;
 
+            Object[] evalExisting = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, existingRow) : existingRow;
+
             // For partial unique indexes, only check rows that satisfy the WHERE predicate
             if (whereExpr != null) {
-                RowContext existingCtx = new RowContext(table, null, existingRow);
+                RowContext existingCtx = new RowContext(table, null, evalExisting);
                 Object existingResult = executor.evalExpr(whereExpr, existingCtx);
                 if (!(existingResult instanceof Boolean && ((Boolean) existingResult))) {
                     continue; // Existing row doesn't satisfy predicate, skip
@@ -172,7 +202,7 @@ class ConstraintValidator {
 
             boolean allMatch = true;
             for (int i = 0; i < colIndices.length; i++) {
-                Object existingVal = existingRow[colIndices[i]];
+                Object existingVal = evalExisting[colIndices[i]];
                 if (!valuesEqual(newVals[i], existingVal)) {
                     allMatch = false;
                     break;
@@ -202,6 +232,59 @@ class ConstraintValidator {
     /** Package-visible for deferred constraint checking from Session.commit(). */
     void validateForeignKeyDeferred(Table table, Object[] row, StoredConstraint sc) {
         validateForeignKey(table, row, sc);
+    }
+
+    /** Validate a deferred constraint at commit time. Dispatches by constraint type. */
+    void validateDeferredConstraint(Table table, Object[] row, StoredConstraint sc) {
+        switch (sc.getType()) {
+            case PRIMARY_KEY:
+            case UNIQUE:
+                // For PK/UNIQUE, validate the whole table for duplicates (handled separately via validateDeferredUniqueness)
+                break;
+            case CHECK:
+                validateCheck(table, row, sc);
+                break;
+            case FOREIGN_KEY:
+                validateForeignKey(table, row, sc);
+                break;
+            case EXCLUDE:
+                validateExclude(table, row, sc, null);
+                break;
+        }
+    }
+
+    /**
+     * Validate deferred PK/UNIQUE constraint by scanning the entire table for duplicates.
+     * Called once per (table, constraint) pair at commit time.
+     */
+    void validateDeferredUniqueness(Table table, StoredConstraint sc) {
+        boolean isPK = sc.getType() == StoredConstraint.Type.PRIMARY_KEY;
+        List<String> columns = sc.getColumns();
+        boolean nullsNotDistinct = sc.isNullsNotDistinct();
+
+        int[] colIndices = new int[columns.size()];
+        for (int i = 0; i < columns.size(); i++) {
+            colIndices[i] = table.getColumnIndex(columns.get(i));
+            if (colIndices[i] < 0) return;
+        }
+
+        Set<TableIndex.IndexKey> seen = new HashSet<>();
+        for (Object[] row : table.getRows()) {
+            Object[] vals = new Object[colIndices.length];
+            boolean hasNull = false;
+            for (int i = 0; i < colIndices.length; i++) {
+                vals[i] = TableIndex.normalize(row[colIndices[i]]);
+                if (vals[i] == null) hasNull = true;
+            }
+            // NULLs are distinct by default (skip), unless NULLS NOT DISTINCT
+            if (hasNull && !isPK && !nullsNotDistinct) continue;
+            TableIndex.IndexKey key = new TableIndex.IndexKey(vals);
+            if (!seen.add(key)) {
+                throw new MemgresException(
+                        "duplicate key value violates unique constraint \"" + sc.getName() + "\"",
+                        "23505");
+            }
+        }
     }
 
     private void validateForeignKey(Table table, Object[] row, StoredConstraint sc) {

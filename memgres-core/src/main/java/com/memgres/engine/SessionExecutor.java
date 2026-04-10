@@ -330,6 +330,27 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, "ALTER DATABASE");
         }
 
+        // SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }
+        if ("constraints".equals(name) && stmt.value() != null && !stmt.value().isEmpty()) {
+            String val = stmt.value();
+            int colonIdx = val.lastIndexOf(':');
+            if (colonIdx > 0) {
+                String namesStr = val.substring(0, colonIdx);
+                String mode = val.substring(colonIdx + 1);
+                boolean deferred = "DEFERRED".equalsIgnoreCase(mode);
+                if (executor.session != null) {
+                    if ("ALL".equals(namesStr)) {
+                        executor.session.setAllConstraintsDeferred(deferred);
+                    } else {
+                        for (String cn : namesStr.split(",")) {
+                            executor.session.setConstraintDeferred(cn.trim(), deferred);
+                        }
+                    }
+                }
+                return QueryResult.message(QueryResult.Type.SET, "SET CONSTRAINTS");
+            }
+        }
+
         Set<String> internalNames = Cols.setOf("constraints", "transaction",
                 "create_noop", "alter_noop", "drop_noop",
                 "drop_owned", "reassign_owned", "do_block", "comment",

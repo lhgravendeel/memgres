@@ -925,4 +925,226 @@ class VirtualGeneratedColumnTest {
         exec("INSERT INTO t1(id, a) VALUES (1, NULL)");
         assertNull(scalar("SELECT b FROM t1 WHERE id = 1"));
     }
+
+    // ========================================================================
+    // Index on virtual column
+    // ========================================================================
+
+    @Test
+    void create_index_on_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 10), (2, 20), (3, 30)");
+        // PG 18 allows indexes on virtual generated columns
+        exec("CREATE INDEX idx_t1_b ON t1 (b)");
+        // Data still readable
+        List<List<String>> rows = query("SELECT id, b FROM t1 ORDER BY b");
+        assertEquals(3, rows.size());
+        assertEquals("20", rows.get(0).get(1));
+        assertEquals("40", rows.get(1).get(1));
+        assertEquals("60", rows.get(2).get(1));
+    }
+
+    @Test
+    void create_unique_index_on_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 10), (2, 20)");
+        // UNIQUE index on virtual column
+        exec("CREATE UNIQUE INDEX idx_t1_b_uniq ON t1 (b)");
+        // Verify it still works
+        assertEquals("20", scalar("SELECT b FROM t1 WHERE id = 1"));
+    }
+
+    @Test
+    void unique_index_on_virtual_column_detects_duplicates() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a / 2) VIRTUAL)");
+        // a=4 → b=2, a=5 → b=2 — duplicate virtual values
+        exec("INSERT INTO t1(id, a) VALUES (1, 4), (2, 5)");
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE UNIQUE INDEX idx_t1_b_dup ON t1 (b)"));
+        assertEquals("23505", ex.getSQLState());
+    }
+
+    // ========================================================================
+    // Expression index on function of virtual column
+    // ========================================================================
+
+    @Test
+    void expression_index_on_function_of_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, name text, " +
+             "display text GENERATED ALWAYS AS (upper(name)) VIRTUAL)");
+        exec("INSERT INTO t1(id, name) VALUES (1, 'alice'), (2, 'bob')");
+        // Create expression index on a function of the virtual column
+        exec("CREATE INDEX idx_lower_display ON t1 ((lower(display)))");
+        // Verify data still works
+        assertEquals("ALICE", scalar("SELECT display FROM t1 WHERE id = 1"));
+    }
+
+    @Test
+    void unique_expression_index_on_virtual_column_function() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 10)");
+        // UNIQUE expression index on function of virtual column
+        // b values: 10, 20. b*10 values: 100, 200 — unique
+        exec("CREATE UNIQUE INDEX idx_b_times10 ON t1 ((b * 10))");
+        // Should exist in catalog
+        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_b_times10'"));
+    }
+
+    @Test
+    void expression_index_on_virtual_column_cast() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a + 100) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 15)");
+        // Expression index casting virtual column to text
+        exec("CREATE INDEX idx_b_text ON t1 ((b::text))");
+        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_b_text'"));
+    }
+
+    // ========================================================================
+    // Volatile function rejection: virtual columns
+    // ========================================================================
+
+    @Test
+    void virtual_column_rejects_volatile_gen_random_uuid() {
+        assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, uid uuid GENERATED ALWAYS AS (gen_random_uuid()) VIRTUAL)"),
+                "gen_random_uuid() is volatile, should be rejected in virtual column");
+    }
+
+    @Test
+    void virtual_column_rejects_volatile_clock_timestamp() {
+        assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, ts timestamp GENERATED ALWAYS AS (clock_timestamp()) VIRTUAL)"),
+                "clock_timestamp() is volatile, should be rejected in virtual column");
+    }
+
+    @Test
+    void virtual_column_rejects_volatile_timeofday() {
+        assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, ts text GENERATED ALWAYS AS (timeofday()) VIRTUAL)"),
+                "timeofday() is volatile, should be rejected in virtual column");
+    }
+
+    @Test
+    void virtual_column_rejects_current_date() {
+        assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, d date GENERATED ALWAYS AS (current_date) VIRTUAL)"),
+                "current_date is not immutable, should be rejected");
+    }
+
+    @Test
+    void virtual_column_rejects_current_time() {
+        assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, t time GENERATED ALWAYS AS (current_time) VIRTUAL)"),
+                "current_time is not immutable, should be rejected");
+    }
+
+    // ========================================================================
+    // Volatile function rejection: expression indexes on virtual columns
+    // ========================================================================
+
+    @Test
+    void expression_index_rejects_volatile_on_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        // Expression index using volatile function + virtual column should fail
+        assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_bad ON t1 ((random() + b))"),
+                "random() in index expression must be rejected");
+    }
+
+    @Test
+    void expression_index_rejects_now_on_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a + 1) VIRTUAL)");
+        assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_bad ON t1 ((now()))"),
+                "now() in index expression must be rejected");
+    }
+
+    @Test
+    void expression_index_rejects_gen_random_uuid() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, name text)");
+        assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_bad ON t1 ((gen_random_uuid()))"),
+                "gen_random_uuid() in index expression must be rejected");
+    }
+
+    // ========================================================================
+    // Unique expression index on virtual column: duplicate enforcement
+    // ========================================================================
+
+    @Test
+    void unique_expression_index_on_virtual_column_rejects_duplicate() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("CREATE UNIQUE INDEX idx_b_unique ON t1 ((b * 10))");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");  // b=10, b*10=100
+        // a=5 → b=10 → b*10=100 — duplicate of first row
+        assertThrows(SQLException.class, () ->
+                exec("INSERT INTO t1(id, a) VALUES (2, 5)"),
+                "Should reject duplicate in unique expression index on virtual column");
+    }
+
+    @Test
+    void unique_index_on_virtual_column_rejects_duplicate() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("CREATE UNIQUE INDEX idx_b ON t1 (b)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5)");  // b=10
+        // a=5 → b=10 — duplicate
+        assertThrows(SQLException.class, () ->
+                exec("INSERT INTO t1(id, a) VALUES (2, 5)"),
+                "Should reject duplicate on virtual column unique index");
+    }
+
+    // ========================================================================
+    // Index on virtual column: maintenance across DML
+    // ========================================================================
+
+    @Test
+    void unique_index_on_virtual_column_after_update() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("CREATE UNIQUE INDEX idx_b_upd ON t1 (b)");
+        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 10)"); // b=10, b=20
+        // Updating a to make b collide with existing value
+        assertThrows(SQLException.class, () ->
+                exec("UPDATE t1 SET a = 10 WHERE id = 1"), // b would become 20, duplicate
+                "Should reject update causing duplicate on virtual column unique index");
+    }
+
+    @Test
+    void drop_index_on_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a + 100) VIRTUAL)");
+        exec("CREATE INDEX idx_b_drop ON t1 (b)");
+        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_b_drop'"));
+        exec("DROP INDEX idx_b_drop");
+        assertEquals("0", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_b_drop'"));
+    }
+
+    @Test
+    void immutable_function_in_expression_index_on_virtual_column_accepted() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
+        exec("INSERT INTO t1(id, a) VALUES (1, -5), (2, 10)");
+        // abs() is immutable — should be accepted in expression index on virtual column
+        exec("CREATE INDEX idx_abs_b ON t1 ((abs(b)))");
+        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_abs_b'"));
+    }
+
+    @Test
+    void multiple_indexes_on_virtual_column() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
+             "b int GENERATED ALWAYS AS (a + 1) VIRTUAL)");
+        exec("CREATE INDEX idx_multi_b1 ON t1 (b)");
+        exec("CREATE INDEX idx_multi_b2 ON t1 ((b * 2))");
+        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_multi_b1'"));
+        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_multi_b2'"));
+    }
 }
