@@ -117,28 +117,29 @@ class DdlFunctionParser {
         String language = "sql";
         boolean[] secDefRef = {false};
         boolean[] strictRef = {false};
+        boolean[] leakproofRef = {false};
         String[] volatilityRef = {"VOLATILE"};
         java.util.Map<String, String> setClauses = new java.util.LinkedHashMap<>();
 
         if (parser.matchKeyword("AS")) {
             body = readFunctionBody();
-            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, setClauses);
+            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses);
             if (parser.matchKeyword("LANGUAGE")) {
                 language = parser.readIdentifierOrString();
             }
         } else if (parser.matchKeyword("LANGUAGE")) {
             language = parser.readIdentifierOrString();
-            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, setClauses);
+            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses);
             if (parser.matchKeyword("AS")) {
                 body = readFunctionBody();
             }
         }
 
-        parseFunctionAttributes(secDefRef, strictRef, volatilityRef, setClauses);
+        parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses);
 
         return new CreateFunctionStmt(name, schema, rawParams.toString().trim(), parsedParams,
                 returnType, body != null ? body : "", language, orReplace, isProcedure, secDefRef[0], strictRef[0],
-                volatilityRef[0], setClauses.isEmpty() ? null : setClauses);
+                leakproofRef[0], volatilityRef[0], setClauses.isEmpty() ? null : setClauses);
     }
 
     CallStmt parseCall() {
@@ -185,7 +186,8 @@ class DdlFunctionParser {
     }
 
     private void parseFunctionAttributes(boolean[] securityDefinerRef, boolean[] strictRef,
-                                          String[] volatilityRef, java.util.Map<String, String> setClauses) {
+                                          String[] volatilityRef, boolean[] leakproofRef,
+                                          java.util.Map<String, String> setClauses) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
             Token t = parser.peek();
             if (t.type() == TokenType.KEYWORD) {
@@ -193,7 +195,7 @@ class DdlFunctionParser {
                 if (kw.equals("IMMUTABLE") || kw.equals("STABLE") || kw.equals("VOLATILE") ||
                         kw.equals("STRICT") || kw.equals("SECURITY") || kw.equals("COST") ||
                         kw.equals("PARALLEL") || kw.equals("CALLED") || kw.equals("RETURNS") ||
-                        kw.equals("ROWS")) {
+                        kw.equals("ROWS") || kw.equals("LEAKPROOF") || kw.equals("SUPPORT")) {
                     parser.advance();
                     if (kw.equals("IMMUTABLE") || kw.equals("STABLE") || kw.equals("VOLATILE")) {
                         volatilityRef[0] = kw;
@@ -207,8 +209,15 @@ class DdlFunctionParser {
                     if (kw.equals("COST")) parser.advance();
                     if (kw.equals("ROWS")) parser.advance();
                     if (kw.equals("PARALLEL")) parser.readIdentifier();
+                    if (kw.equals("SUPPORT")) parser.readIdentifier(); // consume support function name
+                    if (kw.equals("LEAKPROOF")) { leakproofRef[0] = true; }
                     if (kw.equals("CALLED")) { parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = false; }
                     if (kw.equals("RETURNS")) { parser.matchKeyword("NULL"); parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = true; }
+                    continue;
+                }
+                // NOT LEAKPROOF — two keywords
+                if (kw.equals("NOT") && parser.matchKeywords("NOT", "LEAKPROOF")) {
+                    leakproofRef[0] = false;
                     continue;
                 }
                 if (kw.equals("SET")) {
@@ -237,6 +246,7 @@ class DdlFunctionParser {
         return kw.equals("IMMUTABLE") || kw.equals("STABLE") || kw.equals("VOLATILE") ||
                 kw.equals("STRICT") || kw.equals("SECURITY") || kw.equals("COST") ||
                 kw.equals("PARALLEL") || kw.equals("CALLED") || kw.equals("RETURNS") ||
-                kw.equals("ROWS") || kw.equals("SET") || kw.equals("LANGUAGE");
+                kw.equals("ROWS") || kw.equals("SET") || kw.equals("LANGUAGE") ||
+                kw.equals("LEAKPROOF") || kw.equals("SUPPORT") || kw.equals("NOT");
     }
 }

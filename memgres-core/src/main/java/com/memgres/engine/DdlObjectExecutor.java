@@ -377,6 +377,7 @@ class DdlObjectExecutor {
         pgFunc.setSchemaName(executor.defaultSchema());
         pgFunc.setSecurityDefiner(stmt.securityDefiner());
         pgFunc.setStrict(stmt.strict());
+        pgFunc.setLeakproof(stmt.leakproof());
         pgFunc.setVolatility(stmt.volatility());
         pgFunc.setSetClauses(stmt.setClauses());
         pgFunc.setOwner(executor.sessionUser());

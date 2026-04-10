@@ -157,6 +157,7 @@ class DdlParser {
         DropStmt.ObjectType objectType;
         if (parser.matchKeyword("FUNCTION")) objectType = DropStmt.ObjectType.FUNCTION;
         else if (parser.matchKeyword("PROCEDURE")) objectType = DropStmt.ObjectType.FUNCTION;
+        else if (parser.matchKeyword("ROUTINE")) objectType = DropStmt.ObjectType.FUNCTION;
         else if (parser.matchKeyword("TRIGGER")) objectType = DropStmt.ObjectType.TRIGGER;
         else if (parser.matchKeyword("TYPE")) objectType = DropStmt.ObjectType.TYPE;
         else if (parser.matchKeyword("INDEX")) objectType = DropStmt.ObjectType.INDEX;
@@ -356,14 +357,14 @@ class DdlParser {
         if (parser.matchKeyword("DOMAIN")) return parseAlterDomain();
 
         if (parser.matchKeyword("FUNCTION")) {
-            String funcName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) funcName = parser.readIdentifier();
-            if (parser.check(TokenType.LEFT_PAREN)) DdlTableParser.consumeUntilParen(parser);
-            if (parser.matchKeywords("OWNER", "TO")) {
-                return new AlterFunctionOwnerStmt(funcName, parser.readIdentifier());
-            }
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("alter_noop", "ok");
+            return parseAlterFunctionOrProcedure(false);
+        }
+        if (parser.matchKeyword("PROCEDURE")) {
+            return parseAlterFunctionOrProcedure(true);
+        }
+        // ALTER ROUTINE is PG's alias that works for both functions and procedures
+        if (parser.matchKeyword("ROUTINE")) {
+            return parseAlterFunctionOrProcedure(false);
         }
 
         if (parser.matchKeyword("DATABASE")) {
@@ -394,11 +395,14 @@ class DdlParser {
         if (parser.matchKeywords("OPERATOR", "FAMILY")) return parseAlterOperatorFamily();
         if (parser.matchKeyword("OPERATOR")) return parseAlterOperator();
 
+        if (parser.matchKeyword("INDEX")) {
+            return parseAlterIndex();
+        }
+
         // No-op ALTER targets
-        if (parser.matchKeyword("PROCEDURE") || parser.matchKeyword("EXTENSION")
+        if (parser.matchKeyword("EXTENSION")
                 || parser.matchKeyword("AGGREGATE") || parser.matchKeyword("COLLATION")
                 || parser.matchKeyword("RULE") || parser.matchKeyword("CONVERSION")
-                || parser.matchKeyword("INDEX")
                 || parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")
                 || parser.matchKeyword("SERVER")
                 || parser.matchKeywords("USER", "MAPPING")
@@ -1130,6 +1134,168 @@ class DdlParser {
             }
         }
         return new CreateOperatorClassStmt(schema, name, isDefault, forType, method, familyName);
+    }
+
+    // ---- ALTER FUNCTION / ALTER PROCEDURE ----
+
+    private Statement parseAlterFunctionOrProcedure(boolean isProcedure) {
+        boolean ifExists = parser.matchKeywords("IF", "EXISTS");
+        // Read function/procedure name (possibly schema-qualified)
+        String schema = null;
+        String funcName = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) { schema = funcName; funcName = parser.readIdentifier(); }
+        // Consume parameter list if present
+        if (parser.check(TokenType.LEFT_PAREN)) DdlTableParser.consumeUntilParen(parser);
+
+        // RENAME TO
+        if (parser.matchKeywords("RENAME", "TO")) {
+            String newName = parser.readIdentifier();
+            return AlterFunctionStmt.renameTo(funcName, schema, isProcedure, ifExists, newName);
+        }
+        // SET SCHEMA
+        if (parser.matchKeywords("SET", "SCHEMA")) {
+            String newSchema = parser.readIdentifier();
+            return AlterFunctionStmt.setSchema(funcName, schema, isProcedure, ifExists, newSchema);
+        }
+        // OWNER TO
+        if (parser.matchKeywords("OWNER", "TO")) {
+            String newOwner = parser.readIdentifier();
+            return AlterFunctionStmt.ownerTo(funcName, schema, isProcedure, ifExists, newOwner);
+        }
+
+        // Attribute changes: VOLATILE, STABLE, IMMUTABLE, STRICT, CALLED ON NULL INPUT,
+        // RETURNS NULL ON NULL INPUT, SECURITY DEFINER/INVOKER, LEAKPROOF, NOT LEAKPROOF,
+        // COST n, ROWS n, PARALLEL {SAFE|RESTRICTED|UNSAFE}, SET/RESET config
+        String volatility = null;
+        Boolean strict = null;
+        Boolean securityDefiner = null;
+        Boolean leakproof = null;
+        Double cost = null;
+        Double rows = null;
+        String parallel = null;
+        java.util.Map<String, String> setClauses = null;
+        java.util.List<String> resetParams = null;
+
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            if (parser.matchKeyword("VOLATILE")) {
+                volatility = "VOLATILE";
+            } else if (parser.matchKeyword("STABLE")) {
+                volatility = "STABLE";
+            } else if (parser.matchKeyword("IMMUTABLE")) {
+                volatility = "IMMUTABLE";
+            } else if (parser.matchKeyword("STRICT")) {
+                strict = true;
+            } else if (parser.matchKeywords("CALLED", "ON", "NULL", "INPUT")) {
+                strict = false;
+            } else if (parser.matchKeywords("RETURNS", "NULL", "ON", "NULL", "INPUT")) {
+                strict = true;
+            } else if (parser.matchKeywords("SECURITY", "DEFINER")) {
+                securityDefiner = true;
+            } else if (parser.matchKeywords("SECURITY", "INVOKER")) {
+                securityDefiner = false;
+            } else if (parser.matchKeywords("NOT", "LEAKPROOF")) {
+                leakproof = false;
+            } else if (parser.matchKeyword("LEAKPROOF")) {
+                leakproof = true;
+            } else if (parser.matchKeyword("COST")) {
+                cost = Double.parseDouble(parser.advance().value());
+            } else if (parser.matchKeyword("ROWS")) {
+                rows = Double.parseDouble(parser.advance().value());
+            } else if (parser.matchKeywords("PARALLEL", "SAFE")) {
+                parallel = "SAFE";
+            } else if (parser.matchKeywords("PARALLEL", "RESTRICTED")) {
+                parallel = "RESTRICTED";
+            } else if (parser.matchKeywords("PARALLEL", "UNSAFE")) {
+                parallel = "UNSAFE";
+            } else if (parser.matchKeyword("RESET")) {
+                if (parser.matchKeyword("ALL")) {
+                    if (resetParams == null) resetParams = new ArrayList<>();
+                    resetParams.add("ALL");
+                } else {
+                    String param = parser.readIdentifier();
+                    if (resetParams == null) resetParams = new ArrayList<>();
+                    resetParams.add(param);
+                }
+            } else if (parser.matchKeyword("SET")) {
+                String param = parser.readIdentifier();
+                if (parser.matchKeyword("TO") || parser.match(TokenType.EQUALS)) {
+                    StringBuilder val = new StringBuilder();
+                    while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)
+                            && !parser.checkKeyword("SET") && !parser.checkKeyword("RESET")
+                            && !parser.checkKeyword("VOLATILE") && !parser.checkKeyword("STABLE")
+                            && !parser.checkKeyword("IMMUTABLE") && !parser.checkKeyword("STRICT")
+                            && !parser.checkKeyword("COST") && !parser.checkKeyword("ROWS")
+                            && !parser.checkKeyword("SECURITY") && !parser.checkKeyword("PARALLEL")
+                            && !parser.checkKeyword("CALLED") && !parser.checkKeyword("RETURNS")
+                            && !parser.checkKeyword("LEAKPROOF")) {
+                        if (val.length() > 0) val.append(" ");
+                        val.append(parser.advance().value());
+                    }
+                    if (setClauses == null) setClauses = new java.util.LinkedHashMap<>();
+                    setClauses.put(param, val.toString());
+                } else if (parser.matchKeywords("FROM", "CURRENT")) {
+                    if (setClauses == null) setClauses = new java.util.LinkedHashMap<>();
+                    setClauses.put(param, "FROM CURRENT");
+                }
+            } else {
+                // Unknown attribute — skip it
+                parser.advance();
+            }
+        }
+
+        return new AlterFunctionStmt(funcName, schema, isProcedure, ifExists, AlterFunctionStmt.Action.SET_ATTRIBUTES,
+                null, volatility, strict, securityDefiner, leakproof, cost, rows, parallel, setClauses, resetParams);
+    }
+
+    // ---- ALTER INDEX ----
+
+    private Statement parseAlterIndex() {
+        boolean ifExists = parser.matchKeywords("IF", "EXISTS");
+
+        // Handle ALL IN TABLESPACE (no-op)
+        if (parser.matchKeyword("ALL")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_noop", "ok");
+        }
+
+        String indexName = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) indexName = parser.readIdentifier();
+
+        // RENAME TO
+        if (parser.matchKeywords("RENAME", "TO")) {
+            String newName = parser.readIdentifier();
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.RENAME_TO, newName);
+        }
+        // SET TABLESPACE (no-op)
+        if (parser.matchKeywords("SET", "TABLESPACE")) {
+            String tablespace = parser.readIdentifier();
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.SET_TABLESPACE, tablespace);
+        }
+        // ATTACH PARTITION (no-op)
+        if (parser.matchKeywords("ATTACH", "PARTITION")) {
+            String partIdx = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) partIdx = parser.readIdentifier();
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.ATTACH_PARTITION, partIdx);
+        }
+        // ALTER COLUMN n SET STATISTICS n (no-op)
+        if (parser.matchKeywords("ALTER", "COLUMN")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.SET_STATISTICS, null);
+        }
+        // SET ( ... ) (no-op)
+        if (parser.matchKeyword("SET")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.SET_PARAMS, null);
+        }
+        // RESET ( ... ) (no-op)
+        if (parser.matchKeyword("RESET")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.RESET_PARAMS, null);
+        }
+
+        // Fallback: consume and no-op
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.NO_OP, null);
     }
 
     // ---- ALTER OPERATOR ----
