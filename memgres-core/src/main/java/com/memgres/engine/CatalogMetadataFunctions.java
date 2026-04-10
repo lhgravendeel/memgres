@@ -116,7 +116,24 @@ class CatalogMetadataFunctions {
                 return null;
             }
             case "pg_get_partkeydef": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                if (fn.args().isEmpty()) return null;
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                int targetOid;
+                if (arg instanceof Number) targetOid = ((Number) arg).intValue();
+                else try { targetOid = Integer.parseInt(arg.toString().trim()); } catch (NumberFormatException e) { return null; }
+                // Resolve OID to table, return partition key definition
+                for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
+                    for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                        Table t = tableEntry.getValue();
+                        int tblOid = executor.systemCatalog.getOidMap()
+                                .getOrDefault("rel:" + schemaEntry.getKey() + "." + t.getName(), -1);
+                        if (tblOid == targetOid && t.getPartitionStrategy() != null) {
+                            String col = t.getPartitionColumn();
+                            return t.getPartitionStrategy().toLowerCase() + " (" + (col != null ? col : "") + ")";
+                        }
+                    }
+                }
                 return null;
             }
             case "pg_get_viewdef":

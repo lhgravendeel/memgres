@@ -50,6 +50,7 @@ class FromFunctionResolver {
             return resolvePgOptionsToTable(alias, colAliases, evalArgs);
         if (fname.equals("pg_get_sequence_data") || fname.equals("pg_catalog.pg_get_sequence_data"))
             return resolvePgGetSequenceData(alias, colAliases, evalArgs);
+        if (fname.equals("string_to_table")) return resolveStringToTable(alias, colAliases, evalArgs);
         if (fname.startsWith("__tablesample__:")) return resolveTablesample(fname, alias, evalArgs);
         if (fname.equals("__rows_from__")) return resolveRowsFrom(funcFrom, alias, colAliases);
 
@@ -115,6 +116,37 @@ class FromFunctionResolver {
     }
 
     // ---- generate_subscripts ----
+
+    private List<RowContext> resolveStringToTable(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.isEmpty()) throw new MemgresException("function string_to_table() requires at least 2 arguments", "42883");
+        Object strObj = evalArgs.get(0);
+        Object delimObj = evalArgs.size() > 1 ? evalArgs.get(1) : null;
+        if (strObj == null) return new ArrayList<>();
+        String str = strObj.toString();
+        String colName = firstColAlias(colAliases, alias);
+        Column col = new Column(colName, DataType.TEXT, true, false, null);
+        Table virtualTable = new Table(alias, Cols.listOf(col));
+        List<RowContext> contexts = new ArrayList<>();
+        if (delimObj == null) {
+            // NULL delimiter: each character as separate row
+            for (int i = 0; i < str.length(); i++) {
+                Object[] row = new Object[]{ String.valueOf(str.charAt(i)) };
+                virtualTable.insertRow(row);
+                contexts.add(new RowContext(virtualTable, alias, row));
+            }
+        } else {
+            String delim = delimObj.toString();
+            String nullStr = evalArgs.size() > 2 && evalArgs.get(2) != null ? evalArgs.get(2).toString() : null;
+            String[] parts = delim.isEmpty() ? new String[]{ str } : str.split(java.util.regex.Pattern.quote(delim), -1);
+            for (String part : parts) {
+                Object val = (nullStr != null && part.equals(nullStr)) ? null : part;
+                Object[] row = new Object[]{ val };
+                virtualTable.insertRow(row);
+                contexts.add(new RowContext(virtualTable, alias, row));
+            }
+        }
+        return contexts;
+    }
 
     private List<RowContext> resolveGenerateSubscripts(String alias, List<String> colAliases, List<Object> evalArgs) {
         if (evalArgs.isEmpty()) throw new MemgresException("function generate_subscripts() does not exist", "42883");

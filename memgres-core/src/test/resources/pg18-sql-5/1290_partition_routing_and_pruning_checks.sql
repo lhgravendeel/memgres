@@ -39,6 +39,8 @@ ORDER BY event_id;
 
 -- begin-expected
 -- columns: child_name
+-- row: events_feb
+-- row: events_jan
 -- end-expected
 SELECT c.relname AS child_name
 FROM pg_inherits i

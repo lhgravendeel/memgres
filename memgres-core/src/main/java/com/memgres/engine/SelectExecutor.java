@@ -28,7 +28,10 @@ class SelectExecutor {
             "bit_and", "bit_or", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
             "xmlagg", "grouping",
             "var_pop", "var_samp", "stddev_pop", "stddev_samp", "stddev", "variance",
-            "corr", "regr_slope", "regr_intercept", "regr_r2",
+            "bit_xor",
+            "corr", "covar_pop", "covar_samp",
+            "regr_slope", "regr_intercept", "regr_r2",
+            "regr_count", "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
             "json_arrayagg", "json_objectagg",
             "range_agg", "range_intersect_agg"
     );
@@ -36,7 +39,7 @@ class SelectExecutor {
     static final Set<String> SRF_FUNCTION_NAMES = Cols.setOf("generate_series", "unnest", "regexp_matches",
             "json_array_elements", "jsonb_array_elements", "json_object_keys", "jsonb_object_keys",
             "json_array_elements_text", "jsonb_array_elements_text", "generate_subscripts",
-            "jsonb_path_query", "aclexplode");
+            "jsonb_path_query", "aclexplode", "string_to_table");
     private static final Set<String> SRF_FUNCTIONS = SRF_FUNCTION_NAMES;
 
     SelectExecutor(AstExecutor executor) {

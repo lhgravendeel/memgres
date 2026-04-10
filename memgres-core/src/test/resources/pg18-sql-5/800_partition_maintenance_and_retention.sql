@@ -29,6 +29,8 @@ ORDER BY log_id;
 
 -- begin-expected
 -- columns: child_name
+-- row: logs_2024_01
+-- row: logs_2024_02
 -- end-expected
 SELECT c.relname AS child_name
 FROM pg_inherits i

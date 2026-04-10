@@ -779,6 +779,17 @@ class SelectAggregateEvaluator {
                 }
                 return result;
             }
+            case "bit_xor": {
+                Integer result = null;
+                for (RowContext r : group) {
+                    Object v = executor.evalExpr(fn.args().get(0), r);
+                    if (v != null) {
+                        int iv = ((Number) v).intValue();
+                        result = (result == null) ? iv : (result ^ iv);
+                    }
+                }
+                return result;
+            }
             case "json_agg":
             case "jsonb_agg": {
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
@@ -973,6 +984,58 @@ class SelectAggregateEvaluator {
                 BigDecimal r2Val = corrVal.pow(2).setScale(16, RoundingMode.HALF_UP);
                 return r2Val.stripTrailingZeros().toPlainString();
             }
+            case "covar_pop": {
+                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
+                if (rd == null) return null;
+                // covar_pop = sum((xi-xmean)*(yi-ymean)) / N
+                BigDecimal result = rd.sumXYDiff.divide(BigDecimal.valueOf(rd.n), 16, RoundingMode.HALF_UP);
+                return result.stripTrailingZeros().toPlainString();
+            }
+            case "covar_samp": {
+                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
+                if (rd == null) return null;
+                if (rd.n < 2) return null;
+                // covar_samp = sum((xi-xmean)*(yi-ymean)) / (N-1)
+                BigDecimal result = rd.sumXYDiff.divide(BigDecimal.valueOf(rd.n - 1), 16, RoundingMode.HALF_UP);
+                return result.stripTrailingZeros().toPlainString();
+            }
+            case "regr_count": {
+                if (group.isEmpty() || fn.args().size() < 2) return 0L;
+                Expression argY = fn.args().get(0);
+                Expression argX = fn.args().get(1);
+                long count = 0;
+                for (RowContext ctx : group) {
+                    Object vx = executor.evalExpr(argX, ctx);
+                    Object vy = executor.evalExpr(argY, ctx);
+                    if (vx != null && vy != null) count++;
+                }
+                return count;
+            }
+            case "regr_avgx": {
+                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
+                if (rd == null) return null;
+                return rd.xMean.stripTrailingZeros().toPlainString();
+            }
+            case "regr_avgy": {
+                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
+                if (rd == null) return null;
+                return rd.yMean.stripTrailingZeros().toPlainString();
+            }
+            case "regr_sxx": {
+                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
+                if (rd == null) return null;
+                return rd.sumXDiffSq.stripTrailingZeros().toPlainString();
+            }
+            case "regr_syy": {
+                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
+                if (rd == null) return null;
+                return rd.sumYDiffSq.stripTrailingZeros().toPlainString();
+            }
+            case "regr_sxy": {
+                RegressionData rd = RegressionData.compute(group, fn.args(), executor);
+                if (rd == null) return null;
+                return rd.sumXYDiff.stripTrailingZeros().toPlainString();
+            }
             default: {
                 // Check for user-defined aggregate
                 PgAggregate agg = executor.database.getAggregate(name);
@@ -1125,19 +1188,22 @@ class SelectAggregateEvaluator {
         public final BigDecimal sumXYDiff;
         public final BigDecimal sumXDiffSq;
         public final BigDecimal sumYDiffSq;
+        public final int n;
 
         public RegressionData(
                 BigDecimal xMean,
                 BigDecimal yMean,
                 BigDecimal sumXYDiff,
                 BigDecimal sumXDiffSq,
-                BigDecimal sumYDiffSq
+                BigDecimal sumYDiffSq,
+                int n
         ) {
             this.xMean = xMean;
             this.yMean = yMean;
             this.sumXYDiff = sumXYDiff;
             this.sumXDiffSq = sumXDiffSq;
             this.sumYDiffSq = sumYDiffSq;
+            this.n = n;
         }
 
         static RegressionData compute(List<RowContext> group, List<Expression> args, AstExecutor executor) {
@@ -1170,7 +1236,7 @@ class SelectAggregateEvaluator {
                 sumXDiffSq = sumXDiffSq.add(xd.pow(2));
                 sumYDiffSq = sumYDiffSq.add(yd.pow(2));
             }
-            return new RegressionData(xMean, yMean, sumXYDiff, sumXDiffSq, sumYDiffSq);
+            return new RegressionData(xMean, yMean, sumXYDiff, sumXDiffSq, sumYDiffSq, xVals.size());
         }
 
         public BigDecimal xMean() { return xMean; }

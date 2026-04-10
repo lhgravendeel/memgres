@@ -148,6 +148,10 @@ class CatalogCoreBuilder {
                 if (database.getAllTriggers().containsKey(t.getName())) hasTriggers = true;
                 boolean hasIdx = !t.getConstraints().isEmpty() || database.getIndexColumns().keySet().stream()
                         .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.endsWith("." + t.getName()); });
+                // Partition metadata for pg_class
+                String relkind = t.getPartitionStrategy() != null ? "p" : "r";
+                boolean relispartition = t.getPartitionParent() != null;
+                String relpartbound = relispartition ? formatPartitionBound(t) : null;
                 table.insertRow(new Object[]{
                         tblOid, t.getName(), nsOid,
                         0, 0,            // reltype, reloftype
@@ -156,13 +160,13 @@ class CatalogCoreBuilder {
                         tblOid,          // relfilenode
                         0,               // reltablespace
                         0, (double) t.getRows().size(), 0, 0, 0, // relpages, reltuples, relallvisible, relallfrozen, reltoastrelid
-                        hasIdx, false, "p", "r",              // relhasindex, relisshared, relpersistence, relkind
+                        hasIdx, false, "p", relkind,          // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
                         false, hasTriggers, false, false, false, // relhasrules..relforcerowsecurity
                         false,              // relhasoids
-                        true, "d", false,   // relispopulated, relreplident, relispartition
+                        true, "d", relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid
-                        null, null, null, 1 // relacl, reloptions, relpartbound, xmin
+                        null, null, relpartbound, 1 // relacl, reloptions, relpartbound, xmin
                 });
             }
         }
@@ -299,6 +303,40 @@ class CatalogCoreBuilder {
         }
 
         return table;
+    }
+
+    /** Format a partition bound expression for relpartbound (PG-compatible syntax). */
+    private static String formatPartitionBound(Table t) {
+        if (t.isDefaultPartition()) return "DEFAULT";
+        if (t.getPartitionLower() != null && t.getPartitionUpper() != null) {
+            return "FOR VALUES FROM (" + formatBoundValue(t.getPartitionLower())
+                    + ") TO (" + formatBoundValue(t.getPartitionUpper()) + ")";
+        }
+        if (t.getPartitionValues() != null) {
+            StringBuilder sb = new StringBuilder("FOR VALUES IN (");
+            for (int i = 0; i < t.getPartitionValues().size(); i++) {
+                if (i > 0) sb.append(", ");
+                Object v = t.getPartitionValues().get(i);
+                if (v instanceof String) sb.append("'").append(v).append("'");
+                else sb.append(v);
+            }
+            sb.append(")");
+            return sb.toString();
+        }
+        if (t.getPartitionModulus() != null && t.getPartitionRemainder() != null) {
+            return "FOR VALUES WITH (modulus " + t.getPartitionModulus()
+                    + ", remainder " + t.getPartitionRemainder() + ")";
+        }
+        return null;
+    }
+
+    private static String formatBoundValue(Object val) {
+        if (val instanceof String) {
+            String s = (String) val;
+            if (s.equalsIgnoreCase("MINVALUE") || s.equalsIgnoreCase("MAXVALUE")) return s;
+            return "'" + s + "'";
+        }
+        return String.valueOf(val);
     }
 
     Table buildPgAttribute() {

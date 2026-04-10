@@ -891,7 +891,38 @@ class CatalogStubBuilder {
                 col("partcollation", DataType.TEXT),
                 col("partexprs", DataType.TEXT)
         );
-        return new Table("pg_partitioned_table", cols);
+        Table table = new Table("pg_partitioned_table", cols);
+        // Populate from all partitioned tables (those with a partition strategy)
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                Table t = tableEntry.getValue();
+                if (t.getPartitionStrategy() == null) continue;
+                int tblOid = oids.oid("rel:" + schemaName + "." + t.getName());
+                String strategy = t.getPartitionStrategy().substring(0, 1).toLowerCase(); // r/l/h
+                // Find default partition OID
+                Integer defOid = null;
+                for (Table p : t.getPartitions()) {
+                    if (p.isDefaultPartition()) {
+                        String pSchema = findSchemaForTable(p);
+                        if (pSchema != null) defOid = oids.oid("rel:" + pSchema + "." + p.getName());
+                        break;
+                    }
+                }
+                // Compute partition column attribute number (1-based)
+                short partnatts = 1;
+                String partattrs = "0"; // fallback
+                if (t.getPartitionColumn() != null) {
+                    int colIdx = t.getColumnIndex(t.getPartitionColumn());
+                    if (colIdx >= 0) partattrs = String.valueOf(colIdx + 1);
+                }
+                table.insertRow(new Object[]{
+                        tblOid, strategy, partnatts, defOid,
+                        partattrs, "0", "0", null
+                });
+            }
+        }
+        return table;
     }
 
     Table buildPgInherits() {
@@ -901,8 +932,46 @@ class CatalogStubBuilder {
                 colNN("inhseqno", DataType.INTEGER),
                 col("inhdetachpending", DataType.BOOLEAN)
         );
-        // Empty; no inheritance tracking yet, but columns must exist for JOINs
-        return new Table("pg_inherits", cols);
+        Table table = new Table("pg_inherits", cols);
+        // Populate from partition parent-child relationships
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                Table t = tableEntry.getValue();
+                int childOid = oids.oid("rel:" + schemaName + "." + t.getName());
+                // Partition relationship: child has partitionParent
+                if (t.getPartitionParent() != null) {
+                    String parentSchema = findSchemaForTable(t.getPartitionParent());
+                    if (parentSchema != null) {
+                        int parentOid = oids.oid("rel:" + parentSchema + "." + t.getPartitionParent().getName());
+                        int seqno = t.getPartitionParent().getPartitions().indexOf(t) + 1;
+                        if (seqno <= 0) seqno = 1;
+                        table.insertRow(new Object[]{ childOid, parentOid, seqno, false });
+                    }
+                }
+                // Inheritance relationship: child has parentTable (but NOT partition)
+                if (t.getParentTable() != null && t.getPartitionParent() == null) {
+                    String parentSchema = findSchemaForTable(t.getParentTable());
+                    if (parentSchema != null) {
+                        int parentOid = oids.oid("rel:" + parentSchema + "." + t.getParentTable().getName());
+                        int seqno = t.getParentTable().getChildren().indexOf(t) + 1;
+                        if (seqno <= 0) seqno = 1;
+                        table.insertRow(new Object[]{ childOid, parentOid, seqno, false });
+                    }
+                }
+            }
+        }
+        return table;
+    }
+
+    /** Find the schema name for a given Table object by scanning all schemas. */
+    private String findSchemaForTable(Table target) {
+        for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
+            for (Table t : entry.getValue().getTables().values()) {
+                if (t == target) return entry.getKey();
+            }
+        }
+        return null;
     }
 
     Table buildPgEventTrigger() {
