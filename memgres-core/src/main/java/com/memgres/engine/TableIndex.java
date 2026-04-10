@@ -4,6 +4,7 @@ import com.memgres.engine.util.Cols;
 
 import java.math.BigDecimal;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A hash-map based index for a set of columns on a table.
@@ -19,7 +20,9 @@ public class TableIndex {
     private final boolean unique;
 
     // For unique indexes: key → single row.  For non-unique: key → list of rows.
-    private final HashMap<IndexKey, Object> entries = new HashMap<>();
+    // ConcurrentHashMap for defensive thread-safety — all mutations are serialized by
+    // Table.writeLock, but CHM prevents catastrophic corruption if any path is ever missed.
+    private final ConcurrentHashMap<IndexKey, Object> entries = new ConcurrentHashMap<>();
 
     public TableIndex(String constraintName, int[] columnIndices, boolean unique) {
         this.constraintName = constraintName;

@@ -20,7 +20,7 @@ public class Session {
     private final AstExecutor executor;
     private String databaseName = "memgres";
     private DatabaseRegistry databaseRegistry;
-    private TransactionStatus status = TransactionStatus.IDLE;
+    private volatile TransactionStatus status = TransactionStatus.IDLE;
     private final List<UndoEntry> undoLog = new ArrayList<>();
     private final LinkedHashMap<String, Integer> savepoints = new LinkedHashMap<>();
     private final List<DeferredFkCheck> deferredFkChecks = new ArrayList<>();
@@ -186,12 +186,14 @@ public class Session {
     }
 
     // MVCC: uncommitted inserts per table (schema.table -> set of row references)
-    private final Map<String, Set<Object[]>> uncommittedInserts = new LinkedHashMap<>();
+    // ConcurrentHashMap + ConcurrentHashMap.newKeySet inner sets for thread-safe cross-session reads.
+    private volatile Map<String, Set<Object[]>> uncommittedInserts = new ConcurrentHashMap<>();
     // MVCC: uncommitted updates per table (schema.table -> map of current row -> old values)
     // ConcurrentHashMap for thread-safe cross-session reads in isRowBeingUpdatedByOtherSession.
-    private final Map<String, Map<Object[], Object[]>> uncommittedUpdates = new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile Map<String, Map<Object[], Object[]>> uncommittedUpdates = new ConcurrentHashMap<>();
     // MVCC: uncommitted deletes per table (schema.table -> list of deleted rows)
-    private final Map<String, List<Object[]>> uncommittedDeletes = new LinkedHashMap<>();
+    // ConcurrentHashMap + CopyOnWriteArrayList inner lists for thread-safe cross-session reads.
+    private volatile Map<String, List<Object[]>> uncommittedDeletes = new ConcurrentHashMap<>();
     // MVCC: snapshots for REPEATABLE READ (schema.table -> snapshot of rows at first read)
     private final Map<String, List<Object[]>> rrSnapshots = new LinkedHashMap<>();
 
@@ -433,10 +435,10 @@ public class Session {
             rollback();
             throw e;
         }
-        // Clear MVCC tracking; changes are now permanent
-        uncommittedInserts.clear();
-        uncommittedUpdates.clear();
-        uncommittedDeletes.clear();
+        // Swap MVCC maps to new empty instances (atomic from cross-session readers' perspective)
+        uncommittedInserts = new ConcurrentHashMap<>();
+        uncommittedUpdates = new ConcurrentHashMap<>();
+        uncommittedDeletes = new ConcurrentHashMap<>();
         rrSnapshots.clear();
         // Clear transaction-scoped GUC overrides (SET LOCAL)
         gucSettings.clearTransactionOverrides();
@@ -481,10 +483,10 @@ public class Session {
     }
 
     public void rollback() {
-        // Clear MVCC tracking
-        uncommittedInserts.clear();
-        uncommittedUpdates.clear();
-        uncommittedDeletes.clear();
+        // Swap MVCC maps to new empty instances (atomic from cross-session readers' perspective)
+        uncommittedInserts = new ConcurrentHashMap<>();
+        uncommittedUpdates = new ConcurrentHashMap<>();
+        uncommittedDeletes = new ConcurrentHashMap<>();
         rrSnapshots.clear();
         // Clear transaction-scoped GUC overrides (SET LOCAL)
         gucSettings.clearTransactionOverrides();
@@ -865,7 +867,8 @@ public class Session {
     /** Track an uncommitted insert for this session. */
     public void trackUncommittedInsert(String schemaTable, Object[] row) {
         if (status == TransactionStatus.IN_TRANSACTION) {
-            uncommittedInserts.computeIfAbsent(schemaTable, k -> Collections.newSetFromMap(new IdentityHashMap<>())).add(row);
+            uncommittedInserts.computeIfAbsent(schemaTable,
+                    k -> Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()))).add(row);
         }
     }
 
@@ -882,7 +885,8 @@ public class Session {
     /** Track an uncommitted delete for this session. */
     public void trackUncommittedDelete(String schemaTable, List<Object[]> rows) {
         if (status == TransactionStatus.IN_TRANSACTION) {
-            uncommittedDeletes.computeIfAbsent(schemaTable, k -> new ArrayList<>()).addAll(rows);
+            uncommittedDeletes.computeIfAbsent(schemaTable,
+                    k -> Collections.synchronizedList(new ArrayList<>())).addAll(rows);
         }
     }
 
@@ -1096,9 +1100,7 @@ public class Session {
             Table table = s != null ? s.getTable(tableName) : null;
             if (table != null) {
                 Object[] currentValues = java.util.Arrays.copyOf(row, row.length);
-                table.beforeRowUpdate(row, currentValues);
-                System.arraycopy(oldValues, 0, row, 0, oldValues.length);
-                table.afterRowUpdate(row);
+                table.updateRowInPlace(row, currentValues, oldValues);
             } else {
                 // Fallback: table might have been dropped
                 System.arraycopy(oldValues, 0, row, 0, oldValues.length);

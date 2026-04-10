@@ -467,4 +467,271 @@ class TableRowConcurrencyTest {
             st.execute("DROP TABLE t_stress");
         }
     }
+
+    // =========================================================================
+    // 9. Concurrent UPDATEs on the same table (Tier 2.4 — index safety)
+    // =========================================================================
+
+    @RepeatedTest(10)
+    void testConcurrentUpdates() throws Exception {
+        int numThreads = 6;
+        int rowsPerThread = 10;
+        int totalRows = numThreads * rowsPerThread;
+
+        try (Connection setup = connect(); Statement st = setup.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS t_concurrent_upd");
+            st.execute("CREATE TABLE t_concurrent_upd (id int PRIMARY KEY, val int, thread_id int)");
+            for (int i = 0; i < totalRows; i++) {
+                st.execute("INSERT INTO t_concurrent_upd VALUES (" + i + ", 0, " + (i / rowsPerThread) + ")");
+            }
+        }
+
+        // Each thread updates its own rows' val column concurrently
+        CyclicBarrier barrier = new CyclicBarrier(numThreads);
+        ExecutorService pool = Executors.newFixedThreadPool(numThreads);
+        List<Future<?>> futures = new ArrayList<>();
+
+        for (int t = 0; t < numThreads; t++) {
+            final int tid = t;
+            futures.add(pool.submit(() -> {
+                try (Connection c = connect(); Statement st = c.createStatement()) {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    st.execute("UPDATE t_concurrent_upd SET val = val + 100 WHERE thread_id = " + tid);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+        for (Future<?> f : futures) f.get(15, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        try (Connection verify = connect(); Statement st = verify.createStatement()) {
+            // All rows should have val=100
+            assertEquals(totalRows, queryInt(st, "SELECT COUNT(*) FROM t_concurrent_upd WHERE val = 100"),
+                    "All rows should be updated exactly once");
+            // Primary key index should still be intact — each id is unique
+            assertEquals(totalRows, queryInt(st, "SELECT COUNT(DISTINCT id) FROM t_concurrent_upd"),
+                    "Primary key index should be intact after concurrent updates");
+            st.execute("DROP TABLE t_concurrent_upd");
+        }
+    }
+
+    // =========================================================================
+    // 10. Concurrent INSERT + UPDATE on same table (Tier 2.4 — cross-op safety)
+    // =========================================================================
+
+    @RepeatedTest(5)
+    void testConcurrentInsertAndUpdate() throws Exception {
+        try (Connection setup = connect(); Statement st = setup.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS t_ins_upd");
+            st.execute("CREATE TABLE t_ins_upd (id serial PRIMARY KEY, val int)");
+            // Seed some rows for updates
+            for (int i = 0; i < 20; i++) {
+                st.execute("INSERT INTO t_ins_upd (val) VALUES (" + i + ")");
+            }
+        }
+
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        // Thread 1: inserts new rows
+        Future<?> inserter = pool.submit(() -> {
+            try (Connection c = connect(); Statement st = c.createStatement()) {
+                barrier.await(5, TimeUnit.SECONDS);
+                for (int i = 0; i < 50; i++) {
+                    st.execute("INSERT INTO t_ins_upd (val) VALUES (" + (100 + i) + ")");
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        // Thread 2: updates existing rows
+        Future<?> updater = pool.submit(() -> {
+            try (Connection c = connect(); Statement st = c.createStatement()) {
+                barrier.await(5, TimeUnit.SECONDS);
+                for (int i = 0; i < 20; i++) {
+                    st.execute("UPDATE t_ins_upd SET val = val + 1000 WHERE val = " + i);
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        inserter.get(15, TimeUnit.SECONDS);
+        updater.get(15, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        try (Connection verify = connect(); Statement st = verify.createStatement()) {
+            // 20 original + 50 inserted = 70
+            assertEquals(70, queryInt(st, "SELECT COUNT(*) FROM t_ins_upd"),
+                    "Should have original + newly inserted rows");
+            // Updated rows should have val >= 1000
+            assertEquals(20, queryInt(st, "SELECT COUNT(*) FROM t_ins_upd WHERE val >= 1000"),
+                    "All original rows should have been updated");
+            st.execute("DROP TABLE t_ins_upd");
+        }
+    }
+
+    // =========================================================================
+    // 11. MVCC visibility: concurrent reads during transaction (Tier 2.5)
+    // =========================================================================
+
+    @RepeatedTest(10)
+    void testMvccVisibilityDuringConcurrentWrites() throws Exception {
+        try (Connection setup = connect(); Statement st = setup.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS t_mvcc");
+            st.execute("CREATE TABLE t_mvcc (id int PRIMARY KEY, val text)");
+            st.execute("INSERT INTO t_mvcc VALUES (1, 'initial')");
+        }
+
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        AtomicInteger readerSeesUncommitted = new AtomicInteger(0);
+
+        // Thread 1: begins a transaction, inserts rows, waits, then rolls back
+        Future<?> writer = pool.submit(() -> {
+            try (Connection c = connectTx()) {
+                Statement st = c.createStatement();
+                barrier.await(5, TimeUnit.SECONDS);
+                for (int i = 100; i < 110; i++) {
+                    st.execute("INSERT INTO t_mvcc VALUES (" + i + ", 'uncommitted')");
+                }
+                Thread.sleep(200); // Give reader time to check
+                c.rollback();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        // Thread 2: reads after writer has inserted but before commit/rollback
+        Future<?> reader = pool.submit(() -> {
+            try (Connection c = connect()) {
+                Statement st = c.createStatement();
+                barrier.await(5, TimeUnit.SECONDS);
+                Thread.sleep(100); // Let writer insert some rows first
+                ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM t_mvcc WHERE val = 'uncommitted'");
+                rs.next();
+                readerSeesUncommitted.set(rs.getInt(1));
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        writer.get(15, TimeUnit.SECONDS);
+        reader.get(15, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        try (Connection verify = connect(); Statement st = verify.createStatement()) {
+            // After rollback, no uncommitted rows should persist
+            assertEquals(0, queryInt(st, "SELECT COUNT(*) FROM t_mvcc WHERE val = 'uncommitted'"),
+                    "Rolled-back rows should not be visible after rollback");
+            // Reader should not have seen uncommitted rows (MVCC)
+            assertEquals(0, readerSeesUncommitted.get(),
+                    "Reader should not see uncommitted rows from other session");
+            assertEquals(1, queryInt(st, "SELECT COUNT(*) FROM t_mvcc"),
+                    "Only the initial row should remain");
+            st.execute("DROP TABLE t_mvcc");
+        }
+    }
+
+    // =========================================================================
+    // 12. Concurrent transactions with commit/rollback interleaving (MVCC stress)
+    // =========================================================================
+
+    @RepeatedTest(5)
+    void testMvccConcurrentCommitRollbackStress() throws Exception {
+        try (Connection setup = connect(); Statement st = setup.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS t_mvcc_stress");
+            st.execute("CREATE TABLE t_mvcc_stress (id serial, session_id int, committed boolean)");
+        }
+
+        int numSessions = 8;
+        CyclicBarrier barrier = new CyclicBarrier(numSessions);
+        ExecutorService pool = Executors.newFixedThreadPool(numSessions);
+        List<Future<?>> futures = new ArrayList<>();
+
+        for (int s = 0; s < numSessions; s++) {
+            final int sid = s;
+            final boolean shouldCommit = (sid % 2 == 0);
+            futures.add(pool.submit(() -> {
+                try (Connection c = connectTx()) {
+                    Statement st = c.createStatement();
+                    barrier.await(5, TimeUnit.SECONDS);
+                    for (int i = 0; i < 10; i++) {
+                        st.execute("INSERT INTO t_mvcc_stress (session_id, committed) VALUES ("
+                                + sid + ", " + shouldCommit + ")");
+                    }
+                    if (shouldCommit) {
+                        c.commit();
+                    } else {
+                        c.rollback();
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+        for (Future<?> f : futures) f.get(15, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        try (Connection verify = connect(); Statement st = verify.createStatement()) {
+            // Only even sessions committed (0, 2, 4, 6) × 10 rows = 40
+            int committedRows = queryInt(st, "SELECT COUNT(*) FROM t_mvcc_stress WHERE committed = true");
+            assertEquals(40, committedRows, "Only committed sessions' rows should persist");
+            int rolledBackRows = queryInt(st, "SELECT COUNT(*) FROM t_mvcc_stress WHERE committed = false");
+            assertEquals(0, rolledBackRows, "No rows from rolled-back sessions");
+            st.execute("DROP TABLE t_mvcc_stress");
+        }
+    }
+
+    // =========================================================================
+    // 13. Concurrent UPDATE + DELETE on overlapping rows (Tier 2.4 contention)
+    // =========================================================================
+
+    @RepeatedTest(5)
+    void testConcurrentUpdateAndDelete() throws Exception {
+        try (Connection setup = connect(); Statement st = setup.createStatement()) {
+            st.execute("DROP TABLE IF EXISTS t_upd_del");
+            st.execute("CREATE TABLE t_upd_del (id int PRIMARY KEY, val int)");
+            for (int i = 0; i < 100; i++) {
+                st.execute("INSERT INTO t_upd_del VALUES (" + i + ", " + i + ")");
+            }
+        }
+
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+
+        // Thread 1: updates rows with id 0-49
+        Future<?> updater = pool.submit(() -> {
+            try (Connection c = connect(); Statement st = c.createStatement()) {
+                barrier.await(5, TimeUnit.SECONDS);
+                st.execute("UPDATE t_upd_del SET val = val + 1000 WHERE id < 50");
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        // Thread 2: deletes rows with id 50-99
+        Future<?> deleter = pool.submit(() -> {
+            try (Connection c = connect(); Statement st = c.createStatement()) {
+                barrier.await(5, TimeUnit.SECONDS);
+                st.execute("DELETE FROM t_upd_del WHERE id >= 50");
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+
+        updater.get(15, TimeUnit.SECONDS);
+        deleter.get(15, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        try (Connection verify = connect(); Statement st = verify.createStatement()) {
+            assertEquals(50, queryInt(st, "SELECT COUNT(*) FROM t_upd_del"),
+                    "50 rows should remain after deleting the other half");
+            assertEquals(50, queryInt(st, "SELECT COUNT(*) FROM t_upd_del WHERE val >= 1000"),
+                    "All remaining rows should have been updated");
+            st.execute("DROP TABLE t_upd_del");
+        }
+    }
 }

@@ -338,7 +338,7 @@ class DmlExecutor {
                     } else if (stmt.onConflict().doUpdate() != null) {
                         // DO UPDATE: update the conflicting row
                         Object[] oldRow = Arrays.copyOf(conflictRow, conflictRow.length);
-                        table.beforeRowUpdate(conflictRow, oldRow);
+                        Object[] newRow = Arrays.copyOf(conflictRow, conflictRow.length);
                         try {
                             Object[] evalConflict = hasVirtualColumns(table) ? computeVirtualColumns(table, conflictRow) : conflictRow;
                             RowContext conflictCtx = new RowContext(table, null, evalConflict);
@@ -350,14 +350,13 @@ class DmlExecutor {
                                 // In DO UPDATE SET, "excluded" refers to the proposed row
                                 // We handle this by making the proposed values available
                                 Object val = conflictHelper.evalExprWithExcluded(set.value(), conflictCtx, table, row);
-                                conflictRow[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
+                                newRow[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
                             }
-                            computeGeneratedColumns(table, conflictRow);
-                            table.afterRowUpdate(conflictRow);
+                            computeGeneratedColumns(table, newRow);
+                            table.updateRowInPlace(conflictRow, oldRow, newRow);
                         } catch (Exception e) {
                             // Restore old values and re-add to index on failure
-                            System.arraycopy(oldRow, 0, conflictRow, 0, oldRow.length);
-                            table.afterRowUpdate(conflictRow);
+                            table.updateRowInPlace(conflictRow, conflictRow, oldRow);
                             throw e;
                         }
                         executor.constraintValidator.validateConstraints(table, conflictRow, conflictRow);
@@ -573,8 +572,14 @@ class DmlExecutor {
                         row[colIndices.get(i)] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIndices.get(i)));
                     }
                 }
-                executor.constraintValidator.validateConstraints(table, row, null);
-                table.insertRow(row);
+                // Validate + insert atomically under write lock (same as regular INSERT)
+                table.getWriteLock().lock();
+                try {
+                    executor.constraintValidator.validateConstraints(table, row, null);
+                    table.insertRow(row);
+                } finally {
+                    table.getWriteLock().unlock();
+                }
                 recordInsertUndo(null, stmt.table(), row);
                 inserted++;
             }
@@ -662,8 +667,14 @@ class DmlExecutor {
             row = modified;
         }
 
-        executor.constraintValidator.validateConstraints(table, row, null);
-        table.insertRow(row);
+        // Validate + insert atomically under write lock (same as regular INSERT)
+        table.getWriteLock().lock();
+        try {
+            executor.constraintValidator.validateConstraints(table, row, null);
+            table.insertRow(row);
+        } finally {
+            table.getWriteLock().unlock();
+        }
         recordInsertUndo(null, stmt.table(), row);
 
         // Fire AFTER INSERT triggers
@@ -815,9 +826,7 @@ class DmlExecutor {
                 executor.constraintValidator.validateConstraints(table, newRow, row);
                 validationHelper.validateDomainChecks(newRow, table);
                 recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
-                table.beforeRowUpdate(row, oldRow);
-                System.arraycopy(newRow, 0, row, 0, row.length);
-                table.afterRowUpdate(row);
+                table.updateRowInPlace(row, oldRow, newRow);
                 executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
                 if (stmt.returning() != null && !stmt.returning().isEmpty()) {
@@ -873,9 +882,7 @@ class DmlExecutor {
             // Record undo before applying the update
             recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
 
-            table.beforeRowUpdate(row, oldRow);
-            System.arraycopy(newRow, 0, row, 0, row.length);
-            table.afterRowUpdate(row);
+            table.updateRowInPlace(row, oldRow, newRow);
 
             // Handle FK ON UPDATE cascades
             executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
@@ -1300,16 +1307,20 @@ class DmlExecutor {
                         }
                         computeGeneratedColumns(targetTable, newRow);
                         validationHelper.validateEnumValues(newRow, targetTable);
-                        executor.constraintValidator.validateConstraints(targetTable, newRow, null);
-                        // Eagerly insert and check PK so we fail early like PG does,
-                        // preventing subsequent source rows from advancing identity sequences
+                        // Validate + insert atomically under write lock
                         Table routedTable = partitionHelper.routeToPartition(targetTable, newRow);
-                        routedTable.insertRow(newRow);
+                        routedTable.getWriteLock().lock();
                         try {
-                            executor.constraintValidator.validateConstraints(routedTable, newRow, newRow);
-                        } catch (MemgresException e) {
-                            routedTable.removeRow(newRow);
-                            throw e;
+                            executor.constraintValidator.validateConstraints(targetTable, newRow, null);
+                            routedTable.insertRow(newRow);
+                            try {
+                                executor.constraintValidator.validateConstraints(routedTable, newRow, newRow);
+                            } catch (MemgresException e) {
+                                routedTable.removeRow(newRow);
+                                throw e;
+                            }
+                        } finally {
+                            routedTable.getWriteLock().unlock();
                         }
                         rowsToInsert.add(newRow);
                         // Fire AFTER INSERT triggers for MERGE
@@ -1377,19 +1388,25 @@ class DmlExecutor {
                 }
             }
 
-            // Apply deletes
+            // Apply deletes atomically under write lock so concurrent readers
+            // never see the intermediate empty-table state.
             if (!rowsToDelete.isEmpty()) {
-                List<Object[]> allRows = new ArrayList<>(targetTable.getRows());
-                List<Object[]> deletedRows = new ArrayList<>();
-                targetTable.deleteAll();
-                for (Object[] row : allRows) {
-                    if (rowsToDelete.contains(row)) {
-                        deletedRows.add(row);
-                    } else {
-                        targetTable.insertRow(row);
+                targetTable.getWriteLock().lock();
+                try {
+                    List<Object[]> allRows = new ArrayList<>(targetTable.getRows());
+                    List<Object[]> deletedRows = new ArrayList<>();
+                    targetTable.deleteAll();
+                    for (Object[] row : allRows) {
+                        if (rowsToDelete.contains(row)) {
+                            deletedRows.add(row);
+                        } else {
+                            targetTable.insertRow(row);
+                        }
                     }
+                    recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
+                } finally {
+                    targetTable.getWriteLock().unlock();
                 }
-                recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
             }
 
             // Validate uniqueness for already-inserted rows (they were inserted eagerly during iteration)
@@ -1408,9 +1425,14 @@ class DmlExecutor {
         } catch (MemgresException e) {
             // MERGE is atomic; roll back all changes (updates, deletes, inserts) on failure
             executor.currentMergeAction = null;
-            targetTable.deleteAll();
-            for (Object[] origRow : snapshotRows) {
-                targetTable.insertRow(origRow);
+            targetTable.getWriteLock().lock();
+            try {
+                targetTable.deleteAll();
+                for (Object[] origRow : snapshotRows) {
+                    targetTable.insertRow(origRow);
+                }
+            } finally {
+                targetTable.getWriteLock().unlock();
             }
             throw e;
         }

@@ -402,6 +402,7 @@ public class Table {
     /**
      * Notify indexes that a row's values are about to change (UPDATE).
      * Must be called BEFORE the in-place arraycopy with the old values.
+     * @deprecated Use {@link #updateRowInPlace(Object[], Object[], Object[])} instead for atomic index+data update.
      */
     public void beforeRowUpdate(Object[] row, Object[] oldValues) {
         for (TableIndex idx : indexes.values()) {
@@ -412,10 +413,32 @@ public class Table {
     /**
      * Notify indexes that a row's values have changed (UPDATE).
      * Must be called AFTER the in-place arraycopy with new values.
+     * @deprecated Use {@link #updateRowInPlace(Object[], Object[], Object[])} instead for atomic index+data update.
      */
     public void afterRowUpdate(Object[] row) {
         for (TableIndex idx : indexes.values()) {
             idx.put(row);
+        }
+    }
+
+    /**
+     * Atomically update a row's data in-place under writeLock: remove old index entries,
+     * copy new values into the row, then add new index entries.
+     * This ensures concurrent readers never see partially-updated row data and
+     * all index mutations are serialized.
+     */
+    public void updateRowInPlace(Object[] row, Object[] oldValues, Object[] newValues) {
+        writeLock.lock();
+        try {
+            for (TableIndex idx : indexes.values()) {
+                idx.removeByOldValues(oldValues, row);
+            }
+            System.arraycopy(newValues, 0, row, 0, row.length);
+            for (TableIndex idx : indexes.values()) {
+                idx.put(row);
+            }
+        } finally {
+            writeLock.unlock();
         }
     }
 
