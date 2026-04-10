@@ -596,6 +596,10 @@ public class ExpressionParser {
                 left = new BinaryExpr(left, BinaryExpr.BinOp.SUBTRACT, parseBitOr());
             } else if (match(TokenType.CONCAT)) {
                 left = new BinaryExpr(left, BinaryExpr.BinOp.CONCAT, parseBitOr());
+            } else if (check(TokenType.CUSTOM_OPERATOR)) {
+                // User-defined multi-char operators: same precedence as addition (left-associative)
+                String opSymbol = advance().value();
+                left = new CustomOperatorExpr(null, opSymbol, left, parseBitOr());
             } else {
                 break;
             }
@@ -682,6 +686,12 @@ public class ExpressionParser {
         }
         if (match(TokenType.TILDE)) {
             return new UnaryExpr(UnaryExpr.UnaryOp.BIT_NOT, parseUnary());
+        }
+        // Custom multi-char prefix operator (user-defined): ~~> expr
+        if (check(TokenType.CUSTOM_OPERATOR)) {
+            String opSymbol = advance().value();
+            Expression right = parseUnary();
+            return new CustomOperatorExpr(null, opSymbol, null, right);
         }
         // ||/ (cube root) prefix operator; || is lexed as CONCAT token
         if (check(TokenType.CONCAT) && pos + 1 < tokens.size() && tokens.get(pos + 1).type() == TokenType.SLASH) {

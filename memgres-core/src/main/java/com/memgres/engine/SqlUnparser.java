@@ -146,6 +146,13 @@ public class SqlUnparser {
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
             return "(" + exprToSql(bin.left()) + " " + binOpToSql(bin.op()) + " " + exprToSql(bin.right()) + ")";
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            if (cop.left() != null) {
+                return "(" + exprToSql(cop.left()) + " " + cop.opSymbol() + " " + exprToSql(cop.right()) + ")";
+            } else {
+                return "(" + cop.opSymbol() + " " + exprToSql(cop.right()) + ")";
+            }
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
             switch (un.op()) {

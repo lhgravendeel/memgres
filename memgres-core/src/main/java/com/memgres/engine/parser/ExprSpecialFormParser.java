@@ -480,15 +480,16 @@ class ExprSpecialFormParser {
                 binOp = BinaryExpr.BinOp.ILIKE;
                 break;
             default:
-                throw new com.memgres.engine.MemgresException(
-                "operator does not exist: " + spec.opSymbol, "42883");
+                // User-defined operator: create CustomOperatorExpr for runtime dispatch
+                Expression right = ep.parseAddition();
+                return new CustomOperatorExpr(spec.schema, spec.opSymbol, left, right);
         }
 
-        Expression right = ep.parseAddition();
-        return new BinaryExpr(left, binOp, right);
+        Expression rhs = ep.parseAddition();
+        return new BinaryExpr(left, binOp, rhs);
     }
 
-    /** Parse OPERATOR(schema.op)(arg) in prefix/function-call position. */
+    /** Parse OPERATOR(schema.op)(arg1[, arg2]) in prefix/function-call position. */
     Expression parsePrefixQualifiedOperator() {
         ep.advance(); // consume OPERATOR keyword
         OperatorSpec spec = readOperatorSpec();
@@ -497,12 +498,13 @@ class ExprSpecialFormParser {
         List<Expression> args = ep.parseExpressionList();
         ep.expect(TokenType.RIGHT_PAREN);
 
-        if (args.size() >= 2) {
-            throw new com.memgres.engine.MemgresException(
-                "operator does not exist: " + (spec.schema != null ? spec.schema + "." : "") + spec.opSymbol + " record", "42883");
+        if (args.size() == 2) {
+            // Binary operator in function-call style: OPERATOR(schema.op)(a, b)
+            return new CustomOperatorExpr(spec.schema, spec.opSymbol, args.get(0), args.get(1));
         }
 
         if (args.size() == 1) {
+            // Known unary built-in operators
             if ("+".equals(spec.opSymbol)) {
                 return new QualifiedOperatorExpr(spec.schema, spec.opSymbol,
                     new UnaryExpr(UnaryExpr.UnaryOp.POSITIVE, args.get(0)));
@@ -510,8 +512,8 @@ class ExprSpecialFormParser {
                 return new QualifiedOperatorExpr(spec.schema, spec.opSymbol,
                     new UnaryExpr(UnaryExpr.UnaryOp.NEGATE, args.get(0)));
             }
-            throw new com.memgres.engine.MemgresException(
-                "operator does not exist: " + (spec.schema != null ? spec.schema + "." : "") + spec.opSymbol + " " + getOperandTypeName(args.get(0)), "42883");
+            // User-defined unary prefix operator
+            return new CustomOperatorExpr(spec.schema, spec.opSymbol, null, args.get(0));
         }
         throw new com.memgres.engine.MemgresException(
             "operator does not exist: " + (spec.schema != null ? spec.schema + "." : "") + spec.opSymbol, "42883");

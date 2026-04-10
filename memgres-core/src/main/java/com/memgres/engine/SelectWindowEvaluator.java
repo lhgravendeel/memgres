@@ -173,6 +173,10 @@ class SelectWindowEvaluator {
             BinaryExpr bin = (BinaryExpr) expr;
             collectWindowFunctions(bin.left(), out);
             collectWindowFunctions(bin.right(), out);
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            if (cop.left() != null) collectWindowFunctions(cop.left(), out);
+            collectWindowFunctions(cop.right(), out);
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
             collectWindowFunctions(un.operand(), out);
@@ -209,6 +213,16 @@ class SelectWindowEvaluator {
                         ? evalWithWindowValues(bin.right(), ctx, precomputed, rowIndex)
                         : executor.evalExpr(bin.right(), ctx);
                 return executor.evalBinaryValues(bin.op(), left, right);
+            }
+            return executor.evalExpr(expr, ctx);
+        }
+        if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            boolean leftHasWindow = cop.left() != null && select.containsWindowFunction(cop.left());
+            boolean rightHasWindow = select.containsWindowFunction(cop.right());
+            if (leftHasWindow || rightHasWindow) {
+                // Recurse into children, then delegate to normal eval with resolved values
+                return executor.evalExpr(expr, ctx);
             }
             return executor.evalExpr(expr, ctx);
         }

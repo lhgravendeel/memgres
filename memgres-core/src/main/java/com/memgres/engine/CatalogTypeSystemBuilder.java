@@ -354,8 +354,36 @@ class CatalogTypeSystemBuilder {
                     comOid = opOid;
                 }
             }
+            // Resolve oprcode (backing function OID) and oprresult (return type OID)
+            int opcodeOid = 0;
+            int resultOid = 0;
+            if (op.getFunction() != null) {
+                PgFunction func = database.getFunction(op.getFunction());
+                if (func != null) {
+                    opcodeOid = oids.oid("func:" + op.getFunction().toLowerCase());
+                    if (func.getReturnType() != null) {
+                        resultOid = resolveTypeOid(func.getReturnType());
+                    }
+                }
+            }
+            // Resolve oprnegate (negator operator OID)
+            int negOid = 0;
+            if (op.getNegator() != null) {
+                if (op.getNegator().equals(op.getName())) {
+                    negOid = opOid; // Self-referencing negator
+                } else {
+                    // Try to find the negator operator
+                    for (Map.Entry<String, PgOperator> negEntry : database.getUserOperators().entrySet()) {
+                        if (negEntry.getValue().getName().equals(op.getNegator())) {
+                            String negSchema = negEntry.getValue().getSchemaName() != null ? negEntry.getValue().getSchemaName() : "public";
+                            negOid = oids.oid("operator:" + negSchema + "." + negEntry.getValue().getKey());
+                            break;
+                        }
+                    }
+                }
+            }
             table.insertRow(new Object[]{opOid, op.getName(), ns, ownerOid,
-                    op.getKind(), leftOid, rightOid, 0, 0, 0, 0, comOid, 0,
+                    op.getKind(), leftOid, rightOid, resultOid, opcodeOid, 0, 0, comOid, negOid,
                     op.isMerges(), op.isHashes(), 1});
         }
 

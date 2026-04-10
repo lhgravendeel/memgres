@@ -198,6 +198,10 @@ class DdlExecutor {
             BinaryExpr bin = (BinaryExpr) expr;
             validateExprColumnRefs(bin.left(), table, newColName);
             validateExprColumnRefs(bin.right(), table, newColName);
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            if (cop.left() != null) validateExprColumnRefs(cop.left(), table, newColName);
+            validateExprColumnRefs(cop.right(), table, newColName);
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
             validateExprColumnRefs(un.operand(), table, newColName);
@@ -345,6 +349,13 @@ class DdlExecutor {
         } else if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
             return exprToDefaultString(cast.expr()) + "::" + cast.typeName();
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            if (cop.left() != null) {
+                return exprToDefaultString(cop.left()) + " " + cop.opSymbol() + " " + exprToDefaultString(cop.right());
+            } else {
+                return cop.opSymbol() + " " + exprToDefaultString(cop.right());
+            }
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
             String op;

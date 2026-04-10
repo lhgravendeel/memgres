@@ -1637,6 +1637,10 @@ class DmlExecutor {
             BinaryExpr be = (BinaryExpr) expr;
             return exprReferencesOldNew(be.left()) || exprReferencesOldNew(be.right());
         }
+        if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr c = (CustomOperatorExpr) expr;
+            return (c.left() != null && exprReferencesOldNew(c.left())) || exprReferencesOldNew(c.right());
+        }
         if (expr instanceof CaseExpr) {
             CaseExpr ce = (CaseExpr) expr;
             if (exprReferencesOldNew(ce.operand())) return true;

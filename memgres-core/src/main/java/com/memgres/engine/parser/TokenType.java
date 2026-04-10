@@ -83,6 +83,9 @@ public enum TokenType {
     COLON_EQUALS,    // :=
     FAT_ARROW,       // =>
 
+    // User-defined operator (multi-char operator not matching any built-in token)
+    CUSTOM_OPERATOR, // e.g. +++, <=>, ~~>, etc.
+
     // Special
     EOF,
     ERROR

@@ -730,6 +730,10 @@ class FromResolver {
             BinaryExpr bin = (BinaryExpr) expr;
             collectColumnRefs(bin.left(), ctx);
             collectColumnRefs(bin.right(), ctx);
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            if (cop.left() != null) collectColumnRefs(cop.left(), ctx);
+            collectColumnRefs(cop.right(), ctx);
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr ue = (UnaryExpr) expr;
             collectColumnRefs(ue.operand(), ctx);

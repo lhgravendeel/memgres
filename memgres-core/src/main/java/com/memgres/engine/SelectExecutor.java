@@ -481,6 +481,7 @@ class SelectExecutor {
             return false;
         }
         if (expr instanceof BinaryExpr) return containsAggregate(((BinaryExpr) expr).left()) || containsAggregate(((BinaryExpr) expr).right());
+        if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() != null && containsAggregate(c.left())) || containsAggregate(c.right()); }
         if (expr instanceof UnaryExpr) return containsAggregate(((UnaryExpr) expr).operand());
         if (expr instanceof CastExpr) return containsAggregate(((CastExpr) expr).expr());
         if (expr instanceof CaseExpr) {
@@ -507,6 +508,7 @@ class SelectExecutor {
         if (expr instanceof ArraySubqueryExpr) return false;
         if (expr instanceof WindowFuncExpr) return true;
         if (expr instanceof BinaryExpr) return containsWindowFunction(((BinaryExpr) expr).left()) || containsWindowFunction(((BinaryExpr) expr).right());
+        if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() != null && containsWindowFunction(c.left())) || containsWindowFunction(c.right()); }
         if (expr instanceof UnaryExpr) return containsWindowFunction(((UnaryExpr) expr).operand());
         if (expr instanceof CastExpr) return containsWindowFunction(((CastExpr) expr).expr());
         if (expr instanceof CaseExpr) {
@@ -533,6 +535,7 @@ class SelectExecutor {
         if (expr instanceof FunctionCallExpr) return isAggregateFunction(((FunctionCallExpr) expr).name()) || ((FunctionCallExpr) expr).args().stream().allMatch(this::isAggregateOrConstant);
         if (expr instanceof CastExpr) return isAggregateOrConstant(((CastExpr) expr).expr());
         if (expr instanceof BinaryExpr) return isAggregateOrConstant(((BinaryExpr) expr).left()) && isAggregateOrConstant(((BinaryExpr) expr).right());
+        if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() == null || isAggregateOrConstant(c.left())) && isAggregateOrConstant(c.right()); }
         if (expr instanceof UnaryExpr) return isAggregateOrConstant(((UnaryExpr) expr).operand());
         if (expr instanceof SubqueryExpr) return true;
         if (expr instanceof ExistsExpr) return true;
@@ -568,6 +571,7 @@ class SelectExecutor {
         if (expr instanceof CastExpr) return allColumnRefsCoveredByGroupBy(((CastExpr) expr).expr(), groupedExprs);
         if (expr instanceof BinaryExpr) return allColumnRefsCoveredByGroupBy(((BinaryExpr) expr).left(), groupedExprs)
                 && allColumnRefsCoveredByGroupBy(((BinaryExpr) expr).right(), groupedExprs);
+        if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() == null || allColumnRefsCoveredByGroupBy(c.left(), groupedExprs)) && allColumnRefsCoveredByGroupBy(c.right(), groupedExprs); }
         if (expr instanceof UnaryExpr) return allColumnRefsCoveredByGroupBy(((UnaryExpr) expr).operand(), groupedExprs);
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;

@@ -325,6 +325,20 @@ class SelectAggregateEvaluator {
             Object left = evalAggregateExpr(bin.left(), group, representative);
             Object right = evalAggregateExpr(bin.right(), group, representative);
             return executor.evalBinaryValues(bin.op(), left, right);
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            // Evaluate children in aggregate context, then invoke operator with resolved values
+            Object leftVal = cop.left() != null ? evalAggregateExpr(cop.left(), group, representative) : null;
+            Object rightVal = evalAggregateExpr(cop.right(), group, representative);
+            // Build a CustomOperatorExpr with literal-wrapped resolved values
+            Expression leftExpr = cop.left() != null ? new Literal(
+                    leftVal instanceof Number ? Literal.LiteralType.INTEGER : Literal.LiteralType.STRING,
+                    leftVal == null ? "NULL" : String.valueOf(leftVal)) : null;
+            Expression rightExpr = new Literal(
+                    rightVal instanceof Number ? Literal.LiteralType.INTEGER : Literal.LiteralType.STRING,
+                    rightVal == null ? "NULL" : String.valueOf(rightVal));
+            CustomOperatorExpr resolved = new CustomOperatorExpr(cop.schema(), cop.opSymbol(), leftExpr, rightExpr);
+            return representative != null ? executor.evalExpr(resolved, representative) : null;
         } else if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
             Object val = evalAggregateExpr(un.operand(), group, representative);
