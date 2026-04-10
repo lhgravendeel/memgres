@@ -402,7 +402,15 @@ public class RangeOperations {
         // Exclude JSON objects (contain quoted keys with colons)
         if (inner.contains("\"")) return false;
         // Check that inner content starts with a range literal bracket
-        return inner.charAt(0) == '[' || inner.charAt(0) == '(';
+        if (inner.charAt(0) != '[' && inner.charAt(0) != '(') return false;
+        // Extract the first element and validate it's actually a range (not a record like "(1)")
+        // Find the closing bracket of the first element
+        char open = inner.charAt(0);
+        char expectedClose = (open == '[') ? ']' : ')';
+        int closeIdx = inner.indexOf(expectedClose, 1);
+        if (closeIdx < 0) return false;
+        String firstElem = inner.substring(0, closeIdx + 1);
+        return isRangeString(firstElem);
     }
 
     /** Check if a multirange is adjacent to a range (last sub-range -|- range or range -|- first sub-range). */
