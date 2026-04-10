@@ -137,6 +137,16 @@ class DdlFunctionParser {
 
         parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses);
 
+        // SQL-standard function body: RETURN expr or BEGIN ATOMIC ... END (PG 14+)
+        if (body == null && parser.checkKeyword("RETURN")) {
+            parser.advance();
+            body = readSqlStandardReturn();
+            language = "sql";
+        } else if (body == null && parser.checkKeyword("BEGIN") && isBeginAtomic()) {
+            body = readBeginAtomicBody();
+            language = "sql";
+        }
+
         return new CreateFunctionStmt(name, schema, rawParams.toString().trim(), parsedParams,
                 returnType, body != null ? body : "", language, orReplace, isProcedure, secDefRef[0], strictRef[0],
                 leakproofRef[0], volatilityRef[0], setClauses.isEmpty() ? null : setClauses);
@@ -154,6 +164,70 @@ class DdlFunctionParser {
         }
         parser.expect(TokenType.RIGHT_PAREN);
         return new CallStmt(name, args);
+    }
+
+    /**
+     * Check if the current BEGIN is followed by ATOMIC (lookahead without consuming).
+     */
+    private boolean isBeginAtomic() {
+        int saved = parser.pos;
+        if (parser.checkKeyword("BEGIN")) {
+            parser.advance();
+            boolean result = parser.checkKeyword("ATOMIC");
+            parser.pos = saved;
+            return result;
+        }
+        return false;
+    }
+
+    /**
+     * SQL-standard RETURN expr — capture everything until semicolon/EOF as SELECT expr.
+     */
+    private String readSqlStandardReturn() {
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        while (!parser.isAtEnd()) {
+            if (parser.check(TokenType.SEMICOLON) && depth == 0) break;
+            if (parser.check(TokenType.EOF)) break;
+            if (parser.check(TokenType.LEFT_PAREN)) depth++;
+            if (parser.check(TokenType.RIGHT_PAREN)) depth--;
+            Token t = parser.advance();
+            if (sb.length() > 0) sb.append(" ");
+            if (t.type() == TokenType.STRING_LITERAL) {
+                sb.append("'").append(t.value().replace("'", "''")).append("'");
+            } else {
+                sb.append(t.value());
+            }
+        }
+        return "SELECT " + sb.toString().trim();
+    }
+
+    /**
+     * SQL-standard BEGIN ATOMIC ... END — capture the enclosed statements as the body.
+     */
+    private String readBeginAtomicBody() {
+        parser.expectKeyword("BEGIN");
+        parser.expectKeyword("ATOMIC");
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        while (!parser.isAtEnd()) {
+            // END at depth 0 terminates the block
+            if (parser.checkKeyword("END") && depth == 0) {
+                parser.advance(); // consume END
+                break;
+            }
+            // Track nested BEGIN/END (e.g., CASE ... END)
+            if (parser.checkKeyword("CASE")) depth++;
+            if (parser.checkKeyword("END") && depth > 0) depth--;
+            Token t = parser.advance();
+            if (sb.length() > 0) sb.append(" ");
+            if (t.type() == TokenType.STRING_LITERAL) {
+                sb.append("'").append(t.value().replace("'", "''")).append("'");
+            } else {
+                sb.append(t.value());
+            }
+        }
+        return sb.toString().trim();
     }
 
     private String readFunctionBody() {
