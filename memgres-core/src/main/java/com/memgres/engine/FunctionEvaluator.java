@@ -631,6 +631,41 @@ class FunctionEvaluator {
                 }
                 return null;
             }
+            case "array_ndims": {
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                if (arr == null) return null;
+                String s = arr instanceof String ? (String) arr : TypeCoercion.formatPgArray(arr instanceof List<?> ? (List<?>) arr : Cols.listOf(arr));
+                if (!s.startsWith("{")) return null;
+                int dims = 0;
+                for (int ci = 0; ci < s.length(); ci++) {
+                    if (s.charAt(ci) == '{') dims++;
+                    else break;
+                }
+                return dims;
+            }
+            case "array_fill": {
+                Object fillVal = executor.evalExpr(fn.args().get(0), ctx);
+                Object dimsArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (dimsArg == null) return null;
+                List<?> dimsList;
+                if (dimsArg instanceof List<?>) dimsList = (List<?>) dimsArg;
+                else if (dimsArg instanceof String && ((String) dimsArg).startsWith("{")) dimsList = parseSimplePgArray((String) dimsArg);
+                else return null;
+                return buildFilledArray(fillVal, dimsList, 0);
+            }
+            case "trim_array": {
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                Object nObj = executor.evalExpr(fn.args().get(1), ctx);
+                if (arr == null || nObj == null) return null;
+                int n = ((Number) nObj).intValue();
+                List<Object> list;
+                if (arr instanceof List<?>) list = new java.util.ArrayList<>((List<?>) arr);
+                else if (arr instanceof String && ((String) arr).startsWith("{")) list = new java.util.ArrayList<>(parseSimplePgArray((String) arr));
+                else return arr;
+                if (n < 0 || n > list.size()) throw new MemgresException("number of elements to trim must be between 0 and " + list.size(), "22023");
+                list = list.subList(0, list.size() - n);
+                return TypeCoercion.formatPgArray(list);
+            }
             case "array_dims": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
@@ -1429,6 +1464,21 @@ class FunctionEvaluator {
         String t = s.trim();
         if (t.equalsIgnoreCase("infinity") || t.equalsIgnoreCase("-infinity") || t.equalsIgnoreCase("nan")) return true;
         try { Double.parseDouble(t); return true; } catch (NumberFormatException e) { return false; }
+    }
+
+    /** Build a filled multi-dimensional array string. */
+    private String buildFilledArray(Object fillVal, List<?> dims, int dimIdx) {
+        if (dimIdx >= dims.size()) {
+            return fillVal == null ? "NULL" : fillVal.toString();
+        }
+        int size = ((Number) dims.get(dimIdx)).intValue();
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < size; i++) {
+            if (i > 0) sb.append(",");
+            sb.append(buildFilledArray(fillVal, dims, dimIdx + 1));
+        }
+        sb.append("}");
+        return sb.toString();
     }
 
     /** Parse a simple PG array string like {a,b,c} into a List. */

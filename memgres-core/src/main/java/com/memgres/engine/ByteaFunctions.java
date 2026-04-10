@@ -44,6 +44,12 @@ class ByteaFunctions {
                 byte[] input = arg instanceof byte[] ? (byte[]) arg : arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 return ByteaOperations.encodeHex(ByteaOperations.sha256(input));
             }
+            case "sha384": {
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                byte[] input = arg instanceof byte[] ? (byte[]) arg : arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                return ByteaOperations.encodeHex(ByteaOperations.sha384(input));
+            }
             case "sha512": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;

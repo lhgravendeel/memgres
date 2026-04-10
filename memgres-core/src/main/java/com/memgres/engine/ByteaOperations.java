@@ -64,6 +64,15 @@ public final class ByteaOperations {
         }
     }
 
+    /** SHA-384 hash */
+    public static byte[] sha384(byte[] input) {
+        try {
+            return MessageDigest.getInstance("SHA-384").digest(input);
+        } catch (NoSuchAlgorithmException e) {
+            throw new MemgresException("SHA-384 not available");
+        }
+    }
+
     /** SHA-512 hash */
     public static byte[] sha512(byte[] input) {
         try {
