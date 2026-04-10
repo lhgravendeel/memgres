@@ -1147,4 +1147,90 @@ class VirtualGeneratedColumnTest {
         assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_multi_b1'"));
         assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_multi_b2'"));
     }
+
+    // ========================================================================
+    // ALTER TABLE ADD COLUMN: volatile function rejection
+    // ========================================================================
+
+    @Test
+    void alter_table_add_virtual_column_rejects_volatile_now() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int)");
+        assertThrows(SQLException.class, () ->
+                exec("ALTER TABLE t1 ADD COLUMN ts timestamp GENERATED ALWAYS AS (now()) VIRTUAL"),
+                "ALTER TABLE ADD COLUMN with now() should be rejected");
+    }
+
+    @Test
+    void alter_table_add_virtual_column_rejects_volatile_random() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int)");
+        assertThrows(SQLException.class, () ->
+                exec("ALTER TABLE t1 ADD COLUMN r float GENERATED ALWAYS AS (random()) VIRTUAL"),
+                "ALTER TABLE ADD COLUMN with random() should be rejected");
+    }
+
+    @Test
+    void alter_table_add_virtual_column_rejects_gen_random_uuid() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int)");
+        assertThrows(SQLException.class, () ->
+                exec("ALTER TABLE t1 ADD COLUMN uid uuid GENERATED ALWAYS AS (gen_random_uuid()) VIRTUAL"),
+                "ALTER TABLE ADD COLUMN with gen_random_uuid() should be rejected");
+    }
+
+    @Test
+    void alter_table_add_stored_column_rejects_volatile() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int)");
+        assertThrows(SQLException.class, () ->
+                exec("ALTER TABLE t1 ADD COLUMN ts timestamp GENERATED ALWAYS AS (now()) STORED"),
+                "ALTER TABLE ADD STORED COLUMN with now() should also be rejected");
+    }
+
+    @Test
+    void alter_table_add_virtual_column_rejects_subquery() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, a int)");
+        assertThrows(SQLException.class, () ->
+                exec("ALTER TABLE t1 ADD COLUMN x int GENERATED ALWAYS AS ((select 1)) VIRTUAL"),
+                "ALTER TABLE ADD COLUMN with subquery should be rejected");
+    }
+
+    // ========================================================================
+    // Additional volatile functions: statement_timestamp, currval, localtimestamp
+    // ========================================================================
+
+    @Test
+    void virtual_column_rejects_statement_timestamp() {
+        assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, ts timestamp GENERATED ALWAYS AS (statement_timestamp()) VIRTUAL)"),
+                "statement_timestamp() is volatile, should be rejected");
+    }
+
+    @Test
+    void virtual_column_rejects_localtimestamp() {
+        assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, ts timestamp GENERATED ALWAYS AS (localtimestamp) VIRTUAL)"),
+                "localtimestamp is stable, should be rejected in generated column");
+    }
+
+    @Test
+    void expression_index_rejects_statement_timestamp() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, name text)");
+        assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_bad ON t1 ((statement_timestamp()))"),
+                "statement_timestamp() in index expression must be rejected");
+    }
+
+    @Test
+    void expression_index_rejects_current_date() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, name text)");
+        assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_bad ON t1 ((current_date))"),
+                "current_date in index expression must be rejected");
+    }
+
+    @Test
+    void expression_index_rejects_localtimestamp() throws SQLException {
+        exec("CREATE TABLE t1(id int PRIMARY KEY, name text)");
+        assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_bad ON t1 ((localtimestamp))"),
+                "localtimestamp in index expression must be rejected");
+    }
 }

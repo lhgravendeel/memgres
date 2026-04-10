@@ -1376,7 +1376,11 @@ class DdlObjectExecutor {
                         if (colLower.contains("random(") || colLower.contains("now(")
                                 || colLower.contains("clock_timestamp(") || colLower.contains("timeofday(")
                                 || colLower.contains("current_timestamp") || colLower.contains("gen_random_uuid(")
-                                || colLower.contains("nextval(") || colLower.contains("txid_current(")) {
+                                || colLower.contains("nextval(") || colLower.contains("txid_current(")
+                                || colLower.contains("statement_timestamp(") || colLower.contains("currval(")
+                                || colLower.contains("setval(") || colLower.contains("localtimestamp")
+                                || colLower.contains("localtime") || colLower.contains("current_time")
+                                || colLower.contains("current_date")) {
                             throw new MemgresException("functions in index expression must be marked IMMUTABLE", "42P17");
                         }
                         // Try to evaluate the expression against a dummy row to catch type errors

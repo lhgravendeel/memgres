@@ -163,7 +163,9 @@ class DdlTableExecutor {
                         || genNorm.contains("current_timestamp") || genNorm.contains("timeofday(")
                         || genNorm.contains("current_time") || genNorm.contains("current_date")
                         || genNorm.contains("gen_random_uuid(") || genNorm.contains("nextval(")
-                        || genNorm.contains("txid_current(")) {
+                        || genNorm.contains("txid_current(") || genNorm.contains("statement_timestamp(")
+                        || genNorm.contains("currval(") || genNorm.contains("setval(")
+                        || genNorm.contains("localtimestamp") || genNorm.contains("localtime")) {
                     throw new MemgresException("generation expression is not immutable", "42P17");
                 }
                 if (genNorm.contains("select")) {
