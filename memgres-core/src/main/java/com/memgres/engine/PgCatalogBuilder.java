@@ -27,6 +27,13 @@ public class PgCatalogBuilder {
      * Returns an empty table for unrecognized names.
      */
     public Table build(String tableName) {
+        return build(tableName, null);
+    }
+
+    /**
+     * Build the requested pg_catalog table by name, with session context for session-scoped views.
+     */
+    public Table build(String tableName, Session session) {
         switch (tableName) {
             case "pg_class":
                 return core.buildPgClass();
@@ -168,9 +175,9 @@ public class PgCatalogBuilder {
             case "pg_prepared_xacts":
                 return stubs.buildPgPreparedXacts();
             case "pg_cursors":
-                return stubs.buildPgCursors();
+                return stubs.buildPgCursors(session);
             case "pg_prepared_statements":
-                return stubs.buildPgPreparedStatements();
+                return stubs.buildPgPreparedStatements(session);
             case "pg_available_extensions":
                 return stubs.buildPgAvailableExtensions();
             case "pg_available_extension_versions":

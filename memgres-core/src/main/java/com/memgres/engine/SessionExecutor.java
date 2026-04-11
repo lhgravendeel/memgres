@@ -607,8 +607,11 @@ class SessionExecutor {
         int inferredCount = maxParamIndex(stmt.body());
         // Validate the body at PREPARE time (PG does full analysis/type-checking here)
         validatePreparedBody(stmt.body(), paramTypes);
+        // Reconstruct SQL text from AST for pg_prepared_statements catalog view
+        String sqlText = SqlUnparser.toSql(stmt.body());
         executor.session.addPreparedStatement(stmt.name(),
-                new Session.PreparedStmt(stmt.name(), paramTypes, stmt.body(), inferredCount));
+                new Session.PreparedStmt(stmt.name(), paramTypes, stmt.body(), inferredCount,
+                        sqlText, java.time.OffsetDateTime.now(), true));
         return QueryResult.message(QueryResult.Type.SET, "PREPARE");
     }
 
@@ -1120,7 +1123,11 @@ class SessionExecutor {
         QueryResult result = executor.selectExecutor.executeSelect(stmt.query());
         List<Object[]> rows = result.getRows() != null ? new ArrayList<>(result.getRows()) : new ArrayList<>();
         List<Column> columns = result.getColumns() != null ? result.getColumns() : Cols.listOf();
-        executor.session.addCursor(stmt.name(), new Session.CursorState(stmt.name(), columns, rows));
+        // Reconstruct SQL text from AST for pg_cursors catalog view
+        String queryText = SqlUnparser.toSql(stmt.query());
+        executor.session.addCursor(stmt.name(),
+                new Session.CursorState(stmt.name(), columns, rows,
+                        queryText, stmt.withHold, false, stmt.scroll));
         return QueryResult.message(QueryResult.Type.SET, "DECLARE CURSOR");
     }
 

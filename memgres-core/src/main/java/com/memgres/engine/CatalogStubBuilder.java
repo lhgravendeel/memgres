@@ -1054,7 +1054,7 @@ class CatalogStubBuilder {
         return new Table("pg_prepared_xacts", cols); // empty, no 2PC support
     }
 
-    Table buildPgCursors() {
+    Table buildPgCursors(Session session) {
         List<Column> cols = Cols.listOf(
                 col("name", DataType.TEXT),
                 col("statement", DataType.TEXT),
@@ -1063,18 +1063,66 @@ class CatalogStubBuilder {
                 col("is_scrollable", DataType.BOOLEAN),
                 col("creation_time", DataType.TIMESTAMPTZ)
         );
-        return new Table("pg_cursors", cols); // empty, no real cursor tracking
+        Table table = new Table("pg_cursors", cols);
+        if (session != null) {
+            for (Session.CursorState cursor : session.getAllCursors()) {
+                String stmt = cursor.getQueryText();
+                String creationTimeStr = cursor.getCreationTime() != null
+                        ? cursor.getCreationTime().toString() : null;
+                table.insertRow(new Object[]{
+                        cursor.getName(),
+                        stmt,
+                        cursor.isHoldable(),
+                        cursor.isBinary(),
+                        cursor.isScrollable(),
+                        creationTimeStr
+                });
+            }
+        }
+        return table;
     }
 
-    Table buildPgPreparedStatements() {
+    Table buildPgPreparedStatements(Session session) {
         List<Column> cols = Cols.listOf(
                 col("name", DataType.TEXT),
                 col("statement", DataType.TEXT),
                 col("prepare_time", DataType.TIMESTAMPTZ),
                 col("parameter_types", DataType.TEXT),
+                col("result_types", DataType.TEXT),
                 col("from_sql", DataType.BOOLEAN)
         );
-        return new Table("pg_prepared_statements", cols); // empty
+        Table table = new Table("pg_prepared_statements", cols);
+        if (session != null) {
+            for (Session.PreparedStmt ps : session.getAllPreparedStatements()) {
+                String stmtText = ps.sqlText() != null ? ps.sqlText() : SqlUnparser.toSql(ps.body());
+                String prepareTimeStr = ps.prepareTime() != null
+                        ? ps.prepareTime().toString() : null;
+                // Format parameter_types as regtype[] (PG format: {integer,text,...})
+                String paramTypes = formatParamTypes(ps.paramTypes());
+                // result_types: PG 18 column — format as regtype[] from query output columns
+                String resultTypes = null; // populated below if possible
+                table.insertRow(new Object[]{
+                        ps.name(),
+                        stmtText,
+                        prepareTimeStr,
+                        paramTypes,
+                        resultTypes,
+                        ps.fromSql()
+                });
+            }
+        }
+        return table;
+    }
+
+    private String formatParamTypes(java.util.List<String> types) {
+        if (types == null || types.isEmpty()) return "{}";
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < types.size(); i++) {
+            if (i > 0) sb.append(",");
+            sb.append(types.get(i));
+        }
+        sb.append("}");
+        return sb.toString();
     }
 
     Table buildPgAvailableExtensions() {

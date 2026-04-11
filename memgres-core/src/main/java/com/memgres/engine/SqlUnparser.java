@@ -18,6 +18,9 @@ public class SqlUnparser {
         if (stmt == null) return null;
         if (stmt instanceof SelectStmt) return selectToSql(((SelectStmt) stmt));
         if (stmt instanceof SetOpStmt) return setOpToSql(((SetOpStmt) stmt));
+        if (stmt instanceof InsertStmt) return insertToSql(((InsertStmt) stmt));
+        if (stmt instanceof UpdateStmt) return updateToSql(((UpdateStmt) stmt));
+        if (stmt instanceof DeleteStmt) return deleteToSql(((DeleteStmt) stmt));
         return stmt.toString(); // fallback
     }
 
@@ -251,6 +254,81 @@ public class SqlUnparser {
             default:
                 return op.name();
         }
+    }
+
+    private static String insertToSql(InsertStmt ins) {
+        StringBuilder sb = new StringBuilder("INSERT INTO ");
+        if (ins.schema != null) sb.append(ins.schema).append(".");
+        sb.append(ins.table);
+        if (ins.columns != null && !ins.columns.isEmpty()) {
+            sb.append(" (").append(String.join(", ", ins.columns)).append(")");
+        }
+        if (ins.selectStmt != null) {
+            sb.append(" ").append(toSql(ins.selectStmt));
+        } else if (ins.values != null && !ins.values.isEmpty()) {
+            sb.append(" VALUES ");
+            for (int i = 0; i < ins.values.size(); i++) {
+                if (i > 0) sb.append(", ");
+                sb.append("(");
+                List<Expression> row = ins.values.get(i);
+                for (int j = 0; j < row.size(); j++) {
+                    if (j > 0) sb.append(", ");
+                    sb.append(exprToSql(row.get(j)));
+                }
+                sb.append(")");
+            }
+        } else {
+            sb.append(" DEFAULT VALUES");
+        }
+        if (ins.returning != null && !ins.returning.isEmpty()) {
+            sb.append(" RETURNING ");
+            sb.append(ins.returning.stream().map(SqlUnparser::targetToSql).collect(Collectors.joining(", ")));
+        }
+        return sb.toString();
+    }
+
+    private static String updateToSql(UpdateStmt upd) {
+        StringBuilder sb = new StringBuilder("UPDATE ");
+        if (upd.schema != null) sb.append(upd.schema).append(".");
+        sb.append(upd.table);
+        if (upd.alias != null) sb.append(" ").append(upd.alias);
+        sb.append(" SET ");
+        for (int i = 0; i < upd.setClauses.size(); i++) {
+            if (i > 0) sb.append(", ");
+            InsertStmt.SetClause sc = upd.setClauses.get(i);
+            sb.append(sc.column()).append(" = ").append(exprToSql(sc.value()));
+        }
+        if (upd.from != null && !upd.from.isEmpty()) {
+            sb.append(" FROM ");
+            sb.append(upd.from.stream().map(SqlUnparser::fromItemToSql).collect(Collectors.joining(", ")));
+        }
+        if (upd.where != null) {
+            sb.append(" WHERE ").append(exprToSql(upd.where));
+        }
+        if (upd.returning != null && !upd.returning.isEmpty()) {
+            sb.append(" RETURNING ");
+            sb.append(upd.returning.stream().map(SqlUnparser::targetToSql).collect(Collectors.joining(", ")));
+        }
+        return sb.toString();
+    }
+
+    private static String deleteToSql(DeleteStmt del) {
+        StringBuilder sb = new StringBuilder("DELETE FROM ");
+        if (del.schema != null) sb.append(del.schema).append(".");
+        sb.append(del.table);
+        if (del.alias != null) sb.append(" ").append(del.alias);
+        if (del.using != null && !del.using.isEmpty()) {
+            sb.append(" USING ");
+            sb.append(del.using.stream().map(SqlUnparser::fromItemToSql).collect(Collectors.joining(", ")));
+        }
+        if (del.where != null) {
+            sb.append(" WHERE ").append(exprToSql(del.where));
+        }
+        if (del.returning != null && !del.returning.isEmpty()) {
+            sb.append(" RETURNING ");
+            sb.append(del.returning.stream().map(SqlUnparser::targetToSql).collect(Collectors.joining(", ")));
+        }
+        return sb.toString();
     }
 
     private static String caseToSql(CaseExpr c) {
