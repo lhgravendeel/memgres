@@ -36,6 +36,13 @@ class PgPreparedStatementsCursorsTest {
         try (Statement st = conn.createStatement()) { st.execute(sql); }
     }
 
+    private int queryInt(String sql) throws Exception {
+        try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            assertTrue(rs.next(), "Expected a row from: " + sql);
+            return rs.getInt(1);
+        }
+    }
+
     // ===== pg_prepared_statements =====
 
     @Test
@@ -1449,5 +1456,191 @@ class PgPreparedStatementsCursorsTest {
                     "Should skip line comment and find real AS: " + stmt);
         }
         exec("DEALLOCATE lc_plan");
+    }
+
+    // ---- B3 Gap Audit Round 4: DISCARD PLANS, NO SCROLL, cursor position ----
+
+    @Test
+    void discardPlansPreservesPreparedStatements() throws Exception {
+        exec("DEALLOCATE ALL");
+        exec("PREPARE dp_plan AS SELECT 1");
+        // DISCARD PLANS should NOT remove prepared statements (only invalidates cached plans)
+        exec("DISCARD PLANS");
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT name FROM pg_prepared_statements WHERE name = 'dp_plan'")) {
+            assertTrue(rs.next(), "DISCARD PLANS should not remove prepared statements");
+            assertEquals("dp_plan", rs.getString("name"));
+        }
+        exec("DEALLOCATE dp_plan");
+    }
+
+    @Test
+    void noScrollCursorRejectsBackwardFetch() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE ns_cur CURSOR FOR SELECT 1");
+        exec("FETCH NEXT FROM ns_cur"); // forward is OK
+        try {
+            exec("FETCH PRIOR FROM ns_cur");
+            fail("FETCH PRIOR on NO SCROLL cursor should fail");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("cursor can only scan forward"),
+                    "Expected 55000 error: " + e.getMessage());
+        }
+        exec("ROLLBACK");
+    }
+
+    @Test
+    void noScrollCursorRejectsLast() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE ns_cur2 CURSOR FOR SELECT 1");
+        try {
+            exec("FETCH LAST FROM ns_cur2");
+            fail("FETCH LAST on NO SCROLL cursor should fail");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("cursor can only scan forward"),
+                    "Expected 55000 error: " + e.getMessage());
+        }
+        exec("ROLLBACK");
+    }
+
+    @Test
+    void noScrollCursorRejectsAbsolute() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE ns_cur3 CURSOR FOR SELECT 1");
+        try {
+            exec("FETCH ABSOLUTE 1 FROM ns_cur3");
+            fail("FETCH ABSOLUTE on NO SCROLL cursor should fail");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("cursor can only scan forward"),
+                    "Expected 55000 error: " + e.getMessage());
+        }
+        exec("ROLLBACK");
+    }
+
+    @Test
+    void noScrollCursorAllowsForwardRelative() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE ns_cur4 CURSOR FOR SELECT generate_series(1,3)");
+        // RELATIVE with positive count is forward — should work on NO SCROLL
+        assertEquals(1, queryInt("FETCH RELATIVE 1 FROM ns_cur4"));
+        assertEquals(2, queryInt("FETCH RELATIVE 1 FROM ns_cur4"));
+        exec("CLOSE ns_cur4");
+        exec("COMMIT");
+    }
+
+    @Test
+    void noScrollCursorRejectsNegativeRelative() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE ns_cur5 CURSOR FOR SELECT generate_series(1,3)");
+        exec("FETCH NEXT FROM ns_cur5"); // move to row 1
+        try {
+            exec("FETCH RELATIVE -1 FROM ns_cur5");
+            fail("FETCH RELATIVE -1 on NO SCROLL cursor should fail");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("cursor can only scan forward"),
+                    "Expected 55000 error: " + e.getMessage());
+        }
+        exec("ROLLBACK");
+    }
+
+    @Test
+    void scrollCursorAllowsAllDirections() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE sc_cur SCROLL CURSOR FOR SELECT generate_series(1,3)");
+        assertEquals(1, queryInt("FETCH NEXT FROM sc_cur"));
+        assertEquals(2, queryInt("FETCH NEXT FROM sc_cur"));
+        assertEquals(1, queryInt("FETCH PRIOR FROM sc_cur"));
+        assertEquals(1, queryInt("FETCH FIRST FROM sc_cur"));
+        assertEquals(3, queryInt("FETCH LAST FROM sc_cur"));
+        assertEquals(2, queryInt("FETCH ABSOLUTE 2 FROM sc_cur"));
+        exec("CLOSE sc_cur");
+        exec("COMMIT");
+    }
+
+    @Test
+    void cursorPositionMovesToAfterLastOnFetchPastEnd() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE pos_cur SCROLL CURSOR FOR SELECT generate_series(1,2)");
+        assertEquals(1, queryInt("FETCH NEXT FROM pos_cur"));
+        assertEquals(2, queryInt("FETCH NEXT FROM pos_cur"));
+        // FETCH NEXT past end should move position to "after last"
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("FETCH NEXT FROM pos_cur")) {
+            assertFalse(rs.next(), "No more rows");
+        }
+        // Now FETCH PRIOR should return the last row (2), proving position was "after last"
+        assertEquals(2, queryInt("FETCH PRIOR FROM pos_cur"));
+        exec("CLOSE pos_cur");
+        exec("COMMIT");
+    }
+
+    @Test
+    void cursorPositionMovesToBeforeFirstOnFetchPrior() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE pos_cur2 SCROLL CURSOR FOR SELECT generate_series(1,2)");
+        assertEquals(1, queryInt("FETCH NEXT FROM pos_cur2"));
+        // FETCH PRIOR from first row should move to "before first"
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("FETCH PRIOR FROM pos_cur2")) {
+            assertFalse(rs.next(), "No row before first");
+        }
+        // FETCH NEXT should now return first row, proving position was "before first"
+        assertEquals(1, queryInt("FETCH NEXT FROM pos_cur2"));
+        exec("CLOSE pos_cur2");
+        exec("COMMIT");
+    }
+
+    @Test
+    void fetchAbsoluteZeroPositionsBeforeFirst() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE abs0_cur SCROLL CURSOR FOR SELECT generate_series(1,3)");
+        assertEquals(2, queryInt("FETCH ABSOLUTE 2 FROM abs0_cur"));
+        // ABSOLUTE 0 = position before first (returns no row)
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("FETCH ABSOLUTE 0 FROM abs0_cur")) {
+            assertFalse(rs.next(), "ABSOLUTE 0 returns no row");
+        }
+        // NEXT should return first row
+        assertEquals(1, queryInt("FETCH NEXT FROM abs0_cur"));
+        exec("CLOSE abs0_cur");
+        exec("COMMIT");
+    }
+
+    @Test
+    void backwardAllPositionsBeforeFirst() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE bwa_cur SCROLL CURSOR FOR SELECT generate_series(1,3)");
+        // Move to end
+        exec("FETCH LAST FROM bwa_cur");
+        // BACKWARD ALL: fetch all rows backwards, position ends at "before first"
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("FETCH BACKWARD ALL FROM bwa_cur")) {
+            assertTrue(rs.next()); assertEquals(2, rs.getInt(1));
+            assertTrue(rs.next()); assertEquals(1, rs.getInt(1));
+            assertFalse(rs.next());
+        }
+        // Position should be "before first" — NEXT returns first row
+        assertEquals(1, queryInt("FETCH NEXT FROM bwa_cur"));
+        exec("CLOSE bwa_cur");
+        exec("COMMIT");
+    }
+
+    @Test
+    void forwardAllPositionsAfterLast() throws Exception {
+        exec("BEGIN");
+        exec("DECLARE fwa_cur SCROLL CURSOR FOR SELECT generate_series(1,3)");
+        // FORWARD ALL
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("FETCH FORWARD ALL FROM fwa_cur")) {
+            assertTrue(rs.next()); assertEquals(1, rs.getInt(1));
+            assertTrue(rs.next()); assertEquals(2, rs.getInt(1));
+            assertTrue(rs.next()); assertEquals(3, rs.getInt(1));
+            assertFalse(rs.next());
+        }
+        // Position should be "after last" — PRIOR returns last row
+        assertEquals(3, queryInt("FETCH PRIOR FROM fwa_cur"));
+        exec("CLOSE fwa_cur");
+        exec("COMMIT");
     }
 }

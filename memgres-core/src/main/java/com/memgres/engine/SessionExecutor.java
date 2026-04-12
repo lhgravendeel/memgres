@@ -460,7 +460,8 @@ class SessionExecutor {
                 // pg_advisory_unlock_all() — release all session-level advisory locks
                 executor.database.advisoryUnlockAll(executor.session);
             } else if (target.equals("PLANS")) {
-                executor.session.removeAllPreparedStatements();
+                // PG DISCARD PLANS invalidates cached query plans, forcing re-planning on next use.
+                // It does NOT deallocate prepared statements. Since Memgres has no plan cache, this is a no-op.
             } else if (target.equals("TEMP") || target.equals("TEMPORARY")) {
                 executor.session.dropTempObjects();
             }
@@ -1394,6 +1395,17 @@ class SessionExecutor {
         if (cursor == null) {
             throw new MemgresException("cursor \"" + stmt.cursorName() + "\" does not exist", "34000");
         }
+        // PG enforces NO SCROLL: only NEXT, FORWARD, FORWARD_ALL, ALL, and forward RELATIVE are allowed.
+        // PRIOR, BACKWARD, BACKWARD_ALL, FIRST, LAST, ABSOLUTE, and negative RELATIVE are rejected.
+        if (!cursor.isScrollable()) {
+            FetchStmt.Direction dir = stmt.direction();
+            if (dir == FetchStmt.Direction.PRIOR || dir == FetchStmt.Direction.BACKWARD
+                    || dir == FetchStmt.Direction.BACKWARD_ALL || dir == FetchStmt.Direction.FIRST
+                    || dir == FetchStmt.Direction.LAST || dir == FetchStmt.Direction.ABSOLUTE
+                    || (dir == FetchStmt.Direction.RELATIVE && stmt.count() < 0)) {
+                throw new MemgresException("cursor can only scan forward", "55000");
+            }
+        }
         List<Object[]> fetched = cursorFetch(cursor, stmt.direction(), stmt.count());
 
         if (stmt.isMove()) {
@@ -1408,39 +1420,83 @@ class SessionExecutor {
         List<Object[]> result = new ArrayList<>();
 
         switch (dir) {
-            case NEXT:
-                addRow(result, cursor, pos + 1);
+            case NEXT: {
+                // PG: moves position forward by 1 regardless of whether row exists
+                int target = pos + 1;
+                addRow(result, cursor, target);
+                if (result.isEmpty()) cursor.setPosition(Math.min(target, total));
                 break;
-            case PRIOR:
-                addRow(result, cursor, pos - 1);
+            }
+            case PRIOR: {
+                // PG: moves position backward by 1 regardless of whether row exists
+                int target = pos - 1;
+                addRow(result, cursor, target);
+                if (result.isEmpty()) cursor.setPosition(Math.max(target, -1));
                 break;
+            }
             case FIRST:
                 addRow(result, cursor, 0);
+                if (result.isEmpty()) cursor.setPosition(-1);
                 break;
             case LAST:
                 addRow(result, cursor, total - 1);
                 break;
-            case ABSOLUTE:
-                addRow(result, cursor, count > 0 ? count - 1 : total + count);
+            case ABSOLUTE: {
+                // PG: ABSOLUTE 0 positions before first row (returns nothing)
+                // ABSOLUTE N (N>0): position to Nth row (1-based)
+                // ABSOLUTE -N: position from end
+                if (count == 0) {
+                    cursor.setPosition(-1); // before first
+                } else {
+                    addRow(result, cursor, count > 0 ? count - 1 : total + count);
+                }
                 break;
-            case RELATIVE:
-                addRow(result, cursor, pos + count);
+            }
+            case RELATIVE: {
+                int target = pos + count;
+                addRow(result, cursor, target);
+                if (result.isEmpty()) {
+                    cursor.setPosition(target < 0 ? -1 : Math.min(target, total));
+                }
                 break;
+            }
             case FORWARD: {
-                for (int i = 0; i < count; i++) addRow(result, cursor, pos + 1 + i); if (!result.isEmpty()) cursor.setPosition(pos + result.size()); 
+                int lastTarget = pos;
+                for (int i = 0; i < count; i++) {
+                    lastTarget = pos + 1 + i;
+                    addRow(result, cursor, lastTarget);
+                }
+                // PG: position advances even if rows not found
+                if (result.isEmpty() && count > 0) {
+                    cursor.setPosition(Math.min(lastTarget, total));
+                } else if (!result.isEmpty()) {
+                    cursor.setPosition(pos + result.size());
+                }
                 break;
             }
             case FORWARD_ALL:
             case ALL: {
-                for (int i = pos + 1; i < total; i++) addRow(result, cursor, i); if (result.isEmpty()) cursor.setPosition(total); 
+                for (int i = pos + 1; i < total; i++) addRow(result, cursor, i);
+                // PG: position moves to "after last" regardless of whether rows were found
+                cursor.setPosition(total);
                 break;
             }
             case BACKWARD: {
-                for (int i = 0; i < count; i++) addRow(result, cursor, pos - 1 - i); 
+                int lastTarget = pos;
+                for (int i = 0; i < count; i++) {
+                    lastTarget = pos - 1 - i;
+                    addRow(result, cursor, lastTarget);
+                }
+                // PG: position moves backward even if rows not found
+                if (result.isEmpty() && count > 0) {
+                    cursor.setPosition(Math.max(lastTarget, -1));
+                }
                 break;
             }
             case BACKWARD_ALL: {
-                for (int i = pos - 1; i >= 0; i--) addRow(result, cursor, i); 
+                for (int i = pos - 1; i >= 0; i--) addRow(result, cursor, i);
+                // PG: position moves to "before first" regardless
+                cursor.setPosition(-1);
                 break;
             }
         }

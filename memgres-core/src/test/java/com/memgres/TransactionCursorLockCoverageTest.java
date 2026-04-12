@@ -718,7 +718,7 @@ class TransactionCursorLockCoverageTest {
         exec("CREATE TABLE t1 (id INTEGER)");
         exec("INSERT INTO t1 VALUES (1), (2), (3)");
         exec("BEGIN");
-        exec("DECLARE c1 CURSOR FOR SELECT id FROM t1 ORDER BY id");
+        exec("DECLARE c1 SCROLL CURSOR FOR SELECT id FROM t1 ORDER BY id");
         assertEquals(1, queryInt("FETCH FIRST FROM c1"));
         exec("CLOSE c1");
         exec("COMMIT");
@@ -729,7 +729,7 @@ class TransactionCursorLockCoverageTest {
         exec("CREATE TABLE t1 (id INTEGER)");
         exec("INSERT INTO t1 VALUES (1), (2), (3)");
         exec("BEGIN");
-        exec("DECLARE c1 CURSOR FOR SELECT id FROM t1 ORDER BY id");
+        exec("DECLARE c1 SCROLL CURSOR FOR SELECT id FROM t1 ORDER BY id");
         assertEquals(3, queryInt("FETCH LAST FROM c1"));
         exec("CLOSE c1");
         exec("COMMIT");
@@ -740,7 +740,7 @@ class TransactionCursorLockCoverageTest {
         exec("CREATE TABLE t1 (id INTEGER)");
         exec("INSERT INTO t1 VALUES (10), (20), (30)");
         exec("BEGIN");
-        exec("DECLARE c1 CURSOR FOR SELECT id FROM t1 ORDER BY id");
+        exec("DECLARE c1 SCROLL CURSOR FOR SELECT id FROM t1 ORDER BY id");
         assertEquals(20, queryInt("FETCH ABSOLUTE 2 FROM c1"));
         assertEquals(30, queryInt("FETCH ABSOLUTE 3 FROM c1"));
         assertEquals(10, queryInt("FETCH ABSOLUTE 1 FROM c1"));
@@ -1061,7 +1061,7 @@ class TransactionCursorLockCoverageTest {
         exec("CREATE TABLE t1 (id INTEGER)");
         exec("INSERT INTO t1 VALUES (1), (2), (3), (4), (5)");
         exec("BEGIN");
-        exec("DECLARE c1 CURSOR FOR SELECT id FROM t1 ORDER BY id");
+        exec("DECLARE c1 SCROLL CURSOR FOR SELECT id FROM t1 ORDER BY id");
         exec("MOVE ABSOLUTE 3 IN c1");
         assertEquals(4, queryInt("FETCH NEXT FROM c1"));
         exec("CLOSE c1");
@@ -1628,7 +1628,7 @@ class TransactionCursorLockCoverageTest {
         exec("CREATE TABLE t1 (id INTEGER)");
         exec("INSERT INTO t1 VALUES (1), (2), (3)");
         exec("BEGIN");
-        exec("DECLARE c1 CURSOR FOR SELECT id FROM t1 ORDER BY id");
+        exec("DECLARE c1 SCROLL CURSOR FOR SELECT id FROM t1 ORDER BY id");
         exec("MOVE LAST IN c1");
         // After MOVE LAST, position is at last row; FETCH NEXT goes beyond
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("FETCH NEXT FROM c1")) {
