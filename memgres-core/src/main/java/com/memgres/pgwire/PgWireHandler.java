@@ -378,12 +378,153 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         preparedStatements.put(stmtName, new PreparedStmt(sql, paramOids));
         if (stmtName != null && !stmtName.isEmpty()) {
             stmtDescribed.remove(stmtName);
+            // Bridge named protocol-level prepared statements to Session for pg_prepared_statements visibility
+            bridgeProtocolPreparedToSession(stmtName, sql, paramOids);
         }
 
         ByteBuf buf = ctx.alloc().buffer();
         buf.writeByte('1');
         buf.writeInt(4);
         ctx.write(buf);
+    }
+
+    /**
+     * Bridge a named protocol-level prepared statement to Session so it appears
+     * in pg_prepared_statements with from_sql = false (matching real PG behavior).
+     */
+    private void bridgeProtocolPreparedToSession(String name, String sql, int[] paramOids) {
+        try {
+            // Convert parameter OIDs to type names
+            java.util.List<String> paramTypes = new java.util.ArrayList<>();
+            if (paramOids != null) {
+                for (int oid : paramOids) {
+                    if (oid == 0) continue; // unspecified type
+                    com.memgres.engine.DataType dt = com.memgres.engine.DataType.fromOid(oid);
+                    paramTypes.add(dt != null ? dt.toRegtypeDisplay() : "unknown");
+                }
+            }
+            // Parse the SQL to get the AST body
+            com.memgres.engine.parser.ast.Statement body = null;
+            try {
+                body = com.memgres.engine.parser.Parser.parse(sql);
+            } catch (Exception ignored) {
+                // Parse may fail for some protocol-level queries; store without body
+            }
+            // Remove existing if overwriting (PG allows Parse to silently overwrite)
+            if (session.getPreparedStatement(name) != null) {
+                session.removePreparedStatement(name);
+            }
+            int inferredCount = 0;
+            if (paramOids != null) inferredCount = paramOids.length;
+            // Infer result types via dry-run (LIMIT 0)
+            java.util.List<String> resultTypes = inferProtocolResultTypes(sql, body);
+            session.addPreparedStatement(name,
+                    new com.memgres.engine.Session.PreparedStmt(name, paramTypes, body, inferredCount,
+                            sql, java.time.OffsetDateTime.now(), false, resultTypes));
+        } catch (Exception e) {
+            // Don't let catalog bridging failures break protocol handling
+            LOG.debug("[PROTO] Failed to bridge prepared statement '{}' to session: {}", name, e.getMessage());
+        }
+    }
+
+    /**
+     * Infer result column types for a protocol-level prepared statement.
+     * Uses LIMIT 0 dry-run for SELECT only. For DML RETURNING, infers from table schema.
+     * Returns null for non-query statements.
+     */
+    private java.util.List<String> inferProtocolResultTypes(String sql, com.memgres.engine.parser.ast.Statement body) {
+        try {
+            if (sql == null) return null;
+            String upper = sql.trim().toUpperCase();
+            boolean isSelect = upper.startsWith("SELECT") || upper.startsWith("WITH") || upper.startsWith("VALUES");
+            if (isSelect) {
+                // SELECT: safe to dry-run with LIMIT 0
+                com.memgres.engine.Session.TransactionStatus saved = session.getStatus();
+                try {
+                    String drySql = sql.replaceAll("\\$\\d+", "NULL").replaceAll(";\\s*$", "").trim();
+                    if (!drySql.toUpperCase().contains("LIMIT")) drySql = drySql + " LIMIT 0";
+                    com.memgres.engine.QueryResult result = session.execute(drySql, new java.util.ArrayList<>());
+                    if (result.getColumns() != null && !result.getColumns().isEmpty()) {
+                        java.util.List<String> types = new java.util.ArrayList<>();
+                        for (com.memgres.engine.Column col : result.getColumns()) {
+                            types.add(col.getType().toRegtypeDisplay());
+                        }
+                        return types;
+                    }
+                } catch (Exception e) {
+                    session.restoreStatus(saved);
+                    LOG.debug("[PROTO] Failed to infer SELECT result types: {}", e.getMessage());
+                }
+            }
+            // DML with RETURNING: infer from AST and table schema (no execution — avoids side effects)
+            if (body != null) {
+                return inferResultTypesFromAst(body);
+            }
+        } catch (Exception e) {
+            LOG.debug("[PROTO] Failed to infer result types: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    /** Infer result column types from AST by looking up the target table's schema. */
+    private java.util.List<String> inferResultTypesFromAst(com.memgres.engine.parser.ast.Statement body) {
+        try {
+            java.util.List<com.memgres.engine.parser.ast.SelectStmt.SelectTarget> returning = null;
+            String tableName = null;
+            String schemaName = null;
+            if (body instanceof com.memgres.engine.parser.ast.InsertStmt) {
+                com.memgres.engine.parser.ast.InsertStmt ins = (com.memgres.engine.parser.ast.InsertStmt) body;
+                returning = ins.returning;
+                tableName = ins.table;
+                schemaName = ins.schema;
+            } else if (body instanceof com.memgres.engine.parser.ast.UpdateStmt) {
+                com.memgres.engine.parser.ast.UpdateStmt upd = (com.memgres.engine.parser.ast.UpdateStmt) body;
+                returning = upd.returning;
+                tableName = upd.table;
+                schemaName = upd.schema;
+            } else if (body instanceof com.memgres.engine.parser.ast.DeleteStmt) {
+                com.memgres.engine.parser.ast.DeleteStmt del = (com.memgres.engine.parser.ast.DeleteStmt) body;
+                returning = del.returning;
+                tableName = del.table;
+                schemaName = del.schema;
+            }
+            if (returning == null || returning.isEmpty()) return null;
+            // Resolve the table to get column types
+            if (schemaName == null) schemaName = "public";
+            com.memgres.engine.Table table = null;
+            for (com.memgres.engine.Schema s : database.getSchemas().values()) {
+                com.memgres.engine.Table t = s.getTable(tableName);
+                if (t != null) { table = t; break; }
+            }
+            if (table == null) return null;
+            // Map RETURNING targets to column types
+            return mapReturningToTypes(returning, table);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private java.util.List<String> mapReturningToTypes(
+            java.util.List<com.memgres.engine.parser.ast.SelectStmt.SelectTarget> returning,
+            com.memgres.engine.Table table) {
+        java.util.List<String> types = new java.util.ArrayList<>();
+        for (com.memgres.engine.parser.ast.SelectStmt.SelectTarget target : returning) {
+            com.memgres.engine.parser.ast.Expression expr = target.expr();
+            if (expr instanceof com.memgres.engine.parser.ast.WildcardExpr) {
+                // RETURNING * — add all columns
+                for (com.memgres.engine.Column col : table.getColumns()) {
+                    types.add(col.getType().toRegtypeDisplay());
+                }
+            } else if (expr instanceof com.memgres.engine.parser.ast.ColumnRef) {
+                String colName = ((com.memgres.engine.parser.ast.ColumnRef) expr).column();
+                int colIdx = table.getColumnIndex(colName);
+                types.add(colIdx >= 0 ? table.getColumns().get(colIdx).getType().toRegtypeDisplay() : "text");
+            } else {
+                // Expression — default to text
+                types.add("text");
+            }
+        }
+        return types;
     }
 
     private void handleBind(ChannelHandlerContext ctx, PgWireMessage msg) {
@@ -495,6 +636,13 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         String sqlSnip = portal.sql().substring(0, Math.min(70, portal.sql().length())).replace("\n", " ");
 
         try {
+            // Track custom_plans for protocol-level prepared statement executions (PG 14+).
+            // Increment before execution to match PG behavior (counts even on failure).
+            if (portal.stmtName != null && !portal.stmtName.isEmpty() && session != null) {
+                Session.PreparedStmt ps = session.getPreparedStatement(portal.stmtName);
+                if (ps != null) ps.recordExecution();
+            }
+
             QueryResult result;
             String source;
 
@@ -590,6 +738,10 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         if (closeType == 'S') {
             preparedStatements.remove(name);
             stmtDescribed.remove(name);
+            // Also remove from Session (protocol-level bridge)
+            if (!name.isEmpty() && session.getPreparedStatement(name) != null) {
+                session.removePreparedStatement(name);
+            }
         } else {
             portals.remove(name);
         }

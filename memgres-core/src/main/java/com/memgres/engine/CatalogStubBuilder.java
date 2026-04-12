@@ -2,6 +2,8 @@ package com.memgres.engine;
 
 import com.memgres.engine.util.Cols;
 
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -13,6 +15,27 @@ import static com.memgres.engine.CatalogHelper.*;
  * Extracted from PgCatalogBuilder to separate concerns.
  */
 class CatalogStubBuilder {
+
+    /** PG-compatible timestamptz format: "2024-01-15 10:30:00.123456+00" (no 'T', short offset). */
+    private static final DateTimeFormatter PG_TIMESTAMPTZ_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSxxx");
+
+    static String formatTimestamptz(OffsetDateTime ts) {
+        if (ts == null) return null;
+        // Format with 6 fractional digits, then trim trailing offset colon for PG compat
+        // Java produces "+00:00", PG uses "+00"
+        String formatted = ts.format(PG_TIMESTAMPTZ_FMT);
+        // Trim ":00" from offset if offset is whole hours (e.g., "+00:00" -> "+00")
+        if (formatted.endsWith(":00") && formatted.length() > 3) {
+            int lastColon = formatted.lastIndexOf(':');
+            // Ensure we're trimming from the timezone offset, not from the time part
+            String beforeColon = formatted.substring(0, lastColon);
+            if (beforeColon.matches(".*[+\\-]\\d{2}$")) {
+                formatted = beforeColon;
+            }
+        }
+        return formatted;
+    }
 
     final Database database;
     final OidSupplier oids;
@@ -1067,8 +1090,7 @@ class CatalogStubBuilder {
         if (session != null) {
             for (Session.CursorState cursor : session.getAllCursors()) {
                 String stmt = cursor.getQueryText();
-                String creationTimeStr = cursor.getCreationTime() != null
-                        ? cursor.getCreationTime().toString() : null;
+                String creationTimeStr = formatTimestamptz(cursor.getCreationTime());
                 table.insertRow(new Object[]{
                         cursor.getName(),
                         stmt,
@@ -1087,43 +1109,47 @@ class CatalogStubBuilder {
                 col("name", DataType.TEXT),
                 col("statement", DataType.TEXT),
                 col("prepare_time", DataType.TIMESTAMPTZ),
-                col("parameter_types", DataType.TEXT),
-                col("result_types", DataType.TEXT),
-                col("from_sql", DataType.BOOLEAN)
+                col("parameter_types", DataType.TEXT_ARRAY),
+                col("result_types", DataType.TEXT_ARRAY),
+                col("from_sql", DataType.BOOLEAN),
+                col("generic_plans", DataType.BIGINT),
+                col("custom_plans", DataType.BIGINT)
         );
         Table table = new Table("pg_prepared_statements", cols);
         if (session != null) {
             for (Session.PreparedStmt ps : session.getAllPreparedStatements()) {
                 String stmtText = ps.sqlText() != null ? ps.sqlText() : SqlUnparser.toSql(ps.body());
-                String prepareTimeStr = ps.prepareTime() != null
-                        ? ps.prepareTime().toString() : null;
-                // Format parameter_types as regtype[] (PG format: {integer,text,...})
-                String paramTypes = formatParamTypes(ps.paramTypes());
-                // result_types: PG 18 column — format as regtype[] from query output columns
-                String resultTypes = null; // populated below if possible
+                String prepareTimeStr = formatTimestamptz(ps.prepareTime());
+                // parameter_types as regtype[] — stored as List<Object> for array subscripting support
+                List<Object> paramTypes = toRegTypeList(ps.paramTypes());
+                // result_types as regtype[] — null for DML without RETURNING (PG behavior)
+                List<Object> resultTypes = ps.resultTypes() != null ? toRegTypeList(ps.resultTypes()) : null;
+                // generic_plans / custom_plans: PG 14+ plan execution counters.
+                // Memgres has no planner so all executions are effectively custom plans.
+                long genericPlans = 0L;
+                long customPlans = ps.customPlans();
                 table.insertRow(new Object[]{
                         ps.name(),
                         stmtText,
                         prepareTimeStr,
                         paramTypes,
                         resultTypes,
-                        ps.fromSql()
+                        ps.fromSql(),
+                        genericPlans,
+                        customPlans
                 });
             }
         }
         return table;
     }
 
-    private String formatParamTypes(java.util.List<String> types) {
-        if (types == null || types.isEmpty()) return "{}";
-        StringBuilder sb = new StringBuilder("{");
-        for (int i = 0; i < types.size(); i++) {
-            if (i > 0) sb.append(",");
-            sb.append(types.get(i));
-        }
-        sb.append("}");
-        return sb.toString();
+    /** Convert a list of type name strings to a List<Object> for regtype[] array storage. */
+    private List<Object> toRegTypeList(java.util.List<String> types) {
+        if (types == null || types.isEmpty()) return new ArrayList<>();
+        return new ArrayList<>(types);
     }
+
+    // formatParamTypes and formatResultTypes removed — arrays now stored as List<Object> directly
 
     Table buildPgAvailableExtensions() {
         List<Column> cols = Cols.listOf(

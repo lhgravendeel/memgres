@@ -253,4 +253,72 @@ public enum DataType {
                 return null;
         }
     }
+
+    /** Look up DataType by OID. Returns null if not found. */
+    public static DataType fromOid(int oid) {
+        for (DataType dt : values()) {
+            if (dt.oid == oid && dt != SERIAL && dt != BIGSERIAL && dt != SMALLSERIAL && dt != ENUM) {
+                return dt;
+            }
+        }
+        return null;
+    }
+
+    /** Return the regtype display name (PG format used in pg_prepared_statements.result_types). */
+    public String toRegtypeDisplay() {
+        switch (this) {
+            case SMALLINT: return "smallint";
+            case INTEGER: case SERIAL: return "integer";
+            case BIGINT: case BIGSERIAL: return "bigint";
+            case REAL: return "real";
+            case DOUBLE_PRECISION: return "double precision";
+            case NUMERIC: return "numeric";
+            case VARCHAR: return "character varying";
+            case CHAR: return "character";
+            case TEXT: return "text";
+            case NAME: return "name";
+            case BOOLEAN: return "boolean";
+            case DATE: return "date";
+            case TIMESTAMP: return "timestamp without time zone";
+            case TIMESTAMPTZ: return "timestamp with time zone";
+            case TIME: return "time without time zone";
+            case INTERVAL: return "interval";
+            case BYTEA: return "bytea";
+            case UUID: return "uuid";
+            case JSON: return "json";
+            case JSONB: return "jsonb";
+            case MONEY: return "money";
+            case INET: return "inet";
+            case CIDR: return "cidr";
+            case MACADDR: return "macaddr";
+            case TSVECTOR: return "tsvector";
+            case TSQUERY: return "tsquery";
+            case POINT: return "point";
+            case LINE: return "line";
+            case LSEG: return "lseg";
+            case BOX: return "box";
+            case PATH: return "path";
+            case POLYGON: return "polygon";
+            case CIRCLE: return "circle";
+            case XML: return "xml";
+            case BIT: return "bit";
+            case VARBIT: return "bit varying";
+            case INT4RANGE: return "int4range";
+            case INT8RANGE: return "int8range";
+            case NUMRANGE: return "numrange";
+            case DATERANGE: return "daterange";
+            case TSRANGE: return "tsrange";
+            case TSTZRANGE: return "tstzrange";
+            case INT4MULTIRANGE: return "int4multirange";
+            case INT8MULTIRANGE: return "int8multirange";
+            case NUMMULTIRANGE: return "nummultirange";
+            case DATEMULTIRANGE: return "datemultirange";
+            case TSMULTIRANGE: return "tsmultirange";
+            case TSTZMULTIRANGE: return "tstzmultirange";
+            case TEXT_ARRAY: return "text[]";
+            case INT4_ARRAY: return "integer[]";
+            case ACLITEM_ARRAY: return "aclitem[]";
+            default: return pgName;
+        }
+    }
 }

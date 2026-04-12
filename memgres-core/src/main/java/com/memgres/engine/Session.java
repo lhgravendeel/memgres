@@ -122,9 +122,13 @@ public class Session {
         public final String sqlText;
         public final java.time.OffsetDateTime prepareTime;
         public final boolean fromSql;
+        public final List<String> resultTypes;
+        /** Execution counter: Memgres has no planner, so all executions count as custom plans (PG 14+). */
+        private final java.util.concurrent.atomic.AtomicLong customPlanCount = new java.util.concurrent.atomic.AtomicLong(0);
 
         public PreparedStmt(String name, List<String> paramTypes, Statement body, int inferredParamCount,
-                            String sqlText, java.time.OffsetDateTime prepareTime, boolean fromSql) {
+                            String sqlText, java.time.OffsetDateTime prepareTime, boolean fromSql,
+                            List<String> resultTypes) {
             this.name = name;
             this.paramTypes = paramTypes;
             this.body = body;
@@ -132,6 +136,12 @@ public class Session {
             this.sqlText = sqlText;
             this.prepareTime = prepareTime;
             this.fromSql = fromSql;
+            this.resultTypes = resultTypes;
+        }
+
+        public PreparedStmt(String name, List<String> paramTypes, Statement body, int inferredParamCount,
+                            String sqlText, java.time.OffsetDateTime prepareTime, boolean fromSql) {
+            this(name, paramTypes, body, inferredParamCount, sqlText, prepareTime, fromSql, null);
         }
 
         public PreparedStmt(String name, List<String> paramTypes, Statement body, int inferredParamCount) {
@@ -149,6 +159,11 @@ public class Session {
         public String sqlText() { return sqlText; }
         public java.time.OffsetDateTime prepareTime() { return prepareTime; }
         public boolean fromSql() { return fromSql; }
+        public List<String> resultTypes() { return resultTypes; }
+        /** Increment execution counter (called on each EXECUTE). */
+        public void recordExecution() { customPlanCount.incrementAndGet(); }
+        /** Get custom plan execution count (PG 14+). */
+        public long customPlans() { return customPlanCount.get(); }
 
         @Override
         public boolean equals(Object o) {
