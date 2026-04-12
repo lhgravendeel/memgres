@@ -2,6 +2,8 @@ package com.memgres.engine;
 
 import com.memgres.engine.util.Cols;
 
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -13,6 +15,27 @@ import static com.memgres.engine.CatalogHelper.*;
  * Extracted from PgCatalogBuilder to separate concerns.
  */
 class CatalogStubBuilder {
+
+    /** PG-compatible timestamptz format: "2024-01-15 10:30:00.123456+00" (no 'T', short offset). */
+    private static final DateTimeFormatter PG_TIMESTAMPTZ_FMT =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSSxxx");
+
+    static String formatTimestamptz(OffsetDateTime ts) {
+        if (ts == null) return null;
+        // Format with 6 fractional digits, then trim trailing offset colon for PG compat
+        // Java produces "+00:00", PG uses "+00"
+        String formatted = ts.format(PG_TIMESTAMPTZ_FMT);
+        // Trim ":00" from offset if offset is whole hours (e.g., "+00:00" -> "+00")
+        if (formatted.endsWith(":00") && formatted.length() > 3) {
+            int lastColon = formatted.lastIndexOf(':');
+            // Ensure we're trimming from the timezone offset, not from the time part
+            String beforeColon = formatted.substring(0, lastColon);
+            if (beforeColon.matches(".*[+\\-]\\d{2}$")) {
+                formatted = beforeColon;
+            }
+        }
+        return formatted;
+    }
 
     final Database database;
     final OidSupplier oids;
@@ -1054,7 +1077,7 @@ class CatalogStubBuilder {
         return new Table("pg_prepared_xacts", cols); // empty, no 2PC support
     }
 
-    Table buildPgCursors() {
+    Table buildPgCursors(Session session) {
         List<Column> cols = Cols.listOf(
                 col("name", DataType.TEXT),
                 col("statement", DataType.TEXT),
@@ -1063,19 +1086,70 @@ class CatalogStubBuilder {
                 col("is_scrollable", DataType.BOOLEAN),
                 col("creation_time", DataType.TIMESTAMPTZ)
         );
-        return new Table("pg_cursors", cols); // empty, no real cursor tracking
+        Table table = new Table("pg_cursors", cols);
+        if (session != null) {
+            for (Session.CursorState cursor : session.getAllCursors()) {
+                String stmt = cursor.getQueryText();
+                String creationTimeStr = formatTimestamptz(cursor.getCreationTime());
+                table.insertRow(new Object[]{
+                        cursor.getName(),
+                        stmt,
+                        cursor.isHoldable(),
+                        cursor.isBinary(),
+                        cursor.isScrollable(),
+                        creationTimeStr
+                });
+            }
+        }
+        return table;
     }
 
-    Table buildPgPreparedStatements() {
+    Table buildPgPreparedStatements(Session session) {
         List<Column> cols = Cols.listOf(
                 col("name", DataType.TEXT),
                 col("statement", DataType.TEXT),
                 col("prepare_time", DataType.TIMESTAMPTZ),
-                col("parameter_types", DataType.TEXT),
-                col("from_sql", DataType.BOOLEAN)
+                col("parameter_types", DataType.TEXT_ARRAY),
+                col("result_types", DataType.TEXT_ARRAY),
+                col("from_sql", DataType.BOOLEAN),
+                col("generic_plans", DataType.BIGINT),
+                col("custom_plans", DataType.BIGINT)
         );
-        return new Table("pg_prepared_statements", cols); // empty
+        Table table = new Table("pg_prepared_statements", cols);
+        if (session != null) {
+            for (Session.PreparedStmt ps : session.getAllPreparedStatements()) {
+                String stmtText = ps.sqlText() != null ? ps.sqlText() : SqlUnparser.toSql(ps.body());
+                String prepareTimeStr = formatTimestamptz(ps.prepareTime());
+                // parameter_types as regtype[] — stored as List<Object> for array subscripting support
+                List<Object> paramTypes = toRegTypeList(ps.paramTypes());
+                // result_types as regtype[] — null for DML without RETURNING (PG behavior)
+                List<Object> resultTypes = ps.resultTypes() != null ? toRegTypeList(ps.resultTypes()) : null;
+                // generic_plans / custom_plans: PG 14+ plan execution counters.
+                // Memgres has no planner so all executions are effectively custom plans.
+                long genericPlans = 0L;
+                long customPlans = ps.customPlans();
+                table.insertRow(new Object[]{
+                        ps.name(),
+                        stmtText,
+                        prepareTimeStr,
+                        paramTypes,
+                        resultTypes,
+                        ps.fromSql(),
+                        genericPlans,
+                        customPlans
+                });
+            }
+        }
+        return table;
     }
+
+    /** Convert a list of type name strings to a List<Object> for regtype[] array storage. */
+    private List<Object> toRegTypeList(java.util.List<String> types) {
+        if (types == null || types.isEmpty()) return new ArrayList<>();
+        return new ArrayList<>(types);
+    }
+
+    // formatParamTypes and formatResultTypes removed — arrays now stored as List<Object> directly
 
     Table buildPgAvailableExtensions() {
         List<Column> cols = Cols.listOf(

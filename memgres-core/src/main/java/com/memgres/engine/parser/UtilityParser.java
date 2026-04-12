@@ -720,7 +720,7 @@ class UtilityParser {
         parser.expectKeyword("DECLARE");
         String name = parser.readIdentifier();
         // Optional: BINARY, INSENSITIVE, [NO] SCROLL
-        parser.matchKeyword("BINARY");
+        boolean binary = parser.matchKeyword("BINARY");
         parser.matchKeyword("INSENSITIVE");
         boolean scroll = false;
         if (parser.matchKeyword("NO")) {
@@ -739,7 +739,7 @@ class UtilityParser {
         }
         parser.expectKeyword("FOR");
         SelectStmt query = parser.parseSelect();
-        return new DeclareCursorStmt(name, query, scroll, withHold);
+        return new DeclareCursorStmt(name, query, scroll, withHold, binary);
     }
 
     FetchStmt parseFetchOrMove(boolean isMove) {

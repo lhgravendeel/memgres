@@ -81,7 +81,7 @@ public class Lexer {
             "DOMAIN", "EXTRACT", "VALUE", "FILTER", "ESCAPE",
             "EXCLUDE", "NO", "ACTION",
             "DEFERRABLE", "INITIALLY", "DEFERRED", "IMMEDIATE", "ENFORCED",
-            "VALID", "VALIDATE", "HANDLER", "INLINE", "TRUSTED",
+            "VALID", "VALIDATE", "HANDLER", "INLINE", "TRUSTED", "BINARY", "INSENSITIVE",
             "COMMENT", "SECURITY", "DEFINER", "INVOKER",
             "CALLED", "INPUT", "STRICT", "IMMUTABLE", "STABLE", "VOLATILE",
             "PARALLEL", "SAFE", "UNSAFE", "RESTRICTED",

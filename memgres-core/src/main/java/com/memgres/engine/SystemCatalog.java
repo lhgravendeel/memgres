@@ -102,12 +102,20 @@ public class SystemCatalog implements OidSupplier {
      * Returns null if this is not a recognized catalog table.
      */
     public Table resolve(String schema, String tableName) {
+        return resolve(schema, tableName, null);
+    }
+
+    /**
+     * Resolve a system catalog table with session context for session-scoped views
+     * (pg_prepared_statements, pg_cursors).
+     */
+    public Table resolve(String schema, String tableName, Session session) {
         String tbl = tableName.toLowerCase();
         String sch = schema != null ? schema.toLowerCase() : null;
 
         // pg_catalog tables
         if (sch == null && tbl.startsWith("pg_") || "pg_catalog".equals(sch)) {
-            return pgCatalogBuilder.build(tbl);
+            return pgCatalogBuilder.build(tbl, session);
         }
 
         // information_schema tables

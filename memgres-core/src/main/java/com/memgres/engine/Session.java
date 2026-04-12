@@ -119,12 +119,33 @@ public class Session {
         public final List<String> paramTypes;
         public final Statement body;
         public final int inferredParamCount;
+        public final String sqlText;
+        public final java.time.OffsetDateTime prepareTime;
+        public final boolean fromSql;
+        public final List<String> resultTypes;
+        /** Execution counter: Memgres has no planner, so all executions count as custom plans (PG 14+). */
+        private final java.util.concurrent.atomic.AtomicLong customPlanCount = new java.util.concurrent.atomic.AtomicLong(0);
 
-        public PreparedStmt(String name, List<String> paramTypes, Statement body, int inferredParamCount) {
+        public PreparedStmt(String name, List<String> paramTypes, Statement body, int inferredParamCount,
+                            String sqlText, java.time.OffsetDateTime prepareTime, boolean fromSql,
+                            List<String> resultTypes) {
             this.name = name;
             this.paramTypes = paramTypes;
             this.body = body;
             this.inferredParamCount = inferredParamCount;
+            this.sqlText = sqlText;
+            this.prepareTime = prepareTime;
+            this.fromSql = fromSql;
+            this.resultTypes = resultTypes;
+        }
+
+        public PreparedStmt(String name, List<String> paramTypes, Statement body, int inferredParamCount,
+                            String sqlText, java.time.OffsetDateTime prepareTime, boolean fromSql) {
+            this(name, paramTypes, body, inferredParamCount, sqlText, prepareTime, fromSql, null);
+        }
+
+        public PreparedStmt(String name, List<String> paramTypes, Statement body, int inferredParamCount) {
+            this(name, paramTypes, body, inferredParamCount, null, java.time.OffsetDateTime.now(), true);
         }
 
         public PreparedStmt(String name, List<String> paramTypes, Statement body) {
@@ -135,6 +156,14 @@ public class Session {
         public List<String> paramTypes() { return paramTypes; }
         public Statement body() { return body; }
         public int inferredParamCount() { return inferredParamCount; }
+        public String sqlText() { return sqlText; }
+        public java.time.OffsetDateTime prepareTime() { return prepareTime; }
+        public boolean fromSql() { return fromSql; }
+        public List<String> resultTypes() { return resultTypes; }
+        /** Increment execution counter (called on each EXECUTE). */
+        public void recordExecution() { customPlanCount.incrementAndGet(); }
+        /** Get custom plan execution count (PG 14+). */
+        public long customPlans() { return customPlanCount.get(); }
 
         @Override
         public boolean equals(Object o) {
@@ -164,17 +193,37 @@ public class Session {
         private final List<Column> columns;
         private final List<Object[]> rows;
         private int position = -1; // before first row
+        private final String queryText;
+        private final boolean holdable;
+        private final boolean binary;
+        private final boolean scrollable;
+        private final java.time.OffsetDateTime creationTime;
 
-        public CursorState(String name, List<Column> columns, List<Object[]> rows) {
+        public CursorState(String name, List<Column> columns, List<Object[]> rows,
+                           String queryText, boolean holdable, boolean binary, boolean scrollable) {
             this.name = name;
             this.columns = columns;
             this.rows = rows;
+            this.queryText = queryText;
+            this.holdable = holdable;
+            this.binary = binary;
+            this.scrollable = scrollable;
+            this.creationTime = java.time.OffsetDateTime.now();
+        }
+
+        public CursorState(String name, List<Column> columns, List<Object[]> rows) {
+            this(name, columns, rows, null, false, false, false);
         }
 
         public String getName() { return name; }
         public List<Column> getColumns() { return columns; }
         public int getRowCount() { return rows.size(); }
         public int getPosition() { return position; }
+        public String getQueryText() { return queryText; }
+        public boolean isHoldable() { return holdable; }
+        public boolean isBinary() { return binary; }
+        public boolean isScrollable() { return scrollable; }
+        public java.time.OffsetDateTime getCreationTime() { return creationTime; }
 
         /** Get row at index, or null if out of bounds. */
         public Object[] getRow(int idx) {
@@ -479,6 +528,8 @@ public class Session {
         releaseXactAdvisoryLocks();
         // Release all row-level locks held by this session
         database.unlockAllRows(this);
+        // Destroy non-holdable cursors (PG behavior: only WITH HOLD cursors survive COMMIT)
+        destroyNonHoldableCursors();
         transactionTimestamp = null;
         status = TransactionStatus.IDLE;
     }
@@ -512,6 +563,8 @@ public class Session {
         releaseXactAdvisoryLocks();
         // Release all row-level locks held by this session
         database.unlockAllRows(this);
+        // Destroy all cursors on rollback (PG behavior: all cursors destroyed on ROLLBACK)
+        cursors.clear();
         transactionTimestamp = null;
         status = TransactionStatus.IDLE;
     }
@@ -731,6 +784,9 @@ public class Session {
         if (isInTransaction()) {
             rollback();
         }
+        // Explicitly clear session-scoped state
+        cursors.clear();
+        preparedStatements.clear();
         dropTempObjects();
         database.unregisterSession(this);
     }
@@ -804,6 +860,10 @@ public class Session {
         preparedStatements.clear();
     }
 
+    public Collection<PreparedStmt> getAllPreparedStatements() {
+        return Collections.unmodifiableCollection(preparedStatements.values());
+    }
+
     // ---- Cursors ----
 
     public void addCursor(String name, CursorState cursor) {
@@ -820,6 +880,15 @@ public class Session {
 
     public void removeAllCursors() {
         cursors.clear();
+    }
+
+    /** Destroy non-holdable cursors at COMMIT time (PG behavior). WITH HOLD cursors survive. */
+    public void destroyNonHoldableCursors() {
+        cursors.entrySet().removeIf(e -> !e.getValue().isHoldable());
+    }
+
+    public Collection<CursorState> getAllCursors() {
+        return Collections.unmodifiableCollection(cursors.values());
     }
 
     // ---- ON COMMIT DROP tables ----

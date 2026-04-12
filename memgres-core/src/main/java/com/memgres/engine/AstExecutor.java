@@ -53,6 +53,8 @@ public class AstExecutor {
     OffsetDateTime currentStatementTimestamp = null;
     // Current MERGE action for merge_action() function in RETURNING clause (PG 17+)
     String currentMergeAction = null;
+    // Raw SQL text of the current top-level statement (for pg_prepared_statements/pg_cursors verbatim display)
+    String currentRawSql = null;
     // When true, column references with no context throw instead of returning column name as string
     private boolean strictColumnRefs = false;
 
@@ -88,12 +90,15 @@ public class AstExecutor {
         this.boundParameters = parameters != null ? new ArrayList<>(parameters) : new ArrayList<>();
         cteResultCache.clear(); // Clear CTE cache between top-level statements
         currentStatementTimestamp = OffsetDateTime.now();
+        String previousRawSql = this.currentRawSql;
+        this.currentRawSql = sql;
         try {
             Statement stmt = Parser.parse(sql);
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
             return executeStatement(stmt);
         } finally {
             this.boundParameters = previousParams;
+            this.currentRawSql = previousRawSql;
             currentStatementTimestamp = null;
         }
     }

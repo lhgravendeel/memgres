@@ -453,8 +453,15 @@ class SessionExecutor {
                 executor.session.removeAllCursors();
                 // Drop all temp tables for this session
                 executor.session.dropTempObjects();
+                // UNLISTEN * — cancel all notification subscriptions (PG DISCARD ALL behavior)
+                if (executor.database.getNotificationManager() != null) {
+                    executor.database.getNotificationManager().unlistenAll(executor.session);
+                }
+                // pg_advisory_unlock_all() — release all session-level advisory locks
+                executor.database.advisoryUnlockAll(executor.session);
             } else if (target.equals("PLANS")) {
-                executor.session.removeAllPreparedStatements();
+                // PG DISCARD PLANS invalidates cached query plans, forcing re-planning on next use.
+                // It does NOT deallocate prepared statements. Since Memgres has no plan cache, this is a no-op.
             } else if (target.equals("TEMP") || target.equals("TEMPORARY")) {
                 executor.session.dropTempObjects();
             }
@@ -607,9 +614,262 @@ class SessionExecutor {
         int inferredCount = maxParamIndex(stmt.body());
         // Validate the body at PREPARE time (PG does full analysis/type-checking here)
         validatePreparedBody(stmt.body(), paramTypes);
+        // Extract original body SQL from the raw PREPARE statement for verbatim pg_prepared_statements display.
+        // Falls back to AST reconstruction if original SQL is unavailable.
+        String sqlText = extractPrepareBodySql(executor.currentRawSql, stmt.body());
+        // Infer result types for pg_prepared_statements.result_types (PG 16+)
+        List<String> resultTypes = inferResultTypes(stmt.body());
         executor.session.addPreparedStatement(stmt.name(),
-                new Session.PreparedStmt(stmt.name(), paramTypes, stmt.body(), inferredCount));
+                new Session.PreparedStmt(stmt.name(), paramTypes, stmt.body(), inferredCount,
+                        sqlText, java.time.OffsetDateTime.now(), true, resultTypes));
         return QueryResult.message(QueryResult.Type.SET, "PREPARE");
+    }
+
+    /**
+     * Extract the body portion of a PREPARE statement from the original SQL text.
+     * Real PG stores the verbatim body text, not a reconstructed form.
+     * Finds " AS " outside of string literals and quoted identifiers.
+     */
+    private String extractPrepareBodySql(String rawSql, Statement body) {
+        if (rawSql != null) {
+            int idx = findKeywordOutsideQuotes(rawSql, " AS ", 0);
+            if (idx >= 0) {
+                return rawSql.substring(idx + 4).trim();
+            }
+        }
+        return SqlUnparser.toSql(body);
+    }
+
+    /**
+     * Extract the query portion of a DECLARE CURSOR statement from the original SQL text.
+     * Real PG stores the verbatim query text (after FOR), not a reconstructed form.
+     * Finds " FOR " after the CURSOR keyword, outside of string literals and quoted identifiers.
+     */
+    private String extractDeclareQuerySql(String rawSql, Statement query) {
+        if (rawSql != null) {
+            // First find CURSOR keyword to anchor the search, then find FOR after it
+            int cursorIdx = findKeywordOutsideQuotes(rawSql, "CURSOR", 0);
+            if (cursorIdx >= 0) {
+                int forIdx = findKeywordOutsideQuotes(rawSql, " FOR ", cursorIdx + 6);
+                if (forIdx >= 0) {
+                    return rawSql.substring(forIdx + 5).trim();
+                }
+            }
+        }
+        return SqlUnparser.toSql(query);
+    }
+
+    /**
+     * Find a keyword in SQL text, skipping single-quoted strings and double-quoted identifiers.
+     * Returns the index of the match, or -1 if not found.
+     */
+    /**
+     * Find a keyword in SQL text, skipping:
+     * - Single-quoted strings ('...' with '' escaping)
+     * - Double-quoted identifiers ("..." with "" escaping)
+     * - Dollar-quoted strings ($$...$$ and $tag$...$tag$)
+     * - Block comments (/&#42; ... &#42;/)
+     * - Line comments (-- ... \n)
+     * Returns the index of the match, or -1 if not found.
+     */
+    private static int findKeywordOutsideQuotes(String sql, String keyword, int startPos) {
+        String upper = sql.toUpperCase();
+        String keyUpper = keyword.toUpperCase();
+        int len = sql.length();
+        int i = startPos;
+        while (i < len) {
+            char c = sql.charAt(i);
+            if (c == '\'') {
+                // Skip single-quoted string (with '' escaping)
+                i++;
+                while (i < len) {
+                    if (sql.charAt(i) == '\'') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '\'') {
+                            i += 2;
+                        } else {
+                            i++;
+                            break;
+                        }
+                    } else {
+                        i++;
+                    }
+                }
+            } else if (c == '"') {
+                // Skip double-quoted identifier (with "" escaping)
+                i++;
+                while (i < len) {
+                    if (sql.charAt(i) == '"') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '"') {
+                            i += 2;
+                        } else {
+                            i++;
+                            break;
+                        }
+                    } else {
+                        i++;
+                    }
+                }
+            } else if (c == '$') {
+                // Possible dollar-quoted string: $$ or $tag$
+                int tagEnd = findDollarTag(sql, i);
+                if (tagEnd > i) {
+                    String tag = sql.substring(i, tagEnd); // e.g., "$$" or "$tag$"
+                    int closeIdx = sql.indexOf(tag, tagEnd);
+                    if (closeIdx >= 0) {
+                        i = closeIdx + tag.length();
+                    } else {
+                        i = len; // unclosed dollar quote — skip to end
+                    }
+                } else {
+                    i++;
+                }
+            } else if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
+                // Skip line comment (-- ... \n)
+                i += 2;
+                while (i < len && sql.charAt(i) != '\n') {
+                    i++;
+                }
+                if (i < len) i++; // skip the \n
+            } else if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
+                // Skip block comment (/* ... */), supports nesting
+                i += 2;
+                int depth = 1;
+                while (i < len && depth > 0) {
+                    if (sql.charAt(i) == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
+                        depth++;
+                        i += 2;
+                    } else if (sql.charAt(i) == '*' && i + 1 < len && sql.charAt(i + 1) == '/') {
+                        depth--;
+                        i += 2;
+                    } else {
+                        i++;
+                    }
+                }
+            } else if (upper.startsWith(keyUpper, i)) {
+                return i;
+            } else {
+                i++;
+            }
+        }
+        return -1;
+    }
+
+    /** Find the end of a dollar-quote tag starting at pos. Returns pos if not a valid tag. */
+    private static int findDollarTag(String sql, int pos) {
+        if (pos >= sql.length() || sql.charAt(pos) != '$') return pos;
+        int j = pos + 1;
+        if (j >= sql.length()) return pos;
+        // $$ (empty tag)
+        if (sql.charAt(j) == '$') return j + 1;
+        // $identifier$ tag — tag must start with letter or underscore (PG identifier rules),
+        // NOT a digit (which would be $1 parameter reference)
+        if (!Character.isLetter(sql.charAt(j)) && sql.charAt(j) != '_') return pos;
+        j++;
+        while (j < sql.length()) {
+            char ch = sql.charAt(j);
+            if (ch == '$') return j + 1;
+            if (!Character.isLetterOrDigit(ch) && ch != '_') return pos; // not a valid tag
+            j++;
+        }
+        return pos; // unclosed tag start
+    }
+
+    /**
+     * Infer result column types from a prepared statement body.
+     * Returns null for DML without RETURNING (PG behavior).
+     */
+    private List<String> inferResultTypes(Statement body) {
+        try {
+            // For SELECT: safe dry-run with LIMIT 0
+            if (body instanceof SelectStmt || body instanceof SetOpStmt) {
+                return inferResultTypesViaDryRun(body);
+            }
+            // For DML with RETURNING: infer from table schema (no execution — avoids side effects)
+            if (body instanceof InsertStmt && ((InsertStmt) body).returning != null && !((InsertStmt) body).returning.isEmpty()) {
+                return inferResultTypesFromTable((InsertStmt) body);
+            }
+            if (body instanceof UpdateStmt && ((UpdateStmt) body).returning != null && !((UpdateStmt) body).returning.isEmpty()) {
+                return inferResultTypesFromTable((UpdateStmt) body);
+            }
+            if (body instanceof DeleteStmt && ((DeleteStmt) body).returning != null && !((DeleteStmt) body).returning.isEmpty()) {
+                return inferResultTypesFromTable((DeleteStmt) body);
+            }
+            // DML without RETURNING: null (PG behavior)
+            return null;
+        } catch (Exception e) {
+            // Type inference is best-effort; don't fail PREPARE
+            return null;
+        }
+    }
+
+    /**
+     * Execute a SELECT statement as a dry run (LIMIT 0) to infer result column types.
+     */
+    private List<String> inferResultTypesViaDryRun(Statement body) {
+        try {
+            String sql = SqlUnparser.toSql(body);
+            if (sql == null) return null;
+            sql = sql.replaceAll("\\$\\d+", "NULL");
+            if (!sql.toUpperCase().contains("LIMIT")) {
+                sql = sql + " LIMIT 0";
+            }
+            QueryResult result = executor.execute(sql);
+            if (result.getColumns() != null && !result.getColumns().isEmpty()) {
+                List<String> types = new ArrayList<>();
+                for (Column col : result.getColumns()) {
+                    types.add(col.getType().toRegtypeDisplay());
+                }
+                return types;
+            }
+        } catch (Exception e) {
+            // Dry run failed — type inference is best-effort
+        }
+        return null;
+    }
+
+    /**
+     * Infer result types for DML with RETURNING by resolving table schema.
+     * Avoids executing the DML (which could cause side effects or constraint violations).
+     */
+    private List<String> inferResultTypesFromTable(Statement body) {
+        try {
+            String tableName = null;
+            String schemaName = null;
+            List<SelectStmt.SelectTarget> returning = null;
+            if (body instanceof InsertStmt) {
+                InsertStmt ins = (InsertStmt) body;
+                tableName = ins.table; schemaName = ins.schema; returning = ins.returning;
+            } else if (body instanceof UpdateStmt) {
+                UpdateStmt upd = (UpdateStmt) body;
+                tableName = upd.table; schemaName = upd.schema; returning = upd.returning;
+            } else if (body instanceof DeleteStmt) {
+                DeleteStmt del = (DeleteStmt) body;
+                tableName = del.table; schemaName = del.schema; returning = del.returning;
+            }
+            if (returning == null || returning.isEmpty() || tableName == null) return null;
+            // Resolve table
+            if (schemaName == null) schemaName = executor.defaultSchema();
+            Table table = executor.resolveTable(schemaName, tableName);
+            // Map RETURNING targets to column types
+            List<String> types = new ArrayList<>();
+            for (SelectStmt.SelectTarget target : returning) {
+                Expression expr = target.expr();
+                if (expr instanceof WildcardExpr) {
+                    for (Column col : table.getColumns()) {
+                        types.add(col.getType().toRegtypeDisplay());
+                    }
+                } else if (expr instanceof ColumnRef) {
+                    String colName = ((ColumnRef) expr).column();
+                    int colIdx = table.getColumnIndex(colName);
+                    types.add(colIdx >= 0 ? table.getColumns().get(colIdx).getType().toRegtypeDisplay() : "text");
+                } else {
+                    types.add("text"); // expression default
+                }
+            }
+            return types;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**
@@ -950,6 +1210,7 @@ class SessionExecutor {
                 }
             }
             try {
+                prepared.recordExecution();
                 return executor.executeStatement(prepared.body());
             } catch (MemgresException me) {
                 // Remap type coercion errors (e.g., passing 'x' for an int param) to 22P02.
@@ -1114,20 +1375,36 @@ class SessionExecutor {
 
     QueryResult executeDeclareCursor(DeclareCursorStmt stmt) {
         if (executor.session.getCursor(stmt.name()) != null) {
-            throw new MemgresException("cursor \"" + stmt.name() + "\" already exists");
+            throw new MemgresException("cursor \"" + stmt.name() + "\" already exists", "42P03");
         }
         // Execute the query to get all results
         QueryResult result = executor.selectExecutor.executeSelect(stmt.query());
         List<Object[]> rows = result.getRows() != null ? new ArrayList<>(result.getRows()) : new ArrayList<>();
         List<Column> columns = result.getColumns() != null ? result.getColumns() : Cols.listOf();
-        executor.session.addCursor(stmt.name(), new Session.CursorState(stmt.name(), columns, rows));
+        // Extract original query text from the raw DECLARE statement for verbatim pg_cursors display.
+        // Falls back to AST reconstruction if original SQL is unavailable.
+        String queryText = extractDeclareQuerySql(executor.currentRawSql, stmt.query());
+        executor.session.addCursor(stmt.name(),
+                new Session.CursorState(stmt.name(), columns, rows,
+                        queryText, stmt.withHold, stmt.binary, stmt.scroll));
         return QueryResult.message(QueryResult.Type.SET, "DECLARE CURSOR");
     }
 
     QueryResult executeFetch(FetchStmt stmt) {
         Session.CursorState cursor = executor.session.getCursor(stmt.cursorName());
         if (cursor == null) {
-            throw new MemgresException("cursor \"" + stmt.cursorName() + "\" does not exist");
+            throw new MemgresException("cursor \"" + stmt.cursorName() + "\" does not exist", "34000");
+        }
+        // PG enforces NO SCROLL: only NEXT, FORWARD, FORWARD_ALL, ALL, and forward RELATIVE are allowed.
+        // PRIOR, BACKWARD, BACKWARD_ALL, FIRST, LAST, ABSOLUTE, and negative RELATIVE are rejected.
+        if (!cursor.isScrollable()) {
+            FetchStmt.Direction dir = stmt.direction();
+            if (dir == FetchStmt.Direction.PRIOR || dir == FetchStmt.Direction.BACKWARD
+                    || dir == FetchStmt.Direction.BACKWARD_ALL || dir == FetchStmt.Direction.FIRST
+                    || dir == FetchStmt.Direction.LAST || dir == FetchStmt.Direction.ABSOLUTE
+                    || (dir == FetchStmt.Direction.RELATIVE && stmt.count() < 0)) {
+                throw new MemgresException("cursor can only scan forward", "55000");
+            }
         }
         List<Object[]> fetched = cursorFetch(cursor, stmt.direction(), stmt.count());
 
@@ -1143,39 +1420,83 @@ class SessionExecutor {
         List<Object[]> result = new ArrayList<>();
 
         switch (dir) {
-            case NEXT:
-                addRow(result, cursor, pos + 1);
+            case NEXT: {
+                // PG: moves position forward by 1 regardless of whether row exists
+                int target = pos + 1;
+                addRow(result, cursor, target);
+                if (result.isEmpty()) cursor.setPosition(Math.min(target, total));
                 break;
-            case PRIOR:
-                addRow(result, cursor, pos - 1);
+            }
+            case PRIOR: {
+                // PG: moves position backward by 1 regardless of whether row exists
+                int target = pos - 1;
+                addRow(result, cursor, target);
+                if (result.isEmpty()) cursor.setPosition(Math.max(target, -1));
                 break;
+            }
             case FIRST:
                 addRow(result, cursor, 0);
+                if (result.isEmpty()) cursor.setPosition(-1);
                 break;
             case LAST:
                 addRow(result, cursor, total - 1);
                 break;
-            case ABSOLUTE:
-                addRow(result, cursor, count > 0 ? count - 1 : total + count);
+            case ABSOLUTE: {
+                // PG: ABSOLUTE 0 positions before first row (returns nothing)
+                // ABSOLUTE N (N>0): position to Nth row (1-based)
+                // ABSOLUTE -N: position from end
+                if (count == 0) {
+                    cursor.setPosition(-1); // before first
+                } else {
+                    addRow(result, cursor, count > 0 ? count - 1 : total + count);
+                }
                 break;
-            case RELATIVE:
-                addRow(result, cursor, pos + count);
+            }
+            case RELATIVE: {
+                int target = pos + count;
+                addRow(result, cursor, target);
+                if (result.isEmpty()) {
+                    cursor.setPosition(target < 0 ? -1 : Math.min(target, total));
+                }
                 break;
+            }
             case FORWARD: {
-                for (int i = 0; i < count; i++) addRow(result, cursor, pos + 1 + i); if (!result.isEmpty()) cursor.setPosition(pos + result.size()); 
+                int lastTarget = pos;
+                for (int i = 0; i < count; i++) {
+                    lastTarget = pos + 1 + i;
+                    addRow(result, cursor, lastTarget);
+                }
+                // PG: position advances even if rows not found
+                if (result.isEmpty() && count > 0) {
+                    cursor.setPosition(Math.min(lastTarget, total));
+                } else if (!result.isEmpty()) {
+                    cursor.setPosition(pos + result.size());
+                }
                 break;
             }
             case FORWARD_ALL:
             case ALL: {
-                for (int i = pos + 1; i < total; i++) addRow(result, cursor, i); if (result.isEmpty()) cursor.setPosition(total); 
+                for (int i = pos + 1; i < total; i++) addRow(result, cursor, i);
+                // PG: position moves to "after last" regardless of whether rows were found
+                cursor.setPosition(total);
                 break;
             }
             case BACKWARD: {
-                for (int i = 0; i < count; i++) addRow(result, cursor, pos - 1 - i); 
+                int lastTarget = pos;
+                for (int i = 0; i < count; i++) {
+                    lastTarget = pos - 1 - i;
+                    addRow(result, cursor, lastTarget);
+                }
+                // PG: position moves backward even if rows not found
+                if (result.isEmpty() && count > 0) {
+                    cursor.setPosition(Math.max(lastTarget, -1));
+                }
                 break;
             }
             case BACKWARD_ALL: {
-                for (int i = pos - 1; i >= 0; i--) addRow(result, cursor, i); 
+                for (int i = pos - 1; i >= 0; i--) addRow(result, cursor, i);
+                // PG: position moves to "before first" regardless
+                cursor.setPosition(-1);
                 break;
             }
         }
@@ -1195,7 +1516,7 @@ class SessionExecutor {
             executor.session.removeAllCursors();
         } else {
             if (executor.session.getCursor(stmt.cursorName()) == null) {
-                throw new MemgresException("cursor \"" + stmt.cursorName() + "\" does not exist");
+                throw new MemgresException("cursor \"" + stmt.cursorName() + "\" does not exist", "34000");
             }
             executor.session.removeCursor(stmt.cursorName());
         }

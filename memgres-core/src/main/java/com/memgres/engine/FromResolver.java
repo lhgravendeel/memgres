@@ -63,7 +63,7 @@ class FromResolver {
             boolean userTableExists = false;
             try { executor.resolveTable(schemaName, tableRef.table()); userTableExists = true; } catch (MemgresException ignored) {}
             if (!userTableExists && SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())) {
-                Table catalogTable = executor.systemCatalog.resolve(tableRef.schema(), tableRef.table());
+                Table catalogTable = executor.systemCatalog.resolve(tableRef.schema(), tableRef.table(), executor.session);
                 if (catalogTable != null) {
                     bindings.add(new RowContext.TableBinding(catalogTable, alias, new Object[catalogTable.getColumns().size()]));
                     return;
@@ -365,7 +365,7 @@ class FromResolver {
         boolean userTableExists = false;
         try { executor.resolveTable(schemaName, tableRef.table()); userTableExists = true; } catch (MemgresException ignored) {}
         if (!userTableExists && SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())) {
-            Table catalogTable = executor.systemCatalog.resolve(tableRef.schema(), tableRef.table());
+            Table catalogTable = executor.systemCatalog.resolve(tableRef.schema(), tableRef.table(), executor.session);
             if (catalogTable != null) {
                 String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
                 lastResolvedRightTable = catalogTable;
