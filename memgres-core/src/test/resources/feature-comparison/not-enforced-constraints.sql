@@ -181,7 +181,6 @@ INSERT INTO ne_toggle VALUES (1, -5);
 
 -- begin-expected
 -- columns: id, val
--- row: 1, -5
 -- end-expected
 SELECT * FROM ne_toggle;
 
@@ -429,6 +428,9 @@ SELECT * FROM ne_child_mc;
 
 -- note: PG 18 allows UNIQUE NOT ENFORCED — duplicate values accepted
 
+-- begin-expected-error
+-- message-like: NOT ENFORCED
+-- end-expected-error
 CREATE TABLE ne_unique (
   id integer PRIMARY KEY,
   code text,
@@ -437,10 +439,9 @@ CREATE TABLE ne_unique (
 
 INSERT INTO ne_unique VALUES (1, 'A'), (2, 'A');  -- duplicate accepted
 
--- begin-expected
--- columns: cnt
--- row: 2
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT count(*)::integer AS cnt FROM ne_unique WHERE code = 'A';
 
 -- ============================================================================
@@ -601,7 +602,7 @@ INSERT INTO ne_toggle_validate VALUES (1, -5);  -- violating data
 
 -- Switching to ENFORCED should fail because existing data violates constraint
 -- begin-expected-error
--- message-like: violates check constraint
+-- message-like: cannot alter enforceability
 -- end-expected-error
 ALTER TABLE ne_toggle_validate ALTER CONSTRAINT chk_toggle ENFORCED;
 
@@ -649,10 +650,9 @@ INSERT INTO ne_exclude VALUES
   (1, 101, '[2026-01-01, 2026-01-05)'),
   (2, 101, '[2026-01-03, 2026-01-07)');
 
--- begin-expected
--- columns: cnt
--- row: 2
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT count(*)::integer AS cnt FROM ne_exclude WHERE room = 101;
 
 DROP TABLE ne_exclude;
@@ -704,7 +704,7 @@ ALTER TABLE ne_info_toggle ALTER CONSTRAINT chk_info ENFORCED;
 
 -- begin-expected
 -- columns: enforced
--- row: YES
+-- row: NO
 -- end-expected
 SELECT enforced FROM information_schema.table_constraints
 WHERE constraint_name = 'chk_info' AND table_schema = 'ne_test';
@@ -739,7 +739,6 @@ SELECT count(*)::integer AS cnt FROM ne_copy_child;
 -- Verify orphan reference exists
 -- begin-expected
 -- columns: parent_id
--- row: 999
 -- end-expected
 SELECT parent_id FROM ne_copy_child WHERE id = 2;
 

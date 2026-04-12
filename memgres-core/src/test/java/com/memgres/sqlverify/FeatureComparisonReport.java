@@ -261,15 +261,23 @@ public class FeatureComparisonReport {
             // Row data — use Pg18SampleSql5Test value matching for tolerance
             for (int r = 0; r < er.rows().size(); r++) {
                 String expectedRow = er.rows().get(r);
+                List<String> rowData = result.rows().get(r);
+                int colCount = rowData.size();
+
                 // Annotation rows may use comma or pipe as separator.
-                // Normalize to pipe-delimited for comparison (matching valuesMatch expectations).
-                if (!expectedRow.contains("|") && expectedRow.contains(",")) {
-                    expectedRow = expectedRow.replace(", ", "|").replace(",", "|");
+                // Use column count to split intelligently: split(", ", colCount) ensures
+                // commas inside structured values (arrays, composites, JSON) are preserved.
+                if (!expectedRow.contains("|") && expectedRow.contains(",") && colCount > 1) {
+                    String[] parts = expectedRow.split(", ", colCount);
+                    if (parts.length == colCount) {
+                        expectedRow = String.join("|", parts);
+                    }
+                    // else: commas are part of the value, leave as-is
                 }
+
                 // Build actual row in pipe-delimited format
                 StringBuilder sb = new StringBuilder();
-                List<String> rowData = result.rows().get(r);
-                for (int c = 0; c < rowData.size(); c++) {
+                for (int c = 0; c < colCount; c++) {
                     if (c > 0) sb.append("|");
                     String val = rowData.get(c);
                     sb.append(val == null ? "NULL" : val);

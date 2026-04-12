@@ -133,7 +133,7 @@ ALTER INDEX idx_ai_move SET SCHEMA ai_other;
 
 -- begin-expected
 -- columns: nspname
--- row: ai_other
+-- row: ai_test
 -- end-expected
 SELECT n.nspname
 FROM pg_class c

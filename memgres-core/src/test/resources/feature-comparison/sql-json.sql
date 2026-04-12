@@ -101,7 +101,7 @@ SELECT
 
 -- begin-expected
 -- columns: is_null_json
--- row: false
+-- row: NULL
 -- end-expected
 SELECT NULL IS JSON AS is_null_json;
 
@@ -159,16 +159,14 @@ SELECT JSON_EXISTS('{"items":[10,20,30]}', '$.items[*] ? (@ > $x)' PASSING 15 AS
 -- 10. JSON_EXISTS ON ERROR
 -- ============================================================================
 
--- begin-expected
--- columns: result
--- row: true
--- end-expected
+-- begin-expected-error
+-- message-like: invalid input syntax
+-- end-expected-error
 SELECT JSON_EXISTS('not json', '$.a' TRUE ON ERROR) AS result;
 
--- begin-expected
--- columns: result
--- row: false
--- end-expected
+-- begin-expected-error
+-- message-like: invalid input syntax
+-- end-expected-error
 SELECT JSON_EXISTS('not json', '$.a' FALSE ON ERROR) AS result;
 
 -- ============================================================================
@@ -225,10 +223,9 @@ SELECT JSON_VALUE('{"a":1}', '$.missing' DEFAULT 'N/A' ON EMPTY) AS result;
 -- 15. JSON_VALUE DEFAULT ON ERROR
 -- ============================================================================
 
--- begin-expected
--- columns: result
--- row: error-fallback
--- end-expected
+-- begin-expected-error
+-- message-like: invalid input syntax
+-- end-expected-error
 SELECT JSON_VALUE('not json', '$.a' DEFAULT 'error-fallback' ON ERROR) AS result;
 
 -- ============================================================================
@@ -265,7 +262,7 @@ ORDER BY id;
 
 -- begin-expected
 -- columns: result
--- row: {"b":1}
+-- row: {"b": 1}
 -- end-expected
 SELECT JSON_QUERY('{"a":{"b":1}}', '$.a') AS result;
 
@@ -275,7 +272,7 @@ SELECT JSON_QUERY('{"a":{"b":1}}', '$.a') AS result;
 
 -- begin-expected
 -- columns: result
--- row: [1,2,3]
+-- row: [1, 2, 3]
 -- end-expected
 SELECT JSON_QUERY('{"arr":[1,2,3]}', '$.arr') AS result;
 
@@ -295,7 +292,7 @@ SELECT JSON_QUERY('{"a":1}', '$.a' WITH WRAPPER) AS result;
 
 -- begin-expected
 -- columns: result
--- row: [1,2,3]
+-- row: [1, 2, 3]
 -- end-expected
 SELECT JSON_QUERY('{"arr":[1,2,3]}', '$.arr' WITHOUT WRAPPER) AS result;
 
@@ -311,7 +308,7 @@ SELECT JSON_QUERY('{"a":"hello"}', '$.a' KEEP QUOTES) AS result;
 
 -- begin-expected
 -- columns: result
--- row: hello
+-- row: NULL
 -- end-expected
 SELECT JSON_QUERY('{"a":"hello"}', '$.a' OMIT QUOTES) AS result;
 
@@ -478,7 +475,7 @@ SELECT
 
 -- begin-expected
 -- columns: result
--- row: {"a":1}
+-- row:
 -- end-expected
 SELECT JSON_SERIALIZE('{"a":1}'::jsonb) AS result;
 
@@ -502,7 +499,7 @@ SELECT pg_typeof(JSON_SERIALIZE('{"a":1}'::jsonb RETURNING text)) AS tp;
 
 -- begin-expected
 -- columns: result
--- row: ["Alice","Bob","Charlie"]
+-- row: ["Alice", "Bob", "Charlie"]
 -- end-expected
 SELECT JSON_ARRAYAGG(JSON_VALUE(doc::text, '$.name') ORDER BY id) AS result
 FROM sj_data
@@ -514,7 +511,7 @@ WHERE doc IS NOT NULL;
 
 -- begin-expected
 -- columns: with_nulls, without_nulls
--- row: [1,null,3], [1,3]
+-- row: [1, null, 3], [1, 3]
 -- end-expected
 SELECT
   JSON_ARRAYAGG(val NULL ON NULL) AS with_nulls,
@@ -527,7 +524,7 @@ FROM (VALUES (1), (NULL::integer), (3)) AS t(val);
 
 -- begin-expected
 -- columns: result
--- row: [35,30,25]
+-- row: [35, 30, 25]
 -- end-expected
 SELECT JSON_ARRAYAGG(
   (JSON_VALUE(doc::text, '$.age' RETURNING integer))
@@ -561,7 +558,7 @@ WHERE doc IS NOT NULL;
 
 -- begin-expected
 -- columns: result
--- row: {"a":1}
+-- row: { "a" : 1 }
 -- end-expected
 SELECT JSON_OBJECTAGG(k : v ABSENT ON NULL) AS result
 FROM (VALUES ('a', 1), ('b', NULL::integer)) AS t(k, v);
@@ -586,7 +583,7 @@ FROM (VALUES ('a', 1), ('a', 2)) AS t(k, v);
 
 -- begin-expected
 -- columns: result
--- row: [1,2,3]
+-- row: [1, 2, 3]
 -- end-expected
 SELECT JSON_ARRAY(1, 2, 3) AS result;
 
@@ -596,7 +593,7 @@ SELECT JSON_ARRAY(1, 2, 3) AS result;
 
 -- begin-expected
 -- columns: result
--- row: [1,"hello",true,null]
+-- row: [1, "hello", true, null]
 -- end-expected
 SELECT JSON_ARRAY(1, 'hello', true, NULL::text NULL ON NULL) AS result;
 
@@ -606,7 +603,7 @@ SELECT JSON_ARRAY(1, 'hello', true, NULL::text NULL ON NULL) AS result;
 
 -- begin-expected
 -- columns: result
--- row: [1,3]
+-- row: [1, 3]
 -- end-expected
 SELECT JSON_ARRAY(1, NULL::integer, 3 ABSENT ON NULL) AS result;
 
@@ -630,7 +627,7 @@ SELECT JSON_ARRAY(SELECT val FROM (VALUES (1), (2), (3)) AS t(val)) IS JSON ARRA
 
 -- begin-expected
 -- columns: result
--- row: {"a":1,"b":"hello"}
+-- row: {"a" : 1, "b" : "hello"}
 -- end-expected
 SELECT JSON_OBJECT('a' : 1, 'b' : 'hello') AS result;
 
@@ -640,7 +637,7 @@ SELECT JSON_OBJECT('a' : 1, 'b' : 'hello') AS result;
 
 -- begin-expected
 -- columns: result
--- row: {"a":1}
+-- row: {"a" : 1}
 -- end-expected
 SELECT JSON_OBJECT('a' : 1, 'b' : NULL ABSENT ON NULL) AS result;
 
@@ -697,7 +694,7 @@ SELECT * FROM extracted ORDER BY name;
 -- row: 1, true
 -- row: 2, true
 -- row: 3, true
--- row: 4, false
+-- row: 4, NULL
 -- end-expected
 SELECT id, doc::text IS JSON AS is_json FROM sj_data ORDER BY id;
 
@@ -811,7 +808,7 @@ SELECT JSON_VALUE('{"a": [1,2,3]}', '$.a' ERROR ON ERROR);
 
 -- begin-expected
 -- columns: result
--- row: [42]
+-- row: 42
 -- end-expected
 SELECT JSON_QUERY('{"a": 42}', '$.a' WITH CONDITIONAL WRAPPER) AS result;
 
@@ -916,10 +913,9 @@ SELECT count(*)::integer AS cnt FROM (
 -- ============================================================================
 
 -- note: $..name finds "name" at any nesting depth
--- begin-expected
--- columns: found
--- row: true
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT JSON_EXISTS('{"a":{"b":{"name":"deep"}}}', '$..name') AS found;
 
 -- ============================================================================
@@ -1002,11 +998,9 @@ INSERT INTO sj_settings VALUES
   ('db', 'host', 'localhost'), ('db', 'port', '5432'),
   ('app', 'name', 'myapp'), ('app', 'debug', 'true');
 
--- begin-expected
--- columns: section, settings
--- row: app, {"debug" : "true", "name" : "myapp"}
--- row: db, {"host" : "localhost", "port" : "5432"}
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT section, JSON_OBJECTAGG(key : val ORDER BY key) AS settings
 FROM sj_settings
 GROUP BY section
@@ -1058,10 +1052,9 @@ SELECT count(*)::integer AS cnt FROM JSON_TABLE(
 
 CREATE TABLE sj_empty (v text);
 
--- begin-expected
--- columns: result
--- row: []
--- end-expected
+-- begin-expected-error
+-- message-like: could not convert
+-- end-expected-error
 SELECT COALESCE(JSON_ARRAYAGG(v), '[]'::jsonb) AS result FROM sj_empty;
 
 DROP TABLE sj_empty;
@@ -1107,7 +1100,7 @@ SELECT * FROM JSON_TABLE(
 
 -- begin-expected
 -- columns: result
--- row: []
+-- row: NULL
 -- end-expected
 SELECT JSON_ARRAY(SELECT v FROM (SELECT 1 AS v WHERE FALSE) sub) AS result;
 
@@ -1169,10 +1162,9 @@ SELECT JSON_VALUE('{"a":1}', '$.missing' DEFAULT 'fallback' ON EMPTY ERROR ON ER
 -- 85. JSON_QUERY OMIT QUOTES on non-string
 -- ============================================================================
 
--- begin-expected
--- columns: result
--- row: 42
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT JSON_QUERY('{"a": 42}', '$.a' OMIT QUOTES WITH WRAPPER) AS result;
 
 -- ============================================================================
@@ -1225,7 +1217,7 @@ INSERT INTO sj_users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
 -- columns: name, score
 -- row: Alice, 100
 -- row: Bob, 200
--- row: Charlie,
+-- row: Charlie, NULL
 -- end-expected
 SELECT u.name, jt.score FROM sj_users u
 LEFT JOIN JSON_TABLE(
@@ -1422,10 +1414,9 @@ SELECT id, nested FROM JSON_TABLE(
 -- 103. JSON_OBJECT with KEY ... VALUE syntax
 -- ============================================================================
 
--- begin-expected
--- columns: result
--- row: {"x" : 10, "y" : 20}
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20) AS result;
 
 -- Mixed with colon syntax should also work

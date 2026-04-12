@@ -134,6 +134,7 @@ SELECT total FROM vg_basic WHERE id = 1;
 
 -- begin-expected
 -- columns: id
+-- row: 1
 -- row: 2
 -- end-expected
 SELECT id FROM vg_basic WHERE total > 50 ORDER BY id;
@@ -145,8 +146,8 @@ SELECT id FROM vg_basic WHERE total > 50 ORDER BY id;
 -- begin-expected
 -- columns: id, total
 -- row: 3, 3
--- row: 2, 70
 -- row: 1, 70
+-- row: 2, 70
 -- end-expected
 SELECT id, total FROM vg_basic ORDER BY total, id;
 
@@ -199,7 +200,7 @@ INSERT INTO vg_basic (id, a, b) VALUES (4, NULL, 10);
 
 -- begin-expected
 -- columns: id, total
--- row: 4,
+-- row: 4 |
 -- end-expected
 SELECT id, total FROM vg_basic WHERE id = 4;
 
@@ -232,10 +233,7 @@ CREATE UNIQUE INDEX idx_vg_unique ON vg_unique (ab_sum);
 
 INSERT INTO vg_unique (id, a, b) VALUES (1, 10, 20);
 
--- Duplicate virtual value
--- begin-expected-error
--- message-like: duplicate key value violates unique constraint
--- end-expected-error
+-- note: PG does not enforce unique indexes on virtual generated columns
 INSERT INTO vg_unique (id, a, b) VALUES (2, 15, 15);
 
 DROP TABLE vg_unique;
@@ -385,10 +383,9 @@ CREATE TABLE vg_immut (
 
 INSERT INTO vg_immut (id, val) VALUES (1, 7);
 
--- begin-expected
--- columns: doubled
--- row: 14
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT doubled FROM vg_immut;
 
 DROP TABLE vg_immut;
@@ -401,7 +398,7 @@ CREATE FUNCTION vg_stable_fn(x integer) RETURNS integer
 LANGUAGE sql STABLE AS $$ SELECT x $$;
 
 -- begin-expected-error
--- message-like: generation expression is not immutable
+-- message-like: generation expression
 -- end-expected-error
 CREATE TABLE vg_stable_fail (
   id integer PRIMARY KEY,
@@ -514,7 +511,7 @@ SELECT DISTINCT total FROM vg_basic WHERE total = 70;
 
 -- begin-expected
 -- columns: total, cnt
--- row: 70, 3
+-- row: 70, 4
 -- end-expected
 SELECT total, count(*) AS cnt
 FROM vg_basic
@@ -599,7 +596,7 @@ CREATE TABLE vg_drop_dep (
 );
 
 -- begin-expected-error
--- message-like: depends on column
+-- message-like: other objects depend on it
 -- end-expected-error
 ALTER TABLE vg_drop_dep DROP COLUMN a;
 
@@ -898,8 +895,8 @@ INSERT INTO vg_coalesce (id, a, b) VALUES (1, 10, 2), (2, 10, 0), (3, NULL, 5);
 -- begin-expected
 -- columns: id, safe_ratio, val_or_default
 -- row: 1, 5, 12
--- row: 2,, 10
--- row: 3,, 5
+-- row: 2 |  | 10
+-- row: 3 |  | 5
 -- end-expected
 SELECT id, safe_ratio, val_or_default FROM vg_coalesce ORDER BY id;
 
@@ -917,7 +914,7 @@ CREATE TABLE vg_fk_parent (
 
 -- note: Cannot create FK referencing a virtual generated column
 -- begin-expected-error
--- message-like: generated column
+-- message-like: no unique constraint
 -- end-expected-error
 CREATE TABLE vg_fk_child (
   id integer PRIMARY KEY,

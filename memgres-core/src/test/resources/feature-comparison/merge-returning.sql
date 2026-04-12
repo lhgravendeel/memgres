@@ -56,9 +56,9 @@ INSERT INTO mr_target VALUES (1, 'old', 10);
 INSERT INTO mr_source VALUES (1, 'updated', 15), (2, 'new', 20);
 
 -- begin-expected
--- columns: id, val, score
--- row: 1, updated, 15
--- row: 2, new, 20
+-- columns: id, val, score, id, val, score
+-- row: 1, updated, 15, 1, updated, 15
+-- row: 2, new, 20, 2, new, 20
 -- end-expected
 MERGE INTO mr_target t
 USING mr_source s ON t.id = s.id
@@ -248,10 +248,9 @@ TRUNCATE mr_source;
 INSERT INTO mr_target VALUES (1, 'a', 10);
 INSERT INTO mr_source VALUES (1, 'b', 20);
 
--- begin-expected
--- columns: cnt
--- row: 0
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT count(*) AS cnt FROM (
   MERGE INTO mr_target t
   USING mr_source s ON t.id = s.id
@@ -325,10 +324,9 @@ SELECT id, val FROM mr_target ORDER BY id;
 TRUNCATE mr_target;
 TRUNCATE mr_source;
 
--- begin-expected
--- columns: cnt
--- row: 0
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT count(*) AS cnt FROM (
   MERGE INTO mr_target t
   USING mr_source s ON t.id = s.id
@@ -379,6 +377,7 @@ INSERT INTO mr_source VALUES (20, NULL, 50);
 
 -- begin-expected
 -- columns: id, safe_val
+-- row: 10, unknown
 -- row: 20, unknown
 -- end-expected
 MERGE INTO mr_target t

@@ -49,7 +49,7 @@ COMMIT;
 
 -- begin-expected
 -- columns: count
--- row: 1
+-- row: 2
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
@@ -57,7 +57,7 @@ DISCARD ALL;
 
 -- begin-expected
 -- columns: count
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
@@ -69,7 +69,7 @@ SET statement_timeout = '5000';
 
 -- begin-expected
 -- columns: statement_timeout
--- row: 5000
+-- row: 5s
 -- end-expected
 SHOW statement_timeout;
 
@@ -124,7 +124,7 @@ SELECT count(*)::integer AS ps_count FROM pg_prepared_statements;
 
 -- begin-expected
 -- columns: cur_count
--- row: 1
+-- row: 2
 -- end-expected
 SELECT count(*)::integer AS cur_count FROM pg_cursors;
 
@@ -139,7 +139,7 @@ SELECT count(*)::integer AS ps_count FROM pg_prepared_statements;
 
 -- begin-expected
 -- columns: cur_count
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::integer AS cur_count FROM pg_cursors;
 
@@ -189,7 +189,7 @@ DISCARD PLANS;
 
 -- begin-expected
 -- columns: count
--- row: 1
+-- row: 2
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
@@ -285,6 +285,7 @@ BEGIN;
 
 -- begin-expected-error
 -- message-like: DISCARD ALL cannot run inside a transaction block
+-- sqlstate: 25001
 -- end-expected-error
 DISCARD ALL;
 

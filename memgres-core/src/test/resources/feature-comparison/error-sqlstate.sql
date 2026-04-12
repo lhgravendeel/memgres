@@ -309,10 +309,10 @@ BEGIN
 END;
 $$;
 
--- begin-expected
--- columns: state
--- row: P0004
--- end-expected
+-- begin-expected-error
+-- sqlstate: P0004
+-- message-like: assertion
+-- end-expected-error
 SELECT get_sqlstate('SELECT sqlstate_test.sqlstate_assert_fail()') AS state;
 
 -- ============================================================================

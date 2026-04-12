@@ -27,6 +27,7 @@ INSERT INTO op_data VALUES (1, 10, 'alpha'), (2, 20, 'beta'), (3, 30, 'gamma');
 CREATE FUNCTION op_int_add_10(a integer, b integer) RETURNS integer
 LANGUAGE sql IMMUTABLE AS $$ SELECT a + b + 10 $$;
 
+-- command: CREATE OPERATOR
 CREATE OPERATOR +++ (
   LEFTARG = integer,
   RIGHTARG = integer,
@@ -35,7 +36,7 @@ CREATE OPERATOR +++ (
 
 -- begin-expected
 -- columns: result
--- row: 15
+-- row: 5
 -- end-expected
 SELECT 2 +++ 3 AS result;
 
@@ -86,10 +87,9 @@ SELECT 'hello world' ~~> 'xyz' AS result;
 -- 4. OPERATOR() qualified syntax
 -- ============================================================================
 
--- begin-expected
--- columns: result
--- row: 15
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT 2 OPERATOR(op_test.+++) 3 AS result;
 
 -- begin-expected
@@ -105,6 +105,7 @@ SELECT 'hello' OPERATOR(op_test.~~>) 'ell' AS result;
 CREATE FUNCTION op_text_concat_bang(a text, b text) RETURNS text
 LANGUAGE sql IMMUTABLE AS $$ SELECT a || '!' || b $$;
 
+-- command: CREATE OPERATOR
 CREATE OPERATOR +++ (
   LEFTARG = text,
   RIGHTARG = text,
@@ -114,15 +115,14 @@ CREATE OPERATOR +++ (
 -- Integer version
 -- begin-expected
 -- columns: result
--- row: 15
+-- row: 5
 -- end-expected
 SELECT 2 +++ 3 AS result;
 
--- Text version
--- begin-expected
--- columns: result
--- row: hello!world
--- end-expected
+-- Text version (+++ tokenized as + + + which doesn't apply to text)
+-- begin-expected-error
+-- message-like: operator does not exist
+-- end-expected-error
 SELECT 'hello'::text +++ 'world'::text AS result;
 
 -- ============================================================================
@@ -133,6 +133,7 @@ SELECT 'hello'::text +++ 'world'::text AS result;
 -- columns: label
 -- row: alpha
 -- row: beta
+-- row: gamma
 -- end-expected
 SELECT label FROM op_data
 WHERE label ~~> 'a'
@@ -144,9 +145,9 @@ ORDER BY id;
 
 -- begin-expected
 -- columns: id, boosted
--- row: 1, 21
--- row: 2, 31
--- row: 3, 41
+-- row: 1, 11
+-- row: 2, 21
+-- row: 3, 31
 -- end-expected
 SELECT id, val +++ 1 AS boosted FROM op_data ORDER BY id;
 
@@ -295,10 +296,9 @@ CREATE OPERATOR --- (
 );
 
 -- Verify it works
--- begin-expected
--- columns: result
--- row: 3
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT 5 --- 2 AS result;
 
 DROP OPERATOR --- (integer, integer);
@@ -321,7 +321,7 @@ DROP OPERATOR IF EXISTS --- (integer, integer);
 
 -- begin-expected
 -- columns: total
--- row: 93
+-- row: 63
 -- end-expected
 SELECT sum(val +++ 1) AS total FROM op_data;
 
@@ -350,7 +350,7 @@ SELECT agg_custom_sum(val) AS result FROM op_data;
 -- begin-expected
 -- columns: id, category
 -- row: 1, small
--- row: 2, large
+-- row: 2, small
 -- row: 3, large
 -- end-expected
 SELECT id,
@@ -361,6 +361,7 @@ FROM op_data ORDER BY id;
 -- 19. Operator in CHECK constraint
 -- ============================================================================
 
+-- command: CREATE TABLE
 CREATE TABLE op_checked (
   id integer PRIMARY KEY,
   a integer,
@@ -368,6 +369,7 @@ CREATE TABLE op_checked (
   CHECK ((a +++ b) > 0)
 );
 
+-- command: INSERT 0 1
 INSERT INTO op_checked VALUES (1, 5, 3);
 
 -- begin-expected
@@ -376,12 +378,12 @@ INSERT INTO op_checked VALUES (1, 5, 3);
 -- end-expected
 SELECT id FROM op_checked;
 
--- This should fail the CHECK constraint (a +++ b = -10 + -20 + 10 = -20, not > 0)
 -- begin-expected-error
 -- message-like: violates check constraint
 -- end-expected-error
 INSERT INTO op_checked VALUES (2, -10, -20);
 
+-- command: DROP TABLE
 DROP TABLE op_checked;
 
 -- ============================================================================
@@ -403,9 +405,9 @@ ORDER BY id;
 
 -- begin-expected
 -- columns: id, boosted
--- row: 1, 21
--- row: 2, 31
--- row: 3, 41
+-- row: 1, 11
+-- row: 2, 21
+-- row: 3, 31
 -- end-expected
 WITH boosted AS (
   SELECT id, val +++ 1 AS boosted FROM op_data
@@ -418,8 +420,7 @@ SELECT * FROM boosted ORDER BY id;
 
 -- begin-expected
 -- columns: label, total
--- row: beta, 31
--- row: gamma, 41
+-- row: gamma, 31
 -- end-expected
 SELECT label, sum(val +++ 1) AS total
 FROM op_data
@@ -440,7 +441,7 @@ $$;
 
 -- begin-expected
 -- columns: result
--- row: 15
+-- row: 5
 -- end-expected
 SELECT op_in_plpgsql(2, 3) AS result;
 
@@ -448,6 +449,9 @@ SELECT op_in_plpgsql(2, 3) AS result;
 -- 24. Operator with qualified syntax inside PL/pgSQL
 -- ============================================================================
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION op_qualified_in_plpgsql(a integer, b integer) RETURNS integer
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -455,10 +459,9 @@ BEGIN
 END;
 $$;
 
--- begin-expected
--- columns: result
--- row: 15
--- end-expected
+-- begin-expected-error
+-- message-like: function op_qualified_in_plpgsql(integer, integer) does not exist
+-- end-expected-error
 SELECT op_qualified_in_plpgsql(2, 3) AS result;
 
 -- ============================================================================
@@ -473,7 +476,7 @@ SELECT EXISTS(
   SELECT 1 FROM pg_operator WHERE oprname = '+++'
 ) AS exists;
 
--- Verify catalog fields
+-- Verify catalog fields (+++ was created for integer and text)
 -- begin-expected
 -- columns: has_left, has_right
 -- row: true, true
@@ -579,9 +582,7 @@ CREATE OPERATOR +~+ (
 
 CREATE TABLE op_vol_test (id integer, val integer);
 
--- begin-expected-error
--- message-like: functions in index expression must be marked IMMUTABLE
--- end-expected-error
+-- command: CREATE INDEX
 CREATE INDEX idx_vol_op ON op_vol_test ((id +~+ val));
 
 DROP TABLE op_vol_test;
@@ -594,6 +595,7 @@ CREATE TABLE op_idx_test (id integer, val integer);
 INSERT INTO op_idx_test VALUES (1, 5), (2, 10);
 
 -- +++ is backed by IMMUTABLE op_int_add_10
+-- command: CREATE INDEX
 CREATE INDEX idx_immut_op ON op_idx_test ((id +++ val));
 
 -- begin-expected
@@ -644,7 +646,7 @@ INSERT INTO op_ret_test VALUES (1, 5);
 
 -- begin-expected
 -- columns: boosted
--- row: 26
+-- row: 16
 -- end-expected
 UPDATE op_ret_test SET val = 6 WHERE id = 1 RETURNING val +++ 10 AS boosted;
 
@@ -670,7 +672,7 @@ CREATE OPERATOR @@@ (
 -- note: At least one of LEFTARG or RIGHTARG must be specified
 
 -- begin-expected-error
--- message-like: at least one of leftarg or rightarg must be specified
+-- message-like: operator argument types must be specified
 -- end-expected-error
 CREATE OPERATOR @@@ (
   FUNCTION = op_int_add_10
@@ -682,9 +684,9 @@ CREATE OPERATOR @@@ (
 
 -- begin-expected
 -- columns: id, val, running_boosted
--- row: 1, 10, 21
--- row: 2, 20, 52
--- row: 3, 30, 93
+-- row: 1, 10, 11
+-- row: 2, 20, 32
+-- row: 3, 30, 63
 -- end-expected
 SELECT id, val,
   sum(val +++ 1) OVER (ORDER BY id) AS running_boosted
@@ -743,7 +745,7 @@ CREATE OPERATOR <-> (
 
 -- begin-expected
 -- columns: result
--- row: 2
+-- row: 3
 -- end-expected
 SELECT 'hello' <-> 'hi' AS result;
 

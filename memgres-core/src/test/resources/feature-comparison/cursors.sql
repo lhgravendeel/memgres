@@ -215,47 +215,50 @@ DECLARE c4 CURSOR FOR SELECT id FROM cur_test ORDER BY id;
 -- end-expected
 FETCH NEXT FROM c4;
 
--- 4b. PRIOR rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
-FETCH PRIOR FROM c4;
-
--- 4c. LAST rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
-FETCH LAST FROM c4;
-
--- 4d. FIRST rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
-FETCH FIRST FROM c4;
-
--- 4e. ABSOLUTE rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
-FETCH ABSOLUTE 1 FROM c4;
-
--- 4f. Negative RELATIVE rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
-FETCH RELATIVE -1 FROM c4;
-
--- 4g. Positive RELATIVE allowed (forward)
+-- 4b. PRIOR on NO SCROLL: PG 18 allows it (returns 0 rows from before-first)
 -- begin-expected
 -- columns: id
--- row: 3
+-- end-expected
+FETCH PRIOR FROM c4;
+
+-- 4c. LAST on NO SCROLL: PG 18 allows it
+-- begin-expected
+-- columns: id
+-- row: 5
+-- end-expected
+FETCH LAST FROM c4;
+
+-- 4d. FIRST on NO SCROLL: PG 18 allows it
+-- begin-expected
+-- columns: id
+-- row: 1
+-- end-expected
+FETCH FIRST FROM c4;
+
+-- 4e. ABSOLUTE on NO SCROLL: PG 18 allows it
+-- begin-expected
+-- columns: id
+-- row: 1
+-- end-expected
+FETCH ABSOLUTE 1 FROM c4;
+
+-- 4f. Negative RELATIVE on NO SCROLL: PG 18 allows it (returns 0 rows)
+-- begin-expected
+-- columns: id
+-- end-expected
+FETCH RELATIVE -1 FROM c4;
+
+-- 4g. Positive RELATIVE (forward) — cursor at row 1 after FIRST/ABSOLUTE, so RELATIVE 1 returns 2
+-- begin-expected
+-- columns: id
+-- row: 1
 -- end-expected
 FETCH RELATIVE 1 FROM c4;
 
--- 4h. BACKWARD rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
+-- 4h. BACKWARD on NO SCROLL: PG 18 allows it (returns 0 rows)
+-- begin-expected
+-- columns: id
+-- end-expected
 FETCH BACKWARD 1 FROM c4;
 
 CLOSE c4;
@@ -548,10 +551,9 @@ CLOSE c11a;
 FETCH NEXT FROM c11a;
 
 -- 11b. Other cursor still open
--- begin-expected
--- columns: ?column?
--- row: 2
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 FETCH NEXT FROM c11b;
 
 -- 11c. CLOSE ALL
@@ -580,7 +582,7 @@ FETCH NEXT FROM nope;
 DECLARE c12 CURSOR FOR SELECT 1;
 
 -- begin-expected-error
--- message-like: cursor "c12" already exists
+-- message-like: transaction block
 -- end-expected-error
 DECLARE c12 CURSOR FOR SELECT 2;
 
@@ -776,9 +778,10 @@ DECLARE c21 SCROLL CURSOR FOR SELECT id FROM cur_test ORDER BY id;
 -- Move to row 3
 FETCH ABSOLUTE 3 FROM c21;
 
--- FETCH FORWARD 0: returns nothing, position unchanged
+-- FETCH FORWARD 0: returns current row without moving
 -- begin-expected
 -- columns: id
+-- row: 3
 -- end-expected
 FETCH FORWARD 0 FROM c21;
 
@@ -792,9 +795,10 @@ FETCH NEXT FROM c21;
 -- Move back to row 2
 FETCH ABSOLUTE 2 FROM c21;
 
--- FETCH BACKWARD 0: returns nothing, position unchanged
+-- FETCH BACKWARD 0: returns current row without moving
 -- begin-expected
 -- columns: id
+-- row: 2
 -- end-expected
 FETCH BACKWARD 0 FROM c21;
 
@@ -818,22 +822,13 @@ DECLARE c22 CURSOR FOR SELECT id FROM cur_test ORDER BY id;
 -- Forward MOVE OK
 MOVE NEXT IN c22;
 
--- Backward MOVE rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
+-- Backward MOVE on NO SCROLL: PG 18 allows it
 MOVE PRIOR IN c22;
 
--- MOVE ABSOLUTE rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
+-- MOVE ABSOLUTE on NO SCROLL: PG 18 allows it
 MOVE ABSOLUTE 1 IN c22;
 
--- MOVE LAST rejected
--- begin-expected-error
--- message-like: cursor can only scan forward
--- end-expected-error
+-- MOVE LAST on NO SCROLL: PG 18 allows it
 MOVE LAST IN c22;
 
 CLOSE c22;

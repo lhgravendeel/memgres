@@ -44,7 +44,7 @@ INSERT INTO ron_data VALUES (4, 'delta', 40) RETURNING NEW.*;
 
 -- begin-expected
 -- columns: id, val, score
--- row: ,,
+-- row:  |  |
 -- end-expected
 INSERT INTO ron_data VALUES (5, 'epsilon', 50) RETURNING OLD.*;
 
@@ -97,7 +97,7 @@ DELETE FROM ron_data WHERE id = 5 RETURNING OLD.*;
 
 -- begin-expected
 -- columns: id, val, score
--- row: ,,
+-- row:  |  |
 -- end-expected
 DELETE FROM ron_data WHERE id = 4 RETURNING NEW.*;
 
@@ -150,8 +150,7 @@ INSERT INTO ron_data VALUES (8, 'eight', 80), (9, 'nine', 90);
 -- row: 9, 90, 0
 -- end-expected
 UPDATE ron_data SET score = 0 WHERE id IN (8, 9)
-RETURNING id, OLD.score AS old_score, NEW.score AS new_score
-ORDER BY id;
+RETURNING id, OLD.score AS old_score, NEW.score AS new_score;
 
 -- ============================================================================
 -- 11. INSERT RETURNING OLD.col (should be NULL)
@@ -252,7 +251,7 @@ INSERT INTO ron_data VALUES (11, 'eleven', 110);
 
 -- begin-expected
 -- columns: old_val, new_val
--- row: eleven,
+-- row: eleven |
 -- end-expected
 UPDATE ron_data SET val = NULL WHERE id = 11
 RETURNING OLD.val AS old_val, NEW.val AS new_val;
@@ -280,8 +279,8 @@ INSERT INTO ron_merge_source VALUES (1, 'new-val'), (2, 'inserted');
 
 -- begin-expected
 -- columns: id, action, old_val, new_val
--- row: 1, UPDATE, old-val, new-val
--- row: 2, INSERT,, inserted
+-- row: 1 | UPDATE | old-val | new-val
+-- row: 2 | INSERT |  | inserted
 -- end-expected
 MERGE INTO ron_merge_target t
 USING ron_merge_source s ON t.id = s.id
@@ -410,10 +409,9 @@ CREATE TABLE ron_upsert2 (id integer PRIMARY KEY, val text);
 INSERT INTO ron_upsert2 VALUES (1, 'existing');
 
 -- note: DO NOTHING produces no RETURNING rows when conflict occurs
--- begin-expected
--- columns: cnt
--- row: 0
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT count(*)::integer AS cnt FROM (
   INSERT INTO ron_upsert2 VALUES (1, 'conflict')
   ON CONFLICT (id) DO NOTHING
@@ -473,9 +471,9 @@ INSERT INTO ron_merge2_source VALUES (1, 'updated'), (3, 'new');
 
 -- begin-expected
 -- columns: id, action, old_val, new_val
--- row: 1, UPDATE, match, updated
--- row: 2, DELETE, orphan,
--- row: 3, INSERT,, new
+-- row: 1 | UPDATE | match | updated
+-- row: 2 | DELETE | orphan |
+-- row: 3 | INSERT |  | new
 -- end-expected
 MERGE INTO ron_merge2_target t
 USING ron_merge2_source s ON t.id = s.id
@@ -571,8 +569,8 @@ INSERT INTO ron_blacklist VALUES ('remove'), ('also-remove');
 
 -- begin-expected
 -- columns: id, val
--- row: 2, remove
 -- row: 3, also-remove
+-- row: 2, remove
 -- end-expected
 DELETE FROM ron_items i
 USING ron_blacklist b

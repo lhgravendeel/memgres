@@ -68,7 +68,8 @@ SELECT trim_array(ARRAY['a','b','c','d'], 2) AS result;
 -- ============================================================================
 
 -- begin-expected-error
--- message-like: must not exceed array length
+-- sqlstate: 2202E
+-- message-like: must be between 0 and
 -- end-expected-error
 SELECT trim_array(ARRAY[1,2], 5);
 
@@ -77,7 +78,8 @@ SELECT trim_array(ARRAY[1,2], 5);
 -- ============================================================================
 
 -- begin-expected-error
--- message-like: must not be negative
+-- sqlstate: 2202E
+-- message-like: must be between 0 and
 -- end-expected-error
 SELECT trim_array(ARRAY[1,2], -1);
 
@@ -140,7 +142,6 @@ FROM string_to_table('a,NULL,b', ',', 'NULL') AS val;
 
 -- begin-expected
 -- columns: val
--- row:
 -- end-expected
 SELECT val FROM string_to_table('', ',') AS val;
 
@@ -319,7 +320,7 @@ INSERT INTO bf_ranges VALUES ('[1,10)'), ('[3,8)'), ('[5,15)');
 
 -- begin-expected
 -- columns: result
--- row: {[5,8)}
+-- row: [5,8)
 -- end-expected
 SELECT range_intersect_agg(r) AS result FROM bf_ranges;
 
@@ -332,7 +333,7 @@ INSERT INTO bf_ranges VALUES ('[1,3)'), ('[5,7)');
 
 -- begin-expected
 -- columns: result
--- row: {}
+-- row: empty
 -- end-expected
 SELECT range_intersect_agg(r) AS result FROM bf_ranges;
 
@@ -348,7 +349,7 @@ DROP TABLE bf_ranges;
 
 -- begin-expected
 -- columns: result
--- row: true
+-- row: t
 -- end-expected
 SELECT (DATE '2026-01-01', DATE '2026-01-10') OVERLAPS (DATE '2026-01-05', DATE '2026-01-15') AS result;
 
@@ -358,7 +359,7 @@ SELECT (DATE '2026-01-01', DATE '2026-01-10') OVERLAPS (DATE '2026-01-05', DATE 
 
 -- begin-expected
 -- columns: result
--- row: false
+-- row: f
 -- end-expected
 SELECT (DATE '2026-01-01', DATE '2026-01-05') OVERLAPS (DATE '2026-01-06', DATE '2026-01-10') AS result;
 
@@ -368,7 +369,7 @@ SELECT (DATE '2026-01-01', DATE '2026-01-05') OVERLAPS (DATE '2026-01-06', DATE 
 
 -- begin-expected
 -- columns: result
--- row: true
+-- row: t
 -- end-expected
 SELECT (TIMESTAMP '2026-01-01 08:00', TIMESTAMP '2026-01-01 17:00')
        OVERLAPS
@@ -380,7 +381,7 @@ SELECT (TIMESTAMP '2026-01-01 08:00', TIMESTAMP '2026-01-01 17:00')
 
 -- begin-expected
 -- columns: result
--- row: true
+-- row: t
 -- end-expected
 SELECT (DATE '2026-01-01', INTERVAL '5 days') OVERLAPS (DATE '2026-01-03', INTERVAL '5 days') AS result;
 
@@ -391,7 +392,7 @@ SELECT (DATE '2026-01-01', INTERVAL '5 days') OVERLAPS (DATE '2026-01-03', INTER
 -- note: Touching endpoints are NOT considered overlapping per SQL standard
 -- begin-expected
 -- columns: result
--- row: false
+-- row: f
 -- end-expected
 SELECT (DATE '2026-01-01', DATE '2026-01-05') OVERLAPS (DATE '2026-01-05', DATE '2026-01-10') AS result;
 
@@ -401,7 +402,7 @@ SELECT (DATE '2026-01-01', DATE '2026-01-05') OVERLAPS (DATE '2026-01-05', DATE 
 
 -- begin-expected
 -- columns: result
--- row: true
+-- row: t
 -- end-expected
 SELECT (DATE '2026-01-01', DATE '2026-01-01') OVERLAPS (DATE '2026-01-01', DATE '2026-01-05') AS result;
 

@@ -377,10 +377,9 @@ WHERE aggfnoid = 'edge_doublesum_agg'::regproc;
 -- ============================================================================
 
 -- note: Built-in min/max use SORTOP; verify catalog column exists
--- begin-expected
--- columns: has_sortop
--- row: true
--- end-expected
+-- begin-expected-error
+-- message-like: more than one function
+-- end-expected-error
 SELECT aggsortop IS NOT NULL AS has_sortop
 FROM pg_aggregate
 WHERE aggfnoid = 'min'::regproc AND aggtranstype = 'integer'::regtype;

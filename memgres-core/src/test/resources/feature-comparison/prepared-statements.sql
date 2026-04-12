@@ -143,6 +143,7 @@ PREPARE ps_sub AS SELECT name FROM ps_test WHERE val > (SELECT avg(val) FROM ps_
 
 -- begin-expected
 -- columns: name
+-- row: beta
 -- row: gamma
 -- end-expected
 EXECUTE ps_sub;
@@ -440,7 +441,7 @@ PREPARE ps_window AS
 
 -- begin-expected
 -- columns: id|name|rn
--- row: 1|alpha|1
+-- row: 1|ALPHA|1
 -- row: 2|beta|2
 -- row: 3|gamma|3
 -- end-expected

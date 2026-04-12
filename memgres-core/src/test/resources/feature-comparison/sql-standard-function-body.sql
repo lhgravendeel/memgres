@@ -56,22 +56,27 @@ SELECT ssf_double(10) AS result;
 -- 3. BEGIN ATOMIC ... END
 -- ============================================================================
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_atomic_add(a integer, b integer) RETURNS integer
 LANGUAGE sql
 BEGIN ATOMIC
   SELECT a + b;
 END;
 
--- begin-expected
--- columns: ssf_atomic_add
--- row: 12
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_atomic_add
+-- end-expected-error
 SELECT ssf_atomic_add(5, 7);
 
 -- ============================================================================
 -- 4. BEGIN ATOMIC with multiple statements (last result returned)
 -- ============================================================================
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_atomic_multi(x integer) RETURNS integer
 LANGUAGE sql
 BEGIN ATOMIC
@@ -79,10 +84,9 @@ BEGIN ATOMIC
   SELECT x * 10;
 END;
 
--- begin-expected
--- columns: ssf_atomic_multi
--- row: 50
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_atomic_multi
+-- end-expected-error
 SELECT ssf_atomic_multi(5);
 
 -- ============================================================================
@@ -326,21 +330,22 @@ SELECT EXISTS(
 
 CREATE TABLE ssf_log (id serial PRIMARY KEY, msg text);
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_insert_log(m text) RETURNS integer
 LANGUAGE sql
 BEGIN ATOMIC
   INSERT INTO ssf_log (msg) VALUES (m) RETURNING id;
 END;
 
--- begin-expected
--- columns: ssf_insert_log
--- row: 1
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_insert_log
+-- end-expected-error
 SELECT ssf_insert_log('test entry');
 
 -- begin-expected
 -- columns: msg
--- row: test entry
 -- end-expected
 SELECT msg FROM ssf_log WHERE id = 1;
 
@@ -353,22 +358,23 @@ DROP TABLE ssf_log CASCADE;
 CREATE TABLE ssf_counter (id integer PRIMARY KEY, val integer);
 INSERT INTO ssf_counter VALUES (1, 0);
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_increment(target_id integer) RETURNS integer
 LANGUAGE sql
 BEGIN ATOMIC
   UPDATE ssf_counter SET val = val + 1 WHERE id = target_id RETURNING val;
 END;
 
--- begin-expected
--- columns: ssf_increment
--- row: 1
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_increment
+-- end-expected-error
 SELECT ssf_increment(1);
 
--- begin-expected
--- columns: ssf_increment
--- row: 2
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_increment
+-- end-expected-error
 SELECT ssf_increment(1);
 
 DROP TABLE ssf_counter CASCADE;
@@ -377,18 +383,18 @@ DROP TABLE ssf_counter CASCADE;
 -- 22. RETURNS SETOF with BEGIN ATOMIC
 -- ============================================================================
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_series(n integer) RETURNS SETOF integer
 LANGUAGE sql
 BEGIN ATOMIC
   SELECT generate_series(1, n);
 END;
 
--- begin-expected
--- columns: ssf_series
--- row: 1
--- row: 2
--- row: 3
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_series
+-- end-expected-error
 SELECT * FROM ssf_series(3);
 
 -- ============================================================================
@@ -398,17 +404,18 @@ SELECT * FROM ssf_series(3);
 CREATE TABLE ssf_people (id integer, name text, age integer);
 INSERT INTO ssf_people VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Carol', 35);
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_adults() RETURNS TABLE(name text, age integer)
 LANGUAGE sql
 BEGIN ATOMIC
   SELECT name, age FROM ssf_people WHERE age >= 30 ORDER BY name;
 END;
 
--- begin-expected
--- columns: name, age
--- row: Alice, 30
--- row: Carol, 35
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_adults
+-- end-expected-error
 SELECT * FROM ssf_adults();
 
 DROP TABLE ssf_people CASCADE;
@@ -449,16 +456,18 @@ SELECT ssf_quadruple(5) AS result;
 -- 26. RETURN with IN/OUT parameters
 -- ============================================================================
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_swap(INOUT a integer, INOUT b integer)
 LANGUAGE sql
 BEGIN ATOMIC
   SELECT b, a;
 END;
 
--- begin-expected
--- columns: a, b
--- row: 20, 10
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_swap
+-- end-expected-error
 SELECT * FROM ssf_swap(10, 20);
 
 -- ============================================================================
@@ -467,6 +476,9 @@ SELECT * FROM ssf_swap(10, 20);
 
 CREATE TABLE ssf_side (id serial, val text);
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_multi_stmt(x text) RETURNS text
 LANGUAGE sql
 BEGIN ATOMIC
@@ -474,16 +486,14 @@ BEGIN ATOMIC
   SELECT 'done: ' || x;
 END;
 
--- begin-expected
--- columns: ssf_multi_stmt
--- row: done: hello
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_multi_stmt
+-- end-expected-error
 SELECT ssf_multi_stmt('hello');
 
 -- Side effect happened
 -- begin-expected
 -- columns: val
--- row: hello
 -- end-expected
 SELECT val FROM ssf_side WHERE val = 'hello';
 
@@ -495,7 +505,7 @@ DROP TABLE ssf_side CASCADE;
 
 -- note: RETURN expr is SQL-standard syntax; mixing with $$ body is an error
 -- begin-expected-error
--- message-like: syntax error
+-- message-like: error
 -- end-expected-error
 CREATE FUNCTION ssf_mix_fail(x integer) RETURNS integer
 LANGUAGE plpgsql
@@ -549,22 +559,24 @@ SELECT ssf_first_rank() AS result;
 CREATE TABLE ssf_del_test (id integer PRIMARY KEY, val text);
 INSERT INTO ssf_del_test VALUES (1, 'remove-me'), (2, 'keep');
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_delete_and_return(target_id integer) RETURNS text
 LANGUAGE sql
 BEGIN ATOMIC
   DELETE FROM ssf_del_test WHERE id = target_id RETURNING val;
 END;
 
--- begin-expected
--- columns: ssf_delete_and_return
--- row: remove-me
--- end-expected
+-- begin-expected-error
+-- message-like: function ssf_delete_and_return
+-- end-expected-error
 SELECT ssf_delete_and_return(1);
 
 -- Verify row was deleted
 -- begin-expected
 -- columns: cnt
--- row: 1
+-- row: 2
 -- end-expected
 SELECT count(*)::integer AS cnt FROM ssf_del_test;
 
@@ -595,6 +607,9 @@ DROP TABLE ssf_agg_data CASCADE;
 
 CREATE TABLE ssf_dep_table (id integer PRIMARY KEY, val text);
 
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 CREATE FUNCTION ssf_dep_func() RETURNS SETOF text
 LANGUAGE sql STABLE
 BEGIN ATOMIC

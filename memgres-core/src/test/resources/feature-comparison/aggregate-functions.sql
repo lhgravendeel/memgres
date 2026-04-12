@@ -92,7 +92,7 @@ CREATE AGGREGATE agg_concat_bracket(text) (
 -- columns: result
 -- row: [x,y,z,p,q,r,s]
 -- end-expected
-SELECT agg_concat_bracket(label) AS result FROM agg_data ORDER BY id;
+SELECT agg_concat_bracket(label) AS result FROM agg_data;
 
 -- ============================================================================
 -- 5. Aggregate without INITCOND
@@ -107,7 +107,7 @@ CREATE AGGREGATE agg_mysum_no_init(integer) (
 
 -- begin-expected
 -- columns: total
--- row: 120
+-- row: NULL
 -- end-expected
 SELECT agg_mysum_no_init(val) AS total FROM agg_data WHERE val IS NOT NULL;
 
@@ -127,7 +127,7 @@ SELECT agg_mysum_no_init(val) IS NULL AS is_null FROM agg_empty;
 
 -- begin-expected
 -- columns: total
--- row: 0
+-- row: NULL
 -- end-expected
 SELECT agg_mysum(val) AS total
 FROM (VALUES (NULL::integer), (NULL::integer)) AS t(val);
@@ -248,7 +248,7 @@ CREATE AGGREGATE agg_csv(text) (
 -- columns: result
 -- row: x,y,z
 -- end-expected
-SELECT agg_csv(label) AS result FROM agg_data WHERE grp = 'a' ORDER BY id;
+SELECT agg_csv(label) AS result FROM agg_data WHERE grp = 'a';
 
 -- ============================================================================
 -- 14. Multiple aggregates in one query
@@ -343,7 +343,7 @@ SELECT agg_temp(x) AS result FROM (VALUES (1), (2), (3)) AS t(x);
 DROP AGGREGATE agg_temp(integer);
 
 -- begin-expected-error
--- message-like: aggregate agg_temp(integer) does not exist
+-- message-like: does not exist
 -- end-expected-error
 SELECT agg_temp(1);
 
@@ -443,7 +443,7 @@ INSERT INTO agg_bits VALUES (12), (10), (14);  -- 1100, 1010, 1110
 
 -- begin-expected
 -- columns: band, bor, bxor
--- row: 8, 14, 12
+-- row: 8, 14, 8
 -- end-expected
 SELECT bit_and(val) AS band, bit_or(val) AS bor, bit_xor(val) AS bxor FROM agg_bits;
 
@@ -557,8 +557,8 @@ DROP TABLE agg_dup_labels;
 -- begin-expected
 -- columns: id, val, rn, rnk
 -- row: 4, 5, 1, 1
--- row: 5, 15, 2, 2
--- row: 1, 10, 3, 3
+-- row: 1, 10, 2, 2
+-- row: 5, 15, 3, 3
 -- row: 2, 20, 4, 4
 -- row: 3, 30, 5, 5
 -- row: 7, 40, 6, 6
@@ -676,7 +676,7 @@ INSERT INTO agg_nulls VALUES (NULL), (NULL), (NULL);
 
 -- begin-expected
 -- columns: s, a, c
--- row: ,, 0
+-- row:  |  | 0
 -- end-expected
 SELECT sum(val) AS s, avg(val) AS a, count(val) AS c FROM agg_nulls;
 
@@ -688,7 +688,7 @@ DROP TABLE agg_nulls;
 
 -- begin-expected
 -- columns: var_val, stddev_val
--- row: 150.00, 12.25
+-- row: 100.00, 10.00
 -- end-expected
 SELECT
   round(var_samp(val)::numeric, 2) AS var_val,

@@ -184,6 +184,10 @@ SELECT pla_foreach_basic() AS result;
 -- 9. FOREACH SLICE 1 (iterate over 1D slices of 2D array)
 -- ============================================================================
 
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: SLICE
+-- end-expected-error
 CREATE FUNCTION pla_foreach_slice1() RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -198,10 +202,10 @@ BEGIN
 END;
 $$;
 
--- begin-expected
--- columns: result
--- row: {1,2};{3,4};{5,6};
--- end-expected
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: pla_foreach_slice1
+-- end-expected-error
 SELECT pla_foreach_slice1() AS result;
 
 -- ============================================================================
@@ -311,6 +315,7 @@ END;
 $$;
 
 -- begin-expected-error
+-- sqlstate: P0004
 -- message-like: one does not equal two
 -- end-expected-error
 SELECT pla_assert_fail();
@@ -328,6 +333,7 @@ END;
 $$;
 
 -- begin-expected-error
+-- sqlstate: P0004
 -- message-like: assert
 -- end-expected-error
 SELECT pla_assert_no_msg();
@@ -351,6 +357,7 @@ $$;
 SELECT pla_assert_expr(5) AS result;
 
 -- begin-expected-error
+-- sqlstate: P0004
 -- message-like: x must be positive
 -- end-expected-error
 SELECT pla_assert_expr(-1);
@@ -480,7 +487,7 @@ INSERT INTO pla_window VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
 
 -- begin-expected
 -- columns: id, val, sum_excl
--- row: 1, 10, 0
+-- row: 1, 10, NULL
 -- row: 2, 20, 10
 -- row: 3, 30, 30
 -- row: 4, 40, 60
@@ -500,7 +507,7 @@ INSERT INTO pla_window2 VALUES ('a', 10), ('a', 20), ('b', 30), ('b', 40);
 -- note: EXCLUDE GROUP excludes all rows with same ORDER BY value as current
 -- begin-expected
 -- columns: grp, val, sum_excl
--- row: a, 10, 0
+-- row: a, 10, NULL
 -- row: a, 20, 10
 -- row: b, 30, 30
 -- row: b, 40, 60
@@ -554,8 +561,8 @@ FROM pla_window ORDER BY id;
 -- columns: id, score, sum_excl
 -- row: 1, 10, 10
 -- row: 2, 10, 10
--- row: 3, 20, 60
--- row: 4, 20, 60
+-- row: 3, 20, 40
+-- row: 4, 20, 40
 -- row: 5, 30, 100
 -- end-expected
 SELECT id, score,
@@ -568,7 +575,7 @@ FROM pla_ties ORDER BY id;
 
 -- begin-expected
 -- columns: id, val, avg_excl
--- row: 3, 30, 15
+-- row: 3, 30, NULL
 -- end-expected
 SELECT id, val,
   avg(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW)::integer AS avg_excl

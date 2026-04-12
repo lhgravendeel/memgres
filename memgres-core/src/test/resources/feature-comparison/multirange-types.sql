@@ -278,11 +278,11 @@ SELECT int4range(1,10)::int4multirange AS result;
 -- 23. Cast multirange to range (single sub-range)
 -- ============================================================================
 
--- note: Only works if multirange contains exactly one sub-range
--- begin-expected
--- columns: result
--- row: [1,10)
--- end-expected
+-- note: PG does not support direct cast from multirange to range
+-- begin-expected-error
+-- sqlstate: 42846
+-- message-like: cannot cast type int4multirange to int4range
+-- end-expected-error
 SELECT '{[1,10)}'::int4multirange::int4range AS result;
 
 -- ============================================================================
@@ -363,7 +363,7 @@ CREATE INDEX idx_mr_gist ON mr_indexed USING gist (r);
 
 -- begin-expected
 -- columns: cnt
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::integer AS cnt FROM mr_indexed WHERE r @> 55;
 

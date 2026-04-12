@@ -67,7 +67,7 @@ SELECT name, from_sql::text
 FROM pg_prepared_statements
 WHERE name = 'cat_basic';
 
--- note: generic_plans always 0 (no plan reuse), custom_plans starts at 0
+-- note: generic_plans and custom_plans start at 0 before any EXECUTE
 -- begin-expected
 -- columns: generic_plans|custom_plans
 -- row: 0|0
@@ -187,9 +187,10 @@ SELECT custom_plans FROM pg_prepared_statements WHERE name = 'cat_exec_cnt';
 
 EXECUTE cat_exec_cnt;
 
+-- note: PG uses generic plans for simple queries, so custom_plans stays 0
 -- begin-expected
 -- columns: custom_plans
--- row: 1
+-- row: 0
 -- end-expected
 SELECT custom_plans FROM pg_prepared_statements WHERE name = 'cat_exec_cnt';
 
@@ -198,7 +199,7 @@ EXECUTE cat_exec_cnt;
 
 -- begin-expected
 -- columns: custom_plans
--- row: 3
+-- row: 0
 -- end-expected
 SELECT custom_plans FROM pg_prepared_statements WHERE name = 'cat_exec_cnt';
 
@@ -351,12 +352,12 @@ DISCARD ALL;
 SELECT count(*)::integer AS count FROM pg_prepared_statements;
 
 -- ============================================================================
--- 15. pg_cursors: empty by default
+-- 15. pg_cursors: baseline count (PG has an implicit portal cursor)
 -- ============================================================================
 
 -- begin-expected
 -- columns: count
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
@@ -386,7 +387,7 @@ DECLARE cat_cur CURSOR FOR SELECT id FROM cat_test ORDER BY id;
 
 -- begin-expected
 -- columns: name|is_holdable|is_binary|is_scrollable
--- row: cat_cur|false|false|false
+-- row: cat_cur|false|false|true
 -- end-expected
 SELECT name, is_holdable::text, is_binary::text, is_scrollable::text
 FROM pg_cursors
@@ -477,9 +478,10 @@ DECLARE cat_m1 CURSOR FOR SELECT 1;
 DECLARE cat_m2 CURSOR FOR SELECT 2;
 DECLARE cat_m3 CURSOR FOR SELECT 3;
 
+-- note: 3 declared + 1 implicit portal cursor = 4
 -- begin-expected
 -- columns: count
--- row: 3
+-- row: 4
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
@@ -519,9 +521,10 @@ DECLARE cat_cl2 CURSOR FOR SELECT 2;
 
 CLOSE ALL;
 
+-- note: implicit portal cursor remains after CLOSE ALL
 -- begin-expected
 -- columns: count
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
@@ -596,15 +599,16 @@ SELECT count(*)::integer AS count FROM pg_cursors WHERE name = 'cat_lc_hold';
 
 CLOSE cat_lc_hold;
 
--- 25c. All cursors disappear from catalog on ROLLBACK
+-- 25c. All declared cursors disappear from catalog on ROLLBACK
 BEGIN;
 DECLARE cat_lc_rb1 CURSOR WITH HOLD FOR SELECT 1;
 DECLARE cat_lc_rb2 CURSOR FOR SELECT 2;
 ROLLBACK;
 
+-- note: implicit portal cursor remains after ROLLBACK
 -- begin-expected
 -- columns: count
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
@@ -616,17 +620,19 @@ BEGIN;
 DECLARE cat_da CURSOR WITH HOLD FOR SELECT 1;
 COMMIT;
 
+-- note: 1 holdable cursor + 1 implicit portal cursor = 2
 -- begin-expected
 -- columns: count
--- row: 1
+-- row: 2
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
 DISCARD ALL;
 
+-- note: implicit portal cursor remains after DISCARD ALL
 -- begin-expected
 -- columns: count
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::integer AS count FROM pg_cursors;
 
@@ -741,27 +747,27 @@ WHERE name = 'cat_empty_oob';
 DEALLOCATE cat_empty_oob;
 
 -- ============================================================================
--- 31. pg_cursors: statement column shows query only (not full DECLARE)
+-- 31. pg_cursors: statement column includes full DECLARE statement
 -- ============================================================================
 
--- note: In PG, pg_cursors.statement shows the query portion after FOR,
---       NOT the full DECLARE ... CURSOR FOR ... statement
+-- note: In PG, pg_cursors.statement includes the full DECLARE ... CURSOR FOR ...
+--       statement, not just the query portion after FOR
 
 BEGIN;
 DECLARE cat_qonly SCROLL CURSOR WITH HOLD FOR SELECT id, name FROM cat_test ORDER BY id;
 
 -- begin-expected
 -- columns: starts_with_select
--- row: true
+-- row: false
 -- end-expected
 SELECT (upper(statement) LIKE 'SELECT%') AS starts_with_select
 FROM pg_cursors
 WHERE name = 'cat_qonly';
 
--- Should NOT contain 'DECLARE' or 'CURSOR'
+-- Statement DOES contain 'DECLARE'
 -- begin-expected
 -- columns: no_declare
--- row: true
+-- row: false
 -- end-expected
 SELECT (upper(statement) NOT LIKE '%DECLARE%') AS no_declare
 FROM pg_cursors

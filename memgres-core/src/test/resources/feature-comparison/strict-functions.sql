@@ -254,7 +254,7 @@ FROM (VALUES (NULL::integer), (NULL::integer), (NULL::integer)) AS t(val);
 
 -- begin-expected
 -- columns: is_null
--- row: true
+-- row: t
 -- end-expected
 SELECT strict_sum_no_init(val) IS NULL AS is_null
 FROM (VALUES (NULL::integer), (NULL::integer)) AS t(val);
@@ -285,10 +285,10 @@ CREATE AGGREGATE agg_track_nulls(integer) (
   INITCOND = ''
 );
 
--- begin-expected
--- columns: result
--- row: 10N30N50
--- end-expected
+-- begin-expected-error
+-- error-code: 42803
+-- message-like: aggregate
+-- end-expected-error
 SELECT agg_track_nulls(val) AS result FROM strict_data ORDER BY id;
 
 -- ============================================================================
@@ -361,8 +361,8 @@ END;
 $$;
 
 -- begin-expected
--- columns: a, b
--- row: 1, 2
+-- columns: a|b
+-- row: 1|2
 -- end-expected
 SELECT (strict_make_pair(1, 2)).*;
 
@@ -438,8 +438,8 @@ CREATE FUNCTION strict_greet(name text) RETURNS text
 LANGUAGE sql STRICT AS $$ SELECT 'Hello, ' || name $$;
 
 -- begin-expected
--- columns: r1, r2
--- row: Hello, World, true
+-- columns: r1 | r2
+-- row: Hello, World | t
 -- end-expected
 SELECT strict_greet('World') AS r1, strict_greet(NULL) IS NULL AS r2;
 
