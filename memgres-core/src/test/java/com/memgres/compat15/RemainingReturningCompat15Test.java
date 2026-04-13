@@ -4,15 +4,19 @@ import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
 
 import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Tests for 3 remaining Memgres-vs-PG differences from returning-old-new.sql
- * and merge-returning.sql.
+ * Tests for 3 PG vs Memgres differences from returning-old-new.sql and
+ * merge-returning.sql.
  *
- * These tests assert PG 18 behavior. They are expected to FAIL on current
- * Memgres and pass once the underlying issues are fixed.
+ * These tests assert exact PG 18 behavior. They are expected to FAIL on
+ * current Memgres, documenting the real gaps.
+ *
+ * Uses default JDBC (extended query protocol) to match the comparison framework.
  */
 class RemainingReturningCompat15Test {
 
@@ -23,8 +27,8 @@ class RemainingReturningCompat15Test {
     static void setUp() throws Exception {
         memgres = Memgres.builder().port(0).build().start();
         conn = DriverManager.getConnection(
-                memgres.getJdbcUrl() + "?preferQueryMode=simple",
-                memgres.getUser(), memgres.getPassword());
+                "jdbc:postgresql://localhost:" + memgres.getPort() + "/test",
+                "test", "test");
         conn.setAutoCommit(true);
 
         try (Statement s = conn.createStatement()) {
@@ -44,17 +48,17 @@ class RemainingReturningCompat15Test {
             }
             conn.close();
         }
-        if (memgres != null) {
-            memgres.close();
-        }
+        if (memgres != null) memgres.close();
     }
 
-    // ========================================================================
-    // Stmt 44 (returning-old-new.sql): DELETE RETURNING OLD.* should return
-    // all deleted rows (order may vary between PG and Memgres).
-    // ========================================================================
+    /**
+     * Stmt 44 (returning-old-new.sql): DELETE RETURNING OLD.* row ordering.
+     *
+     * PG returns (20, twenty, 200) first, then (21, twenty-one, 210).
+     * Memgres returns them in reverse order.
+     */
     @Test
-    void stmt44_deleteReturningOldShouldReturnAllRows() throws Exception {
+    void stmt44_deleteReturningOldRowOrder() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("DROP TABLE IF EXISTS ron_data CASCADE");
             s.execute("CREATE TABLE ron_data (id integer PRIMARY KEY, val text, score integer)");
@@ -62,49 +66,58 @@ class RemainingReturningCompat15Test {
 
             try (ResultSet rs = s.executeQuery(
                     "DELETE FROM ron_data WHERE id IN (20, 21) RETURNING OLD.*")) {
-                java.util.Set<Integer> ids = new java.util.HashSet<>();
-                assertTrue(rs.next(), "Expected first row");
-                ids.add(rs.getInt("id"));
-                assertTrue(rs.next(), "Expected second row");
-                ids.add(rs.getInt("id"));
-                assertFalse(rs.next(), "Expected exactly 2 rows");
-                assertEquals(java.util.Set.of(20, 21), ids,
-                        "DELETE RETURNING OLD.* should return both deleted rows");
+                List<Integer> ids = new ArrayList<>();
+                while (rs.next()) {
+                    ids.add(rs.getInt("id"));
+                }
+                assertEquals(2, ids.size(), "Expected 2 deleted rows");
+                assertEquals(20, ids.get(0),
+                        "PG returns id=20 as first row, but Memgres returns " + ids.get(0));
+                assertEquals(21, ids.get(1),
+                        "PG returns id=21 as second row, but Memgres returns " + ids.get(1));
             }
         }
     }
 
-    // ========================================================================
-    // Stmt 63 (returning-old-new.sql): INSERT ON CONFLICT DO NOTHING
-    // RETURNING NEW.* should work (not syntax error).
-    // PG: OK [2 | no-conflict]
-    // Memgres: ERROR [42601] syntax error at or near "INTO"
-    // ========================================================================
+    /**
+     * Stmt 62 (returning-old-new.sql): INSERT ... ON CONFLICT DO NOTHING
+     * RETURNING NEW.* wrapped in a subquery.
+     *
+     * PG: ERROR [42601] syntax error at or near "INTO"
+     * Memgres: OK (cnt) [0]
+     */
     @Test
-    void stmt63_insertOnConflictDoNothingReturningNewShouldWork() throws Exception {
+    void stmt62_onConflictDoNothingReturningNewInSubquery_pgErrors() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("DROP TABLE IF EXISTS ron_upsert2 CASCADE");
             s.execute("CREATE TABLE ron_upsert2 (id integer PRIMARY KEY, val text)");
             s.execute("INSERT INTO ron_upsert2 VALUES (1, 'existing')");
 
-            try (ResultSet rs = s.executeQuery(
-                    "INSERT INTO ron_upsert2 VALUES (2, 'no-conflict') "
-                    + "ON CONFLICT (id) DO NOTHING RETURNING NEW.*")) {
-                assertTrue(rs.next(), "Expected one result row for non-conflicting insert");
-                assertEquals(2, rs.getInt("id"));
-                assertEquals("no-conflict", rs.getString("val"));
-                assertFalse(rs.next(), "Expected exactly 1 row");
+            try {
+                s.executeQuery(
+                        "SELECT count(*)::integer AS cnt FROM ("
+                        + "  INSERT INTO ron_upsert2 VALUES (1, 'conflict')"
+                        + "  ON CONFLICT (id) DO NOTHING"
+                        + "  RETURNING NEW.*"
+                        + ") sub");
+                fail("PG rejects this with ERROR [42601] syntax error at or near \"INTO\", "
+                        + "but Memgres succeeded");
+            } catch (SQLException e) {
+                assertEquals("42601", e.getSQLState(),
+                        "SQLSTATE should be 42601 (syntax_error), got: "
+                        + e.getSQLState() + " - " + e.getMessage());
             }
         }
     }
 
-    // ========================================================================
-    // Stmt 16 (merge-returning.sql): MERGE RETURNING * returns at least
-    // the target table columns with correct values.
-    // PG returns both target and source columns; Memgres returns target only.
-    // ========================================================================
+    /**
+     * Stmt 16 (merge-returning.sql): MERGE RETURNING * should return 6 columns.
+     *
+     * PG returns (id, val, score, id, val, score) — both target AND source.
+     * Memgres returns (id, val, score) — target only.
+     */
     @Test
-    void stmt16_mergeReturningShouldReturnTargetColumns() throws Exception {
+    void stmt16_mergeReturningStar_shouldReturn6Columns() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("DROP TABLE IF EXISTS mr_target CASCADE");
             s.execute("DROP TABLE IF EXISTS mr_source CASCADE");
@@ -120,16 +133,13 @@ class RemainingReturningCompat15Test {
                     + "RETURNING *")) {
 
                 ResultSetMetaData md = rs.getMetaData();
-                assertTrue(md.getColumnCount() >= 3,
-                        "MERGE RETURNING * should return at least 3 columns (target), got "
-                        + md.getColumnCount());
+                assertEquals(6, md.getColumnCount(),
+                        "PG returns 6 columns for MERGE RETURNING * (target + source), "
+                        + "but Memgres returns " + md.getColumnCount());
 
-                java.util.Set<Integer> ids = new java.util.HashSet<>();
-                while (rs.next()) {
-                    ids.add(rs.getInt(1));
-                }
-                assertEquals(java.util.Set.of(1, 2), ids,
-                        "MERGE RETURNING should include both matched and inserted rows");
+                assertTrue(rs.next(), "Expected first row");
+                assertTrue(rs.next(), "Expected second row");
+                assertFalse(rs.next(), "Expected exactly 2 rows");
             }
         }
     }

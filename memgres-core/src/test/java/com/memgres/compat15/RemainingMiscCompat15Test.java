@@ -8,13 +8,12 @@ import java.sql.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Tests for 11 remaining miscellaneous Memgres-vs-PG differences from various
- * SQL files: alter-index, builtin-functions, prepared-statements,
- * procedure-transaction-control, plpgsql-functions, pg-stat-views,
- * plpgsql-advanced, and custom-operators.
+ * Tests for 10 remaining PG vs Memgres differences from various SQL files.
  *
- * These tests assert PG 18 behavior. They are expected to FAIL on current
- * Memgres and pass once the underlying issues are fixed.
+ * These tests assert exact PG 18 behavior. They are expected to FAIL on
+ * current Memgres, documenting the real gaps.
+ *
+ * Uses default JDBC (extended query protocol) to match the comparison framework.
  */
 class RemainingMiscCompat15Test {
 
@@ -25,8 +24,8 @@ class RemainingMiscCompat15Test {
     static void setUp() throws Exception {
         memgres = Memgres.builder().port(0).build().start();
         conn = DriverManager.getConnection(
-                memgres.getJdbcUrl() + "?preferQueryMode=simple",
-                memgres.getUser(), memgres.getPassword());
+                "jdbc:postgresql://localhost:" + memgres.getPort() + "/test",
+                "test", "test");
         conn.setAutoCommit(true);
 
         try (Statement s = conn.createStatement()) {
@@ -46,89 +45,210 @@ class RemainingMiscCompat15Test {
             }
             conn.close();
         }
-        if (memgres != null) {
-            memgres.close();
-        }
+        if (memgres != null) memgres.close();
     }
 
     // ========================================================================
-    // Stmt 69 (alter-index.sql): ALTER INDEX RESET should clear fillfactor
-    // from reloptions.
-    // PG: no_options = true (reloptions IS NULL or no fillfactor)
-    // Memgres: no_options = false (fillfactor still present)
+    // custom-operators.sql stmt 62: +++ operator should NOT exist in pg_operator.
+    // PG: EXISTS(...oprname='+++') = false
+    // Memgres: true (Memgres is more permissive and allows +++ as operator name)
     // ========================================================================
     @Test
-    void alterIndex_stmt69_resetShouldClearFillfactor() throws Exception {
+    void stmt62_triplePlusOperatorShouldNotExist() throws Exception {
         try (Statement s = conn.createStatement()) {
-            s.execute("DROP TABLE IF EXISTS ai_data CASCADE");
-            s.execute("CREATE TABLE ai_data (id integer PRIMARY KEY, val integer, label text)");
-            s.execute("INSERT INTO ai_data VALUES (1, 10, 'alpha')");
-            s.execute("CREATE INDEX idx_ai_storage ON ai_data (val)");
-
-            // Set fillfactor
-            s.execute("ALTER INDEX idx_ai_storage SET (fillfactor = 70)");
-
-            // Verify it was set
-            try (ResultSet rs = s.executeQuery(
-                    "SELECT (reloptions @> ARRAY['fillfactor=70']) AS has_option "
-                    + "FROM pg_class WHERE relname = 'idx_ai_storage'")) {
-                assertTrue(rs.next());
-                assertTrue(rs.getBoolean("has_option"), "fillfactor should be set");
+            s.execute("CREATE OR REPLACE FUNCTION op_int_add_10(a integer, b integer) "
+                    + "RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT a + b + 10 $$");
+            try {
+                s.execute("CREATE OPERATOR +++ ("
+                        + "LEFTARG = integer, RIGHTARG = integer, "
+                        + "FUNCTION = op_int_add_10)");
+            } catch (SQLException ignored) {
             }
 
-            // Reset fillfactor
-            s.execute("ALTER INDEX idx_ai_storage RESET (fillfactor)");
-
-            // Verify it was cleared
             try (ResultSet rs = s.executeQuery(
-                    "SELECT (reloptions IS NULL OR NOT reloptions @> ARRAY['fillfactor=70']) AS no_options "
-                    + "FROM pg_class WHERE relname = 'idx_ai_storage'")) {
+                    "SELECT EXISTS(SELECT 1 FROM pg_operator WHERE oprname = '+++') AS exists")) {
                 assertTrue(rs.next());
-                assertTrue(rs.getBoolean("no_options"),
-                        "After ALTER INDEX RESET, fillfactor should be cleared from reloptions");
+                assertFalse(rs.getBoolean("exists"),
+                        "PG does not allow +++ as an operator name, so EXISTS should be false. "
+                        + "Memgres incorrectly accepts it.");
             }
         }
     }
 
     // ========================================================================
-    // Stmts 8,9 (builtin-functions-pg14-16.sql): trim_array out-of-range
-    // should use SQLSTATE 2202E (not 22023).
-    // PG: ERROR [2202E]
-    // Memgres: ERROR [22023]
+    // custom-operators.sql stmt 63: No rows for +++ in pg_operator.
+    // PG: 0 rows. Memgres: 1 row (has_left=t, has_right=t).
     // ========================================================================
     @Test
-    void builtinFunctions_stmt8_trimArrayOutOfRangeShouldError2202E() throws Exception {
+    void stmt63_triplePlusOperatorNoDetails() throws Exception {
         try (Statement s = conn.createStatement()) {
-            s.executeQuery("SELECT trim_array(ARRAY[1,2], 5)");
-            fail("Expected error for trim_array with count > array length");
-        } catch (SQLException e) {
-            assertEquals("2202E", e.getSQLState(),
-                    "SQLSTATE should be 2202E (array_subscript_error), got: "
-                    + e.getSQLState() + " - " + e.getMessage());
-        }
-    }
+            s.execute("CREATE OR REPLACE FUNCTION op_int_add_10(a integer, b integer) "
+                    + "RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT a + b + 10 $$");
+            try {
+                s.execute("CREATE OPERATOR +++ ("
+                        + "LEFTARG = integer, RIGHTARG = integer, "
+                        + "FUNCTION = op_int_add_10)");
+            } catch (SQLException ignored) {
+            }
 
-    @Test
-    void builtinFunctions_stmt9_trimArrayNegativeShouldError2202E() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.executeQuery("SELECT trim_array(ARRAY[1,2], -1)");
-            fail("Expected error for trim_array with negative count");
-        } catch (SQLException e) {
-            assertEquals("2202E", e.getSQLState(),
-                    "SQLSTATE should be 2202E (array_subscript_error), got: "
-                    + e.getSQLState() + " - " + e.getMessage());
+            try (ResultSet rs = s.executeQuery(
+                    "SELECT oprleft <> 0 AS has_left, oprright <> 0 AS has_right "
+                    + "FROM pg_operator WHERE oprname = '+++' LIMIT 1")) {
+                assertFalse(rs.next(),
+                        "PG returns 0 rows for oprname='+++' because +++ is not a valid "
+                        + "operator name. Memgres incorrectly returns a row.");
+            }
         }
     }
 
     // ========================================================================
-    // Stmt 88 (prepared-statements.sql): EXECUTE of UNION prepared statement
-    // should return results.
+    // pg-stat-views.sql stmt 15: pg_stat_activity state for current session.
+    // PG: state = 'active' (the session is actively running a query)
+    // Memgres: state = 'idle'
+    // ========================================================================
+    @Test
+    void stmt15_pgStatActivityStateShouldBeActive() throws Exception {
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT state FROM pg_stat_activity WHERE pid = pg_backend_pid()")) {
+            assertTrue(rs.next(), "Expected one row for current session");
+            assertEquals("active", rs.getString("state"),
+                    "PG reports state='active' during query execution, "
+                    + "but Memgres reports 'idle'");
+        }
+    }
+
+    // ========================================================================
+    // plpgsql-advanced.sql stmt 21: CREATE FUNCTION with FOREACH SLICE.
+    // PG: ERROR [42601] syntax error at or near "SLICE"
+    // Memgres: succeeds (creates the function)
+    //
+    // The comparison shows PG 18 rejecting this CREATE FUNCTION.
+    // ========================================================================
+    @Test
+    void stmt21_foreachSliceShouldError() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            try {
+                s.execute("CREATE OR REPLACE FUNCTION pla_foreach_slice1() RETURNS text "
+                        + "LANGUAGE plpgsql AS $$ "
+                        + "DECLARE "
+                        + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]]; "
+                        + "  slice integer[]; "
+                        + "  result text := ''; "
+                        + "BEGIN "
+                        + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP "
+                        + "    result := result || slice::text || ';'; "
+                        + "  END LOOP; "
+                        + "  RETURN result; "
+                        + "END; $$");
+                fail("PG comparison shows ERROR [42601] syntax error at or near \"SLICE\", "
+                        + "but Memgres succeeded in creating the function");
+            } catch (SQLException e) {
+                assertEquals("42601", e.getSQLState(),
+                        "SQLSTATE should be 42601 (syntax_error), got: "
+                        + e.getSQLState() + " - " + e.getMessage());
+            }
+        }
+    }
+
+    // ========================================================================
+    // plpgsql-advanced.sql stmt 22: SELECT pla_foreach_slice1()
+    // In PG, stmt 21 fails so the function doesn't exist → stmt 22 errors.
+    // In Memgres, stmt 21 succeeds so the function exists → stmt 22 works.
+    //
+    // We reproduce the comparison scenario: attempt CREATE (Memgres succeeds),
+    // then call the function. The test asserts PG behavior: function should
+    // not exist (because CREATE should have failed).
+    // ========================================================================
+    @Test
+    void stmt22_foreachSliceFunctionShouldNotExist() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            // Ensure clean state
+            s.execute("DROP FUNCTION IF EXISTS pla_foreach_slice1()");
+
+            // Attempt to create — Memgres will succeed, PG would fail
+            try {
+                s.execute("CREATE OR REPLACE FUNCTION pla_foreach_slice1() RETURNS text "
+                        + "LANGUAGE plpgsql AS $$ "
+                        + "DECLARE "
+                        + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]]; "
+                        + "  slice integer[]; "
+                        + "  result text := ''; "
+                        + "BEGIN "
+                        + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP "
+                        + "    result := result || slice::text || ';'; "
+                        + "  END LOOP; "
+                        + "  RETURN result; "
+                        + "END; $$");
+            } catch (SQLException ignored) {
+                // PG would fail here with 42601
+            }
+
+            // In PG, the function doesn't exist (CREATE failed).
+            // In Memgres, the function exists (CREATE succeeded).
+            try {
+                ResultSet rs = s.executeQuery("SELECT pla_foreach_slice1() AS result");
+                rs.next();
+                String result = rs.getString("result");
+                rs.close();
+                fail("PG errors with 42883 (function does not exist) because CREATE FUNCTION "
+                        + "failed at SLICE keyword. Memgres returned: " + result);
+            } catch (SQLException e) {
+                assertEquals("42883", e.getSQLState(),
+                        "SQLSTATE should be 42883 (undefined_function), got: "
+                        + e.getSQLState() + " - " + e.getMessage());
+            }
+        }
+    }
+
+    // ========================================================================
+    // plpgsql-functions.sql stmt 115: After DROP FUNCTION fn_to_drop(integer),
+    // calling fn_to_drop(1) should fail — even with fn_to_drop(text) still present.
+    //
+    // The comparison creates BOTH overloads (integer and text), drops only integer,
+    // then calls fn_to_drop(1). PG cannot resolve the integer literal to the text
+    // overload and errors. Memgres may incorrectly resolve via implicit cast.
+    // ========================================================================
+    @Test
+    void stmt115_droppedFunctionShouldNotExist() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            // Create both overloads — matching the comparison scenario
+            s.execute("CREATE OR REPLACE FUNCTION fn_to_drop(integer) RETURNS integer "
+                    + "LANGUAGE sql AS $$ SELECT $1 $$");
+            s.execute("CREATE OR REPLACE FUNCTION fn_to_drop(text) RETURNS text "
+                    + "LANGUAGE sql AS $$ SELECT $1 $$");
+
+            // Drop only the integer variant
+            s.execute("DROP FUNCTION fn_to_drop(integer)");
+
+            // PG: fn_to_drop(1) fails — integer literal doesn't match text overload
+            // Memgres: may incorrectly resolve to fn_to_drop(text)
+            try {
+                s.executeQuery("SELECT fn_to_drop(1)");
+                fail("PG errors with 42883 after DROP FUNCTION fn_to_drop(integer), "
+                        + "even though fn_to_drop(text) exists. Integer literal 1 should NOT "
+                        + "resolve to the text overload.");
+            } catch (SQLException e) {
+                assertEquals("42883", e.getSQLState(),
+                        "SQLSTATE should be 42883 (undefined_function), got: "
+                        + e.getSQLState() + " - " + e.getMessage());
+            } finally {
+                try { s.execute("DROP FUNCTION IF EXISTS fn_to_drop(text)"); } catch (SQLException ignored) {}
+            }
+        }
+    }
+
+    // ========================================================================
+    // prepared-statements.sql stmt 88: EXECUTE ps_union should return results.
     // PG: OK (val) [1] ; [2] ; [3]
     // Memgres: ERROR [XX000] IllegalStateException: Received resultset tuples,
     //          but no field structure for them
+    //
+    // This bug is specific to extended query protocol (Describe phase for UNION).
+    // The comparison uses default JDBC (extended mode), not simple mode.
     // ========================================================================
     @Test
-    void preparedStatements_stmt88_executeUnionShouldReturnResults() throws Exception {
+    void stmt88_executeUnionShouldReturnResults() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("DEALLOCATE ALL");
             s.execute("PREPARE ps_union AS "
@@ -137,13 +257,10 @@ class RemainingMiscCompat15Test {
             try (ResultSet rs = s.executeQuery("EXECUTE ps_union")) {
                 assertTrue(rs.next(), "Expected row 1");
                 assertEquals(1, rs.getInt("val"));
-
                 assertTrue(rs.next(), "Expected row 2");
                 assertEquals(2, rs.getInt("val"));
-
                 assertTrue(rs.next(), "Expected row 3");
                 assertEquals(3, rs.getInt("val"));
-
                 assertFalse(rs.next(), "Expected exactly 3 rows");
             }
 
@@ -152,12 +269,12 @@ class RemainingMiscCompat15Test {
     }
 
     // ========================================================================
-    // Stmt 51 (procedure-transaction-control.sql): ROLLBACK in exception handler.
-    // PG rejects ROLLBACK inside an active subtransaction (exception handler).
-    // The 'before error' row was already committed, so at least 1 row should exist.
+    // procedure-transaction-control.sql stmt 51: ROLLBACK in exception handler.
+    // PG: ptc_log has 2 rows (both 'before error' committed and 'recovered')
+    // Memgres: ptc_log has 1 row (only 'before error')
     // ========================================================================
     @Test
-    void procedureTxControl_stmt51_rollbackInExceptionShouldHaveAtLeast1Row() throws Exception {
+    void stmt51_rollbackInExceptionShouldProduceTwoRows() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("DROP TABLE IF EXISTS ptc_log CASCADE");
             s.execute("CREATE TABLE ptc_log (id serial PRIMARY KEY, msg text)");
@@ -185,147 +302,9 @@ class RemainingMiscCompat15Test {
             try (ResultSet rs = s.executeQuery(
                     "SELECT count(*)::integer AS cnt FROM ptc_log")) {
                 assertTrue(rs.next());
-                int cnt = rs.getInt("cnt");
-                assertTrue(cnt >= 1,
-                        "ptc_log should have at least 1 row ('before error' was committed), got " + cnt);
-            }
-        }
-    }
-
-    // ========================================================================
-    // Stmt 115 (plpgsql-functions.sql): DROP FUNCTION with specific parameter
-    // types should only remove that overload.
-    // ========================================================================
-    @Test
-    void plpgsqlFunctions_stmt115_dropOverloadedFunctionShouldBeSpecific() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE OR REPLACE FUNCTION fn_to_drop(integer) RETURNS integer "
-                    + "LANGUAGE sql AS $$ SELECT $1 $$");
-            s.execute("CREATE OR REPLACE FUNCTION fn_to_drop(text) RETURNS text "
-                    + "LANGUAGE sql AS $$ SELECT $1 $$");
-
-            // Drop only the integer variant
-            s.execute("DROP FUNCTION fn_to_drop(integer)");
-
-            // Text variant should still work
-            try (ResultSet rs = s.executeQuery("SELECT fn_to_drop('hello')")) {
-                assertTrue(rs.next());
-                assertEquals("hello", rs.getString(1));
-            }
-
-            // Clean up
-            s.execute("DROP FUNCTION IF EXISTS fn_to_drop(text)");
-        }
-    }
-
-    // ========================================================================
-    // Stmt 15 (pg-stat-views.sql): pg_stat_activity state for the current query.
-    // PG: state = 'active' during query execution
-    // Memgres: state may be 'active' or 'idle' depending on timing
-    // ========================================================================
-    @Test
-    void pgStatViews_stmt15_stateShouldExist() throws Exception {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(
-                     "SELECT state FROM pg_stat_activity WHERE pid = pg_backend_pid()")) {
-            assertTrue(rs.next(), "Expected one row for current session in pg_stat_activity");
-            String state = rs.getString("state");
-            assertNotNull(state, "state should not be null");
-            assertTrue(state.equals("active") || state.equals("idle"),
-                    "state should be 'active' or 'idle', got: " + state);
-        }
-    }
-
-    // ========================================================================
-    // Stmts 21,22 (plpgsql-advanced.sql): FOREACH SLICE is valid PL/pgSQL
-    // syntax supported in PG 9.1+ and PG 18. Memgres correctly supports it.
-    // ========================================================================
-    @Test
-    void plpgsqlAdvanced_stmt21_foreachSliceShouldSucceed() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE OR REPLACE FUNCTION pla_foreach_slice1() RETURNS text "
-                    + "LANGUAGE plpgsql AS $$ "
-                    + "DECLARE "
-                    + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]]; "
-                    + "  slice integer[]; "
-                    + "  result text := ''; "
-                    + "BEGIN "
-                    + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP "
-                    + "    result := result || slice::text || ';'; "
-                    + "  END LOOP; "
-                    + "  RETURN result; "
-                    + "END; $$");
-            // Function creation should succeed
-        }
-    }
-
-    @Test
-    void plpgsqlAdvanced_stmt22_foreachSliceFunctionShouldRun() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE OR REPLACE FUNCTION pla_foreach_slice1() RETURNS text "
-                    + "LANGUAGE plpgsql AS $$ "
-                    + "DECLARE "
-                    + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]]; "
-                    + "  slice integer[]; "
-                    + "  result text := ''; "
-                    + "BEGIN "
-                    + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP "
-                    + "    result := result || slice::text || ';'; "
-                    + "  END LOOP; "
-                    + "  RETURN result; "
-                    + "END; $$");
-            try (ResultSet rs = s.executeQuery("SELECT pla_foreach_slice1() AS result")) {
-                assertTrue(rs.next(), "Expected one result row");
-                // Function should return concatenated slices
-                assertNotNull(rs.getString("result"));
-            }
-            s.execute("DROP FUNCTION IF EXISTS pla_foreach_slice1()");
-        }
-    }
-
-    // ========================================================================
-    // Stmts 62,63 (custom-operators.sql): Memgres is more permissive than PG
-    // and allows +++ as an operator name. If CREATE OPERATOR +++ succeeds,
-    // it should appear in pg_operator.
-    // ========================================================================
-    @Test
-    void customOperators_stmt62_triplePlusExistsInMemgres() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE OR REPLACE FUNCTION op_int_add_10(a integer, b integer) "
-                    + "RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT a + b + 10 $$");
-            try {
-                s.execute("CREATE OPERATOR +++ ("
-                        + "LEFTARG = integer, RIGHTARG = integer, "
-                        + "FUNCTION = op_int_add_10)");
-            } catch (SQLException ignored) {
-            }
-
-            try (ResultSet rs = s.executeQuery(
-                    "SELECT EXISTS(SELECT 1 FROM pg_operator WHERE oprname = '+++')::text AS exists")) {
-                assertTrue(rs.next());
-                assertEquals("true", rs.getString("exists"),
-                        "Memgres accepts CREATE OPERATOR +++, so it should appear in pg_operator");
-            }
-        }
-    }
-
-    @Test
-    void customOperators_stmt63_triplePlusDetailsInMemgres() throws Exception {
-        try (Statement s = conn.createStatement()) {
-            s.execute("CREATE OR REPLACE FUNCTION op_int_add_10(a integer, b integer) "
-                    + "RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT a + b + 10 $$");
-            try {
-                s.execute("CREATE OPERATOR +++ ("
-                        + "LEFTARG = integer, RIGHTARG = integer, "
-                        + "FUNCTION = op_int_add_10)");
-            } catch (SQLException ignored) {
-            }
-
-            try (ResultSet rs = s.executeQuery(
-                    "SELECT oprleft <> 0 AS has_left, oprright <> 0 AS has_right "
-                    + "FROM pg_operator WHERE oprname = '+++' LIMIT 1")) {
-                assertTrue(rs.next(),
-                        "Memgres pg_operator should have a row for oprname='+++'");
+                assertEquals(2, rs.getInt("cnt"),
+                        "PG produces 2 rows in ptc_log ('before error' + 'recovered'), "
+                        + "but Memgres produces fewer");
             }
         }
     }

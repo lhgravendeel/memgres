@@ -8,10 +8,12 @@ import java.sql.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Tests for 2 remaining Memgres-vs-PG cursor differences.
+ * Tests for 2 PG vs Memgres cursor differences.
  *
- * These tests assert PG 18 behavior. They are expected to FAIL on current
- * Memgres and pass once the underlying issues are fixed.
+ * These tests assert exact PG 18 behavior. They are expected to FAIL on
+ * current Memgres, documenting the real gaps.
+ *
+ * Uses default JDBC (extended query protocol) to match the comparison framework.
  */
 class RemainingCursorsCompat15Test {
 
@@ -22,8 +24,8 @@ class RemainingCursorsCompat15Test {
     static void setUp() throws Exception {
         memgres = Memgres.builder().port(0).build().start();
         conn = DriverManager.getConnection(
-                memgres.getJdbcUrl() + "?preferQueryMode=simple",
-                memgres.getUser(), memgres.getPassword());
+                "jdbc:postgresql://localhost:" + memgres.getPort() + "/test",
+                "test", "test");
         conn.setAutoCommit(true);
 
         try (Statement s = conn.createStatement()) {
@@ -43,58 +45,72 @@ class RemainingCursorsCompat15Test {
             }
             conn.close();
         }
-        if (memgres != null) {
-            memgres.close();
-        }
+        if (memgres != null) memgres.close();
     }
 
-    // ========================================================================
-    // Stmt 90 (cursors.sql): WITH HOLD cursor should survive COMMIT
-    // PG: FETCH NEXT FROM c7_hold returns [1] after COMMIT
-    // Memgres: ERROR [34000] cursor "c7_hold" does not exist
-    // ========================================================================
+    /**
+     * Stmt 90 (cursors.sql): WITH HOLD cursor should survive COMMIT.
+     *
+     * The comparison declares BOTH a regular cursor (c7_nohold) and a
+     * WITH HOLD cursor (c7_hold) in the same transaction, commits, then
+     * fetches from c7_nohold (error), then fetches from c7_hold.
+     *
+     * PG: FETCH c7_hold returns (id=1) after COMMIT.
+     * Memgres: ERROR [34000] cursor "c7_hold" does not exist.
+     */
     @Test
     void stmt90_withHoldCursorShouldSurviveCommit() throws Exception {
         try (Statement s = conn.createStatement()) {
-            // Start a transaction, declare a WITH HOLD cursor, then COMMIT
             s.execute("BEGIN");
+
+            // Declare both cursors — matching the comparison scenario
+            s.execute("DECLARE c7_nohold CURSOR FOR SELECT id FROM cur_compat_test ORDER BY id");
             s.execute("DECLARE c7_hold CURSOR WITH HOLD FOR SELECT id FROM cur_compat_test ORDER BY id");
+
             s.execute("COMMIT");
 
-            // WITH HOLD cursor should still be accessible after COMMIT
+            // Regular cursor gone after COMMIT
+            try {
+                s.executeQuery("FETCH NEXT FROM c7_nohold");
+            } catch (SQLException expected) {
+                // Expected: cursor "c7_nohold" does not exist
+            }
+
+            // WITH HOLD cursor should still work after COMMIT
             try (ResultSet rs = s.executeQuery("FETCH NEXT FROM c7_hold")) {
-                assertTrue(rs.next(), "Expected one row from WITH HOLD cursor after COMMIT");
+                assertTrue(rs.next(), "WITH HOLD cursor should survive COMMIT and return a row");
                 assertEquals(1, rs.getInt("id"),
                         "First FETCH from WITH HOLD cursor should return id=1");
             }
 
-            // Clean up cursor
-            s.execute("CLOSE c7_hold");
+            try { s.execute("CLOSE c7_hold"); } catch (SQLException ignored) { }
         }
     }
 
-    // ========================================================================
-    // Stmt 155: Cursor declared with explicit NO SCROLL should reject FETCH PRIOR.
-    // PG behavior varies for implicit scrollability, but NO SCROLL is always strict.
-    // ========================================================================
+    /**
+     * Stmt 155 (pg-catalog-prepared-statements-cursors.sql): Default cursor
+     * (declared without explicit SCROLL or NO SCROLL) should reject FETCH PRIOR.
+     *
+     * PG: ERROR [55000] cursor can only scan forward
+     * Memgres: OK (?column?) 0 rows — incorrectly allows backward fetch
+     */
     @Test
-    void stmt155_noScrollCursorShouldRejectFetchPrior() throws Exception {
+    void stmt155_defaultCursorShouldRejectFetchPrior() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("BEGIN");
-            s.execute("DECLARE cat_ns NO SCROLL CURSOR FOR SELECT 1");
+            // Plain cursor without SCROLL or NO SCROLL — PG defaults to forward-only
+            s.execute("DECLARE cat_ns CURSOR FOR SELECT 1");
 
             try {
                 s.executeQuery("FETCH PRIOR FROM cat_ns");
-                fail("Expected error for FETCH PRIOR on NO SCROLL cursor, but query succeeded");
+                fail("PG rejects FETCH PRIOR on a default (non-SCROLL) cursor with "
+                        + "ERROR [55000], but Memgres succeeded");
             } catch (SQLException e) {
                 assertEquals("55000", e.getSQLState(),
                         "SQLSTATE should be 55000 (cursor can only scan forward), got: "
                         + e.getSQLState() + " - " + e.getMessage());
             } finally {
-                try {
-                    s.execute("ROLLBACK");
-                } catch (SQLException ignored) {
-                }
+                try { s.execute("ROLLBACK"); } catch (SQLException ignored) { }
             }
         }
     }
