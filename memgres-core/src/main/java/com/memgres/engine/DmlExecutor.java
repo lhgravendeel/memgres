@@ -939,6 +939,30 @@ class DmlExecutor {
                 continue;
             }
             Object val = executor.evalExpr(set.value(), ctx);
+            // Composite field update: SET col.subfield = value
+            if (set.subfield() != null) {
+                Object current = newRow[colIdx];
+                String typeName = genCol.getCompositeTypeName();
+                if (typeName != null && current != null) {
+                    java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+                    if (fields != null) {
+                        // Parse current value into parts
+                        String s = current.toString();
+                        if (s.startsWith("(") && s.endsWith(")")) {
+                            String[] parts = executor.compositeTypeHandler.splitCompositeString(s.substring(1, s.length() - 1));
+                            for (int fi = 0; fi < fields.size(); fi++) {
+                                if (fields.get(fi).name().equalsIgnoreCase(set.subfield())) {
+                                    String[] newParts = java.util.Arrays.copyOf(parts, Math.max(parts.length, fi + 1));
+                                    newParts[fi] = val == null ? "" : val.toString();
+                                    newRow[colIdx] = "(" + String.join(",", newParts) + ")";
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             newRow[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
         }
     }
@@ -1359,6 +1383,7 @@ class DmlExecutor {
                                 }
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
+                                mergeCount++;
                             } else if (wnmbs.setClauses() != null && !wnmbs.setClauses().isEmpty()) {
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
                                 for (InsertStmt.SetClause set : wnmbs.setClauses()) {
@@ -1378,10 +1403,11 @@ class DmlExecutor {
                                     executor.currentMergeAction = "UPDATE";
                                     returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow));
                                 }
+                                mergeCount++;
+                            } else {
+                                // DO NOTHING: empty setClauses, no action — don't increment mergeCount
                             }
-                            // DO NOTHING: empty setClauses, no action
                             processedTargetRows.add(targetRow);
-                            mergeCount++;
                             break;
                         }
                     }

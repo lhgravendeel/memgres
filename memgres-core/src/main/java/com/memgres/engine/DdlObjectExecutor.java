@@ -707,6 +707,7 @@ class DdlObjectExecutor {
                 "array_append", "array_prepend", "array_cat", "array_remove",
                 "array_to_string", "string_to_array", "array_position", "array_positions",
                 "array_ndims", "array_dims", "array_fill", "array_replace",
+                "array_sample", "array_shuffle",
                 "current_setting", "set_config",
                 "split_part", "left", "right", "repeat", "reverse", "lpad", "rpad",
                 "starts_with", "encode", "decode", "md5",

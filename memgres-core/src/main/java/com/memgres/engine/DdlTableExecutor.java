@@ -528,9 +528,12 @@ class DdlTableExecutor {
 
     QueryResult executeTruncate(TruncateStmt stmt) {
         int totalCount = 0;
+        List<String> searchSchemas = executor.session != null
+                ? executor.session.getEffectiveSearchPath(false)
+                : Cols.listOf("public");
         for (String tableName : stmt.tables()) {
             boolean found = false;
-            for (String schemaName : Cols.listOf("public")) {
+            for (String schemaName : searchSchemas) {
                 Schema schema = executor.database.getSchema(schemaName);
                 if (schema != null) {
                     Table table = schema.getTable(tableName);
@@ -547,7 +550,7 @@ class DdlTableExecutor {
                 }
             }
             if (!found) {
-                throw new MemgresException("Table not found: " + tableName);
+                throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
             }
         }
         return QueryResult.command(QueryResult.Type.DELETE, 0);

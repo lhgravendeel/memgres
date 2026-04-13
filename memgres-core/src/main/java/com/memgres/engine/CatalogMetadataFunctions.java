@@ -1223,6 +1223,8 @@ class CatalogMetadataFunctions {
             case "array_remove":
             case "array_position":
             case "array_positions":
+            case "array_sample":
+            case "array_shuffle":
             case "jsonb_build_object":
             case "jsonb_build_array":
             case "jsonb_object":

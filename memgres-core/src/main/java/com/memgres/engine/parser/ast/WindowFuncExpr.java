@@ -52,16 +52,23 @@ public final class WindowFuncExpr implements Expression {
         public final FrameType type;
         public final FrameBound start;
         public final FrameBound end;
+        public final ExcludeMode excludeMode;
 
         public FrameClause(FrameType type, FrameBound start, FrameBound end) {
+            this(type, start, end, null);
+        }
+
+        public FrameClause(FrameType type, FrameBound start, FrameBound end, ExcludeMode excludeMode) {
             this.type = type;
             this.start = start;
             this.end = end;
+            this.excludeMode = excludeMode;
         }
 
         public FrameType type() { return type; }
         public FrameBound start() { return start; }
         public FrameBound end() { return end; }
+        public ExcludeMode excludeMode() { return excludeMode; }
 
         @Override
         public boolean equals(Object o) {
@@ -70,17 +77,18 @@ public final class WindowFuncExpr implements Expression {
             FrameClause that = (FrameClause) o;
             return java.util.Objects.equals(type, that.type)
                 && java.util.Objects.equals(start, that.start)
-                && java.util.Objects.equals(end, that.end);
+                && java.util.Objects.equals(end, that.end)
+                && java.util.Objects.equals(excludeMode, that.excludeMode);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(type, start, end);
+            return java.util.Objects.hash(type, start, end, excludeMode);
         }
 
         @Override
         public String toString() {
-            return "FrameClause[type=" + type + ", " + "start=" + start + ", " + "end=" + end + "]";
+            return "FrameClause[type=" + type + ", " + "start=" + start + ", " + "end=" + end + ", exclude=" + excludeMode + "]";
         }
     }
 
@@ -126,6 +134,13 @@ public final class WindowFuncExpr implements Expression {
         UNBOUNDED_FOLLOWING,
         PRECEDING,  // N PRECEDING
         FOLLOWING   // N FOLLOWING
+    }
+
+    public enum ExcludeMode {
+        NO_OTHERS,      // EXCLUDE NO OTHERS (default)
+        CURRENT_ROW,    // EXCLUDE CURRENT ROW
+        GROUP,          // EXCLUDE GROUP
+        TIES            // EXCLUDE TIES
     }
 
     public String name() { return name; }

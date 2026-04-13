@@ -141,14 +141,21 @@ public final class InsertStmt implements Statement {
 
     public static final class SetClause {
         public final String column;
+        public final String subfield;
         public final Expression value;
 
         public SetClause(String column, Expression value) {
+            this(column, null, value);
+        }
+
+        public SetClause(String column, String subfield, Expression value) {
             this.column = column;
+            this.subfield = subfield;
             this.value = value;
         }
 
         public String column() { return column; }
+        public String subfield() { return subfield; }
         public Expression value() { return value; }
 
         @Override
@@ -157,17 +164,18 @@ public final class InsertStmt implements Statement {
             if (o == null || getClass() != o.getClass()) return false;
             SetClause that = (SetClause) o;
             return java.util.Objects.equals(column, that.column)
+                && java.util.Objects.equals(subfield, that.subfield)
                 && java.util.Objects.equals(value, that.value);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(column, value);
+            return java.util.Objects.hash(column, subfield, value);
         }
 
         @Override
         public String toString() {
-            return "SetClause[column=" + column + ", " + "value=" + value + "]";
+            return "SetClause[column=" + column + (subfield != null ? "." + subfield : "") + ", " + "value=" + value + "]";
         }
     }
 

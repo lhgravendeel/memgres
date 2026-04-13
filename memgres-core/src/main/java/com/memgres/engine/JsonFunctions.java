@@ -72,7 +72,7 @@ class JsonFunctions {
                     for (Map.Entry<?, ?> entry : map.entrySet()) {
                         if (!first) sb.append(",");
                         first = false;
-                        sb.append("\"").append(entry.getKey()).append("\":");
+                        sb.append("\"").append(entry.getKey()).append("\": ");
                         Object v = entry.getValue();
                         if (v == null) {
                             sb.append("null");
@@ -97,7 +97,7 @@ class JsonFunctions {
                     StringBuilder sb = new StringBuilder("{");
                     for (int i = 0; i < list.size(); i++) {
                         if (i > 0) sb.append(",");
-                        sb.append("\"f").append(i + 1).append("\":");
+                        sb.append("\"f").append(i + 1).append("\": ");
                         Object v = list.get(i);
                         if (v == null) sb.append("null");
                         else if (v instanceof Number || v instanceof Boolean) sb.append(v);

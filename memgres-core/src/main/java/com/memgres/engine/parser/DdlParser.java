@@ -545,6 +545,25 @@ class DdlParser {
             return new CreateViewStmt(name, query, orReplace, true, columnNames, withData);
         }
 
+        // WITH (option=value, ...) before AS — e.g. security_invoker
+        if (parser.checkKeyword("WITH")) {
+            int saved = parser.position();
+            parser.advance(); // consume WITH
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                parser.advance(); // consume (
+                int depth = 1;
+                while (depth > 0 && !parser.isAtEnd()) {
+                    if (parser.check(TokenType.LEFT_PAREN)) depth++;
+                    else if (parser.check(TokenType.RIGHT_PAREN)) depth--;
+                    if (depth > 0) parser.advance();
+                }
+                parser.expect(TokenType.RIGHT_PAREN);
+            } else {
+                // Not WITH (options), restore position
+                parser.resetPosition(saved);
+            }
+        }
+
         parser.expectKeyword("AS");
         boolean parenWrapped2 = parser.match(TokenType.LEFT_PAREN);
         Statement query = parser.tryParseSetOp(parser.parseSelect());

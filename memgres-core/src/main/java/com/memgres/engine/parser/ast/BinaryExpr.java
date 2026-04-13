@@ -47,7 +47,9 @@ public final class BinaryExpr implements Expression {
         // Distinct comparison (NULL-safe)
         IS_DISTINCT_FROM, IS_NOT_DISTINCT_FROM,
         // Range
-        RANGE_ADJACENT
+        RANGE_ADJACENT,
+        // SQL OVERLAPS operator: (start1, end1) OVERLAPS (start2, end2)
+        OVERLAPS
     }
 
     public Expression left() { return left; }

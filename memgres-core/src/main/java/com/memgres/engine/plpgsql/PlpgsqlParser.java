@@ -247,6 +247,8 @@ public class PlpgsqlParser {
                     return parseReturn();
                 case "RAISE":
                     return parseRaise();
+                case "ASSERT":
+                    return parseAssert();
                 case "PERFORM":
                     return parsePerform();
                 case "EXECUTE":
@@ -525,6 +527,25 @@ public class PlpgsqlParser {
 
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.RaiseStmt(level, format, args, errcode, hint);
+    }
+
+    // ---- ASSERT ----
+
+    private PlpgsqlStatement parseAssert() {
+        matchKw("ASSERT");
+        // Collect condition text until comma or semicolon
+        StringBuilder condBuf = new StringBuilder();
+        while (!check(TokenType.SEMICOLON) && !check(TokenType.COMMA) && !isAtEnd()) {
+            condBuf.append(peek().value()).append(' ');
+            advance();
+        }
+        String condition = condBuf.toString().trim();
+        String message = null;
+        if (match(TokenType.COMMA)) {
+            message = collectUntilSemicolon();
+        }
+        match(TokenType.SEMICOLON);
+        return new PlpgsqlStatement.AssertStmt(condition, message);
     }
 
     // ---- PERFORM ----

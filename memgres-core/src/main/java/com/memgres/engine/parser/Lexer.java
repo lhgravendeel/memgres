@@ -93,7 +93,7 @@ public class Lexer {
             "ATTACH", "DETACH", "STATEMENT", "REFERENCING",
             "MERGE", "MATCHED", "RESTART",
             "TRIM", "LEADING", "TRAILING", "BOTH",
-            "UNKNOWN", "SYMMETRIC", "OVERRIDING",
+            "UNKNOWN", "SYMMETRIC", "OVERRIDING", "OVERLAPS",
             "AUTHORIZATION", "INCLUDING", "EXCLUDING",
             "RULE", "INSTEAD", "ALSO",
             "COLLATION", "CONVERSION", "AGGREGATE", "OPERATOR", "CLASS", "FAMILY",

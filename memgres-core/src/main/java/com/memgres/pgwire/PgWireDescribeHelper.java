@@ -44,7 +44,7 @@ class PgWireDescribeHelper {
 
         // DML with RETURNING: infer columns from table schema
         String upper = stripLeadingComments(sql).toUpperCase();
-        if (upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE"))) {
+        if (upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || upper.startsWith("MERGE"))) {
             List<Column> returningCols = inferReturningColumns(sql);
             if (returningCols != null) {
                 sendRowDescription(ctx, QueryResult.select(returningCols, Cols.listOf()));
@@ -139,7 +139,7 @@ class PgWireDescribeHelper {
 
         // DML with RETURNING
         String upper = stripLeadingComments(sql).toUpperCase();
-        boolean isDmlReturning = upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE"));
+        boolean isDmlReturning = upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || upper.startsWith("MERGE"));
         boolean isCteDmlReturning = upper.startsWith("WITH") && !isWithSelect(upper) && upper.contains("RETURNING");
         if (isDmlReturning || isCteDmlReturning) {
             if (isDmlReturning) {
@@ -282,7 +282,7 @@ class PgWireDescribeHelper {
         }
         if (upper.startsWith("WITH")) return isWithSelect(upper);
         if (upper.contains("RETURNING") && (upper.startsWith("INSERT")
-                || upper.startsWith("UPDATE") || upper.startsWith("DELETE"))) {
+                || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || upper.startsWith("MERGE"))) {
             return true;
         }
         return false;
@@ -422,6 +422,13 @@ class PgWireDescribeHelper {
             int fromIdx = upper.indexOf("FROM");
             if (fromIdx >= 0) {
                 String rest = sql.substring(fromIdx + 4).trim();
+                int endIdx = rest.indexOf(' ');
+                tableName = endIdx > 0 ? rest.substring(0, endIdx).trim() : rest.trim();
+            }
+        } else if (upper.startsWith("MERGE")) {
+            int intoIdx = upper.indexOf("INTO");
+            if (intoIdx >= 0) {
+                String rest = sql.substring(intoIdx + 4).trim();
                 int endIdx = rest.indexOf(' ');
                 tableName = endIdx > 0 ? rest.substring(0, endIdx).trim() : rest.trim();
             }

@@ -1348,7 +1348,8 @@ class SelectParser {
         if (isClauseKeyword(word)) return false;
         return !word.equals("USING") && !word.equals("TABLESAMPLE")
                 && !word.equals("WITH") && !word.equals("WINDOW")
-                && !word.equals("OVER") && !word.equals("LATERAL");
+                && !word.equals("OVER") && !word.equals("LATERAL")
+                && !word.equals("OVERLAPS");
     }
 
     Expression parseLimitOffsetExpr() {

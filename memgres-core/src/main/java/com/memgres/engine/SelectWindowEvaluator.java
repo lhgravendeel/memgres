@@ -517,7 +517,28 @@ class SelectWindowEvaluator {
             frameEnd = Math.min(sortedPartition.size() - 1, frameEnd);
 
             List<RowContext> frameRows = new ArrayList<>();
+            WindowFuncExpr.ExcludeMode excludeMode = hasFrame && wf.frame().excludeMode() != null
+                    ? wf.frame().excludeMode() : null;
             for (int fi = frameStart; fi <= frameEnd; fi++) {
+                if (excludeMode != null) {
+                    if (excludeMode == WindowFuncExpr.ExcludeMode.CURRENT_ROW && fi == i) continue;
+                    if (excludeMode == WindowFuncExpr.ExcludeMode.GROUP || excludeMode == WindowFuncExpr.ExcludeMode.TIES) {
+                        // Compare sort key of fi with sort key of current row i
+                        boolean sameGroup = true;
+                        if (hasOrderBy) {
+                            for (SelectStmt.OrderByItem ob : wf.orderBy()) {
+                                Object v1 = executor.evalExpr(ob.expr(), contexts.get(sortedPartition.get(fi)));
+                                Object v2 = executor.evalExpr(ob.expr(), contexts.get(sortedPartition.get(i)));
+                                if (!java.util.Objects.equals(v1, v2)) { sameGroup = false; break; }
+                            }
+                        }
+                        if (sameGroup) {
+                            if (excludeMode == WindowFuncExpr.ExcludeMode.GROUP) continue;
+                            // TIES: exclude peers but keep current row
+                            if (fi != i) continue;
+                        }
+                    }
+                }
                 frameRows.add(contexts.get(sortedPartition.get(fi)));
             }
 

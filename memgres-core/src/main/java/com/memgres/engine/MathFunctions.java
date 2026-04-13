@@ -52,12 +52,14 @@ class MathFunctions {
             case "round": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                double val = executor.toDouble(arg);
                 if (fn.args().size() > 1) {
                     int scale = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
-                    double factor = Math.pow(10, scale);
-                    return Math.round(val * factor) / factor;
+                    java.math.BigDecimal bd = (arg instanceof java.math.BigDecimal)
+                            ? (java.math.BigDecimal) arg
+                            : new java.math.BigDecimal(executor.toDouble(arg));
+                    return bd.setScale(scale, java.math.RoundingMode.HALF_UP);
                 }
+                double val = executor.toDouble(arg);
                 return (long) Math.round(val);
             }
             case "random":

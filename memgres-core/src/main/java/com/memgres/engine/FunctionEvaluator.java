@@ -662,7 +662,7 @@ class FunctionEvaluator {
                 if (arr instanceof List<?>) list = new java.util.ArrayList<>((List<?>) arr);
                 else if (arr instanceof String && ((String) arr).startsWith("{")) list = new java.util.ArrayList<>(parseSimplePgArray((String) arr));
                 else return arr;
-                if (n < 0 || n > list.size()) throw new MemgresException("number of elements to trim must be between 0 and " + list.size(), "22023");
+                if (n < 0 || n > list.size()) throw new MemgresException("number of elements to trim must be between 0 and " + list.size(), "2202E");
                 list = list.subList(0, list.size() - n);
                 return TypeCoercion.formatPgArray(list);
             }
@@ -704,6 +704,29 @@ class FunctionEvaluator {
                 else if (arr instanceof String && ((String) arr).startsWith("{")) list = new ArrayList<>(parseSimplePgArray(((String) arr)));
                 else return arr;
                 java.util.Collections.reverse(list);
+                return TypeCoercion.formatPgArray(list);
+            }
+            case "array_sample": {
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                if (arr == null) return null;
+                int n = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                List<Object> list;
+                if (arr instanceof List<?>) list = new ArrayList<>((List<?>) arr);
+                else if (arr instanceof String && ((String) arr).startsWith("{")) list = new ArrayList<>(parseSimplePgArray(((String) arr)));
+                else return arr;
+                if (n < 0) throw new MemgresException("sample size must not be negative", "2202H");
+                if (n > list.size()) n = list.size();
+                java.util.Collections.shuffle(list);
+                return TypeCoercion.formatPgArray(list.subList(0, n));
+            }
+            case "array_shuffle": {
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                if (arr == null) return null;
+                List<Object> list;
+                if (arr instanceof List<?>) list = new ArrayList<>((List<?>) arr);
+                else if (arr instanceof String && ((String) arr).startsWith("{")) list = new ArrayList<>(parseSimplePgArray(((String) arr)));
+                else return arr;
+                java.util.Collections.shuffle(list);
                 return TypeCoercion.formatPgArray(list);
             }
             case "array_to_string": {

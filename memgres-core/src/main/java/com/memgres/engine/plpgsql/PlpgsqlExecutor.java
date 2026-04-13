@@ -515,6 +515,8 @@ public class PlpgsqlExecutor {
             executeSql(s, scope);
         } else if (stmt instanceof PlpgsqlStatement.NullStmt) {
             // no-op
+        } else if (stmt instanceof PlpgsqlStatement.AssertStmt) {
+            executeAssert((PlpgsqlStatement.AssertStmt) stmt, scope);
         } else if (stmt instanceof PlpgsqlStatement.GetDiagnosticsStmt) {
             PlpgsqlStatement.GetDiagnosticsStmt gd = (PlpgsqlStatement.GetDiagnosticsStmt) stmt;
             executeGetDiagnostics(gd, scope);
@@ -783,6 +785,18 @@ public class PlpgsqlExecutor {
                     throw new MemgresException(msg, condState);
                 }
                 break;
+        }
+    }
+
+    private void executeAssert(PlpgsqlStatement.AssertStmt stmt, Scope scope) {
+        Object condVal = evalExpr(stmt.condition(), scope);
+        if (!isTruthy(condVal)) {
+            String msg = "ASSERT_FAILURE";
+            if (stmt.message() != null) {
+                Object msgVal = evalExpr(stmt.message().trim(), scope);
+                msg = msgVal != null ? msgVal.toString() : "ASSERT_FAILURE";
+            }
+            throw new MemgresException(msg, "P0004");
         }
     }
 

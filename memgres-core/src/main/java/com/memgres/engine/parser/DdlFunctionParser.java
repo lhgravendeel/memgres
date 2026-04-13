@@ -210,10 +210,12 @@ class DdlFunctionParser {
         parser.expectKeyword("ATOMIC");
         StringBuilder sb = new StringBuilder();
         int depth = 0;
+        boolean foundEnd = false;
         while (!parser.isAtEnd()) {
             // END at depth 0 terminates the block
             if (parser.checkKeyword("END") && depth == 0) {
                 parser.advance(); // consume END
+                foundEnd = true;
                 break;
             }
             // Track nested BEGIN/END (e.g., CASE ... END)
@@ -226,6 +228,9 @@ class DdlFunctionParser {
             } else {
                 sb.append(t.value());
             }
+        }
+        if (!foundEnd) {
+            throw new ParseException("syntax error at end of input", parser.peek());
         }
         return sb.toString().trim();
     }

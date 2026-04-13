@@ -790,6 +790,33 @@ public interface PlpgsqlStatement {
         }
     }
 
+        public static final class AssertStmt implements PlpgsqlStatement {
+        public final String condition;
+        public final String message;
+
+        public AssertStmt(String condition, String message) {
+            this.condition = condition;
+            this.message = message;
+        }
+
+        public String condition() { return condition; }
+        public String message() { return message; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            AssertStmt that = (AssertStmt) o;
+            return java.util.Objects.equals(condition, that.condition) && java.util.Objects.equals(message, that.message);
+        }
+
+        @Override
+        public int hashCode() { return java.util.Objects.hash(condition, message); }
+
+        @Override
+        public String toString() { return "AssertStmt[condition=" + condition + ", message=" + message + "]"; }
+    }
+
         public static final class NullStmt implements PlpgsqlStatement {
         public NullStmt() {}
 

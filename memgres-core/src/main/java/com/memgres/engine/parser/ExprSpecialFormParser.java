@@ -326,17 +326,34 @@ class ExprSpecialFormParser {
         else if (ep.matchKeyword("RANGE")) frameType = WindowFuncExpr.FrameType.RANGE;
         else { ep.expectKeyword("GROUPS"); frameType = WindowFuncExpr.FrameType.GROUPS; }
 
+        WindowFuncExpr.FrameBound start;
+        WindowFuncExpr.FrameBound end;
         if (ep.matchKeyword("BETWEEN")) {
-            WindowFuncExpr.FrameBound start = parseFrameBound();
+            start = parseFrameBound();
             ep.expectKeyword("AND");
-            WindowFuncExpr.FrameBound end = parseFrameBound();
-            return new WindowFuncExpr.FrameClause(frameType, start, end);
+            end = parseFrameBound();
         } else {
-            WindowFuncExpr.FrameBound start = parseFrameBound();
-            WindowFuncExpr.FrameBound end = new WindowFuncExpr.FrameBound(
+            start = parseFrameBound();
+            end = new WindowFuncExpr.FrameBound(
                     WindowFuncExpr.FrameBoundType.CURRENT_ROW, null);
-            return new WindowFuncExpr.FrameClause(frameType, start, end);
         }
+
+        WindowFuncExpr.ExcludeMode excludeMode = null;
+        if (ep.matchKeyword("EXCLUDE")) {
+            if (ep.matchKeyword("CURRENT")) {
+                ep.expectKeyword("ROW");
+                excludeMode = WindowFuncExpr.ExcludeMode.CURRENT_ROW;
+            } else if (ep.matchKeyword("GROUP")) {
+                excludeMode = WindowFuncExpr.ExcludeMode.GROUP;
+            } else if (ep.matchKeyword("TIES")) {
+                excludeMode = WindowFuncExpr.ExcludeMode.TIES;
+            } else {
+                ep.expectKeyword("NO");
+                ep.expectKeyword("OTHERS");
+                excludeMode = WindowFuncExpr.ExcludeMode.NO_OTHERS;
+            }
+        }
+        return new WindowFuncExpr.FrameClause(frameType, start, end, excludeMode);
     }
 
     private WindowFuncExpr.FrameBound parseFrameBound() {

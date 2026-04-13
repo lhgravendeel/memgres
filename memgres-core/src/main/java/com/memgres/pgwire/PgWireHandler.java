@@ -1149,9 +1149,35 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 current.append(sql, i, eol);
                 i = eol - 1;
             } else if (c == ';') {
-                String stmt = current.toString().trim();
-                if (!stmt.isEmpty()) statements.add(stmt);
-                current = new StringBuilder();
+                // Check if we are inside a BEGIN ATOMIC block
+                String soFar = current.toString();
+                String upper = soFar.toUpperCase();
+                boolean inBeginAtomic = false;
+                int baIdx = upper.lastIndexOf("BEGIN ATOMIC");
+                if (baIdx >= 0) {
+                    // Check there's no matching END after BEGIN ATOMIC
+                    String afterBa = upper.substring(baIdx + 12);
+                    // Count nested BEGIN/END (for CASE ... END)
+                    int depth2 = 0;
+                    boolean foundEnd = false;
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\b(BEGIN|CASE|END)\\b").matcher(afterBa);
+                    while (m.find()) {
+                        String kw = m.group(1);
+                        if (kw.equals("BEGIN") || kw.equals("CASE")) depth2++;
+                        else if (kw.equals("END")) {
+                            if (depth2 > 0) depth2--;
+                            else { foundEnd = true; break; }
+                        }
+                    }
+                    if (!foundEnd) inBeginAtomic = true;
+                }
+                if (inBeginAtomic) {
+                    current.append(c);
+                } else {
+                    String stmt = current.toString().trim();
+                    if (!stmt.isEmpty()) statements.add(stmt);
+                    current = new StringBuilder();
+                }
             } else {
                 current.append(c);
             }

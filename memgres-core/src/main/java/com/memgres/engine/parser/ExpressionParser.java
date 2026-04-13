@@ -556,6 +556,9 @@ public class ExpressionParser {
         // Range adjacency operator: -|-
         if (match(TokenType.RANGE_ADJACENT)) return new BinaryExpr(left, BinaryExpr.BinOp.RANGE_ADJACENT, parseAddition());
 
+        // SQL OVERLAPS: (start, end) OVERLAPS (start, end)
+        if (matchKeyword("OVERLAPS")) return new BinaryExpr(left, BinaryExpr.BinOp.OVERLAPS, parseAddition());
+
         // OPERATOR(schema.op) infix syntax: expr OPERATOR(pg_catalog.+) expr
         if (checkKeyword("OPERATOR")) {
             return specialFormParser.parseQualifiedOperator(left);

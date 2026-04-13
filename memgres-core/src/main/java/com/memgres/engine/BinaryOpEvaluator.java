@@ -896,9 +896,52 @@ class BinaryOpEvaluator {
                 }
                 return false;
             }
+            case OVERLAPS: {
+                // SQL OVERLAPS: (start1, end1) OVERLAPS (start2, end2) → boolean
+                if (left == null || right == null) return null;
+                if (!(left instanceof AstExecutor.PgRow) || !(right instanceof AstExecutor.PgRow)) return false;
+                List<Object> lRow = ((AstExecutor.PgRow) left).values();
+                List<Object> rRow = ((AstExecutor.PgRow) right).values();
+                if (lRow.size() != 2 || rRow.size() != 2) return false;
+                Object s1 = lRow.get(0), e1 = lRow.get(1);
+                Object s2 = rRow.get(0), e2 = rRow.get(1);
+                if (s1 == null || e1 == null || s2 == null || e2 == null) return null;
+                // Handle interval as second element: (date, interval) means start + interval = end
+                if (e1 instanceof PgInterval) e1 = addInterval(s1, (PgInterval) e1);
+                if (e2 instanceof PgInterval) e2 = addInterval(s2, (PgInterval) e2);
+                // Ensure start <= end (PG swaps them if reversed)
+                if (TypeCoercion.compare(s1, e1) > 0) { Object tmp = s1; s1 = e1; e1 = tmp; }
+                if (TypeCoercion.compare(s2, e2) > 0) { Object tmp = s2; s2 = e2; e2 = tmp; }
+                // Overlaps when: s1 < e2 AND s2 < e1
+                return TypeCoercion.compare(s1, e2) < 0 && TypeCoercion.compare(s2, e1) < 0;
+            }
             default:
                 return null;
         }
+    }
+
+    /** Add an interval to a date/timestamp value for OVERLAPS calculation. */
+    private static Object addInterval(Object start, PgInterval interval) {
+        if (start instanceof java.time.LocalDate) {
+            java.time.LocalDate d = (java.time.LocalDate) start;
+            d = d.plusMonths(interval.getMonths()).plusDays(interval.getDays());
+            long totalMicros = interval.getMicroseconds();
+            if (totalMicros != 0) {
+                return d.atStartOfDay().plus(totalMicros, java.time.temporal.ChronoUnit.MICROS);
+            }
+            return d;
+        }
+        if (start instanceof java.time.LocalDateTime) {
+            java.time.LocalDateTime dt = (java.time.LocalDateTime) start;
+            dt = dt.plusMonths(interval.getMonths()).plusDays(interval.getDays());
+            return dt.plus(interval.getMicroseconds(), java.time.temporal.ChronoUnit.MICROS);
+        }
+        if (start instanceof java.time.OffsetDateTime) {
+            java.time.OffsetDateTime odt = (java.time.OffsetDateTime) start;
+            odt = odt.plusMonths(interval.getMonths()).plusDays(interval.getDays());
+            return odt.plus(interval.getMicroseconds(), java.time.temporal.ChronoUnit.MICROS);
+        }
+        return start; // fallback
     }
 
     /**
@@ -1476,6 +1519,21 @@ class BinaryOpEvaluator {
                     return RangeOperations.areAdjacent(RangeOperations.parse(ls), RangeOperations.parse(rs));
                 }
                 return false;
+            }
+            case OVERLAPS: {
+                if (left == null || right == null) return null;
+                if (!(left instanceof AstExecutor.PgRow) || !(right instanceof AstExecutor.PgRow)) return false;
+                List<Object> lRow = ((AstExecutor.PgRow) left).values();
+                List<Object> rRow = ((AstExecutor.PgRow) right).values();
+                if (lRow.size() != 2 || rRow.size() != 2) return false;
+                Object s1 = lRow.get(0), e1 = lRow.get(1);
+                Object s2 = rRow.get(0), e2 = rRow.get(1);
+                if (s1 == null || e1 == null || s2 == null || e2 == null) return null;
+                if (e1 instanceof PgInterval) e1 = addInterval(s1, (PgInterval) e1);
+                if (e2 instanceof PgInterval) e2 = addInterval(s2, (PgInterval) e2);
+                if (TypeCoercion.compare(s1, e1) > 0) { Object tmp = s1; s1 = e1; e1 = tmp; }
+                if (TypeCoercion.compare(s2, e2) > 0) { Object tmp = s2; s2 = e2; e2 = tmp; }
+                return TypeCoercion.compare(s1, e2) < 0 && TypeCoercion.compare(s2, e1) < 0;
             }
             default:
                 return null;
