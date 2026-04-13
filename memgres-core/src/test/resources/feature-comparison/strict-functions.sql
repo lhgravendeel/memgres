@@ -133,11 +133,11 @@ SELECT strict_plpgsql(42) AS r1, strict_plpgsql(NULL) IS NULL AS r2;
 
 -- begin-expected
 -- columns: id, doubled
--- row: 1, 20
--- row: 2,
--- row: 3, 60
--- row: 4,
--- row: 5, 100
+-- row: 1 | 20
+-- row: 2 |
+-- row: 3 | 60
+-- row: 4 |
+-- row: 5 | 100
 -- end-expected
 SELECT id, strict_double(val) AS doubled FROM strict_data ORDER BY id;
 
@@ -303,9 +303,9 @@ INSERT INTO strict_grouped VALUES
 
 -- begin-expected
 -- columns: grp, total
--- row: a, 4
--- row: b,
--- row: c, 10
+-- row: a | 4
+-- row: b |
+-- row: c | 10
 -- end-expected
 SELECT grp, strict_sum_no_init(val) AS total
 FROM strict_grouped

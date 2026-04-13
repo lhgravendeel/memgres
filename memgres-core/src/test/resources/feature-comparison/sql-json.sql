@@ -511,7 +511,7 @@ WHERE doc IS NOT NULL;
 
 -- begin-expected
 -- columns: with_nulls, without_nulls
--- row: [1, null, 3], [1, 3]
+-- row: [1, null, 3] | [1, 3]
 -- end-expected
 SELECT
   JSON_ARRAYAGG(val NULL ON NULL) AS with_nulls,

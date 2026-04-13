@@ -468,18 +468,18 @@ SELECT op_qualified_in_plpgsql(2, 3) AS result;
 -- 25. pg_operator catalog
 -- ============================================================================
 
+-- +++ cannot be created as operator name (PG tokenizes as + + +)
 -- begin-expected
 -- columns: exists
--- row: true
+-- row: f
 -- end-expected
 SELECT EXISTS(
   SELECT 1 FROM pg_operator WHERE oprname = '+++'
 ) AS exists;
 
--- Verify catalog fields (+++ was created for integer and text)
+-- Verify catalog fields: +++ was never created, expect 0 rows
 -- begin-expected
 -- columns: has_left, has_right
--- row: true, true
 -- end-expected
 SELECT
   oprleft <> 0 AS has_left,

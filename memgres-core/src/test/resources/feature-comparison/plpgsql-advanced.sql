@@ -563,7 +563,7 @@ FROM pla_window ORDER BY id;
 -- row: 2, 10, 10
 -- row: 3, 20, 40
 -- row: 4, 20, 40
--- row: 5, 30, 100
+-- row: 5, 30, 60
 -- end-expected
 SELECT id, score,
   sum(score) OVER (ORDER BY score GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) AS sum_excl
