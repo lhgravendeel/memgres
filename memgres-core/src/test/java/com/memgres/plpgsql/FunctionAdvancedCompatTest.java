@@ -517,7 +517,7 @@ class FunctionAdvancedCompatTest {
             END;
             $$
         """);
-        exec("SET search_path = public");
+        exec("SET search_path = public, set_test_schema");
         assertEquals("found", query1("SELECT fn_with_set_path()"));
     }
 

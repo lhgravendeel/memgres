@@ -374,6 +374,14 @@ class JsonFunctions {
     }
 
     List<String> evaluateJsonPathAll(String json, String path) {
+        // PG does not support recursive descent ($..key) — throw syntax error
+        if (path.contains("..")) {
+            throw new MemgresException("syntax error at or near \".\" of jsonpath input", "42601");
+        }
+        // Validate path syntax — reject nested brackets like $.[[invalid
+        if (path.contains("[[")) {
+            throw new MemgresException("syntax error at or near \"[\" of jsonpath input", "42601");
+        }
         // Strip leading $
         String rest = path.startsWith("$") ? path.substring(1) : path;
 
@@ -425,12 +433,29 @@ class JsonFunctions {
                 while (i < rest.length() && rest.charAt(i) != '.' && rest.charAt(i) != '[') i++;
                 String key = rest.substring(start, i);
                 if (!key.isEmpty()) {
-                    List<String> next = new ArrayList<>();
-                    for (String node : current) {
-                        String extracted = JsonOperations.extractKey(node, key);
-                        if (extracted != null) next.add(extracted.trim());
+                    if (key.equals("*")) {
+                        // Wildcard: expand all values of the object
+                        List<String> next = new ArrayList<>();
+                        for (String node : current) {
+                            node = node.trim();
+                            if (node.startsWith("{")) {
+                                Map<String, String> map = JsonOperations.parseObjectKeys(node);
+                                for (String v : map.values()) next.add(v.trim());
+                            } else if (node.startsWith("[")) {
+                                // For arrays, .* expands all elements
+                                List<String> elems = JsonOperations.parseArrayElements(node);
+                                for (String e : elems) next.add(e.trim());
+                            }
+                        }
+                        current = next;
+                    } else {
+                        List<String> next = new ArrayList<>();
+                        for (String node : current) {
+                            String extracted = JsonOperations.extractKey(node, key);
+                            if (extracted != null) next.add(extracted.trim());
+                        }
+                        current = next;
                     }
-                    current = next;
                 }
             } else if (c == '[') {
                 i++;
@@ -494,6 +519,23 @@ class JsonFunctions {
 
     private boolean evaluateJsonPathFilter(String nodeJson, String filter) {
         filter = filter.trim();
+        // Handle && (AND) and || (OR) logical operators — split at top level (not inside parens)
+        int andIdx = findTopLevelLogicalOp(filter, "&&");
+        if (andIdx >= 0) {
+            String left = filter.substring(0, andIdx).trim();
+            String right = filter.substring(andIdx + 2).trim();
+            return evaluateJsonPathFilter(nodeJson, left) && evaluateJsonPathFilter(nodeJson, right);
+        }
+        int orIdx = findTopLevelLogicalOp(filter, "||");
+        if (orIdx >= 0) {
+            String left = filter.substring(0, orIdx).trim();
+            String right = filter.substring(orIdx + 2).trim();
+            return evaluateJsonPathFilter(nodeJson, left) || evaluateJsonPathFilter(nodeJson, right);
+        }
+        // Handle parenthesized sub-expressions
+        if (filter.startsWith("(") && filter.endsWith(")")) {
+            return evaluateJsonPathFilter(nodeJson, filter.substring(1, filter.length() - 1).trim());
+        }
         String[] ops = {">=", "<=", "!=", "==", ">", "<"};
         for (String op : ops) {
             int opIdx = filter.indexOf(op);
@@ -565,6 +607,20 @@ class JsonFunctions {
             }
         }
         return false;
+    }
+
+    /** Find the index of a top-level logical operator (not inside parentheses). */
+    private int findTopLevelLogicalOp(String filter, String op) {
+        int depth = 0;
+        for (int i = 0; i < filter.length() - op.length() + 1; i++) {
+            char c = filter.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (depth == 0 && filter.startsWith(op, i)) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     Boolean evaluateJsonPathPredicate(String json, String path) {

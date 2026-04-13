@@ -142,14 +142,21 @@ public final class InsertStmt implements Statement {
     public static final class SetClause {
         public final String column;
         public final Expression value;
+        public final String subField; // for composite field updates like SET pos.x = value
 
         public SetClause(String column, Expression value) {
+            this(column, value, null);
+        }
+
+        public SetClause(String column, Expression value, String subField) {
             this.column = column;
             this.value = value;
+            this.subField = subField;
         }
 
         public String column() { return column; }
         public Expression value() { return value; }
+        public String subField() { return subField; }
 
         @Override
         public boolean equals(Object o) {

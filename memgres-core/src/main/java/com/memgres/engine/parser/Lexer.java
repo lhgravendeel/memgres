@@ -88,7 +88,8 @@ public class Lexer {
             "COST", "SUPPORT", "LEAKPROOF",
             "WORK", "ABORT",
             "PROCEDURE",  // used in EXECUTE PROCEDURE
-            "CALL", "SETOF", "INOUT", "VARIADIC", "SLICE", "ROUTINE",
+            "CALL", "SETOF", "INOUT", "VARIADIC", "SLICE", "ROUTINE", "ASSERT",
+            "TIES", "OTHERS",
             "ATOMIC", "CHAIN",
             "ATTACH", "DETACH", "STATEMENT", "REFERENCING",
             "MERGE", "MATCHED", "RESTART",

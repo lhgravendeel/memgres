@@ -269,8 +269,20 @@ public class PlpgsqlParser {
                 case "COMMIT":
                     return parseCommit();
                 case "ROLLBACK":
-                case "ABORT":
                     return parseRollback();
+                case "ABORT":
+                    return parseAbort();
+                case "SAVEPOINT": {
+                    // SAVEPOINT is unsupported in PL/pgSQL — rejected at creation time
+                    advance();
+                    while (pos < tokens.size() && !check(TokenType.SEMICOLON)) advance();
+                    if (check(TokenType.SEMICOLON)) advance();
+                    return new PlpgsqlStatement.SavepointStmt();
+                }
+                case "ASSERT":
+                    return parseAssert();
+                case "CALL":
+                    return parseSqlStmt();
                 case "SELECT":
                 case "INSERT":
                 case "UPDATE":
@@ -454,6 +466,17 @@ public class PlpgsqlParser {
             return new PlpgsqlStatement.ReturnNextStmt(value);
         }
         if (matchKw("QUERY")) {
+            if (matchKw("EXECUTE")) {
+                String sqlExpr = collectUntilMulti(";", "USING");
+                List<String> usingExprs = new ArrayList<>();
+                if (matchKw("USING")) {
+                    do {
+                        usingExprs.add(collectUntilMulti(",", ";"));
+                    } while (match(TokenType.COMMA));
+                }
+                match(TokenType.SEMICOLON);
+                return new PlpgsqlStatement.ReturnQueryExecuteStmt(sqlExpr, usingExprs);
+            }
             String sql = collectUntilSemicolon();
             match(TokenType.SEMICOLON);
             return new PlpgsqlStatement.ReturnQueryStmt(sql);
@@ -465,6 +488,19 @@ public class PlpgsqlParser {
         String value = collectUntilSemicolon();
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.ReturnStmt(value);
+    }
+
+    // ---- ASSERT ----
+
+    private PlpgsqlStatement parseAssert() {
+        matchKw("ASSERT");
+        String condition = collectUntilMulti(";", ",");
+        String message = null;
+        if (match(TokenType.COMMA)) {
+            message = collectUntilSemicolon();
+        }
+        match(TokenType.SEMICOLON);
+        return new PlpgsqlStatement.AssertStmt(condition, message);
     }
 
     // ---- RAISE ----
@@ -669,6 +705,17 @@ public class PlpgsqlParser {
             }
         }
 
+        // Handle SHOW param INTO var
+        if (intoVars == null && upper.startsWith("SHOW")) {
+            java.util.regex.Matcher showIntoMatcher = java.util.regex.Pattern.compile(
+                    "\\bINTO\\b\\s+(\\w+)\\s*$",
+                    java.util.regex.Pattern.CASE_INSENSITIVE).matcher(sql);
+            if (showIntoMatcher.find()) {
+                intoVars = Cols.listOf(showIntoMatcher.group(1).trim());
+                sql = sql.substring(0, showIntoMatcher.start()).trim();
+            }
+        }
+
         // Handle INSERT/UPDATE/DELETE ... RETURNING col1[, col2] INTO var1[, var2]
         if (intoVars == null) {
             String upperSql = sql.toUpperCase();
@@ -781,10 +828,24 @@ public class PlpgsqlParser {
     }
 
     private PlpgsqlStatement parseRollback() {
-        advance(); // consume ROLLBACK or ABORT
+        advance(); // consume ROLLBACK
+        // Check for ROLLBACK TO SAVEPOINT — rejected at creation time in PL/pgSQL
+        if (checkKw("TO")) {
+            while (pos < tokens.size() && !check(TokenType.SEMICOLON)) advance();
+            if (check(TokenType.SEMICOLON)) advance();
+            return new PlpgsqlStatement.SavepointStmt();
+        }
         boolean chain = parseAndChain();
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.RollbackStmt(chain);
+    }
+
+    private PlpgsqlStatement parseAbort() {
+        advance(); // consume ABORT
+        // Consume the rest until semicolon
+        while (pos < tokens.size() && !check(TokenType.SEMICOLON)) advance();
+        if (check(TokenType.SEMICOLON)) advance();
+        return new PlpgsqlStatement.AbortStmt();
     }
 
     private boolean parseAndChain() {

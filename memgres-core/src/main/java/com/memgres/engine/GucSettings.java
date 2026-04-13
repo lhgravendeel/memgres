@@ -150,6 +150,50 @@ public class GucSettings {
         return DEFAULTS.getOrDefault(key, null);
     }
 
+    /** Set of timeout parameters whose display value should be human-formatted by PG. */
+    private static final Set<String> TIMEOUT_PARAMS = Set.of(
+            "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout",
+            "idle_session_timeout", "authentication_timeout");
+
+    /**
+     * Get a parameter value formatted for display (SHOW).
+     * For timeout parameters, PG normalizes plain millisecond integers to human-friendly form
+     * (e.g., "5000" -> "5s", "60000" -> "1min", "0" stays "0").
+     */
+    public String getForDisplay(String name) {
+        String val = get(name);
+        if (val == null) return null;
+        String key = name.toLowerCase();
+        if (TIMEOUT_PARAMS.contains(key)) {
+            return formatTimeoutForDisplay(val);
+        }
+        return val;
+    }
+
+    /**
+     * Format a timeout value for SHOW display.
+     * Plain integer values (milliseconds) are converted to the shortest human unit:
+     * 0 -> "0", 100 -> "100ms", 5000 -> "5s", 60000 -> "1min", 3600000 -> "1h", 86400000 -> "1d".
+     * Values already with a unit suffix are returned as-is.
+     */
+    private static String formatTimeoutForDisplay(String value) {
+        if (value == null || value.isEmpty()) return value;
+        // If it already has a unit suffix, return as-is
+        if (value.matches(".*[a-zA-Z]$")) return value;
+        long ms;
+        try {
+            ms = Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            return value;
+        }
+        if (ms == 0) return "0";
+        if (ms % 86400000 == 0) return (ms / 86400000) + "d";
+        if (ms % 3600000 == 0) return (ms / 3600000) + "h";
+        if (ms % 60000 == 0) return (ms / 60000) + "min";
+        if (ms % 1000 == 0) return (ms / 1000) + "s";
+        return ms + "ms";
+    }
+
     /** Check if a parameter has been explicitly set at the session level (not just the default). */
     public boolean hasSessionOverride(String name) {
         return sessionOverrides.containsKey(name.toLowerCase()) || transactionOverrides.containsKey(name.toLowerCase());

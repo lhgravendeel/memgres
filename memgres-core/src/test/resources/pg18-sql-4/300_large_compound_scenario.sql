@@ -155,8 +155,8 @@ ORDER BY task_id;
 -- row: 4|4|INSERT||doing
 -- row: 5|2|UPDATE|doing|done
 -- row: 6|4|UPDATE|doing|done
--- row: 7|5|INSERT||todo
--- row: 8|3|UPDATE|done|done
+-- row: 7|3|UPDATE|done|done
+-- row: 8|5|INSERT||todo
 -- end-expected
 SELECT audit_id, task_id, action, old_status, new_status
 FROM task_audit

@@ -367,6 +367,7 @@ class UtilityParser {
         if (parser.checkKeyword("TRANSACTION")) {
             parser.advance();
             String isolLevel = null;
+            Boolean readOnly = null;
             if (parser.matchKeyword("ISOLATION")) {
                 parser.matchKeyword("LEVEL");
                 if (parser.matchKeyword("READ")) {
@@ -379,8 +380,19 @@ class UtilityParser {
                     isolLevel = "serializable";
                 }
             }
-            // consume remaining (READ ONLY/WRITE, DEFERRABLE, etc.)
+            // Parse READ ONLY/WRITE
+            if (parser.matchKeyword("READ")) {
+                if (parser.matchKeyword("ONLY")) {
+                    readOnly = true;
+                } else if (parser.matchKeyword("WRITE")) {
+                    readOnly = false;
+                }
+            }
+            // consume remaining (DEFERRABLE, etc.)
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            if (readOnly != null) {
+                return new SetStmt("transaction_read_only", readOnly ? "on" : "off");
+            }
             if (isolLevel != null) {
                 return new SetStmt("transaction_isolation", isolLevel);
             }
@@ -722,9 +734,10 @@ class UtilityParser {
         // Optional: BINARY, INSENSITIVE, [NO] SCROLL
         boolean binary = parser.matchKeyword("BINARY");
         parser.matchKeyword("INSENSITIVE");
-        boolean scroll = false;
+        boolean scroll = true; // PG default: cursors are scrollable unless NO SCROLL is specified
         if (parser.matchKeyword("NO")) {
             parser.matchKeyword("SCROLL");
+            scroll = false;
         } else if (parser.matchKeyword("SCROLL")) {
             scroll = true;
         }
@@ -738,7 +751,7 @@ class UtilityParser {
             parser.matchKeyword("HOLD");
         }
         parser.expectKeyword("FOR");
-        SelectStmt query = parser.parseSelect();
+        Statement query = parser.tryParseSetOp(parser.parseSelect());
         return new DeclareCursorStmt(name, query, scroll, withHold, binary);
     }
 
@@ -1130,8 +1143,8 @@ class UtilityParser {
         } else {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         }
-        // Store the comment
-        return new SetStmt("comment:" + objectType + ":" + objectName, comment != null ? comment : "");
+        // Store the comment (null for IS NULL to trigger removal)
+        return new SetStmt("comment:" + objectType + ":" + objectName, comment);
     }
 
     // ---- SECURITY LABEL ----

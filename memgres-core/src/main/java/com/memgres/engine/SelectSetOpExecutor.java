@@ -63,26 +63,49 @@ class SelectSetOpExecutor {
                         Column orig = columns.get(ci);
                         columns.set(ci, new Column(orig.getName(), wider, orig.isNullable(), orig.isPrimaryKey(), orig.getDefaultValue()));
                     }
+                } else if (leftCat == rightCat) {
+                    // Same category, different types (e.g., varchar vs text) - allow
                 } else if (leftCat != rightCat) {
-                    boolean coercible = true;
-                    if (!rightResult.getRows().isEmpty()) {
-                        for (Object[] row : rightResult.getRows()) {
-                            if (ci < row.length && row[ci] != null && leftCat == TypeCoercion.TypeCategory.NUMERIC) {
-                                try { TypeCoercion.toBigDecimal(row[ci]); } catch (Exception e) { coercible = false; break; }
-                            }
-                        }
-                    }
-                    if (!leftResult.getRows().isEmpty()) {
-                        for (Object[] row : leftResult.getRows()) {
-                            if (ci < row.length && row[ci] != null && rightCat == TypeCoercion.TypeCategory.NUMERIC) {
-                                try { TypeCoercion.toBigDecimal(row[ci]); } catch (Exception e) { coercible = false; break; }
-                            }
-                        }
-                    }
-                    if (!coercible) {
-                        String sqlState = stmt.all() ? "22P02" : "42804";
+                    boolean leftIsText = leftType == DataType.TEXT || leftType == DataType.VARCHAR
+                            || leftType == DataType.CHAR || leftType == DataType.NAME;
+                    boolean rightIsText = rightType == DataType.TEXT || rightType == DataType.VARCHAR
+                            || rightType == DataType.CHAR || rightType == DataType.NAME;
+                    if (!leftIsText && !rightIsText) {
                         throw new MemgresException(stmt.op().name() + " types " + leftType.getPgName() + " and "
-                                + rightType.getPgName() + " cannot be matched", sqlState);
+                                + rightType.getPgName() + " cannot be matched", "42804");
+                    }
+                    // One side is text-category, the other is not. In PostgreSQL, string
+                    // literals and NULL have type "unknown" which is implicitly coercible to
+                    // any type. Our engine uses TEXT for both unknown literals and actual text
+                    // columns. To distinguish: columns from real tables have tableOid > 0.
+                    Column textCol = leftIsText ? columns.get(ci) : rightResult.getColumns().get(ci);
+                    if (textCol.getTableOid() != 0) {
+                        // TEXT from a real table column — genuine type mismatch
+                        throw new MemgresException(stmt.op().name() + " types " + leftType.getPgName() + " and "
+                                + rightType.getPgName() + " cannot be matched", "42804");
+                    }
+                    // TEXT from a computed expression or literal — attempt coercion
+                    DataType targetType = leftIsText ? rightType : leftType;
+                    List<Object[]> textRows = leftIsText ? leftResult.getRows() : rightResult.getRows();
+                    for (Object[] row : textRows) {
+                        Object val = row[ci];
+                        if (val != null) {
+                            try {
+                                executor.castEvaluator.applyCast(val, targetType.getPgName());
+                            } catch (Exception e) {
+                                // PG returns 22P02 (invalid_text_representation) when a
+                                // literal/unknown value cannot be coerced to the target type
+                                // in a set operation (e.g., SELECT 1 UNION ALL SELECT 'x').
+                                throw new MemgresException(
+                                        "invalid input syntax for type " + targetType.getPgName()
+                                                + ": \"" + val + "\"", "22P02");
+                            }
+                        }
+                    }
+                    // Coercion succeeded for all values — use the non-text type
+                    if (leftIsText && !rightIsText) {
+                        Column orig = columns.get(ci);
+                        columns.set(ci, new Column(orig.getName(), rightType, orig.isNullable(), orig.isPrimaryKey(), orig.getDefaultValue()));
                     }
                 }
             }

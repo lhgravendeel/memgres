@@ -498,13 +498,16 @@ class SelectWindowEvaluator {
                                                    Object[] results) {
         boolean hasOrderBy = wf.orderBy() != null && !wf.orderBy().isEmpty();
         boolean hasFrame = wf.frame() != null;
+        WindowFuncExpr.ExcludeMode excludeMode = hasFrame ? wf.frame().excludeMode() : null;
 
         for (int i = 0; i < sortedPartition.size(); i++) {
             int frameStart, frameEnd;
 
             if (hasFrame) {
-                frameStart = resolveFrameBound(wf.frame().start(), i, sortedPartition.size());
-                frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size());
+                frameStart = resolveFrameBound(wf.frame().start(), i, sortedPartition.size(),
+                        wf.frame().type(), wf.orderBy(), contexts, sortedPartition, true);
+                frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size(),
+                        wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
             } else if (hasOrderBy) {
                 frameStart = 0;
                 frameEnd = i;
@@ -518,21 +521,79 @@ class SelectWindowEvaluator {
 
             List<RowContext> frameRows = new ArrayList<>();
             for (int fi = frameStart; fi <= frameEnd; fi++) {
+                if (excludeMode != null && excludeMode != WindowFuncExpr.ExcludeMode.NO_OTHERS) {
+                    if (shouldExcludeRow(excludeMode, wf.orderBy(), contexts, sortedPartition, i, fi)) {
+                        continue;
+                    }
+                }
                 frameRows.add(contexts.get(sortedPartition.get(fi)));
             }
 
             FunctionCallExpr fn = new FunctionCallExpr(funcName, wf.args(), wf.distinct(), wf.star());
-            results[sortedPartition.get(i)] = select.aggregateEvaluator.evalAggregate(fn, frameRows);
+            Object val = select.aggregateEvaluator.evalAggregate(fn, frameRows);
+            // If no rows in frame after exclusion, aggregate should be NULL (not 0)
+            if (frameRows.isEmpty()) val = null;
+            results[sortedPartition.get(i)] = val;
         }
     }
 
-    private int resolveFrameBound(WindowFuncExpr.FrameBound bound, int currentIdx, int partitionSize) {
+    /**
+     * Determine whether a row at position fi should be excluded given the exclude mode.
+     * Position i is the current row being computed.
+     */
+    private boolean shouldExcludeRow(WindowFuncExpr.ExcludeMode excludeMode,
+                                      List<SelectStmt.OrderByItem> orderBy,
+                                      List<RowContext> contexts,
+                                      List<Integer> sortedPartition,
+                                      int currentIdx, int frameIdx) {
+        switch (excludeMode) {
+            case CURRENT_ROW:
+                return frameIdx == currentIdx;
+            case TIES:
+                // Exclude peer rows (same ORDER BY values) but NOT the current row itself
+                if (frameIdx == currentIdx) return false;
+                return orderByValuesEqual(orderBy, contexts,
+                        sortedPartition.get(currentIdx), sortedPartition.get(frameIdx));
+            case GROUP:
+                // Exclude current row AND all peers
+                return orderByValuesEqual(orderBy, contexts,
+                        sortedPartition.get(currentIdx), sortedPartition.get(frameIdx));
+            default:
+                return false;
+        }
+    }
+
+    private int resolveFrameBound(WindowFuncExpr.FrameBound bound, int currentIdx, int partitionSize,
+                                    WindowFuncExpr.FrameType frameType,
+                                    List<SelectStmt.OrderByItem> orderBy,
+                                    List<RowContext> contexts,
+                                    List<Integer> sortedPartition,
+                                    boolean isStartBound) {
         switch (bound.boundType()) {
             case UNBOUNDED_PRECEDING:
                 return 0;
             case UNBOUNDED_FOLLOWING:
                 return partitionSize - 1;
             case CURRENT_ROW:
+                if (frameType == WindowFuncExpr.FrameType.GROUPS || frameType == WindowFuncExpr.FrameType.RANGE) {
+                    if (isStartBound) {
+                        // First row of current peer group
+                        int firstPeer = currentIdx;
+                        while (firstPeer > 0 && orderByValuesEqual(orderBy, contexts,
+                                sortedPartition.get(currentIdx), sortedPartition.get(firstPeer - 1))) {
+                            firstPeer--;
+                        }
+                        return firstPeer;
+                    } else {
+                        // Last row of current peer group
+                        int lastPeer = currentIdx;
+                        while (lastPeer + 1 < partitionSize && orderByValuesEqual(orderBy, contexts,
+                                sortedPartition.get(currentIdx), sortedPartition.get(lastPeer + 1))) {
+                            lastPeer++;
+                        }
+                        return lastPeer;
+                    }
+                }
                 return currentIdx;
             case PRECEDING:
                 return currentIdx - executor.toInt(executor.evalExpr(bound.offset(), null));

@@ -1,5 +1,7 @@
 package com.memgres.engine.parser.ast;
 
+import java.util.Map;
+
 /**
  * ALTER VIEW [IF EXISTS] name RENAME TO new_name
  * Also handles ALTER VIEW ... SET SCHEMA, ALTER VIEW ... OWNER TO, etc.
@@ -9,17 +11,24 @@ public final class AlterViewStmt implements Statement {
     public final String newName;
     public final boolean ifExists;
     public final Action action;
+    public final Map<String, String> setOptions;
 
     public AlterViewStmt(String name, String newName, boolean ifExists, Action action) {
+        this(name, newName, ifExists, action, null);
+    }
+
+    public AlterViewStmt(String name, String newName, boolean ifExists, Action action, Map<String, String> setOptions) {
         this.name = name;
         this.newName = newName;
         this.ifExists = ifExists;
         this.action = action;
+        this.setOptions = setOptions;
     }
 
     public enum Action {
         RENAME_TO,
         OWNER_TO,
+        SET_OPTIONS,
         NO_OP    // SET SCHEMA, etc., accepted but ignored
     }
 
@@ -32,6 +41,7 @@ public final class AlterViewStmt implements Statement {
     public String newName() { return newName; }
     public boolean ifExists() { return ifExists; }
     public Action action() { return action; }
+    public Map<String, String> setOptions() { return setOptions; }
 
     @Override
     public boolean equals(Object o) {

@@ -58,7 +58,7 @@ class FromFunctionResolver {
         PgFunction userFunc = executor.database.getFunction(fname);
         if (userFunc != null) return resolveUserFunction(userFunc, alias, colAliases, evalArgs);
 
-        throw new MemgresException("Set-returning function not supported in FROM: " + fname);
+        throw new MemgresException("function " + fname + " does not exist", "42883");
     }
 
     // ---- generate_series ----
@@ -123,6 +123,8 @@ class FromFunctionResolver {
         Object delimObj = evalArgs.size() > 1 ? evalArgs.get(1) : null;
         if (strObj == null) return new ArrayList<>();
         String str = strObj.toString();
+        // PG: string_to_table('', delim) returns 0 rows when the input string is empty
+        if (str.isEmpty() && delimObj != null && delimObj.toString().length() > 0) return new ArrayList<>();
         String colName = firstColAlias(colAliases, alias);
         Column col = new Column(colName, DataType.TEXT, true, false, null);
         Table virtualTable = new Table(alias, Cols.listOf(col));
@@ -750,13 +752,15 @@ class FromFunctionResolver {
             List<Column> cols = new ArrayList<>();
             if (returnType != null && returnType.toUpperCase().startsWith("SETOF ")) {
                 String refTable = returnType.substring(6).trim();
-                try {
-                    Table sourceTable = executor.resolveTable("public", refTable);
-                    if (sourceTable != null) {
-                        cols.addAll(sourceTable.getColumns());
+                if (!"record".equalsIgnoreCase(refTable)) {
+                    try {
+                        Table sourceTable = executor.resolveTable("public", refTable);
+                        if (sourceTable != null) {
+                            cols.addAll(sourceTable.getColumns());
+                        }
+                    } catch (Exception e) {
+                        // Not a table, use single column
                     }
-                } catch (Exception e) {
-                    // Not a table, use single column
                 }
             }
 
@@ -764,7 +768,11 @@ class FromFunctionResolver {
             List<RowContext> contexts = new ArrayList<>();
             if (!resultList.isEmpty() && resultList.get(0) instanceof Object[]) {
                 Object[] firstRow = (Object[]) resultList.get(0);
-                if (cols.isEmpty()) {
+                if (cols.isEmpty() && colAliases != null && !colAliases.isEmpty()) {
+                    for (int i = 0; i < colAliases.size(); i++) {
+                        cols.add(new Column(colAliases.get(i), DataType.TEXT, true, false, null));
+                    }
+                } else if (cols.isEmpty()) {
                     for (int i = 0; i < firstRow.length; i++) {
                         cols.add(new Column("column" + (i + 1), DataType.TEXT, true, false, null));
                     }
@@ -1040,28 +1048,32 @@ class FromFunctionResolver {
         List<List<Object>> result = new ArrayList<>();
         for (int ni = 0; ni < nestedJsons.size(); ni++) {
             String nestedJson = nestedJsons.get(ni);
-            List<Object> row = new ArrayList<>();
-            int parentIdx = 0;
-            for (int i = 0; i < columns.size(); i++) {
-                if (i == nestedIdx) {
-                    // Add nested column values
-                    for (JsonTableExpr.JsonTableColumn nc : nestedCol.nestedColumns) {
-                        row.add(extractColumnValue(nc, nestedJson, ni));
+            // Recursively build rows for nested columns (supports multi-level nesting)
+            List<List<Object>> nestedRows = buildJsonTableRows(nestedCol.nestedColumns, nestedJson, ni);
+            for (List<Object> nestedRow : nestedRows) {
+                List<Object> row = new ArrayList<>();
+                int parentIdx = 0;
+                int nestedValIdx = 0;
+                for (int i = 0; i < columns.size(); i++) {
+                    if (i == nestedIdx) {
+                        // Add all values from the nested row
+                        row.addAll(nestedRow);
+                    } else {
+                        row.add(parentValues.get(parentIdx++));
                     }
-                } else {
-                    row.add(parentValues.get(parentIdx++));
                 }
+                result.add(row);
             }
-            result.add(row);
         }
 
         if (result.isEmpty()) {
             // No nested results — produce one row with nulls for nested columns
             List<Object> row = new ArrayList<>();
             int parentIdx = 0;
+            int nestedColCount = countLeafColumns(nestedCol.nestedColumns);
             for (int i = 0; i < columns.size(); i++) {
                 if (i == nestedIdx) {
-                    for (int nc = 0; nc < nestedCol.nestedColumns.size(); nc++) {
+                    for (int nc = 0; nc < nestedColCount; nc++) {
                         row.add(null);
                     }
                 } else {
@@ -1072,6 +1084,19 @@ class FromFunctionResolver {
         }
 
         return result;
+    }
+
+    /** Count the total number of leaf columns (recursing into nested columns). */
+    private int countLeafColumns(List<JsonTableExpr.JsonTableColumn> columns) {
+        int count = 0;
+        for (JsonTableExpr.JsonTableColumn col : columns) {
+            if (col.nestedColumns != null) {
+                count += countLeafColumns(col.nestedColumns);
+            } else {
+                count++;
+            }
+        }
+        return count;
     }
 
     private Object extractColumnValue(JsonTableExpr.JsonTableColumn col, String rowJson, int rowIdx) {

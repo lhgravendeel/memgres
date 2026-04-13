@@ -71,7 +71,7 @@ class DdlViewExecutor {
                 // Silently ignore execution errors during view validation
             }
             executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, stmt.query(), stmt.orReplace(),
-                    false, null, null, null, stmt.checkOption()));
+                    false, null, null, null, stmt.checkOption(), stmt.withOptions()));
         }
 
         executor.database.registerSchemaObject(viewSchema, "view", stmt.name());
@@ -111,6 +111,22 @@ class DdlViewExecutor {
             Database.ViewDef vd = executor.database.getView(stmt.name());
             String vSchema = (vd != null && vd.schemaName() != null) ? vd.schemaName() : executor.defaultSchema();
             executor.database.setObjectOwner("view:" + vSchema + "." + stmt.name(), newOwner);
+        }
+        if (stmt.action() == AlterViewStmt.Action.SET_OPTIONS) {
+            Database.ViewDef existing = executor.database.getView(stmt.name());
+            if (existing == null) {
+                if (stmt.ifExists()) return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+                throw new MemgresException("view \"" + stmt.name() + "\" does not exist", "42P01");
+            }
+            // Merge new options into existing reloptions
+            Map<String, String> merged = new LinkedHashMap<>();
+            if (existing.reloptions() != null) merged.putAll(existing.reloptions());
+            if (stmt.setOptions() != null) merged.putAll(stmt.setOptions());
+            executor.database.removeView(stmt.name());
+            executor.database.addView(new Database.ViewDef(existing.name(), existing.schemaName(), existing.query(),
+                    existing.orReplace(), existing.materialized(),
+                    existing.cachedColumns(), existing.cachedRows(), existing.sourceSQL(),
+                    existing.checkOption(), merged));
         }
         if (stmt.action() == AlterViewStmt.Action.NO_OP) {
             Database.ViewDef existing = executor.database.getView(stmt.name());

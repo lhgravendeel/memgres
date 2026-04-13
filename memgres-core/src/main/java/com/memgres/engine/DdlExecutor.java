@@ -544,6 +544,51 @@ class DdlExecutor {
     }
 
     /**
+     * PG 18: Virtual generated columns cannot use user-defined functions at all.
+     * Even IMMUTABLE UDFs are rejected with SQLSTATE 0A000.
+     */
+    static void checkVirtualColumnUdf(String exprStr, Database db) {
+        try {
+            Expression parsed = com.memgres.engine.parser.Parser.parseExpression(exprStr);
+            checkVirtualColumnUdfExpr(parsed, db);
+        } catch (MemgresException e) {
+            throw e;
+        } catch (Exception ignored) {}
+    }
+
+    private static void checkVirtualColumnUdfExpr(Expression expr, Database db) {
+        if (expr == null) return;
+        if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            PgFunction pgFunc = db.getFunction(fn.name());
+            if (pgFunc != null) {
+                throw new MemgresException("generation expression uses user-defined function", "0A000");
+            }
+            if (fn.args() != null) {
+                for (Expression arg : fn.args()) checkVirtualColumnUdfExpr(arg, db);
+            }
+        } else if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            checkVirtualColumnUdfExpr(bin.left(), db);
+            checkVirtualColumnUdfExpr(bin.right(), db);
+        } else if (expr instanceof UnaryExpr) {
+            checkVirtualColumnUdfExpr(((UnaryExpr) expr).operand(), db);
+        } else if (expr instanceof CastExpr) {
+            checkVirtualColumnUdfExpr(((CastExpr) expr).expr(), db);
+        } else if (expr instanceof CaseExpr) {
+            CaseExpr ce = (CaseExpr) expr;
+            if (ce.operand() != null) checkVirtualColumnUdfExpr(ce.operand(), db);
+            if (ce.whenClauses() != null) {
+                for (CaseExpr.WhenClause wc : ce.whenClauses()) {
+                    checkVirtualColumnUdfExpr(wc.condition, db);
+                    checkVirtualColumnUdfExpr(wc.result, db);
+                }
+            }
+            if (ce.elseExpr() != null) checkVirtualColumnUdfExpr(ce.elseExpr(), db);
+        }
+    }
+
+    /**
      * Check immutability using string-based expression (parses first, then walks AST).
      * Falls back to string matching if parsing fails.
      */
@@ -658,7 +703,16 @@ class DdlExecutor {
             "int", "integer", "bigint", "smallint", "numeric", "decimal", "real", "float", "double",
             "boolean", "bool", "text", "varchar", "char", "date", "timestamp", "interval",
             "coalesce", "nullif", "ifnull",
-            "count", "sum", "min", "max", "avg"
+            "count", "sum", "min", "max", "avg",
+            "returning", "passing", "json_value", "json_query", "json_exists",
+            "json_object", "json_array", "json_serialize", "json_scalar",
+            "json_table", "json_arrayagg", "json_objectagg",
+            "path", "wrapper", "conditional", "unconditional",
+            "keep", "omit", "quotes", "format", "json", "jsonb",
+            "value", "key", "columns", "nested", "ordinality",
+            "empty", "error", "object", "array", "scalar",
+            "on", "with", "without", "unique", "keys",
+            "absent", "default", "exists"
     ));
 
     static boolean isSqlKeywordOrFunction(String ident) {

@@ -214,12 +214,10 @@ class NotEnforcedConstraintTest {
         exec("CREATE TABLE t1(id int PRIMARY KEY, val int CONSTRAINT chk_val CHECK (val > 0) NOT ENFORCED)");
         // Initially not enforced — allows violation
         exec("INSERT INTO t1 VALUES (1, -1)");
-        // Now make it enforced
-        exec("ALTER TABLE t1 ALTER CONSTRAINT chk_val ENFORCED");
-        // Should now reject violations
+        // PG 18: toggling to ENFORCED validates existing data — should fail with 42809
         SQLException ex = assertThrows(SQLException.class, () ->
-                exec("INSERT INTO t1 VALUES (2, -2)"));
-        assertEquals("23514", ex.getSQLState());
+                exec("ALTER TABLE t1 ALTER CONSTRAINT chk_val ENFORCED"));
+        assertEquals("42809", ex.getSQLState());
     }
 
     @Test
@@ -556,14 +554,10 @@ class NotEnforcedConstraintTest {
     void alter_to_enforced_does_not_revalidate_existing_violations() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, val int CONSTRAINT chk CHECK (val > 0) NOT ENFORCED)");
         exec("INSERT INTO t1 VALUES (1, -5)");
-        // Toggle to ENFORCED — PG 18 does NOT revalidate existing rows
-        exec("ALTER TABLE t1 ALTER CONSTRAINT chk ENFORCED");
-        // Existing violation remains
-        assertEquals("-5", scalar("SELECT val FROM t1 WHERE id = 1"));
-        // But new violations are blocked
+        // PG 18: toggling to ENFORCED validates existing data — should fail with 42809
         SQLException ex = assertThrows(SQLException.class, () ->
-                exec("INSERT INTO t1 VALUES (2, -10)"));
-        assertEquals("23514", ex.getSQLState());
+                exec("ALTER TABLE t1 ALTER CONSTRAINT chk ENFORCED"));
+        assertEquals("42809", ex.getSQLState());
     }
 
     @Test

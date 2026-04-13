@@ -48,7 +48,7 @@ public class StoredConstraint {
     }
     private List<ExcludeElement> excludeElements;
 
-    private final String name;
+    private String name;
     private final Type type;
     private final List<String> columns;
     private final Expression checkExpr;
@@ -99,6 +99,7 @@ public class StoredConstraint {
     }
 
     public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
     public Type getType() { return type; }
     public List<String> getColumns() { return columns; }
     public Expression getCheckExpr() { return checkExpr; }

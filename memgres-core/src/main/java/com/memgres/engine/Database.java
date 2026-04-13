@@ -37,6 +37,7 @@ public class Database {
     private final Map<String, Boolean> indexUniqueFlags = new ConcurrentHashMap<>(); // index name → is unique
     private final Map<String, String> indexWhereClauses = new ConcurrentHashMap<>(); // index name → WHERE predicate
     private final Map<String, String> indexMethods = new ConcurrentHashMap<>(); // index name → access method (btree, hash, etc.)
+    private final Map<String, Map<String, String>> indexReloptions = new ConcurrentHashMap<>(); // index name → storage params
     private final NotificationManager notificationManager = new NotificationManager();
     private DatabaseRegistry databaseRegistry;
 
@@ -310,6 +311,10 @@ public class Database {
         userAggregates.remove(name.toLowerCase());
     }
 
+    public Map<String, PgAggregate> getUserAggregates() {
+        return userAggregates;
+    }
+
     // User-defined operators (keyed by name+argtypes for overloading)
     public void addOperator(PgOperator op) {
         userOperators.put(op.getKey().toLowerCase(), op);
@@ -471,7 +476,7 @@ public class Database {
         return overloads.get(0); // fallback to first
     }
 
-    private boolean typesCompatible(String argType, String paramType) {
+    public boolean typesCompatible(String argType, String paramType) {
         String a = argType.toLowerCase().trim();
         String p = paramType.toLowerCase().trim();
         if (a.equals(p)) return true;
@@ -513,6 +518,46 @@ public class Database {
         } else {
             functions.put(key, overloads.get(0));
         }
+    }
+
+    /** Rename a single specific overload of a function/procedure. */
+    public void renameFunctionOverload(PgFunction func, String newName) {
+        String oldName = func.getName();
+        String oldKey = oldName.toLowerCase();
+        String newKey = newName.toLowerCase();
+        // Remove this specific overload from the old name's overload list
+        List<PgFunction> oldOverloads = functionOverloads.get(oldKey);
+        if (oldOverloads != null) {
+            oldOverloads.remove(func);
+            if (oldOverloads.isEmpty()) {
+                functionOverloads.remove(oldKey);
+                functions.remove(oldKey);
+            } else {
+                functions.put(oldKey, oldOverloads.get(0));
+            }
+        }
+        // Update the function's name
+        func.setName(newName);
+        // Add to the new name's overload list
+        List<PgFunction> newOverloads = functionOverloads.computeIfAbsent(newKey, k -> new ArrayList<>());
+        newOverloads.add(func);
+        functions.put(newKey, func);
+        // Update schema registry
+        if (oldOverloads == null || oldOverloads.isEmpty()) {
+            for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
+                if (entry.getValue().remove("function:" + oldKey)) {
+                    entry.getValue().add("function:" + newKey);
+                }
+            }
+        } else {
+            // Old name still exists (other overloads remain), just register the new name
+            for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
+                entry.getValue().add("function:" + newKey);
+            }
+        }
+        // Update object ownership key
+        String oldOwner = objectOwners.remove("function:" + oldKey);
+        if (oldOwner != null) objectOwners.put("function:" + newKey, oldOwner);
     }
 
     /** Rename a function/procedure: re-key in all maps, update the PgFunction name field. */
@@ -611,7 +656,11 @@ public class Database {
 
     // Comments
     public void addComment(String objectType, String objectName, String comment) {
-        comments.put(objectType + ":" + objectName, comment);
+        if (comment == null) {
+            comments.remove(objectType + ":" + objectName);
+        } else {
+            comments.put(objectType + ":" + objectName, comment);
+        }
     }
 
     public String getComment(String objectType, String objectName) {
@@ -659,6 +708,14 @@ public class Database {
         return indexColumns.get(name.toLowerCase());
     }
 
+    public Map<String, String> getIndexReloptions(String name) {
+        return indexReloptions.get(name.toLowerCase());
+    }
+
+    public void setIndexReloptions(String name, Map<String, String> opts) {
+        indexReloptions.put(name.toLowerCase(), opts);
+    }
+
     public boolean hasIndex(String name) {
         return indexColumns.containsKey(name.toLowerCase());
     }
@@ -669,6 +726,7 @@ public class Database {
         indexUniqueFlags.remove(name.toLowerCase());
         indexWhereClauses.remove(name.toLowerCase());
         indexMethods.remove(name.toLowerCase());
+        indexReloptions.remove(name.toLowerCase());
     }
 
     /** Rename an index: re-key across all index maps and update schema registry. */
@@ -685,6 +743,8 @@ public class Database {
         if (where != null) indexWhereClauses.put(newKey, where);
         String method = indexMethods.remove(oldKey);
         if (method != null) indexMethods.put(newKey, method);
+        Map<String, String> opts = indexReloptions.remove(oldKey);
+        if (opts != null) indexReloptions.put(newKey, opts);
         // Update schema registry
         for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
             if (entry.getValue().remove("index:" + oldKey)) {
@@ -970,6 +1030,7 @@ public class Database {
         public final List<Object[]> cachedRows;
         public final String sourceSQL;
         public final String checkOption;
+        public final Map<String, String> reloptions;
 
         public ViewDef(
                 String name,
@@ -982,6 +1043,21 @@ public class Database {
                 String sourceSQL,
                 String checkOption
         ) {
+            this(name, schemaName, query, orReplace, materialized, cachedColumns, cachedRows, sourceSQL, checkOption, null);
+        }
+
+        public ViewDef(
+                String name,
+                String schemaName,
+                Statement query,
+                boolean orReplace,
+                boolean materialized,
+                List<Column> cachedColumns,
+                List<Object[]> cachedRows,
+                String sourceSQL,
+                String checkOption,
+                Map<String, String> reloptions
+        ) {
             this.name = name;
             this.schemaName = schemaName;
             this.query = query;
@@ -991,6 +1067,7 @@ public class Database {
             this.cachedRows = cachedRows;
             this.sourceSQL = sourceSQL;
             this.checkOption = checkOption;
+            this.reloptions = reloptions;
         }
 
         /** Convenience constructor (full, without checkOption). */
@@ -1030,6 +1107,7 @@ public class Database {
         public List<Object[]> cachedRows() { return cachedRows; }
         public String sourceSQL() { return sourceSQL; }
         public String checkOption() { return checkOption; }
+        public Map<String, String> reloptions() { return reloptions; }
 
         @Override
         public boolean equals(Object o) {

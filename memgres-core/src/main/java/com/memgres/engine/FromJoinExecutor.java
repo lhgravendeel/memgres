@@ -132,11 +132,20 @@ class FromJoinExecutor {
                 }
                 if (!matched && isLeft) {
                     String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
-                    List<Column> cols = funcFrom.columnAliases() != null
-                            ? funcFrom.columnAliases().stream()
+                    List<Column> cols;
+                    // For JSON_TABLE, extract column definitions from the JsonTableExpr
+                    if (funcFrom.functionName().equals("__json_table__") && !funcFrom.args().isEmpty()
+                            && funcFrom.args().get(0) instanceof JsonTableExpr) {
+                        JsonTableExpr jt = (JsonTableExpr) funcFrom.args().get(0);
+                        cols = new ArrayList<>();
+                        collectJsonTableNullCols(jt.columns, cols);
+                    } else if (funcFrom.columnAliases() != null) {
+                        cols = funcFrom.columnAliases().stream()
                                 .map(cn -> new Column(cn, DataType.TEXT, true, false, null))
-                                .collect(java.util.stream.Collectors.toList())
-                            : Cols.listOf();
+                                .collect(java.util.stream.Collectors.toList());
+                    } else {
+                        cols = Cols.listOf();
+                    }
                     Table virtualTable = new Table(alias, cols);
                     Object[] nullRow = new Object[cols.size()];
                     RowContext rightCtx = new RowContext(virtualTable, alias, nullRow);
@@ -619,5 +628,16 @@ class FromJoinExecutor {
             }
         }
         return sb.toString();
+    }
+
+    /** Recursively collect leaf column definitions from JSON_TABLE columns for null-padded LEFT JOIN rows. */
+    private void collectJsonTableNullCols(List<JsonTableExpr.JsonTableColumn> columns, List<Column> cols) {
+        for (JsonTableExpr.JsonTableColumn col : columns) {
+            if (col.nestedColumns != null) {
+                collectJsonTableNullCols(col.nestedColumns, cols);
+            } else {
+                cols.add(new Column(col.name, col.forOrdinality ? DataType.INTEGER : DataType.TEXT, true, false, null));
+            }
+        }
     }
 }

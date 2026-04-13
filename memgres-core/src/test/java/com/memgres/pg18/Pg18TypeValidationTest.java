@@ -551,8 +551,9 @@ class Pg18TypeValidationTest {
     // =========================================================================
 
     @Test
-    void unionTypeMismatch_intAndText_shouldFail42804() {
-        assertSqlError("SELECT 1 UNION SELECT 'a'", "42804");
+    void unionTypeMismatch_intAndText_shouldFail22P02() {
+        // PG 18: treats 'a' as unknown, attempts coercion to int, fails with 22P02
+        assertSqlError("SELECT 1 UNION SELECT 'a'", "22P02");
     }
 
     @Test

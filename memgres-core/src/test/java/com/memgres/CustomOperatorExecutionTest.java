@@ -1702,14 +1702,15 @@ class CustomOperatorExecutionTest {
 
     void virtualColumnRejectsVolatileUserFunction() throws SQLException {
         // A virtual generated column using a VOLATILE user function should be rejected
-        // PG 18: ERROR 42P17 "generation expression is not immutable"
+        // PG 18: ERROR 0A000 "generation expression uses user-defined function"
+        // (PG checks UDF restriction before immutability for virtual columns)
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION my_vol_fn(a integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a * 2; END; $$ LANGUAGE plpgsql VOLATILE");
 
             SQLException ex = assertThrows(SQLException.class,
                     () -> stmt.execute("CREATE TABLE vol_fn_gen (x int, y int GENERATED ALWAYS AS (my_vol_fn(x)) VIRTUAL)"));
-            assertEquals("42P17", ex.getSQLState());
+            assertEquals("0A000", ex.getSQLState());
         }
     }
 
@@ -1717,14 +1718,15 @@ class CustomOperatorExecutionTest {
 
     void virtualColumnRejectsStableUserFunction() throws SQLException {
         // A virtual generated column using a STABLE user function should be rejected
-        // PG 18: ERROR 42P17 "generation expression is not immutable"
+        // PG 18: ERROR 0A000 "generation expression uses user-defined function"
+        // (PG checks UDF restriction before immutability for virtual columns)
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION my_stab_fn(a integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a * 2; END; $$ LANGUAGE plpgsql STABLE");
 
             SQLException ex = assertThrows(SQLException.class,
                     () -> stmt.execute("CREATE TABLE stab_fn_gen (x int, y int GENERATED ALWAYS AS (my_stab_fn(x)) VIRTUAL)"));
-            assertEquals("42P17", ex.getSQLState());
+            assertEquals("0A000", ex.getSQLState());
         }
     }
 

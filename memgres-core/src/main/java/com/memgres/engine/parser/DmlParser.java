@@ -227,9 +227,14 @@ class DmlParser {
         List<InsertStmt.SetClause> clauses = new ArrayList<>();
         do {
             String col = parser.readIdentifier();
+            String subField = null;
+            // Check for composite field update: col.field = value
+            if (parser.match(TokenType.DOT)) {
+                subField = parser.readIdentifier();
+            }
             parser.expect(TokenType.EQUALS);
             Expression val = parser.parseExpression();
-            clauses.add(new InsertStmt.SetClause(col, val));
+            clauses.add(new InsertStmt.SetClause(col, val, subField));
         } while (parser.match(TokenType.COMMA));
         return clauses;
     }

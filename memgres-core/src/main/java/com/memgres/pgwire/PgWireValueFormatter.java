@@ -201,6 +201,7 @@ class PgWireValueFormatter {
      * For unconstrained types: -1
      */
     static int pgTypeMod(Column col) {
+        if (col.getType() == null) return -1;
         Integer precision = col.getPrecision();
         Integer scale = col.getScale();
         switch (col.getType()) {
@@ -231,8 +232,9 @@ class PgWireValueFormatter {
             writeCString(buf, col.getName());
             buf.writeInt(col.getTableOid());
             buf.writeShort(col.getAttNum());
-            buf.writeInt(col.getType().getOid());
-            buf.writeShort(pgTypeSize(col.getType()));
+            DataType colType = col.getType() != null ? col.getType() : DataType.TEXT;
+            buf.writeInt(colType.getOid());
+            buf.writeShort(pgTypeSize(colType));
             buf.writeInt(pgTypeMod(col));
             buf.writeShort(0); // format code (0 = text)
         }

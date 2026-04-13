@@ -358,6 +358,10 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             sendErrorSimple(ctx, "XX000", "Internal error: " + e.getMessage());
         }
         if (!copyHandler.inCopyFromMode) {
+            // In autocommit mode, reset failed transaction state (PG auto-rolls back)
+            if (session != null && session.isFailed() && !session.isExplicitTransactionBlock()) {
+                session.rollback();
+            }
             sendReadyForQuery(ctx, session);
         }
     }
@@ -646,6 +650,10 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             QueryResult result;
             String source;
 
+            // Set session state to 'active' during query execution (matches PG behavior
+            // for pg_stat_activity). This mirrors what the Simple Query path does.
+            if (session != null) session.setQueryState(portal.sql());
+
             if (portal.suspendedResult != null) {
                 result = portal.suspendedResult;
                 source = "suspended";
@@ -701,7 +709,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     sendCommandCompleteWithNotices(ctx, "SELECT " + allRows.size());
                 }
             } else {
-                sendResultDataOnly(ctx, result, portal.resultFormatCodes());
+                // CALL with OUT params: PG sends RowDescription during Execute (not Describe)
+                String upperSql = PgWireDescribeHelper.stripLeadingComments(portal.sql()).toUpperCase();
+                if (upperSql.startsWith("CALL") && result.getType() == QueryResult.Type.SELECT
+                        && !result.getColumns().isEmpty() && !portal.rowDescriptionSent) {
+                    sendRowDescription(ctx, result);
+                    for (Object[] row : result.getRows()) sendDataRow(ctx, row, result.getColumns(), portal.resultFormatCodes());
+                    sendCommandCompleteWithNotices(ctx, "CALL");
+                } else {
+                    sendResultDataOnly(ctx, result, portal.resultFormatCodes());
+                }
             }
         } catch (MemgresException e) {
             LOG.warn("[PROTO] Execute ERROR {}: {} | {}", e.getSqlState(), e.getMessage(), sqlSnip);
@@ -717,12 +734,18 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         } catch (Exception e) {
             LOG.error("[PROTO] Execute INTERNAL ERROR: {} | {}", e.getMessage(), sqlSnip, e);
             sendExtendedError(ctx, "XX000", "Internal error: " + e.getMessage());
+        } finally {
+            if (session != null) session.setIdleState();
         }
     }
 
     private void handleSync(ChannelHandlerContext ctx) {
         rowDescSentByDescribe = false;
         errorPendingUntilSync = false;
+        // In autocommit mode, reset failed transaction state (PG auto-rolls back)
+        if (session != null && session.isFailed() && !session.isExplicitTransactionBlock()) {
+            session.rollback();
+        }
         sendReadyForQuery(ctx, session);
     }
 
@@ -1053,11 +1076,30 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     // ---- Statement splitting ----
 
+    /**
+     * Check if the word at position i in sql matches the given keyword (case-insensitive),
+     * and is bounded by non-identifier characters on both sides.
+     */
+    private static boolean matchWordAt(String sql, int i, String keyword) {
+        int len = keyword.length();
+        if (i + len > sql.length()) return false;
+        if (!sql.regionMatches(true, i, keyword, 0, len)) return false;
+        // Check boundary before
+        if (i > 0 && Character.isLetterOrDigit(sql.charAt(i - 1))) return false;
+        // Check boundary after
+        if (i + len < sql.length() && (Character.isLetterOrDigit(sql.charAt(i + len)) || sql.charAt(i + len) == '_')) return false;
+        return true;
+    }
+
     private String[] splitStatements(String sql) {
         java.util.List<String> statements = new java.util.ArrayList<>();
         StringBuilder current = new StringBuilder();
         boolean inString = false;
         char stringChar = 0;
+        // Track BEGIN ATOMIC ... END blocks so semicolons inside are not treated as statement separators.
+        // caseDepth counts nested CASE expressions whose END should not close the block.
+        boolean inBeginAtomic = false;
+        int caseDepth = 0;
 
         for (int i = 0; i < sql.length(); i++) {
             char c = sql.charAt(i);
@@ -1149,10 +1191,45 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 current.append(sql, i, eol);
                 i = eol - 1;
             } else if (c == ';') {
-                String stmt = current.toString().trim();
-                if (!stmt.isEmpty()) statements.add(stmt);
-                current = new StringBuilder();
+                if (inBeginAtomic) {
+                    // Inside BEGIN ATOMIC block — semicolons are part of the body, not statement separators
+                    current.append(c);
+                } else {
+                    String stmt = current.toString().trim();
+                    if (!stmt.isEmpty()) statements.add(stmt);
+                    current = new StringBuilder();
+                    inBeginAtomic = false;
+                    caseDepth = 0;
+                }
             } else {
+                // Detect BEGIN ATOMIC, CASE, and END keywords to track block nesting
+                if (!inString && Character.isLetter(c)) {
+                    if (inBeginAtomic) {
+                        if (matchWordAt(sql, i, "CASE")) {
+                            caseDepth++;
+                        } else if (matchWordAt(sql, i, "END")) {
+                            if (caseDepth > 0) {
+                                caseDepth--;
+                            } else {
+                                // This END closes the BEGIN ATOMIC block
+                                current.append(sql, i, i + 3);
+                                i += 2; // advance past "END" (loop will i++ once more)
+                                inBeginAtomic = false;
+                                caseDepth = 0;
+                                continue;
+                            }
+                        }
+                    } else if (matchWordAt(sql, i, "BEGIN")) {
+                        // Check if followed by ATOMIC
+                        int afterBegin = i + 5; // length of "BEGIN"
+                        // Skip whitespace
+                        while (afterBegin < sql.length() && Character.isWhitespace(sql.charAt(afterBegin))) afterBegin++;
+                        if (matchWordAt(sql, afterBegin, "ATOMIC")) {
+                            inBeginAtomic = true;
+                            caseDepth = 0;
+                        }
+                    }
+                }
                 current.append(c);
             }
         }

@@ -326,17 +326,36 @@ class ExprSpecialFormParser {
         else if (ep.matchKeyword("RANGE")) frameType = WindowFuncExpr.FrameType.RANGE;
         else { ep.expectKeyword("GROUPS"); frameType = WindowFuncExpr.FrameType.GROUPS; }
 
+        WindowFuncExpr.FrameBound start, end;
         if (ep.matchKeyword("BETWEEN")) {
-            WindowFuncExpr.FrameBound start = parseFrameBound();
+            start = parseFrameBound();
             ep.expectKeyword("AND");
-            WindowFuncExpr.FrameBound end = parseFrameBound();
-            return new WindowFuncExpr.FrameClause(frameType, start, end);
+            end = parseFrameBound();
         } else {
-            WindowFuncExpr.FrameBound start = parseFrameBound();
-            WindowFuncExpr.FrameBound end = new WindowFuncExpr.FrameBound(
+            start = parseFrameBound();
+            end = new WindowFuncExpr.FrameBound(
                     WindowFuncExpr.FrameBoundType.CURRENT_ROW, null);
-            return new WindowFuncExpr.FrameClause(frameType, start, end);
         }
+
+        // Parse optional EXCLUDE clause
+        WindowFuncExpr.ExcludeMode excludeMode = null;
+        if (ep.matchKeyword("EXCLUDE")) {
+            if (ep.matchKeyword("CURRENT")) {
+                ep.expectKeyword("ROW");
+                excludeMode = WindowFuncExpr.ExcludeMode.CURRENT_ROW;
+            } else if (ep.matchKeyword("TIES")) {
+                excludeMode = WindowFuncExpr.ExcludeMode.TIES;
+            } else if (ep.matchKeyword("GROUP")) {
+                excludeMode = WindowFuncExpr.ExcludeMode.GROUP;
+            } else if (ep.matchKeyword("NO")) {
+                ep.expectKeyword("OTHERS");
+                excludeMode = WindowFuncExpr.ExcludeMode.NO_OTHERS;
+            } else {
+                throw new RuntimeException("Expected CURRENT ROW, TIES, GROUP, or NO OTHERS after EXCLUDE");
+            }
+        }
+
+        return new WindowFuncExpr.FrameClause(frameType, start, end, excludeMode);
     }
 
     private WindowFuncExpr.FrameBound parseFrameBound() {
@@ -403,18 +422,11 @@ class ExprSpecialFormParser {
         if (opTok.type() == TokenType.EOF || opTok.type() == TokenType.RIGHT_PAREN) {
             throw new ParseException("Expected operator symbol", opTok);
         }
+        // PG reads exactly ONE operator token (the lexer already applies tokenization
+        // rules, e.g. +++ becomes +, +, + but ~~> stays as one token).
         String opSymbol = opTok.value();
         ep.advance();
-        StringBuilder opBuilder = new StringBuilder(opSymbol);
-        while (!ep.check(TokenType.RIGHT_PAREN) && !ep.isAtEnd()) {
-            opBuilder.append(ep.peek().value());
-            ep.advance();
-        }
-        opSymbol = opBuilder.toString().trim();
         ep.expect(TokenType.RIGHT_PAREN);
-        if (schema != null && !schema.equalsIgnoreCase("pg_catalog") && !schema.equalsIgnoreCase("public")) {
-            throw new com.memgres.engine.MemgresException("schema \"" + schema + "\" does not exist", "3F000");
-        }
         return new OperatorSpec(schema, opSymbol);
     }
 
@@ -486,7 +498,12 @@ class ExprSpecialFormParser {
         }
 
         Expression rhs = ep.parseAddition();
-        return new BinaryExpr(left, binOp, rhs);
+        Expression result = new BinaryExpr(left, binOp, rhs);
+        // Wrap in QualifiedOperatorExpr to preserve schema for validation at runtime
+        if (spec.schema != null) {
+            result = new QualifiedOperatorExpr(spec.schema, spec.opSymbol, result);
+        }
+        return result;
     }
 
     /** Parse OPERATOR(schema.op)(arg1[, arg2]) in prefix/function-call position. */
@@ -887,11 +904,13 @@ class ExprSpecialFormParser {
         }
         List<Expression> args = new ArrayList<>();
         boolean nullOnNull = false;
-        boolean keyValueSyntax = ep.checkKeyword("KEY");
+        // Support both KEY...VALUE and key : value syntax
+        boolean useKeyValueSyntax = ep.checkKeyword("KEY");
         do {
             Expression key;
             Expression val;
-            if (ep.matchKeyword("KEY")) {
+            if (useKeyValueSyntax) {
+                ep.expectKeyword("KEY");
                 key = ep.parseExpression();
                 ep.expectKeyword("VALUE");
                 val = ep.parseExpression();

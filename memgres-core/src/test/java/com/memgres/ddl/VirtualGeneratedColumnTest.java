@@ -581,7 +581,7 @@ class VirtualGeneratedColumnTest {
     void reject_default_plus_generated() {
         SQLException ex = assertThrows(SQLException.class, () ->
                 exec("CREATE TABLE t1(id int PRIMARY KEY, a int DEFAULT 1 GENERATED ALWAYS AS (a + 1) VIRTUAL)"));
-        assertTrue(ex.getMessage().contains("generated column") || ex.getMessage().contains("default value"),
+        assertTrue(ex.getMessage().contains("generation expression") || ex.getMessage().contains("default"),
                 "Expected error about generated column + default, got: " + ex.getMessage());
     }
 
@@ -589,7 +589,7 @@ class VirtualGeneratedColumnTest {
     void reject_default_plus_stored_generated() {
         SQLException ex = assertThrows(SQLException.class, () ->
                 exec("CREATE TABLE t1(id int PRIMARY KEY, a int DEFAULT 1 GENERATED ALWAYS AS (a + 1) STORED)"));
-        assertTrue(ex.getMessage().contains("generated column") || ex.getMessage().contains("default value"),
+        assertTrue(ex.getMessage().contains("generation expression") || ex.getMessage().contains("default"),
                 "Expected error about generated column + default, got: " + ex.getMessage());
     }
 

@@ -96,7 +96,7 @@ class DdlFunctionParser {
         if (parser.matchKeyword("RETURNS")) {
             if (parser.checkKeyword("SETOF")) {
                 parser.advance();
-                returnType = "SETOF " + parser.readIdentifier();
+                returnType = "SETOF " + parser.parseTypeName();
             } else if (parser.checkKeyword("TABLE")) {
                 parser.advance();
                 returnType = "TABLE";
@@ -109,7 +109,7 @@ class DdlFunctionParser {
                 }
                 parser.expect(TokenType.RIGHT_PAREN);
             } else {
-                returnType = parser.readIdentifier();
+                returnType = parser.parseTypeName();
             }
         }
 
@@ -139,10 +139,18 @@ class DdlFunctionParser {
 
         // SQL-standard function body: RETURN expr or BEGIN ATOMIC ... END (PG 14+)
         if (body == null && parser.checkKeyword("RETURN")) {
+            // PG: inline SQL function body only valid for language SQL
+            if (!"sql".equalsIgnoreCase(language)) {
+                throw new ParseException("inline SQL function body only valid for language SQL", parser.peek(), "42P13");
+            }
             parser.advance();
             body = readSqlStandardReturn();
             language = "sql";
         } else if (body == null && parser.checkKeyword("BEGIN") && isBeginAtomic()) {
+            // PG: inline SQL function body only valid for language SQL
+            if (!"sql".equalsIgnoreCase(language)) {
+                throw new ParseException("inline SQL function body only valid for language SQL", parser.peek(), "42P13");
+            }
             body = readBeginAtomicBody();
             language = "sql";
         }
@@ -155,6 +163,10 @@ class DdlFunctionParser {
     CallStmt parseCall() {
         parser.expectKeyword("CALL");
         String name = parser.readIdentifier();
+        // Support schema-qualified procedure names: schema.procedure(...)
+        if (parser.match(TokenType.DOT)) {
+            name = name + "." + parser.readIdentifier();
+        }
         parser.expect(TokenType.LEFT_PAREN);
         List<Expression> args = new ArrayList<>();
         if (!parser.check(TokenType.RIGHT_PAREN)) {
@@ -210,10 +222,12 @@ class DdlFunctionParser {
         parser.expectKeyword("ATOMIC");
         StringBuilder sb = new StringBuilder();
         int depth = 0;
+        boolean foundEnd = false;
         while (!parser.isAtEnd()) {
             // END at depth 0 terminates the block
             if (parser.checkKeyword("END") && depth == 0) {
                 parser.advance(); // consume END
+                foundEnd = true;
                 break;
             }
             // Track nested BEGIN/END (e.g., CASE ... END)
@@ -226,6 +240,9 @@ class DdlFunctionParser {
             } else {
                 sb.append(t.value());
             }
+        }
+        if (!foundEnd) {
+            throw new ParseException("unterminated BEGIN ATOMIC block — missing END", parser.peek());
         }
         return sb.toString().trim();
     }

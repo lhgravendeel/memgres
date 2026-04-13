@@ -9,6 +9,7 @@ public final class DropStmt implements Statement {
     public final String onTable;
     public final boolean ifExists;
     public final boolean cascade;
+    public final java.util.List<String> paramTypes;
 
     public DropStmt(
             ObjectType objectType,
@@ -17,11 +18,23 @@ public final class DropStmt implements Statement {
             boolean ifExists,
             boolean cascade
     ) {
+        this(objectType, name, onTable, ifExists, cascade, null);
+    }
+
+    public DropStmt(
+            ObjectType objectType,
+            String name,
+            String onTable,
+            boolean ifExists,
+            boolean cascade,
+            java.util.List<String> paramTypes
+    ) {
         this.objectType = objectType;
         this.name = name;
         this.onTable = onTable;
         this.ifExists = ifExists;
         this.cascade = cascade;
+        this.paramTypes = paramTypes;
     }
 
     public enum ObjectType {
@@ -35,6 +48,7 @@ public final class DropStmt implements Statement {
     public String onTable() { return onTable; }
     public boolean ifExists() { return ifExists; }
     public boolean cascade() { return cascade; }
+    public java.util.List<String> paramTypes() { return paramTypes; }
 
     @Override
     public boolean equals(Object o) {

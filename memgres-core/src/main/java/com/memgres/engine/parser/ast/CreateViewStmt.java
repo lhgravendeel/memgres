@@ -1,6 +1,7 @@
 package com.memgres.engine.parser.ast;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -16,9 +17,16 @@ public final class CreateViewStmt implements Statement {
     public final List<String> columnNames;
     public final boolean withData;
     public final String checkOption;
+    public final Map<String, String> withOptions;
 
     public CreateViewStmt(String name, Statement query, boolean orReplace, boolean materialized,
                           List<String> columnNames, boolean withData, String checkOption) {
+        this(name, query, orReplace, materialized, columnNames, withData, checkOption, null);
+    }
+
+    public CreateViewStmt(String name, Statement query, boolean orReplace, boolean materialized,
+                          List<String> columnNames, boolean withData, String checkOption,
+                          Map<String, String> withOptions) {
         this.name = name;
         this.query = query;
         this.orReplace = orReplace;
@@ -26,6 +34,7 @@ public final class CreateViewStmt implements Statement {
         this.columnNames = columnNames;
         this.withData = withData;
         this.checkOption = checkOption;
+        this.withOptions = withOptions;
     }
 
     /** Backward-compatible constructor (no check option) */
@@ -45,6 +54,7 @@ public final class CreateViewStmt implements Statement {
     public List<String> columnNames() { return columnNames; }
     public boolean withData() { return withData; }
     public String checkOption() { return checkOption; }
+    public Map<String, String> withOptions() { return withOptions; }
 
     @Override
     public boolean equals(Object o) {

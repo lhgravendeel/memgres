@@ -104,6 +104,13 @@ class CompositeTypeHandler {
             }
             return null;
         }
+        if (val instanceof java.util.Map) {
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> map = (java.util.Map<String, Object>) val;
+            Object fieldVal = map.get(fieldName.toLowerCase());
+            if (fieldVal == null) fieldVal = map.get(fieldName);
+            return fieldVal;
+        }
         if (val instanceof String && ((String) val).startsWith("(") && ((String) val).endsWith(")")) {
             String s = (String) val;
             List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);

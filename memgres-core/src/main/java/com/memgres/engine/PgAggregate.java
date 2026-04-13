@@ -14,6 +14,7 @@ public class PgAggregate {
     private final String combinefunc; // combine function for parallel aggregation (may be null)
     private final String sortop;      // sort operator (may be null)
     private final String[] argTypes;  // argument types for the aggregate
+    private String schemaName;        // schema where the aggregate is defined
 
     public PgAggregate(String name, String sfunc, String stype, String initcond,
                        String finalfunc, String combinefunc, String sortop, String[] argTypes) {
@@ -35,4 +36,6 @@ public class PgAggregate {
     public String getCombinefunc() { return combinefunc; }
     public String getSortop() { return sortop; }
     public String[] getArgTypes() { return argTypes; }
+    public String getSchemaName() { return schemaName; }
+    public void setSchemaName(String schemaName) { this.schemaName = schemaName; }
 }

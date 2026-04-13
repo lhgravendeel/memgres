@@ -44,7 +44,7 @@ class PgWireDescribeHelper {
 
         // DML with RETURNING: infer columns from table schema
         String upper = stripLeadingComments(sql).toUpperCase();
-        if (upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE"))) {
+        if (upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || upper.startsWith("MERGE"))) {
             List<Column> returningCols = inferReturningColumns(sql);
             if (returningCols != null) {
                 sendRowDescription(ctx, QueryResult.select(returningCols, Cols.listOf()));
@@ -80,6 +80,17 @@ class PgWireDescribeHelper {
             } catch (Exception e) {
                 LOG.debug("Failed to describe SHOW: {}", e.getMessage());
             }
+        }
+
+        // CALL with OUT/INOUT params: infer columns from procedure definition
+        if (upperSql.startsWith("CALL")) {
+            List<Column> callCols = inferCallOutColumns(sql);
+            if (callCols != null) {
+                sendRowDescription(ctx, QueryResult.select(callCols, Cols.listOf()));
+                return true;
+            }
+            sendNoData(ctx);
+            return false;
         }
 
         // SELECT (safe to describe): use LIMIT 0 to get column metadata
@@ -139,7 +150,7 @@ class PgWireDescribeHelper {
 
         // DML with RETURNING
         String upper = stripLeadingComments(sql).toUpperCase();
-        boolean isDmlReturning = upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE"));
+        boolean isDmlReturning = upper.contains("RETURNING") && (upper.startsWith("INSERT") || upper.startsWith("UPDATE") || upper.startsWith("DELETE") || upper.startsWith("MERGE"));
         boolean isCteDmlReturning = upper.startsWith("WITH") && !isWithSelect(upper) && upper.contains("RETURNING");
         if (isDmlReturning || isCteDmlReturning) {
             if (isDmlReturning) {
@@ -160,6 +171,50 @@ class PgWireDescribeHelper {
             } catch (Exception e) {
                 LOG.warn("[PROTO] Describe Portal DML exec failed: {} | {}", e.getMessage(), sqlSnip);
             }
+        }
+
+        // CALL: check for OUT/INOUT params by inspecting procedure signature without executing.
+        // Only execute during Describe if the procedure has OUT/INOUT params (needs RowDescription).
+        // For procedures without OUT/INOUT params, send NoData and let Execute handle the actual call.
+        if (upper.startsWith("CALL")) {
+            boolean hasOutParams = false;
+            try {
+                // Parse the CALL to get procedure name and look up its signature
+                String callBody = sql.substring(4).trim();
+                String procName = callBody.split("\\s*\\(", 2)[0].trim();
+                com.memgres.engine.PgFunction proc;
+                if (procName.contains(".")) {
+                    String[] parts = procName.split("\\.", 2);
+                    proc = session.getDatabase().getFunction(parts[0], parts[1]);
+                } else {
+                    proc = session.getDatabase().getFunction(procName);
+                }
+                if (proc != null) {
+                    for (com.memgres.engine.PgFunction.Param p : proc.getParams()) {
+                        String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+                        if ("OUT".equals(mode) || "INOUT".equals(mode)) {
+                            hasOutParams = true;
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // Fallback: if we can't determine, don't execute during Describe
+            }
+            if (hasOutParams) {
+                try {
+                    QueryResult result = session.execute(sql, paramValues);
+                    if (result.getType() == QueryResult.Type.SELECT && !result.getColumns().isEmpty()) {
+                        sendRowDescription(ctx, QueryResult.select(result.getColumns(), Cols.listOf()));
+                        if (Memgres.logAllStatements) LOG.info("[PROTO] Describe Portal → RowDesc (CALL OUT, {} cols) {}", result.getColumns().size(), sqlSnip);
+                        return new DescribePortalResult(true, result);
+                    }
+                } catch (Exception e) {
+                    LOG.debug("[PROTO] Describe Portal CALL exec failed: {} | {}", e.getMessage(), sqlSnip);
+                }
+            }
+            sendNoData(ctx);
+            return new DescribePortalResult(false, null);
         }
 
         if (isSafeToDescribe(sql)) {
@@ -318,6 +373,45 @@ class PgWireDescribeHelper {
             }
         }
         return true;
+    }
+
+    // ---- CALL OUT param inference ----
+
+    /**
+     * For CALL statements, look up the procedure and check for OUT/INOUT params.
+     * Returns column metadata if the procedure has OUT params, null otherwise.
+     */
+    private List<Column> inferCallOutColumns(String sql) {
+        try {
+            String stripped = stripLeadingComments(sql).trim();
+            // Extract procedure name from "CALL proc_name(...)"
+            String afterCall = stripped.substring(4).trim(); // skip "CALL"
+            int parenIdx = afterCall.indexOf('(');
+            if (parenIdx < 0) return null;
+            String procName = afterCall.substring(0, parenIdx).trim().toLowerCase();
+            // Look up the function/procedure
+            PgFunction func;
+            if (procName.contains(".")) {
+                String[] parts = procName.split("\\.", 2);
+                func = database.getFunction(parts[0], parts[1]);
+            } else {
+                func = database.getFunction(procName);
+            }
+            if (func == null || !func.isProcedure()) return null;
+            // Collect OUT/INOUT params
+            List<Column> outCols = new ArrayList<>();
+            for (PgFunction.Param p : func.getParams()) {
+                String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+                if ("OUT".equals(mode) || "INOUT".equals(mode)) {
+                    String colName = p.name() != null ? p.name() : "column" + (outCols.size() + 1);
+                    outCols.add(new Column(colName, DataType.TEXT, true, false, null));
+                }
+            }
+            return outCols.isEmpty() ? null : outCols;
+        } catch (Exception e) {
+            LOG.debug("Failed to infer CALL OUT columns: {}", e.getMessage());
+            return null;
+        }
     }
 
     // ---- Column inference ----

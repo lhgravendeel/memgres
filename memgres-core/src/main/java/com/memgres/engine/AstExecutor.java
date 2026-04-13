@@ -634,7 +634,36 @@ public class AstExecutor {
 
     // ---- ALTER FUNCTION / ALTER PROCEDURE ----
 
+    /**
+     * Resolve the function/procedure targeted by an ALTER FUNCTION/PROCEDURE statement,
+     * matching by name and optionally by parameter type signature.
+     */
     private PgFunction resolveAlterFunction(AlterFunctionStmt stmt) {
+        java.util.List<String> paramTypes = stmt.paramTypes();
+        if (paramTypes != null) {
+            // Signature-based resolution: match by name and parameter types
+            java.util.List<PgFunction> overloads = stmt.schema() != null
+                ? database.getFunctionOverloads(stmt.name()).stream()
+                    .filter(f -> stmt.schema().equalsIgnoreCase(f.getSchemaName()))
+                    .collect(java.util.stream.Collectors.toList())
+                : database.getFunctionOverloads(stmt.name());
+            for (PgFunction f : overloads) {
+                java.util.List<String> fTypes = f.getParams().stream()
+                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
+                    .map(PgFunction.Param::typeName)
+                    .collect(java.util.stream.Collectors.toList());
+                if (fTypes.size() != paramTypes.size()) continue;
+                boolean match = true;
+                for (int i = 0; i < fTypes.size(); i++) {
+                    if (!database.typesCompatible(fTypes.get(i), paramTypes.get(i))) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) return f;
+            }
+            return null; // no matching overload
+        }
         return stmt.schema() != null
             ? database.getFunction(stmt.schema(), stmt.name())
             : database.getFunction(stmt.name());
@@ -651,10 +680,35 @@ public class AstExecutor {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
                     throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
                 }
-                if (database.getFunction(stmt.targetValue()) != null) {
-                    throw new MemgresException(kind + " " + stmt.targetValue() + " already exists", "42723");
+                // Check for name conflict: target name must not already exist with compatible signature
+                java.util.List<PgFunction> existingTarget = database.getFunctionOverloads(stmt.targetValue());
+                if (!existingTarget.isEmpty()) {
+                    // Check if there's a conflict (same param types)
+                    java.util.List<String> funcParamTypes = func.getParams().stream()
+                        .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
+                        .map(PgFunction.Param::typeName)
+                        .collect(java.util.stream.Collectors.toList());
+                    for (PgFunction existing : existingTarget) {
+                        java.util.List<String> existingParamTypes = existing.getParams().stream()
+                            .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
+                            .map(PgFunction.Param::typeName)
+                            .collect(java.util.stream.Collectors.toList());
+                        if (funcParamTypes.size() == existingParamTypes.size()) {
+                            boolean match = true;
+                            for (int i = 0; i < funcParamTypes.size(); i++) {
+                                if (!database.typesCompatible(funcParamTypes.get(i), existingParamTypes.get(i))) {
+                                    match = false;
+                                    break;
+                                }
+                            }
+                            if (match) {
+                                throw new MemgresException(kind + " " + stmt.targetValue() + " already exists", "42723");
+                            }
+                        }
+                    }
                 }
-                database.renameFunction(stmt.name(), stmt.targetValue());
+                // Rename only this specific overload, not all overloads
+                database.renameFunctionOverload(func, stmt.targetValue());
                 return QueryResult.message(QueryResult.Type.SET, tag);
             }
             case SET_SCHEMA: {
@@ -695,12 +749,40 @@ public class AstExecutor {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
                     throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
                 }
+                // Record undo for transactional rollback
+                if (session != null && session.getStatus() == Session.TransactionStatus.IN_TRANSACTION) {
+                    final String oldVolatility = func.getVolatility();
+                    final boolean oldStrict = func.isStrict();
+                    final boolean oldSecDef = func.isSecurityDefiner();
+                    final boolean oldLeakproof = func.isLeakproof();
+                    final double oldCost = func.getCost();
+                    final double oldRows = func.getRows();
+                    final String oldParallel = func.getParallel();
+                    final java.util.Map<String, String> oldSetClauses = func.getSetClauses() != null
+                        ? new java.util.LinkedHashMap<>(func.getSetClauses()) : null;
+                    final PgFunction undoFunc = func;
+                    session.recordUndo(db -> {
+                        undoFunc.setVolatility(oldVolatility);
+                        undoFunc.setStrict(oldStrict);
+                        undoFunc.setSecurityDefiner(oldSecDef);
+                        undoFunc.setLeakproof(oldLeakproof);
+                        undoFunc.setCost(oldCost);
+                        undoFunc.setRows(oldRows);
+                        undoFunc.setParallel(oldParallel);
+                        undoFunc.setSetClauses(oldSetClauses);
+                    });
+                }
                 if (stmt.volatility() != null) func.setVolatility(stmt.volatility());
                 if (stmt.strict() != null) func.setStrict(stmt.strict());
                 if (stmt.securityDefiner() != null) func.setSecurityDefiner(stmt.securityDefiner());
                 if (stmt.leakproof() != null) func.setLeakproof(stmt.leakproof());
                 if (stmt.cost() != null) func.setCost(stmt.cost());
-                if (stmt.rows() != null) func.setRows(stmt.rows());
+                // ROWS: only store for set-returning functions (proretset=true); PG ignores ROWS for scalar functions
+                if (stmt.rows() != null && func.getReturnType() != null
+                        && (func.getReturnType().toUpperCase().startsWith("SETOF")
+                            || func.getReturnType().toUpperCase().contains("TABLE"))) {
+                    func.setRows(stmt.rows());
+                }
                 if (stmt.parallel() != null) func.setParallel(stmt.parallel());
                 if (stmt.setClauses() != null) {
                     java.util.Map<String, String> existing = func.getSetClauses();
@@ -728,19 +810,59 @@ public class AstExecutor {
         }
     }
 
+    /** Rename a PK/UNIQUE constraint-backed index. Returns true if found and renamed. */
+    private boolean renameConstraintIndex(String oldName, String newName) {
+        String oldLower = oldName.toLowerCase();
+        for (java.util.Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
+            for (java.util.Map.Entry<String, Table> te : se.getValue().getTables().entrySet()) {
+                for (StoredConstraint sc : te.getValue().getConstraints()) {
+                    if ((sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE)
+                            && sc.getName().toLowerCase().equals(oldLower)) {
+                        sc.setName(newName);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     // ---- ALTER INDEX ----
 
     private QueryResult executeAlterIndex(AlterIndexStmt stmt) {
         switch (stmt.action()) {
             case RENAME_TO: {
+                boolean found = database.hasIndex(stmt.name());
+                if (!found) {
+                    // Also check PK/UNIQUE constraint-backed indexes
+                    found = renameConstraintIndex(stmt.name(), stmt.targetValue());
+                }
+                if (!found) {
+                    if (database.hasIndex(stmt.name())) found = true;
+                }
+                if (!found) {
+                    if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+                    throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
+                }
+                if (database.hasIndex(stmt.name())) {
+                    if (database.hasIndex(stmt.targetValue())) {
+                        throw new MemgresException("relation \"" + stmt.targetValue() + "\" already exists", "42P07");
+                    }
+                    database.renameIndex(stmt.name(), stmt.targetValue());
+                }
+                return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+            }
+            case SET_PARAMS: {
                 if (!database.hasIndex(stmt.name())) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }
-                if (database.hasIndex(stmt.targetValue())) {
-                    throw new MemgresException("relation \"" + stmt.targetValue() + "\" already exists", "42P07");
+                if (stmt.params != null && !stmt.params.isEmpty()) {
+                    java.util.Map<String, String> existing = database.getIndexReloptions(stmt.name());
+                    java.util.Map<String, String> merged = existing != null ? new java.util.LinkedHashMap<>(existing) : new java.util.LinkedHashMap<>();
+                    merged.putAll(stmt.params);
+                    database.setIndexReloptions(stmt.name(), merged);
                 }
-                database.renameIndex(stmt.name(), stmt.targetValue());
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
             }
             default:

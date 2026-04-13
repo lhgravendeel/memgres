@@ -488,6 +488,12 @@ class ExprEvaluator {
      * Evaluate a prefix-style qualified operator expression: OPERATOR(schema.op)(args).
      */
     private Object evalQualifiedOperator(QualifiedOperatorExpr qop, RowContext ctx) {
+        // Validate explicit schema qualifier: OPERATOR(schema.op) — PG rejects if schema doesn't exist
+        if (qop.schema() != null && !"pg_catalog".equals(qop.schema())
+                && executor.database.getSchema(qop.schema()) == null) {
+            throw new MemgresException(
+                "schema \"" + qop.schema() + "\" does not exist", "3F000");
+        }
         // Check that search_path is valid because PG requires valid schemas for type resolution
         if (executor.session != null) {
             String searchPath = executor.session.getGucSettings().get("search_path");
@@ -512,6 +518,13 @@ class ExprEvaluator {
      * Looks up the PgOperator by name, resolves its backing function, and calls it.
      */
     private Object evalCustomOperator(CustomOperatorExpr cop, RowContext ctx) {
+        // Validate explicit schema qualifier: reject if schema doesn't exist (3F000)
+        if (cop.schema() != null && !"pg_catalog".equals(cop.schema())
+                && executor.database.getSchema(cop.schema()) == null) {
+            throw new MemgresException(
+                "schema \"" + cop.schema() + "\" does not exist", "3F000");
+        }
+
         Object leftVal = cop.left() != null ? evalExpr(cop.left(), ctx) : null;
         Object rightVal = evalExpr(cop.right(), ctx);
 
@@ -788,6 +801,10 @@ class ExprEvaluator {
                     if (!inner.isEmpty() && !inner.contains("\"") && !inner.contains(":")) {
                         return false; // object must have quoted keys with colons
                     }
+                    // Validate that keys are properly quoted (reject {key: value} syntax)
+                    if (!inner.isEmpty() && inner.contains(":") && !inner.trim().startsWith("\"")) {
+                        return false; // keys must be double-quoted in valid JSON
+                    }
                 }
                 return true;
             } catch (Exception e) { return false; }
@@ -795,7 +812,12 @@ class ExprEvaluator {
         // scalar values
         if (s.equals("true") || s.equals("false") || s.equals("null")) return true;
         if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) return true;
-        try { Double.parseDouble(s); return true; } catch (NumberFormatException e) {}
+        // Strict numeric validation: reject NaN, Infinity, etc.
+        try {
+            double d = Double.parseDouble(s);
+            if (Double.isNaN(d) || Double.isInfinite(d)) return false;
+            return true;
+        } catch (NumberFormatException e) {}
         return false;
     }
 
@@ -844,11 +866,19 @@ class ExprEvaluator {
         if (pathVal == null) return null;
         String json = inputVal.toString();
         String path = pathVal.toString().trim();
+        // PG: syntax errors in jsonpath always propagate (not caught by ON ERROR)
+        if (path.contains("..")) {
+            throw new MemgresException("syntax error at or near \".\" of jsonpath input", "42601");
+        }
+        if (path.contains("[[")) {
+            throw new MemgresException("syntax error at or near \"[\" of jsonpath input", "42601");
+        }
+        // PG: invalid JSON input always errors — the implicit cast to json/jsonb fails
+        // before JSON_EXISTS runs, so ON ERROR cannot catch it
+        if (!isValidJson(json)) {
+            throw new MemgresException("invalid input syntax for type json", "22P02");
+        }
         try {
-            if (!isValidJson(json)) {
-                if (je.onError() == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("invalid input for JSON_EXISTS", "22032");
-                return je.onError() == JsonExistsExpr.OnBehavior.TRUE_VAL ? true : false;
-            }
             // Substitute PASSING variables into path
             if (je.passing() != null && !je.passing().isEmpty()) {
                 for (Map.Entry<String, Expression> e : je.passing().entrySet()) {
@@ -871,6 +901,10 @@ class ExprEvaluator {
         if (pathVal == null) return null;
         String json = inputVal.toString();
         String path = pathVal.toString().trim();
+        // PG: invalid JSON input always throws an error regardless of ON ERROR behavior
+        if (!isValidJson(json)) {
+            throw new MemgresException("invalid input syntax for type json", "22P02");
+        }
         try {
             // Substitute PASSING variables
             if (jv.passing != null && !jv.passing.isEmpty()) {
@@ -882,6 +916,10 @@ class ExprEvaluator {
             List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
             if (results.isEmpty()) {
                 // ON EMPTY behavior
+                if (jv.onEmpty == JsonExistsExpr.OnBehavior.ERROR) {
+                    // ON EMPTY errors propagate directly (not caught by ON ERROR handler)
+                    throw new MemgresException("no SQL/JSON item found for specified path", "22035");
+                }
                 if (jv.defaultOnEmpty != null) return evalExpr(jv.defaultOnEmpty, ctx);
                 return null; // NULL ON EMPTY is default
             }
@@ -906,6 +944,8 @@ class ExprEvaluator {
             }
             return trimmed;
         } catch (MemgresException e) {
+            // ON EMPTY errors should always propagate
+            if (e.getSqlState() != null && e.getSqlState().equals("22035")) throw e;
             if (jv.onError == JsonExistsExpr.OnBehavior.ERROR) throw e;
             if (jv.defaultOnError != null) return evalExpr(jv.defaultOnError, ctx);
             return null;
@@ -926,22 +966,30 @@ class ExprEvaluator {
             }
             List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);
             if (results.isEmpty()) return handleJsonQueryOnEmpty(jq);
-            String result = results.get(0);
+            String result = results.get(0).trim();
+            // PG: JSON_QUERY normalizes output with spaces (jsonb output style)
+            result = JsonOperations.normalizeJsonb(result);
             // Wrapper behavior
             if (jq.wrapper == JsonQueryExpr.WrapperBehavior.WITH_WRAPPER) {
-                if (results.size() == 1) result = "[" + result + "]";
-                else result = "[" + String.join(", ", results) + "]";
+                List<String> trimmed = new ArrayList<>();
+                for (String r : results) {
+                    trimmed.add(JsonOperations.normalizeJsonb(r.trim()));
+                }
+                if (trimmed.size() == 1) result = "[" + trimmed.get(0) + "]";
+                else result = "[" + String.join(", ", trimmed) + "]";
             } else if (jq.wrapper == JsonQueryExpr.WrapperBehavior.WITH_CONDITIONAL_WRAPPER) {
                 String t = result.trim();
-                if (!t.startsWith("{") && !t.startsWith("[")) {
-                    result = "[" + result + "]";
-                }
+                // PG 17+: CONDITIONAL WRAPPER does NOT wrap scalars or single objects/arrays;
+                // it only wraps when multiple items would be returned
+                // Single scalars, objects, and arrays are returned as-is
             }
-            // Quotes behavior
+            // Quotes behavior — PG: OMIT QUOTES on a string scalar returns NULL
+            // because an unquoted string is not valid JSON
             if (jq.quotes == JsonQueryExpr.QuotesBehavior.OMIT) {
                 String t = result.trim();
                 if (t.startsWith("\"") && t.endsWith("\"")) {
-                    result = t.substring(1, t.length() - 1);
+                    // PG: OMIT QUOTES on a scalar string returns NULL (not valid JSON without quotes)
+                    return null;
                 }
             }
             return result;
@@ -1661,7 +1709,7 @@ class ExprEvaluator {
                 case BIT_STRING:
                     return DataType.BIT;
                 case NULL:
-                    return DataType.TEXT;
+                    return null;
                 case DEFAULT:
                     return DataType.TEXT;
             }
@@ -1713,7 +1761,7 @@ class ExprEvaluator {
         }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String name = fn.name().toLowerCase();
+            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
             if (name.equals("count") || name.equals("length") || name.equals("char_length")
                     || name.equals("octet_length") || name.equals("bit_length")
                     || name.equals("position") || name.equals("strpos")
@@ -1740,7 +1788,10 @@ class ExprEvaluator {
             if (name.equals("current_date") || name.equals("date_trunc")
                     || name.equals("to_date") || name.equals("make_date")) return DataType.DATE;
             if (name.equals("coalesce") || name.equals("nullif") || name.equals("greatest") || name.equals("least")) {
-                if (!fn.args().isEmpty()) return inferTypeFromContext(fn.args().get(0), bindings);
+                for (Expression arg : fn.args()) {
+                    DataType dt = inferTypeFromContext(arg, bindings);
+                    if (dt != null) return dt;
+                }
                 return DataType.TEXT;
             }
             if (name.equals("bool_and") || name.equals("bool_or") || name.equals("every")
@@ -1761,15 +1812,58 @@ class ExprEvaluator {
                     || name.equals("radians") || name.equals("sin") || name.equals("cos")
                     || name.equals("tan") || name.equals("asin") || name.equals("acos")
                     || name.equals("atan") || name.equals("atan2")) return DataType.DOUBLE_PRECISION;
+            if (name.equals("array_sample") || name.equals("array_shuffle")) {
+                // Returns an array of the same type as the input
+                if (!fn.args().isEmpty()) {
+                    DataType argType = inferTypeFromContext(fn.args().get(0), bindings);
+                    if (argType == DataType.INT4_ARRAY) return DataType.INT4_ARRAY;
+                    if (argType == DataType.TEXT_ARRAY) return DataType.TEXT_ARRAY;
+                    // If the argument is a cast to integer[], infer INT4_ARRAY
+                    Expression arg0 = fn.args().get(0);
+                    if (arg0 instanceof CastExpr) {
+                        String targetType = ((CastExpr) arg0).typeName().toLowerCase();
+                        if (targetType.equals("integer[]") || targetType.equals("int[]") || targetType.equals("int4[]")) return DataType.INT4_ARRAY;
+                        if (targetType.equals("text[]") || targetType.equals("varchar[]")) return DataType.TEXT_ARRAY;
+                    }
+                    if (arg0 instanceof ArrayExpr) return DataType.INT4_ARRAY;
+                }
+                return DataType.TEXT;
+            }
             if (name.equals("array_agg")) return DataType.TEXT; // array type, but TEXT as fallback
             if (name.equals("row_number") || name.equals("rank") || name.equals("dense_rank")
-                    || name.equals("ntile")) return DataType.BIGINT;
+                    || name.equals("ntile") || name.equals("txid_current")
+                    || name.equals("pg_current_xact_id")) return DataType.BIGINT;
             if (name.equals("lag") || name.equals("lead") || name.equals("first_value")
                     || name.equals("last_value") || name.equals("nth_value")) {
                 if (!fn.args().isEmpty()) return inferTypeFromContext(fn.args().get(0), bindings);
                 return DataType.TEXT;
             }
             if (name.equals("uuid_generate_v4") || name.equals("gen_random_uuid")) return DataType.UUID;
+            // Check user-defined functions and aggregates for return type
+            if (executor != null && executor.database != null) {
+                PgFunction userFunc = executor.database.getFunction(name);
+                if (userFunc != null && userFunc.getReturnType() != null) {
+                    DataType dt = DataType.fromPgName(userFunc.getReturnType().replaceAll("\\(.*\\)", "").trim());
+                    if (dt != null) return dt;
+                }
+                PgAggregate userAgg = executor.database.getAggregate(name);
+                if (userAgg != null) {
+                    // If aggregate has a finalfunc, use its return type
+                    String ff = userAgg.getFinalfunc();
+                    if (ff != null) {
+                        PgFunction ffFunc = executor.database.getFunction(ff);
+                        if (ffFunc != null && ffFunc.getReturnType() != null) {
+                            DataType dt = DataType.fromPgName(ffFunc.getReturnType().replaceAll("\\(.*\\)", "").trim());
+                            if (dt != null) return dt;
+                        }
+                    }
+                    // Otherwise use the stype
+                    if (userAgg.getStype() != null) {
+                        DataType dt = DataType.fromPgName(userAgg.getStype().replaceAll("\\(.*\\)", "").trim());
+                        if (dt != null) return dt;
+                    }
+                }
+            }
             return DataType.TEXT;
         }
         if (expr instanceof IsNullExpr) return DataType.BOOLEAN;

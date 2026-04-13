@@ -237,6 +237,7 @@ class PgWireBinaryCodec {
      */
     static void writeBinaryValue(ByteBuf buf, Object val, DataType type) {
         try {
+            if (type == null) type = DataType.TEXT;
             switch (type) {
                 case BOOLEAN: {
                     buf.writeInt(1);

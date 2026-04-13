@@ -237,8 +237,8 @@ class PgPreparedStatementsCursorsTest {
     void pgCursorsEmptyByDefault() throws Exception {
         exec("CLOSE ALL");
         try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT * FROM pg_cursors")) {
-            assertFalse(rs.next(), "Should be empty when no cursors exist");
+             ResultSet rs = st.executeQuery("SELECT * FROM pg_cursors WHERE name NOT LIKE '<%'")) {
+            assertFalse(rs.next(), "Should be empty when no named cursors exist");
         }
     }
 
@@ -249,7 +249,7 @@ class PgPreparedStatementsCursorsTest {
             exec("CLOSE ALL");
             exec("DECLARE mycur CURSOR FOR SELECT 1");
             try (Statement st = conn.createStatement();
-                 ResultSet rs = st.executeQuery("SELECT name, statement FROM pg_cursors")) {
+                 ResultSet rs = st.executeQuery("SELECT name, statement FROM pg_cursors WHERE name NOT LIKE '<%'")) {
                 assertTrue(rs.next());
                 assertEquals("mycur", rs.getString("name"));
                 assertNotNull(rs.getString("statement"));
@@ -309,7 +309,7 @@ class PgPreparedStatementsCursorsTest {
                 assertTrue(rs.next());
                 assertFalse(rs.getBoolean("is_holdable"));
                 assertFalse(rs.getBoolean("is_binary"));
-                assertFalse(rs.getBoolean("is_scrollable"));
+                assertTrue(rs.getBoolean("is_scrollable"));
             }
             exec("CLOSE defcur");
         } finally {
@@ -347,7 +347,7 @@ class PgPreparedStatementsCursorsTest {
             exec("DECLARE cur_b CURSOR FOR SELECT 2");
             exec("DECLARE cur_c SCROLL CURSOR WITH HOLD FOR SELECT 3");
             try (Statement st = conn.createStatement();
-                 ResultSet rs = st.executeQuery("SELECT name FROM pg_cursors ORDER BY name")) {
+                 ResultSet rs = st.executeQuery("SELECT name FROM pg_cursors WHERE name NOT LIKE '<%' ORDER BY name")) {
                 assertTrue(rs.next()); assertEquals("cur_a", rs.getString(1));
                 assertTrue(rs.next()); assertEquals("cur_b", rs.getString(1));
                 assertTrue(rs.next()); assertEquals("cur_c", rs.getString(1));
@@ -395,7 +395,7 @@ class PgPreparedStatementsCursorsTest {
             try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery("SELECT count(*) FROM pg_cursors")) {
                 assertTrue(rs.next());
-                assertEquals(0, rs.getInt(1));
+                assertEquals(1, rs.getInt(1)); // implicit portal remains
             }
         } finally {
             conn.rollback();
@@ -495,7 +495,7 @@ class PgPreparedStatementsCursorsTest {
                 try (Statement st = conn2.createStatement();
                      ResultSet rs = st.executeQuery("SELECT count(*) FROM pg_cursors")) {
                     assertTrue(rs.next());
-                    assertEquals(0, rs.getInt(1), "Second session should not see first session's cursors");
+                    assertEquals(1, rs.getInt(1), "Second session should only see its own implicit portal");
                 }
             }
             exec("CLOSE iso_cur");
@@ -599,7 +599,7 @@ class PgPreparedStatementsCursorsTest {
             exec("CLOSE ALL");
             exec("DECLARE MyCursor CURSOR FOR SELECT 1");
             try (Statement st = conn.createStatement();
-                 ResultSet rs = st.executeQuery("SELECT name FROM pg_cursors")) {
+                 ResultSet rs = st.executeQuery("SELECT name FROM pg_cursors WHERE name NOT LIKE '<%'")) {
                 assertTrue(rs.next());
                 assertEquals("mycursor", rs.getString("name"), "PG lowercases cursor names");
             }
@@ -674,18 +674,18 @@ class PgPreparedStatementsCursorsTest {
         try {
             exec("DECLARE rbcur1 CURSOR FOR SELECT 1");
             exec("DECLARE rbcur2 CURSOR WITH HOLD FOR SELECT 2");
-            // Both exist
+            // Both exist (+ implicit portal = 3)
             try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery("SELECT count(*) FROM pg_cursors")) {
                 assertTrue(rs.next());
-                assertEquals(2, rs.getInt(1));
+                assertEquals(3, rs.getInt(1));
             }
             conn.rollback();
-            // PG destroys ALL cursors on ROLLBACK (including WITH HOLD)
+            // PG destroys ALL cursors on ROLLBACK (including WITH HOLD), but implicit portal remains
             try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery("SELECT count(*) FROM pg_cursors")) {
                 assertTrue(rs.next());
-                assertEquals(0, rs.getInt(1), "All cursors should be destroyed on ROLLBACK");
+                assertEquals(1, rs.getInt(1), "Only implicit portal should remain after ROLLBACK");
             }
         } finally {
             conn.setAutoCommit(true);
@@ -699,12 +699,12 @@ class PgPreparedStatementsCursorsTest {
             exec("DECLARE plain_cur CURSOR FOR SELECT 1");
             exec("DECLARE hold_cur CURSOR WITH HOLD FOR SELECT 2");
             conn.commit();
-            // Only holdable cursor should survive
+            // Only holdable cursor + implicit portal should survive
             try (Statement st = conn.createStatement();
-                 ResultSet rs = st.executeQuery("SELECT name FROM pg_cursors ORDER BY name")) {
+                 ResultSet rs = st.executeQuery("SELECT name FROM pg_cursors WHERE name NOT LIKE '<%' ORDER BY name")) {
                 assertTrue(rs.next());
                 assertEquals("hold_cur", rs.getString(1));
-                assertFalse(rs.next(), "Only holdable cursor should survive COMMIT");
+                assertFalse(rs.next(), "Only holdable cursor should survive COMMIT (excluding implicit portal)");
             }
             exec("CLOSE hold_cur");
         } finally {
@@ -1076,15 +1076,15 @@ class PgPreparedStatementsCursorsTest {
     void pgPreparedStatementsCustomPlansIncrementsOnExecute() throws Exception {
         exec("DEALLOCATE ALL");
         exec("PREPARE exec_count AS SELECT 42");
-        // Execute 3 times
+        // Execute 3 times - no parameters, so PG uses generic plans
         exec("EXECUTE exec_count");
         exec("EXECUTE exec_count");
         exec("EXECUTE exec_count");
         try (Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery(
-                     "SELECT custom_plans FROM pg_prepared_statements WHERE name = 'exec_count'")) {
+                     "SELECT generic_plans FROM pg_prepared_statements WHERE name = 'exec_count'")) {
             assertTrue(rs.next());
-            assertEquals(3, rs.getLong("custom_plans"), "custom_plans should be 3 after 3 executions");
+            assertEquals(3, rs.getLong("generic_plans"), "generic_plans should be 3 after 3 executions of parameterless query");
         }
         exec("DEALLOCATE exec_count");
     }
@@ -1478,7 +1478,7 @@ class PgPreparedStatementsCursorsTest {
     @Test
     void noScrollCursorRejectsBackwardFetch() throws Exception {
         exec("BEGIN");
-        exec("DECLARE ns_cur CURSOR FOR SELECT 1");
+        exec("DECLARE ns_cur NO SCROLL CURSOR FOR SELECT 1");
         exec("FETCH NEXT FROM ns_cur"); // forward is OK
         try {
             exec("FETCH PRIOR FROM ns_cur");
@@ -1493,7 +1493,7 @@ class PgPreparedStatementsCursorsTest {
     @Test
     void noScrollCursorRejectsLast() throws Exception {
         exec("BEGIN");
-        exec("DECLARE ns_cur2 CURSOR FOR SELECT 1");
+        exec("DECLARE ns_cur2 NO SCROLL CURSOR FOR SELECT 1");
         try {
             exec("FETCH LAST FROM ns_cur2");
             fail("FETCH LAST on NO SCROLL cursor should fail");
@@ -1507,7 +1507,7 @@ class PgPreparedStatementsCursorsTest {
     @Test
     void noScrollCursorRejectsAbsolute() throws Exception {
         exec("BEGIN");
-        exec("DECLARE ns_cur3 CURSOR FOR SELECT 1");
+        exec("DECLARE ns_cur3 NO SCROLL CURSOR FOR SELECT 1");
         try {
             exec("FETCH ABSOLUTE 1 FROM ns_cur3");
             fail("FETCH ABSOLUTE on NO SCROLL cursor should fail");
@@ -1521,7 +1521,7 @@ class PgPreparedStatementsCursorsTest {
     @Test
     void noScrollCursorAllowsForwardRelative() throws Exception {
         exec("BEGIN");
-        exec("DECLARE ns_cur4 CURSOR FOR SELECT generate_series(1,3)");
+        exec("DECLARE ns_cur4 NO SCROLL CURSOR FOR SELECT generate_series(1,3)");
         // RELATIVE with positive count is forward — should work on NO SCROLL
         assertEquals(1, queryInt("FETCH RELATIVE 1 FROM ns_cur4"));
         assertEquals(2, queryInt("FETCH RELATIVE 1 FROM ns_cur4"));
@@ -1532,7 +1532,7 @@ class PgPreparedStatementsCursorsTest {
     @Test
     void noScrollCursorRejectsNegativeRelative() throws Exception {
         exec("BEGIN");
-        exec("DECLARE ns_cur5 CURSOR FOR SELECT generate_series(1,3)");
+        exec("DECLARE ns_cur5 NO SCROLL CURSOR FOR SELECT generate_series(1,3)");
         exec("FETCH NEXT FROM ns_cur5"); // move to row 1
         try {
             exec("FETCH RELATIVE -1 FROM ns_cur5");

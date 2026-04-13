@@ -127,18 +127,39 @@ class FromResolver {
         } else if (item instanceof SelectStmt.FunctionFrom) {
             SelectStmt.FunctionFrom funcFrom = (SelectStmt.FunctionFrom) item;
             String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
-            List<String> ca = funcFrom.columnAliases();
-            if (ca != null && !ca.isEmpty()) {
+            // JSON_TABLE: extract column definitions from the JsonTableExpr
+            if (funcFrom.functionName().equals("__json_table__") && !funcFrom.args().isEmpty()
+                    && funcFrom.args().get(0) instanceof JsonTableExpr) {
+                JsonTableExpr jt = (JsonTableExpr) funcFrom.args().get(0);
                 List<Column> cols = new ArrayList<>();
-                for (String colName : ca) {
-                    cols.add(new Column(colName, DataType.TEXT, true, false, null));
-                }
+                collectJsonTableColumnDefs(jt.columns, cols);
                 Table virtualTable = new Table(alias, cols);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             } else {
-                List<Column> cols = Cols.listOf(new Column(alias, DataType.TEXT, true, false, null));
-                Table virtualTable = new Table(alias, cols);
-                bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[1]));
+                List<String> ca = funcFrom.columnAliases();
+                if (ca != null && !ca.isEmpty()) {
+                    List<Column> cols = new ArrayList<>();
+                    for (String colName : ca) {
+                        cols.add(new Column(colName, DataType.TEXT, true, false, null));
+                    }
+                    Table virtualTable = new Table(alias, cols);
+                    bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
+                } else {
+                    List<Column> cols = Cols.listOf(new Column(alias, DataType.TEXT, true, false, null));
+                    Table virtualTable = new Table(alias, cols);
+                    bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[1]));
+                }
+            }
+        }
+    }
+
+    /** Recursively collect leaf column definitions from JSON_TABLE columns. */
+    private void collectJsonTableColumnDefs(List<JsonTableExpr.JsonTableColumn> columns, List<Column> cols) {
+        for (JsonTableExpr.JsonTableColumn col : columns) {
+            if (col.nestedColumns != null) {
+                collectJsonTableColumnDefs(col.nestedColumns, cols);
+            } else {
+                cols.add(new Column(col.name, col.forOrdinality ? DataType.INTEGER : DataType.TEXT, true, false, null));
             }
         }
     }
@@ -421,6 +442,7 @@ class FromResolver {
         if (table.isRlsEnabled() && !table.getRlsPolicies().isEmpty()) {
             contexts = applyRlsFiltering(contexts, table);
         }
+
         return contexts;
     }
 

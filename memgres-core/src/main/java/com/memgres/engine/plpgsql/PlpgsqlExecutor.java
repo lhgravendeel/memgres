@@ -45,6 +45,12 @@ public class PlpgsqlExecutor {
         ContinueSignal(String label) { super(null, null, true, false); this.label = label; }
     }
 
+    /** Wrapper for a pre-formatted SQL expression that should be emitted verbatim by appendValue. */
+    private static class RawSql {
+        final String sql;
+        RawSql(String sql) { this.sql = sql; }
+    }
+
     // Variable scope
     static class Scope {
         final Map<String, Object> variables = new LinkedHashMap<>();
@@ -120,6 +126,8 @@ public class PlpgsqlExecutor {
         } catch (RuntimeException e) {
             throw new MemgresException(e.getMessage() != null ? e.getMessage() : "syntax error in PL/pgSQL block", "42601");
         }
+        // DO blocks are anonymous code blocks that support transaction control (PG 11+)
+        this.isProcedureExecution = true;
         Scope scope = new Scope(null);
         scope.declare("found", false);
         try {
@@ -131,6 +139,12 @@ public class PlpgsqlExecutor {
 
     public Object executeFunction(PgFunction function, List<Object> args) {
         this.isProcedureExecution = function.isProcedure();
+        // Track function call depth: when inside a non-procedure function, transaction control is forbidden
+        boolean enteredFunctionContext = false;
+        if (!function.isProcedure() && session != null) {
+            session.enterFunctionCall();
+            enteredFunctionContext = true;
+        }
         // Apply function-level SET clauses (save current values, apply overrides)
         java.util.Map<String, String> savedGuc = null;
         if (function.getSetClauses() != null && !function.getSetClauses().isEmpty() && session != null) {
@@ -157,6 +171,10 @@ public class PlpgsqlExecutor {
         try {
             return executeFunctionBody(function, args);
         } finally {
+            // Exit function context
+            if (enteredFunctionContext) {
+                session.exitFunctionCall();
+            }
             // Restore SECURITY DEFINER role
             if (function.isSecurityDefiner() && session != null && function.getOwner() != null) {
                 GucSettings guc = session.getGucSettings();
@@ -248,6 +266,14 @@ public class PlpgsqlExecutor {
         if (isSetof || isTable) {
             List<Object> results = new ArrayList<>();
             scope.declare("__return_next_results__", results);
+            // Store out param names for RETURN NEXT with no expression
+            if (isTable && !outParams.isEmpty()) {
+                List<String> outNames = new ArrayList<>();
+                for (PgFunction.Param p : outParams) {
+                    outNames.add(p.name() != null ? p.name().toLowerCase() : ("$" + (params.indexOf(p) + 1)));
+                }
+                scope.declare("__return_next_out_params__", outNames);
+            }
             try {
                 executeBlock(block, scope);
             } catch (ReturnSignal rs) { /* done */ }
@@ -301,6 +327,23 @@ public class PlpgsqlExecutor {
                 break; // VARIADIC is always the last param
             } else if (i < args.size()) {
                 val = args.get(i);
+                // For array (List) parameters, wrap as typed array literal so that
+                // substituteVariables produces valid SQL (especially for empty arrays
+                // where ARRAY[] without a type cast causes "cannot determine type of empty array")
+                if (val instanceof java.util.List<?> && p.typeName() != null) {
+                    java.util.List<?> list = (java.util.List<?>) val;
+                    StringBuilder arrSb = new StringBuilder();
+                    arrSb.append("(ARRAY[");
+                    for (int j = 0; j < list.size(); j++) {
+                        if (j > 0) arrSb.append(",");
+                        Object elem = list.get(j);
+                        if (elem == null) arrSb.append("NULL");
+                        else if (elem instanceof Number || elem instanceof Boolean) arrSb.append(elem);
+                        else arrSb.append("'").append(elem.toString().replace("'", "''")).append("'");
+                    }
+                    arrSb.append("]::").append(p.typeName()).append(")");
+                    val = new RawSql(arrSb.toString());
+                }
             } else if (p.defaultExpr() != null) {
                 QueryResult defaultResult = astExecutor.execute("SELECT " + p.defaultExpr());
                 val = (!defaultResult.getRows().isEmpty() && defaultResult.getRows().get(0).length > 0)
@@ -420,23 +463,59 @@ public class PlpgsqlExecutor {
         } else {
             // PG uses a subtransaction for exception blocks — COMMIT/ROLLBACK forbidden inside
             exceptionBlockDepth++;
+            // Create a savepoint to rollback changes if an exception is caught (subtransaction semantics)
+            String subtxnSavepoint = "__plpgsql_subtxn_" + exceptionBlockDepth + "_" + System.nanoTime();
+            // Track whether we implicitly started a transaction for the savepoint (autocommit mode)
+            boolean implicitTxnStarted = false;
+            if (session != null) {
+                implicitTxnStarted = !session.isInTransaction();
+                session.savepoint(subtxnSavepoint);
+            }
             try {
                 executeStatements(block.body(), scope);
+                // Body succeeded — release the savepoint
+                if (session != null) {
+                    try { session.releaseSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
+                    if (implicitTxnStarted && session.isInTransaction() && !session.isExplicitTransactionBlock()) {
+                        session.commit();
+                    }
+                }
             } catch (ReturnSignal rs) {
+                // Release savepoint on normal RETURN
+                if (session != null) {
+                    try { session.releaseSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
+                    if (implicitTxnStarted && session.isInTransaction() && !session.isExplicitTransactionBlock()) {
+                        session.commit();
+                    }
+                }
                 throw rs;
             } catch (MemgresException e) {
+                // Rollback to savepoint to undo changes made in the try body (subtransaction rollback)
+                if (session != null) {
+                    try { session.rollbackToSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
+                }
                 String sqlState = e.getSqlState() != null ? e.getSqlState() : "P0001";
                 for (PlpgsqlStatement.ExceptionHandler handler : block.exceptionHandlers()) {
                     if (matchesCondition(handler.conditionNames(), sqlState)) {
                         Scope handlerScope = new Scope(scope);
                         handlerScope.declare("sqlerrm", e.getMessage());
                         handlerScope.declare("sqlstate", sqlState);
-                        executeStatements(handler.body(), handlerScope);
+                        try {
+                            executeStatements(handler.body(), handlerScope);
+                        } catch (ReturnSignal rs) {
+                            releaseSubtxnSavepoint(subtxnSavepoint, implicitTxnStarted);
+                            throw rs;
+                        }
+                        releaseSubtxnSavepoint(subtxnSavepoint, implicitTxnStarted);
                         return;
                     }
                 }
                 throw e;
             } catch (RuntimeException e) {
+                // Rollback to savepoint to undo changes made in the try body (subtransaction rollback)
+                if (session != null) {
+                    try { session.rollbackToSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
+                }
                 // Handle Java exceptions (like ArithmeticException for / by zero)
                 String sqlState = mapJavaExceptionToSqlState(e);
                 for (PlpgsqlStatement.ExceptionHandler handler : block.exceptionHandlers()) {
@@ -444,13 +523,32 @@ public class PlpgsqlExecutor {
                         Scope handlerScope = new Scope(scope);
                         handlerScope.declare("sqlerrm", e.getMessage());
                         handlerScope.declare("sqlstate", sqlState);
-                        executeStatements(handler.body(), handlerScope);
+                        try {
+                            executeStatements(handler.body(), handlerScope);
+                        } catch (ReturnSignal rs) {
+                            releaseSubtxnSavepoint(subtxnSavepoint, implicitTxnStarted);
+                            throw rs;
+                        }
+                        releaseSubtxnSavepoint(subtxnSavepoint, implicitTxnStarted);
                         return;
                     }
                 }
                 throw e;
             } finally {
                 exceptionBlockDepth--;
+            }
+        }
+    }
+
+    /**
+     * Release a subtransaction savepoint and commit the implicit transaction if one was started.
+     * Called after a PL/pgSQL EXCEPTION handler completes (normally or via RETURN).
+     */
+    private void releaseSubtxnSavepoint(String savepoint, boolean implicitTxnStarted) {
+        if (session != null) {
+            try { session.releaseSavepoint(savepoint); } catch (Exception ignored) {}
+            if (implicitTxnStarted && session.isInTransaction() && !session.isExplicitTransactionBlock()) {
+                session.commit();
             }
         }
     }
@@ -501,6 +599,12 @@ public class PlpgsqlExecutor {
         } else if (stmt instanceof PlpgsqlStatement.ReturnQueryStmt) {
             PlpgsqlStatement.ReturnQueryStmt rq = (PlpgsqlStatement.ReturnQueryStmt) stmt;
             executeReturnQuery(rq, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ReturnQueryExecuteStmt) {
+            PlpgsqlStatement.ReturnQueryExecuteStmt rqe = (PlpgsqlStatement.ReturnQueryExecuteStmt) stmt;
+            executeReturnQueryExecute(rqe, scope);
+        } else if (stmt instanceof PlpgsqlStatement.AssertStmt) {
+            PlpgsqlStatement.AssertStmt as = (PlpgsqlStatement.AssertStmt) stmt;
+            executeAssert(as, scope);
         } else if (stmt instanceof PlpgsqlStatement.RaiseStmt) {
             PlpgsqlStatement.RaiseStmt ra = (PlpgsqlStatement.RaiseStmt) stmt;
             executeRaise(ra, scope);
@@ -531,6 +635,11 @@ public class PlpgsqlExecutor {
             executeCommit((PlpgsqlStatement.CommitStmt) stmt);
         } else if (stmt instanceof PlpgsqlStatement.RollbackStmt) {
             executeRollback((PlpgsqlStatement.RollbackStmt) stmt);
+        } else if (stmt instanceof PlpgsqlStatement.AbortStmt) {
+            // ABORT is an unsupported transaction command in PL/pgSQL (PG raises 0A000)
+            throw new MemgresException("unsupported transaction command in PL/pgSQL", "0A000");
+        } else if (stmt instanceof PlpgsqlStatement.SavepointStmt) {
+            throw new MemgresException("unsupported transaction command in PL/pgSQL", "0A000");
         }
     }
 
@@ -582,9 +691,18 @@ public class PlpgsqlExecutor {
         if (!isProcedureExecution) {
             throw new MemgresException("invalid transaction termination", "2D000");
         }
+        // When called from within a function context (even indirectly), transaction control is forbidden
+        if (session != null && session.isInFunctionContext()) {
+            throw new MemgresException("invalid transaction termination", "2D000");
+        }
+        // When inside an explicit transaction block (user-issued BEGIN), procedure COMMIT/ROLLBACK is forbidden
+        if (session != null && session.isExplicitTransactionBlock()) {
+            throw new MemgresException("invalid transaction termination", "2D000");
+        }
+        // Both COMMIT and ROLLBACK are forbidden inside exception blocks (subtransactions)
         if (exceptionBlockDepth > 0) {
             throw new MemgresException(
-                    "cannot commit while a subtransaction is active", "2D000");
+                    "cannot " + command.toLowerCase() + " while a subtransaction is active", "2D000");
         }
     }
 
@@ -732,7 +850,23 @@ public class PlpgsqlExecutor {
 
     @SuppressWarnings("unchecked")
     private void executeReturnNext(PlpgsqlStatement.ReturnNextStmt stmt, Scope scope) {
-        Object value = evalExpr(stmt.valueExpr(), scope);
+        String expr = stmt.valueExpr();
+        Object value;
+        if (expr == null || expr.trim().isEmpty()) {
+            // RETURN NEXT with no expression: collect OUT parameter values as a row
+            List<String> outNames = (List<String>) scope.get("__return_next_out_params__");
+            if (outNames != null && !outNames.isEmpty()) {
+                Object[] row = new Object[outNames.size()];
+                for (int i = 0; i < outNames.size(); i++) {
+                    row[i] = scope.get(outNames.get(i));
+                }
+                value = row;
+            } else {
+                value = null;
+            }
+        } else {
+            value = evalExpr(expr, scope);
+        }
         List<Object> results = (List<Object>) scope.get("__return_next_results__");
         if (results != null) results.add(value);
     }
@@ -746,6 +880,66 @@ public class PlpgsqlExecutor {
             for (Object[] row : result.getRows()) {
                 results.add(row.length == 1 ? row[0] : row);
             }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void executeReturnQueryExecute(PlpgsqlStatement.ReturnQueryExecuteStmt stmt, Scope scope) {
+        Object sqlVal = evalExpr(stmt.sqlExpr(), scope);
+        if (sqlVal == null) {
+            throw new MemgresException("query string argument of EXECUTE is null", "22004");
+        }
+        String sql = String.valueOf(sqlVal);
+        // Substitute USING parameters ($1, $2, ...) into the SQL string
+        if (stmt.usingExprs() != null && !stmt.usingExprs().isEmpty()) {
+            for (int i = stmt.usingExprs().size(); i >= 1; i--) {
+                Object paramVal = evalExpr(stmt.usingExprs().get(i - 1), scope);
+                String replacement;
+                if (paramVal == null) {
+                    replacement = "NULL";
+                } else if (paramVal instanceof Number) {
+                    replacement = paramVal.toString();
+                } else if (paramVal instanceof Boolean) {
+                    replacement = paramVal.toString();
+                } else {
+                    replacement = "'" + paramVal.toString().replace("'", "''") + "'";
+                }
+                sql = sql.replace("$" + i, replacement);
+            }
+        }
+        QueryResult result = astExecutor.execute(sql);
+        List<Object> results = (List<Object>) scope.get("__return_next_results__");
+        if (results != null) {
+            for (Object[] row : result.getRows()) {
+                results.add(row.length == 1 ? row[0] : row);
+            }
+        }
+    }
+
+    // ---- ASSERT ----
+
+    private void executeAssert(PlpgsqlStatement.AssertStmt stmt, Scope scope) {
+        // Check plpgsql.check_asserts GUC
+        if (session != null) {
+            String checkAsserts = session.getGucSettings().get("plpgsql.check_asserts");
+            if (checkAsserts != null && (checkAsserts.equalsIgnoreCase("off") || checkAsserts.equalsIgnoreCase("false"))) {
+                return; // assertions disabled
+            }
+        }
+        Object condVal = evalExpr(stmt.condition(), scope);
+        boolean passed = false;
+        if (condVal instanceof Boolean) {
+            passed = (Boolean) condVal;
+        } else if (condVal != null) {
+            passed = true; // non-null, non-false is truthy
+        }
+        if (!passed) {
+            String message = "assertion failed";
+            if (stmt.message() != null) {
+                Object msgVal = evalExpr(stmt.message(), scope);
+                message = msgVal != null ? msgVal.toString() : "assertion failed";
+            }
+            throw new MemgresException(message, "P0004");
         }
     }
 
@@ -856,7 +1050,15 @@ public class PlpgsqlExecutor {
     // ---- SQL statement execution ----
 
     private void executeSql(PlpgsqlStatement.SqlStmt stmt, Scope scope) {
-        String sql = substituteVariables(stmt.sql(), scope);
+        String originalSql = stmt.sql().trim();
+        String sql = substituteVariables(originalSql, scope);
+
+        // For CALL statements, detect OUT params and bind results back to PL/pgSQL variables
+        if (originalSql.toUpperCase().startsWith("CALL ")) {
+            executeCallInPlpgsql(originalSql, sql, scope);
+            return;
+        }
+
         QueryResult result = astExecutor.execute(sql);
         scope.lastRowCount = result.getAffectedRows();
 
@@ -866,6 +1068,71 @@ public class PlpgsqlExecutor {
         } else if (stmt.intoVars() != null) {
             scope.set("found", false);
         }
+    }
+
+    /**
+     * Execute CALL within PL/pgSQL, binding OUT param values back to local variables.
+     * In PG, CALL proc(in_val, out_var) binds the OUT result back to out_var.
+     */
+    private void executeCallInPlpgsql(String originalSql, String substitutedSql, Scope scope) {
+        QueryResult result = astExecutor.execute(substitutedSql);
+        scope.lastRowCount = result.getAffectedRows();
+
+        // If the CALL returned a result set (OUT/INOUT params), bind them back to variables
+        if (result.getType() == QueryResult.Type.SELECT && !result.getRows().isEmpty()
+                && !result.getColumns().isEmpty()) {
+            Object[] row = result.getRows().get(0);
+
+            // Extract the original argument list from the CALL to find variable names
+            // Parse: CALL proc_name(arg1, arg2, ...)
+            int parenStart = originalSql.indexOf('(');
+            int parenEnd = originalSql.lastIndexOf(')');
+            if (parenStart > 0 && parenEnd > parenStart) {
+                String argStr = originalSql.substring(parenStart + 1, parenEnd);
+                // Split args by comma (respecting parentheses)
+                List<String> argNames = splitArguments(argStr);
+
+                // Look up the procedure to find which params are OUT/INOUT
+                String procName = originalSql.substring(5, parenStart).trim().toLowerCase();
+                PgFunction proc = database.getFunction(procName);
+                if (proc != null) {
+                    int outIdx = 0;
+                    for (int i = 0; i < proc.getParams().size(); i++) {
+                        PgFunction.Param p = proc.getParams().get(i);
+                        String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+                        if ("OUT".equals(mode) || "INOUT".equals(mode)) {
+                            if (i < argNames.size() && outIdx < row.length) {
+                                String varName = argNames.get(i).trim();
+                                if (scope.has(varName)) {
+                                    scope.set(varName, row[outIdx]);
+                                }
+                            }
+                            outIdx++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Split a comma-separated argument list respecting parentheses. */
+    private List<String> splitArguments(String argStr) {
+        List<String> args = new ArrayList<>();
+        int depth = 0;
+        StringBuilder current = new StringBuilder();
+        for (int i = 0; i < argStr.length(); i++) {
+            char c = argStr.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == ',' && depth == 0) {
+                args.add(current.toString().trim());
+                current = new StringBuilder();
+                continue;
+            }
+            current.append(c);
+        }
+        if (current.length() > 0) args.add(current.toString().trim());
+        return args;
     }
 
     private void setFromRow(Scope scope, List<String> varNames, QueryResult result) {
@@ -899,12 +1166,20 @@ public class PlpgsqlExecutor {
         if (dotIdx > 0) {
             String qualifier = target.substring(0, dotIdx);
             String field = target.substring(dotIdx + 1);
-            Object qualObj = scope.get(qualifier);
-            if (qualObj instanceof Map) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> map = (Map<String, Object>) qualObj;
-                map.put(field.toLowerCase(), value);
-                return;
+            if (scope.has(qualifier)) {
+                Object qualObj = scope.get(qualifier);
+                if (qualObj instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> map = (Map<String, Object>) qualObj;
+                    map.put(field.toLowerCase(), value);
+                    return;
+                } else if (qualObj == null) {
+                    // Initialize composite variable as a map on first field assignment
+                    Map<String, Object> map = new java.util.LinkedHashMap<>();
+                    map.put(field.toLowerCase(), value);
+                    scope.set(qualifier, map);
+                    return;
+                }
             }
         }
         // Check that the variable is declared; PG gives 42601 for undeclared variables
@@ -1254,6 +1529,8 @@ public class PlpgsqlExecutor {
         }
         if (val == null) {
             sb.append("NULL");
+        } else if (val instanceof RawSql) {
+            sb.append(((RawSql) val).sql);
         } else if (val instanceof Number || val instanceof Boolean) {
             sb.append(val);
         } else if (val instanceof byte[]) {
@@ -1278,6 +1555,16 @@ public class PlpgsqlExecutor {
                 else sb.append("'").append(elem.toString().replace("'", "''")).append("'");
             }
             sb.append("])");
+        } else if (val instanceof PgInterval) {
+            sb.append("'").append(val.toString().replace("'", "''")).append("'::interval");
+        } else if (val instanceof java.time.OffsetDateTime) {
+            sb.append("'").append(val.toString().replace("'", "''")).append("'::timestamptz");
+        } else if (val instanceof java.time.LocalDateTime) {
+            sb.append("'").append(val.toString().replace("'", "''")).append("'::timestamp");
+        } else if (val instanceof java.time.LocalDate) {
+            sb.append("'").append(val.toString().replace("'", "''")).append("'::date");
+        } else if (val instanceof java.time.LocalTime) {
+            sb.append("'").append(val.toString().replace("'", "''")).append("'::time");
         } else {
             sb.append("'").append(val.toString().replace("'", "''")).append("'");
         }
@@ -1370,7 +1657,7 @@ public class PlpgsqlExecutor {
     private boolean matchesCondition(List<String> conditions, String sqlState) {
         for (String cond : conditions) {
             String condLower = cond.toLowerCase().trim();
-            if (condLower.equals("others")) return true;
+            if (condLower.equals("others")) return !"P0004".equals(sqlState);
             if (condLower.startsWith("sqlstate ")) {
                 if (sqlState.equals(condLower.substring(9).trim().replace("'", ""))) return true;
                 continue;
@@ -1428,6 +1715,20 @@ public class PlpgsqlExecutor {
                 return "42809";
             case "dependent_objects_still_exist":
                 return "2BP01";
+            case "serialization_failure":
+                return "40001";
+            case "read_only_sql_transaction":
+                return "25006";
+            case "assert_failure":
+                return "P0004";
+            case "datatype_mismatch":
+                return "42804";
+            case "feature_not_supported":
+                return "0A000";
+            case "invalid_parameter_value":
+                return "22023";
+            case "object_not_in_prerequisite_state":
+                return "55000";
             default:
                 return condition.length() == 5 ? condition : "P0001";
         }

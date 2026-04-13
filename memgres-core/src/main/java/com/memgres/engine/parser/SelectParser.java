@@ -618,6 +618,8 @@ class SelectParser {
                 cteBody = parser.parseUpdate();
             } else if (parser.checkKeyword("DELETE")) {
                 cteBody = parser.parseDelete();
+            } else if (parser.checkKeyword("MERGE")) {
+                cteBody = parser.parseMerge(null);
             } else if (parser.checkKeyword("VALUES")) {
                 cteBody = parseValues();
                 cteBody = tryParseSetOp(cteBody);
@@ -1078,6 +1080,13 @@ class SelectParser {
                 }
                 return new SelectStmt.SubqueryFrom(subStmt, alias, lateral, columnAliases);
             } else {
+                // Check if MERGE is used as a subquery source (not valid SQL)
+                if (parser.pos + 1 < parser.tokens.size()) {
+                    Token afterParen = parser.tokens.get(parser.pos + 1);
+                    if (afterParen.type() == TokenType.KEYWORD && afterParen.value().equals("MERGE")) {
+                        throw new ParseException("syntax error", afterParen);
+                    }
+                }
                 // Parenthesized FROM item (e.g., pg_dump style: ((a JOIN b ON ...) JOIN c ON ...))
                 parser.advance(); // consume (
                 SelectStmt.FromItem inner = parseFromItem(); // recursively parse the join tree
@@ -1437,7 +1446,13 @@ class SelectParser {
         List<JsonTableExpr.JsonTableColumn> cols = new ArrayList<>();
         do {
             // NESTED PATH ...
-            if (parser.matchKeyword("NESTED")) {
+            // Disambiguate: NESTED as a column name vs. NESTED PATH clause.
+            // If NESTED is followed by PATH or a string literal, it's a NESTED PATH clause.
+            // Otherwise (e.g., "nested jsonb ..."), it's a column named "nested".
+            if (parser.checkKeyword("NESTED") &&
+                    (parser.checkKeywordAt(1, "PATH") ||
+                     (parser.pos + 1 < parser.tokens.size() && parser.tokens.get(parser.pos + 1).type() == TokenType.STRING_LITERAL))) {
+                parser.advance(); // consume NESTED
                 parser.matchKeyword("PATH"); // optional
                 Expression nestedPath = parser.parseExpression();
                 parser.expectKeyword("COLUMNS");
@@ -1453,8 +1468,12 @@ class SelectParser {
                 cols.add(JsonTableExpr.JsonTableColumn.ordinality(colName));
                 continue;
             }
-            // type [EXISTS] PATH 'expr'
+            // type [FORMAT JSON] [EXISTS] PATH 'expr'
             String typeName = parser.parseTypeName();
+            // Optional FORMAT JSON clause (e.g., nested jsonb FORMAT JSON PATH '$.data')
+            if (parser.matchKeyword("FORMAT")) {
+                parser.expectKeyword("JSON"); // consume FORMAT JSON, ignore (just a hint)
+            }
             boolean existsPath = false;
             if (parser.matchKeyword("EXISTS")) {
                 existsPath = true;

@@ -96,6 +96,13 @@ public class Session {
     // Transaction-scoped advisory locks: released on commit/rollback
     private final Set<Long> xactAdvisoryLocks = new LinkedHashSet<>();
 
+    // Tracks function call depth for procedure transaction control validation.
+    // When > 0, we are inside a function (not procedure) and COMMIT/ROLLBACK is forbidden.
+    private int functionCallDepth = 0;
+
+    /** Whether the current transaction was started by an explicit BEGIN from the user (not an implicit procedure txn). */
+    private boolean explicitTransactionBlock = false;
+
     // Temp tables with ON COMMIT DROP: schema.table pairs to drop on commit
     private final List<String[]> onCommitDropTables = new ArrayList<>();
     // Temp tables with ON COMMIT DELETE ROWS: schema.table pairs to truncate on commit
@@ -123,8 +130,10 @@ public class Session {
         public final java.time.OffsetDateTime prepareTime;
         public final boolean fromSql;
         public final List<String> resultTypes;
-        /** Execution counter: Memgres has no planner, so all executions count as custom plans (PG 14+). */
+        /** Execution counters: PG 14+ tracks generic vs custom plans separately.
+         *  Queries without parameters use generic plans; parameterized queries use custom plans. */
         private final java.util.concurrent.atomic.AtomicLong customPlanCount = new java.util.concurrent.atomic.AtomicLong(0);
+        private final java.util.concurrent.atomic.AtomicLong genericPlanCount = new java.util.concurrent.atomic.AtomicLong(0);
 
         public PreparedStmt(String name, List<String> paramTypes, Statement body, int inferredParamCount,
                             String sqlText, java.time.OffsetDateTime prepareTime, boolean fromSql,
@@ -160,10 +169,21 @@ public class Session {
         public java.time.OffsetDateTime prepareTime() { return prepareTime; }
         public boolean fromSql() { return fromSql; }
         public List<String> resultTypes() { return resultTypes; }
-        /** Increment execution counter (called on each EXECUTE). */
-        public void recordExecution() { customPlanCount.incrementAndGet(); }
+        /** Increment execution counter (called on each EXECUTE).
+         *  Queries without parameters use generic plans; parameterized use custom plans.
+         *  This applies to both SQL-level and protocol-level prepared statements. */
+        public void recordExecution() {
+            boolean hasParams = (paramTypes != null && !paramTypes.isEmpty()) || inferredParamCount > 0;
+            if (hasParams) {
+                customPlanCount.incrementAndGet();
+            } else {
+                genericPlanCount.incrementAndGet();
+            }
+        }
         /** Get custom plan execution count (PG 14+). */
         public long customPlans() { return customPlanCount.get(); }
+        /** Get generic plan execution count (PG 14+). */
+        public long genericPlans() { return genericPlanCount.get(); }
 
         @Override
         public boolean equals(Object o) {
@@ -274,6 +294,24 @@ public class Session {
     public TransactionStatus getStatus() {
         return status;
     }
+
+    /** Increment function call depth (entering a non-procedure function). */
+    public void enterFunctionCall() { functionCallDepth++; }
+
+    /** Decrement function call depth (leaving a non-procedure function). */
+    public void exitFunctionCall() { if (functionCallDepth > 0) functionCallDepth--; }
+
+    /** Whether we are inside a function context where transaction control is forbidden. */
+    public boolean isInFunctionContext() { return functionCallDepth > 0; }
+
+    /** Mark the current transaction as an explicit transaction block (started by user BEGIN). */
+    public void setExplicitTransactionBlock(boolean explicit) { this.explicitTransactionBlock = explicit; }
+
+    /** Whether the current transaction was started by an explicit BEGIN from the user. */
+    public boolean isExplicitTransactionBlock() { return explicitTransactionBlock; }
+
+    /** Whether the transaction is in the FAILED state. */
+    public boolean isFailed() { return status == TransactionStatus.FAILED; }
 
     /**
      * Restore session status to the given value.
@@ -531,6 +569,7 @@ public class Session {
         // Destroy non-holdable cursors (PG behavior: only WITH HOLD cursors survive COMMIT)
         destroyNonHoldableCursors();
         transactionTimestamp = null;
+        explicitTransactionBlock = false;
         status = TransactionStatus.IDLE;
     }
 
@@ -566,6 +605,7 @@ public class Session {
         // Destroy all cursors on rollback (PG behavior: all cursors destroyed on ROLLBACK)
         cursors.clear();
         transactionTimestamp = null;
+        explicitTransactionBlock = false;
         status = TransactionStatus.IDLE;
     }
 
