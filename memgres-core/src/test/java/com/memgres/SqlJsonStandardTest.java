@@ -1499,8 +1499,8 @@ class SqlJsonStandardTest {
     @Test
     void jsonArray_emptySubquery() throws SQLException {
         exec("CREATE TABLE ja_empty_sq (v int)");
-        // Empty table → JSON_ARRAY(SELECT ...) returns empty array
-        assertEquals("[]", q("SELECT JSON_ARRAY(SELECT v FROM ja_empty_sq)"));
+        // Empty table → JSON_ARRAY(SELECT ...) returns NULL (PG behavior)
+        assertNull(q("SELECT JSON_ARRAY(SELECT v FROM ja_empty_sq)"));
     }
 
     @Test

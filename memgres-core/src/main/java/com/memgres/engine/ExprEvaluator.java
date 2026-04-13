@@ -928,7 +928,7 @@ class ExprEvaluator {
             String trimmed = result.trim();
             if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
                 if (jv.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                    throw new MemgresException("JSON_VALUE: non-scalar result", "22032");
+                    throw new MemgresException("JSON path expression in JSON_VALUE must return single scalar item", "2203F");
                 }
                 if (jv.defaultOnError != null) return evalExpr(jv.defaultOnError, ctx);
                 return null;
@@ -961,7 +961,7 @@ class ExprEvaluator {
         String path = pathVal.toString().trim();
         try {
             if (!isValidJson(json)) {
-                if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("invalid input for JSON_QUERY", "22032");
+                if (jq.onError == JsonExistsExpr.OnBehavior.ERROR) throw new MemgresException("invalid input syntax for type json", "22P02");
                 return handleJsonQueryOnEmpty(jq);
             }
             List<String> results = executor.functionEvaluator.evaluateJsonPathAll(json, path);

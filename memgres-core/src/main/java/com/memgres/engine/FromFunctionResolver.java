@@ -975,7 +975,7 @@ class FromFunctionResolver {
         // Validate JSON input
         if (!ExprEvaluator.isValidJson(json)) {
             if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                throw new MemgresException("invalid JSON input for JSON_TABLE", "22032");
+                throw new MemgresException("invalid input syntax for type json", "22P02");
             }
             return contexts; // EMPTY ON ERROR (default)
         }
@@ -993,9 +993,14 @@ class FromFunctionResolver {
                     contexts.add(new RowContext(virtualTable, alias, row));
                 }
             }
+        } catch (MemgresException e) {
+            if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
+                throw e; // Preserve original SQLSTATE (42601 for jsonpath errors, etc.)
+            }
+            // Default: EMPTY ON ERROR — return empty result
         } catch (Exception e) {
             if (jt.onError == JsonExistsExpr.OnBehavior.ERROR) {
-                throw new MemgresException("invalid JSON input for JSON_TABLE", "22032");
+                throw new MemgresException("invalid input syntax for type json", "22P02");
             }
             // Default: EMPTY ON ERROR — return empty result
         }
@@ -1118,7 +1123,12 @@ class FromFunctionResolver {
                 }
                 return null;
             }
-            return unquoteJsonString(vals.get(0));
+            String raw = vals.get(0);
+            // For jsonb/json columns, normalize with PG jsonb spacing
+            if (col.typeName != null && (col.typeName.equalsIgnoreCase("jsonb") || col.typeName.equalsIgnoreCase("json"))) {
+                return JsonOperations.normalizeJsonb(raw.trim());
+            }
+            return unquoteJsonString(raw);
         } catch (Exception e) {
             if (col.defaultOnError != null) {
                 return executor.evalExpr(col.defaultOnError, null);

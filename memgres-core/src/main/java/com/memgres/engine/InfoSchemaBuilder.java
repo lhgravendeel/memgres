@@ -11,7 +11,7 @@ import java.util.*;
 public class InfoSchemaBuilder {
 
     /** pg_catalog tables whose columns should be listed in information_schema.columns. */
-    private static final List<String> PG_CATALOG_TABLES_FOR_IS = List.of(
+    private static final List<String> PG_CATALOG_TABLES_FOR_IS = Cols.listOf(
         "pg_stat_user_tables", "pg_stat_all_tables",
         "pg_stat_user_indexes", "pg_stat_all_indexes",
         "pg_stat_database", "pg_statio_user_tables",

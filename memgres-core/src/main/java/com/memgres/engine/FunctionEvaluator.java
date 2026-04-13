@@ -682,7 +682,7 @@ class FunctionEvaluator {
                 if (arr instanceof List<?>) list = new java.util.ArrayList<>((List<?>) arr);
                 else if (arr instanceof String && ((String) arr).startsWith("{")) list = new java.util.ArrayList<>(parseSimplePgArray((String) arr));
                 else return arr;
-                if (n < 0 || n > list.size()) throw new MemgresException("number of elements to trim must be between 0 and " + list.size(), "22023");
+                if (n < 0 || n > list.size()) throw new MemgresException("number of elements to trim must be between 0 and " + list.size(), "2202E");
                 list = list.subList(0, list.size() - n);
                 return TypeCoercion.formatPgArray(list);
             }
@@ -1080,8 +1080,8 @@ class FunctionEvaluator {
                 }
                 SubqueryExpr sq = (SubqueryExpr) subqExpr;
                 QueryResult result = executor.executeStatement(sq.subquery());
-                // PG: JSON_ARRAY from empty subquery returns empty array []
-                if (result.getRows().isEmpty()) return "[]";
+                // PG: JSON_ARRAY from empty subquery returns NULL
+                if (result.getRows().isEmpty()) return null;
                 StringBuilder sb = new StringBuilder("[");
                 boolean first = true;
                 for (Object[] row : result.getRows()) {

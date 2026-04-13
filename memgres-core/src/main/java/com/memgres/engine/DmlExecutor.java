@@ -101,14 +101,8 @@ class DmlExecutor {
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);
 
-        // PG 18: RETURNING OLD/NEW is not supported with ON CONFLICT DO NOTHING
-        if (stmt.onConflict() != null && stmt.onConflict().doNothing() && stmt.returning() != null) {
-            for (SelectStmt.SelectTarget rt : stmt.returning()) {
-                if (exprReferencesOldNew(rt.expr())) {
-                    throw new MemgresException("syntax error at or near \"INTO\"", "42601");
-                }
-            }
-        }
+        // PG 18: RETURNING OLD/NEW is supported with ON CONFLICT DO NOTHING
+        // Non-conflicting rows return NEW.*, conflicting (skipped) rows return nothing
 
         List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.table());
         // Check for INSTEAD OF triggers (on views)

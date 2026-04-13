@@ -1,5 +1,7 @@
 package com.memgres.engine;
 
+import com.memgres.engine.util.Cols;
+
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -151,9 +153,9 @@ public class GucSettings {
     }
 
     /** Set of timeout parameters whose display value should be human-formatted by PG. */
-    private static final Set<String> TIMEOUT_PARAMS = Set.of(
-            "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout",
-            "idle_session_timeout", "authentication_timeout");
+    private static final Set<String> TIMEOUT_PARAMS = Cols.setOf(
+        "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout",
+        "idle_session_timeout", "authentication_timeout");
 
     /**
      * Get a parameter value formatted for display (SHOW).

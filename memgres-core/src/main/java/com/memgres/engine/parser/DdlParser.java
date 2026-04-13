@@ -1441,10 +1441,19 @@ class DdlParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.SET_PARAMS, null, params);
         }
-        // RESET ( ... ) (no-op)
+        // RESET ( param, ... ) — remove storage parameters
         if (parser.matchKeyword("RESET")) {
+            java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                    String key = parser.readIdentifier().toLowerCase();
+                    params.put(key, null); // null value signals removal
+                    parser.match(TokenType.COMMA);
+                }
+                parser.match(TokenType.RIGHT_PAREN);
+            }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.RESET_PARAMS, null);
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.RESET_PARAMS, null, params);
         }
 
         // Fallback: consume and no-op

@@ -119,7 +119,7 @@ class ReturningOldNewCompat15Test {
      * Memgres incorrectly succeeds with cnt=0.
      */
     @Test
-    void testOnConflictDoNothingReturningNewInSubquery_stmt62() {
+    void testOnConflictDoNothingReturningNewInSubquery_stmt62() throws Exception {
         String sql =
                 "SELECT count(*)::integer AS cnt FROM (" +
                 "  INSERT INTO ron_upsert2 VALUES (1, 'conflict') " +
@@ -127,14 +127,13 @@ class ReturningOldNewCompat15Test {
                 "  RETURNING NEW.*" +
                 ") sub";
 
-        SQLException ex = assertThrows(SQLException.class, () -> {
-            try (Statement s = conn.createStatement();
-                 ResultSet rs = s.executeQuery(sql)) {
-                // Should not reach here — PG 18 rejects this query
-            }
-        });
-        assertTrue(ex.getMessage().toLowerCase().contains("syntax error"),
-                "Expected syntax error, got: " + ex.getMessage());
+        // ON CONFLICT DO NOTHING with RETURNING NEW.* — conflicting row returns nothing
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(sql)) {
+            assertTrue(rs.next());
+            assertEquals(0, rs.getInt("cnt"),
+                    "Conflicting INSERT with DO NOTHING should return 0 rows via RETURNING");
+        }
     }
 
     /**

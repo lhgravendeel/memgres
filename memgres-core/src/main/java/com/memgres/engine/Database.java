@@ -716,6 +716,10 @@ public class Database {
         indexReloptions.put(name.toLowerCase(), opts);
     }
 
+    public void removeIndexReloptions(String name) {
+        indexReloptions.remove(name.toLowerCase());
+    }
+
     public boolean hasIndex(String name) {
         return indexColumns.containsKey(name.toLowerCase());
     }

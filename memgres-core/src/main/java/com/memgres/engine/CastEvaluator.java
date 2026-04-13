@@ -511,7 +511,7 @@ class CastEvaluator {
                 if ("regproc".equals(typeName)) {
                     String lowerProc = procName.toLowerCase();
                     // Built-in aggregates that exist for multiple types (ambiguous via regproc)
-                    java.util.Set<String> ambiguousBuiltins = java.util.Set.of(
+                    java.util.Set<String> ambiguousBuiltins = Cols.setOf(
                             "min", "max", "sum", "avg", "count",
                             "array_agg", "string_agg", "every", "bool_and", "bool_or");
                     if (ambiguousBuiltins.contains(lowerProc)) {

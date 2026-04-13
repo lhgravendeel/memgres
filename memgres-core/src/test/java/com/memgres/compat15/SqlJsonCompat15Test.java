@@ -429,17 +429,17 @@ class SqlJsonCompat15Test {
     }
 
     // ========================================================================
-    // Stmt 100: JSON_ARRAY from empty subquery should return empty array
-    // PG 17+: JSON_ARRAY(SELECT ...) on empty result returns []
+    // Stmt 100: JSON_ARRAY from empty subquery should return NULL
+    // PG 17+: JSON_ARRAY(SELECT ...) on empty result returns NULL
     // ========================================================================
     @Test
-    void stmt100_jsonArrayEmptySubqueryShouldReturnEmptyArray() throws Exception {
+    void stmt100_jsonArrayEmptySubqueryShouldReturnNull() throws Exception {
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery(
                      "SELECT JSON_ARRAY(SELECT v FROM (SELECT 1 AS v WHERE FALSE) sub) AS result")) {
             assertTrue(rs.next(), "Expected one result row");
-            assertEquals("[]", rs.getString("result"),
-                    "JSON_ARRAY from empty subquery should return empty array per PG 17+ behavior");
+            assertNull(rs.getString("result"),
+                    "JSON_ARRAY from empty subquery should return NULL per PG behavior");
         }
     }
 

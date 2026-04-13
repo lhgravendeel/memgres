@@ -865,6 +865,27 @@ public class AstExecutor {
                 }
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
             }
+            case RESET_PARAMS: {
+                if (!database.hasIndex(stmt.name())) {
+                    if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+                    throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
+                }
+                if (stmt.params != null && !stmt.params.isEmpty()) {
+                    java.util.Map<String, String> existing = database.getIndexReloptions(stmt.name());
+                    if (existing != null) {
+                        java.util.Map<String, String> updated = new java.util.LinkedHashMap<>(existing);
+                        for (String key : stmt.params.keySet()) {
+                            updated.remove(key);
+                        }
+                        if (updated.isEmpty()) {
+                            database.removeIndexReloptions(stmt.name());
+                        } else {
+                            database.setIndexReloptions(stmt.name(), updated);
+                        }
+                    }
+                }
+                return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+            }
             default:
                 // All other actions (SET TABLESPACE, ATTACH PARTITION, etc.) are accepted no-ops
                 if (stmt.action() != AlterIndexStmt.Action.NO_OP
