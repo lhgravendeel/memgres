@@ -28,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * .md files are skipped (scenario design docs, not executable SQL).
  */
-class Pg18SampleSql5Test {
+public class Pg18SampleSql5Test {
 
     private static Memgres memgres;
     private static Connection conn;
@@ -328,7 +328,7 @@ class Pg18SampleSql5Test {
      * Parse a SQL file into blocks. Each block is a SQL statement optionally
      * preceded by an expectation comment block.
      */
-    static List<ParsedBlock> parseFile(String content) {
+    public static List<ParsedBlock> parseFile(String content) {
         List<ParsedBlock> blocks = new ArrayList<>();
         List<String> lines = Strs.lines(content).collect(Collectors.toList());
 
@@ -498,7 +498,7 @@ class Pg18SampleSql5Test {
      * Compare expected and actual row values with tolerance for numeric formatting.
      * E.g. "1.20" matches "1.2", and "4 days" matches "4 days".
      */
-    static boolean valuesMatch(String expected, String actual) {
+    public static boolean valuesMatch(String expected, String actual) {
         if (expected.equals(actual)) return true;
         // Compare cell by cell
         String[] eParts = expected.split("\\|", -1);
@@ -510,7 +510,7 @@ class Pg18SampleSql5Test {
         return true;
     }
 
-    static boolean cellMatches(String expected, String actual) {
+    public static boolean cellMatches(String expected, String actual) {
         if (expected.equals(actual)) return true;
         // In the test file format, empty string between pipes means NULL
         if (expected.isEmpty() && actual.equalsIgnoreCase("NULL")) return true;
