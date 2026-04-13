@@ -103,8 +103,9 @@ public class FeatureComparisonReport {
                 SqlVerifyHarness.StatementResult memResult = SqlVerifyHarness.executeStatement(memgresConn, block.sql());
                 SqlVerifyHarness.StatementResult pgResult = hasPg ? SqlVerifyHarness.executeStatement(pgConn, block.sql()) : null;
 
-                // Compare PG vs Memgres
-                if (pgResult != null) {
+                // Compare PG vs Memgres (only for annotated statements —
+                // unannotated setup statements are noise in the comparison)
+                if (pgResult != null && block.expectation() != null) {
                     String pgMemDiff = compareResults(pgResult, memResult, block.sql());
                     if (pgMemDiff != null) {
                         fd.pgVsMemgres.add(new Difference(sectionNum, block.sql(), pgMemDiff, pgResult, memResult));
@@ -198,12 +199,22 @@ public class FeatureComparisonReport {
                 return "Row count differs: PG=" + pg.rows().size() + " Memgres=" + mem.rows().size();
             }
 
-            // Row data (use SqlVerifyHarness normalization)
+            // Row data — use tolerant cell matching (boolean normalization,
+            // numeric tolerance, NULL equivalence) to avoid false positives
             for (int r = 0; r < pg.rows().size(); r++) {
-                String pgRow = SqlVerifyHarness.formatRow(pg.rows().get(r));
-                String memRow = SqlVerifyHarness.formatRow(mem.rows().get(r));
-                if (!pgRow.equals(memRow)) {
-                    return "Row " + (r + 1) + " differs: PG=[" + pgRow + "] Memgres=[" + memRow + "]";
+                List<String> pgCells = pg.rows().get(r);
+                List<String> memCells = mem.rows().get(r);
+                if (pgCells.size() != memCells.size()) {
+                    return "Row " + (r + 1) + " column count differs: PG=" + pgCells.size() + " Memgres=" + memCells.size();
+                }
+                for (int c = 0; c < pgCells.size(); c++) {
+                    String pv = pgCells.get(c) == null ? "" : pgCells.get(c);
+                    String mv = memCells.get(c) == null ? "" : memCells.get(c);
+                    if (!Pg18SampleSql5Test.cellMatches(pv, mv)) {
+                        String pgRow = SqlVerifyHarness.formatRow(pgCells);
+                        String memRow = SqlVerifyHarness.formatRow(memCells);
+                        return "Row " + (r + 1) + " differs: PG=[" + pgRow + "] Memgres=[" + memRow + "]";
+                    }
                 }
             }
         } else {

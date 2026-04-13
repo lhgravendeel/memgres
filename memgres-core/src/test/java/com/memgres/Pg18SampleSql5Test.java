@@ -510,7 +510,7 @@ public class Pg18SampleSql5Test {
         return true;
     }
 
-    static boolean cellMatches(String expected, String actual) {
+    public static boolean cellMatches(String expected, String actual) {
         if (expected.equals(actual)) return true;
         // In the test file format, empty string between pipes means NULL
         if (expected.isEmpty() && actual.equalsIgnoreCase("NULL")) return true;
