@@ -247,17 +247,55 @@ class SelectAggregateEvaluator {
         }
 
         // ORDER BY on aggregate results
+        // Pre-compute ORDER BY values for aggregate expressions not in target columns
         List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
+        Map<Object[], Object[]> orderByValues = null;
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
+            // Check if any ORDER BY expr needs aggregate evaluation
+            boolean needsAggEval = false;
+            for (SelectStmt.OrderByItem item : resolvedOrderBy) {
+                int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
+                if (colIdx < 0 && select.containsAggregate(item.expr())) {
+                    needsAggEval = true;
+                    break;
+                }
+            }
+            if (needsAggEval && !groups.isEmpty()) {
+                orderByValues = new IdentityHashMap<>();
+                for (int gi = 0; gi < groups.size() && gi < resultRows.size(); gi++) {
+                    List<RowContext> group = groups.get(gi);
+                    RowContext rep = group.isEmpty() ? null : group.get(0);
+                    Object[] obVals = new Object[resolvedOrderBy.size()];
+                    for (int oi = 0; oi < resolvedOrderBy.size(); oi++) {
+                        SelectStmt.OrderByItem item = resolvedOrderBy.get(oi);
+                        int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
+                        if (colIdx >= 0) {
+                            obVals[oi] = resultRows.get(gi)[colIdx];
+                        } else {
+                            obVals[oi] = evalAggregateExpr(item.expr(), group, rep);
+                        }
+                    }
+                    orderByValues.put(resultRows.get(gi), obVals);
+                }
+            }
+            final Map<Object[], Object[]> finalOrderByValues = orderByValues;
             resultRows.sort((a, b) -> {
-                for (SelectStmt.OrderByItem item : resolvedOrderBy) {
-                    int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
+                for (int oi = 0; oi < resolvedOrderBy.size(); oi++) {
+                    SelectStmt.OrderByItem item = resolvedOrderBy.get(oi);
                     Object va, vb;
-                    if (colIdx >= 0) {
-                        va = a[colIdx];
-                        vb = b[colIdx];
+                    if (finalOrderByValues != null) {
+                        Object[] aVals = finalOrderByValues.get(a);
+                        Object[] bVals = finalOrderByValues.get(b);
+                        va = aVals != null ? aVals[oi] : a[0];
+                        vb = bVals != null ? bVals[oi] : b[0];
                     } else {
-                        va = a[0]; vb = b[0];
+                        int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
+                        if (colIdx >= 0) {
+                            va = a[colIdx];
+                            vb = b[colIdx];
+                        } else {
+                            va = a[0]; vb = b[0];
+                        }
                     }
 
                     if (va == null && vb == null) continue;
@@ -286,7 +324,21 @@ class SelectAggregateEvaluator {
     Object evalAggregateExpr(Expression expr, List<RowContext> group, RowContext representative) {
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            String name = fn.name().toLowerCase();
+            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
+            // Check for json/jsonb type mismatch in COALESCE
+            if (name.equals("coalesce")) {
+                boolean hasJsonAgg = false, hasJsonbCast = false;
+                for (Expression arg : fn.args()) {
+                    if (arg instanceof FunctionCallExpr) {
+                        String aname = ((FunctionCallExpr) arg).name().toLowerCase();
+                        if (aname.equals("json_arrayagg") || aname.equals("json_objectagg")) hasJsonAgg = true;
+                    }
+                    if (arg instanceof CastExpr && ((CastExpr) arg).typeName().equalsIgnoreCase("jsonb")) hasJsonbCast = true;
+                }
+                if (hasJsonAgg && hasJsonbCast) {
+                    throw new MemgresException("could not convert type jsonb to json", "42846");
+                }
+            }
             if (select.isAggregateFunction(name)) {
                 return evalAggregate(fn, group);
             }
@@ -347,11 +399,38 @@ class SelectAggregateEvaluator {
             CastExpr cast = (CastExpr) expr;
             Object val = evalAggregateExpr(cast.expr(), group, representative);
             return executor.castEvaluator.applyCast(val, cast.typeName());
+        } else if (expr instanceof IsJsonExpr) {
+            IsJsonExpr ij = (IsJsonExpr) expr;
+            Object inner = evalAggregateExpr(ij.expr(), group, representative);
+            // Evaluate IS JSON on the aggregated result
+            if (inner == null) return null;
+            String s = inner.toString().trim();
+            boolean valid = ExprEvaluator.isValidJson(s);
+            if (valid && ij.jsonType() != null) {
+                switch (ij.jsonType()) {
+                    case OBJECT: valid = s.startsWith("{"); break;
+                    case ARRAY: valid = s.startsWith("["); break;
+                    case SCALAR: valid = !s.startsWith("{") && !s.startsWith("["); break;
+                    case VALUE: break;
+                }
+            }
+            return ij.negated() ? !valid : valid;
+        } else if (expr instanceof IsNullExpr) {
+            IsNullExpr isn = (IsNullExpr) expr;
+            Object val = evalAggregateExpr(isn.expr(), group, representative);
+            boolean isNull = (val == null);
+            return isn.negated() ? !isNull : isNull;
         } else if (expr instanceof OrderedSetAggExpr) {
             OrderedSetAggExpr osa = (OrderedSetAggExpr) expr;
             return evalOrderedSetAggregate(osa, group);
         } else if (expr instanceof WindowFuncExpr) {
             return null;
+        } else if (expr instanceof Literal) {
+            // Literals don't depend on row context, evaluate them directly
+            return executor.evalExpr(expr, representative);
+        } else if (expr instanceof SubqueryExpr) {
+            // Subqueries can be evaluated without a representative row
+            return executor.evalExpr(expr, representative);
         } else {
             return representative != null ? executor.evalExpr(expr, representative) : null;
         }
@@ -488,7 +567,7 @@ class SelectAggregateEvaluator {
     // ---- Core aggregate evaluation ----
 
     Object evalAggregate(FunctionCallExpr fn, List<RowContext> group) {
-        String name = fn.name().toLowerCase();
+        String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
 
         for (Expression arg : fn.args()) {
             if (select.containsAggregate(arg)) {
@@ -877,7 +956,7 @@ class SelectAggregateEvaluator {
                         }
                     }
                 }
-                StringBuilder sb4 = new StringBuilder("{");
+                StringBuilder sb4 = new StringBuilder("{ ");
                 boolean first4 = true;
                 Set<String> seenKeys2 = uniqueKeys2 ? new HashSet<>() : null;
                 for (RowContext r : group) {
@@ -891,10 +970,10 @@ class SelectAggregateEvaluator {
                     }
                     if (!first4) sb4.append(", ");
                     first4 = false;
-                    sb4.append("\"").append(ks.replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+                    sb4.append("\"").append(ks.replace("\\", "\\\\").replace("\"", "\\\"")).append("\" : ");
                     appendJsonVal(sb4, v);
                 }
-                sb4.append("}");
+                sb4.append(" }");
                 return sb4.toString();
             }
             case "xmlagg": {

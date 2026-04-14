@@ -82,10 +82,10 @@ class ConstraintValidator {
                                     Object[] excludeRow, boolean isPK, String constraintName,
                                     boolean nullsNotDistinct, com.memgres.engine.parser.ast.Expression whereExpr,
                                     java.util.List<com.memgres.engine.parser.ast.Expression> exprColumns) {
-        // Compute virtual column values so uniqueness checks work on virtual columns
+        // Compute virtual column values so uniqueness checks work on virtual columns (lenient: suppress errors)
         boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
         if (hasVirtual) {
-            newRow = executor.dmlExecutor.computeVirtualColumns(table, newRow);
+            newRow = executor.dmlExecutor.computeVirtualColumns(table, newRow, false);
         }
         // For partial unique indexes, check if the new row satisfies the WHERE predicate
         if (whereExpr != null) {
@@ -114,7 +114,7 @@ class ConstraintValidator {
             for (Object[] existingRow : table.getRows()) {
                 if (excludeRow != null && existingRow == excludeRow) continue;
 
-                Object[] evalExisting = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, existingRow) : existingRow;
+                Object[] evalExisting = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, existingRow, false) : existingRow;
 
                 if (whereExpr != null) {
                     RowContext existingCtx = new RowContext(table, null, evalExisting);
@@ -189,7 +189,7 @@ class ConstraintValidator {
         for (Object[] existingRow : table.getRows()) {
             if (excludeRow != null && existingRow == excludeRow) continue;
 
-            Object[] evalExisting = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, existingRow) : existingRow;
+            Object[] evalExisting = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, existingRow, false) : existingRow;
 
             // For partial unique indexes, only check rows that satisfy the WHERE predicate
             if (whereExpr != null) {
@@ -218,7 +218,7 @@ class ConstraintValidator {
 
     private void validateCheck(Table table, Object[] row, StoredConstraint sc) {
         // Compute virtual column values so CHECK expressions can reference them
-        Object[] evalRow = executor.dmlExecutor.hasVirtualColumns(table) ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+        Object[] evalRow = executor.dmlExecutor.hasVirtualColumns(table) ? executor.dmlExecutor.computeVirtualColumns(table, row, false) : row;
         RowContext ctx = new RowContext(table, null, evalRow);
         Object result = executor.evalExpr(sc.getCheckExpr(), ctx);
         if (result instanceof Boolean && !((Boolean) result)) {
@@ -774,6 +774,23 @@ class ConstraintValidator {
                                 throw new MemgresException(
                                     "invalid input syntax for type integer: \"" + sVal + "\"", "22P02");
                             }
+                        }
+                    }
+                }
+                // Check for numeric literal vs text/varchar column (PG rejects: operator does not exist: text = integer)
+                if (col != null && lit != null && (lit.literalType() == Literal.LiteralType.INTEGER || lit.literalType() == Literal.LiteralType.FLOAT)) {
+                    int colIdx = table.getColumnIndex(col.column());
+                    if (colIdx >= 0) {
+                        Column column = table.getColumns().get(colIdx);
+                        DataType dt = column.getType();
+                        if (dt == DataType.TEXT || dt == DataType.VARCHAR || dt == DataType.CHAR) {
+                            String opSym = bin.op() == BinaryExpr.BinOp.EQUAL ? "=" :
+                                    bin.op() == BinaryExpr.BinOp.NOT_EQUAL ? "<>" :
+                                    bin.op() == BinaryExpr.BinOp.LESS_THAN ? "<" :
+                                    bin.op() == BinaryExpr.BinOp.GREATER_THAN ? ">" :
+                                    bin.op() == BinaryExpr.BinOp.LESS_EQUAL ? "<=" : ">=";
+                            throw new MemgresException(
+                                    "operator does not exist: text " + opSym + " integer", "42883");
                         }
                     }
                 }

@@ -111,6 +111,14 @@ class DdlAlterTableExecutor {
             if (sc == null) {
                 throw new MemgresException("constraint \"" + ace.constraintName() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
             }
+            // PG 18: only FOREIGN KEY constraints support ALTER CONSTRAINT ... [NOT] ENFORCED.
+            // CHECK, UNIQUE, PRIMARY KEY, and EXCLUDE constraints cannot be toggled.
+            if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) {
+                throw new MemgresException(
+                        "cannot alter enforceability of constraint \"" + ace.constraintName()
+                                + "\" of relation \"" + stmt.table() + "\"",
+                        "42809");
+            }
             sc.setNotEnforced(ace.notEnforced());
         } else if (action instanceof AlterTableStmt.SetSchema) {
             AlterTableStmt.SetSchema setSchema = (AlterTableStmt.SetSchema) action;
@@ -243,8 +251,24 @@ class DdlAlterTableExecutor {
             throw new MemgresException("column \"" + dropCol.column()
                     + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
         }
+        // Check for dependent generated columns
+        String colNameLower = dropCol.column().toLowerCase();
+        List<String> dependentGenCols = new ArrayList<>();
+        for (Column c : table.getColumns()) {
+            if (c.getGeneratedExpr() != null && !c.getName().equalsIgnoreCase(dropCol.column())) {
+                String genExpr = c.getGeneratedExpr().toLowerCase();
+                if (genExpr.contains(colNameLower)) {
+                    dependentGenCols.add(c.getName());
+                }
+            }
+        }
         if (!dropCol.cascade()) {
             String colName = dropCol.column().toLowerCase();
+            if (!dependentGenCols.isEmpty()) {
+                throw new MemgresException("cannot drop column " + dropCol.column()
+                        + " of relation " + stmt.table()
+                        + " because other objects depend on it", "2BP01");
+            }
             for (Map.Entry<String, Database.ViewDef> viewEntry : executor.database.getViews().entrySet()) {
                 String viewSql = viewEntry.getValue().query() != null ? viewEntry.getValue().query().toString() : "";
                 if (viewSql.toLowerCase().contains(stmt.table().toLowerCase())
@@ -262,6 +286,21 @@ class DdlAlterTableExecutor {
         }
         executor.recordUndo(new Session.DropColumnUndo(schemaName, stmt.table(), droppedCol, colIdx, colValues));
         table.removeColumn(dropCol.column());
+        // CASCADE: also drop dependent generated columns
+        if (dropCol.cascade() && !dependentGenCols.isEmpty()) {
+            for (String depCol : dependentGenCols) {
+                int depIdx = table.getColumnIndex(depCol);
+                if (depIdx >= 0) {
+                    Column depColumn = table.getColumns().get(depIdx);
+                    List<Object> depValues = new ArrayList<>();
+                    for (Object[] row : table.getRows()) {
+                        depValues.add(row[depIdx]);
+                    }
+                    executor.recordUndo(new Session.DropColumnUndo(schemaName, stmt.table(), depColumn, depIdx, depValues));
+                    table.removeColumn(depCol);
+                }
+            }
+        }
     }
 
     private Table executeRenameTable(AlterTableStmt.RenameTable rename, Table table,
@@ -333,6 +372,16 @@ class DdlAlterTableExecutor {
         int colIdx = table.getColumnIndex(alterCol.column());
         if (colIdx < 0) {
             throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
+        }
+        // Check for generated column dependencies
+        String alterColLower = alterCol.column().toLowerCase();
+        for (Column c : table.getColumns()) {
+            if (c.getGeneratedExpr() != null && !c.getName().equalsIgnoreCase(alterCol.column())) {
+                String genExpr = c.getGeneratedExpr().toLowerCase();
+                if (genExpr.contains(alterColLower)) {
+                    throw new MemgresException("cannot alter type of a column used by a generated column", "0A000");
+                }
+            }
         }
         DataType currentType = table.getColumns().get(colIdx).getType();
         if (setType.usingExpr() == null && currentType != null && dt != null && currentType != dt) {

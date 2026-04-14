@@ -36,7 +36,7 @@ class SetOperationInSubqueryTest {
             s.execute("CREATE TABLE services (id serial PRIMARY KEY, name text, category text, rate numeric)");
             s.execute("CREATE TABLE archive (id serial PRIMARY KEY, name text, source text)");
             s.execute("INSERT INTO products (name, category, price) VALUES ('Widget', 'hardware', 9.99), ('Gadget', 'electronics', 19.99), ('Tool', 'hardware', 14.99)");
-            s.execute("INSERT INTO services (name, category, rate) VALUES ('Consulting', 'professional', 100), ('Support', 'technical', 50)");
+            s.execute("INSERT INTO services (name, category, rate) VALUES ('Consulting', 'professional', 100), ('Support', 'technical', 50), ('Widget', 'hardware', 25)");
             s.execute("INSERT INTO archive (name, source) VALUES ('OldWidget', 'products'), ('OldService', 'services')");
         }
     }
@@ -106,7 +106,7 @@ class SetOperationInSubqueryTest {
     @Test
     void testExistsWithIntersect() throws SQLException {
         // INTERSECT inside EXISTS: finds names that appear in both tables
-        exec("INSERT INTO services (name, category, rate) VALUES ('Widget', 'overlap', 0)");
+        // 'Widget' exists in both products and services (added in setUp)
         assertTrue(queryBool("""
             SELECT EXISTS (
                 SELECT name FROM products
@@ -284,7 +284,7 @@ class SetOperationInSubqueryTest {
 
     @Test
     void testCteWithUnionAll() throws SQLException {
-        assertEquals("5", query1("""
+        assertEquals("6", query1("""
             WITH all_items AS (
                 SELECT name, category FROM products
                 UNION ALL

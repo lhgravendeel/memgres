@@ -1,11 +1,14 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * DDL statement parsing (CREATE, DROP, ALTER, TRUNCATE), extracted from Parser to reduce class size.
@@ -71,6 +74,10 @@ class DdlParser {
         if (parser.matchKeyword("SCHEMA")) return parseCreateSchema();
         if (parser.matchKeyword("POLICY")) return policyParser.parseCreatePolicy();
         if (parser.matchKeyword("ROLE")) return roleParser.parseCreateRole(false);
+        if (parser.matchKeywords("USER", "MAPPING")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("create_noop", "ok");
+        }
         if (parser.matchKeyword("USER")) return roleParser.parseCreateRole(true);
         if (unique) {
             parser.expectKeyword("INDEX");
@@ -88,6 +95,16 @@ class DdlParser {
         if (parser.matchKeywords("OPERATOR", "FAMILY")) return parseCreateOperatorFamily();
         if (parser.matchKeyword("OPERATOR")) return parseCreateOperator();
 
+        // CREATE LANGUAGE — no-op, but PG 18 does not support IF NOT EXISTS
+        if (parser.matchKeyword("LANGUAGE")) {
+            if (parser.checkKeyword("IF")) {
+                throw new MemgresException(
+                        "syntax error at or near \"NOT\"", "42601");
+            }
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("create_noop", "ok");
+        }
+
         // No-op CREATE targets (accepted but not functionally implemented)
         if (parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
                 || parser.matchKeyword("CONVERSION")
@@ -95,12 +112,10 @@ class DdlParser {
                 || parser.matchKeywords("TEXT", "SEARCH")
                 || parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")
                 || parser.matchKeyword("SERVER")
-                || parser.matchKeywords("USER", "MAPPING")
                 || parser.matchKeywords("FOREIGN", "TABLE")
                 || parser.matchKeyword("PUBLICATION")
                 || parser.matchKeyword("SUBSCRIPTION")
                 || parser.matchKeyword("TABLESPACE")
-                || parser.matchKeyword("LANGUAGE")
                 || parser.matchKeywords("EVENT", "TRIGGER")
                 || parser.matchKeyword("TRANSFORM")
                 || parser.matchKeywords("ACCESS", "METHOD")
@@ -124,6 +139,10 @@ class DdlParser {
     Statement parseDrop() {
         parser.expectKeyword("DROP");
 
+        if (parser.matchKeywords("USER", "MAPPING")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("drop_noop", "ok");
+        }
         if (parser.matchKeyword("ROLE") || parser.matchKeyword("USER") || parser.matchKeyword("GROUP")) {
             return roleParser.parseDropRole();
         }
@@ -185,7 +204,6 @@ class DdlParser {
         }
         else if (parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")
                 || parser.matchKeyword("SERVER")
-                || parser.matchKeywords("USER", "MAPPING")
                 || parser.matchKeywords("FOREIGN", "TABLE")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("drop_noop", "ok");
@@ -266,9 +284,10 @@ class DdlParser {
             if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
         }
 
+        java.util.List<String> funcParamTypes = null;
         if ((objectType == DropStmt.ObjectType.FUNCTION || objectType == DropStmt.ObjectType.AGGREGATE)
                 && parser.check(TokenType.LEFT_PAREN)) {
-            DdlTableParser.consumeUntilParen(parser);
+            funcParamTypes = parseFunctionDropParamTypes();
         }
         if (objectType == DropStmt.ObjectType.OPERATOR && parser.check(TokenType.LEFT_PAREN)) {
             // Capture arg types for operator overload resolution
@@ -322,7 +341,45 @@ class DdlParser {
         boolean cascade = parser.matchKeyword("CASCADE");
         parser.matchKeyword("RESTRICT");
 
-        return new DropStmt(objectType, name, onTable, ifExists, cascade);
+        return new DropStmt(objectType, name, onTable, ifExists, cascade, funcParamTypes);
+    }
+
+    /**
+     * Parse parameter types from DROP FUNCTION name(type1, type2, ...).
+     * Supports optional parameter modes (IN, OUT, INOUT, VARIADIC) and parameter names.
+     * Returns a list of type names (excluding OUT parameters).
+     */
+    private java.util.List<String> parseFunctionDropParamTypes() {
+        parser.expect(TokenType.LEFT_PAREN);
+        java.util.List<String> types = new java.util.ArrayList<>();
+        if (parser.check(TokenType.RIGHT_PAREN)) {
+            parser.advance();
+            return types;
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+            // Skip optional mode keywords
+            String mode = "IN";
+            if (parser.checkKeyword("IN") || parser.checkKeyword("OUT")
+                    || parser.checkKeyword("INOUT") || parser.checkKeyword("VARIADIC")) {
+                mode = parser.advance().value().toUpperCase();
+            }
+            // Collect type tokens until comma or right paren
+            StringBuilder typeBuf = new StringBuilder();
+            int depth = 0;
+            while (!parser.isAtEnd()) {
+                if (depth == 0 && (parser.check(TokenType.COMMA) || parser.check(TokenType.RIGHT_PAREN))) break;
+                if (parser.check(TokenType.LEFT_PAREN)) depth++;
+                if (parser.check(TokenType.RIGHT_PAREN)) depth--;
+                if (typeBuf.length() > 0) typeBuf.append(" ");
+                typeBuf.append(parser.advance().value());
+            }
+            if (!"OUT".equals(mode)) {
+                types.add(typeBuf.toString().trim());
+            }
+            parser.match(TokenType.COMMA);
+        }
+        parser.expect(TokenType.RIGHT_PAREN);
+        return types;
     }
 
     // ---- ALTER dispatcher ----
@@ -331,6 +388,10 @@ class DdlParser {
         parser.expectKeyword("ALTER");
         if (parser.matchKeyword("TYPE")) return parseAlterType();
         if (parser.matchKeyword("SEQUENCE")) return parseAlterSequence();
+        if (parser.matchKeywords("USER", "MAPPING")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_noop", "ok");
+        }
         if (parser.matchKeyword("ROLE") || parser.matchKeyword("USER")) return roleParser.parseAlterRole();
         if (parser.matchKeyword("POLICY")) return policyParser.parseAlterPolicy();
         if (parser.matchKeywords("DEFAULT", "PRIVILEGES")) return parseAlterDefaultPrivileges();
@@ -349,6 +410,10 @@ class DdlParser {
             }
             if (parser.matchKeywords("OWNER", "TO")) {
                 return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.OWNER_TO);
+            }
+            if (parser.matchKeyword("SET") && parser.check(TokenType.LEFT_PAREN)) {
+                Map<String, String> opts = parseViewWithOptions();
+                return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.SET_OPTIONS, opts);
             }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.NO_OP);
@@ -405,7 +470,6 @@ class DdlParser {
                 || parser.matchKeyword("RULE") || parser.matchKeyword("CONVERSION")
                 || parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")
                 || parser.matchKeyword("SERVER")
-                || parser.matchKeywords("USER", "MAPPING")
                 || parser.matchKeywords("FOREIGN", "TABLE")
                 || parser.matchKeyword("PUBLICATION")
                 || parser.matchKeyword("SUBSCRIPTION")
@@ -545,6 +609,22 @@ class DdlParser {
             return new CreateViewStmt(name, query, orReplace, true, columnNames, withData);
         }
 
+        // Parse WITH (options) before AS, e.g. WITH (security_invoker = true)
+        Map<String, String> withOptions = null;
+        if (parser.matchKeyword("WITH")) {
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                withOptions = parseViewWithOptions();
+            } else {
+                // This is actually WITH CHECK OPTION without options, push back
+                // But since we already consumed WITH, handle inline
+                if (parser.matchKeyword("CASCADED") || parser.matchKeyword("LOCAL") || parser.checkKeyword("CHECK")) {
+                    // Oops - this was WITH [CASCADED|LOCAL] CHECK OPTION after query
+                    // But we haven't parsed AS/query yet, so this must be WITH (...) options
+                    // This path shouldn't be reached for well-formed SQL
+                }
+            }
+        }
+
         parser.expectKeyword("AS");
         boolean parenWrapped2 = parser.match(TokenType.LEFT_PAREN);
         Statement query = parser.tryParseSetOp(parser.parseSelect());
@@ -559,7 +639,28 @@ class DdlParser {
             if (checkOption == null) checkOption = "CASCADED";
         }
 
-        return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption);
+        return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption, withOptions);
+    }
+
+    private Map<String, String> parseViewWithOptions() {
+        Map<String, String> opts = new LinkedHashMap<>();
+        parser.expect(TokenType.LEFT_PAREN);
+        do {
+            String key = parser.readIdentifier();
+            parser.expect(TokenType.EQUALS);
+            // value can be identifier (true/false) or string literal or number
+            String value;
+            if (parser.check(TokenType.STRING_LITERAL)) {
+                value = parser.advance().value();
+            } else if (parser.check(TokenType.INTEGER_LITERAL)) {
+                value = parser.advance().value();
+            } else {
+                value = parser.readIdentifier();
+            }
+            opts.put(key.toLowerCase(), value.toLowerCase());
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        return opts;
     }
 
     RefreshMaterializedViewStmt parseRefreshMaterializedView() {
@@ -622,6 +723,12 @@ class DdlParser {
                 parser.matchKeyword("BY");
             }
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                // Handle ORDER BY appearing mid-list (ordered-set aggregates)
+                if (parser.checkKeyword("ORDER")) {
+                    parser.advance(); // consume ORDER
+                    parser.matchKeyword("BY"); // consume BY
+                    continue;
+                }
                 if (parser.check(TokenType.STAR)) {
                     parser.advance();
                     argTypes.add("*");
@@ -1138,29 +1245,93 @@ class DdlParser {
 
     // ---- ALTER FUNCTION / ALTER PROCEDURE ----
 
+    /** Check if a token is the start of a multi-word SQL type name. */
+    private static boolean isMultiWordTypeStart(String token) {
+        switch (token.toLowerCase()) {
+            case "double":        // double precision
+            case "character":     // character varying
+            case "timestamp":     // timestamp with/without time zone
+            case "time":          // time with/without time zone
+            case "bit":           // bit varying
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private Statement parseAlterFunctionOrProcedure(boolean isProcedure) {
-        boolean ifExists = parser.matchKeywords("IF", "EXISTS");
+        // PG 18: ALTER FUNCTION/PROCEDURE does not support IF EXISTS
+        if (parser.checkKeyword("IF")) {
+            throw new MemgresException(
+                    "syntax error at or near \"" + parser.peek().value() + "\"", "42601");
+        }
+        boolean ifExists = false;
         // Read function/procedure name (possibly schema-qualified)
         String schema = null;
         String funcName = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) { schema = funcName; funcName = parser.readIdentifier(); }
-        // Consume parameter list if present
-        if (parser.check(TokenType.LEFT_PAREN)) DdlTableParser.consumeUntilParen(parser);
+        // Parse parameter type list if present (e.g., "(integer, text)")
+        java.util.List<String> paramTypes = null;
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance(); // consume '('
+            paramTypes = new ArrayList<>();
+            if (!parser.check(TokenType.RIGHT_PAREN)) {
+                // Parse parameter types, skipping optional IN/OUT/INOUT/VARIADIC mode and optional param name
+                while (true) {
+                    // Skip parameter mode keywords if present
+                    if (parser.checkKeyword("IN") || parser.checkKeyword("OUT")
+                            || parser.checkKeyword("INOUT") || parser.checkKeyword("VARIADIC")) {
+                        parser.advance();
+                    }
+                    // Read the type name; could be multi-word (e.g., "double precision", "character varying")
+                    // But first, check if next token is a name followed by a type (e.g., "x integer")
+                    StringBuilder typeName = new StringBuilder();
+                    String first = parser.advance().value();
+                    // Peek ahead: if next token is not comma/right-paren and first looks like a param name,
+                    // the first token was the parameter name, and we need to read the actual type
+                    if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)
+                            && !parser.isAtEnd()) {
+                        // First was a param name or start of multi-word type
+                        // Heuristic: if first is a known type-start keyword, include it in the type
+                        String second = parser.advance().value();
+                        boolean firstIsTypeStart = isMultiWordTypeStart(first);
+                        if (firstIsTypeStart) {
+                            typeName.append(first).append(" ");
+                        }
+                        typeName.append(second);
+                        while (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)
+                                && !parser.isAtEnd()) {
+                            typeName.append(" ").append(parser.advance().value());
+                        }
+                    } else {
+                        // first IS the type (no param name)
+                        typeName.append(first);
+                    }
+                    paramTypes.add(typeName.toString().trim());
+                    if (parser.check(TokenType.COMMA)) {
+                        parser.advance(); // consume ','
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if (parser.check(TokenType.RIGHT_PAREN)) parser.advance(); // consume ')'
+        }
 
         // RENAME TO
         if (parser.matchKeywords("RENAME", "TO")) {
             String newName = parser.readIdentifier();
-            return AlterFunctionStmt.renameTo(funcName, schema, isProcedure, ifExists, newName);
+            return AlterFunctionStmt.renameTo(funcName, schema, isProcedure, ifExists, newName, paramTypes);
         }
         // SET SCHEMA
         if (parser.matchKeywords("SET", "SCHEMA")) {
             String newSchema = parser.readIdentifier();
-            return AlterFunctionStmt.setSchema(funcName, schema, isProcedure, ifExists, newSchema);
+            return AlterFunctionStmt.setSchema(funcName, schema, isProcedure, ifExists, newSchema, paramTypes);
         }
         // OWNER TO
         if (parser.matchKeywords("OWNER", "TO")) {
             String newOwner = parser.readIdentifier();
-            return AlterFunctionStmt.ownerTo(funcName, schema, isProcedure, ifExists, newOwner);
+            return AlterFunctionStmt.ownerTo(funcName, schema, isProcedure, ifExists, newOwner, paramTypes);
         }
 
         // Attribute changes: VOLATILE, STABLE, IMMUTABLE, STRICT, CALLED ON NULL INPUT,
@@ -1244,7 +1415,7 @@ class DdlParser {
         }
 
         return new AlterFunctionStmt(funcName, schema, isProcedure, ifExists, AlterFunctionStmt.Action.SET_ATTRIBUTES,
-                null, volatility, strict, securityDefiner, leakproof, cost, rows, parallel, setClauses, resetParams);
+                null, volatility, strict, securityDefiner, leakproof, cost, rows, parallel, setClauses, resetParams, paramTypes);
     }
 
     // ---- ALTER INDEX ----
@@ -1282,15 +1453,43 @@ class DdlParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.SET_STATISTICS, null);
         }
-        // SET ( ... ) (no-op)
-        if (parser.matchKeyword("SET")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.SET_PARAMS, null);
+        // SET ( key = value, ... ) — parse storage parameters
+        // PG 18: ALTER INDEX does not support SET SCHEMA — reject it
+        if (parser.checkKeyword("SET") && parser.checkKeywordAt(1, "SCHEMA")) {
+            throw new MemgresException(
+                    "syntax error at or near \"SCHEMA\"", "42601");
         }
-        // RESET ( ... ) (no-op)
-        if (parser.matchKeyword("RESET")) {
+        if (parser.matchKeyword("SET")) {
+            java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                    String key = parser.readIdentifier().toLowerCase();
+                    parser.match(TokenType.EQUALS);
+                    StringBuilder val = new StringBuilder();
+                    while (!parser.isAtEnd() && !parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                        val.append(parser.advance().value());
+                    }
+                    params.put(key, val.toString().trim());
+                    parser.match(TokenType.COMMA);
+                }
+                parser.match(TokenType.RIGHT_PAREN);
+            }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.RESET_PARAMS, null);
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.SET_PARAMS, null, params);
+        }
+        // RESET ( param, ... ) — remove storage parameters
+        if (parser.matchKeyword("RESET")) {
+            java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                    String key = parser.readIdentifier().toLowerCase();
+                    params.put(key, null); // null value signals removal
+                    parser.match(TokenType.COMMA);
+                }
+                parser.match(TokenType.RIGHT_PAREN);
+            }
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.RESET_PARAMS, null, params);
         }
 
         // Fallback: consume and no-op

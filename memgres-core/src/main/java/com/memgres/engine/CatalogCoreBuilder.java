@@ -176,6 +176,19 @@ class CatalogCoreBuilder {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             int viewOwnerOid = resolveOwnerOid(database, oids, "view:" + vSchema + "." + vd.name());
             int vOid = oids.oid("rel:" + vSchema + "." + vd.name());
+            // Build reloptions array string from view options
+            String viewRelOptions = null;
+            if (vd.reloptions() != null && !vd.reloptions().isEmpty()) {
+                StringBuilder sb = new StringBuilder("{");
+                boolean first = true;
+                for (Map.Entry<String, String> opt : vd.reloptions().entrySet()) {
+                    if (!first) sb.append(",");
+                    sb.append(opt.getKey()).append("=").append(opt.getValue());
+                    first = false;
+                }
+                sb.append("}");
+                viewRelOptions = sb.toString();
+            }
             table.insertRow(new Object[]{
                     vOid, vd.name(), oids.oid("ns:" + vSchema),
                     0, 0, viewOwnerOid, 0, vOid, 0,
@@ -186,7 +199,7 @@ class CatalogCoreBuilder {
                     false, // relhasoids
                     true, "n", false,
                     0, 0, 0,
-                    null, null, null, 1
+                    null, viewRelOptions, null, 1
             });
         }
 
@@ -265,6 +278,16 @@ class CatalogCoreBuilder {
             }
             int idxOid = oids.oid("rel:" + indexSchema + "." + indexName);
             short idxNatts = (short) idx.getValue().size();
+            // Build reloptions array from index storage parameters
+            Map<String, String> idxOpts = database.getIndexReloptions(indexName);
+            Object reloptionsVal = null;
+            if (idxOpts != null && !idxOpts.isEmpty()) {
+                List<String> optList = new ArrayList<>();
+                for (Map.Entry<String, String> oe : idxOpts.entrySet()) {
+                    optList.add(oe.getKey() + "=" + oe.getValue());
+                }
+                reloptionsVal = optList;
+            }
             table.insertRow(new Object[]{
                     idxOid, indexName, oids.oid("ns:" + indexSchema),
                     0, 0, 10, 403, idxOid, 0,  // relam=403 (btree)
@@ -274,7 +297,7 @@ class CatalogCoreBuilder {
                     false, false, false, false, false,
                     false, // relhasoids
                     true, "n", false, 0, 0, 0,
-                    null, null, null, 1
+                    null, reloptionsVal, null, 1
             });
         }
 
@@ -470,7 +493,31 @@ class CatalogCoreBuilder {
                 }
             }
         }
+
+        // Add pg_attribute entries for key catalog tables so queries like
+        // "SELECT ... FROM pg_attribute WHERE attrelid = 'pg_aggregate'::regclass" work.
+        addCatalogTableAttributes(table, "pg_aggregate", new String[]{
+                "aggfnoid", "aggtransfn", "aggtranstype", "aggfinalfn",
+                "agginitval", "aggsortop", "aggfinalextra", "aggtransspace",
+                "aggmtransfn", "aggminvtransfn", "aggmtranstype", "aggmtransspace",
+                "aggmfinalfn", "aggmfinalextra", "aggminitval", "aggkind",
+                "aggnumdirectargs", "aggcombinefn", "aggserialfn", "aggdeserialfn"
+        });
+
         return table;
+    }
+
+    /** Helper: add pg_attribute rows for a system catalog table. */
+    private void addCatalogTableAttributes(Table attrTable, String catalogName, String[] colNames) {
+        int relOid = oids.oid("rel:pg_catalog." + catalogName);
+        for (int i = 0; i < colNames.length; i++) {
+            attrTable.insertRow(new Object[]{
+                    relOid, colNames[i], 0, (short) (i + 1),
+                    false, -1, (short) -1, false, false,
+                    "", "", 0, 1, true, 0, null, 0, null,
+                    null, (short) -1, "p", "", false, null, "i"
+            });
+        }
     }
 
     Table buildPgType() {
@@ -963,6 +1010,19 @@ class CatalogCoreBuilder {
             }
             String fnOwner = fn.getOwner();
             int fnOwnerOid = (fnOwner != null && !fnOwner.isEmpty()) ? oids.oid("role:" + fnOwner) : 10;
+            // Build proconfig from function-level SET clauses (e.g., "work_mem=256MB")
+            String proconfig = null;
+            if (fn.getSetClauses() != null && !fn.getSetClauses().isEmpty()) {
+                StringBuilder sb = new StringBuilder("{");
+                boolean first = true;
+                for (Map.Entry<String, String> sc : fn.getSetClauses().entrySet()) {
+                    if (!first) sb.append(",");
+                    sb.append(sc.getKey()).append("=").append(sc.getValue());
+                    first = false;
+                }
+                sb.append("}");
+                proconfig = sb.toString();
+            }
             table.insertRow(new Object[]{
                     oids.oid("proc:" + fn.getName()), fn.getName(), funcNs, fnOwnerOid,
                     langOid, fn.getCost(), fn.getRows(), 0, "-", kind,
@@ -971,9 +1031,28 @@ class CatalogCoreBuilder {
                     fn.getParallel() != null ? fn.getParallel().substring(0, 1).toLowerCase() : "u",
                     nargs, (short) 0, 0,
                     argTypes, null, null, null, null, null,
-                    fn.getBody(), null, null, null, null, 1
+                    fn.getBody(), null, null, proconfig, null, 1
             });
         }
+
+        // User-defined aggregates: emit with prokind='a'
+        for (Map.Entry<String, PgAggregate> aggEntry : database.getUserAggregates().entrySet()) {
+            PgAggregate agg = aggEntry.getValue();
+            // Determine namespace from the aggregate's schema
+            String aggSchema = agg.getSchemaName() != null ? agg.getSchemaName() : "public";
+            int aggNs = aggSchema.equals("pg_catalog") ? pgCatalogNs : oids.oid("ns:" + aggSchema);
+            // Determine arg count from aggregate's argTypes
+            short aggNargs = agg.getArgTypes() != null ? (short) agg.getArgTypes().length : 0;
+            table.insertRow(new Object[]{
+                    oids.oid("proc:" + agg.getName()), agg.getName(), aggNs, 10,
+                    oids.oid("lang:internal"), 1.0, 0.0, 0, "-", "a",
+                    false, false, false, false, "i", "u",
+                    aggNargs, (short) 0, 0,
+                    null, null, null, null, null, null,
+                    null, null, null, null, null, 1
+            });
+        }
+
         return table;
     }
 }

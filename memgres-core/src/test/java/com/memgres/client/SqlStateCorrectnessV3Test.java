@@ -445,7 +445,7 @@ class SqlStateCorrectnessV3Test {
         exec("CREATE TABLE ssv3_idx_t (id INT)");
         try {
             assertSqlState("42P17",
-                "CREATE INDEX ssv3_bad_idx ON ssv3_idx_t (random())");
+                "CREATE INDEX ssv3_bad_idx ON ssv3_idx_t ((random()))");
         } finally {
             exec("DROP TABLE IF EXISTS ssv3_idx_t");
         }

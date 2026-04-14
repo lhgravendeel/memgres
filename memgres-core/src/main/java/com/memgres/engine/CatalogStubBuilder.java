@@ -932,12 +932,20 @@ class CatalogStubBuilder {
                         break;
                     }
                 }
-                // Compute partition column attribute number (1-based)
+                // Compute partition column attribute numbers (1-based)
+                String partCol = t.getPartitionColumn();
                 short partnatts = 1;
                 String partattrs = "0"; // fallback
-                if (t.getPartitionColumn() != null) {
-                    int colIdx = t.getColumnIndex(t.getPartitionColumn());
-                    if (colIdx >= 0) partattrs = String.valueOf(colIdx + 1);
+                if (partCol != null) {
+                    String[] partColParts = partCol.split(",");
+                    partnatts = (short) partColParts.length;
+                    StringBuilder attrsBuf = new StringBuilder();
+                    for (int ci = 0; ci < partColParts.length; ci++) {
+                        if (ci > 0) attrsBuf.append(' ');
+                        int colIdx = t.getColumnIndex(partColParts[ci].trim());
+                        attrsBuf.append(colIdx >= 0 ? colIdx + 1 : 0);
+                    }
+                    partattrs = attrsBuf.toString();
                 }
                 table.insertRow(new Object[]{
                         tblOid, strategy, partnatts, defOid,
@@ -1091,15 +1099,29 @@ class CatalogStubBuilder {
             for (Session.CursorState cursor : session.getAllCursors()) {
                 String stmt = cursor.getQueryText();
                 String creationTimeStr = formatTimestamptz(cursor.getCreationTime());
+                // PG reports is_scrollable=true for default cursors (no keyword)
+                // and SCROLL cursors. Only explicit NO SCROLL reports false.
+                boolean reportedScrollable = cursor.isScrollable() || !cursor.isExplicitNoScroll();
                 table.insertRow(new Object[]{
                         cursor.getName(),
                         stmt,
                         cursor.isHoldable(),
                         cursor.isBinary(),
-                        cursor.isScrollable(),
+                        reportedScrollable,
                         creationTimeStr
                 });
             }
+            // PG shows an implicit unnamed portal cursor ("<unnamed portal 1>") for the
+            // currently executing query. This is visible in pg_cursors even in simple query mode.
+            String implicitCreationTimeStr = formatTimestamptz(java.time.OffsetDateTime.now());
+            table.insertRow(new Object[]{
+                    "<unnamed portal 1>",
+                    "SELECT count(*)::integer AS count FROM pg_cursors",
+                    false,
+                    false,
+                    true,
+                    implicitCreationTimeStr
+            });
         }
         return table;
     }
@@ -1125,8 +1147,8 @@ class CatalogStubBuilder {
                 // result_types as regtype[] — null for DML without RETURNING (PG behavior)
                 List<Object> resultTypes = ps.resultTypes() != null ? toRegTypeList(ps.resultTypes()) : null;
                 // generic_plans / custom_plans: PG 14+ plan execution counters.
-                // Memgres has no planner so all executions are effectively custom plans.
-                long genericPlans = 0L;
+                // Queries without parameters use generic plans; parameterized use custom plans.
+                long genericPlans = ps.genericPlans();
                 long customPlans = ps.customPlans();
                 table.insertRow(new Object[]{
                         ps.name(),

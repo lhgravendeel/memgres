@@ -178,6 +178,13 @@ class SelectExecutor {
             if (containsWindowFunction(stmt.where())) {
                 throw new MemgresException("window functions are not allowed in WHERE", "42P20");
             }
+            // Pre-flight type validation of WHERE clause (PG checks at plan time)
+            // Only validate for simple single-table SELECTs (not CTEs/subqueries/joins)
+            if (simpleFrom && baseBindings.size() == 1 && !hasJoins
+                    && (stmt.withClauses() == null || stmt.withClauses().isEmpty())
+                    && executor.cteStack.isEmpty()) {
+                executor.validateWhereTypesAgainstTable(stmt.where(), baseBindings.get(0).table());
+            }
             if (!contexts.isEmpty()) {
                 Object testVal = executor.evalExpr(stmt.where(), contexts.get(0));
                 if (testVal instanceof Number) {
@@ -205,6 +212,32 @@ class SelectExecutor {
                         throw new MemgresException(
                                 "column \"" + colName + "\" must appear in the GROUP BY clause or be used in an aggregate function",
                                 "42803");
+                    }
+                }
+                // Validate ORDER BY: non-aggregate columns are not allowed without GROUP BY
+                if (stmt.orderBy() != null) {
+                    for (SelectStmt.OrderByItem ob : stmt.orderBy()) {
+                        Expression obExpr = ob.expr();
+                        if (obExpr instanceof Literal && ((Literal) obExpr).literalType() == Literal.LiteralType.INTEGER) continue;
+                        if (!isAggregateOrConstant(obExpr)) {
+                            String colName = obExpr instanceof ColumnRef ? ((ColumnRef) obExpr).column()
+                                    : executor.exprToAlias(obExpr);
+                            // Check if it matches a target alias that is an aggregate
+                            boolean matchesAggTarget = false;
+                            for (SelectStmt.SelectTarget t : stmt.targets()) {
+                                if (t.alias() != null && t.alias().equalsIgnoreCase(colName) && isAggregateOrConstant(t.expr())) {
+                                    matchesAggTarget = true;
+                                    break;
+                                }
+                            }
+                            if (!matchesAggTarget) {
+                                String tableName = obExpr instanceof ColumnRef && ((ColumnRef) obExpr).table() != null
+                                        ? ((ColumnRef) obExpr).table() + "." + colName : colName;
+                                throw new MemgresException(
+                                        "column \"" + tableName + "\" must appear in the GROUP BY clause or be used in an aggregate function",
+                                        "42803");
+                            }
+                        }
                     }
                 }
             }
@@ -466,8 +499,9 @@ class SelectExecutor {
     // ---- Expression analysis helpers (shared across delegates) ----
 
     boolean isAggregateFunction(String name) {
-        return AGGREGATE_FUNCTIONS.contains(name.toLowerCase())
-                || executor.database.hasAggregate(name);
+        String stripped = FunctionEvaluator.stripSchemaPrefix(name.toLowerCase());
+        return AGGREGATE_FUNCTIONS.contains(stripped)
+                || executor.database.hasAggregate(stripped);
     }
 
     boolean containsAggregate(Expression expr) {
@@ -488,6 +522,8 @@ class SelectExecutor {
         if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() != null && containsAggregate(c.left())) || containsAggregate(c.right()); }
         if (expr instanceof UnaryExpr) return containsAggregate(((UnaryExpr) expr).operand());
         if (expr instanceof CastExpr) return containsAggregate(((CastExpr) expr).expr());
+        if (expr instanceof IsJsonExpr) return containsAggregate(((IsJsonExpr) expr).expr());
+        if (expr instanceof IsNullExpr) return containsAggregate(((IsNullExpr) expr).expr());
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
             for (CaseExpr.WhenClause when : c.whenClauses()) {
@@ -538,6 +574,8 @@ class SelectExecutor {
         if (expr instanceof OrderedSetAggExpr) return true;
         if (expr instanceof FunctionCallExpr) return isAggregateFunction(((FunctionCallExpr) expr).name()) || ((FunctionCallExpr) expr).args().stream().allMatch(this::isAggregateOrConstant);
         if (expr instanceof CastExpr) return isAggregateOrConstant(((CastExpr) expr).expr());
+        if (expr instanceof IsJsonExpr) return isAggregateOrConstant(((IsJsonExpr) expr).expr());
+        if (expr instanceof IsNullExpr) return isAggregateOrConstant(((IsNullExpr) expr).expr());
         if (expr instanceof BinaryExpr) return isAggregateOrConstant(((BinaryExpr) expr).left()) && isAggregateOrConstant(((BinaryExpr) expr).right());
         if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() == null || isAggregateOrConstant(c.left())) && isAggregateOrConstant(c.right()); }
         if (expr instanceof UnaryExpr) return isAggregateOrConstant(((UnaryExpr) expr).operand());
@@ -1099,7 +1137,7 @@ class SelectExecutor {
     }
 
     private boolean isSrfCall(Expression expr) {
-        if (expr instanceof FunctionCallExpr && SRF_FUNCTIONS.contains(((FunctionCallExpr) expr).name().toLowerCase())) return true;
+        if (expr instanceof FunctionCallExpr && SRF_FUNCTIONS.contains(FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) expr).name().toLowerCase()))) return true;
         if (expr instanceof CastExpr) return isSrfCall(((CastExpr) expr).expr());
         return false;
     }

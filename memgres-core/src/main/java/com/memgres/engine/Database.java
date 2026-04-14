@@ -37,6 +37,7 @@ public class Database {
     private final Map<String, Boolean> indexUniqueFlags = new ConcurrentHashMap<>(); // index name → is unique
     private final Map<String, String> indexWhereClauses = new ConcurrentHashMap<>(); // index name → WHERE predicate
     private final Map<String, String> indexMethods = new ConcurrentHashMap<>(); // index name → access method (btree, hash, etc.)
+    private final Map<String, Map<String, String>> indexReloptions = new ConcurrentHashMap<>(); // index name → storage params
     private final NotificationManager notificationManager = new NotificationManager();
     private DatabaseRegistry databaseRegistry;
 
@@ -168,6 +169,14 @@ public class Database {
                 "-- built-in: suppresses redundant updates", "internal");
         suppressFunc.setSchemaName("pg_catalog");
         addFunction(suppressFunc);
+        // Register pg_sleep so ALTER FUNCTION pg_sleep(...) works (PG has it in pg_proc)
+        PgFunction pgSleepFunc = new PgFunction("pg_sleep", "void",
+                "-- built-in: pg_sleep", "internal",
+                Cols.listOf(new PgFunction.Param("seconds", "double precision", "IN", null)), false);
+        pgSleepFunc.setSchemaName("pg_catalog");
+        pgSleepFunc.setVolatility("VOLATILE");
+        pgSleepFunc.setStrict(true);
+        addFunction(pgSleepFunc);
     }
 
     // ---- Connection management ----
@@ -310,6 +319,10 @@ public class Database {
         userAggregates.remove(name.toLowerCase());
     }
 
+    public Map<String, PgAggregate> getUserAggregates() {
+        return userAggregates;
+    }
+
     // User-defined operators (keyed by name+argtypes for overloading)
     public void addOperator(PgOperator op) {
         userOperators.put(op.getKey().toLowerCase(), op);
@@ -429,7 +442,37 @@ public class Database {
     public PgFunction resolveFunction(String name, int argCount, List<String> argTypeHints) {
         List<PgFunction> overloads = getFunctionOverloads(name);
         if (overloads.isEmpty()) return null;
-        if (overloads.size() == 1) return overloads.get(0);
+        // For a single overload, return it unless type hints indicate a clearly incompatible call.
+        // This preserves correct behavior for functions with default params or INOUT params
+        // where arg count may not match param count, while still rejecting calls like
+        // fn_to_drop(1) when only fn_to_drop(text) exists (integer !-> text in PG).
+        //
+        // We only reject when a numeric-family hint targets a text-family param, matching
+        // PG's rule that integer literals don't implicitly cast to text in function resolution.
+        // Other mismatches are allowed because type hints can be unreliable (e.g., JDBC may
+        // report 'text' for a numeric expression result).
+        if (overloads.size() == 1) {
+            if (argTypeHints == null || argTypeHints.isEmpty()
+                    || argTypeHints.stream().allMatch(h -> h == null)) {
+                return overloads.get(0);
+            }
+            PgFunction f = overloads.get(0);
+            List<PgFunction.Param> inputParams = f.getParams().stream()
+                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
+                    .collect(Collectors.toList());
+            boolean hasIncompatible = false;
+            for (int i = 0; i < argTypeHints.size() && i < inputParams.size(); i++) {
+                String hint = argTypeHints.get(i);
+                String paramType = inputParams.get(i).typeName();
+                if (hint != null && paramType != null && isNumericToTextMismatch(hint, paramType)) {
+                    hasIncompatible = true;
+                    break;
+                }
+            }
+            if (!hasIncompatible) {
+                return f;
+            }
+        }
 
         // Try to match by argument count and type hints
         for (PgFunction f : overloads) {
@@ -456,22 +499,41 @@ public class Database {
                 if (match) return f;
             }
         }
-        // Fallback: match by arg count only
-        for (PgFunction f : overloads) {
-            long inputCount = f.getParams().stream()
-                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
-                    .count();
-            boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
-            if (hasVariadic) {
-                if (argCount >= inputCount) return f;
-            } else {
-                if (inputCount == argCount) return f;
+        // Fallback: match by arg count only — but only when no type hints were provided.
+        // When type hints exist and no overload matched, the call is genuinely unresolvable
+        // (e.g., fn_to_drop(integer) was dropped, fn_to_drop(text) remains, calling fn_to_drop(1)).
+        if (argTypeHints == null || argTypeHints.isEmpty() || argTypeHints.stream().allMatch(h -> h == null)) {
+            for (PgFunction f : overloads) {
+                long inputCount = f.getParams().stream()
+                        .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
+                        .count();
+                boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
+                if (hasVariadic) {
+                    if (argCount >= inputCount) return f;
+                } else {
+                    if (inputCount == argCount) return f;
+                }
             }
+            return overloads.get(0); // fallback to first
         }
-        return overloads.get(0); // fallback to first
+        return null;
     }
 
-    private boolean typesCompatible(String argType, String paramType) {
+    /**
+     * Returns true if the arg type hint is from the numeric family and the param type
+     * is from the text family. In PG, numeric types do NOT implicitly cast to text
+     * for function resolution purposes (e.g., fn(integer) should not match fn(text)).
+     */
+    private boolean isNumericToTextMismatch(String argType, String paramType) {
+        String a = argType.toLowerCase().trim();
+        String p = paramType.toLowerCase().trim();
+        Set<String> numeric = Cols.setOf("int", "integer", "int4", "bigint", "int8", "smallint", "int2",
+                "numeric", "decimal", "real", "float", "float4", "float8", "double precision");
+        Set<String> textual = Cols.setOf("text", "varchar", "character varying", "char", "character", "name");
+        return numeric.contains(a) && textual.contains(p);
+    }
+
+    public boolean typesCompatible(String argType, String paramType) {
         String a = argType.toLowerCase().trim();
         String p = paramType.toLowerCase().trim();
         if (a.equals(p)) return true;
@@ -513,6 +575,46 @@ public class Database {
         } else {
             functions.put(key, overloads.get(0));
         }
+    }
+
+    /** Rename a single specific overload of a function/procedure. */
+    public void renameFunctionOverload(PgFunction func, String newName) {
+        String oldName = func.getName();
+        String oldKey = oldName.toLowerCase();
+        String newKey = newName.toLowerCase();
+        // Remove this specific overload from the old name's overload list
+        List<PgFunction> oldOverloads = functionOverloads.get(oldKey);
+        if (oldOverloads != null) {
+            oldOverloads.remove(func);
+            if (oldOverloads.isEmpty()) {
+                functionOverloads.remove(oldKey);
+                functions.remove(oldKey);
+            } else {
+                functions.put(oldKey, oldOverloads.get(0));
+            }
+        }
+        // Update the function's name
+        func.setName(newName);
+        // Add to the new name's overload list
+        List<PgFunction> newOverloads = functionOverloads.computeIfAbsent(newKey, k -> new ArrayList<>());
+        newOverloads.add(func);
+        functions.put(newKey, func);
+        // Update schema registry
+        if (oldOverloads == null || oldOverloads.isEmpty()) {
+            for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
+                if (entry.getValue().remove("function:" + oldKey)) {
+                    entry.getValue().add("function:" + newKey);
+                }
+            }
+        } else {
+            // Old name still exists (other overloads remain), just register the new name
+            for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
+                entry.getValue().add("function:" + newKey);
+            }
+        }
+        // Update object ownership key
+        String oldOwner = objectOwners.remove("function:" + oldKey);
+        if (oldOwner != null) objectOwners.put("function:" + newKey, oldOwner);
     }
 
     /** Rename a function/procedure: re-key in all maps, update the PgFunction name field. */
@@ -611,7 +713,11 @@ public class Database {
 
     // Comments
     public void addComment(String objectType, String objectName, String comment) {
-        comments.put(objectType + ":" + objectName, comment);
+        if (comment == null) {
+            comments.remove(objectType + ":" + objectName);
+        } else {
+            comments.put(objectType + ":" + objectName, comment);
+        }
     }
 
     public String getComment(String objectType, String objectName) {
@@ -659,6 +765,18 @@ public class Database {
         return indexColumns.get(name.toLowerCase());
     }
 
+    public Map<String, String> getIndexReloptions(String name) {
+        return indexReloptions.get(name.toLowerCase());
+    }
+
+    public void setIndexReloptions(String name, Map<String, String> opts) {
+        indexReloptions.put(name.toLowerCase(), opts);
+    }
+
+    public void removeIndexReloptions(String name) {
+        indexReloptions.remove(name.toLowerCase());
+    }
+
     public boolean hasIndex(String name) {
         return indexColumns.containsKey(name.toLowerCase());
     }
@@ -669,6 +787,7 @@ public class Database {
         indexUniqueFlags.remove(name.toLowerCase());
         indexWhereClauses.remove(name.toLowerCase());
         indexMethods.remove(name.toLowerCase());
+        indexReloptions.remove(name.toLowerCase());
     }
 
     /** Rename an index: re-key across all index maps and update schema registry. */
@@ -685,6 +804,8 @@ public class Database {
         if (where != null) indexWhereClauses.put(newKey, where);
         String method = indexMethods.remove(oldKey);
         if (method != null) indexMethods.put(newKey, method);
+        Map<String, String> opts = indexReloptions.remove(oldKey);
+        if (opts != null) indexReloptions.put(newKey, opts);
         // Update schema registry
         for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
             if (entry.getValue().remove("index:" + oldKey)) {
@@ -970,6 +1091,7 @@ public class Database {
         public final List<Object[]> cachedRows;
         public final String sourceSQL;
         public final String checkOption;
+        public final Map<String, String> reloptions;
 
         public ViewDef(
                 String name,
@@ -982,6 +1104,21 @@ public class Database {
                 String sourceSQL,
                 String checkOption
         ) {
+            this(name, schemaName, query, orReplace, materialized, cachedColumns, cachedRows, sourceSQL, checkOption, null);
+        }
+
+        public ViewDef(
+                String name,
+                String schemaName,
+                Statement query,
+                boolean orReplace,
+                boolean materialized,
+                List<Column> cachedColumns,
+                List<Object[]> cachedRows,
+                String sourceSQL,
+                String checkOption,
+                Map<String, String> reloptions
+        ) {
             this.name = name;
             this.schemaName = schemaName;
             this.query = query;
@@ -991,6 +1128,7 @@ public class Database {
             this.cachedRows = cachedRows;
             this.sourceSQL = sourceSQL;
             this.checkOption = checkOption;
+            this.reloptions = reloptions;
         }
 
         /** Convenience constructor (full, without checkOption). */
@@ -1030,6 +1168,7 @@ public class Database {
         public List<Object[]> cachedRows() { return cachedRows; }
         public String sourceSQL() { return sourceSQL; }
         public String checkOption() { return checkOption; }
+        public Map<String, String> reloptions() { return reloptions; }
 
         @Override
         public boolean equals(Object o) {

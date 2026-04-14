@@ -142,7 +142,7 @@ class SessionExecutor {
             if (guc != null && !guc.isKnown(param) && !param.isEmpty() && !param.contains(".")) {
                 throw new MemgresException("unrecognized configuration parameter \"" + param + "\"", "42704");
             }
-            String value = guc != null ? guc.get(param) : null;
+            String value = guc != null ? guc.getForDisplay(param) : null;
             // Bug fix: SHOW transaction_isolation should reflect default_transaction_isolation
             // when SET SESSION CHARACTERISTICS has been used but SET TRANSACTION has not.
             // The JDBC driver sets default_transaction_isolation via
@@ -448,6 +448,11 @@ class SessionExecutor {
         if (executor.session != null) {
             String target = stmt.target().toUpperCase();
             if (target.equals("ALL")) {
+                // PG: DISCARD ALL cannot run inside a transaction block
+                if (executor.session.isInTransaction()) {
+                    throw new MemgresException(
+                        "DISCARD ALL cannot run inside a transaction block", "25001");
+                }
                 executor.session.getGucSettings().resetAll();
                 executor.session.removeAllPreparedStatements();
                 executor.session.removeAllCursors();
@@ -1209,6 +1214,23 @@ class SessionExecutor {
                     executor.boundParameters.add(executor.evalExpr(param, null));
                 }
             }
+            // Validate parameter types at binding time (PG checks this eagerly)
+            if (declaredCount > 0 && prepared.paramTypes() != null) {
+                for (int pi = 0; pi < Math.min(executor.boundParameters.size(), prepared.paramTypes().size()); pi++) {
+                    Object val = executor.boundParameters.get(pi);
+                    String declaredType = prepared.paramTypes().get(pi);
+                    if (val != null && declaredType != null) {
+                        try {
+                            Object coerced = executor.castEvaluator.applyCast(val, declaredType);
+                            executor.boundParameters.set(pi, coerced);
+                        } catch (Exception e) {
+                            throw new MemgresException(
+                                    "invalid input syntax for type " + declaredType + ": \"" + val + "\"",
+                                    "22P02");
+                        }
+                    }
+                }
+            }
             try {
                 prepared.recordExecution();
                 return executor.executeStatement(prepared.body());
@@ -1374,19 +1396,25 @@ class SessionExecutor {
     // ---- Cursors ----
 
     QueryResult executeDeclareCursor(DeclareCursorStmt stmt) {
+        // PG: non-holdable cursors require an explicit transaction block
+        if (!stmt.withHold() && !executor.session.isExplicitTransactionBlock()) {
+            throw new MemgresException("DECLARE CURSOR can only be used in transaction blocks", "25P01");
+        }
         if (executor.session.getCursor(stmt.name()) != null) {
             throw new MemgresException("cursor \"" + stmt.name() + "\" already exists", "42P03");
         }
-        // Execute the query to get all results
-        QueryResult result = executor.selectExecutor.executeSelect(stmt.query());
+        // Execute the query to get all results (may be SELECT or UNION/INTERSECT/EXCEPT)
+        QueryResult result = executor.executeStatement(stmt.query());
         List<Object[]> rows = result.getRows() != null ? new ArrayList<>(result.getRows()) : new ArrayList<>();
         List<Column> columns = result.getColumns() != null ? result.getColumns() : Cols.listOf();
-        // Extract original query text from the raw DECLARE statement for verbatim pg_cursors display.
-        // Falls back to AST reconstruction if original SQL is unavailable.
-        String queryText = extractDeclareQuerySql(executor.currentRawSql, stmt.query());
+        // PG stores the full DECLARE statement in pg_cursors.statement, not just the query.
+        String queryText = executor.currentRawSql != null ? executor.currentRawSql.trim() :
+                ("DECLARE " + stmt.name() + (stmt.scroll ? " SCROLL" : "")
+                 + " CURSOR" + (stmt.withHold ? " WITH HOLD" : "")
+                 + " FOR " + SqlUnparser.toSql(stmt.query()));
         executor.session.addCursor(stmt.name(),
                 new Session.CursorState(stmt.name(), columns, rows,
-                        queryText, stmt.withHold, stmt.binary, stmt.scroll));
+                        queryText, stmt.withHold, stmt.binary, stmt.scroll, stmt.explicitNoScroll));
         return QueryResult.message(QueryResult.Type.SET, "DECLARE CURSOR");
     }
 
@@ -1395,15 +1423,25 @@ class SessionExecutor {
         if (cursor == null) {
             throw new MemgresException("cursor \"" + stmt.cursorName() + "\" does not exist", "34000");
         }
-        // PG enforces NO SCROLL: only NEXT, FORWARD, FORWARD_ALL, ALL, and forward RELATIVE are allowed.
-        // PRIOR, BACKWARD, BACKWARD_ALL, FIRST, LAST, ABSOLUTE, and negative RELATIVE are rejected.
-        if (!cursor.isScrollable()) {
-            FetchStmt.Direction dir = stmt.direction();
-            if (dir == FetchStmt.Direction.PRIOR || dir == FetchStmt.Direction.BACKWARD
-                    || dir == FetchStmt.Direction.BACKWARD_ALL || dir == FetchStmt.Direction.FIRST
-                    || dir == FetchStmt.Direction.LAST || dir == FetchStmt.Direction.ABSOLUTE
-                    || (dir == FetchStmt.Direction.RELATIVE && stmt.count() < 0)) {
-                throw new MemgresException("cursor can only scan forward", "55000");
+        // PG: only explicitly declared NO SCROLL cursors reject backward movement.
+        // Default cursors (no SCROLL/NO SCROLL keyword) are effectively scrollable in PG 18.
+        if (cursor.isExplicitNoScroll()) {
+            switch (stmt.direction()) {
+                case PRIOR:
+                case FIRST:
+                case LAST:
+                case ABSOLUTE:
+                    throw new MemgresException("cursor can only scan forward", "55000");
+                case RELATIVE:
+                    if (stmt.count() < 0) {
+                        throw new MemgresException("cursor can only scan forward", "55000");
+                    }
+                    break;
+                case BACKWARD:
+                case BACKWARD_ALL:
+                    throw new MemgresException("cursor can only scan forward", "55000");
+                default:
+                    break;
             }
         }
         List<Object[]> fetched = cursorFetch(cursor, stmt.direction(), stmt.count());
@@ -1461,6 +1499,12 @@ class SessionExecutor {
                 break;
             }
             case FORWARD: {
+                if (count == 0) {
+                    // PG: FETCH FORWARD 0 returns the current row without moving
+                    addRow(result, cursor, pos);
+                    if (!result.isEmpty()) cursor.setPosition(pos);
+                    break;
+                }
                 int lastTarget = pos;
                 for (int i = 0; i < count; i++) {
                     lastTarget = pos + 1 + i;
@@ -1482,6 +1526,12 @@ class SessionExecutor {
                 break;
             }
             case BACKWARD: {
+                if (count == 0) {
+                    // PG: FETCH BACKWARD 0 returns the current row without moving
+                    addRow(result, cursor, pos);
+                    if (!result.isEmpty()) cursor.setPosition(pos);
+                    break;
+                }
                 int lastTarget = pos;
                 for (int i = 0; i < count; i++) {
                     lastTarget = pos - 1 - i;

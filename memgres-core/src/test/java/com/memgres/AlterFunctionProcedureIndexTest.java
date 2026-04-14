@@ -306,18 +306,19 @@ class AlterFunctionProcedureIndexTest {
 
     @Test
     void testAlterFunctionIfExistsNonexistent() throws SQLException {
-        // IF EXISTS on nonexistent function should not throw
-        exec("ALTER FUNCTION IF EXISTS af_no_such_ifex() RENAME TO af_whatever");
-        exec("ALTER FUNCTION IF EXISTS af_no_such_ifex() OWNER TO test");
-        exec("ALTER FUNCTION IF EXISTS af_no_such_ifex() SET SCHEMA public");
-        exec("ALTER FUNCTION IF EXISTS af_no_such_ifex() IMMUTABLE STRICT");
+        // PG 18: ALTER FUNCTION does not support IF EXISTS — rejected with 42601
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("ALTER FUNCTION IF EXISTS af_no_such_ifex() RENAME TO af_whatever"));
+        assertEquals("42601", ex.getSQLState());
     }
 
     @Test
     void testAlterFunctionIfExistsExisting() throws SQLException {
+        // PG 18: ALTER FUNCTION does not support IF EXISTS — rejected with 42601
         exec("CREATE FUNCTION af_ifex_f1() RETURNS integer AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql");
-        exec("ALTER FUNCTION IF EXISTS af_ifex_f1() IMMUTABLE");
-        // Should still work on existing function
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("ALTER FUNCTION IF EXISTS af_ifex_f1() IMMUTABLE"));
+        assertEquals("42601", ex.getSQLState());
     }
 
     // =========================================================================
@@ -340,7 +341,10 @@ class AlterFunctionProcedureIndexTest {
 
     @Test
     void testAlterRoutineIfExists() throws SQLException {
-        exec("ALTER ROUTINE IF EXISTS ar_no_such_routine() RENAME TO whatever");
+        // PG 18: ALTER ROUTINE does not support IF EXISTS — rejected with 42601
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("ALTER ROUTINE IF EXISTS ar_no_such_routine() RENAME TO whatever"));
+        assertEquals("42601", ex.getSQLState());
     }
 
     // =========================================================================
@@ -349,9 +353,10 @@ class AlterFunctionProcedureIndexTest {
 
     @Test
     void testAlterProcedureIfExists() throws SQLException {
-        exec("ALTER PROCEDURE IF EXISTS ap_no_such_ifex() RENAME TO whatever");
-        exec("ALTER PROCEDURE IF EXISTS ap_no_such_ifex() OWNER TO test");
-        exec("ALTER PROCEDURE IF EXISTS ap_no_such_ifex() IMMUTABLE");
+        // PG 18: ALTER PROCEDURE does not support IF EXISTS — rejected with 42601
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("ALTER PROCEDURE IF EXISTS ap_no_such_ifex() RENAME TO whatever"));
+        assertEquals("42601", ex.getSQLState());
     }
 
     // =========================================================================

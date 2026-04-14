@@ -80,6 +80,8 @@ class FunctionEvaluator {
 
     Object evalFunction(FunctionCallExpr fn, RowContext ctx) {
         String name = fn.name().toLowerCase();
+        // Strip schema prefixes for built-in function resolution
+        name = stripSchemaPrefix(name);
 
         // Reject DEFAULT as a function argument; PG gives 42601 (syntax error)
         for (Expression arg : fn.args()) {
@@ -457,6 +459,24 @@ class FunctionEvaluator {
             }
             case "coalesce": {
                 // PG validates type compatibility at plan time before short-circuit evaluation.
+                // Check for json vs jsonb type mismatch (PG rejects mixing these)
+                boolean hasJsonFunc = false, hasJsonbCast = false;
+                for (Expression arg : fn.args()) {
+                    if (arg instanceof FunctionCallExpr) {
+                        String fname = ((FunctionCallExpr) arg).name().toLowerCase();
+                        if (fname.equals("json_arrayagg") || fname.equals("json_objectagg")
+                                || fname.equals("json_array_constructor") || fname.equals("json_object_constructor")) {
+                            hasJsonFunc = true;
+                        }
+                    }
+                    if (arg instanceof CastExpr) {
+                        String targetType = ((CastExpr) arg).typeName().toLowerCase();
+                        if (targetType.equals("jsonb")) hasJsonbCast = true;
+                    }
+                }
+                if (hasJsonFunc && hasJsonbCast) {
+                    throw new MemgresException("could not convert type jsonb to json", "42846");
+                }
                 // Check for obvious mismatches: numeric literal mixed with non-numeric string literal.
                 boolean hasNum = false, hasBadStr = false;
                 String badVal = null;
@@ -662,7 +682,7 @@ class FunctionEvaluator {
                 if (arr instanceof List<?>) list = new java.util.ArrayList<>((List<?>) arr);
                 else if (arr instanceof String && ((String) arr).startsWith("{")) list = new java.util.ArrayList<>(parseSimplePgArray((String) arr));
                 else return arr;
-                if (n < 0 || n > list.size()) throw new MemgresException("number of elements to trim must be between 0 and " + list.size(), "22023");
+                if (n < 0 || n > list.size()) throw new MemgresException("number of elements to trim must be between 0 and " + list.size(), "2202E");
                 list = list.subList(0, list.size() - n);
                 return TypeCoercion.formatPgArray(list);
             }
@@ -953,6 +973,62 @@ class FunctionEvaluator {
                 }
                 return result;
             }
+            case "overlaps": {
+                // SQL OVERLAPS: (start1, end1_or_interval) OVERLAPS (start2, end2_or_interval) -> boolean
+                // Each argument is a row constructor (ArrayExpr) with 2 elements
+                if (fn.args().size() != 2)
+                    throw new MemgresException("OVERLAPS requires exactly two range arguments", "42804");
+                Expression leftExpr = fn.args().get(0);
+                Expression rightExpr = fn.args().get(1);
+                Object leftVal = executor.evalExpr(leftExpr, ctx);
+                Object rightVal = executor.evalExpr(rightExpr, ctx);
+                // Extract start/end from each side (PgRow or List)
+                java.time.temporal.Temporal s1, e1, s2, e2;
+                List<?> lv = extractRowValues(leftVal);
+                s1 = toTemporal(lv.get(0));
+                e1 = resolveOverlapEnd(s1, lv.get(1));
+                List<?> rv = extractRowValues(rightVal);
+                s2 = toTemporal(rv.get(0));
+                e2 = resolveOverlapEnd(s2, rv.get(1));
+                // SQL standard: two periods overlap iff (s1 < e2) AND (s2 < e1)
+                // With the normalization that if start > end, swap them
+                if (compareTemporal(s1, e1) > 0) { java.time.temporal.Temporal tmp = s1; s1 = e1; e1 = tmp; }
+                if (compareTemporal(s2, e2) > 0) { java.time.temporal.Temporal tmp = s2; s2 = e2; e2 = tmp; }
+                // Special case: zero-length period starting at same point as other period's start
+                if (compareTemporal(s1, e1) == 0 && compareTemporal(s1, s2) == 0) return true;
+                if (compareTemporal(s2, e2) == 0 && compareTemporal(s2, s1) == 0) return true;
+                return compareTemporal(s1, e2) < 0 && compareTemporal(s2, e1) < 0;
+            }
+            case "array_sample": {
+                // array_sample(arr, n) - returns n random elements from arr (PG 16+)
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                Object nObj = executor.evalExpr(fn.args().get(1), ctx);
+                if (arr == null) return null;
+                int n = executor.toInt(nObj);
+                List<Object> elements;
+                if (arr instanceof List<?>) {
+                    elements = new ArrayList<>((List<?>) arr);
+                } else {
+                    elements = new ArrayList<>(parseSimplePgArray(arr.toString()));
+                }
+                if (n <= 0) return TypeCoercion.formatPgArray(new ArrayList<>());
+                if (n >= elements.size()) n = elements.size();
+                java.util.Collections.shuffle(elements, new java.util.Random());
+                return TypeCoercion.formatPgArray(new ArrayList<>(elements.subList(0, n)));
+            }
+            case "array_shuffle": {
+                // array_shuffle(arr) - returns arr with elements in random order (PG 16+)
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                if (arr == null) return null;
+                List<Object> elements;
+                if (arr instanceof List<?>) {
+                    elements = new ArrayList<>((List<?>) arr);
+                } else {
+                    elements = new ArrayList<>(parseSimplePgArray(arr.toString()));
+                }
+                java.util.Collections.shuffle(elements, new java.util.Random());
+                return TypeCoercion.formatPgArray(elements);
+            }
             case "enum_first": {
                 String enumType = resolveEnumTypeFromArg(fn.args().get(0), ctx);
                 if (enumType == null) return null;
@@ -983,10 +1059,19 @@ class FunctionEvaluator {
             }
             case "json_serialize": {
                 if (fn.args().isEmpty()) throw new MemgresException("function json_serialize requires one argument", "42883");
-                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                Expression arg = fn.args().get(0);
+                Object val = executor.evalExpr(arg, ctx);
                 if (val == null) return null;
-                // JSON_SERIALIZE converts a JSON value to text — return as-is (preserves formatting)
-                return val.toString();
+                String jsonStr = val.toString();
+                // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+                String trimmed = jsonStr.trim();
+                String normalized;
+                if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                    normalized = JsonOperations.normalizeJsonb(trimmed);
+                } else {
+                    normalized = jsonStr;
+                }
+                return normalized;
             }
             case "json_array_subquery": {
                 // JSON_ARRAY(SELECT ...) — execute subquery and build JSON array from results
@@ -997,6 +1082,8 @@ class FunctionEvaluator {
                 }
                 SubqueryExpr sq = (SubqueryExpr) subqExpr;
                 QueryResult result = executor.executeStatement(sq.subquery());
+                // PG: JSON_ARRAY from empty subquery returns NULL
+                if (result.getRows().isEmpty()) return null;
                 StringBuilder sb = new StringBuilder("[");
                 boolean first = true;
                 for (Object[] row : result.getRows()) {
@@ -1117,31 +1204,83 @@ class FunctionEvaluator {
                 // Try user-defined function; resolve overloads by argument types
                 PgFunction userFunc;
                 {
-                    List<PgFunction> overloads = executor.database.getFunctionOverloads(name);
-                    if (overloads.size() > 1) {
-                        // Resolve by evaluating argument types
-                        List<String> argTypeHints = new ArrayList<>();
-                        for (Expression arg : fn.args()) {
-                            // Check for explicit cast (e.g., ROW(...)::typename) - use cast type as hint
-                            if (arg instanceof CastExpr) {
-                                argTypeHints.add(((CastExpr) arg).typeName());
-                                continue;
-                            }
-                            try {
-                                Object v = executor.evalExpr(arg, ctx);
-                                if (v instanceof Integer) argTypeHints.add("integer");
-                                else if (v instanceof Long) argTypeHints.add("bigint");
-                                else if (v instanceof String) argTypeHints.add("text");
-                                else if (v instanceof Boolean) argTypeHints.add("boolean");
-                                else if (v instanceof Double || v instanceof Float) argTypeHints.add("double precision");
-                                else argTypeHints.add(null);
-                            } catch (Exception e) {
-                                argTypeHints.add(null);
+                    // Handle schema-qualified function names (e.g., lib.helper)
+                    String lookupName = name;
+                    String qualifiedSchema = null;
+                    if (name.contains(".")) {
+                        int dot = name.indexOf('.');
+                        qualifiedSchema = name.substring(0, dot);
+                        lookupName = name.substring(dot + 1);
+                    }
+                    List<PgFunction> overloads = executor.database.getFunctionOverloads(lookupName);
+                    // Filter by explicit schema when schema-qualified
+                    if (qualifiedSchema != null) {
+                        String qs = qualifiedSchema;
+                        List<PgFunction> filtered = new ArrayList<>();
+                        for (PgFunction f : overloads) {
+                            String fSchema = f.getSchemaName() != null ? f.getSchemaName().toLowerCase() : "public";
+                            if (qs.equalsIgnoreCase(fSchema)) filtered.add(f);
+                        }
+                        // For pg_catalog qualification, fall back to unfiltered (built-ins lack schema)
+                        if (!filtered.isEmpty() || !"pg_catalog".equalsIgnoreCase(qs)) {
+                            overloads = filtered;
+                        }
+                    } else if (!name.contains(".") && executor.session != null) {
+                        Set<String> visibleSchemas = new LinkedHashSet<>();
+                        visibleSchemas.add("pg_catalog");
+                        String searchPath = executor.session.getGucSettings().get("search_path");
+                        if (searchPath != null) {
+                            for (String sp : searchPath.split(",")) {
+                                visibleSchemas.add(sp.trim().toLowerCase());
                             }
                         }
-                        userFunc = executor.database.resolveFunction(name, fn.args().size(), argTypeHints);
+                        visibleSchemas.add("public");
+                        List<PgFunction> filtered = new ArrayList<>();
+                        for (PgFunction f : overloads) {
+                            String fSchema = f.getSchemaName() != null ? f.getSchemaName().toLowerCase() : "public";
+                            if (visibleSchemas.contains(fSchema)) filtered.add(f);
+                        }
+                        // Apply filter. Fall back to unfiltered only if ALL functions have null schema (built-ins)
+                        if (!filtered.isEmpty()) {
+                            overloads = filtered;
+                        } else {
+                            boolean anyHasSchema = overloads.stream().anyMatch(f -> f.getSchemaName() != null);
+                            if (anyHasSchema) {
+                                overloads = filtered; // empty — function exists but not in search_path
+                            }
+                            // else: all have null schema (built-ins) — keep unfiltered
+                        }
+                    }
+                    if (overloads.size() >= 1) {
+                        // Resolve by evaluating argument types
+                        // When named args are present, type hints are in call order which
+                        // may differ from param order, so skip hints to avoid false mismatches.
+                        boolean callHasNamedArgs = fn.args().stream()
+                                .anyMatch(a -> a instanceof NamedArgExpr && !((NamedArgExpr) a).name().equals("__variadic__"));
+                        List<String> argTypeHints = new ArrayList<>();
+                        if (!callHasNamedArgs) {
+                            for (Expression arg : fn.args()) {
+                                // Check for explicit cast (e.g., ROW(...)::typename) - use cast type as hint
+                                if (arg instanceof CastExpr) {
+                                    argTypeHints.add(((CastExpr) arg).typeName());
+                                    continue;
+                                }
+                                try {
+                                    Object v = executor.evalExpr(arg, ctx);
+                                    if (v instanceof Integer) argTypeHints.add("integer");
+                                    else if (v instanceof Long) argTypeHints.add("bigint");
+                                    else if (v instanceof String) argTypeHints.add("text");
+                                    else if (v instanceof Boolean) argTypeHints.add("boolean");
+                                    else if (v instanceof Double || v instanceof Float) argTypeHints.add("double precision");
+                                    else argTypeHints.add(null);
+                                } catch (Exception e) {
+                                    argTypeHints.add(null);
+                                }
+                            }
+                        }
+                        userFunc = executor.database.resolveFunction(lookupName, fn.args().size(), argTypeHints);
                     } else {
-                        userFunc = overloads.isEmpty() ? null : overloads.get(0);
+                        userFunc = null;
                     }
                 }
                 if (userFunc != null) {
@@ -1522,5 +1661,83 @@ class FunctionEvaluator {
         String last = s.substring(start).trim();
         if (!last.isEmpty()) result.add(last);
         return result;
+    }
+
+    // ---- OVERLAPS helper methods ----
+
+    private List<?> extractRowValues(Object val) {
+        if (val instanceof AstExecutor.PgRow) return ((AstExecutor.PgRow) val).values();
+        if (val instanceof List<?>) return (List<?>) val;
+        throw new MemgresException("OVERLAPS arguments must be row constructors", "42804");
+    }
+
+    private java.time.temporal.Temporal toTemporal(Object val) {
+        if (val instanceof java.time.LocalDate) return (java.time.LocalDate) val;
+        if (val instanceof java.time.LocalDateTime) return (java.time.LocalDateTime) val;
+        if (val instanceof java.time.OffsetDateTime) return (java.time.OffsetDateTime) val;
+        if (val instanceof java.time.LocalTime) return ((java.time.LocalTime) val).atDate(java.time.LocalDate.of(1970, 1, 1));
+        String s = val.toString().trim();
+        try { return java.time.LocalDate.parse(s); } catch (Exception ignored) {}
+        try { return java.time.LocalDateTime.parse(s.replace(" ", "T")); } catch (Exception ignored) {}
+        try { return java.time.OffsetDateTime.parse(s); } catch (Exception ignored) {}
+        throw new MemgresException("cannot convert value to temporal type for OVERLAPS: " + s, "42804");
+    }
+
+    private java.time.temporal.Temporal resolveOverlapEnd(java.time.temporal.Temporal start, Object endOrInterval) {
+        if (endOrInterval instanceof java.time.LocalDate || endOrInterval instanceof java.time.LocalDateTime
+                || endOrInterval instanceof java.time.OffsetDateTime) {
+            return toTemporal(endOrInterval);
+        }
+        // Handle PgInterval: add interval to start date/timestamp
+        if (endOrInterval instanceof PgInterval) {
+            PgInterval iv = (PgInterval) endOrInterval;
+            if (start instanceof java.time.LocalDate) return iv.addTo((java.time.LocalDate) start);
+            if (start instanceof java.time.LocalDateTime) return iv.addTo((java.time.LocalDateTime) start);
+            if (start instanceof java.time.OffsetDateTime) return iv.addTo((java.time.OffsetDateTime) start);
+        }
+        // Try as a date/timestamp string
+        String s = endOrInterval.toString().trim();
+        try { return toTemporal(endOrInterval); } catch (Exception ignored) {}
+        // Try parsing as interval string and add to start
+        PgInterval iv = PgInterval.parse(s);
+        if (start instanceof java.time.LocalDate) return iv.addTo((java.time.LocalDate) start);
+        if (start instanceof java.time.LocalDateTime) return iv.addTo((java.time.LocalDateTime) start);
+        if (start instanceof java.time.OffsetDateTime) return iv.addTo((java.time.OffsetDateTime) start);
+        throw new MemgresException("unsupported temporal type for OVERLAPS", "42804");
+    }
+
+    @SuppressWarnings("unchecked")
+    private int compareTemporal(java.time.temporal.Temporal a, java.time.temporal.Temporal b) {
+        if (a instanceof java.time.LocalDate && b instanceof java.time.LocalDate) {
+            return ((java.time.LocalDate) a).compareTo((java.time.LocalDate) b);
+        }
+        if (a instanceof java.time.LocalDateTime && b instanceof java.time.LocalDateTime) {
+            return ((java.time.LocalDateTime) a).compareTo((java.time.LocalDateTime) b);
+        }
+        if (a instanceof java.time.OffsetDateTime && b instanceof java.time.OffsetDateTime) {
+            return ((java.time.OffsetDateTime) a).compareTo((java.time.OffsetDateTime) b);
+        }
+        // Mixed types: convert both to LocalDateTime for comparison
+        java.time.LocalDateTime la = toLocalDateTime(a);
+        java.time.LocalDateTime lb = toLocalDateTime(b);
+        return la.compareTo(lb);
+    }
+
+    private java.time.LocalDateTime toLocalDateTime(java.time.temporal.Temporal t) {
+        if (t instanceof java.time.LocalDateTime) return (java.time.LocalDateTime) t;
+        if (t instanceof java.time.LocalDate) return ((java.time.LocalDate) t).atStartOfDay();
+        if (t instanceof java.time.OffsetDateTime) return ((java.time.OffsetDateTime) t).toLocalDateTime();
+        throw new MemgresException("cannot convert to LocalDateTime for comparison", "42804");
+    }
+
+    /** Strip well-known schema prefixes (pg_catalog., information_schema.) from a function name. */
+    static String stripSchemaPrefix(String name) {
+        if (name.startsWith("pg_catalog.")) {
+            return name.substring("pg_catalog.".length());
+        }
+        if (name.startsWith("information_schema.")) {
+            return name.substring("information_schema.".length());
+        }
+        return name;
     }
 }

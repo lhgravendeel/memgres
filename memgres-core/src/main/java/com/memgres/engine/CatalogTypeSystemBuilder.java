@@ -403,6 +403,21 @@ class CatalogTypeSystemBuilder {
         return table;
     }
 
+    /**
+     * Check if an operator name is invalid in PostgreSQL.
+     * PG rule: multi-character operators ending with + or - must also contain
+     * at least one character from ~!@#%^&amp;|`?\
+     */
+    private static boolean isInvalidPgOperatorName(String name) {
+        char last = name.charAt(name.length() - 1);
+        if (last != '+' && last != '-') return false;
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if ("~!@#%^&|`?\\".indexOf(c) >= 0) return false;
+        }
+        return true;
+    }
+
     private int resolveTypeOid(String typeName) {
         if (typeName == null) return 0;
         try {
@@ -539,7 +554,39 @@ class CatalogTypeSystemBuilder {
                 col("aggnumdirectargs", DataType.SMALLINT),
                 col("aggcombinefn", DataType.INTEGER), col("aggserialfn", DataType.INTEGER),
                 col("aggdeserialfn", DataType.INTEGER), col("xmin", DataType.INTEGER));
-        return new Table("pg_aggregate", cols);
+        Table table = new Table("pg_aggregate", cols);
+
+        // Populate with user-defined aggregates
+        for (Map.Entry<String, PgAggregate> entry : database.getUserAggregates().entrySet()) {
+            PgAggregate agg = entry.getValue();
+            int aggOid = oids.oid("proc:" + agg.getName());
+            int sfuncOid = oids.oid("proc:" + agg.getSfunc());
+            int finalfuncOid = agg.getFinalfunc() != null ? oids.oid("proc:" + agg.getFinalfunc()) : 0;
+            int combinefuncOid = agg.getCombinefunc() != null ? oids.oid("proc:" + agg.getCombinefunc()) : 0;
+            int sortopOid = 0; // sort operator not commonly used
+            // Resolve stype to a type OID
+            int stypeOid = resolveTypeOid(agg.getStype());
+            // Use RegprocValue for function OID columns so ::text resolves to function name
+            Object sfuncVal = new RegprocValue(sfuncOid, agg.getSfunc());
+            Object finalfuncVal = agg.getFinalfunc() != null
+                    ? new RegprocValue(finalfuncOid, agg.getFinalfunc()) : 0;
+            Object combinefuncVal = agg.getCombinefunc() != null
+                    ? new RegprocValue(combinefuncOid, agg.getCombinefunc()) : 0;
+            table.insertRow(new Object[]{
+                    aggOid, sfuncVal,
+                    stypeOid, finalfuncVal,
+                    agg.getInitcond(), sortopOid,
+                    false, 0,          // aggfinalextra, aggtransspace
+                    0, 0,              // aggmtransfn, aggminvtransfn
+                    0, 0,              // aggmtranstype, aggmtransspace
+                    0, false,          // aggmfinalfn, aggmfinalextra
+                    null, "n",         // aggminitval, aggkind (normal)
+                    (short) 0,         // aggnumdirectargs
+                    combinefuncVal, 0, // aggcombinefn, aggserialfn
+                    0, 1               // aggdeserialfn, xmin
+            });
+        }
+        return table;
     }
 
     Table buildPgAmop() {

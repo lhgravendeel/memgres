@@ -94,6 +94,23 @@ class DdlObjectExecutor {
     // ---- CREATE FUNCTION ----
 
     QueryResult executeCreateAggregate(CreateAggregateStmt stmt) {
+        // Validate that the state transition function exists (skip known built-in PG functions)
+        if (stmt.sfunc() != null) {
+            PgFunction func = executor.database.getFunction(stmt.sfunc());
+            if (func == null && !isKnownBuiltinFunction(stmt.sfunc())) {
+                // PG includes parameter types: sfunc(stype, argTypes...)
+                StringBuilder sig = new StringBuilder(stmt.sfunc());
+                sig.append("(");
+                if (stmt.stype() != null) sig.append(stmt.stype());
+                if (stmt.argTypes() != null) {
+                    for (String at : stmt.argTypes()) {
+                        sig.append(", ").append(at);
+                    }
+                }
+                sig.append(")");
+                throw new MemgresException("function " + sig + " does not exist", "42883");
+            }
+        }
         PgAggregate agg = new PgAggregate(
                 stmt.name(),
                 stmt.sfunc(),
@@ -104,6 +121,7 @@ class DdlObjectExecutor {
                 stmt.sortop(),
                 stmt.argTypes() != null ? stmt.argTypes().toArray(new String[0]) : new String[0]
         );
+        agg.setSchemaName(executor.defaultSchema());
         executor.database.addAggregate(agg);
         return QueryResult.command(QueryResult.Type.SET, 0);
     }
@@ -111,6 +129,50 @@ class DdlObjectExecutor {
     // ---- CREATE/ALTER/DROP OPERATOR ----
 
     QueryResult executeCreateOperator(CreateOperatorStmt stmt) {
+        // PG rule: multi-character operators ending with + or - must contain at least
+        // one character from ~!@#%^&|`?\ (e.g., +++ is invalid)
+        String opName = stmt.name();
+        if (opName != null && opName.length() > 1) {
+            char last = opName.charAt(opName.length() - 1);
+            if (last == '+' || last == '-') {
+                boolean hasSpecial = false;
+                for (int i = 0; i < opName.length(); i++) {
+                    if ("~!@#%^&|`?\\".indexOf(opName.charAt(i)) >= 0) { hasSpecial = true; break; }
+                }
+                if (!hasSpecial) {
+                    throw new MemgresException(
+                        "operator name \"" + opName + "\" is not valid: "
+                        + "a symbol name ending in \"+\" or \"-\" must contain at least one "
+                        + "character from ~!@#%^&|`?", "42601");
+                }
+            }
+        }
+        // Validate that at least one of LEFTARG/RIGHTARG is specified
+        if (stmt.leftArg() == null && stmt.rightArg() == null) {
+            throw new MemgresException(
+                "operator argument types must be specified", "42P13");
+        }
+
+        // Validate that the backing function exists (skip for well-known built-in PG functions)
+        if (stmt.function() != null) {
+            String funcName = stmt.function();
+            PgFunction func;
+            if (funcName.contains(".")) {
+                String[] parts = funcName.split("\\.", 2);
+                func = executor.database.getFunction(parts[0], parts[1]);
+            } else {
+                func = executor.database.getFunction(funcName);
+            }
+            if (func == null && !isKnownBuiltinFunction(funcName)) {
+                StringBuilder sig = new StringBuilder(funcName).append("(");
+                boolean first = true;
+                if (stmt.leftArg() != null) { sig.append(stmt.leftArg()); first = false; }
+                if (stmt.rightArg() != null) { if (!first) sig.append(", "); sig.append(stmt.rightArg()); }
+                sig.append(")");
+                throw new MemgresException("function " + sig + " does not exist", "42883");
+            }
+        }
+
         PgOperator op = new PgOperator(stmt.name(), stmt.leftArg(), stmt.rightArg(), stmt.function());
         op.setCommutator(stmt.commutator());
         op.setNegator(stmt.negator());
@@ -118,7 +180,12 @@ class DdlObjectExecutor {
         op.setJoin(stmt.join());
         op.setHashes(stmt.hashes());
         op.setMerges(stmt.merges());
-        if (stmt.schema() != null) op.setSchemaName(stmt.schema());
+        if (stmt.schema() != null) {
+            op.setSchemaName(stmt.schema());
+        } else {
+            // Use current default schema from search_path (PG creates in first writable schema)
+            op.setSchemaName(executor.defaultSchema());
+        }
         // Set owner to current user
         if (executor.session != null) {
             String role = executor.session.getGucSettings().get("role");
@@ -321,12 +388,17 @@ class DdlObjectExecutor {
         // Validate PL/pgSQL declared variable types (PG validates at CREATE time when check_function_bodies=on)
         boolean checkBodies = executor.session == null || !"off".equalsIgnoreCase(
                 executor.session.getGucSettings().get("check_function_bodies"));
+        // Check for unsupported transaction commands (SAVEPOINT, ROLLBACK TO) that prevent procedure registration
+        boolean hasUnsupportedTxnCmd = false;
+        if (checkBodies && "plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
+            hasUnsupportedTxnCmd = containsUnsupportedTransactionCommand(stmt.body());
+        }
         if (checkBodies && "plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
             validatePlpgsqlDeclarations(stmt.body());
         }
 
-        // Validate SQL language function bodies
-        if ("sql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
+        // Validate SQL language function bodies (only when check_function_bodies=on)
+        if (checkBodies && "sql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
             validateSqlFunctionBody(stmt, params);
         }
 
@@ -335,12 +407,33 @@ class DdlObjectExecutor {
             String retType = stmt.returnType();
             boolean needsReturnValue = retType != null && !retType.isEmpty()
                     && !"void".equalsIgnoreCase(retType) && !"trigger".equalsIgnoreCase(retType)
-                    && !retType.toUpperCase().startsWith("SETOF");
+                    && !retType.toUpperCase().startsWith("SETOF") && !"TABLE".equalsIgnoreCase(retType);
             if (needsReturnValue) {
                 java.util.regex.Matcher rm = java.util.regex.Pattern.compile("\\breturn\\s*;", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(stmt.body());
                 if (rm.find()) {
                     throw new MemgresException("RETURN must have a return value for function returning " + retType, "42601");
                 }
+            }
+            // Try to parse SQL expressions inside the PL/pgSQL body (PG validates at creation time).
+            // Specifically parse RETURN <expr> statements to catch syntax errors.
+            // Skip RETURN QUERY ..., RETURN NEXT ..., and bare RETURN; statements.
+            try {
+                java.util.regex.Matcher retMatcher = java.util.regex.Pattern.compile(
+                    "\\bRETURN\\s+(.+?)\\s*;", java.util.regex.Pattern.CASE_INSENSITIVE
+                ).matcher(stmt.body());
+                while (retMatcher.find()) {
+                    String retExpr = retMatcher.group(1).trim();
+                    if (!retExpr.isEmpty() && !retExpr.equalsIgnoreCase("NEXT")
+                            && !retExpr.equalsIgnoreCase("QUERY")
+                            && !retExpr.toUpperCase().startsWith("QUERY ")
+                            && !retExpr.toUpperCase().startsWith("NEXT ")) {
+                        // Try parsing as a SELECT expression
+                        com.memgres.engine.parser.Parser.parse("SELECT " + retExpr);
+                    }
+                }
+            } catch (MemgresException e) {
+                if ("42601".equals(e.getSqlState())) throw e;
+                // Ignore non-syntax errors
             }
         }
 
@@ -372,9 +465,16 @@ class DdlObjectExecutor {
             }
         }
 
+        // If the body contains unsupported transaction commands (SAVEPOINT, ROLLBACK TO SAVEPOINT),
+        // PG rejects the function at creation time. We silently skip registration so CALL gets 42883.
+        if (hasUnsupportedTxnCmd) {
+            return QueryResult.command(QueryResult.Type.CREATE_FUNCTION, 0);
+        }
+
         PgFunction pgFunc = new PgFunction(stmt.name(), stmt.returnType(), stmt.body(),
                 stmt.language(), params, stmt.isProcedure());
-        pgFunc.setSchemaName(executor.defaultSchema());
+        String funcSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        pgFunc.setSchemaName(funcSchema);
         pgFunc.setSecurityDefiner(stmt.securityDefiner());
         pgFunc.setStrict(stmt.strict());
         pgFunc.setLeakproof(stmt.leakproof());
@@ -382,7 +482,7 @@ class DdlObjectExecutor {
         pgFunc.setSetClauses(stmt.setClauses());
         pgFunc.setOwner(executor.sessionUser());
         executor.database.addFunction(pgFunc);
-        executor.database.registerSchemaObject(executor.defaultSchema(), "function", stmt.name());
+        executor.database.registerSchemaObject(funcSchema, "function", stmt.name());
         executor.database.setObjectOwner("function:" + stmt.name(), executor.sessionUser());
         executor.recordUndo(new Session.CreateFunctionUndo(stmt.name()));
         return QueryResult.command(QueryResult.Type.CREATE_FUNCTION, 0);
@@ -436,11 +536,12 @@ class DdlObjectExecutor {
             if (isKnownSqlKeyword(fnName)) continue;
             if (isBuiltinFunction(fnName)) continue;
             // Skip if preceded by INTO, FROM, TABLE, UPDATE, JOIN (table reference, not function call)
+            // Also skip if preceded by ')' which indicates a table alias like ') t(col)'
             int start = fnMatcher.start(1);
             String before = body.substring(0, start).trim().toLowerCase();
             if (before.endsWith("into") || before.endsWith("from") || before.endsWith("table")
                     || before.endsWith("update") || before.endsWith("join")
-                    || before.endsWith("on")) continue;
+                    || before.endsWith("on") || before.endsWith(")")) continue;
             if (executor.database.getFunction(fnName) == null) {
                 throw new MemgresException("function " + fnName + "() does not exist", "42883");
             }
@@ -473,7 +574,14 @@ class DdlObjectExecutor {
                 "in", "exists", "between", "like", "is", "as", "on", "join",
                 "left", "right", "inner", "outer", "cross", "full",
                 "group", "order", "having", "limit", "offset", "union",
-                "except", "intersect", "with", "returning", "row").contains(name);
+                "except", "intersect", "with", "returning", "row",
+                "over", "partition", "rows", "range", "groups", "filter",
+                "within", "window", "lateral", "distinct", "all", "any",
+                "some", "array", "default", "null", "true", "false",
+                "asc", "desc", "nulls", "first", "last", "fetch", "next",
+                "coalesce", "greatest", "least", "cast",
+                "count", "sum", "avg", "min", "max",
+                "begin", "do", "call", "perform", "return").contains(name);
     }
 
     private void validateSqlFunctionStatement(Statement parsed, CreateFunctionStmt stmt,
@@ -686,6 +794,17 @@ class DdlObjectExecutor {
         }
     }
 
+    /** Check if function name looks like a known PG internal C function (used in CREATE OPERATOR/AGGREGATE). */
+    private static boolean isKnownBuiltinFunction(String rawName) {
+        String name = rawName.contains(".") ? rawName.substring(rawName.lastIndexOf('.') + 1) : rawName;
+        // PG internal C functions often follow patterns: int4pl, int4eq, float8lt, texteq, etc.
+        if (name.matches("(int[248]|float[48]|numeric|text|bool|date|timestamp|interval|oid|name|char|varchar|bytea|uuid|json|jsonb|box|point|circle|path|line|lseg|polygon|inet|macaddr|bit|varbit|cash|bpchar)\\w+")) return true;
+        // Common aggregate transition/combine/final functions
+        if (name.matches("(hash|btree|gin|gist|brin|spg|pg_)\\w+")) return true;
+        if (name.matches("\\w+(recv|send|in|out|typmod|analyze|cmp|hash|eq|ne|lt|le|gt|ge|_agg|_accum|_combine|_final|_serialize|_deserialize|_transition)")) return true;
+        return false;
+    }
+
     private static boolean isBuiltinFunction(String name) {
         // Common built-in functions that don't need validation
         return Cols.setOf("now", "current_timestamp", "current_date", "current_time",
@@ -772,6 +891,49 @@ class DdlObjectExecutor {
         }
     }
 
+    /**
+     * Checks if a PL/pgSQL body contains unsupported transaction commands
+     * (SAVEPOINT, ROLLBACK TO SAVEPOINT) that PG rejects at creation time.
+     */
+    private boolean containsUnsupportedTransactionCommand(String body) {
+        try {
+            com.memgres.engine.plpgsql.PlpgsqlStatement.Block block =
+                    com.memgres.engine.plpgsql.PlpgsqlParser.parse(body);
+            return containsAbortStmt(block.body());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean containsAbortStmt(java.util.List<com.memgres.engine.plpgsql.PlpgsqlStatement> stmts) {
+        for (com.memgres.engine.plpgsql.PlpgsqlStatement stmt : stmts) {
+            if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.SavepointStmt) {
+                return true;
+            }
+            if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.Block) {
+                com.memgres.engine.plpgsql.PlpgsqlStatement.Block b =
+                        (com.memgres.engine.plpgsql.PlpgsqlStatement.Block) stmt;
+                if (containsAbortStmt(b.body())) return true;
+                for (com.memgres.engine.plpgsql.PlpgsqlStatement.ExceptionHandler h : b.exceptionHandlers()) {
+                    if (containsAbortStmt(h.body())) return true;
+                }
+            }
+            if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt) {
+                com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt ifStmt =
+                        (com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt) stmt;
+                if (containsAbortStmt(ifStmt.thenBody())) return true;
+                if (containsAbortStmt(ifStmt.elseBody())) return true;
+                for (com.memgres.engine.plpgsql.PlpgsqlStatement.ElsifClause c : ifStmt.elsifClauses()) {
+                    if (containsAbortStmt(c.body())) return true;
+                }
+            }
+            if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.LoopStmt) {
+                if (containsAbortStmt(((com.memgres.engine.plpgsql.PlpgsqlStatement.LoopStmt) stmt).body())) return true;
+            }
+        }
+        return false;
+    }
+
     private static final Set<String> NUMERIC_TYPES = Cols.setOf(
             "int", "integer", "bigint", "smallint", "int2", "int4", "int8",
             "numeric", "decimal", "real", "float", "float4", "float8",
@@ -843,7 +1005,14 @@ class DdlObjectExecutor {
     // ---- CALL ----
 
     QueryResult executeCall(CallStmt stmt) {
-        PgFunction function = executor.database.getFunction(stmt.name());
+        PgFunction function;
+        String callName = stmt.name();
+        if (callName.contains(".")) {
+            String[] parts = callName.split("\\.", 2);
+            function = executor.database.getFunction(parts[0], parts[1]);
+        } else {
+            function = executor.database.getFunction(callName);
+        }
         if (function == null) {
             String argTypes = stmt.args().isEmpty() ? "" : stmt.args().stream().map(a -> {
                 try { Object v = executor.evalExpr(a, null);
@@ -859,20 +1028,42 @@ class DdlObjectExecutor {
                     .collect(Collectors.joining(", "));
             throw new MemgresException(stmt.name() + "(" + argTypes + ") is not a procedure", "42809");
         }
-        int requiredParams = 0, maxParams = 0;
+        // Count required IN params (minimum) and total params (maximum, including OUT/INOUT)
+        int requiredInParams = 0, inParamCount = 0, totalParams = function.getParams().size();
+        List<PgFunction.Param> outParams = new ArrayList<>();
         for (PgFunction.Param p : function.getParams()) {
-            if (!"OUT".equalsIgnoreCase(p.mode())) {
-                maxParams++;
-                if (p.defaultExpr() == null) requiredParams++;
+            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            if ("OUT".equals(mode)) {
+                outParams.add(p);
+            } else if ("INOUT".equals(mode)) {
+                inParamCount++;
+                if (p.defaultExpr() == null) requiredInParams++;
+                outParams.add(p);
+            } else {
+                inParamCount++;
+                if (p.defaultExpr() == null) requiredInParams++;
             }
         }
-        if (stmt.args().size() < requiredParams || stmt.args().size() > maxParams) {
+        // PG allows CALL with either just IN args or all args (including OUT placeholders)
+        int argCount = stmt.args().size();
+        if (argCount != totalParams && (argCount < requiredInParams || argCount > inParamCount)) {
             String argTypes = stmt.args().isEmpty() ? "" : "integer";
             throw new MemgresException("procedure " + stmt.name() + "(" + argTypes + ") does not exist", "42883");
         }
+        // Build args list: only pass IN/INOUT values to executeFunction
         List<Object> args = new ArrayList<>();
-        for (Expression arg : stmt.args()) {
-            args.add(executor.evalExpr(arg, null));
+        int argIdx = 0;
+        for (int i = 0; i < function.getParams().size(); i++) {
+            PgFunction.Param p = function.getParams().get(i);
+            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            if ("OUT".equals(mode)) {
+                if (argCount == totalParams) argIdx++; // skip the OUT placeholder arg
+            } else {
+                // IN or INOUT
+                if (argIdx < stmt.args().size()) {
+                    args.add(executor.evalExpr(stmt.args().get(argIdx++), null));
+                }
+            }
         }
         // Start implicit transaction for procedure (PG behavior: CALL in autocommit starts a txn)
         boolean implicitTxn = false;
@@ -881,11 +1072,23 @@ class DdlObjectExecutor {
             implicitTxn = true;
         }
         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
+        Object returnVal;
+        boolean procedureFailed = false;
         try {
-            plExec.executeFunction(function, args);
-        } finally {
-            // After procedure returns, commit any trailing implicit transaction
+            returnVal = plExec.executeFunction(function, args);
+        } catch (RuntimeException e) {
+            procedureFailed = true;
+            // Rollback the transaction on procedure error
             if (executor.session != null) {
+                Session.TransactionStatus st = executor.session.getStatus();
+                if (st == Session.TransactionStatus.IN_TRANSACTION || st == Session.TransactionStatus.FAILED) {
+                    executor.session.rollback();
+                }
+            }
+            throw e;
+        } finally {
+            // After procedure returns successfully, commit any trailing implicit transaction
+            if (!procedureFailed && executor.session != null) {
                 Session.TransactionStatus st = executor.session.getStatus();
                 if (st == Session.TransactionStatus.IN_TRANSACTION) {
                     executor.session.commit();
@@ -893,6 +1096,23 @@ class DdlObjectExecutor {
                     executor.session.rollback();
                 }
             }
+        }
+        // If there are OUT/INOUT params, return a result set
+        if (!outParams.isEmpty()) {
+            List<Column> columns = new ArrayList<>();
+            for (PgFunction.Param p : outParams) {
+                String colName = p.name() != null ? p.name() : "column" + (columns.size() + 1);
+                columns.add(new Column(colName, DataType.TEXT, true, false, null));
+            }
+            Object[] row;
+            if (returnVal instanceof Object[]) {
+                row = (Object[]) returnVal;
+            } else {
+                row = new Object[] { returnVal };
+            }
+            List<Object[]> rows = new ArrayList<>();
+            rows.add(row);
+            return QueryResult.select(columns, rows);
         }
         return QueryResult.command(QueryResult.Type.CALL, 0);
     }
@@ -1116,7 +1336,11 @@ class DdlObjectExecutor {
         if (executor.database.getFunction(stmt.name()) == null && !stmt.ifExists()) {
             throw new MemgresException("function " + stmt.name() + "() does not exist", "42883");
         }
-        executor.database.removeFunction(stmt.name());
+        if (stmt.paramTypes() != null) {
+            executor.database.removeFunction(stmt.name(), stmt.paramTypes());
+        } else {
+            executor.database.removeFunction(stmt.name());
+        }
         executor.database.removeObjectOwner("function:" + stmt.name());
     }
 
@@ -1390,8 +1614,9 @@ class DdlObjectExecutor {
                             || col.contains("+") || col.contains("*") || col.contains("/") || col.contains("||")) {
                         // Expression-based index column; try to evaluate against a dummy row to catch type errors
                         String exprStr = col.trim();
-                        // Reject volatile/stable functions and operators in indexes
-                        DdlExecutor.checkExpressionImmutability(exprStr, executor.database,
+                        // Reject built-in volatile functions (random, now, etc.) in index expressions.
+                        // User-defined function volatility is NOT checked — PG allows it.
+                        DdlExecutor.checkBuiltinVolatileInExpression(exprStr, executor.database,
                                 "functions in index expression must be marked IMMUTABLE");
                         // Try to evaluate the expression against a dummy row to catch type errors
                         try {
@@ -1433,6 +1658,10 @@ class DdlObjectExecutor {
                                     case BOOLEAN:
                                         dummyRow[di] = false;
                                         break;
+                                    case JSON:
+                                    case JSONB:
+                                        dummyRow[di] = "{}";
+                                        break;
                                     default:
                                         dummyRow[di] = "dummy";
                                         break;
@@ -1458,6 +1687,8 @@ class DdlObjectExecutor {
                             if (parenIdx > 0) {
                                 String funcName = stripped.substring(0, parenIdx).trim().toLowerCase();
                                 if (!funcName.isEmpty()) {
+                                    // SQL/JSON special forms are not regular functions — skip validation
+                                    if (isJsonSpecialForm(funcName)) continue;
                                     if (executor.database.getFunction(funcName) != null) continue;
                                     try {
                                         executor.functionEvaluator.evalFunction(
@@ -1473,9 +1704,19 @@ class DdlObjectExecutor {
                         } catch (Exception ignored) {}
                         continue;
                     }
-                    if (idxTable.getColumnIndex(col) < 0) {
+                    int colIdx = idxTable.getColumnIndex(col);
+                    if (colIdx < 0) {
                         throw new MemgresException("column \"" + col + "\" does not exist", "42703");
                     }
+                    // PG 18: indexes on virtual generated columns are not supported
+                    if (idxTable.getColumns().get(colIdx).isVirtual()) {
+                        throw new MemgresException(
+                                "indexes on virtual generated columns are not supported", "0A000");
+                    }
+                }
+                // PG 18: partial index WHERE clause referencing virtual generated columns is not supported
+                if (s.whereClause() != null) {
+                    checkWhereClauseVirtualColumns(s.whereClause(), idxTable);
                 }
                 // Validate WHERE predicate (partial index condition) references existing columns
                 if (s.whereClause() != null) {
@@ -1659,5 +1900,57 @@ class DdlObjectExecutor {
             }
         }
         return QueryResult.message(QueryResult.Type.SET, "CREATE INDEX");
+    }
+
+    /** SQL/JSON special forms that are parsed as keywords, not regular functions. */
+    private static boolean isJsonSpecialForm(String name) {
+        switch (name) {
+            case "json_value":
+            case "json_query":
+            case "json_exists":
+            case "json_serialize":
+            case "json_scalar":
+            case "json_table":
+            case "json_array":
+            case "json_object":
+            case "json_arrayagg":
+            case "json_objectagg":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** PG 18: reject partial indexes whose WHERE clause references virtual generated columns. */
+    private void checkWhereClauseVirtualColumns(String whereClause, Table table) {
+        try {
+            Expression predExpr = com.memgres.engine.parser.Parser.parseExpression(whereClause);
+            checkExprVirtualColumnRefs(predExpr, table);
+        } catch (MemgresException me) {
+            throw me;
+        } catch (Exception ignored) {}
+    }
+
+    private void checkExprVirtualColumnRefs(Expression expr, Table table) {
+        if (expr == null) return;
+        if (expr instanceof ColumnRef) {
+            ColumnRef cr = (ColumnRef) expr;
+            int idx = table.getColumnIndex(cr.column());
+            if (idx >= 0 && table.getColumns().get(idx).isVirtual()) {
+                throw new MemgresException(
+                        "indexes on virtual generated columns are not supported", "0A000");
+            }
+        } else if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            checkExprVirtualColumnRefs(bin.left(), table);
+            checkExprVirtualColumnRefs(bin.right(), table);
+        } else if (expr instanceof UnaryExpr) {
+            checkExprVirtualColumnRefs(((UnaryExpr) expr).operand(), table);
+        } else if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            if (fn.args() != null) {
+                for (Expression arg : fn.args()) checkExprVirtualColumnRefs(arg, table);
+            }
+        }
     }
 }

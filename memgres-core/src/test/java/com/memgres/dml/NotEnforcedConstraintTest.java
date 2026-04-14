@@ -72,6 +72,27 @@ class NotEnforcedConstraintTest {
     }
 
     // ========================================================================
+    // EXCLUDE constraint NOT ENFORCED — rejected by PG 18 with 0A000
+    // ========================================================================
+
+    @Test
+    void exclude_not_enforced_is_rejected() {
+        // PG 18: "EXCLUDE constraints cannot be marked NOT ENFORCED"
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int, room int, during tsrange, " +
+                     "CONSTRAINT excl_room EXCLUDE USING gist (room WITH =, during WITH &&) NOT ENFORCED)"));
+        assertEquals("0A000", ex.getSQLState());
+        assertTrue(ex.getMessage().toLowerCase().contains("exclude"));
+    }
+
+    @Test
+    void exclude_without_not_enforced_is_accepted() throws SQLException {
+        // Plain EXCLUDE (without NOT ENFORCED) should still be accepted (as DDL stub)
+        exec("CREATE TABLE t1(id int, room int, during tsrange, " +
+             "CONSTRAINT excl_room EXCLUDE USING gist (room WITH =, during WITH &&))");
+    }
+
+    // ========================================================================
     // CHECK constraint NOT ENFORCED — table level
     // ========================================================================
 
@@ -198,28 +219,21 @@ class NotEnforcedConstraintTest {
     // ========================================================================
 
     @Test
-    void alter_constraint_to_not_enforced() throws SQLException {
+    void alter_check_constraint_to_not_enforced_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, val int CONSTRAINT chk_val CHECK (val > 0))");
-        // Initially enforced — rejects violation
-        assertThrows(SQLException.class, () -> exec("INSERT INTO t1 VALUES (1, -1)"));
-        // Now make it not enforced
-        exec("ALTER TABLE t1 ALTER CONSTRAINT chk_val NOT ENFORCED");
-        // Should now accept violations
-        exec("INSERT INTO t1 VALUES (1, -1)");
-        assertEquals("-1", scalar("SELECT val FROM t1 WHERE id = 1"));
+        // PG 18: cannot alter enforceability of CHECK constraints (only FK allowed)
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("ALTER TABLE t1 ALTER CONSTRAINT chk_val NOT ENFORCED"));
+        assertEquals("42809", ex.getSQLState());
     }
 
     @Test
-    void alter_constraint_to_enforced() throws SQLException {
+    void alter_check_constraint_to_enforced_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, val int CONSTRAINT chk_val CHECK (val > 0) NOT ENFORCED)");
-        // Initially not enforced — allows violation
-        exec("INSERT INTO t1 VALUES (1, -1)");
-        // Now make it enforced
-        exec("ALTER TABLE t1 ALTER CONSTRAINT chk_val ENFORCED");
-        // Should now reject violations
+        // PG 18: cannot alter enforceability of CHECK constraints
         SQLException ex = assertThrows(SQLException.class, () ->
-                exec("INSERT INTO t1 VALUES (2, -2)"));
-        assertEquals("23514", ex.getSQLState());
+                exec("ALTER TABLE t1 ALTER CONSTRAINT chk_val ENFORCED"));
+        assertEquals("42809", ex.getSQLState());
     }
 
     @Test
@@ -290,16 +304,18 @@ class NotEnforcedConstraintTest {
     }
 
     @Test
-    void pg_constraint_conenforced_updates_on_alter() throws SQLException {
-        exec("CREATE TABLE t1(id int PRIMARY KEY, val int CONSTRAINT chk CHECK (val > 0))");
+    void pg_constraint_conenforced_updates_on_alter_fk() throws SQLException {
+        exec("CREATE TABLE parent(id int PRIMARY KEY)");
+        exec("CREATE TABLE t1(id int PRIMARY KEY, parent_id int, " +
+             "CONSTRAINT fk_test FOREIGN KEY (parent_id) REFERENCES parent(id))");
         assertEquals("t", scalar(
-                "SELECT conenforced FROM pg_constraint WHERE conname = 'chk'"));
-        exec("ALTER TABLE t1 ALTER CONSTRAINT chk NOT ENFORCED");
+                "SELECT conenforced FROM pg_constraint WHERE conname = 'fk_test'"));
+        exec("ALTER TABLE t1 ALTER CONSTRAINT fk_test NOT ENFORCED");
         assertEquals("f", scalar(
-                "SELECT conenforced FROM pg_constraint WHERE conname = 'chk'"));
-        exec("ALTER TABLE t1 ALTER CONSTRAINT chk ENFORCED");
+                "SELECT conenforced FROM pg_constraint WHERE conname = 'fk_test'"));
+        exec("ALTER TABLE t1 ALTER CONSTRAINT fk_test ENFORCED");
         assertEquals("t", scalar(
-                "SELECT conenforced FROM pg_constraint WHERE conname = 'chk'"));
+                "SELECT conenforced FROM pg_constraint WHERE conname = 'fk_test'"));
     }
 
     @Test
@@ -553,17 +569,13 @@ class NotEnforcedConstraintTest {
     // ========================================================================
 
     @Test
-    void alter_to_enforced_does_not_revalidate_existing_violations() throws SQLException {
+    void alter_check_to_enforced_rejected_even_with_violations() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, val int CONSTRAINT chk CHECK (val > 0) NOT ENFORCED)");
         exec("INSERT INTO t1 VALUES (1, -5)");
-        // Toggle to ENFORCED — PG 18 does NOT revalidate existing rows
-        exec("ALTER TABLE t1 ALTER CONSTRAINT chk ENFORCED");
-        // Existing violation remains
-        assertEquals("-5", scalar("SELECT val FROM t1 WHERE id = 1"));
-        // But new violations are blocked
+        // PG 18: cannot alter enforceability of CHECK constraints at all
         SQLException ex = assertThrows(SQLException.class, () ->
-                exec("INSERT INTO t1 VALUES (2, -10)"));
-        assertEquals("23514", ex.getSQLState());
+                exec("ALTER TABLE t1 ALTER CONSTRAINT chk ENFORCED"));
+        assertEquals("42809", ex.getSQLState());
     }
 
     @Test

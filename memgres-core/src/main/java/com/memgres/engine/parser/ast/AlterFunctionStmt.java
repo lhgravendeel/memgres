@@ -25,6 +25,7 @@ public final class AlterFunctionStmt implements Statement {
     public final String parallel;             // SAFE, RESTRICTED, UNSAFE or null
     public final Map<String, String> setClauses; // SET config_param = value (null=unchanged)
     public final java.util.List<String> resetParams; // RESET config_param names (null=unchanged)
+    public final java.util.List<String> paramTypes; // parameter types from signature (null if no parens)
 
     public AlterFunctionStmt(
             String name,
@@ -41,7 +42,8 @@ public final class AlterFunctionStmt implements Statement {
             Double rows,
             String parallel,
             Map<String, String> setClauses,
-            java.util.List<String> resetParams
+            java.util.List<String> resetParams,
+            java.util.List<String> paramTypes
     ) {
         this.name = name;
         this.schema = schema;
@@ -58,6 +60,7 @@ public final class AlterFunctionStmt implements Statement {
         this.parallel = parallel;
         this.setClauses = setClauses;
         this.resetParams = resetParams;
+        this.paramTypes = paramTypes;
     }
 
     public enum Action {
@@ -68,21 +71,21 @@ public final class AlterFunctionStmt implements Statement {
     }
 
     /** Convenience factory for RENAME TO. */
-    public static AlterFunctionStmt renameTo(String name, String schema, boolean isProcedure, boolean ifExists, String newName) {
+    public static AlterFunctionStmt renameTo(String name, String schema, boolean isProcedure, boolean ifExists, String newName, java.util.List<String> paramTypes) {
         return new AlterFunctionStmt(name, schema, isProcedure, ifExists, Action.RENAME_TO, newName,
-                null, null, null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null, paramTypes);
     }
 
     /** Convenience factory for SET SCHEMA. */
-    public static AlterFunctionStmt setSchema(String name, String schema, boolean isProcedure, boolean ifExists, String newSchema) {
+    public static AlterFunctionStmt setSchema(String name, String schema, boolean isProcedure, boolean ifExists, String newSchema, java.util.List<String> paramTypes) {
         return new AlterFunctionStmt(name, schema, isProcedure, ifExists, Action.SET_SCHEMA, newSchema,
-                null, null, null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null, paramTypes);
     }
 
     /** Convenience factory for OWNER TO. */
-    public static AlterFunctionStmt ownerTo(String name, String schema, boolean isProcedure, boolean ifExists, String newOwner) {
+    public static AlterFunctionStmt ownerTo(String name, String schema, boolean isProcedure, boolean ifExists, String newOwner, java.util.List<String> paramTypes) {
         return new AlterFunctionStmt(name, schema, isProcedure, ifExists, Action.OWNER_TO, newOwner,
-                null, null, null, null, null, null, null, null, null);
+                null, null, null, null, null, null, null, null, null, paramTypes);
     }
 
     public String name() { return name; }
@@ -100,6 +103,7 @@ public final class AlterFunctionStmt implements Statement {
     public String parallel() { return parallel; }
     public Map<String, String> setClauses() { return setClauses; }
     public java.util.List<String> resetParams() { return resetParams; }
+    public java.util.List<String> paramTypes() { return paramTypes; }
 
     /** Returns the PG command tag: "ALTER FUNCTION" or "ALTER ROUTINE". */
     public String commandTag() {

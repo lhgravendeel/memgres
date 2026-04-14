@@ -288,13 +288,13 @@ class BinaryOpEvaluator {
                     }
                     return true;
                 }
-                // PG rejects implicit text = integer comparison
+                // text vs integer comparison: coerce to compare numerically if possible,
+                // otherwise treat as not-equal (catalog queries may compare text columns with OIDs)
                 if ((left instanceof String && (right instanceof Integer || right instanceof Long))
                         || (right instanceof String && (left instanceof Integer || left instanceof Long))) {
-                    // But allow if the string is a numeric literal (e.g., WHERE id = '5')
                     String sVal = left instanceof String ? (String) left : (String) right;
                     try { Long.parseLong(sVal); } catch (NumberFormatException e) {
-                        throw new MemgresException("operator does not exist: text = integer", "42883");
+                        return false;
                     }
                 }
                 return TypeCoercion.areEqual(left, right);
@@ -828,7 +828,14 @@ class BinaryOpEvaluator {
             }
             case DISTANCE: {
                 if (left == null || right == null) return null;
-                return GeometricOperations.distance(left.toString(), right.toString());
+                // Try user-defined operator first (e.g., text <-> text)
+                Object udResult = tryUserDefinedOperator("<->", left, right);
+                if (udResult != null) return udResult;
+                try {
+                    return GeometricOperations.distance(left.toString(), right.toString());
+                } catch (Exception e) {
+                    throw new MemgresException("operator does not exist: " + AstExecutor.pgTypeNameOf(left) + " <-> " + AstExecutor.pgTypeNameOf(right), "42883");
+                }
             }
             case APPROX_EQUAL: {
                 if (left == null || right == null) return null;
@@ -1409,7 +1416,14 @@ class BinaryOpEvaluator {
             }
             case DISTANCE: {
                 if (left == null || right == null) return null;
-                return GeometricOperations.distance(left.toString(), right.toString());
+                // Try user-defined operator first (e.g., text <-> text)
+                Object udResult = tryUserDefinedOperator("<->", left, right);
+                if (udResult != null) return udResult;
+                try {
+                    return GeometricOperations.distance(left.toString(), right.toString());
+                } catch (Exception e) {
+                    throw new MemgresException("operator does not exist: " + AstExecutor.pgTypeNameOf(left) + " <-> " + AstExecutor.pgTypeNameOf(right), "42883");
+                }
             }
             case APPROX_EQUAL: {
                 if (left == null || right == null) return null;

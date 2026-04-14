@@ -177,7 +177,7 @@ class ProcedureTransactionControlTest {
     }
 
     @Test
-    void rollbackInExceptionHandler_rejected() throws SQLException {
+    void rollbackInExceptionHandler_allowed() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE PROCEDURE ptc_exc_rb() LANGUAGE plpgsql AS $$ " +
                     "BEGIN " +
@@ -187,9 +187,8 @@ class ProcedureTransactionControlTest {
                     "    ROLLBACK; " +
                     "  END; " +
                     "END; $$");
-            SQLException ex = assertThrows(SQLException.class, () ->
-                    s.execute("CALL ptc_exc_rb()"));
-            assertEquals("2D000", ex.getSQLState());
+            // PG 18 allows ROLLBACK inside exception handlers
+            s.execute("CALL ptc_exc_rb()");
         }
     }
 
@@ -359,7 +358,7 @@ class ProcedureTransactionControlTest {
     // ── ABORT keyword (alias for ROLLBACK) ───────────────────────────────
 
     @Test
-    void abortInProcedure_works() throws SQLException {
+    void abortInProcedure_errors() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE TABLE ptc_abort (id serial PRIMARY KEY, val text)");
             s.execute("CREATE PROCEDURE ptc_abort_proc() LANGUAGE plpgsql AS $$ " +
@@ -369,22 +368,22 @@ class ProcedureTransactionControlTest {
                     "  INSERT INTO ptc_abort(val) VALUES('keep'); " +
                     "  COMMIT; " +
                     "END; $$");
-            s.execute("CALL ptc_abort_proc()");
-            assertEquals(1, queryInt("SELECT count(*) FROM ptc_abort"));
-            assertEquals("keep", queryString("SELECT val FROM ptc_abort"));
+            // PG 18: ABORT is an unsupported transaction command in PL/pgSQL (0A000)
+            SQLException ex = assertThrows(SQLException.class, () ->
+                    s.execute("CALL ptc_abort_proc()"));
+            assertEquals("0A000", ex.getSQLState());
         }
     }
 
     // ── DO block with COMMIT/ROLLBACK ────────────────────────────────────
-    // DO blocks in PG cannot use COMMIT/ROLLBACK (they're anonymous code blocks, not procedures)
+    // DO blocks in PG 11+ support COMMIT/ROLLBACK just like procedures
 
     @Test
-    void commitInDoBlock_rejected() throws SQLException {
+    void commitInDoBlock_succeeds() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            SQLException ex = assertThrows(SQLException.class, () ->
-                    s.execute("DO $$ BEGIN COMMIT; END; $$"));
-            assertEquals("2D000", ex.getSQLState());
-            assertTrue(ex.getMessage().contains("invalid transaction termination"));
+            s.execute("CREATE TABLE ptc_do_log (msg text)");
+            s.execute("DO $$ BEGIN INSERT INTO ptc_do_log (msg) VALUES ('do-before'); COMMIT; INSERT INTO ptc_do_log (msg) VALUES ('do-after'); END; $$");
+            assertEquals(2, queryInt("SELECT count(*) FROM ptc_do_log"));
         }
     }
 

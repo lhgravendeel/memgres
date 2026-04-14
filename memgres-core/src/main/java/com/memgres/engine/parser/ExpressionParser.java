@@ -561,6 +561,13 @@ public class ExpressionParser {
             return specialFormParser.parseQualifiedOperator(left);
         }
 
+        // SQL OVERLAPS syntax: (start, end) OVERLAPS (start, end) -> boolean
+        if (checkIdentifier("overlaps")) {
+            advance(); // consume OVERLAPS
+            Expression right = parseAddition();
+            return new FunctionCallExpr("overlaps", java.util.Arrays.asList(left, right), false, false);
+        }
+
         return left;
     }
 
@@ -1138,7 +1145,7 @@ public class ExpressionParser {
 
                 // It might be a function call: schema.func(...)
                 if (check(TokenType.LEFT_PAREN)) {
-                    return parseFunctionCallExpr(name2);
+                    return parseFunctionCallExpr(name + "." + name2);
                 }
 
                 return new ColumnRef(null, name, name2);

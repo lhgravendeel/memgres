@@ -203,6 +203,12 @@ class CastEvaluator {
                     RegclassValue rc = (RegclassValue) val;
                     return formatRegclassDisplay(rc.name());
                 }
+                if (val instanceof RegprocValue) {
+                    return ((RegprocValue) val).name();
+                }
+                if (val instanceof RegtypeValue) {
+                    return ((RegtypeValue) val).name();
+                }
                 // For OffsetDateTime, apply session timezone conversion (PG behavior for timestamptz::text)
                 if (val instanceof java.time.OffsetDateTime && executor.session != null) {
                     java.time.OffsetDateTime odt = (java.time.OffsetDateTime) val;
@@ -224,6 +230,13 @@ class CastEvaluator {
                 // Array (List) to text: use PostgreSQL {e1,e2,...} format
                 if (val instanceof java.util.List<?>) {
                     return formatListAsPgArray((java.util.List<?>) val);
+                }
+                // Boolean to text: PG cast returns "true"/"false"
+                if (val instanceof Boolean) {
+                    return ((Boolean) val) ? "true" : "false";
+                }
+                if (val instanceof byte[]) {
+                    return new String((byte[]) val, java.nio.charset.StandardCharsets.UTF_8);
                 }
                 return val.toString();
             }
@@ -299,7 +312,13 @@ class CastEvaluator {
             case "daterange":
             case "tsrange":
             case "tstzrange": {
-                return RangeOperations.parse(val.toString()).toString();
+                String rangeStr = val.toString().trim();
+                // Detect multirange-to-range cast (multirange starts with '{')
+                if (rangeStr.startsWith("{") && rangeStr.endsWith("}")) {
+                    String multirangeType = typeName.replace("range", "multirange");
+                    throw new MemgresException("cannot cast type " + multirangeType + " to " + typeName, "42846");
+                }
+                return RangeOperations.parse(rangeStr).toString();
             }
             case "int4multirange":
             case "int8multirange":
@@ -494,6 +513,17 @@ class CastEvaluator {
                 if (procName.contains(".")) {
                     procName = procName.substring(procName.lastIndexOf('.') + 1);
                 }
+                // For regproc (no signature), check for ambiguous built-in aggregates
+                if ("regproc".equals(typeName)) {
+                    String lowerProc = procName.toLowerCase();
+                    // Built-in aggregates that exist for multiple types (ambiguous via regproc)
+                    java.util.Set<String> ambiguousBuiltins = Cols.setOf(
+                            "min", "max", "sum", "avg", "count",
+                            "array_agg", "string_agg", "every", "bool_and", "bool_or");
+                    if (ambiguousBuiltins.contains(lowerProc)) {
+                        throw new MemgresException("more than one function named \"" + procName + "\"", "42725");
+                    }
+                }
                 // For regprocedure (explicit signature lookup like 'fname(int)'::regprocedure),
                 // validate that the function exists. regproc is used for system function references
                 // (like typinput in pg_type) which may reference built-in PG functions we don't track.
@@ -506,14 +536,26 @@ class CastEvaluator {
                         throw new MemgresException("function \"" + procName + "\" does not exist", "42883");
                     }
                 }
+                // Try to resolve to an OID for comparison with pg_proc/pg_aggregate
+                // Strip argument list if present (e.g. "cfmt_fn(int)" -> "cfmt_fn")
+                String oidLookupName = procName;
+                if (oidLookupName.contains("(")) {
+                    oidLookupName = oidLookupName.substring(0, oidLookupName.indexOf('(')).trim();
+                }
+                int procOid = executor.systemCatalog.getOid("proc:" + oidLookupName);
+                if (procOid == 0) {
+                    procOid = executor.systemCatalog.getOid("proc:" + oidLookupName.toLowerCase());
+                }
+                if (procOid != 0) return procOid;
                 return procName;
             }
             case "regtype": {
                 // ::regtype converts a type name to its OID or name
+                if (val instanceof RegtypeValue) return val;
                 if (val instanceof Number) {
                     int oid = ((Number) val).intValue();
                     String name = OID_TO_TYPE.get(oid);
-                    return name != null ? name : String.valueOf(oid);
+                    return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
                 String rtName = val.toString().trim().toLowerCase();
                 // Validate the type exists
@@ -570,7 +612,7 @@ class CastEvaluator {
                 if (dt == null && executor.database.getDomain(rtName) == null && !executor.database.isCustomEnum(rtName)) {
                     throw new MemgresException("type \"" + val + "\" does not exist", "42704");
                 }
-                // Return canonical type name (e.g., 'int4' -> 'integer')
+                // Return RegtypeValue with canonical type name and OID
                 if (dt != null) {
                     // Map the DataType back to the canonical PG name
                     String canonical;
@@ -636,13 +678,22 @@ class CastEvaluator {
                             canonical = dt.getPgName();
                             break;
                     }
-                    return canonical;
+                    return new RegtypeValue(dt.getOid(), canonical);
                 }
-                return val.toString();
+                return new RegtypeValue(0, val.toString());
             }
             case "oid": {
                 if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
+                if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
+                if (val instanceof RegtypeValue) return ((RegtypeValue) val).oid();
                 return TypeCoercion.toInteger(val);
+            }
+            case "regnamespace": {
+                // ::regnamespace converts a schema name to its OID
+                if (val instanceof Number) return val;
+                String nsName = val.toString().trim();
+                int nsOid = executor.systemCatalog.getOid("ns:" + nsName);
+                return nsOid;
             }
             default: {
                 // Check if it's a domain type

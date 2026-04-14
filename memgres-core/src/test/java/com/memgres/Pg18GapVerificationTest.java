@@ -279,7 +279,6 @@ class Pg18GapVerificationTest {
     }
 
     @Test
-    @Disabled("regtype::oid cast chain not yet working")
     void regtypeCast() throws Exception {
         try (Statement st = conn.createStatement()) {
             try (ResultSet rs = st.executeQuery("SELECT 'integer'::regtype::oid")) {
@@ -341,7 +340,6 @@ class Pg18GapVerificationTest {
     // ===== Window function edge cases =====
 
     @Test
-    @Disabled("GROUPS frame mode not yet fully implemented")
     void windowGroupsFrame() throws Exception {
         try (Statement st = conn.createStatement()) {
             st.execute("CREATE TABLE wg (val int)");
@@ -411,7 +409,6 @@ class Pg18GapVerificationTest {
     // ===== PL/pgSQL edge cases =====
 
     @Test
-    @Disabled("PL/pgSQL ASSERT not yet implemented (D3 gap)")
     void plpgsqlAssert() throws Exception {
         try (Statement st = conn.createStatement()) {
             // ASSERT should not error when condition is true
@@ -420,7 +417,6 @@ class Pg18GapVerificationTest {
     }
 
     @Test
-    @Disabled("PL/pgSQL ASSERT not yet implemented (D3 gap)")
     void plpgsqlAssertFailure() throws Exception {
         try (Statement st = conn.createStatement()) {
             try {
@@ -434,7 +430,6 @@ class Pg18GapVerificationTest {
     }
 
     @Test
-    @Disabled("RETURN QUERY EXECUTE not yet implemented (D1 gap)")
     void plpgsqlReturnQueryExecute() throws Exception {
         try (Statement st = conn.createStatement()) {
             st.execute("CREATE TABLE rqe (id int, val text)");
@@ -771,7 +766,6 @@ class Pg18GapVerificationTest {
     // ===== SQL OVERLAPS syntax (C2 from gaps) =====
 
     @Test
-    @Disabled("SQL OVERLAPS syntax not yet parsed (C2 gap)")
     void overlapsOperator() throws Exception {
         try (Statement st = conn.createStatement()) {
             try (ResultSet rs = st.executeQuery(
@@ -784,7 +778,6 @@ class Pg18GapVerificationTest {
     }
 
     @Test
-    @Disabled("SQL OVERLAPS syntax not yet parsed (C2 gap)")
     void overlapsNoOverlap() throws Exception {
         try (Statement st = conn.createStatement()) {
             try (ResultSet rs = st.executeQuery(

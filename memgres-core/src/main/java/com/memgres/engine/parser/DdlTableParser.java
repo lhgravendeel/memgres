@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -56,12 +57,20 @@ class DdlTableParser {
                 if (parser.matchKeyword("FROM")) {
                     parser.expect(TokenType.LEFT_PAREN);
                     bounds.add("FROM");
-                    bounds.add(DdlParser.readValueOrMinMax(parser));
+                    StringBuilder fromVals = new StringBuilder(DdlParser.readValueOrMinMax(parser));
+                    while (parser.match(TokenType.COMMA)) {
+                        fromVals.append(", ").append(DdlParser.readValueOrMinMax(parser));
+                    }
+                    bounds.add(fromVals.toString());
                     parser.expect(TokenType.RIGHT_PAREN);
                     parser.expectKeyword("TO");
                     parser.expect(TokenType.LEFT_PAREN);
                     bounds.add("TO");
-                    bounds.add(DdlParser.readValueOrMinMax(parser));
+                    StringBuilder toVals = new StringBuilder(DdlParser.readValueOrMinMax(parser));
+                    while (parser.match(TokenType.COMMA)) {
+                        toVals.append(", ").append(DdlParser.readValueOrMinMax(parser));
+                    }
+                    bounds.add(toVals.toString());
                     parser.expect(TokenType.RIGHT_PAREN);
                 } else if (parser.matchKeyword("IN")) {
                     parser.expect(TokenType.LEFT_PAREN);
@@ -88,7 +97,11 @@ class DdlTableParser {
                 else if (parser.matchKeyword("LIST")) subPartBy = "LIST";
                 else { parser.expectKeyword("HASH"); subPartBy = "HASH"; }
                 parser.expect(TokenType.LEFT_PAREN);
-                subPartCol = parser.readIdentifier();
+                StringBuilder subPartColBuf = new StringBuilder(parser.readIdentifier());
+                while (parser.match(TokenType.COMMA)) {
+                    subPartColBuf.append(", ").append(parser.readIdentifier());
+                }
+                subPartCol = subPartColBuf.toString();
                 parser.expect(TokenType.RIGHT_PAREN);
             }
             return new CreateTableStmt(schema, name, ifNotExists, temporary,
@@ -139,7 +152,11 @@ class DdlTableParser {
             else if (parser.matchKeyword("LIST")) partitionBy = "LIST";
             else { parser.expectKeyword("HASH"); partitionBy = "HASH"; }
             parser.expect(TokenType.LEFT_PAREN);
-            partitionCol = parser.readIdentifier();
+            StringBuilder partColBuf = new StringBuilder(parser.readIdentifier());
+            while (parser.match(TokenType.COMMA)) {
+                partColBuf.append(", ").append(parser.readIdentifier());
+            }
+            partitionCol = partColBuf.toString();
             parser.expect(TokenType.RIGHT_PAREN);
         }
 
@@ -419,6 +436,9 @@ class DdlTableParser {
             } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
                 parser.advance(); parser.advance();
             }
+            if (parseNotEnforced()) {
+                throw new MemgresException("PRIMARY KEY constraints cannot be marked NOT ENFORCED", "0A000");
+            }
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.PRIMARY_KEY,
                     cols, null, null, null, null, null, false, pkDeferrable, pkInitiallyDeferred, false, null);
         }
@@ -449,6 +469,9 @@ class DdlTableParser {
                 }
             } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
                 parser.advance(); parser.advance();
+            }
+            if (parseNotEnforced()) {
+                throw new MemgresException("UNIQUE constraints cannot be marked NOT ENFORCED", "0A000");
             }
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.UNIQUE,
                     cols, null, null, null, null, null, nullsNotDistinct, uqDeferrable, uqInitiallyDeferred, false, null);
@@ -554,6 +577,11 @@ class DdlTableParser {
                 }
             } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
                 parser.advance(); parser.advance();
+            }
+            boolean exNotEnforced = parseNotEnforced();
+            if (exNotEnforced) {
+                throw new com.memgres.engine.MemgresException(
+                        "EXCLUDE constraints cannot be marked NOT ENFORCED", "0A000");
             }
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.EXCLUDE,
                     excludeCols, null, null, null, null, null, false, exDeferrable, exInitiallyDeferred, false, excludeElements);

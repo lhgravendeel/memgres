@@ -631,6 +631,70 @@ public interface PlpgsqlStatement {
         }
     }
 
+        public static final class ReturnQueryExecuteStmt implements PlpgsqlStatement {
+        public final String sqlExpr;
+        public final List<String> usingExprs;
+
+        public ReturnQueryExecuteStmt(String sqlExpr, List<String> usingExprs) {
+            this.sqlExpr = sqlExpr;
+            this.usingExprs = usingExprs;
+        }
+
+        public String sqlExpr() { return sqlExpr; }
+        public List<String> usingExprs() { return usingExprs; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            ReturnQueryExecuteStmt that = (ReturnQueryExecuteStmt) o;
+            return java.util.Objects.equals(sqlExpr, that.sqlExpr)
+                && java.util.Objects.equals(usingExprs, that.usingExprs);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(sqlExpr, usingExprs);
+        }
+
+        @Override
+        public String toString() {
+            return "ReturnQueryExecuteStmt[sqlExpr=" + sqlExpr + ", usingExprs=" + usingExprs + "]";
+        }
+    }
+
+        public static final class AssertStmt implements PlpgsqlStatement {
+        public final String condition;
+        public final String message;
+
+        public AssertStmt(String condition, String message) {
+            this.condition = condition;
+            this.message = message;
+        }
+
+        public String condition() { return condition; }
+        public String message() { return message; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            AssertStmt that = (AssertStmt) o;
+            return java.util.Objects.equals(condition, that.condition)
+                && java.util.Objects.equals(message, that.message);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(condition, message);
+        }
+
+        @Override
+        public String toString() {
+            return "AssertStmt[condition=" + condition + ", message=" + message + "]";
+        }
+    }
+
         public static final class RaiseStmt implements PlpgsqlStatement {
         public final String level;
         public final String format;
@@ -984,5 +1048,17 @@ public interface PlpgsqlStatement {
 
         @Override
         public String toString() { return "RollbackStmt[chain=" + chain + "]"; }
+    }
+
+    /** ABORT in a procedure body — unsupported transaction command (PG raises 0A000 at runtime). */
+    public static final class AbortStmt implements PlpgsqlStatement {
+        @Override
+        public String toString() { return "AbortStmt[]"; }
+    }
+
+    /** SAVEPOINT/ROLLBACK TO SAVEPOINT in a procedure body — rejected at creation time by PG. */
+    public static final class SavepointStmt implements PlpgsqlStatement {
+        @Override
+        public String toString() { return "SavepointStmt[]"; }
     }
 }

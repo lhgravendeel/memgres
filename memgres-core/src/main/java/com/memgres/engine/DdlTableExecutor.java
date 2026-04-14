@@ -156,10 +156,17 @@ class DdlTableExecutor {
             if (def.generatedExpr() != null) {
                 // PG rejects DEFAULT + GENERATED ALWAYS AS on same column
                 if (def.defaultExpr() != null) {
-                    throw new MemgresException("a generated column is not allowed to have a default value", "42601");
+                    throw new MemgresException("both default and generation expression specified for column \"" + def.name() + "\"", "42601");
                 }
-                DdlExecutor.checkExpressionImmutability(def.generatedExpr(), executor.database,
-                        "generation expression is not immutable");
+                if (def.generatedVirtual()) {
+                    // PG 18: check UDF restriction first (0A000), then immutability (42P17)
+                    DdlExecutor.checkVirtualColumnUdf(def.generatedExpr(), executor.database);
+                    DdlExecutor.checkExpressionImmutability(def.generatedExpr(), executor.database,
+                            "generation expression is not immutable");
+                } else {
+                    DdlExecutor.checkExpressionImmutability(def.generatedExpr(), executor.database,
+                            "generation expression is not immutable");
+                }
                 if (def.generatedExpr().toLowerCase().replaceAll("\\s+", "").contains("select")) {
                     throw new MemgresException("cannot use subquery in column generation expression", "0A000");
                 }
@@ -193,8 +200,13 @@ class DdlTableExecutor {
         if (stmt.partitionBy() != null) {
             table.setPartitionStrategy(stmt.partitionBy());
             String partCol = stmt.partitionColumn();
-            if (partCol != null && table.getColumnIndex(partCol) < 0) {
-                throw new MemgresException("column \"" + partCol + "\" named in partition key does not exist", "42703");
+            if (partCol != null) {
+                for (String col : partCol.split(",")) {
+                    String trimmed = col.trim();
+                    if (table.getColumnIndex(trimmed) < 0) {
+                        throw new MemgresException("column \"" + trimmed + "\" named in partition key does not exist", "42703");
+                    }
+                }
             }
             table.setPartitionColumn(partCol);
         }
@@ -383,6 +395,28 @@ class DdlTableExecutor {
         if (def.referencesColumn() != null && refTable.getColumnIndex(def.referencesColumn()) < 0) {
             throw new MemgresException("column \"" + def.referencesColumn() + "\" referenced in foreign key constraint does not exist", "42703");
         }
+        // Validate that the referenced column has a unique/PK constraint
+        if (def.referencesColumn() != null) {
+            int refColIdx = refTable.getColumnIndex(def.referencesColumn());
+            if (refColIdx >= 0) {
+                Column refCol = refTable.getColumns().get(refColIdx);
+                // Check if there's a unique or PK constraint on the referenced column
+                boolean hasUnique = refCol.isPrimaryKey();
+                if (!hasUnique) {
+                    for (StoredConstraint sc : refTable.getConstraints()) {
+                        if ((sc.getType() == StoredConstraint.Type.UNIQUE || sc.getType() == StoredConstraint.Type.PRIMARY_KEY)
+                                && sc.getColumns().size() == 1
+                                && sc.getColumns().get(0).equalsIgnoreCase(def.referencesColumn())) {
+                            hasUnique = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hasUnique) {
+                    throw new MemgresException("there is no unique constraint matching given keys for referenced table \"" + refTableName + "\"", "42830");
+                }
+            }
+        }
         List<String> refCols = def.referencesColumn() != null
                 ? Cols.listOf(def.referencesColumn()) : Cols.listOf();
         StoredConstraint fk = StoredConstraint.foreignKey(
@@ -505,6 +539,14 @@ class DdlTableExecutor {
                         }
                     }
                     for (String v : viewsToDrop) executor.database.removeView(v);
+                    // CASCADE: also drop dependent functions (e.g., BEGIN ATOMIC bodies referencing this table)
+                    List<String> funcsToDrop = new ArrayList<>();
+                    for (PgFunction fn : executor.database.getFunctions().values()) {
+                        if (sqlFunctionDependsOnTable(fn, name)) {
+                            funcsToDrop.add(fn.getName());
+                        }
+                    }
+                    for (String f : funcsToDrop) executor.database.removeFunction(f);
                 }
                 executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable));
             }
@@ -524,20 +566,59 @@ class DdlTableExecutor {
         }
     }
 
+    /**
+     * Check if a SQL-language function body references the given table name.
+     * Covers RETURNS type, SETOF type, and FROM/INTO/UPDATE/DELETE table references in the body.
+     */
+    private boolean sqlFunctionDependsOnTable(PgFunction fn, String tableName) {
+        String lName = tableName.toLowerCase();
+        String retType = fn.getReturnType();
+        if (retType != null) {
+            String rt = retType.toLowerCase().replace("setof ", "").trim();
+            if (rt.equals(lName)) return true;
+        }
+        String body = fn.getBody();
+        if (body != null) {
+            String lBody = body.toLowerCase();
+            // Check for table reference: FROM table, INTO table, UPDATE table, etc.
+            if (java.util.regex.Pattern.compile("\\b" + java.util.regex.Pattern.quote(lName) + "\\b",
+                    java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ---- TRUNCATE ----
 
     QueryResult executeTruncate(TruncateStmt stmt) {
         int totalCount = 0;
         for (String tableName : stmt.tables()) {
             boolean found = false;
-            for (String schemaName : Cols.listOf("public")) {
+            // Check if table name is schema-qualified
+            String explicitSchema = null;
+            String bareName = tableName;
+            if (tableName.contains(".")) {
+                int dot = tableName.indexOf('.');
+                explicitSchema = tableName.substring(0, dot);
+                bareName = tableName.substring(dot + 1);
+            }
+            List<String> searchSchemas;
+            if (explicitSchema != null) {
+                searchSchemas = Cols.listOf(explicitSchema);
+            } else {
+                // Use search_path from session, falling back to "public"
+                String defSchema = executor.defaultSchema();
+                searchSchemas = defSchema.equals("public") ? Cols.listOf("public") : Cols.listOf(defSchema, "public");
+            }
+            for (String schemaName : searchSchemas) {
                 Schema schema = executor.database.getSchema(schemaName);
                 if (schema != null) {
-                    Table table = schema.getTable(tableName);
+                    Table table = schema.getTable(bareName);
                     if (table != null) {
                         found = true;
                         List<Object[]> oldRows = new ArrayList<>(table.getRows());
-                        executor.recordUndo(new Session.TruncateUndo(schemaName, tableName, oldRows, table.getSerialCounter()));
+                        executor.recordUndo(new Session.TruncateUndo(schemaName, bareName, oldRows, table.getSerialCounter()));
                         totalCount += table.deleteAll();
                         if (stmt.restartIdentity()) {
                             table.resetSerialCounter(1);
@@ -547,7 +628,7 @@ class DdlTableExecutor {
                 }
             }
             if (!found) {
-                throw new MemgresException("Table not found: " + tableName);
+                throw new MemgresException("Table not found: " + bareName);
             }
         }
         return QueryResult.command(QueryResult.Type.DELETE, 0);

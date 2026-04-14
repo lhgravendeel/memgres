@@ -581,7 +581,7 @@ class VirtualGeneratedColumnTest {
     void reject_default_plus_generated() {
         SQLException ex = assertThrows(SQLException.class, () ->
                 exec("CREATE TABLE t1(id int PRIMARY KEY, a int DEFAULT 1 GENERATED ALWAYS AS (a + 1) VIRTUAL)"));
-        assertTrue(ex.getMessage().contains("generated column") || ex.getMessage().contains("default value"),
+        assertTrue(ex.getMessage().contains("generation expression") || ex.getMessage().contains("default"),
                 "Expected error about generated column + default, got: " + ex.getMessage());
     }
 
@@ -589,7 +589,7 @@ class VirtualGeneratedColumnTest {
     void reject_default_plus_stored_generated() {
         SQLException ex = assertThrows(SQLException.class, () ->
                 exec("CREATE TABLE t1(id int PRIMARY KEY, a int DEFAULT 1 GENERATED ALWAYS AS (a + 1) STORED)"));
-        assertTrue(ex.getMessage().contains("generated column") || ex.getMessage().contains("default value"),
+        assertTrue(ex.getMessage().contains("generation expression") || ex.getMessage().contains("default"),
                 "Expected error about generated column + default, got: " + ex.getMessage());
     }
 
@@ -931,40 +931,33 @@ class VirtualGeneratedColumnTest {
     // ========================================================================
 
     @Test
-    void create_index_on_virtual_column() throws SQLException {
+    void create_index_on_virtual_column_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
              "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
-        exec("INSERT INTO t1(id, a) VALUES (1, 10), (2, 20), (3, 30)");
-        // PG 18 allows indexes on virtual generated columns
-        exec("CREATE INDEX idx_t1_b ON t1 (b)");
-        // Data still readable
-        List<List<String>> rows = query("SELECT id, b FROM t1 ORDER BY b");
-        assertEquals(3, rows.size());
-        assertEquals("20", rows.get(0).get(1));
-        assertEquals("40", rows.get(1).get(1));
-        assertEquals("60", rows.get(2).get(1));
+        // PG 18: indexes on virtual generated columns are not supported
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_t1_b ON t1 (b)"));
+        assertEquals("0A000", ex.getSQLState());
     }
 
     @Test
-    void create_unique_index_on_virtual_column() throws SQLException {
+    void create_unique_index_on_virtual_column_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
              "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
-        exec("INSERT INTO t1(id, a) VALUES (1, 10), (2, 20)");
-        // UNIQUE index on virtual column
-        exec("CREATE UNIQUE INDEX idx_t1_b_uniq ON t1 (b)");
-        // Verify it still works
-        assertEquals("20", scalar("SELECT b FROM t1 WHERE id = 1"));
+        // PG 18: indexes on virtual generated columns are not supported
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE UNIQUE INDEX idx_t1_b_uniq ON t1 (b)"));
+        assertEquals("0A000", ex.getSQLState());
     }
 
     @Test
-    void unique_index_on_virtual_column_detects_duplicates() throws SQLException {
+    void unique_index_on_virtual_column_detects_duplicates_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
              "b int GENERATED ALWAYS AS (a / 2) VIRTUAL)");
-        // a=4 → b=2, a=5 → b=2 — duplicate virtual values
-        exec("INSERT INTO t1(id, a) VALUES (1, 4), (2, 5)");
+        // PG 18: indexes on virtual generated columns are not supported
         SQLException ex = assertThrows(SQLException.class, () ->
                 exec("CREATE UNIQUE INDEX idx_t1_b_dup ON t1 (b)"));
-        assertEquals("23505", ex.getSQLState());
+        assertEquals("0A000", ex.getSQLState());
     }
 
     // ========================================================================
@@ -1069,6 +1062,7 @@ class VirtualGeneratedColumnTest {
     @Test
     void expression_index_rejects_gen_random_uuid() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, name text)");
+        // gen_random_uuid() is a built-in volatile function — still rejected
         assertThrows(SQLException.class, () ->
                 exec("CREATE INDEX idx_bad ON t1 ((gen_random_uuid()))"),
                 "gen_random_uuid() in index expression must be rejected");
@@ -1094,12 +1088,10 @@ class VirtualGeneratedColumnTest {
     void unique_index_on_virtual_column_rejects_duplicate() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
              "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
-        exec("CREATE UNIQUE INDEX idx_b ON t1 (b)");
-        exec("INSERT INTO t1(id, a) VALUES (1, 5)");  // b=10
-        // a=5 → b=10 — duplicate
-        assertThrows(SQLException.class, () ->
-                exec("INSERT INTO t1(id, a) VALUES (2, 5)"),
-                "Should reject duplicate on virtual column unique index");
+        // PG 18: indexes on virtual generated columns are not supported
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE UNIQUE INDEX idx_b ON t1 (b)"));
+        assertEquals("0A000", ex.getSQLState());
     }
 
     // ========================================================================
@@ -1107,25 +1099,23 @@ class VirtualGeneratedColumnTest {
     // ========================================================================
 
     @Test
-    void unique_index_on_virtual_column_after_update() throws SQLException {
+    void unique_index_on_virtual_column_after_update_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
              "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
-        exec("CREATE UNIQUE INDEX idx_b_upd ON t1 (b)");
-        exec("INSERT INTO t1(id, a) VALUES (1, 5), (2, 10)"); // b=10, b=20
-        // Updating a to make b collide with existing value
-        assertThrows(SQLException.class, () ->
-                exec("UPDATE t1 SET a = 10 WHERE id = 1"), // b would become 20, duplicate
-                "Should reject update causing duplicate on virtual column unique index");
+        // PG 18: indexes on virtual generated columns are not supported
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE UNIQUE INDEX idx_b_upd ON t1 (b)"));
+        assertEquals("0A000", ex.getSQLState());
     }
 
     @Test
-    void drop_index_on_virtual_column() throws SQLException {
+    void drop_index_on_virtual_column_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
              "b int GENERATED ALWAYS AS (a + 100) VIRTUAL)");
-        exec("CREATE INDEX idx_b_drop ON t1 (b)");
-        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_b_drop'"));
-        exec("DROP INDEX idx_b_drop");
-        assertEquals("0", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_b_drop'"));
+        // PG 18: indexes on virtual generated columns are not supported
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_b_drop ON t1 (b)"));
+        assertEquals("0A000", ex.getSQLState());
     }
 
     @Test
@@ -1139,13 +1129,13 @@ class VirtualGeneratedColumnTest {
     }
 
     @Test
-    void multiple_indexes_on_virtual_column() throws SQLException {
+    void multiple_indexes_on_virtual_column_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
              "b int GENERATED ALWAYS AS (a + 1) VIRTUAL)");
-        exec("CREATE INDEX idx_multi_b1 ON t1 (b)");
-        exec("CREATE INDEX idx_multi_b2 ON t1 ((b * 2))");
-        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_multi_b1'"));
-        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_multi_b2'"));
+        // PG 18: indexes on virtual generated columns are not supported
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_multi_b1 ON t1 (b)"));
+        assertEquals("0A000", ex.getSQLState());
     }
 
     // ========================================================================

@@ -278,12 +278,12 @@ class SqlJsonStandardTest {
 
     @Test
     void jsonQuery_extractObject() throws SQLException {
-        assertEquals("{\"b\":1}", q("SELECT JSON_QUERY('{\"a\":{\"b\":1}}', '$.a')"));
+        assertEquals("{\"b\": 1}", q("SELECT JSON_QUERY('{\"a\":{\"b\":1}}', '$.a')"));
     }
 
     @Test
     void jsonQuery_extractArray() throws SQLException {
-        assertEquals("[1,2,3]", q("SELECT JSON_QUERY('{\"a\":[1,2,3]}', '$.a')"));
+        assertEquals("[1, 2, 3]", q("SELECT JSON_QUERY('{\"a\":[1,2,3]}', '$.a')"));
     }
 
     @Test
@@ -300,25 +300,25 @@ class SqlJsonStandardTest {
     @Test
     void jsonQuery_nestedObject() throws SQLException {
         String result = q("SELECT JSON_QUERY('{\"a\":{\"b\":{\"c\":3}}}', '$.a.b')");
-        assertEquals("{\"c\":3}", result);
+        assertEquals("{\"c\": 3}", result);
     }
 
     @Test
     void jsonQuery_withConditionalWrapper() throws SQLException {
-        // WITH CONDITIONAL WRAPPER wraps only if result is not already object/array
-        assertEquals("[42]", q("SELECT JSON_QUERY('{\"a\":42}', '$.a' WITH CONDITIONAL WRAPPER)"));
+        // PG 17+: WITH CONDITIONAL WRAPPER does NOT wrap single scalars
+        assertEquals("42", q("SELECT JSON_QUERY('{\"a\":42}', '$.a' WITH CONDITIONAL WRAPPER)"));
     }
 
     @Test
     void jsonQuery_withConditionalWrapperOnObject() throws SQLException {
         // Object should not be double-wrapped
-        assertEquals("{\"b\":1}", q("SELECT JSON_QUERY('{\"a\":{\"b\":1}}', '$.a' WITH CONDITIONAL WRAPPER)"));
+        assertEquals("{\"b\": 1}", q("SELECT JSON_QUERY('{\"a\":{\"b\":1}}', '$.a' WITH CONDITIONAL WRAPPER)"));
     }
 
     @Test
     void jsonQuery_omitQuotes() throws SQLException {
-        // OMIT QUOTES strips quotes from string result
-        assertEquals("hello", q("SELECT JSON_QUERY('{\"a\":\"hello\"}', '$.a' OMIT QUOTES)"));
+        // PG: OMIT QUOTES on a string scalar returns NULL (unquoted string is not valid JSON)
+        assertNull(q("SELECT JSON_QUERY('{\"a\":\"hello\"}', '$.a' OMIT QUOTES)"));
     }
 
     @Test
@@ -551,12 +551,20 @@ class SqlJsonStandardTest {
 
     @Test
     void jsonSerialize_object() throws SQLException {
-        assertEquals("{\"a\": 1}", q("SELECT JSON_SERIALIZE('{\"a\":1}'::jsonb)"));
+        // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("SELECT JSON_SERIALIZE('{\"a\":1}'::jsonb)")) {
+            assertTrue(rs.next());
+            assertEquals("{\"a\": 1}", rs.getString(1));
+        }
     }
 
     @Test
     void jsonSerialize_array() throws SQLException {
-        assertEquals("[1, 2, 3]", q("SELECT JSON_SERIALIZE('[1,2,3]'::jsonb)"));
+        // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("SELECT JSON_SERIALIZE('[1,2,3]'::jsonb)")) {
+            assertTrue(rs.next());
+            assertEquals("[1, 2, 3]", rs.getString(1));
+        }
     }
 
     @Test
@@ -760,11 +768,11 @@ class SqlJsonStandardTest {
     }
 
     @Test
-    void jsonObject_keyValueSyntax() throws SQLException {
-        String result = q("SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20)");
-        assertNotNull(result);
-        assertTrue(result.contains("\"x\""));
-        assertTrue(result.contains("\"y\""));
+    void jsonObject_keyValueSyntax() {
+        // PG 18 rejects KEY...VALUE syntax — KEY is parsed as a type name (42704)
+        SQLException e = assertThrows(SQLException.class,
+                () -> q("SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20)"));
+        assertEquals("42704", e.getSQLState());
     }
 
     @Test
@@ -1048,7 +1056,10 @@ class SqlJsonStandardTest {
 
     @Test
     void jsonExists_trueOnError() throws SQLException {
-        assertEquals("t", q("SELECT JSON_EXISTS('not json', '$.a' TRUE ON ERROR)"));
+        // PG: invalid JSON input always errors — the implicit cast to json fails
+        // before JSON_EXISTS runs, so TRUE ON ERROR cannot catch it
+        assertThrows(SQLException.class, () ->
+                q("SELECT JSON_EXISTS('not json', '$.a' TRUE ON ERROR)"));
     }
 
     @Test
@@ -1136,19 +1147,19 @@ class SqlJsonStandardTest {
     @Test
     void jsonQuery_withWrapperOnObject() throws SQLException {
         // WITH WRAPPER wraps even objects in an array
-        assertEquals("[{\"b\":1}]", q("SELECT JSON_QUERY('{\"a\":{\"b\":1}}', '$.a' WITH WRAPPER)"));
+        assertEquals("[{\"b\": 1}]", q("SELECT JSON_QUERY('{\"a\":{\"b\":1}}', '$.a' WITH WRAPPER)"));
     }
 
     @Test
     void jsonQuery_withWrapperOnArray() throws SQLException {
         // WITH WRAPPER wraps arrays in another array
-        assertEquals("[[1,2]]", q("SELECT JSON_QUERY('{\"a\":[1,2]}', '$.a' WITH WRAPPER)"));
+        assertEquals("[[1, 2]]", q("SELECT JSON_QUERY('{\"a\":[1,2]}', '$.a' WITH WRAPPER)"));
     }
 
     @Test
     void jsonQuery_conditionalWrapperOnArray() throws SQLException {
         // CONDITIONAL WRAPPER does NOT wrap arrays
-        assertEquals("[1,2]", q("SELECT JSON_QUERY('{\"a\":[1,2]}', '$.a' WITH CONDITIONAL WRAPPER)"));
+        assertEquals("[1, 2]", q("SELECT JSON_QUERY('{\"a\":[1,2]}', '$.a' WITH CONDITIONAL WRAPPER)"));
     }
 
     @Test
@@ -1160,7 +1171,7 @@ class SqlJsonStandardTest {
     @Test
     void jsonQuery_rootPath() throws SQLException {
         // $ returns the entire document
-        assertEquals("{\"a\":1}", q("SELECT JSON_QUERY('{\"a\":1}', '$')"));
+        assertEquals("{\"a\": 1}", q("SELECT JSON_QUERY('{\"a\":1}', '$')"));
     }
 
     // ================================================================
@@ -1429,7 +1440,7 @@ class SqlJsonStandardTest {
     void chainJsonQueryThenJsonValue() throws SQLException {
         // Extract nested object with JSON_QUERY, then extract scalar from it with JSON_VALUE
         String inner = q("SELECT JSON_QUERY('{\"a\":{\"b\":42}}', '$.a')");
-        assertEquals("{\"b\":42}", inner);
+        assertEquals("{\"b\": 42}", inner);
         // Now chain: JSON_VALUE of a JSON_QUERY result
         assertEquals("42", q("SELECT JSON_VALUE(JSON_QUERY('{\"a\":{\"b\":42}}', '$.a'), '$.b')"));
     }
@@ -1496,8 +1507,8 @@ class SqlJsonStandardTest {
     @Test
     void jsonArray_emptySubquery() throws SQLException {
         exec("CREATE TABLE ja_empty_sq (v int)");
-        // Empty table → JSON_ARRAY(SELECT ...) returns empty array
-        assertEquals("[]", q("SELECT JSON_ARRAY(SELECT v FROM ja_empty_sq)"));
+        // Empty table → JSON_ARRAY(SELECT ...) returns NULL (PG behavior)
+        assertNull(q("SELECT JSON_ARRAY(SELECT v FROM ja_empty_sq)"));
     }
 
     @Test

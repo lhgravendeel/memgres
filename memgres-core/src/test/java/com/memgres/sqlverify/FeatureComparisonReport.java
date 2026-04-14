@@ -6,6 +6,7 @@ import com.memgres.engine.util.IO;
 import com.memgres.engine.util.Strs;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.sql.*;
 import java.util.*;
@@ -79,7 +80,7 @@ public class FeatureComparisonReport {
 
         // --- Run all files ---
         List<FileDifferences> allDiffs = new ArrayList<>();
-        int totalSections = 0, totalPgMemDiffs = 0, totalPgAnnotDiffs = 0, totalMemAnnotDiffs = 0;
+        int totalSections = 0, totalPgMemDiffs = 0, totalPgAnnotDiffs = 0, totalMemAnnotDiffs = 0, totalSetupDivergences = 0, totalPgBugSkips = 0;
 
         for (Path sqlFile : sqlFiles) {
             String fileName = sqlFile.getFileName().toString();
@@ -103,25 +104,47 @@ public class FeatureComparisonReport {
                 SqlVerifyHarness.StatementResult memResult = SqlVerifyHarness.executeStatement(memgresConn, block.sql());
                 SqlVerifyHarness.StatementResult pgResult = hasPg ? SqlVerifyHarness.executeStatement(pgConn, block.sql()) : null;
 
-                // Compare PG vs Memgres (only for annotated statements —
-                // unannotated setup statements are noise in the comparison)
-                if (pgResult != null && block.expectation() != null) {
-                    String pgMemDiff = compareResults(pgResult, memResult, block.sql());
-                    if (pgMemDiff != null) {
-                        fd.pgVsMemgres.add(new Difference(sectionNum, block.sql(), pgMemDiff, pgResult, memResult));
-                        totalPgMemDiffs++;
+                // Skip PG comparisons for known PG bugs
+                if (block.pgBugSkip() != null && pgResult != null) {
+                    fd.pgBugSkips.add(new Difference(sectionNum, block.sql(), block.pgBugSkip(), pgResult, memResult));
+                    totalPgBugSkips++;
+                } else {
+                    // Compare PG vs Memgres for annotated statements
+                    if (pgResult != null && block.expectation() != null) {
+                        String pgMemDiff = compareResults(pgResult, memResult, block.sql());
+                        if (pgMemDiff != null) {
+                            fd.pgVsMemgres.add(new Difference(sectionNum, block.sql(), pgMemDiff, pgResult, memResult));
+                            totalPgMemDiffs++;
+                        }
                     }
-                }
 
-                // Compare each engine against annotations (if present)
-                if (block.expectation() != null) {
-                    if (pgResult != null) {
+                    // Detect setup statement divergences (unannotated statements
+                    // where one engine errors and the other succeeds)
+                    if (pgResult != null && block.expectation() == null) {
+                        if (pgResult.success() != memResult.success()) {
+                            String desc;
+                            if (pgResult.success()) {
+                                desc = "Setup divergence: PG succeeded, Memgres errored: " + memResult.errorMessage();
+                            } else {
+                                desc = "Setup divergence: PG errored (" + pgResult.errorState() + ": " + pgResult.errorMessage() + "), Memgres succeeded";
+                            }
+                            fd.setupDivergences.add(new Difference(sectionNum, block.sql(), desc, pgResult, memResult));
+                            totalSetupDivergences++;
+                        }
+                    }
+
+                    // Compare PG against annotations (if present and not a known PG bug)
+                    if (block.expectation() != null && pgResult != null) {
                         String pgAnnotDiff = compareToAnnotation(pgResult, block);
                         if (pgAnnotDiff != null) {
                             fd.pgVsAnnotation.add(new Difference(sectionNum, block.sql(), pgAnnotDiff, pgResult, null));
                             totalPgAnnotDiffs++;
                         }
                     }
+                }
+
+                // Always compare Memgres against annotations (if present)
+                if (block.expectation() != null) {
                     String memAnnotDiff = compareToAnnotation(memResult, block);
                     if (memAnnotDiff != null) {
                         fd.memgresVsAnnotation.add(new Difference(sectionNum, block.sql(), memAnnotDiff, null, memResult));
@@ -132,8 +155,8 @@ public class FeatureComparisonReport {
 
             allDiffs.add(fd);
             String status = fd.totalDiffs() == 0 ? "PASS" : "FAIL";
-            System.out.printf("[%s] %-55s  pg-vs-mem=%d  pg-vs-annot=%d  mem-vs-annot=%d%n",
-                    status, fileName, fd.pgVsMemgres.size(), fd.pgVsAnnotation.size(), fd.memgresVsAnnotation.size());
+            System.out.printf("[%s] %-55s  pg-vs-mem=%d  pg-vs-annot=%d  mem-vs-annot=%d  setup-div=%d%n",
+                    status, fileName, fd.pgVsMemgres.size(), fd.pgVsAnnotation.size(), fd.memgresVsAnnotation.size(), fd.setupDivergences.size());
         }
 
         // --- Summary ---
@@ -143,6 +166,10 @@ public class FeatureComparisonReport {
         System.out.printf("  PG vs Memgres differences:      %d%n", totalPgMemDiffs);
         System.out.printf("  PG vs annotation differences:    %d%n", totalPgAnnotDiffs);
         System.out.printf("  Memgres vs annotation diffs:     %d%n", totalMemAnnotDiffs);
+        System.out.printf("  Setup statement divergences:     %d%n", totalSetupDivergences);
+        if (totalPgBugSkips > 0) {
+            System.out.printf("  Skipped (known PG bugs):         %d%n", totalPgBugSkips);
+        }
         System.out.println(Strs.repeat("=", 80));
 
         // --- Write report ---
@@ -213,7 +240,22 @@ public class FeatureComparisonReport {
                     if (!Pg18SampleSql5Test.cellMatches(pv, mv)) {
                         String pgRow = SqlVerifyHarness.formatRow(pgCells);
                         String memRow = SqlVerifyHarness.formatRow(memCells);
-                        return "Row " + (r + 1) + " differs: PG=[" + pgRow + "] Memgres=[" + memRow + "]";
+                        StringBuilder debug = new StringBuilder();
+                        debug.append("Row ").append(r + 1).append(" differs: PG=[").append(pgRow)
+                                .append("] Memgres=[").append(memRow).append("]");
+                        // Append hex dump and type info for the differing cell
+                        debug.append("\n  - Column: ").append(pg.columns().get(c));
+                        if (pg.columnTypeNames() != null) {
+                            debug.append(" pgType=").append(pg.columnTypeNames().get(c));
+                        }
+                        if (mem.columnTypeNames() != null) {
+                            debug.append(" memType=").append(mem.columnTypeNames().get(c));
+                        }
+                        debug.append("\n  - PG hex: ").append(toHex(pgCells.get(c)));
+                        debug.append("\n  - Memgres hex: ").append(toHex(memCells.get(c)));
+                        debug.append("\n  - PG len: ").append(pv.length())
+                                .append(", Memgres len: ").append(mv.length());
+                        return debug.toString();
                     }
                 }
             }
@@ -316,11 +358,13 @@ public class FeatureComparisonReport {
         md.append("Generated by `FeatureComparisonReport`\n\n");
 
         // Summary table
-        int totalPgMem = 0, totalPgAnn = 0, totalMemAnn = 0;
+        int totalPgMem = 0, totalPgAnn = 0, totalMemAnn = 0, totalSetupDiv = 0, totalBugSkips = 0;
         for (FileDifferences fd : allDiffs) {
             totalPgMem += fd.pgVsMemgres.size();
             totalPgAnn += fd.pgVsAnnotation.size();
             totalMemAnn += fd.memgresVsAnnotation.size();
+            totalSetupDiv += fd.setupDivergences.size();
+            totalBugSkips += fd.pgBugSkips.size();
         }
 
         md.append("## Summary\n\n");
@@ -333,17 +377,25 @@ public class FeatureComparisonReport {
             md.append("| PG vs annotation mismatches | ").append(totalPgAnn).append(" |\n");
         }
         md.append("| Memgres vs annotation mismatches | ").append(totalMemAnn).append(" |\n");
+        if (hasPg) {
+            md.append("| Setup statement divergences | ").append(totalSetupDiv).append(" |\n");
+            if (totalBugSkips > 0) {
+                md.append("| Skipped (known PG bugs) | ").append(totalBugSkips).append(" |\n");
+            }
+        }
         md.append("\n");
 
         // Per-file summary
         md.append("## Per-File Summary\n\n");
-        md.append("| File | PG vs Memgres | PG vs Annot | Mem vs Annot |\n");
-        md.append("|------|:---:|:---:|:---:|\n");
+        md.append("| File | PG vs Memgres | PG vs Annot | Mem vs Annot | Setup Div | PG Bugs |\n");
+        md.append("|------|:---:|:---:|:---:|:---:|:---:|\n");
         for (FileDifferences fd : allDiffs) {
             md.append("| ").append(fd.fileName).append(" | ");
             md.append(hasPg ? fd.pgVsMemgres.size() : "-").append(" | ");
             md.append(hasPg ? fd.pgVsAnnotation.size() : "-").append(" | ");
-            md.append(fd.memgresVsAnnotation.size()).append(" |\n");
+            md.append(fd.memgresVsAnnotation.size()).append(" | ");
+            md.append(hasPg ? fd.setupDivergences.size() : "-").append(" | ");
+            md.append(hasPg ? fd.pgBugSkips.size() : "-").append(" |\n");
         }
         md.append("\n");
 
@@ -361,6 +413,20 @@ public class FeatureComparisonReport {
                     if (fd.pgVsMemgres.isEmpty()) continue;
                     md.append("### ").append(fd.fileName).append("\n\n");
                     for (Difference diff : fd.pgVsMemgres) {
+                        appendDifference(md, diff);
+                    }
+                }
+            }
+
+            // Setup statement divergences (unannotated)
+            if (hasPg && totalSetupDiv > 0) {
+                md.append("## Setup Statement Divergences\n\n");
+                md.append("Unannotated statements (setup/teardown) where one engine errors and the other succeeds.\n");
+                md.append("These may cause cascading differences in subsequent annotated statements.\n\n");
+                for (FileDifferences fd : allDiffs) {
+                    if (fd.setupDivergences.isEmpty()) continue;
+                    md.append("### ").append(fd.fileName).append("\n\n");
+                    for (Difference diff : fd.setupDivergences) {
                         appendDifference(md, diff);
                     }
                 }
@@ -389,6 +455,22 @@ public class FeatureComparisonReport {
                     md.append("### ").append(fd.fileName).append("\n\n");
                     for (Difference diff : fd.pgVsAnnotation) {
                         appendDifference(md, diff);
+                    }
+                }
+            }
+
+            // Known PG bugs (informational)
+            if (hasPg && totalBugSkips > 0) {
+                md.append("## Skipped: Known PG Bugs\n\n");
+                md.append("Statements where PG comparison is skipped due to known PostgreSQL bugs.\n\n");
+                for (FileDifferences fd : allDiffs) {
+                    if (fd.pgBugSkips.isEmpty()) continue;
+                    md.append("### ").append(fd.fileName).append("\n\n");
+                    for (Difference diff : fd.pgBugSkips) {
+                        md.append("**Stmt ").append(diff.sectionNum).append(":** ").append(diff.description).append("\n\n");
+                        String sqlPreview = diff.sql.replaceAll("\\s+", " ").trim();
+                        if (sqlPreview.length() > 200) sqlPreview = sqlPreview.substring(0, 200) + "...";
+                        md.append("```sql\n").append(sqlPreview).append("\n```\n\n");
                     }
                 }
             }
@@ -451,6 +533,18 @@ public class FeatureComparisonReport {
         return SqlVerifyHarness.findResourceDir("feature-comparison");
     }
 
+    /** Convert a string to hex representation for debugging wire-level differences. */
+    private static String toHex(String s) {
+        if (s == null) return "NULL";
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        StringBuilder sb = new StringBuilder(bytes.length * 3);
+        for (int i = 0; i < bytes.length; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(String.format("%02x", bytes[i] & 0xFF));
+        }
+        return sb.toString() + " (\"" + s.replace("\n", "\\n").replace("\r", "\\r") + "\")";
+    }
+
     // =========================================================================
     // Data classes
     // =========================================================================
@@ -477,13 +571,16 @@ public class FeatureComparisonReport {
         final List<Difference> pgVsMemgres = new ArrayList<>();
         final List<Difference> pgVsAnnotation = new ArrayList<>();
         final List<Difference> memgresVsAnnotation = new ArrayList<>();
+        final List<Difference> setupDivergences = new ArrayList<>();
+        final List<Difference> pgBugSkips = new ArrayList<>();
 
         FileDifferences(String fileName) {
             this.fileName = fileName;
         }
 
         int totalDiffs() {
-            return pgVsMemgres.size() + pgVsAnnotation.size() + memgresVsAnnotation.size();
+            // pg bug skips are informational, not counted as diffs
+            return pgVsMemgres.size() + pgVsAnnotation.size() + memgresVsAnnotation.size() + setupDivergences.size();
         }
     }
 }

@@ -120,7 +120,8 @@ class CatalogMetadataFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 int targetOid;
-                if (arg instanceof Number) targetOid = ((Number) arg).intValue();
+                if (arg instanceof RegclassValue) targetOid = ((RegclassValue) arg).oid();
+                else if (arg instanceof Number) targetOid = ((Number) arg).intValue();
                 else try { targetOid = Integer.parseInt(arg.toString().trim()); } catch (NumberFormatException e) { return null; }
                 // Resolve OID to table, return partition key definition
                 for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
@@ -130,7 +131,7 @@ class CatalogMetadataFunctions {
                                 .getOrDefault("rel:" + schemaEntry.getKey() + "." + t.getName(), -1);
                         if (tblOid == targetOid && t.getPartitionStrategy() != null) {
                             String col = t.getPartitionColumn();
-                            return t.getPartitionStrategy().toLowerCase() + " (" + (col != null ? col : "") + ")";
+                            return t.getPartitionStrategy().toUpperCase() + " (" + (col != null ? col : "") + ")";
                         }
                     }
                 }
@@ -140,15 +141,7 @@ class CatalogMetadataFunctions {
                 return evalPgGetViewdef(fn, ctx);
             case "pg_get_functiondef": {
                 if (!fn.args().isEmpty()) {
-                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                    String funcName = arg != null ? arg.toString() : "";
-                    if (funcName.contains(".")) {
-                        funcName = funcName.substring(funcName.lastIndexOf('.') + 1);
-                    }
-                    if (funcName.contains("(")) {
-                        funcName = funcName.substring(0, funcName.indexOf('('));
-                    }
-                    PgFunction func = executor.database.getFunction(funcName);
+                    PgFunction func = resolveFunction(fn.args().get(0), ctx);
                     if (func != null) {
                         return buildFunctionDef(func);
                     }
@@ -847,7 +840,7 @@ class CatalogMetadataFunctions {
         }
         PgFunction found = null;
         if (schema != null) {
-            found = executor.database.getFunction(schema + "." + funcName);
+            found = executor.database.getFunction(schema, funcName);
             if (found == null) found = executor.database.getFunction(funcName);
         } else {
             found = executor.database.getFunction(funcName);
@@ -1109,7 +1102,12 @@ class CatalogMetadataFunctions {
             }
         }
         String funcName = arg.toString();
-        return executor.database.getFunction(funcName);
+        // Strip argument list if present, e.g. "cfmt.cfmt_fn(int)" -> "cfmt.cfmt_fn"
+        int parenIdx = funcName.indexOf('(');
+        if (parenIdx >= 0) {
+            funcName = funcName.substring(0, parenIdx).trim();
+        }
+        return resolveFunctionByName(funcName);
     }
 
     private static String buildFunctionIdentityArguments(PgFunction func) {

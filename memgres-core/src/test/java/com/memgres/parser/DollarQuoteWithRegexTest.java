@@ -164,11 +164,10 @@ class DollarQuoteWithRegexTest {
                 SELECT string_agg(
                     column_name || ' ' || data_type ||
                     CASE WHEN is_nullable = 'NO' THEN ' NOT NULL' ELSE '' END,
-                    ', '
+                    ', ' ORDER BY ordinal_position
                 ) INTO col_defs
                 FROM information_schema.columns
-                WHERE table_name = source_name
-                ORDER BY ordinal_position;
+                WHERE table_name = source_name;
 
                 IF col_defs IS NULL THEN
                     RETURN 'source table not found: ' || source_name;

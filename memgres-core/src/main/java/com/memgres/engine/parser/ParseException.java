@@ -8,10 +8,10 @@ import com.memgres.engine.MemgresException;
 public class ParseException extends MemgresException {
 
     public ParseException(String message, Token token) {
-        super(message + " at position " + token.position() + " near '" + token.value() + "'", "42601");
+        super("syntax error: " + message + " at position " + token.position() + " near '" + token.value() + "'", "42601");
     }
 
     public ParseException(String message, Token token, String sqlState) {
-        super(message + " at position " + token.position() + " near '" + token.value() + "'", sqlState);
+        super("syntax error: " + message + " at position " + token.position() + " near '" + token.value() + "'", sqlState);
     }
 }

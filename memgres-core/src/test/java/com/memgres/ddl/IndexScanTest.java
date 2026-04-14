@@ -225,15 +225,13 @@ class IndexScanTest {
     // ========================================================================
 
     @Test
-    void create_index_on_virtual_column_succeeds() throws SQLException {
+    void create_index_on_virtual_column_rejected() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, a int, " +
              "b int GENERATED ALWAYS AS (a * 2) VIRTUAL)");
-        exec("INSERT INTO t1(id, a) VALUES (1, 10), (2, 20)");
-        exec("CREATE INDEX idx_t1_b ON t1 (b)");
-        // Index exists in catalog
-        assertEquals("1", scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'idx_t1_b'"));
-        // Data still readable
-        assertEquals("20", scalar("SELECT b FROM t1 WHERE id = 1"));
+        // PG 18: indexes on virtual generated columns are not supported
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE INDEX idx_t1_b ON t1 (b)"));
+        assertEquals("0A000", ex.getSQLState());
     }
 
     @Test

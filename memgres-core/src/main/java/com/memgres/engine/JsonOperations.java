@@ -402,34 +402,52 @@ public final class JsonOperations {
         return i;
     }
 
-    private static String mapToJson(Map<String, String> map) {
+    private static String mapToJson(Map<String, String> map, boolean compact) {
         StringBuilder sb = new StringBuilder("{");
         boolean first = true;
+        String sep = compact ? "," : ", ";
+        String colon = compact ? ":" : ": ";
         for (Map.Entry<String, String> entry : map.entrySet()) {
-            if (!first) sb.append(", ");
-            sb.append("\"").append(entry.getKey()).append("\": ").append(normalizeJsonb(entry.getValue()));
+            if (!first) sb.append(sep);
+            sb.append("\"").append(entry.getKey()).append("\"").append(colon).append(doNormalize(entry.getValue(), compact));
             first = false;
         }
         sb.append("}");
         return sb.toString();
     }
 
+    private static String mapToJson(Map<String, String> map) {
+        return mapToJson(map, false);
+    }
+
     /**
-     * Recursively normalize a JSONB value, re-ordering object keys by PG's length-first rule.
+     * Recursively normalize a JSONB value with spaces (PG jsonb text output style).
      */
     public static String normalizeJsonb(String json) {
+        return doNormalize(json, false);
+    }
+
+    /**
+     * Recursively normalize a JSONB value in compact form (no spaces), used by JSON_QUERY.
+     */
+    public static String normalizeJsonbCompact(String json) {
+        return doNormalize(json, true);
+    }
+
+    private static String doNormalize(String json, boolean compact) {
         if (json == null) return "null";
         json = json.trim();
         if (json.startsWith("{") && json.endsWith("}")) {
             Map<String, String> map = parseObjectKeys(json);
-            return mapToJson(map);
+            return mapToJson(map, compact);
         }
         if (json.startsWith("[") && json.endsWith("]")) {
             List<String> elems = parseArrayElements(json);
             StringBuilder sb = new StringBuilder("[");
+            String sep = compact ? "," : ", ";
             for (int i = 0; i < elems.size(); i++) {
-                if (i > 0) sb.append(", ");
-                sb.append(normalizeJsonb(elems.get(i)));
+                if (i > 0) sb.append(sep);
+                sb.append(doNormalize(elems.get(i), compact));
             }
             sb.append("]");
             return sb.toString();

@@ -13,6 +13,9 @@ public class RangeOperations {
         public final boolean lowerInclusive;
         public final boolean upperInclusive;
         public final boolean empty;
+        // Original string representations for proper formatting (dates, timestamps, decimals)
+        public final String lowerStr;
+        public final String upperStr;
 
         public PgRange(
                 Number lower,
@@ -21,19 +24,37 @@ public class RangeOperations {
                 boolean upperInclusive,
                 boolean empty
         ) {
+            this(lower, upper, lowerInclusive, upperInclusive, empty, null, null);
+        }
+
+        public PgRange(
+                Number lower,
+                Number upper,
+                boolean lowerInclusive,
+                boolean upperInclusive,
+                boolean empty,
+                String lowerStr,
+                String upperStr
+        ) {
             this.lower = lower;
             this.upper = upper;
             this.lowerInclusive = lowerInclusive;
             this.upperInclusive = upperInclusive;
             this.empty = empty;
+            this.lowerStr = lowerStr;
+            this.upperStr = upperStr;
         }
 
         /** Canonical string form: [lower,upper) or empty */
         @Override
         public String toString() {
             if (empty) return "empty";
-            return (lowerInclusive ? "[" : "(") + (lower != null ? lower : "") + ","
-                    + (upper != null ? upper : "") + (upperInclusive ? "]" : ")");
+            String lo = lowerStr != null ? lowerStr : (lower != null ? lower.toString() : "");
+            String hi = upperStr != null ? upperStr : (upper != null ? upper.toString() : "");
+            // Quote timestamp bounds (contain space between date and time)
+            if (lo.contains(" ") && lo.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}.*")) lo = "\"" + lo + "\"";
+            if (hi.contains(" ") && hi.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}.*")) hi = "\"" + hi + "\"";
+            return (lowerInclusive ? "[" : "(") + lo + "," + hi + (upperInclusive ? "]" : ")");
         }
 
         /** Check if this range contains a value. */
@@ -301,11 +322,20 @@ public class RangeOperations {
         String[] parts = inner.split(",", 2);
         if (parts.length != 2) throw new MemgresException("malformed range literal: \"" + s + "\"", "22P02");
 
-        Long lo = parts[0].trim().isEmpty() ? null : parseRangeBoundLong(parts[0].trim());
-        Long hi = parts[1].trim().isEmpty() ? null : parseRangeBoundLong(parts[1].trim());
+        String loRaw = parts[0].trim();
+        String hiRaw = parts[1].trim();
+        // Strip surrounding quotes from raw strings for display
+        String loDisplay = stripQuotes(loRaw);
+        String hiDisplay = stripQuotes(hiRaw);
 
-        if (lo != null && hi != null) {
-            // Canonicalize to [lo, hi)
+        Long lo = loRaw.isEmpty() ? null : parseRangeBoundLong(loRaw);
+        Long hi = hiRaw.isEmpty() ? null : parseRangeBoundLong(hiRaw);
+
+        // Determine if this is a non-integer type (dates, timestamps, decimals)
+        boolean isNonInteger = isNonIntegerBound(loRaw.isEmpty() ? hiRaw : loRaw);
+
+        if (lo != null && hi != null && !isNonInteger) {
+            // Canonicalize integer ranges to [lo, hi)
             long canonLo = li ? lo : lo + 1;
             long canonHi = ui ? hi + 1 : hi;
             if (canonLo > canonHi) {
@@ -316,7 +346,30 @@ public class RangeOperations {
             }
             return new PgRange(canonLo, canonHi, true, false, false);
         }
-        return new PgRange(lo, hi, li, ui, false);
+        // For non-integer types, preserve original string representations
+        return new PgRange(lo, hi, li, ui, false,
+                lo != null ? loDisplay : null,
+                hi != null ? hiDisplay : null);
+    }
+
+    private static String stripQuotes(String s) {
+        s = s.trim();
+        if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
+            return s.substring(1, s.length() - 1);
+        }
+        return s;
+    }
+
+    private static boolean isNonIntegerBound(String raw) {
+        raw = stripQuotes(raw.trim());
+        if (raw.isEmpty()) return false;
+        // Date: YYYY-MM-DD
+        if (raw.matches("\\d{4}-\\d{2}-\\d{2}")) return true;
+        // Timestamp: YYYY-MM-DD HH:MM...
+        if (raw.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}.*")) return true;
+        // Decimal: contains a dot
+        if (raw.contains(".")) return true;
+        return false;
     }
 
     /** Check if a value is a PG range string (not a geometric type). */

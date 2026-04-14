@@ -236,14 +236,21 @@ public class Pg18SampleSql5Test {
         public static final class ParsedBlock {
         public final String sql;
         public final Object expectation;
+        public final String pgBugSkip;
 
         public ParsedBlock(String sql, Object expectation) {
+            this(sql, expectation, null);
+        }
+
+        public ParsedBlock(String sql, Object expectation, String pgBugSkip) {
             this.sql = sql;
             this.expectation = expectation;
+            this.pgBugSkip = pgBugSkip;
         }
 
         public String sql() { return sql; }
         public Object expectation() { return expectation; }
+        public String pgBugSkip() { return pgBugSkip; }
 
         @Override
         public boolean equals(Object o) {
@@ -334,9 +341,17 @@ public class Pg18SampleSql5Test {
 
         int i = 0;
         Object pendingExpectation = null;
+        String pendingPgBugSkip = null;
 
         while (i < lines.size()) {
             String line = lines.get(i).trim();
+
+            // Parse pg-bug skip annotation
+            if (line.startsWith("-- pg-bug:")) {
+                pendingPgBugSkip = line.substring("-- pg-bug:".length()).trim();
+                i++;
+                continue;
+            }
 
             // Parse expectation blocks
             if (line.equals("-- begin-expected")) {
@@ -387,6 +402,7 @@ public class Pg18SampleSql5Test {
             boolean inSingle = false, inDouble = false;
             String dollarTag = null;
             boolean foundSemicolon = false;
+            boolean inBeginAtomic = false;
 
             while (i < lines.size() && !foundSemicolon) {
                 String rawLine = lines.get(i);
@@ -428,6 +444,25 @@ public class Pg18SampleSql5Test {
                         continue;
                     }
 
+                    // BEGIN ATOMIC...END: semicolons inside are part of the body
+                    if (inBeginAtomic) {
+                        sqlBuf.append(c);
+                        // Check for END keyword followed by ; (end of BEGIN ATOMIC block)
+                        if (c == ';') {
+                            String soFar = sqlBuf.toString();
+                            // Look for END followed by optional whitespace then ;
+                            String trimmed = soFar.substring(0, soFar.length() - 1).stripTrailing();
+                            if (trimmed.length() >= 3
+                                    && trimmed.substring(trimmed.length() - 3).equalsIgnoreCase("END")
+                                    && (trimmed.length() == 3 || !Character.isLetterOrDigit(trimmed.charAt(trimmed.length() - 4)))) {
+                                inBeginAtomic = false;
+                                foundSemicolon = true;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
                     if (c == '$') {
                         int dEnd = processedLine.indexOf('$', ci + 1);
                         if (dEnd > ci) {
@@ -447,6 +482,21 @@ public class Pg18SampleSql5Test {
                         break;
                     }
                     sqlBuf.append(c);
+
+                    // Detect BEGIN ATOMIC (must check after appending)
+                    if (!inBeginAtomic && Character.isLetter(c)) {
+                        String soFar = sqlBuf.toString();
+                        if (soFar.length() >= 12) { // "BEGIN ATOMIC" = 12 chars
+                            String tail = soFar.substring(soFar.length() - 12);
+                            if (tail.equalsIgnoreCase("BEGIN ATOMIC")) {
+                                // Verify the char before BEGIN is not a letter (word boundary)
+                                if (soFar.length() == 12
+                                        || !Character.isLetterOrDigit(soFar.charAt(soFar.length() - 13))) {
+                                    inBeginAtomic = true;
+                                }
+                            }
+                        }
+                    }
                 }
                 if (!foundSemicolon) sqlBuf.append('\n');
                 i++;
@@ -454,8 +504,9 @@ public class Pg18SampleSql5Test {
 
             String sql = sqlBuf.toString().trim();
             if (!sql.isEmpty()) {
-                blocks.add(new ParsedBlock(sql, pendingExpectation));
+                blocks.add(new ParsedBlock(sql, pendingExpectation, pendingPgBugSkip));
                 pendingExpectation = null;
+                pendingPgBugSkip = null;
             }
         }
 

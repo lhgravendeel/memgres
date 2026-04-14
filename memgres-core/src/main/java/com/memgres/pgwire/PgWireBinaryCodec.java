@@ -237,6 +237,7 @@ class PgWireBinaryCodec {
      */
     static void writeBinaryValue(ByteBuf buf, Object val, DataType type) {
         try {
+            if (type == null) type = DataType.TEXT;
             switch (type) {
                 case BOOLEAN: {
                     buf.writeInt(1);
@@ -322,6 +323,18 @@ class PgWireBinaryCodec {
                     else if (val instanceof Number) bd = BigDecimal.valueOf(((Number) val).doubleValue());
                     else bd = new BigDecimal(val.toString());
                     encodeBinaryNumericToBuf(buf, bd);
+                    break;
+                }
+                case BYTEA: {
+                    // Send raw bytes in binary format (not hex-encoded)
+                    byte[] raw;
+                    if (val instanceof byte[]) {
+                        raw = (byte[]) val;
+                    } else {
+                        raw = val.toString().getBytes(StandardCharsets.UTF_8);
+                    }
+                    buf.writeInt(raw.length);
+                    buf.writeBytes(raw);
                     break;
                 }
                 default: {

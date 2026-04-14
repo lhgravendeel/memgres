@@ -27,6 +27,7 @@ class DdlAdminExecutor {
             switch (stmt.action()) {
                 case BEGIN: {
                     executor.session.begin();
+                    executor.session.setExplicitTransactionBlock(true);
                     if (stmt.isolationLevel() != null) {
                         executor.session.getGucSettings().set("transaction_isolation", stmt.isolationLevel());
                     }

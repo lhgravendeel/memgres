@@ -117,6 +117,13 @@ class DdlAlterActionParser {
             // Fall through; could be other SET variants, but for now error
             throw new ParseException("Unsupported ALTER TABLE SET action", parser.peek());
         }
+        // RESET (storage_parameter, ...): no-op for in-memory database
+        if (parser.matchKeyword("RESET")) {
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                DdlTableParser.consumeUntilParen(parser);
+                return new AlterTableStmt.SetStorageParams();
+            }
+        }
         if (parser.matchKeyword("OWNER")) {
             parser.expectKeyword("TO");
             String newOwner = parser.readIdentifier();

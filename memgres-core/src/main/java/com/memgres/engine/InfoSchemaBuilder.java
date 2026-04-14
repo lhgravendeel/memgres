@@ -10,6 +10,22 @@ import java.util.*;
  */
 public class InfoSchemaBuilder {
 
+    /** pg_catalog tables whose columns should be listed in information_schema.columns. */
+    private static final List<String> PG_CATALOG_TABLES_FOR_IS = Cols.listOf(
+        "pg_stat_user_tables", "pg_stat_all_tables",
+        "pg_stat_user_indexes", "pg_stat_all_indexes",
+        "pg_stat_database", "pg_statio_user_tables",
+        "pg_stat_activity", "pg_stat_replication",
+        "pg_am", "pg_prepared_statements", "pg_cursors",
+        "pg_class", "pg_attribute", "pg_namespace", "pg_type",
+        "pg_proc", "pg_index", "pg_description",
+        "pg_constraint", "pg_depend", "pg_roles",
+        "pg_database", "pg_tablespace", "pg_settings",
+        "pg_extension", "pg_enum", "pg_operator",
+        "pg_aggregate", "pg_trigger", "pg_rewrite",
+        "pg_stat_bgwriter", "pg_stat_wal"
+    );
+
     private final Database database;
     private final OidSupplier oids;
 
@@ -144,82 +160,94 @@ public class InfoSchemaBuilder {
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 Table t = tableEntry.getValue();
-                for (int i = 0; i < t.getColumns().size(); i++) {
-                    Column col = t.getColumns().get(i);
-                    DataType dt = col.getType();
-                    String dataType = CatalogHelper.pgTypeName(dt);
-                    boolean isCharType = dt == DataType.VARCHAR || dt == DataType.CHAR || dt == DataType.TEXT || dt == DataType.NAME;
-                    boolean isNumericType = dt == DataType.SMALLINT || dt == DataType.INTEGER || dt == DataType.BIGINT
-                            || dt == DataType.SERIAL || dt == DataType.BIGSERIAL || dt == DataType.SMALLSERIAL
-                            || dt == DataType.REAL || dt == DataType.DOUBLE_PRECISION || dt == DataType.NUMERIC;
-                    boolean isDateTimeType = dt == DataType.TIMESTAMP || dt == DataType.TIMESTAMPTZ
-                            || dt == DataType.TIME || dt == DataType.DATE || dt == DataType.INTERVAL;
-
-                    Integer charMaxLen = null; // could be populated if we tracked varchar(N) lengths
-                    Integer charOctetLen = isCharType ? Integer.valueOf(1073741824) : null;
-                    Integer numPrec = CatalogHelper.numericPrecision(dt);
-                    Integer numPrecRadix = numPrec != null ? Integer.valueOf(dt == DataType.NUMERIC ? 10 : 2) : null;
-                    Integer numScale = dt == DataType.NUMERIC ? Integer.valueOf(0) : (numPrec != null && dt != DataType.REAL && dt != DataType.DOUBLE_PRECISION ? Integer.valueOf(0) : null);
-                    Integer datetimePrec = isDateTimeType ? Integer.valueOf(6) : null;
-                    if (dt == DataType.DATE) datetimePrec = Integer.valueOf(0);
-                    Integer intervalPrec = dt == DataType.INTERVAL ? Integer.valueOf(6) : null;
-
-                    String udtSchema = isCharType || isNumericType || isDateTimeType || dt == DataType.BOOLEAN
-                            || dt == DataType.BYTEA || dt == DataType.UUID || dt == DataType.JSON || dt == DataType.JSONB
-                            || dt == DataType.XML ? "pg_catalog" : (dt == DataType.ENUM ? schemaEntry.getKey() : "pg_catalog");
-                    String udtName = (dt == DataType.ENUM && col.getEnumTypeName() != null)
-                            ? col.getEnumTypeName() : col.getType().getPgName();
-
-                    table.insertRow(new Object[]{
-                            "memgres",                              // table_catalog
-                            schemaEntry.getKey(),                   // table_schema
-                            t.getName(),                            // table_name
-                            col.getName(),                          // column_name
-                            i + 1,                                  // ordinal_position
-                            CatalogHelper.formatColumnDefault(col), // column_default
-                            col.isNullable() ? "YES" : "NO",       // is_nullable
-                            dataType,                               // data_type
-                            charMaxLen,                             // character_maximum_length
-                            charOctetLen,                           // character_octet_length
-                            numPrec,                                // numeric_precision
-                            numPrecRadix,                           // numeric_precision_radix
-                            numScale,                               // numeric_scale
-                            datetimePrec,                           // datetime_precision
-                            null,                                   // interval_type
-                            intervalPrec,                           // interval_precision
-                            null,                                   // character_set_catalog
-                            null,                                   // character_set_schema
-                            null,                                   // character_set_name
-                            null,                                   // collation_catalog
-                            null,                                   // collation_schema
-                            null,                                   // collation_name
-                            null,                                   // domain_catalog
-                            null,                                   // domain_schema
-                            null,                                   // domain_name
-                            "memgres",                              // udt_catalog
-                            udtSchema,                              // udt_schema
-                            udtName,                                // udt_name
-                            null,                                   // scope_catalog
-                            null,                                   // scope_schema
-                            null,                                   // scope_name
-                            null,                                   // maximum_cardinality
-                            String.valueOf(i + 1),                  // dtd_identifier
-                            "NO",                                   // is_self_referencing
-                            "NO",                                   // is_identity (not yet supported)
-                            null,                                   // identity_generation
-                            null,                                   // identity_start
-                            null,                                   // identity_increment
-                            null,                                   // identity_maximum
-                            null,                                   // identity_minimum
-                            null,                                   // identity_cycle
-                            col.isGenerated() ? "ALWAYS" : "NEVER", // is_generated
-                            col.getGeneratedExpr(),                 // generation_expression
-                            "YES"                                   // is_updatable
-                    });
-                }
+                addColumnsForTable(table, schemaEntry.getKey(), t, true);
             }
         }
+
+        // Also add pg_catalog virtual table columns so that queries like
+        // SELECT ... FROM information_schema.columns WHERE table_schema = 'pg_catalog' work.
+        PgCatalogBuilder pgBuilder = new PgCatalogBuilder(database, oids);
+        for (String pgTable : PG_CATALOG_TABLES_FOR_IS) {
+            try {
+                Table pgCatTable = pgBuilder.build(pgTable);
+                if (pgCatTable != null && !pgCatTable.getColumns().isEmpty()) {
+                    addColumnsForTable(table, "pg_catalog", pgCatTable, false);
+                }
+            } catch (Exception ignored) {
+                // Skip tables that can't be built without session context
+            }
+        }
+
         return table;
+    }
+
+    /** Add column entries for a table to the information_schema.columns table. */
+    private void addColumnsForTable(Table isTable, String schemaName, Table t, boolean isUserTable) {
+        for (int i = 0; i < t.getColumns().size(); i++) {
+            Column col = t.getColumns().get(i);
+            DataType dt = col.getType();
+            String dataType = CatalogHelper.pgTypeName(dt);
+            boolean isCharType = dt == DataType.VARCHAR || dt == DataType.CHAR || dt == DataType.TEXT || dt == DataType.NAME;
+            boolean isNumericType = dt == DataType.SMALLINT || dt == DataType.INTEGER || dt == DataType.BIGINT
+                    || dt == DataType.SERIAL || dt == DataType.BIGSERIAL || dt == DataType.SMALLSERIAL
+                    || dt == DataType.REAL || dt == DataType.DOUBLE_PRECISION || dt == DataType.NUMERIC;
+            boolean isDateTimeType = dt == DataType.TIMESTAMP || dt == DataType.TIMESTAMPTZ
+                    || dt == DataType.TIME || dt == DataType.DATE || dt == DataType.INTERVAL;
+
+            Integer charMaxLen = null;
+            Integer charOctetLen = isCharType ? Integer.valueOf(1073741824) : null;
+            Integer numPrec = CatalogHelper.numericPrecision(dt);
+            Integer numPrecRadix = numPrec != null ? Integer.valueOf(dt == DataType.NUMERIC ? 10 : 2) : null;
+            Integer numScale = dt == DataType.NUMERIC ? Integer.valueOf(0) : (numPrec != null && dt != DataType.REAL && dt != DataType.DOUBLE_PRECISION ? Integer.valueOf(0) : null);
+            Integer datetimePrec = isDateTimeType ? Integer.valueOf(6) : null;
+            if (dt == DataType.DATE) datetimePrec = Integer.valueOf(0);
+            Integer intervalPrec = dt == DataType.INTERVAL ? Integer.valueOf(6) : null;
+
+            String udtSchema = "pg_catalog";
+            String udtName = col.getType().getPgName();
+            if (isUserTable) {
+                udtSchema = isCharType || isNumericType || isDateTimeType || dt == DataType.BOOLEAN
+                        || dt == DataType.BYTEA || dt == DataType.UUID || dt == DataType.JSON || dt == DataType.JSONB
+                        || dt == DataType.XML ? "pg_catalog" : (dt == DataType.ENUM ? schemaName : "pg_catalog");
+                if (dt == DataType.ENUM && col.getEnumTypeName() != null) {
+                    udtName = col.getEnumTypeName();
+                }
+            }
+
+            isTable.insertRow(new Object[]{
+                    "memgres",                              // table_catalog
+                    schemaName,                             // table_schema
+                    t.getName(),                            // table_name
+                    col.getName(),                          // column_name
+                    i + 1,                                  // ordinal_position
+                    isUserTable ? CatalogHelper.formatColumnDefault(col) : null, // column_default
+                    col.isNullable() ? "YES" : "NO",       // is_nullable
+                    dataType,                               // data_type
+                    charMaxLen,                             // character_maximum_length
+                    charOctetLen,                           // character_octet_length
+                    numPrec,                                // numeric_precision
+                    numPrecRadix,                           // numeric_precision_radix
+                    numScale,                               // numeric_scale
+                    datetimePrec,                           // datetime_precision
+                    null,                                   // interval_type
+                    intervalPrec,                           // interval_precision
+                    null, null, null,                       // character_set_*
+                    null, null, null,                       // collation_*
+                    null, null, null,                       // domain_*
+                    "memgres",                              // udt_catalog
+                    udtSchema,                              // udt_schema
+                    udtName,                                // udt_name
+                    null, null, null,                       // scope_*
+                    null,                                   // maximum_cardinality
+                    String.valueOf(i + 1),                  // dtd_identifier
+                    "NO",                                   // is_self_referencing
+                    "NO",                                   // is_identity
+                    null, null, null, null, null, null,     // identity_*
+                    isUserTable && col.isGenerated() ? "ALWAYS" : "NEVER", // is_generated
+                    isUserTable ? col.getGeneratedExpr() : null, // generation_expression
+                    "YES"                                   // is_updatable
+            });
+        }
     }
 
     private Table buildIsSchemata() {

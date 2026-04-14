@@ -393,6 +393,8 @@ public final class TypeCoercion {
 
     public static Integer toInteger(Object val) {
         if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
+        if (val instanceof RegtypeValue) return ((RegtypeValue) val).oid();
+        if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
         if (val instanceof java.math.BigDecimal) {
             java.math.BigDecimal bd = (java.math.BigDecimal) val;
             long lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
