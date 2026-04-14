@@ -206,6 +206,9 @@ class CastEvaluator {
                 if (val instanceof RegprocValue) {
                     return ((RegprocValue) val).name();
                 }
+                if (val instanceof RegtypeValue) {
+                    return ((RegtypeValue) val).name();
+                }
                 // For OffsetDateTime, apply session timezone conversion (PG behavior for timestamptz::text)
                 if (val instanceof java.time.OffsetDateTime && executor.session != null) {
                     java.time.OffsetDateTime odt = (java.time.OffsetDateTime) val;
@@ -548,10 +551,11 @@ class CastEvaluator {
             }
             case "regtype": {
                 // ::regtype converts a type name to its OID or name
+                if (val instanceof RegtypeValue) return val;
                 if (val instanceof Number) {
                     int oid = ((Number) val).intValue();
                     String name = OID_TO_TYPE.get(oid);
-                    return name != null ? name : String.valueOf(oid);
+                    return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
                 String rtName = val.toString().trim().toLowerCase();
                 // Validate the type exists
@@ -608,7 +612,7 @@ class CastEvaluator {
                 if (dt == null && executor.database.getDomain(rtName) == null && !executor.database.isCustomEnum(rtName)) {
                     throw new MemgresException("type \"" + val + "\" does not exist", "42704");
                 }
-                // Return canonical type name (e.g., 'int4' -> 'integer')
+                // Return RegtypeValue with canonical type name and OID
                 if (dt != null) {
                     // Map the DataType back to the canonical PG name
                     String canonical;
@@ -674,13 +678,14 @@ class CastEvaluator {
                             canonical = dt.getPgName();
                             break;
                     }
-                    return canonical;
+                    return new RegtypeValue(dt.getOid(), canonical);
                 }
-                return val.toString();
+                return new RegtypeValue(0, val.toString());
             }
             case "oid": {
                 if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
                 if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
+                if (val instanceof RegtypeValue) return ((RegtypeValue) val).oid();
                 return TypeCoercion.toInteger(val);
             }
             case "regnamespace": {
