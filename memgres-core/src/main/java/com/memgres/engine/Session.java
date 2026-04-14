@@ -217,10 +217,13 @@ public class Session {
         private final boolean holdable;
         private final boolean binary;
         private final boolean scrollable;
+        private final boolean explicitNoScroll;
         private final java.time.OffsetDateTime creationTime;
+        private boolean committed; // true after the declaring transaction commits
 
         public CursorState(String name, List<Column> columns, List<Object[]> rows,
-                           String queryText, boolean holdable, boolean binary, boolean scrollable) {
+                           String queryText, boolean holdable, boolean binary, boolean scrollable,
+                           boolean explicitNoScroll) {
             this.name = name;
             this.columns = columns;
             this.rows = rows;
@@ -228,11 +231,17 @@ public class Session {
             this.holdable = holdable;
             this.binary = binary;
             this.scrollable = scrollable;
+            this.explicitNoScroll = explicitNoScroll;
             this.creationTime = java.time.OffsetDateTime.now();
         }
 
+        public CursorState(String name, List<Column> columns, List<Object[]> rows,
+                           String queryText, boolean holdable, boolean binary, boolean scrollable) {
+            this(name, columns, rows, queryText, holdable, binary, scrollable, false);
+        }
+
         public CursorState(String name, List<Column> columns, List<Object[]> rows) {
-            this(name, columns, rows, null, false, false, false);
+            this(name, columns, rows, null, false, false, false, false);
         }
 
         public String getName() { return name; }
@@ -243,6 +252,9 @@ public class Session {
         public boolean isHoldable() { return holdable; }
         public boolean isBinary() { return binary; }
         public boolean isScrollable() { return scrollable; }
+        public boolean isExplicitNoScroll() { return explicitNoScroll; }
+        public boolean isCommitted() { return committed; }
+        public void markCommitted() { this.committed = true; }
         public java.time.OffsetDateTime getCreationTime() { return creationTime; }
 
         /** Get row at index, or null if out of bounds. */
@@ -602,8 +614,9 @@ public class Session {
         releaseXactAdvisoryLocks();
         // Release all row-level locks held by this session
         database.unlockAllRows(this);
-        // Destroy all cursors on rollback (PG behavior: all cursors destroyed on ROLLBACK)
-        cursors.clear();
+        // Destroy cursors on rollback. Holdable cursors that were already committed
+        // (promoted to session-level) survive ROLLBACK, matching PG behavior.
+        cursors.entrySet().removeIf(e -> !e.getValue().isHoldable() || !e.getValue().isCommitted());
         transactionTimestamp = null;
         explicitTransactionBlock = false;
         status = TransactionStatus.IDLE;
@@ -922,9 +935,13 @@ public class Session {
         cursors.clear();
     }
 
-    /** Destroy non-holdable cursors at COMMIT time (PG behavior). WITH HOLD cursors survive. */
+    /** Destroy non-holdable cursors at COMMIT time (PG behavior). WITH HOLD cursors survive and are marked as committed. */
     public void destroyNonHoldableCursors() {
         cursors.entrySet().removeIf(e -> !e.getValue().isHoldable());
+        // Mark surviving holdable cursors as committed (session-level)
+        for (CursorState c : cursors.values()) {
+            if (c.isHoldable()) c.markCommitted();
+        }
     }
 
     public Collection<CursorState> getAllCursors() {

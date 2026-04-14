@@ -760,11 +760,11 @@ class SqlJsonStandardTest {
     }
 
     @Test
-    void jsonObject_keyValueSyntax() throws SQLException {
-        String result = q("SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20)");
-        assertNotNull(result);
-        assertTrue(result.contains("\"x\""));
-        assertTrue(result.contains("\"y\""));
+    void jsonObject_keyValueSyntax() {
+        // PG 18 rejects KEY...VALUE syntax — KEY is parsed as a type name (42704)
+        SQLException e = assertThrows(SQLException.class,
+                () -> q("SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20)"));
+        assertEquals("42704", e.getSQLState());
     }
 
     @Test

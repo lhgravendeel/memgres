@@ -699,10 +699,12 @@ public class PlpgsqlExecutor {
         if (session != null && session.isExplicitTransactionBlock()) {
             throw new MemgresException("invalid transaction termination", "2D000");
         }
-        // Both COMMIT and ROLLBACK are forbidden inside exception blocks (subtransactions)
-        if (exceptionBlockDepth > 0) {
+        // COMMIT is forbidden inside exception blocks (subtransactions).
+        // ROLLBACK is allowed — PG permits ROLLBACK in exception handlers to roll back
+        // the main transaction, after which the exception handler continues in a new transaction.
+        if (exceptionBlockDepth > 0 && command.equalsIgnoreCase("COMMIT")) {
             throw new MemgresException(
-                    "cannot " + command.toLowerCase() + " while a subtransaction is active", "2D000");
+                    "cannot commit while a subtransaction is active", "2D000");
         }
     }
 

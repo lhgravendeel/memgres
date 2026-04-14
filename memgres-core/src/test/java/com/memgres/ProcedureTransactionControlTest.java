@@ -177,7 +177,7 @@ class ProcedureTransactionControlTest {
     }
 
     @Test
-    void rollbackInExceptionHandler_rejected() throws SQLException {
+    void rollbackInExceptionHandler_allowed() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE PROCEDURE ptc_exc_rb() LANGUAGE plpgsql AS $$ " +
                     "BEGIN " +
@@ -187,9 +187,8 @@ class ProcedureTransactionControlTest {
                     "    ROLLBACK; " +
                     "  END; " +
                     "END; $$");
-            SQLException ex = assertThrows(SQLException.class, () ->
-                    s.execute("CALL ptc_exc_rb()"));
-            assertEquals("2D000", ex.getSQLState());
+            // PG 18 allows ROLLBACK inside exception handlers
+            s.execute("CALL ptc_exc_rb()");
         }
     }
 

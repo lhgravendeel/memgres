@@ -600,7 +600,15 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 sendExtendedError(ctx, "34000", "portal \"" + name + "\" does not exist");
                 return;
             }
-            PgWireDescribeHelper.DescribePortalResult result = describeHelper.describePortal(ctx, portal.sql(), portal.paramValues());
+            // Set session state to 'active' during Describe — portal description may
+            // execute the query to infer columns, and pg_stat_activity should show 'active'.
+            if (session != null) session.setQueryState(portal.sql());
+            PgWireDescribeHelper.DescribePortalResult result;
+            try {
+                result = describeHelper.describePortal(ctx, portal.sql(), portal.paramValues());
+            } finally {
+                if (session != null) session.setIdleState();
+            }
             if (result.rowDescSent()) {
                 rowDescSentByDescribe = true;
                 portal.rowDescriptionSent = true;

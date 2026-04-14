@@ -127,12 +127,11 @@ class ReturningOldNewCompat15Test {
                 "  RETURNING NEW.*" +
                 ") sub";
 
-        // ON CONFLICT DO NOTHING with RETURNING NEW.* — conflicting row returns nothing
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(sql)) {
-            assertTrue(rs.next());
-            assertEquals(0, rs.getInt("cnt"),
-                    "Conflicting INSERT with DO NOTHING should return 0 rows via RETURNING");
+        // PG 18 rejects RETURNING NEW/OLD in INSERT subqueries with a syntax error
+        try (Statement s = conn.createStatement()) {
+            SQLException ex = assertThrows(SQLException.class, () -> s.executeQuery(sql));
+            assertEquals("42601", ex.getSQLState(),
+                    "Expected syntax error (42601) for RETURNING NEW.* in INSERT subquery");
         }
     }
 

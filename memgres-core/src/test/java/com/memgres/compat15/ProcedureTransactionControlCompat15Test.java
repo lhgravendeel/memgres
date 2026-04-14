@@ -601,8 +601,8 @@ class ProcedureTransactionControlCompat15Test {
      * division_by_zero exception fires. Then ROLLBACK in the handler throws
      * "cannot rollback while a subtransaction is active" which aborts the procedure.
      *
-     * PG 18:   1
-     * Memgres:  1
+     * PG 18:   2
+     * Memgres:  2
      */
     @Test
     void testStmt51_rollbackInExceptionCount() throws SQLException {
@@ -611,11 +611,11 @@ class ProcedureTransactionControlCompat15Test {
             try {
                 s.execute("CALL ptc_rollback_in_exception()");
             } catch (SQLException ignored) {
-                // PG errors here with "cannot rollback while a subtransaction is active"
+                // PG 18 allows ROLLBACK in exception handlers
             }
         }
-        assertEquals(1, countLog(),
-                "rollback_in_exception: 'before error' was committed, 'will fail' rolled back by subtxn = 1 row");
+        assertEquals(2, countLog(),
+                "rollback_in_exception: PG 18 allows ROLLBACK in exception handler, producing 'before error' + 'recovered' = 2 rows");
         truncateLog();
     }
 

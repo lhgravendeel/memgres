@@ -280,9 +280,21 @@ class ExprEvaluator {
             String col = ref.column().toLowerCase();
             switch (col) {
                 case "current_user":
-                case "session_user":
                 case "current_role": {
-                    return "memgres"; 
+                    // Respect SECURITY DEFINER role override via GUC
+                    if (executor.session != null) {
+                        GucSettings guc = executor.session.getGucSettings();
+                        if (guc.hasSessionOverride("role")) {
+                            String role = guc.get("role");
+                            if (role != null && !role.equalsIgnoreCase("NONE") && !role.equalsIgnoreCase("DEFAULT")) {
+                                return role;
+                            }
+                        }
+                    }
+                    return executor.sessionUser();
+                }
+                case "session_user": {
+                    return executor.sessionUser();
                 }
                 case "current_database":
                 case "current_catalog": {
@@ -307,9 +319,21 @@ class ExprEvaluator {
             String col = ref.column().toLowerCase();
             switch (col) {
                 case "current_user":
+                case "current_role": {
+                    // Respect SECURITY DEFINER role override via GUC
+                    if (executor.session != null) {
+                        GucSettings guc = executor.session.getGucSettings();
+                        if (guc.hasSessionOverride("role")) {
+                            String role = guc.get("role");
+                            if (role != null && !role.equalsIgnoreCase("NONE") && !role.equalsIgnoreCase("DEFAULT")) {
+                                return role;
+                            }
+                        }
+                    }
+                    return executor.sessionUser();
+                }
                 case "session_user":
-                case "current_role":
-                    return "memgres";
+                    return executor.sessionUser();
                 case "current_database":
                 case "current_catalog":
                     return executor.session != null ? executor.session.getDatabaseName() : "memgres";

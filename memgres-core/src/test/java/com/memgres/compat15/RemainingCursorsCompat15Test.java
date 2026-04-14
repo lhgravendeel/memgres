@@ -89,26 +89,21 @@ class RemainingCursorsCompat15Test {
 
     /**
      * Stmt 155 (pg-catalog-prepared-statements-cursors.sql): Default cursor
-     * (declared without explicit SCROLL or NO SCROLL) should reject FETCH PRIOR.
+     * (declared without explicit SCROLL or NO SCROLL) allows FETCH PRIOR.
      *
-     * PG: ERROR [55000] cursor can only scan forward
-     * Memgres: OK (?column?) 0 rows — incorrectly allows backward fetch
+     * PG 18 actual behavior: returns 0 rows (not an error).
+     * The annotation in the SQL file incorrectly expected 55000, but the
+     * actual PG comparison run (cursors.sql stmts 41-47) confirms PG allows it.
      */
     @Test
-    void stmt155_defaultCursorShouldRejectFetchPrior() throws Exception {
+    void stmt155_defaultCursorAllowsFetchPrior() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("BEGIN");
-            // Plain cursor without SCROLL or NO SCROLL — PG defaults to forward-only
             s.execute("DECLARE cat_ns CURSOR FOR SELECT 1");
 
-            try {
-                s.executeQuery("FETCH PRIOR FROM cat_ns");
-                fail("PG rejects FETCH PRIOR on a default (non-SCROLL) cursor with "
-                        + "ERROR [55000], but Memgres succeeded");
-            } catch (SQLException e) {
-                assertEquals("55000", e.getSQLState(),
-                        "SQLSTATE should be 55000 (cursor can only scan forward), got: "
-                        + e.getSQLState() + " - " + e.getMessage());
+            try (ResultSet rs = s.executeQuery("FETCH PRIOR FROM cat_ns")) {
+                assertFalse(rs.next(),
+                        "FETCH PRIOR on default cursor returns 0 rows (before-first position)");
             } finally {
                 try { s.execute("ROLLBACK"); } catch (SQLException ignored) { }
             }

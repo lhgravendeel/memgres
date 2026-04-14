@@ -191,7 +191,7 @@ class PgCatalogPreparedStmtsCursorsCompat15Test {
                 assertEquals("false", rs.getString(2), "is_holdable");
                 assertEquals("false", rs.getString(3), "is_binary");
                 assertEquals("true", rs.getString(4),
-                        "is_scrollable should be true by default in PG");
+                        "is_scrollable should be true by default in PG 18 (only explicit NO SCROLL reports false)");
             }
             s.execute("CLOSE cat_cur");
         } finally {

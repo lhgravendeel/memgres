@@ -139,11 +139,8 @@ class DmlExecutor {
             valueRows = stmt.values();
         }
 
-        List<Object[]> insertedRows = new ArrayList<>(); // for transition tables in statement triggers
+        // Pre-validate all rows' column counts before inserting any rows (atomicity)
         for (List<Expression> valueRow : valueRows) {
-            Object[] row = new Object[table.getColumns().size()];
-
-            // Validate column count matches value count FIRST
             if (stmt.columns() != null && stmt.columns().size() != valueRow.size()) {
                 throw new MemgresException("INSERT has more " +
                         (stmt.columns().size() > valueRow.size() ? "target columns than expressions" : "expressions than target columns"),
@@ -151,6 +148,11 @@ class DmlExecutor {
             } else if (stmt.columns() == null && valueRow.size() > table.getColumns().size()) {
                 throw new MemgresException("INSERT has more expressions than target columns", "42601");
             }
+        }
+
+        List<Object[]> insertedRows = new ArrayList<>(); // for transition tables in statement triggers
+        for (List<Expression> valueRow : valueRows) {
+            Object[] row = new Object[table.getColumns().size()];
 
             // Fill provided values FIRST (with type coercion); validates before consuming serials
             Set<Integer> filledCols = new HashSet<>();
@@ -1162,8 +1164,17 @@ class DmlExecutor {
 
         List<Object[]> deletedRows = new ArrayList<>();
         List<Object[]> returningRows = new ArrayList<>();
-        // Collect returning data before deleting, using deleteOrder for USING joins to match PG row order
-        List<Object[]> orderedDelete = deleteOrder.isEmpty() ? new ArrayList<>(toDelete) : deleteOrder;
+        // Collect returning data before deleting, using deleteOrder for USING joins to match PG row order.
+        // For non-USING deletes, preserve original table row order (PG returns rows in heap order).
+        List<Object[]> orderedDelete;
+        if (!deleteOrder.isEmpty()) {
+            orderedDelete = deleteOrder;
+        } else {
+            orderedDelete = new ArrayList<>();
+            for (Object[] row : allRows) {
+                if (toDelete.contains(row)) orderedDelete.add(row);
+            }
+        }
         if (hasReturning) {
             for (Object[] row : orderedDelete) {
                 returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, row, null));
@@ -1264,6 +1275,15 @@ class DmlExecutor {
         // Resolve source rows
         List<RowContext> sourceRows = executor.fromResolver.resolveFromItem(stmt.source());
 
+        // Extract source table for MERGE RETURNING * (includes source columns)
+        Table mergeSourceTable = null;
+        if (!sourceRows.isEmpty()) {
+            List<RowContext.TableBinding> srcBindings = sourceRows.get(0).getBindings();
+            if (!srcBindings.isEmpty()) {
+                mergeSourceTable = srcBindings.get(0).table();
+            }
+        }
+
         // Snapshot target rows before MERGE so we can roll back on failure
         List<Object[]> snapshotRows = new ArrayList<>();
         for (Object[] row : targetTable.getRows()) {
@@ -1321,7 +1341,7 @@ class DmlExecutor {
                                 // DELETE — collect RETURNING before marking for deletion
                                 if (hasReturning) {
                                     executor.currentMergeAction = "DELETE";
-                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, targetRow, null));
+                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, targetRow, null, sourceCtx));
                                 }
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
@@ -1347,7 +1367,7 @@ class DmlExecutor {
                                 // Collect RETURNING after update (uses new values)
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
-                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow));
+                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow, sourceCtx));
                                 }
                                 processedTargetRows.add(targetRow);
                                 mergeCount++;
@@ -1380,10 +1400,16 @@ class DmlExecutor {
                             if (wnmbs.andCondition() != null && !executor.isTruthy(executor.evalExpr(wnmbs.andCondition(), targetCtx))) {
                                 continue;
                             }
+                            // Build null-padded source context for RETURNING * (NOT MATCHED BY SOURCE has no source row)
+                            RowContext nullSourceCtx = null;
+                            if (mergeSourceTable != null) {
+                                Object[] nullSourceRow = new Object[mergeSourceTable.getColumns().size()];
+                                nullSourceCtx = new RowContext(mergeSourceTable, null, nullSourceRow);
+                            }
                             if (wnmbs.isDelete()) {
                                 if (hasReturning) {
                                     executor.currentMergeAction = "DELETE";
-                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, targetRow, null));
+                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, targetRow, null, nullSourceCtx));
                                 }
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
@@ -1404,7 +1430,7 @@ class DmlExecutor {
                                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable);
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
-                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow));
+                                    returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow, nullSourceCtx));
                                 }
                             }
                             // DO NOTHING: empty setClauses, no action
@@ -1479,7 +1505,7 @@ class DmlExecutor {
                         triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, newRow, null, targetTable);
                         if (hasReturning) {
                             executor.currentMergeAction = "INSERT";
-                            returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, newRow, null, newRow));
+                            returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, newRow, null, newRow, sourceCtx));
                         }
                         mergeCount++;
                         break;
@@ -1538,7 +1564,7 @@ class DmlExecutor {
 
         executor.currentMergeAction = null;
         if (hasReturning) {
-            List<Column> retCols = buildReturningColumns(stmt.returning(), targetTable);
+            List<Column> retCols = buildReturningColumns(stmt.returning(), targetTable, mergeSourceTable);
             return QueryResult.returning(QueryResult.Type.MERGE, retCols, returningRows, mergeCount);
         }
         return QueryResult.command(QueryResult.Type.MERGE, mergeCount);
@@ -1709,6 +1735,16 @@ class DmlExecutor {
      */
     private Object[] evalReturning(List<SelectStmt.SelectTarget> returning, Table table, String alias,
                                     Object[] row, Object[] oldRow, Object[] newRow) {
+        return evalReturning(returning, table, alias, row, oldRow, newRow, null);
+    }
+
+    /**
+     * Evaluate RETURNING expressions with OLD/NEW and MERGE source support.
+     * @param sourceCtx source row context for MERGE (null for non-MERGE)
+     */
+    private Object[] evalReturning(List<SelectStmt.SelectTarget> returning, Table table, String alias,
+                                    Object[] row, Object[] oldRow, Object[] newRow,
+                                    RowContext sourceCtx) {
         // Compute virtual generated column values for RETURNING evaluation
         if (hasVirtualColumns(table)) {
             row = computeVirtualColumns(table, row);
@@ -1786,6 +1822,12 @@ class DmlExecutor {
                 } else {
                     // Bare * or table.* — return current row (NEW behavior, backward compat)
                     for (Object val : row) values.add(val);
+                    // For MERGE RETURNING *, also include source row columns
+                    if (we.table() == null && sourceCtx != null) {
+                        for (RowContext.TableBinding b : sourceCtx.getBindings()) {
+                            for (Object val : b.row()) values.add(val);
+                        }
+                    }
                 }
             } else {
                 values.add(executor.evalExpr(target.expr(), ctx));
@@ -1874,10 +1916,24 @@ class DmlExecutor {
 
     /** Build Column metadata for RETURNING clause. */
     private List<Column> buildReturningColumns(List<SelectStmt.SelectTarget> returning, Table table) {
+        return buildReturningColumns(returning, table, null);
+    }
+
+    /** Build Column metadata for RETURNING clause, with optional source table for MERGE. */
+    private List<Column> buildReturningColumns(List<SelectStmt.SelectTarget> returning, Table table, Table sourceTable) {
         List<Column> cols = new ArrayList<>();
         for (SelectStmt.SelectTarget target : returning) {
             if (target.expr() instanceof WildcardExpr) {
-                cols.addAll(table.getColumns());
+                WildcardExpr we = (WildcardExpr) target.expr();
+                if (we.table() == null) {
+                    // Bare * — for MERGE, include target + source columns
+                    cols.addAll(table.getColumns());
+                    if (sourceTable != null) {
+                        cols.addAll(sourceTable.getColumns());
+                    }
+                } else {
+                    cols.addAll(table.getColumns());
+                }
             } else if (target.alias() != null) {
                 cols.add(new Column(target.alias(), DataType.TEXT, true, false, null));
             } else if (target.expr() instanceof ColumnRef) {

@@ -540,19 +540,18 @@ class SqlJsonCompat15Test {
     }
 
     // ========================================================================
-    // Stmt 138: JSON_OBJECT with KEY...VALUE syntax should work
-    // PG 17+: JSON_OBJECT supports KEY...VALUE syntax per SQL standard
+    // Stmt 138: JSON_OBJECT with KEY...VALUE syntax — PG 18 rejects this.
+    // KEY is parsed as a type name, producing error 42704: type "key" does not exist.
     // ========================================================================
     @Test
-    void stmt138_jsonObjectKeyValueSyntaxShouldWork() throws Exception {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(
-                     "SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20) AS result")) {
-            assertTrue(rs.next(), "Expected one result row");
-            String result = rs.getString("result");
-            assertNotNull(result, "JSON_OBJECT with KEY...VALUE should return a result");
-            assertTrue(result.contains("\"x\"") && result.contains("\"y\""),
-                    "Result should contain keys x and y, got: " + result);
+    void stmt138_jsonObjectKeyValueSyntaxShouldError() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.executeQuery(
+                    "SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20) AS result");
+            fail("PG 18 rejects JSON_OBJECT(KEY ...) with 42704");
+        } catch (SQLException e) {
+            assertEquals("42704", e.getSQLState(),
+                    "Expected 42704, got: " + e.getSQLState());
         }
     }
 

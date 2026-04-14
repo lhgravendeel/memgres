@@ -98,7 +98,17 @@ class DdlObjectExecutor {
         if (stmt.sfunc() != null) {
             PgFunction func = executor.database.getFunction(stmt.sfunc());
             if (func == null && !isKnownBuiltinFunction(stmt.sfunc())) {
-                throw new MemgresException("function " + stmt.sfunc() + " does not exist", "42883");
+                // PG includes parameter types: sfunc(stype, argTypes...)
+                StringBuilder sig = new StringBuilder(stmt.sfunc());
+                sig.append("(");
+                if (stmt.stype() != null) sig.append(stmt.stype());
+                if (stmt.argTypes() != null) {
+                    for (String at : stmt.argTypes()) {
+                        sig.append(", ").append(at);
+                    }
+                }
+                sig.append(")");
+                throw new MemgresException("function " + sig + " does not exist", "42883");
             }
         }
         PgAggregate agg = new PgAggregate(
@@ -119,6 +129,24 @@ class DdlObjectExecutor {
     // ---- CREATE/ALTER/DROP OPERATOR ----
 
     QueryResult executeCreateOperator(CreateOperatorStmt stmt) {
+        // PG rule: multi-character operators ending with + or - must contain at least
+        // one character from ~!@#%^&|`?\ (e.g., +++ is invalid)
+        String opName = stmt.name();
+        if (opName != null && opName.length() > 1) {
+            char last = opName.charAt(opName.length() - 1);
+            if (last == '+' || last == '-') {
+                boolean hasSpecial = false;
+                for (int i = 0; i < opName.length(); i++) {
+                    if ("~!@#%^&|`?\\".indexOf(opName.charAt(i)) >= 0) { hasSpecial = true; break; }
+                }
+                if (!hasSpecial) {
+                    throw new MemgresException(
+                        "operator name \"" + opName + "\" is not valid: "
+                        + "a symbol name ending in \"+\" or \"-\" must contain at least one "
+                        + "character from ~!@#%^&|`?", "42601");
+                }
+            }
+        }
         // Validate that at least one of LEFTARG/RIGHTARG is specified
         if (stmt.leftArg() == null && stmt.rightArg() == null) {
             throw new MemgresException(

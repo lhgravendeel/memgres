@@ -1099,12 +1099,15 @@ class CatalogStubBuilder {
             for (Session.CursorState cursor : session.getAllCursors()) {
                 String stmt = cursor.getQueryText();
                 String creationTimeStr = formatTimestamptz(cursor.getCreationTime());
+                // PG reports is_scrollable=true for default cursors (no keyword)
+                // and SCROLL cursors. Only explicit NO SCROLL reports false.
+                boolean reportedScrollable = cursor.isScrollable() || !cursor.isExplicitNoScroll();
                 table.insertRow(new Object[]{
                         cursor.getName(),
                         stmt,
                         cursor.isHoldable(),
                         cursor.isBinary(),
-                        cursor.isScrollable(),
+                        reportedScrollable,
                         creationTimeStr
                 });
             }

@@ -430,7 +430,8 @@ class PgWireDescribeHelper {
             if (planName != null) {
                 Session.PreparedStmt plan = session.getPreparedStatement(planName);
                 if (plan != null && plan.body() != null) {
-                    boolean isSelect = plan.body() instanceof com.memgres.engine.parser.ast.SelectStmt;
+                    boolean isSelect = plan.body() instanceof com.memgres.engine.parser.ast.SelectStmt
+                            || plan.body() instanceof com.memgres.engine.parser.ast.SetOpStmt;
                     boolean hasDmlReturning = false;
                     if (plan.body() instanceof com.memgres.engine.parser.ast.InsertStmt) {
                         com.memgres.engine.parser.ast.InsertStmt ins = (com.memgres.engine.parser.ast.InsertStmt) plan.body();
@@ -520,6 +521,29 @@ class PgWireDescribeHelper {
                 tableName = endIdx > 0 ? rest.substring(0, endIdx).trim() : rest.trim();
             }
         }
+        // For MERGE, extract both target and source tables
+        Table mergeSourceTable = null;
+        if (upper.startsWith("MERGE")) {
+            int intoIdx = upper.indexOf("INTO");
+            if (intoIdx >= 0) {
+                String rest = sql.substring(intoIdx + 4).trim();
+                int endIdx = rest.indexOf(' ');
+                tableName = endIdx > 0 ? rest.substring(0, endIdx).trim() : rest.trim();
+            }
+            // Extract source table name from USING clause
+            int usingIdx = upper.indexOf("USING");
+            if (usingIdx >= 0) {
+                String usingRest = sql.substring(usingIdx + 5).trim();
+                int endIdx = usingRest.indexOf(' ');
+                String srcName = endIdx > 0 ? usingRest.substring(0, endIdx).trim() : usingRest.trim();
+                srcName = srcName.replace("\"", "");
+                for (Schema schema : database.getSchemas().values()) {
+                    mergeSourceTable = schema.getTable(srcName.toLowerCase());
+                    if (mergeSourceTable == null) mergeSourceTable = schema.getTable(srcName);
+                    if (mergeSourceTable != null) break;
+                }
+            }
+        }
         if (tableName == null) return null;
         tableName = tableName.replace("\"", "");
         Table table = null;
@@ -533,7 +557,13 @@ class PgWireDescribeHelper {
         int retIdx = upper.lastIndexOf("RETURNING");
         if (retIdx < 0) return null;
         String retPart = sql.substring(retIdx + "RETURNING".length()).trim();
-        if (retPart.equals("*")) return new ArrayList<>(table.getColumns());
+        if (retPart.equals("*")) {
+            List<Column> cols = new ArrayList<>(table.getColumns());
+            if (mergeSourceTable != null) {
+                cols.addAll(mergeSourceTable.getColumns());
+            }
+            return cols;
+        }
         List<Column> result = new ArrayList<>();
         for (String colExpr : retPart.split(",")) {
             String colName = colExpr.trim().replace("\"", "");

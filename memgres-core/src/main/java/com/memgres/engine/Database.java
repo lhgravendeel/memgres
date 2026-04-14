@@ -434,7 +434,37 @@ public class Database {
     public PgFunction resolveFunction(String name, int argCount, List<String> argTypeHints) {
         List<PgFunction> overloads = getFunctionOverloads(name);
         if (overloads.isEmpty()) return null;
-        if (overloads.size() == 1) return overloads.get(0);
+        // For a single overload, return it unless type hints indicate a clearly incompatible call.
+        // This preserves correct behavior for functions with default params or INOUT params
+        // where arg count may not match param count, while still rejecting calls like
+        // fn_to_drop(1) when only fn_to_drop(text) exists (integer !-> text in PG).
+        //
+        // We only reject when a numeric-family hint targets a text-family param, matching
+        // PG's rule that integer literals don't implicitly cast to text in function resolution.
+        // Other mismatches are allowed because type hints can be unreliable (e.g., JDBC may
+        // report 'text' for a numeric expression result).
+        if (overloads.size() == 1) {
+            if (argTypeHints == null || argTypeHints.isEmpty()
+                    || argTypeHints.stream().allMatch(h -> h == null)) {
+                return overloads.get(0);
+            }
+            PgFunction f = overloads.get(0);
+            List<PgFunction.Param> inputParams = f.getParams().stream()
+                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
+                    .collect(Collectors.toList());
+            boolean hasIncompatible = false;
+            for (int i = 0; i < argTypeHints.size() && i < inputParams.size(); i++) {
+                String hint = argTypeHints.get(i);
+                String paramType = inputParams.get(i).typeName();
+                if (hint != null && paramType != null && isNumericToTextMismatch(hint, paramType)) {
+                    hasIncompatible = true;
+                    break;
+                }
+            }
+            if (!hasIncompatible) {
+                return f;
+            }
+        }
 
         // Try to match by argument count and type hints
         for (PgFunction f : overloads) {
@@ -461,19 +491,38 @@ public class Database {
                 if (match) return f;
             }
         }
-        // Fallback: match by arg count only
-        for (PgFunction f : overloads) {
-            long inputCount = f.getParams().stream()
-                    .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
-                    .count();
-            boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
-            if (hasVariadic) {
-                if (argCount >= inputCount) return f;
-            } else {
-                if (inputCount == argCount) return f;
+        // Fallback: match by arg count only — but only when no type hints were provided.
+        // When type hints exist and no overload matched, the call is genuinely unresolvable
+        // (e.g., fn_to_drop(integer) was dropped, fn_to_drop(text) remains, calling fn_to_drop(1)).
+        if (argTypeHints == null || argTypeHints.isEmpty() || argTypeHints.stream().allMatch(h -> h == null)) {
+            for (PgFunction f : overloads) {
+                long inputCount = f.getParams().stream()
+                        .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
+                        .count();
+                boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
+                if (hasVariadic) {
+                    if (argCount >= inputCount) return f;
+                } else {
+                    if (inputCount == argCount) return f;
+                }
             }
+            return overloads.get(0); // fallback to first
         }
-        return overloads.get(0); // fallback to first
+        return null;
+    }
+
+    /**
+     * Returns true if the arg type hint is from the numeric family and the param type
+     * is from the text family. In PG, numeric types do NOT implicitly cast to text
+     * for function resolution purposes (e.g., fn(integer) should not match fn(text)).
+     */
+    private boolean isNumericToTextMismatch(String argType, String paramType) {
+        String a = argType.toLowerCase().trim();
+        String p = paramType.toLowerCase().trim();
+        Set<String> numeric = Cols.setOf("int", "integer", "int4", "bigint", "int8", "smallint", "int2",
+                "numeric", "decimal", "real", "float", "float4", "float8", "double precision");
+        Set<String> textual = Cols.setOf("text", "varchar", "character varying", "char", "character", "name");
+        return numeric.contains(a) && textual.contains(p);
     }
 
     public boolean typesCompatible(String argType, String paramType) {

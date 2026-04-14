@@ -1055,6 +1055,26 @@ class SelectParser {
                     subStmt = parser.parseDelete();
                 } else if (parser.checkKeyword("INSERT")) {
                     subStmt = parser.parseInsert();
+                    // PG rejects RETURNING NEW/OLD in INSERT subqueries
+                    if (subStmt instanceof com.memgres.engine.parser.ast.InsertStmt) {
+                        com.memgres.engine.parser.ast.InsertStmt ins = (com.memgres.engine.parser.ast.InsertStmt) subStmt;
+                        if (ins.returning() != null) {
+                            for (SelectStmt.SelectTarget rt : ins.returning()) {
+                                Expression retExpr = rt.expr();
+                                if (retExpr instanceof WildcardExpr) {
+                                    WildcardExpr we = (WildcardExpr) retExpr;
+                                    if (we.table() != null && (we.table().equalsIgnoreCase("NEW") || we.table().equalsIgnoreCase("OLD"))) {
+                                        throw new com.memgres.engine.MemgresException("syntax error at or near \"INTO\"", "42601");
+                                    }
+                                } else if (retExpr instanceof ColumnRef) {
+                                    ColumnRef cr = (ColumnRef) retExpr;
+                                    if (cr.table() != null && (cr.table().equalsIgnoreCase("NEW") || cr.table().equalsIgnoreCase("OLD"))) {
+                                        throw new com.memgres.engine.MemgresException("syntax error at or near \"INTO\"", "42601");
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else {
                     subStmt = parser.parseSelect();
                     subStmt = tryParseSetOp(subStmt);

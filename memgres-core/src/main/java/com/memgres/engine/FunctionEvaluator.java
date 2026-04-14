@@ -1249,30 +1249,36 @@ class FunctionEvaluator {
                             // else: all have null schema (built-ins) — keep unfiltered
                         }
                     }
-                    if (overloads.size() > 1) {
+                    if (overloads.size() >= 1) {
                         // Resolve by evaluating argument types
+                        // When named args are present, type hints are in call order which
+                        // may differ from param order, so skip hints to avoid false mismatches.
+                        boolean callHasNamedArgs = fn.args().stream()
+                                .anyMatch(a -> a instanceof NamedArgExpr && !((NamedArgExpr) a).name().equals("__variadic__"));
                         List<String> argTypeHints = new ArrayList<>();
-                        for (Expression arg : fn.args()) {
-                            // Check for explicit cast (e.g., ROW(...)::typename) - use cast type as hint
-                            if (arg instanceof CastExpr) {
-                                argTypeHints.add(((CastExpr) arg).typeName());
-                                continue;
-                            }
-                            try {
-                                Object v = executor.evalExpr(arg, ctx);
-                                if (v instanceof Integer) argTypeHints.add("integer");
-                                else if (v instanceof Long) argTypeHints.add("bigint");
-                                else if (v instanceof String) argTypeHints.add("text");
-                                else if (v instanceof Boolean) argTypeHints.add("boolean");
-                                else if (v instanceof Double || v instanceof Float) argTypeHints.add("double precision");
-                                else argTypeHints.add(null);
-                            } catch (Exception e) {
-                                argTypeHints.add(null);
+                        if (!callHasNamedArgs) {
+                            for (Expression arg : fn.args()) {
+                                // Check for explicit cast (e.g., ROW(...)::typename) - use cast type as hint
+                                if (arg instanceof CastExpr) {
+                                    argTypeHints.add(((CastExpr) arg).typeName());
+                                    continue;
+                                }
+                                try {
+                                    Object v = executor.evalExpr(arg, ctx);
+                                    if (v instanceof Integer) argTypeHints.add("integer");
+                                    else if (v instanceof Long) argTypeHints.add("bigint");
+                                    else if (v instanceof String) argTypeHints.add("text");
+                                    else if (v instanceof Boolean) argTypeHints.add("boolean");
+                                    else if (v instanceof Double || v instanceof Float) argTypeHints.add("double precision");
+                                    else argTypeHints.add(null);
+                                } catch (Exception e) {
+                                    argTypeHints.add(null);
+                                }
                             }
                         }
                         userFunc = executor.database.resolveFunction(lookupName, fn.args().size(), argTypeHints);
                     } else {
-                        userFunc = overloads.isEmpty() ? null : overloads.get(0);
+                        userFunc = null;
                     }
                 }
                 if (userFunc != null) {

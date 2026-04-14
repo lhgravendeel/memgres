@@ -43,13 +43,13 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION add_ints(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = add_ints)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = add_ints)");
 
             // Verify operator exists in pg_operator
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprname, oprkind FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT oprname, oprkind FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
-                assertEquals("+++", rs.getString("oprname"));
+                assertEquals("~++", rs.getString("oprname"));
                 assertEquals("b", rs.getString("oprkind"));
                 assertFalse(rs.next());
             }
@@ -148,11 +148,11 @@ class OperatorTest {
             stmt.execute("CREATE SCHEMA myschema");
             stmt.execute("CREATE FUNCTION myschema.add_ints(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR myschema.+++ (LEFTARG = integer, RIGHTARG = integer, "
+            stmt.execute("CREATE OPERATOR myschema.~++ (LEFTARG = integer, RIGHTARG = integer, "
                     + "FUNCTION = myschema.add_ints)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprname FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT oprname FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
             }
         }
@@ -184,11 +184,11 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION dup_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dup_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dup_fn)");
 
             // Creating the same operator again should error
             SQLException ex = assertThrows(SQLException.class, () ->
-                    stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dup_fn)"));
+                    stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dup_fn)"));
             // PG error: operator already exists
             assertTrue(ex.getMessage().toLowerCase().contains("already exists")
                     || ex.getSQLState().equals("42710"));
@@ -204,20 +204,20 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION drop_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = drop_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = drop_fn)");
 
             // Verify it exists
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(1, rs.getInt(1));
             }
 
-            stmt.execute("DROP OPERATOR +++ (integer, integer)");
+            stmt.execute("DROP OPERATOR ~++ (integer, integer)");
 
             // Should be gone
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(0, rs.getInt(1));
             }
@@ -228,7 +228,7 @@ class OperatorTest {
     void dropOperatorIfExists() throws SQLException {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             // Should not error when operator doesn't exist
-            stmt.execute("DROP OPERATOR IF EXISTS +++ (integer, integer)");
+            stmt.execute("DROP OPERATOR IF EXISTS ~++ (integer, integer)");
         }
     }
 
@@ -236,7 +236,7 @@ class OperatorTest {
     void dropOperatorNonExistentErrors() throws SQLException {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             assertThrows(SQLException.class, () ->
-                    stmt.execute("DROP OPERATOR +++ (integer, integer)"));
+                    stmt.execute("DROP OPERATOR ~++ (integer, integer)"));
         }
     }
 
@@ -245,11 +245,11 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION casc_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = casc_fn)");
-            stmt.execute("DROP OPERATOR +++ (integer, integer) CASCADE");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = casc_fn)");
+            stmt.execute("DROP OPERATOR ~++ (integer, integer) CASCADE");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(0, rs.getInt(1));
             }
@@ -339,7 +339,7 @@ class OperatorTest {
     void alterOperatorNonExistentErrors() throws SQLException {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             assertThrows(SQLException.class, () ->
-                    stmt.execute("ALTER OPERATOR +++ (integer, integer) OWNER TO memgres"));
+                    stmt.execute("ALTER OPERATOR ~++ (integer, integer) OWNER TO memgres"));
         }
     }
 
@@ -355,12 +355,12 @@ class OperatorTest {
             stmt.execute("CREATE FUNCTION concat_texts(a text, b text) RETURNS text AS $$ "
                     + "BEGIN RETURN a || b; END; $$ LANGUAGE plpgsql");
 
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = add_ints_ol)");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = text, RIGHTARG = text, FUNCTION = concat_texts)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = add_ints_ol)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = text, RIGHTARG = text, FUNCTION = concat_texts)");
 
             // Both should exist in pg_operator
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(2, rs.getInt(1));
             }
@@ -375,15 +375,15 @@ class OperatorTest {
             stmt.execute("CREATE FUNCTION concat_texts2(a text, b text) RETURNS text AS $$ "
                     + "BEGIN RETURN a || b; END; $$ LANGUAGE plpgsql");
 
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = add_ints_ol2)");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = text, RIGHTARG = text, FUNCTION = concat_texts2)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = add_ints_ol2)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = text, RIGHTARG = text, FUNCTION = concat_texts2)");
 
             // Drop only the integer version
-            stmt.execute("DROP OPERATOR +++ (integer, integer)");
+            stmt.execute("DROP OPERATOR ~++ (integer, integer)");
 
             // Text version should remain
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(1, rs.getInt(1));
             }
@@ -1066,12 +1066,12 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION cat_add(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = cat_add)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = cat_add)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprname, oprkind, oprleft, oprright FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT oprname, oprkind, oprleft, oprright FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
-                assertEquals("+++", rs.getString("oprname"));
+                assertEquals("~++", rs.getString("oprname"));
                 assertEquals("b", rs.getString("oprkind"));
                 // oprleft and oprright should be the OIDs for integer type
                 int leftOid = rs.getInt("oprleft");
@@ -1147,10 +1147,10 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION sql_add(a integer, b integer) RETURNS integer AS $$ "
                     + "SELECT a + b; $$ LANGUAGE sql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = sql_add)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = sql_add)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprname FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT oprname FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
             }
         }
@@ -1165,10 +1165,10 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION sd_add(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql SECURITY DEFINER");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = sd_add)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = sd_add)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprname FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT oprname FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
             }
         }
@@ -1183,10 +1183,10 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION strict_add(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql STRICT");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = strict_add)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = strict_add)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprname FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT oprname FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
             }
         }
@@ -1201,10 +1201,10 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION imm_add(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql IMMUTABLE");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = imm_add)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = imm_add)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprname FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT oprname FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
             }
         }
@@ -1219,11 +1219,11 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION rest_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = rest_fn)");
-            stmt.execute("DROP OPERATOR +++ (integer, integer) RESTRICT");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = rest_fn)");
+            stmt.execute("DROP OPERATOR ~++ (integer, integer) RESTRICT");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(0, rs.getInt(1));
             }
@@ -1241,25 +1241,25 @@ class OperatorTest {
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
 
             // Create
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = cycle_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = cycle_fn)");
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(1, rs.getInt(1));
             }
 
             // Drop
-            stmt.execute("DROP OPERATOR +++ (integer, integer)");
+            stmt.execute("DROP OPERATOR ~++ (integer, integer)");
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(0, rs.getInt(1));
             }
 
             // Recreate — should succeed
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = cycle_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = cycle_fn)");
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(1, rs.getInt(1));
             }
@@ -1282,7 +1282,7 @@ class OperatorTest {
 
             stmt.execute("CREATE FUNCTION cnt_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = cnt_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = cnt_fn)");
 
             // Count after create
             int countAfter;
@@ -1293,7 +1293,7 @@ class OperatorTest {
             assertEquals(countBefore + 1, countAfter);
 
             // Drop
-            stmt.execute("DROP OPERATOR +++ (integer, integer)");
+            stmt.execute("DROP OPERATOR ~++ (integer, integer)");
             try (ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM pg_operator")) {
                 assertTrue(rs.next());
                 assertEquals(countBefore, rs.getInt(1));
@@ -1315,12 +1315,12 @@ class OperatorTest {
             stmt.execute("CREATE FUNCTION s2_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a * b; END; $$ LANGUAGE plpgsql");
 
-            stmt.execute("CREATE OPERATOR s1.+++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = s1_fn)");
-            stmt.execute("CREATE OPERATOR s2.+++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = s2_fn)");
+            stmt.execute("CREATE OPERATOR s1.~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = s1_fn)");
+            stmt.execute("CREATE OPERATOR s2.~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = s2_fn)");
 
             // Both should exist in pg_operator
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(2, rs.getInt(1));
             }
@@ -1525,23 +1525,23 @@ class OperatorTest {
             stmt.execute("CREATE FUNCTION ol_bigint(a bigint, b bigint) RETURNS bigint AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
 
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = ol_int)");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = text, RIGHTARG = text, FUNCTION = ol_text)");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = ol_bigint)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = ol_int)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = text, RIGHTARG = text, FUNCTION = ol_text)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = bigint, RIGHTARG = bigint, FUNCTION = ol_bigint)");
 
             // 3 overloads
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(3, rs.getInt(1));
             }
 
             // Drop only the text version
-            stmt.execute("DROP OPERATOR +++ (text, text)");
+            stmt.execute("DROP OPERATOR ~++ (text, text)");
 
             // 2 remaining
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(2, rs.getInt(1));
             }
@@ -1585,13 +1585,13 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION own_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = own_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = own_fn)");
 
             // Owner should be a valid role
             try (ResultSet rs = stmt.executeQuery(
                     "SELECT o.oprowner, r.rolname FROM pg_operator o "
                     + "JOIN pg_roles r ON o.oprowner = r.oid "
-                    + "WHERE o.oprname = '+++'")) {
+                    + "WHERE o.oprname = '~++'")) {
                 assertTrue(rs.next());
                 String ownerName = rs.getString("rolname");
                 assertNotNull(ownerName);
@@ -1767,15 +1767,15 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION wt_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = wt_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = wt_fn)");
 
             // Drop with wrong arg types — should error (no such operator with text args)
             assertThrows(SQLException.class, () ->
-                    stmt.execute("DROP OPERATOR +++ (text, text)"));
+                    stmt.execute("DROP OPERATOR ~++ (text, text)"));
 
             // Original should still exist
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(1, rs.getInt(1));
             }
@@ -1819,12 +1819,12 @@ class OperatorTest {
 
             stmt.execute("CREATE FUNCTION sr_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = sr_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = sr_fn)");
 
             try (ResultSet rs = stmt.executeQuery(
                     "SELECT r.rolname FROM pg_operator o "
                     + "JOIN pg_roles r ON o.oprowner = r.oid "
-                    + "WHERE o.oprname = '+++'")) {
+                    + "WHERE o.oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals("op_creator", rs.getString(1));
             }
@@ -2000,13 +2000,13 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION ie_fn(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a; END; $$ LANGUAGE plpgsql");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = ie_fn)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = ie_fn)");
 
             // Should succeed and actually remove
-            stmt.execute("DROP OPERATOR IF EXISTS +++ (integer, integer)");
+            stmt.execute("DROP OPERATOR IF EXISTS ~++ (integer, integer)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(0, rs.getInt(1));
             }
@@ -2306,19 +2306,19 @@ class OperatorTest {
 
     @Test
     void operatorNameExtendsBuiltinPlus() throws SQLException {
-        // + exists as built-in, create ++, +++
+        // + exists as built-in, create ~+, ~++
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION dbl_plus(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql");
             stmt.execute("CREATE FUNCTION tri_plus(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + b + 1; END; $$ LANGUAGE plpgsql");
 
-            stmt.execute("CREATE OPERATOR ++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dbl_plus)");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = tri_plus)");
+            stmt.execute("CREATE OPERATOR ~+ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dbl_plus)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = tri_plus)");
 
-            // All three (built-in +, user ++ and +++) should coexist
+            // All three (built-in +, user ~+ and ~++) should coexist
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname IN ('+', '++', '+++')")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname IN ('+', '~+', '~++')")) {
                 assertTrue(rs.next());
                 assertTrue(rs.getInt(1) >= 3);
             }
@@ -2418,12 +2418,12 @@ class OperatorTest {
                     + "BEGIN RETURN a AND b; END; $$ LANGUAGE plpgsql");
 
             // All use same operator name, different arg types — all should succeed
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = ov_int)");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = text, RIGHTARG = text, FUNCTION = ov_txt)");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = boolean, RIGHTARG = boolean, FUNCTION = ov_bool)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = ov_int)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = text, RIGHTARG = text, FUNCTION = ov_txt)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = boolean, RIGHTARG = boolean, FUNCTION = ov_bool)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(3, rs.getInt(1));
             }
@@ -2438,10 +2438,10 @@ class OperatorTest {
             stmt.execute("CREATE FUNCTION dup2(a integer, b integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a * b; END; $$ LANGUAGE plpgsql");
 
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dup1)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dup1)");
             // Same name AND same arg types — should error
             assertThrows(SQLException.class, () ->
-                    stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dup2)"));
+                    stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = integer, FUNCTION = dup2)"));
         }
     }
 
@@ -2451,18 +2451,18 @@ class OperatorTest {
 
     @Test
     void asymmetricTypeOperatorPlusReverse() throws SQLException {
-        // Create +++ for (integer, text) AND (text, integer) — both should coexist
+        // Create ~++ for (integer, text) AND (text, integer) — both should coexist
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE FUNCTION asym_it(a integer, b text) RETURNS text AS $$ "
                     + "BEGIN RETURN a::text || b; END; $$ LANGUAGE plpgsql");
             stmt.execute("CREATE FUNCTION asym_ti(a text, b integer) RETURNS text AS $$ "
                     + "BEGIN RETURN a || b::text; END; $$ LANGUAGE plpgsql");
 
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = integer, RIGHTARG = text, FUNCTION = asym_it)");
-            stmt.execute("CREATE OPERATOR +++ (LEFTARG = text, RIGHTARG = integer, FUNCTION = asym_ti)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = integer, RIGHTARG = text, FUNCTION = asym_it)");
+            stmt.execute("CREATE OPERATOR ~++ (LEFTARG = text, RIGHTARG = integer, FUNCTION = asym_ti)");
 
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '+++'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '~++'")) {
                 assertTrue(rs.next());
                 assertEquals(2, rs.getInt(1));
             }

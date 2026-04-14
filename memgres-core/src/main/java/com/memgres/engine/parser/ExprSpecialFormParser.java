@@ -904,21 +904,17 @@ class ExprSpecialFormParser {
         }
         List<Expression> args = new ArrayList<>();
         boolean nullOnNull = false;
-        // Support both KEY...VALUE and key : value syntax
-        boolean useKeyValueSyntax = ep.checkKeyword("KEY");
+        // PG 18 rejects KEY...VALUE syntax in JSON_OBJECT — KEY is parsed as a type name,
+        // producing error 42704: type "key" does not exist. Only colon syntax is supported.
+        if (ep.checkKeyword("KEY")) {
+            throw new com.memgres.engine.MemgresException("type \"key\" does not exist", "42704");
+        }
         do {
             Expression key;
             Expression val;
-            if (useKeyValueSyntax) {
-                ep.expectKeyword("KEY");
-                key = ep.parseExpression();
-                ep.expectKeyword("VALUE");
-                val = ep.parseExpression();
-            } else {
-                key = ep.parseExpression();
-                ep.expect(TokenType.COLON);
-                val = ep.parseExpression();
-            }
+            key = ep.parseExpression();
+            ep.expect(TokenType.COLON);
+            val = ep.parseExpression();
             args.add(key);
             args.add(val);
         } while (ep.match(TokenType.COMMA) && !isNullOnNullLookahead() && !ep.checkKeyword("ABSENT")

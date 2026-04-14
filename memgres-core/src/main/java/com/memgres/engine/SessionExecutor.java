@@ -1414,7 +1414,7 @@ class SessionExecutor {
                  + " FOR " + SqlUnparser.toSql(stmt.query()));
         executor.session.addCursor(stmt.name(),
                 new Session.CursorState(stmt.name(), columns, rows,
-                        queryText, stmt.withHold, stmt.binary, stmt.scroll));
+                        queryText, stmt.withHold, stmt.binary, stmt.scroll, stmt.explicitNoScroll));
         return QueryResult.message(QueryResult.Type.SET, "DECLARE CURSOR");
     }
 
@@ -1423,8 +1423,9 @@ class SessionExecutor {
         if (cursor == null) {
             throw new MemgresException("cursor \"" + stmt.cursorName() + "\" does not exist", "34000");
         }
-        // PG: NO SCROLL cursors reject backward movement directions
-        if (!cursor.isScrollable()) {
+        // PG: only explicitly declared NO SCROLL cursors reject backward movement.
+        // Default cursors (no SCROLL/NO SCROLL keyword) are effectively scrollable in PG 18.
+        if (cursor.isExplicitNoScroll()) {
             switch (stmt.direction()) {
                 case PRIOR:
                 case FIRST:

@@ -135,6 +135,7 @@ class SecurityAbuseCaseTest {
     void searchPathHijackPrevention() throws Exception {
         exec("CREATE SCHEMA IF NOT EXISTS sec_private");
         exec("CREATE TABLE IF NOT EXISTS sec_private.data (v INT)");
+        exec("DELETE FROM sec_private.data");
         exec("INSERT INTO sec_private.data VALUES (42)");
 
         // Function explicitly qualifies the table name, safe against search_path changes.

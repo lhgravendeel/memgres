@@ -117,7 +117,7 @@ class SystemInfoCoverageTest {
     @Test
     void testCurrentUserValue() throws SQLException {
         String result = query1("SELECT current_user");
-        assertEquals("memgres", result);
+        assertEquals("test", result);
     }
 
     // --- session_user ---
@@ -132,7 +132,7 @@ class SystemInfoCoverageTest {
     @Test
     void testSessionUserValue() throws SQLException {
         String result = query1("SELECT session_user");
-        assertEquals("memgres", result);
+        assertEquals("test", result);
     }
 
     // --- current_role ---
@@ -830,8 +830,8 @@ class SystemInfoCoverageTest {
              ResultSet rs = s.executeQuery(
                      "SELECT current_user, session_user")) {
             assertTrue(rs.next());
-            assertEquals("memgres", rs.getString(1));
-            assertEquals("memgres", rs.getString(2));
+            assertEquals("test", rs.getString(1));
+            assertEquals("test", rs.getString(2));
         }
     }
 

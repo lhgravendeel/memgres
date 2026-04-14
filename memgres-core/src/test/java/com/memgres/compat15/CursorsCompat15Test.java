@@ -12,8 +12,8 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Compatibility tests for 13 cursor.sql failures where Memgres diverges from PG 18.
  *
- * Stmts 41-47: NO SCROLL cursor allows PRIOR/LAST/FIRST/ABSOLUTE/RELATIVE/BACKWARD in PG 18,
- *              but Memgres errors "cursor can only scan forward" or "cursor does not exist"
+ * Stmts 41-47: Default (no keyword) cursor in PG 18 allows backward fetch operations.
+ *              Only explicitly declared NO SCROLL cursors reject them with SQLSTATE 55000.
  * Stmt 90:     WITH HOLD cursor should survive COMMIT; Memgres errors cursor does not exist
  * Stmt 129:    DECLARE inside txn with duplicate name should error 42P03, but outside txn
  *              should error 25P01; Memgres errors 42P03 (wrong SQLSTATE)
@@ -72,15 +72,14 @@ class CursorsCompat15Test {
     }
 
     // ========================================================================
-    // Stmts 41-47: NO SCROLL cursor should allow backward directions in PG 18
+    // Stmts 41-47: Default (no keyword) cursor in PG 18 allows backward fetch operations
     // ========================================================================
 
     /**
-     * Stmt 41: FETCH PRIOR on a NO SCROLL cursor.
+     * Stmt 41: FETCH PRIOR on a default (no keyword) cursor.
      *
-     * PG 18 allows PRIOR on a default (NO SCROLL) cursor and returns 0 rows
-     * (cursor is before-first after one NEXT from position before row 1).
-     * Memgres errors: "cursor can only scan forward" [55000]
+     * PG 18: a cursor declared without SCROLL keyword allows backward fetch.
+     * FETCH PRIOR from row 1 goes before first, returning 0 rows.
      */
     @Test
     void stmt41_fetchPriorOnNoScrollCursor() throws SQLException {
@@ -90,8 +89,7 @@ class CursorsCompat15Test {
             st.executeQuery("FETCH NEXT FROM c4"); // move to row 1
 
             ResultSet rs = st.executeQuery("FETCH PRIOR FROM c4");
-            // PG returns 0 rows (moved before first)
-            assertFalse(rs.next(), "FETCH PRIOR from row 1 should return 0 rows");
+            assertFalse(rs.next(), "FETCH PRIOR from row 1 should return 0 rows (before first)");
             rs.close();
 
             st.execute("CLOSE c4");
@@ -101,10 +99,10 @@ class CursorsCompat15Test {
     }
 
     /**
-     * Stmt 42: FETCH LAST on a NO SCROLL cursor.
+     * Stmt 42: FETCH LAST on a default (no keyword) cursor.
      *
-     * PG 18 allows LAST on a default cursor and returns row [5].
-     * Memgres errors: "cursor \"c4\" does not exist" [34000]
+     * PG 18: a cursor declared without SCROLL keyword allows backward fetch.
+     * FETCH LAST returns the last row (id=5).
      */
     @Test
     void stmt42_fetchLastOnNoScrollCursor() throws SQLException {
@@ -116,7 +114,7 @@ class CursorsCompat15Test {
             ResultSet rs = st.executeQuery("FETCH LAST FROM c4");
             assertTrue(rs.next(), "FETCH LAST should return one row");
             assertEquals(5, rs.getInt("id"), "FETCH LAST should return id=5");
-            assertFalse(rs.next(), "FETCH LAST should return exactly one row");
+            assertFalse(rs.next());
             rs.close();
 
             st.execute("CLOSE c4");
@@ -126,10 +124,10 @@ class CursorsCompat15Test {
     }
 
     /**
-     * Stmt 43: FETCH FIRST on a NO SCROLL cursor.
+     * Stmt 43: FETCH FIRST on a default (no keyword) cursor.
      *
-     * PG 18 allows FIRST on a default cursor and returns row [1].
-     * Memgres errors: "cursor \"c4\" does not exist" [34000]
+     * PG 18: a cursor declared without SCROLL keyword allows backward fetch.
+     * FETCH FIRST returns the first row (id=1).
      */
     @Test
     void stmt43_fetchFirstOnNoScrollCursor() throws SQLException {
@@ -141,7 +139,7 @@ class CursorsCompat15Test {
             ResultSet rs = st.executeQuery("FETCH FIRST FROM c4");
             assertTrue(rs.next(), "FETCH FIRST should return one row");
             assertEquals(1, rs.getInt("id"), "FETCH FIRST should return id=1");
-            assertFalse(rs.next(), "FETCH FIRST should return exactly one row");
+            assertFalse(rs.next());
             rs.close();
 
             st.execute("CLOSE c4");
@@ -151,10 +149,10 @@ class CursorsCompat15Test {
     }
 
     /**
-     * Stmt 44: FETCH ABSOLUTE 1 on a NO SCROLL cursor.
+     * Stmt 44: FETCH ABSOLUTE 1 on a default (no keyword) cursor.
      *
-     * PG 18 allows ABSOLUTE on a default cursor and returns row [1].
-     * Memgres errors: "cursor \"c4\" does not exist" [34000]
+     * PG 18: a cursor declared without SCROLL keyword allows backward fetch.
+     * FETCH ABSOLUTE 1 returns the first row (id=1).
      */
     @Test
     void stmt44_fetchAbsoluteOnNoScrollCursor() throws SQLException {
@@ -166,7 +164,7 @@ class CursorsCompat15Test {
             ResultSet rs = st.executeQuery("FETCH ABSOLUTE 1 FROM c4");
             assertTrue(rs.next(), "FETCH ABSOLUTE 1 should return one row");
             assertEquals(1, rs.getInt("id"), "FETCH ABSOLUTE 1 should return id=1");
-            assertFalse(rs.next(), "FETCH ABSOLUTE 1 should return exactly one row");
+            assertFalse(rs.next());
             rs.close();
 
             st.execute("CLOSE c4");
@@ -176,11 +174,10 @@ class CursorsCompat15Test {
     }
 
     /**
-     * Stmt 45: FETCH RELATIVE -1 on a NO SCROLL cursor.
+     * Stmt 45: FETCH RELATIVE -1 on a default (no keyword) cursor.
      *
-     * PG 18 allows negative RELATIVE on a default cursor; returns 0 rows
-     * (cursor at row 1 after ABSOLUTE 1, RELATIVE -1 goes before first).
-     * Memgres errors: "cursor \"c4\" does not exist" [34000]
+     * PG 18: a cursor declared without SCROLL keyword allows backward fetch.
+     * FETCH RELATIVE -1 from row 1 goes before first, returning 0 rows.
      */
     @Test
     void stmt45_fetchRelativeNegativeOnNoScrollCursor() throws SQLException {
@@ -189,10 +186,8 @@ class CursorsCompat15Test {
             st.execute("DECLARE c4 CURSOR FOR SELECT id FROM cur_test ORDER BY id");
             st.executeQuery("FETCH NEXT FROM c4"); // move to row 1
 
-            // Context: after stmt 44 (ABSOLUTE 1), PG cursor is at row 1.
-            // RELATIVE -1 from row 1 goes before first => 0 rows
             ResultSet rs = st.executeQuery("FETCH RELATIVE -1 FROM c4");
-            assertFalse(rs.next(), "FETCH RELATIVE -1 from row 1 should return 0 rows");
+            assertFalse(rs.next(), "FETCH RELATIVE -1 from row 1 should return 0 rows (before first)");
             rs.close();
 
             st.execute("CLOSE c4");
@@ -234,10 +229,10 @@ class CursorsCompat15Test {
     }
 
     /**
-     * Stmt 47: FETCH BACKWARD 1 on a NO SCROLL cursor.
+     * Stmt 47: FETCH BACKWARD 1 on a default (no keyword) cursor.
      *
-     * PG 18 allows BACKWARD on a default cursor; returns 0 rows when at start.
-     * Memgres errors: "cursor \"c4\" does not exist" [34000]
+     * PG 18: a cursor declared without SCROLL keyword allows backward fetch.
+     * FETCH BACKWARD 1 from row 1 goes before first, returning 0 rows.
      */
     @Test
     void stmt47_fetchBackwardOnNoScrollCursor() throws SQLException {
@@ -246,9 +241,8 @@ class CursorsCompat15Test {
             st.execute("DECLARE c4 CURSOR FOR SELECT id FROM cur_test ORDER BY id");
             st.executeQuery("FETCH NEXT FROM c4"); // at row 1
 
-            // BACKWARD 1 from row 1 goes before first => 0 rows
             ResultSet rs = st.executeQuery("FETCH BACKWARD 1 FROM c4");
-            assertFalse(rs.next(), "FETCH BACKWARD 1 from row 1 should return 0 rows");
+            assertFalse(rs.next(), "FETCH BACKWARD 1 from row 1 should return 0 rows (before first)");
             rs.close();
 
             st.execute("CLOSE c4");

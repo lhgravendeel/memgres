@@ -734,10 +734,12 @@ class UtilityParser {
         // Optional: BINARY, INSENSITIVE, [NO] SCROLL
         boolean binary = parser.matchKeyword("BINARY");
         parser.matchKeyword("INSENSITIVE");
-        boolean scroll = true; // PG default: cursors are scrollable unless NO SCROLL is specified
+        boolean scroll = false;
+        boolean explicitNoScroll = false;
         if (parser.matchKeyword("NO")) {
             parser.matchKeyword("SCROLL");
             scroll = false;
+            explicitNoScroll = true;
         } else if (parser.matchKeyword("SCROLL")) {
             scroll = true;
         }
@@ -752,7 +754,7 @@ class UtilityParser {
         }
         parser.expectKeyword("FOR");
         Statement query = parser.tryParseSetOp(parser.parseSelect());
-        return new DeclareCursorStmt(name, query, scroll, withHold, binary);
+        return new DeclareCursorStmt(name, query, scroll, withHold, binary, explicitNoScroll);
     }
 
     FetchStmt parseFetchOrMove(boolean isMove) {

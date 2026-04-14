@@ -9,18 +9,24 @@ public final class DeclareCursorStmt implements Statement {
     public final boolean scroll;
     public final boolean withHold;
     public final boolean binary;
+    public final boolean explicitNoScroll;
 
-    public DeclareCursorStmt(String name, Statement query, boolean scroll, boolean withHold, boolean binary) {
+    public DeclareCursorStmt(String name, Statement query, boolean scroll, boolean withHold, boolean binary, boolean explicitNoScroll) {
         this.name = name;
         this.query = query;
         this.scroll = scroll;
         this.withHold = withHold;
         this.binary = binary;
+        this.explicitNoScroll = explicitNoScroll;
+    }
+
+    public DeclareCursorStmt(String name, Statement query, boolean scroll, boolean withHold, boolean binary) {
+        this(name, query, scroll, withHold, binary, false);
     }
 
     /** Backward-compatible constructor (binary defaults to false). */
     public DeclareCursorStmt(String name, Statement query, boolean scroll, boolean withHold) {
-        this(name, query, scroll, withHold, false);
+        this(name, query, scroll, withHold, false, false);
     }
 
     public String name() { return name; }
@@ -28,6 +34,7 @@ public final class DeclareCursorStmt implements Statement {
     public boolean scroll() { return scroll; }
     public boolean withHold() { return withHold; }
     public boolean binary() { return binary; }
+    public boolean explicitNoScroll() { return explicitNoScroll; }
 
     @Override
     public boolean equals(Object o) {

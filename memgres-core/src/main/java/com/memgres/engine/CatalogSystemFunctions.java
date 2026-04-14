@@ -205,10 +205,10 @@ class CatalogSystemFunctions {
                         }
                     }
                 }
-                return "memgres";
+                return executor.sessionUser();
             }
             case "session_user":
-                return "memgres";
+                return executor.sessionUser();
             case "pg_backend_pid":
                 if (executor.session != null) return executor.session.getPid();
                 try {
