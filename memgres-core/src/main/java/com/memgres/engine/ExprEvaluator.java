@@ -1863,6 +1863,7 @@ class ExprEvaluator {
                 return DataType.TEXT;
             }
             if (name.equals("uuid_generate_v4") || name.equals("gen_random_uuid")) return DataType.UUID;
+            if (name.equals("json_serialize")) return DataType.TEXT;
             // Check user-defined functions and aggregates for return type
             if (executor != null && executor.database != null) {
                 PgFunction userFunc = executor.database.getFunction(name);

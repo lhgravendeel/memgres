@@ -551,12 +551,20 @@ class SqlJsonStandardTest {
 
     @Test
     void jsonSerialize_object() throws SQLException {
-        assertEquals("{\"a\": 1}", q("SELECT JSON_SERIALIZE('{\"a\":1}'::jsonb)"));
+        // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("SELECT JSON_SERIALIZE('{\"a\":1}'::jsonb)")) {
+            assertTrue(rs.next());
+            assertEquals("{\"a\": 1}", rs.getString(1));
+        }
     }
 
     @Test
     void jsonSerialize_array() throws SQLException {
-        assertEquals("[1, 2, 3]", q("SELECT JSON_SERIALIZE('[1,2,3]'::jsonb)"));
+        // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery("SELECT JSON_SERIALIZE('[1,2,3]'::jsonb)")) {
+            assertTrue(rs.next());
+            assertEquals("[1, 2, 3]", rs.getString(1));
+        }
     }
 
     @Test

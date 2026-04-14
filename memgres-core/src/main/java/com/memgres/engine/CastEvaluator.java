@@ -232,6 +232,9 @@ class CastEvaluator {
                 if (val instanceof Boolean) {
                     return ((Boolean) val) ? "true" : "false";
                 }
+                if (val instanceof byte[]) {
+                    return new String((byte[]) val, java.nio.charset.StandardCharsets.UTF_8);
+                }
                 return val.toString();
             }
             case "boolean":

@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -94,6 +95,16 @@ class DdlParser {
         if (parser.matchKeywords("OPERATOR", "FAMILY")) return parseCreateOperatorFamily();
         if (parser.matchKeyword("OPERATOR")) return parseCreateOperator();
 
+        // CREATE LANGUAGE — no-op, but PG 18 does not support IF NOT EXISTS
+        if (parser.matchKeyword("LANGUAGE")) {
+            if (parser.checkKeyword("IF")) {
+                throw new MemgresException(
+                        "syntax error at or near \"NOT\"", "42601");
+            }
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("create_noop", "ok");
+        }
+
         // No-op CREATE targets (accepted but not functionally implemented)
         if (parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
                 || parser.matchKeyword("CONVERSION")
@@ -105,7 +116,6 @@ class DdlParser {
                 || parser.matchKeyword("PUBLICATION")
                 || parser.matchKeyword("SUBSCRIPTION")
                 || parser.matchKeyword("TABLESPACE")
-                || parser.matchKeyword("LANGUAGE")
                 || parser.matchKeywords("EVENT", "TRIGGER")
                 || parser.matchKeyword("TRANSFORM")
                 || parser.matchKeywords("ACCESS", "METHOD")
@@ -1235,8 +1245,27 @@ class DdlParser {
 
     // ---- ALTER FUNCTION / ALTER PROCEDURE ----
 
+    /** Check if a token is the start of a multi-word SQL type name. */
+    private static boolean isMultiWordTypeStart(String token) {
+        switch (token.toLowerCase()) {
+            case "double":        // double precision
+            case "character":     // character varying
+            case "timestamp":     // timestamp with/without time zone
+            case "time":          // time with/without time zone
+            case "bit":           // bit varying
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private Statement parseAlterFunctionOrProcedure(boolean isProcedure) {
-        boolean ifExists = parser.matchKeywords("IF", "EXISTS");
+        // PG 18: ALTER FUNCTION/PROCEDURE does not support IF EXISTS
+        if (parser.checkKeyword("IF")) {
+            throw new MemgresException(
+                    "syntax error at or near \"" + parser.peek().value() + "\"", "42601");
+        }
+        boolean ifExists = false;
         // Read function/procedure name (possibly schema-qualified)
         String schema = null;
         String funcName = parser.readIdentifier();
@@ -1263,10 +1292,12 @@ class DdlParser {
                     if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)
                             && !parser.isAtEnd()) {
                         // First was a param name or start of multi-word type
-                        // Try to detect: if the next token plus current could be a type like "double precision"
-                        // Heuristic: read all tokens until comma or right-paren
+                        // Heuristic: if first is a known type-start keyword, include it in the type
                         String second = parser.advance().value();
-                        // Check if second + more tokens form the type
+                        boolean firstIsTypeStart = isMultiWordTypeStart(first);
+                        if (firstIsTypeStart) {
+                            typeName.append(first).append(" ");
+                        }
                         typeName.append(second);
                         while (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)
                                 && !parser.isAtEnd()) {
@@ -1423,6 +1454,11 @@ class DdlParser {
             return new AlterIndexStmt(indexName, ifExists, AlterIndexStmt.Action.SET_STATISTICS, null);
         }
         // SET ( key = value, ... ) — parse storage parameters
+        // PG 18: ALTER INDEX does not support SET SCHEMA — reject it
+        if (parser.checkKeyword("SET") && parser.checkKeywordAt(1, "SCHEMA")) {
+            throw new MemgresException(
+                    "syntax error at or near \"SCHEMA\"", "42601");
+        }
         if (parser.matchKeyword("SET")) {
             java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
             if (parser.match(TokenType.LEFT_PAREN)) {

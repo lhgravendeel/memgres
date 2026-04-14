@@ -169,6 +169,14 @@ public class Database {
                 "-- built-in: suppresses redundant updates", "internal");
         suppressFunc.setSchemaName("pg_catalog");
         addFunction(suppressFunc);
+        // Register pg_sleep so ALTER FUNCTION pg_sleep(...) works (PG has it in pg_proc)
+        PgFunction pgSleepFunc = new PgFunction("pg_sleep", "void",
+                "-- built-in: pg_sleep", "internal",
+                Cols.listOf(new PgFunction.Param("seconds", "double precision", "IN", null)), false);
+        pgSleepFunc.setSchemaName("pg_catalog");
+        pgSleepFunc.setVolatility("VOLATILE");
+        pgSleepFunc.setStrict(true);
+        addFunction(pgSleepFunc);
     }
 
     // ---- Connection management ----

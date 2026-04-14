@@ -473,9 +473,10 @@ SELECT
 -- 32. JSON_SERIALIZE — convert to text
 -- ============================================================================
 
+-- pg-bug: PG 18 JSON_SERIALIZE returns jsonb version byte (0x01) instead of serialized text — known PG bug, will be fixed upstream
 -- begin-expected
 -- columns: result
--- row:
+-- row: {"a": 1}
 -- end-expected
 SELECT JSON_SERIALIZE('{"a":1}'::jsonb) AS result;
 

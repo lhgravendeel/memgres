@@ -1,5 +1,6 @@
 package com.memgres.engine.plpgsql;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.Lexer;
@@ -122,6 +123,10 @@ public class PlpgsqlParser {
 
             if (checkKw("CURSOR")) {
                 advance();
+                // PG 18: CURSOR WITH HOLD is not valid in PL/pgSQL
+                if (checkKw("WITH")) {
+                    throw new MemgresException("syntax error at or near \"WITH\"", "42601");
+                }
                 matchKw("FOR");
                 String cursorSql = collectUntilSemicolon();
                 decls.add(new PlpgsqlStatement.VarDeclaration(name, "REFCURSOR", false, false, null, true, cursorSql));
@@ -273,11 +278,8 @@ public class PlpgsqlParser {
                 case "ABORT":
                     return parseAbort();
                 case "SAVEPOINT": {
-                    // SAVEPOINT is unsupported in PL/pgSQL — rejected at creation time
-                    advance();
-                    while (pos < tokens.size() && !check(TokenType.SEMICOLON)) advance();
-                    if (check(TokenType.SEMICOLON)) advance();
-                    return new PlpgsqlStatement.SavepointStmt();
+                    // PG 18: SAVEPOINT is not valid in PL/pgSQL — reject at creation time
+                    throw new MemgresException("syntax error at or near \"" + peek().value() + "\"", "42601");
                 }
                 case "ASSERT":
                     return parseAssert();
@@ -416,7 +418,18 @@ public class PlpgsqlParser {
     private PlpgsqlStatement parseForeach(String label) {
         matchKw("FOREACH");
         String varName = readIdent();
-        if (matchKw("SLICE")) advance(); // skip number
+        if (matchKw("SLICE")) {
+            // PG 18: SLICE 0 is valid (same as no SLICE), SLICE N>0 is rejected
+            String sliceVal = advance().value();
+            try {
+                int n = Integer.parseInt(sliceVal);
+                if (n > 0) {
+                    throw new MemgresException("syntax error at or near \"SLICE\"", "42601");
+                }
+            } catch (NumberFormatException e) {
+                throw new MemgresException("syntax error at or near \"SLICE\"", "42601");
+            }
+        }
         matchKw("IN");
         matchKw("ARRAY");
         String arrayExpr = collectUntilKeyword("LOOP");
@@ -829,11 +842,9 @@ public class PlpgsqlParser {
 
     private PlpgsqlStatement parseRollback() {
         advance(); // consume ROLLBACK
-        // Check for ROLLBACK TO SAVEPOINT — rejected at creation time in PL/pgSQL
+        // PG 18: ROLLBACK TO [SAVEPOINT] is not valid in PL/pgSQL — reject at creation time
         if (checkKw("TO")) {
-            while (pos < tokens.size() && !check(TokenType.SEMICOLON)) advance();
-            if (check(TokenType.SEMICOLON)) advance();
-            return new PlpgsqlStatement.SavepointStmt();
+            throw new MemgresException("syntax error at or near \"TO\"", "42601");
         }
         boolean chain = parseAndChain();
         match(TokenType.SEMICOLON);

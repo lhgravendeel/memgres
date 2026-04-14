@@ -777,10 +777,15 @@ public class AstExecutor {
                 if (stmt.securityDefiner() != null) func.setSecurityDefiner(stmt.securityDefiner());
                 if (stmt.leakproof() != null) func.setLeakproof(stmt.leakproof());
                 if (stmt.cost() != null) func.setCost(stmt.cost());
-                // ROWS: only store for set-returning functions (proretset=true); PG ignores ROWS for scalar functions
-                if (stmt.rows() != null && func.getReturnType() != null
-                        && (func.getReturnType().toUpperCase().startsWith("SETOF")
-                            || func.getReturnType().toUpperCase().contains("TABLE"))) {
+                // ROWS: PG 18 rejects ROWS for non-set-returning functions with 22023
+                if (stmt.rows() != null) {
+                    boolean isSrf = func.getReturnType() != null
+                            && (func.getReturnType().toUpperCase().startsWith("SETOF")
+                                || func.getReturnType().toUpperCase().contains("TABLE"));
+                    if (!isSrf) {
+                        throw new MemgresException(
+                                "ROWS is not applicable when function does not return a set", "22023");
+                    }
                     func.setRows(stmt.rows());
                 }
                 if (stmt.parallel() != null) func.setParallel(stmt.parallel());

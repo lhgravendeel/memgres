@@ -53,7 +53,8 @@ class AlterFunctionProcedureCompat15Test {
             // -- Section 8: ALTER FUNCTION COST / ROWS (Stmt 49 setup)
             s.execute("CREATE FUNCTION af_cost(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$");
             s.execute("ALTER FUNCTION af_cost(integer) COST 1000");
-            s.execute("ALTER FUNCTION af_cost(integer) ROWS 500");
+            // PG 18: ROWS on non-SRF is rejected with 22023; skip it
+            try { s.execute("ALTER FUNCTION af_cost(integer) ROWS 500"); } catch (SQLException ignored) {}
 
             // -- Section 10: ALTER FUNCTION SET configuration (Stmt 59 setup)
             s.execute("CREATE FUNCTION af_config() RETURNS text LANGUAGE plpgsql AS $$\n"

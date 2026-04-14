@@ -166,13 +166,11 @@ class WithHoldJsonSerializeCompat15Test {
              ResultSet rs = s.executeQuery(
                      "SELECT JSON_SERIALIZE('{\"a\":1}'::jsonb) AS result")) {
             assertTrue(rs.next());
-            String result = rs.getString("result");
-            // PG 18: JSON_SERIALIZE without RETURNING defaults to text.
-            // The comparison framework shows PG returns empty via JDBC —
-            // likely a bytea/type OID issue. We test Memgres returns valid text.
-            assertNotNull(result, "JSON_SERIALIZE should return non-null text");
-            assertTrue(result.contains("\"a\""), "Result should contain key 'a'");
-            assertTrue(result.contains("1"), "Result should contain value 1");
+            // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+            String val = rs.getString("result");
+            assertNotNull(val, "JSON_SERIALIZE should return non-null text");
+            assertTrue(val.contains("\"a\""), "Result should contain key 'a'");
+            assertTrue(val.contains("1"), "Result should contain value 1");
         }
     }
 

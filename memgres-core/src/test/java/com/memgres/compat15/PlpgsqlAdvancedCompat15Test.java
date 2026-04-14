@@ -103,23 +103,26 @@ class PlpgsqlAdvancedCompat15Test {
             """);
 
             // --- D2: FOREACH SLICE setup ---
-            // Stmt 21: pla_foreach_slice1 (should error with 42601/SLICE on PG, but Memgres succeeds)
-            // We need to attempt creation; Memgres allows it even though PG doesn't.
-            s.execute("""
-                CREATE FUNCTION pla_foreach_slice1() RETURNS text
-                LANGUAGE plpgsql AS $$
-                DECLARE
-                  arr integer[] := ARRAY[[1,2],[3,4],[5,6]];
-                  slice integer[];
-                  result text := '';
-                BEGIN
-                  FOREACH slice SLICE 1 IN ARRAY arr LOOP
-                    result := result || slice::text || ';';
-                  END LOOP;
-                  RETURN result;
-                END;
-                $$
-            """);
+            // Stmt 21: pla_foreach_slice1 — PG 18 rejects FOREACH SLICE with 42601
+            try {
+                s.execute("""
+                    CREATE FUNCTION pla_foreach_slice1() RETURNS text
+                    LANGUAGE plpgsql AS $$
+                    DECLARE
+                      arr integer[] := ARRAY[[1,2],[3,4],[5,6]];
+                      slice integer[];
+                      result text := '';
+                    BEGIN
+                      FOREACH slice SLICE 1 IN ARRAY arr LOOP
+                        result := result || slice::text || ';';
+                      END LOOP;
+                      RETURN result;
+                    END;
+                    $$
+                """);
+            } catch (java.sql.SQLException ignored) {
+                // Expected: FOREACH SLICE rejected with 42601
+            }
 
             // --- D3: ASSERT setup ---
             // Stmt 30: pla_assert_pass
@@ -424,41 +427,42 @@ class PlpgsqlAdvancedCompat15Test {
      * Memgres: OK 0 rows affected
      */
     /**
-     * Stmt 21: FOREACH SLICE 1 is valid PG 18 syntax — CREATE FUNCTION should succeed.
-     * (Original differences.md entry was incorrect; PG 18 supports FOREACH SLICE.)
+     * Stmt 21: PG 18 rejects FOREACH SLICE with 42601 syntax error.
      */
     @Test
-    void testStmt21_foreachSlice1CreateShouldSucceed() throws SQLException {
+    void testStmt21_foreachSlice1CreateShouldFail() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            s.execute("""
-                CREATE OR REPLACE FUNCTION pla_foreach_slice1_test() RETURNS text
-                LANGUAGE plpgsql AS $$
-                DECLARE
-                  arr integer[] := ARRAY[[1,2],[3,4],[5,6]];
-                  slice integer[];
-                  result text := '';
-                BEGIN
-                  FOREACH slice SLICE 1 IN ARRAY arr LOOP
-                    result := result || slice::text || ';';
-                  END LOOP;
-                  RETURN result;
-                END;
-                $$
-            """);
-            // Should succeed — FOREACH SLICE is valid PG 18 syntax
+            SQLException ex = assertThrows(SQLException.class, () ->
+                    s.execute("""
+                        CREATE OR REPLACE FUNCTION pla_foreach_slice1_test() RETURNS text
+                        LANGUAGE plpgsql AS $$
+                        DECLARE
+                          arr integer[] := ARRAY[[1,2],[3,4],[5,6]];
+                          slice integer[];
+                          result text := '';
+                        BEGIN
+                          FOREACH slice SLICE 1 IN ARRAY arr LOOP
+                            result := result || slice::text || ';';
+                          END LOOP;
+                          RETURN result;
+                        END;
+                        $$
+                    """));
+            assertEquals("42601", ex.getSQLState(),
+                    "FOREACH SLICE should be rejected with 42601");
         }
     }
 
     /**
-     * Stmt 22: FOREACH SLICE function should be callable and return a result.
-     * PG 18 supports FOREACH SLICE, so the function created in setUp should work.
+     * Stmt 22: Since FOREACH SLICE creation fails, calling it should fail with 42883.
      */
     @Test
-    void testStmt22_foreachSlice1CallShouldSucceed() throws SQLException {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT pla_foreach_slice1() AS result")) {
-            assertTrue(rs.next(), "Expected a result row");
-            assertNotNull(rs.getString(1), "Result should not be null");
+    void testStmt22_foreachSlice1CallShouldFail() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            SQLException ex = assertThrows(SQLException.class, () ->
+                    s.executeQuery("SELECT pla_foreach_slice1() AS result"));
+            assertEquals("42883", ex.getSQLState(),
+                    "Function should not exist since creation was rejected");
         }
     }
 

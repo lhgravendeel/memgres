@@ -111,19 +111,13 @@ class DdlAlterTableExecutor {
             if (sc == null) {
                 throw new MemgresException("constraint \"" + ace.constraintName() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
             }
-            // PG 18: toggling from NOT ENFORCED to ENFORCED validates existing data.
-            // If any row violates the constraint, reject with 42809.
-            if (sc.isNotEnforced() && !ace.notEnforced() && sc.getType() == StoredConstraint.Type.CHECK && sc.getCheckExpr() != null) {
-                for (Object[] row : table.getRows()) {
-                    Object[] evalRow = row;
-                    RowContext ctx = new RowContext(table, null, evalRow);
-                    Object result = executor.evalExpr(sc.getCheckExpr(), ctx);
-                    if (result instanceof Boolean && !((Boolean) result)) {
-                        throw new MemgresException(
-                                "cannot alter enforceability of constraint \"" + ace.constraintName() + "\"",
-                                "42809");
-                    }
-                }
+            // PG 18: only FOREIGN KEY constraints support ALTER CONSTRAINT ... [NOT] ENFORCED.
+            // CHECK, UNIQUE, PRIMARY KEY, and EXCLUDE constraints cannot be toggled.
+            if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) {
+                throw new MemgresException(
+                        "cannot alter enforceability of constraint \"" + ace.constraintName()
+                                + "\" of relation \"" + stmt.table() + "\"",
+                        "42809");
             }
             sc.setNotEnforced(ace.notEnforced());
         } else if (action instanceof AlterTableStmt.SetSchema) {

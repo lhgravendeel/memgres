@@ -227,18 +227,22 @@ class ProcedureTransactionControlCompat15Test {
                 END;
                 $$""");
 
-            // Procedure 18: SAVEPOINT inside procedure (should fail)
-            s.execute("""
-                CREATE PROCEDURE ptc_savepoint() LANGUAGE plpgsql AS $$
-                BEGIN
-                  INSERT INTO ptc_log (msg) VALUES ('before-sp');
-                  SAVEPOINT sp1;
-                  INSERT INTO ptc_log (msg) VALUES ('after-sp');
-                  ROLLBACK TO SAVEPOINT sp1;
-                  INSERT INTO ptc_log (msg) VALUES ('after-rollback-sp');
-                  COMMIT;
-                END;
-                $$""");
+            // Procedure 18: SAVEPOINT inside procedure — PG 18 rejects at creation time
+            try {
+                s.execute("""
+                    CREATE PROCEDURE ptc_savepoint() LANGUAGE plpgsql AS $$
+                    BEGIN
+                      INSERT INTO ptc_log (msg) VALUES ('before-sp');
+                      SAVEPOINT sp1;
+                      INSERT INTO ptc_log (msg) VALUES ('after-sp');
+                      ROLLBACK TO SAVEPOINT sp1;
+                      INSERT INTO ptc_log (msg) VALUES ('after-rollback-sp');
+                      COMMIT;
+                    END;
+                    $$""");
+            } catch (java.sql.SQLException ignored) {
+                // Expected: SAVEPOINT rejected with 42601
+            }
 
             // Procedure 19: COMMIT in procedure called from function (should error)
             s.execute("""
@@ -799,26 +803,30 @@ class ProcedureTransactionControlCompat15Test {
     void testStmt89_cursorHoldMsgs() throws SQLException {
         truncateLog();
         try (Statement s = conn.createStatement()) {
-            // Create the procedure inline since it uses CURSOR WITH HOLD
-            s.execute("""
-                CREATE OR REPLACE PROCEDURE ptc_cursor_hold() LANGUAGE plpgsql AS $$
-                DECLARE
-                  cur CURSOR WITH HOLD FOR SELECT generate_series(1, 3) AS n;
-                  rec record;
-                BEGIN
-                  OPEN cur;
-                  FETCH cur INTO rec;
-                  INSERT INTO ptc_log (msg) VALUES ('fetched-' || rec.n::text);
-                  COMMIT;
-                  FETCH cur INTO rec;
-                  INSERT INTO ptc_log (msg) VALUES ('fetched-' || rec.n::text);
-                  CLOSE cur;
-                END;
-                $$""");
+            // PG 18: CURSOR WITH HOLD rejected at creation time with 42601
+            try {
+                s.execute("""
+                    CREATE OR REPLACE PROCEDURE ptc_cursor_hold() LANGUAGE plpgsql AS $$
+                    DECLARE
+                      cur CURSOR WITH HOLD FOR SELECT generate_series(1, 3) AS n;
+                      rec record;
+                    BEGIN
+                      OPEN cur;
+                      FETCH cur INTO rec;
+                      INSERT INTO ptc_log (msg) VALUES ('fetched-' || rec.n::text);
+                      COMMIT;
+                      FETCH cur INTO rec;
+                      INSERT INTO ptc_log (msg) VALUES ('fetched-' || rec.n::text);
+                      CLOSE cur;
+                    END;
+                    $$""");
+            } catch (SQLException ignored) {
+                // Expected: CURSOR WITH HOLD rejected with 42601
+            }
             try {
                 s.execute("CALL ptc_cursor_hold()");
             } catch (SQLException ignored) {
-                // May error
+                // May error — procedure may not exist
             }
         }
         List<String> msgs = getLogMessages();

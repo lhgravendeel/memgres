@@ -539,6 +539,14 @@ class DdlTableExecutor {
                         }
                     }
                     for (String v : viewsToDrop) executor.database.removeView(v);
+                    // CASCADE: also drop dependent functions (e.g., BEGIN ATOMIC bodies referencing this table)
+                    List<String> funcsToDrop = new ArrayList<>();
+                    for (PgFunction fn : executor.database.getFunctions().values()) {
+                        if (sqlFunctionDependsOnTable(fn, name)) {
+                            funcsToDrop.add(fn.getName());
+                        }
+                    }
+                    for (String f : funcsToDrop) executor.database.removeFunction(f);
                 }
                 executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable));
             }
@@ -556,6 +564,29 @@ class DdlTableExecutor {
                         "table \"" + name + "\" does not exist, skipping", null);
             }
         }
+    }
+
+    /**
+     * Check if a SQL-language function body references the given table name.
+     * Covers RETURNS type, SETOF type, and FROM/INTO/UPDATE/DELETE table references in the body.
+     */
+    private boolean sqlFunctionDependsOnTable(PgFunction fn, String tableName) {
+        String lName = tableName.toLowerCase();
+        String retType = fn.getReturnType();
+        if (retType != null) {
+            String rt = retType.toLowerCase().replace("setof ", "").trim();
+            if (rt.equals(lName)) return true;
+        }
+        String body = fn.getBody();
+        if (body != null) {
+            String lBody = body.toLowerCase();
+            // Check for table reference: FROM table, INTO table, UPDATE table, etc.
+            if (java.util.regex.Pattern.compile("\\b" + java.util.regex.Pattern.quote(lName) + "\\b",
+                    java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body).find()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ---- TRUNCATE ----

@@ -705,7 +705,7 @@ class ValidationPermissivenessTest {
 
     @Test
     void create_unique_index_volatile_expression_rejected() {
-        // random() is volatile; unique index on it is problematic
+        // random() is a built-in volatile function; rejected in index expressions
         assertSqlFails("CREATE UNIQUE INDEX vp_volatile_idx ON vp_idx_t ((random()))");
     }
 

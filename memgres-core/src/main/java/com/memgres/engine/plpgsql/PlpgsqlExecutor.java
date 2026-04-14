@@ -312,21 +312,26 @@ public class PlpgsqlExecutor {
         // Substitute parameter names (with default support)
         Scope scope = new Scope(null);
         List<PgFunction.Param> params = function.getParams();
+        int argIdx = 0;
         for (int i = 0; i < params.size(); i++) {
             PgFunction.Param p = params.get(i);
-            String pName = p.name() != null ? p.name() : ("$" + (i + 1));
+            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            // Skip pure OUT params (e.g., RETURNS TABLE columns) — they are output column
+            // definitions, not input variables. Substituting them would corrupt the SQL body.
+            if ("OUT".equalsIgnoreCase(mode)) continue;
+            String pName = p.name() != null ? p.name() : ("$" + (argIdx + 1));
             Object val;
-            if ("VARIADIC".equalsIgnoreCase(p.mode())) {
+            if ("VARIADIC".equalsIgnoreCase(mode)) {
                 // Collect all remaining args into a list (array)
                 List<Object> variadicArgs = new ArrayList<>();
-                for (int j = i; j < args.size(); j++) {
+                for (int j = argIdx; j < args.size(); j++) {
                     variadicArgs.add(args.get(j));
                 }
                 val = variadicArgs;
                 scope.declare(pName, val);
                 break; // VARIADIC is always the last param
-            } else if (i < args.size()) {
-                val = args.get(i);
+            } else if (argIdx < args.size()) {
+                val = args.get(argIdx);
                 // For array (List) parameters, wrap as typed array literal so that
                 // substituteVariables produces valid SQL (especially for empty arrays
                 // where ARRAY[] without a type cast causes "cannot determine type of empty array")
@@ -352,6 +357,7 @@ public class PlpgsqlExecutor {
                 val = null;
             }
             scope.declare(pName, val);
+            argIdx++;
         }
         String substituted = substituteVariables(body, scope);
 
@@ -375,6 +381,15 @@ public class PlpgsqlExecutor {
                 results.add(row.length == 1 ? row[0] : row);
             }
             return results;
+        }
+
+        // For functions with multiple INOUT params, return all columns as Object[]
+        long inoutCount = params.stream()
+                .filter(p -> "INOUT".equalsIgnoreCase(p.mode()))
+                .count();
+        if (inoutCount > 1 && !result.getRows().isEmpty()) {
+            Object[] row = result.getRows().get(0);
+            if (row.length > 1) return row;
         }
 
         if (!result.getRows().isEmpty() && result.getRows().get(0).length > 0) {

@@ -208,10 +208,11 @@ class SqlJsonCompat15Test {
              ResultSet rs = s.executeQuery(
                      "SELECT JSON_SERIALIZE('{\"a\":1}'::jsonb) AS result")) {
             assertTrue(rs.next(), "Expected one result row");
-            String result = rs.getString("result");
-            // PG: JSON_SERIALIZE on jsonb returns the text representation with spaces
-            assertEquals("{\"a\": 1}", result,
-                    "JSON_SERIALIZE on jsonb should return formatted text, got: " + result);
+            // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+            String val = rs.getString("result");
+            assertNotNull(val, "JSON_SERIALIZE should return non-null text");
+            assertEquals("{\"a\": 1}", val,
+                    "JSON_SERIALIZE should return formatted JSON text");
         }
     }
 

@@ -589,6 +589,25 @@ class DdlExecutor {
     }
 
     /**
+     * Check only built-in volatile functions/identifiers in an expression string.
+     * Used for CREATE INDEX — PG enforces immutability for built-in volatile functions
+     * but allows user-defined volatile functions in expression indexes.
+     */
+    static void checkBuiltinVolatileInExpression(String exprStr, Database db, String errorMsg) {
+        String norm = exprStr.toLowerCase().replaceAll("\\s+", "");
+        for (String fn : BUILTIN_VOLATILE_FUNCTIONS) {
+            if (norm.contains(fn + "(")) {
+                throw new MemgresException(errorMsg, "42P17");
+            }
+        }
+        for (String id : BUILTIN_VOLATILE_IDENTIFIERS) {
+            if (norm.contains(id)) {
+                throw new MemgresException(errorMsg, "42P17");
+            }
+        }
+    }
+
+    /**
      * Check immutability using string-based expression (parses first, then walks AST).
      * Falls back to string matching if parsing fails.
      */

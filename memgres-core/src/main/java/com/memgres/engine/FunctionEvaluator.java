@@ -1063,13 +1063,15 @@ class FunctionEvaluator {
                 Object val = executor.evalExpr(arg, ctx);
                 if (val == null) return null;
                 String jsonStr = val.toString();
-                // PG: JSON_SERIALIZE converts a JSON/JSONB value to text with normalized formatting
-                // (spaces after colons and commas for readability)
+                // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
                 String trimmed = jsonStr.trim();
+                String normalized;
                 if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-                    return JsonOperations.normalizeJsonb(trimmed);
+                    normalized = JsonOperations.normalizeJsonb(trimmed);
+                } else {
+                    normalized = jsonStr;
                 }
-                return jsonStr;
+                return normalized;
             }
             case "json_array_subquery": {
                 // JSON_ARRAY(SELECT ...) — execute subquery and build JSON array from results

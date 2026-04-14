@@ -52,15 +52,11 @@ class RemainingJsonCompat15Test {
              ResultSet rs = s.executeQuery(
                      "SELECT JSON_SERIALIZE('{\"a\":1}'::jsonb) AS result")) {
             assertTrue(rs.next(), "Expected one result row");
-            String result = rs.getString("result");
-            assertNotNull(result, "JSON_SERIALIZE should return a non-null result");
-            // PG comparison shows a different byte-level result.
-            // The exact PG output is unclear from the report (\u0001 control char).
-            // We assert the normalized JSON text which is what PG's JSON_SERIALIZE
-            // should logically produce. If this test passes, the difference may be
-            // in wire protocol encoding (type OID, binary vs text format).
-            assertEquals("{\"a\": 1}", result,
-                    "JSON_SERIALIZE on jsonb should return normalized JSON text");
+            // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+            String val = rs.getString("result");
+            assertNotNull(val, "JSON_SERIALIZE should return non-null text");
+            assertEquals("{\"a\": 1}", val,
+                    "JSON_SERIALIZE should return normalized JSON text");
         }
     }
 

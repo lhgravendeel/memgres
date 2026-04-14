@@ -128,21 +128,23 @@ class RemainingMiscCompat15Test {
     // ========================================================================
     @Test
     void stmt21_foreachSliceCreatesSuccessfully() throws Exception {
+        // PG 18: FOREACH SLICE is not supported — rejected at creation time with 42601
         try (Statement s = conn.createStatement()) {
             s.execute("DROP FUNCTION IF EXISTS pla_foreach_slice1()");
-            s.execute("CREATE OR REPLACE FUNCTION pla_foreach_slice1() RETURNS text "
-                    + "LANGUAGE plpgsql AS $$ "
-                    + "DECLARE "
-                    + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]]; "
-                    + "  slice integer[]; "
-                    + "  result text := ''; "
-                    + "BEGIN "
-                    + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP "
-                    + "    result := result || slice::text || ';'; "
-                    + "  END LOOP; "
-                    + "  RETURN result; "
-                    + "END; $$");
-            // Function should be created successfully — FOREACH SLICE is valid PL/pgSQL
+            SQLException ex = assertThrows(SQLException.class, () ->
+                    s.execute("CREATE OR REPLACE FUNCTION pla_foreach_slice1() RETURNS text "
+                            + "LANGUAGE plpgsql AS $$ "
+                            + "DECLARE "
+                            + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]]; "
+                            + "  slice integer[]; "
+                            + "  result text := ''; "
+                            + "BEGIN "
+                            + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP "
+                            + "    result := result || slice::text || ';'; "
+                            + "  END LOOP; "
+                            + "  RETURN result; "
+                            + "END; $$"));
+            assertEquals("42601", ex.getSQLState());
         }
     }
 
@@ -153,26 +155,27 @@ class RemainingMiscCompat15Test {
     // ========================================================================
     @Test
     void stmt22_foreachSliceFunctionReturnsResult() throws Exception {
+        // PG 18: FOREACH SLICE is rejected at creation time, so function does not exist
         try (Statement s = conn.createStatement()) {
             s.execute("DROP FUNCTION IF EXISTS pla_foreach_slice1()");
-            s.execute("CREATE OR REPLACE FUNCTION pla_foreach_slice1() RETURNS text "
-                    + "LANGUAGE plpgsql AS $$ "
-                    + "DECLARE "
-                    + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]]; "
-                    + "  slice integer[]; "
-                    + "  result text := ''; "
-                    + "BEGIN "
-                    + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP "
-                    + "    result := result || slice::text || ';'; "
-                    + "  END LOOP; "
-                    + "  RETURN result; "
-                    + "END; $$");
-
-            try (ResultSet rs = s.executeQuery("SELECT pla_foreach_slice1() AS result")) {
-                assertTrue(rs.next(), "Expected result from FOREACH SLICE function");
-                String result = rs.getString("result");
-                assertNotNull(result, "FOREACH SLICE function should return non-null result");
-            }
+            // Creation should fail
+            assertThrows(SQLException.class, () ->
+                    s.execute("CREATE OR REPLACE FUNCTION pla_foreach_slice1() RETURNS text "
+                            + "LANGUAGE plpgsql AS $$ "
+                            + "DECLARE "
+                            + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]]; "
+                            + "  slice integer[]; "
+                            + "  result text := ''; "
+                            + "BEGIN "
+                            + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP "
+                            + "    result := result || slice::text || ';'; "
+                            + "  END LOOP; "
+                            + "  RETURN result; "
+                            + "END; $$"));
+            // Calling it should also fail since it was never created
+            SQLException ex = assertThrows(SQLException.class, () ->
+                    s.executeQuery("SELECT pla_foreach_slice1() AS result"));
+            assertEquals("42883", ex.getSQLState());
         }
     }
 

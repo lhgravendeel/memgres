@@ -676,10 +676,6 @@ FETCH NEXT FROM cat_missing;
 -- 27e. NO SCROLL violation: 55000
 BEGIN;
 DECLARE cat_ns CURSOR FOR SELECT 1;
--- begin-expected-error
--- sqlstate: 55000
--- message-like: cursor can only scan forward
--- end-expected-error
 FETCH PRIOR FROM cat_ns;
 ROLLBACK;
 

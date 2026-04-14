@@ -8,12 +8,11 @@ import java.sql.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Tests for 3 PG vs Memgres differences from not-enforced-constraints.sql.
+ * Tests for PG 18 NOT ENFORCED behavior on CHECK constraints.
  *
- * These tests assert exact PG 18 behavior. They are expected to FAIL on
- * current Memgres, documenting the real gaps.
- *
- * Uses default JDBC (extended query protocol) to match the comparison framework.
+ * PG 18 does NOT allow ALTER CONSTRAINT ... [NOT] ENFORCED on CHECK constraints —
+ * only FOREIGN KEY constraints support this. CHECK constraints must have their
+ * enforceability set at creation time and it cannot be changed afterward.
  */
 class RemainingNotEnforcedCompat15Test {
 
@@ -49,94 +48,57 @@ class RemainingNotEnforcedCompat15Test {
     }
 
     /**
-     * Stmt 33: ALTER TABLE ALTER CONSTRAINT NOT ENFORCED, then INSERT violating data.
-     * Matches comparison SQL blocks 29-33: create table with ENFORCED CHECK,
-     * fail INSERT, ALTER NOT ENFORCED, INSERT again, SELECT.
-     *
-     * PG and Memgres should both have 1 row after this sequence.
-     * The real comparison difference was in block numbering (the original test
-     * incorrectly expected 0 rows). This test verifies correct NOT ENFORCED behavior.
+     * PG 18: ALTER CONSTRAINT ... NOT ENFORCED on a CHECK constraint is rejected
+     * with SQLSTATE 42809 "cannot alter enforceability of constraint".
      */
     @Test
-    void stmt33_toggleNotEnforcedThenInsert() throws Exception {
+    void stmt33_alterCheckNotEnforcedRejected() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("DROP TABLE IF EXISTS ne_toggle CASCADE");
             s.execute("CREATE TABLE ne_toggle (id integer PRIMARY KEY, val integer, "
                     + "CONSTRAINT chk_toggle CHECK (val > 0))");
 
-            // INSERT fails — constraint is ENFORCED
             try {
-                s.execute("INSERT INTO ne_toggle VALUES (1, -5)");
-            } catch (SQLException ignored) {}
-
-            // Disable enforcement
-            s.execute("ALTER TABLE ne_toggle ALTER CONSTRAINT chk_toggle NOT ENFORCED");
-
-            // INSERT succeeds — constraint is NOT ENFORCED
-            s.execute("INSERT INTO ne_toggle VALUES (1, -5)");
-
-            try (ResultSet rs = s.executeQuery(
-                    "SELECT count(*)::integer AS cnt FROM ne_toggle")) {
-                assertTrue(rs.next());
-                assertEquals(1, rs.getInt("cnt"),
-                        "After ALTER NOT ENFORCED and INSERT, table should have 1 row.");
+                s.execute("ALTER TABLE ne_toggle ALTER CONSTRAINT chk_toggle NOT ENFORCED");
+                fail("ALTER CONSTRAINT NOT ENFORCED on CHECK should fail");
+            } catch (SQLException e) {
+                assertEquals("42809", e.getSQLState());
             }
         }
     }
 
     /**
-     * Stmt 35: ALTER CONSTRAINT ENFORCED validates existing data and rejects
-     * the toggle when violations exist (SQLSTATE 42809).
-     * After the failed ALTER, the constraint remains NOT ENFORCED.
+     * PG 18: ALTER CONSTRAINT ... ENFORCED on a CHECK (NOT ENFORCED) constraint
+     * is also rejected — cannot toggle enforceability of CHECK at all.
      */
     @Test
-    void stmt35_alterEnforcedRejectsViolatingData() throws Exception {
+    void stmt35_alterCheckEnforcedAlsoRejected() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("DROP TABLE IF EXISTS ne_toggle CASCADE");
             s.execute("CREATE TABLE ne_toggle (id integer PRIMARY KEY, val integer, "
-                    + "CONSTRAINT chk_toggle CHECK (val > 0))");
+                    + "CONSTRAINT chk_toggle CHECK (val > 0) NOT ENFORCED)");
 
-            s.execute("ALTER TABLE ne_toggle ALTER CONSTRAINT chk_toggle NOT ENFORCED");
-            s.execute("INSERT INTO ne_toggle VALUES (1, -5)");
-
-            // ALTER ENFORCED should fail because existing data violates the constraint
             try {
                 s.execute("ALTER TABLE ne_toggle ALTER CONSTRAINT chk_toggle ENFORCED");
-                fail("ALTER CONSTRAINT ENFORCED should fail when violating data exists");
+                fail("ALTER CONSTRAINT ENFORCED on CHECK should fail");
             } catch (SQLException e) {
-                // PG returns 42809 "cannot alter enforceability of constraint"
-                assertTrue(e.getSQLState().equals("42809") || e.getSQLState().equals("23514"),
-                        "Expected 42809 or 23514, got: " + e.getSQLState());
-            }
-
-            // Constraint is still NOT ENFORCED — violating INSERT should succeed
-            s.execute("INSERT INTO ne_toggle VALUES (2, -10)");
-
-            try (ResultSet rs = s.executeQuery(
-                    "SELECT count(*)::integer AS cnt FROM ne_toggle")) {
-                assertTrue(rs.next());
-                assertEquals(2, rs.getInt("cnt"),
-                        "After failed ALTER ENFORCED, constraint is still NOT ENFORCED. "
-                        + "Both violating rows should exist.");
+                assertEquals("42809", e.getSQLState());
             }
         }
     }
 
     /**
-     * Stmt 135: information_schema.table_constraints.enforced column after
-     * successful ALTER CONSTRAINT ENFORCED.
-     *
-     * After ALTER CONSTRAINT ... ENFORCED succeeds (no violations), info_schema
-     * should report 'YES' for the enforced column.
+     * CHECK NOT ENFORCED still shows enforced='NO' in information_schema and
+     * cannot be toggled. The enforced state is immutable after creation.
      */
     @Test
-    void stmt135_informationSchemaEnforcedAfterToggle() throws Exception {
+    void stmt135_informationSchemaEnforcedImmutable() throws Exception {
         try (Statement s = conn.createStatement()) {
             s.execute("DROP TABLE IF EXISTS ne_info_toggle CASCADE");
             s.execute("CREATE TABLE ne_info_toggle (id integer PRIMARY KEY, val integer, "
                     + "CONSTRAINT chk_info CHECK (val > 0) NOT ENFORCED)");
 
-            // Verify NOT ENFORCED shows as 'NO'
+            // NOT ENFORCED shows as 'NO'
             try (ResultSet rs = s.executeQuery(
                     "SELECT enforced FROM information_schema.table_constraints "
                     + "WHERE constraint_name = 'chk_info' AND table_schema = 'ne_compat'")) {
@@ -145,18 +107,41 @@ class RemainingNotEnforcedCompat15Test {
                         "NOT ENFORCED constraint should show enforced='NO'");
             }
 
-            // Insert valid data and toggle to ENFORCED
-            s.execute("INSERT INTO ne_info_toggle VALUES (1, 5)");
-            s.execute("ALTER TABLE ne_info_toggle ALTER CONSTRAINT chk_info ENFORCED");
+            // Cannot toggle to ENFORCED — rejected for CHECK constraints
+            try {
+                s.execute("ALTER TABLE ne_info_toggle ALTER CONSTRAINT chk_info ENFORCED");
+                fail("ALTER CONSTRAINT ENFORCED on CHECK should fail");
+            } catch (SQLException e) {
+                assertEquals("42809", e.getSQLState());
+            }
 
-            // After successful ALTER ENFORCED, info_schema should show 'YES'
+            // Still shows 'NO' (unchanged)
             try (ResultSet rs = s.executeQuery(
                     "SELECT enforced FROM information_schema.table_constraints "
                     + "WHERE constraint_name = 'chk_info' AND table_schema = 'ne_compat'")) {
-                assertTrue(rs.next(), "Expected one row from information_schema");
-                assertEquals("YES", rs.getString("enforced"),
-                        "After ALTER CONSTRAINT ENFORCED succeeds, info_schema should show 'YES'.");
+                assertTrue(rs.next());
+                assertEquals("NO", rs.getString("enforced"),
+                        "After failed ALTER, constraint should still show enforced='NO'");
             }
+        }
+    }
+
+    /**
+     * FK constraints DO support ALTER CONSTRAINT ... [NOT] ENFORCED (the only type that does).
+     */
+    @Test
+    void fk_alter_constraint_enforced_toggle_works() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS child CASCADE");
+            s.execute("DROP TABLE IF EXISTS parent CASCADE");
+            s.execute("CREATE TABLE parent (id integer PRIMARY KEY)");
+            s.execute("CREATE TABLE child (id integer PRIMARY KEY, pid integer, "
+                    + "CONSTRAINT fk_pid FOREIGN KEY (pid) REFERENCES parent(id))");
+
+            // Toggle to NOT ENFORCED — should succeed for FK
+            s.execute("ALTER TABLE child ALTER CONSTRAINT fk_pid NOT ENFORCED");
+            // Toggle back to ENFORCED — should succeed
+            s.execute("ALTER TABLE child ALTER CONSTRAINT fk_pid ENFORCED");
         }
     }
 }

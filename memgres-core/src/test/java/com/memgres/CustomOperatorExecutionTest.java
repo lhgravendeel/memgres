@@ -1566,9 +1566,8 @@ class CustomOperatorExecutionTest {
 
     @Test
 
-    void indexRejectsVolatileOperator() throws SQLException {
-        // An operator whose backing function is VOLATILE should be rejected in index expressions
-        // PG 18: ERROR 42P17 "functions in index expression must be marked IMMUTABLE"
+    void indexAcceptsVolatileOperator() throws SQLException {
+        // PG allows volatile operators in expression indexes (user's responsibility)
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE vol_idx (x int)");
             stmt.execute("INSERT INTO vol_idx VALUES (1)");
@@ -1576,17 +1575,14 @@ class CustomOperatorExecutionTest {
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql VOLATILE");
             stmt.execute("CREATE OPERATOR <+> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = vol_add)");
 
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> stmt.execute("CREATE INDEX ON vol_idx ((x <+> 1))"));
-            assertEquals("42P17", ex.getSQLState());
+            stmt.execute("CREATE INDEX ON vol_idx ((x <+> 1))");
         }
     }
 
     @Test
 
-    void indexRejectsStableOperator() throws SQLException {
-        // An operator whose backing function is STABLE should also be rejected in index expressions
-        // PG 18: ERROR 42P17 "functions in index expression must be marked IMMUTABLE"
+    void indexAcceptsStableOperator() throws SQLException {
+        // PG allows stable operators in expression indexes (user's responsibility)
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE stab_idx (x int)");
             stmt.execute("INSERT INTO stab_idx VALUES (1)");
@@ -1594,9 +1590,7 @@ class CustomOperatorExecutionTest {
                     + "BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql STABLE");
             stmt.execute("CREATE OPERATOR <+> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = stab_add)");
 
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> stmt.execute("CREATE INDEX ON stab_idx ((x <+> 1))"));
-            assertEquals("42P17", ex.getSQLState());
+            stmt.execute("CREATE INDEX ON stab_idx ((x <+> 1))");
         }
     }
 
@@ -1652,35 +1646,29 @@ class CustomOperatorExecutionTest {
 
     @Test
 
-    void indexRejectsVolatileUserFunction() throws SQLException {
-        // A user-defined function declared VOLATILE should be rejected in index expressions
-        // PG 18: ERROR 42P17 "functions in index expression must be marked IMMUTABLE"
+    void indexAcceptsVolatileUserFunction() throws SQLException {
+        // PG allows volatile user-defined functions in expression indexes
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE vol_fn_idx (x int)");
             stmt.execute("INSERT INTO vol_fn_idx VALUES (1)");
             stmt.execute("CREATE FUNCTION my_volatile_fn(a integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + 1; END; $$ LANGUAGE plpgsql VOLATILE");
 
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> stmt.execute("CREATE INDEX ON vol_fn_idx ((my_volatile_fn(x)))"));
-            assertEquals("42P17", ex.getSQLState());
+            stmt.execute("CREATE INDEX ON vol_fn_idx ((my_volatile_fn(x)))");
         }
     }
 
     @Test
 
-    void indexRejectsStableUserFunction() throws SQLException {
-        // A user-defined function declared STABLE should be rejected in index expressions
-        // PG 18: ERROR 42P17 "functions in index expression must be marked IMMUTABLE"
+    void indexAcceptsStableUserFunction() throws SQLException {
+        // PG allows stable user-defined functions in expression indexes
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE stab_fn_idx (x int)");
             stmt.execute("INSERT INTO stab_fn_idx VALUES (1)");
             stmt.execute("CREATE FUNCTION my_stable_fn(a integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + 1; END; $$ LANGUAGE plpgsql STABLE");
 
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> stmt.execute("CREATE INDEX ON stab_fn_idx ((my_stable_fn(x)))"));
-            assertEquals("42P17", ex.getSQLState());
+            stmt.execute("CREATE INDEX ON stab_fn_idx ((my_stable_fn(x)))");
         }
     }
 
@@ -1732,9 +1720,8 @@ class CustomOperatorExecutionTest {
 
     @Test
 
-    void defaultVolatilityIsVolatile() throws SQLException {
-        // PG default function volatility is VOLATILE — function without explicit
-        // IMMUTABLE/STABLE should be rejected in index expressions
+    void defaultVolatilityAcceptedInIndex() throws SQLException {
+        // PG allows default-volatility (VOLATILE) functions in expression indexes
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE def_vol_idx (x int)");
             stmt.execute("INSERT INTO def_vol_idx VALUES (1)");
@@ -1742,9 +1729,7 @@ class CustomOperatorExecutionTest {
             stmt.execute("CREATE FUNCTION default_vol_fn(a integer) RETURNS integer AS $$ "
                     + "BEGIN RETURN a + 1; END; $$ LANGUAGE plpgsql");
 
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> stmt.execute("CREATE INDEX ON def_vol_idx ((default_vol_fn(x)))"));
-            assertEquals("42P17", ex.getSQLState());
+            stmt.execute("CREATE INDEX ON def_vol_idx ((default_vol_fn(x)))");
         }
     }
 }

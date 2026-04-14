@@ -31,18 +31,26 @@ public class SqlVerifyHarness {
         public final String errorMessage;
         public final String errorState;
         public final List<String> columns;
+        public final List<String> columnTypeNames;
         public final List<List<String>> rows;
         public final int updateCount;
 
         public StatementResult(String sql, boolean success, String errorMessage, String errorState,
-                               List<String> columns, List<List<String>> rows, int updateCount) {
+                               List<String> columns, List<String> columnTypeNames, List<List<String>> rows, int updateCount) {
             this.sql = sql;
             this.success = success;
             this.errorMessage = errorMessage;
             this.errorState = errorState;
             this.columns = columns;
+            this.columnTypeNames = columnTypeNames;
             this.rows = rows;
             this.updateCount = updateCount;
+        }
+
+        /** Backwards-compatible constructor (no columnTypeNames). */
+        public StatementResult(String sql, boolean success, String errorMessage, String errorState,
+                               List<String> columns, List<List<String>> rows, int updateCount) {
+            this(sql, success, errorMessage, errorState, columns, null, rows, updateCount);
         }
 
         public String sql() { return sql; }
@@ -50,6 +58,7 @@ public class SqlVerifyHarness {
         public String errorMessage() { return errorMessage; }
         public String errorState() { return errorState; }
         public List<String> columns() { return columns; }
+        public List<String> columnTypeNames() { return columnTypeNames; }
         public List<List<String>> rows() { return rows; }
         public int updateCount() { return updateCount; }
 
@@ -189,8 +198,14 @@ public class SqlVerifyHarness {
                     ResultSetMetaData md = rs.getMetaData();
                     int colCount = md.getColumnCount();
                     List<String> columns = new ArrayList<>();
+                    List<String> columnTypeNames = new ArrayList<>();
                     for (int i = 1; i <= colCount; i++) {
                         columns.add(md.getColumnName(i));
+                        try {
+                            columnTypeNames.add(md.getColumnTypeName(i) + "(oid=" + md.getColumnType(i) + ")");
+                        } catch (Exception | AssertionError e) {
+                            columnTypeNames.add("unknown");
+                        }
                     }
                     List<List<String>> rows = new ArrayList<>();
                     while (rs.next()) {
@@ -201,7 +216,7 @@ public class SqlVerifyHarness {
                         }
                         rows.add(row);
                     }
-                    return new StatementResult(sql, true, null, null, columns, rows, -1);
+                    return new StatementResult(sql, true, null, null, columns, columnTypeNames, rows, -1);
                 }
             } else {
                 int updateCount = s.getUpdateCount();

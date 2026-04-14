@@ -1614,8 +1614,9 @@ class DdlObjectExecutor {
                             || col.contains("+") || col.contains("*") || col.contains("/") || col.contains("||")) {
                         // Expression-based index column; try to evaluate against a dummy row to catch type errors
                         String exprStr = col.trim();
-                        // Reject volatile/stable functions and operators in indexes
-                        DdlExecutor.checkExpressionImmutability(exprStr, executor.database,
+                        // Reject built-in volatile functions (random, now, etc.) in index expressions.
+                        // User-defined function volatility is NOT checked — PG allows it.
+                        DdlExecutor.checkBuiltinVolatileInExpression(exprStr, executor.database,
                                 "functions in index expression must be marked IMMUTABLE");
                         // Try to evaluate the expression against a dummy row to catch type errors
                         try {
@@ -1657,6 +1658,10 @@ class DdlObjectExecutor {
                                     case BOOLEAN:
                                         dummyRow[di] = false;
                                         break;
+                                    case JSON:
+                                    case JSONB:
+                                        dummyRow[di] = "{}";
+                                        break;
                                     default:
                                         dummyRow[di] = "dummy";
                                         break;
@@ -1682,6 +1687,8 @@ class DdlObjectExecutor {
                             if (parenIdx > 0) {
                                 String funcName = stripped.substring(0, parenIdx).trim().toLowerCase();
                                 if (!funcName.isEmpty()) {
+                                    // SQL/JSON special forms are not regular functions — skip validation
+                                    if (isJsonSpecialForm(funcName)) continue;
                                     if (executor.database.getFunction(funcName) != null) continue;
                                     try {
                                         executor.functionEvaluator.evalFunction(
@@ -1697,9 +1704,19 @@ class DdlObjectExecutor {
                         } catch (Exception ignored) {}
                         continue;
                     }
-                    if (idxTable.getColumnIndex(col) < 0) {
+                    int colIdx = idxTable.getColumnIndex(col);
+                    if (colIdx < 0) {
                         throw new MemgresException("column \"" + col + "\" does not exist", "42703");
                     }
+                    // PG 18: indexes on virtual generated columns are not supported
+                    if (idxTable.getColumns().get(colIdx).isVirtual()) {
+                        throw new MemgresException(
+                                "indexes on virtual generated columns are not supported", "0A000");
+                    }
+                }
+                // PG 18: partial index WHERE clause referencing virtual generated columns is not supported
+                if (s.whereClause() != null) {
+                    checkWhereClauseVirtualColumns(s.whereClause(), idxTable);
                 }
                 // Validate WHERE predicate (partial index condition) references existing columns
                 if (s.whereClause() != null) {
@@ -1883,5 +1900,57 @@ class DdlObjectExecutor {
             }
         }
         return QueryResult.message(QueryResult.Type.SET, "CREATE INDEX");
+    }
+
+    /** SQL/JSON special forms that are parsed as keywords, not regular functions. */
+    private static boolean isJsonSpecialForm(String name) {
+        switch (name) {
+            case "json_value":
+            case "json_query":
+            case "json_exists":
+            case "json_serialize":
+            case "json_scalar":
+            case "json_table":
+            case "json_array":
+            case "json_object":
+            case "json_arrayagg":
+            case "json_objectagg":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** PG 18: reject partial indexes whose WHERE clause references virtual generated columns. */
+    private void checkWhereClauseVirtualColumns(String whereClause, Table table) {
+        try {
+            Expression predExpr = com.memgres.engine.parser.Parser.parseExpression(whereClause);
+            checkExprVirtualColumnRefs(predExpr, table);
+        } catch (MemgresException me) {
+            throw me;
+        } catch (Exception ignored) {}
+    }
+
+    private void checkExprVirtualColumnRefs(Expression expr, Table table) {
+        if (expr == null) return;
+        if (expr instanceof ColumnRef) {
+            ColumnRef cr = (ColumnRef) expr;
+            int idx = table.getColumnIndex(cr.column());
+            if (idx >= 0 && table.getColumns().get(idx).isVirtual()) {
+                throw new MemgresException(
+                        "indexes on virtual generated columns are not supported", "0A000");
+            }
+        } else if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            checkExprVirtualColumnRefs(bin.left(), table);
+            checkExprVirtualColumnRefs(bin.right(), table);
+        } else if (expr instanceof UnaryExpr) {
+            checkExprVirtualColumnRefs(((UnaryExpr) expr).operand(), table);
+        } else if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            if (fn.args() != null) {
+                for (Expression arg : fn.args()) checkExprVirtualColumnRefs(arg, table);
+            }
+        }
     }
 }

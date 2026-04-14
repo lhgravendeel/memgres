@@ -325,6 +325,18 @@ class PgWireBinaryCodec {
                     encodeBinaryNumericToBuf(buf, bd);
                     break;
                 }
+                case BYTEA: {
+                    // Send raw bytes in binary format (not hex-encoded)
+                    byte[] raw;
+                    if (val instanceof byte[]) {
+                        raw = (byte[]) val;
+                    } else {
+                        raw = val.toString().getBytes(StandardCharsets.UTF_8);
+                    }
+                    buf.writeInt(raw.length);
+                    buf.writeBytes(raw);
+                    break;
+                }
                 default: {
                     String text = PgWireValueFormatter.formatValue(val, null);
                     byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
