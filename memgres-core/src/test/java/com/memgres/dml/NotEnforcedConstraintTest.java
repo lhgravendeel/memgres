@@ -72,6 +72,27 @@ class NotEnforcedConstraintTest {
     }
 
     // ========================================================================
+    // EXCLUDE constraint NOT ENFORCED — rejected by PG 18 with 0A000
+    // ========================================================================
+
+    @Test
+    void exclude_not_enforced_is_rejected() {
+        // PG 18: "EXCLUDE constraints cannot be marked NOT ENFORCED"
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int, room int, during tsrange, " +
+                     "CONSTRAINT excl_room EXCLUDE USING gist (room WITH =, during WITH &&) NOT ENFORCED)"));
+        assertEquals("0A000", ex.getSQLState());
+        assertTrue(ex.getMessage().toLowerCase().contains("exclude"));
+    }
+
+    @Test
+    void exclude_without_not_enforced_is_accepted() throws SQLException {
+        // Plain EXCLUDE (without NOT ENFORCED) should still be accepted (as DDL stub)
+        exec("CREATE TABLE t1(id int, room int, during tsrange, " +
+             "CONSTRAINT excl_room EXCLUDE USING gist (room WITH =, during WITH &&))");
+    }
+
+    // ========================================================================
     // CHECK constraint NOT ENFORCED — table level
     // ========================================================================
 

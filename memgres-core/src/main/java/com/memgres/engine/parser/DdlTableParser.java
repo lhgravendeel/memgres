@@ -578,6 +578,11 @@ class DdlTableParser {
             } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
                 parser.advance(); parser.advance();
             }
+            boolean exNotEnforced = parseNotEnforced();
+            if (exNotEnforced) {
+                throw new com.memgres.engine.MemgresException(
+                        "EXCLUDE constraints cannot be marked NOT ENFORCED", "0A000");
+            }
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.EXCLUDE,
                     excludeCols, null, null, null, null, null, false, exDeferrable, exInitiallyDeferred, false, excludeElements);
         }
