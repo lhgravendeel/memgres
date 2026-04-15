@@ -3842,12 +3842,10 @@ SQL: DROP ROLE compat_role
 OK: 0 rows affected
 --- STMT 58 ---
 SQL: -- bad admin/session cases SET no_such_guc = '1'
-OK: 0 rows affected
+ERROR [42704]: ERROR: unrecognized configuration parameter "no_such_guc"
 --- STMT 59 ---
 SQL: SHOW no_such_guc
-RESULT: 1 columns, 1 rows
-COLUMNS: no_such_guc
-ROW: 1
+ERROR [42704]: ERROR: unrecognized configuration parameter "no_such_guc"
 --- STMT 60 ---
 SQL: LISTEN
 ERROR [42601]: ERROR: syntax error: Expected identifier at position 6 near ''

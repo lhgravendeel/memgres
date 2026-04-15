@@ -12,6 +12,10 @@ public final class CreateSequenceStmt implements Statement {
     public final Long maxValue;
     public final Boolean cycle;
     public final boolean temporary;
+    private Integer cache;
+
+    public Integer getCache() { return cache; }
+    public void setCache(Integer cache) { this.cache = cache; }
 
     public CreateSequenceStmt(
             String name,

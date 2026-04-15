@@ -141,7 +141,15 @@ class DdlExecutor {
                 return sc;
             }
             case CHECK: {
-                if (name == null) name = tableName + "_check";
+                if (name == null) {
+                    // PG uses {table}_{col}_check for inline column CHECK constraints
+                    List<String> checkCols = tc.columns();
+                    if (checkCols != null && !checkCols.isEmpty()) {
+                        name = tableName + "_" + String.join("_", checkCols) + "_check";
+                    } else {
+                        name = tableName + "_check";
+                    }
+                }
                 StoredConstraint chk = StoredConstraint.check(name, tc.checkExpr());
                 if (tc.notEnforced()) chk.setNotEnforced(true);
                 if (tc.deferrable()) {

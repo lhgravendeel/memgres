@@ -319,7 +319,7 @@ class CatalogSystemFunctions {
                     if (fn.args().size() > 1 && executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx))) {
                         return null;
                     }
-                    throw new MemgresException("unrecognized configuration parameter \"" + setting + "\"");
+                    throw new MemgresException("unrecognized configuration parameter \"" + setting + "\"", "42704");
                 }
                 return value;
             }

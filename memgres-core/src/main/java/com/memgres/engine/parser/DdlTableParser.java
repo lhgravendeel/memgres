@@ -289,7 +289,7 @@ class DdlTableParser {
                 boolean checkNotEnforced = parseNotEnforced();
                 columnCheckExpr = checkExpr;
                 pendingColumnChecks.add(new TableConstraint(null, TableConstraint.ConstraintType.CHECK,
-                        Cols.listOf(), checkExpr, null, null, null, null, false, false, false, checkNotEnforced, null));
+                        Cols.listOf(colName), checkExpr, null, null, null, null, false, false, false, checkNotEnforced, null));
                 continue;
             }
             if (parser.matchKeyword("CONSTRAINT")) {

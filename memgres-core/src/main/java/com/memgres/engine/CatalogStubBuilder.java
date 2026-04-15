@@ -262,7 +262,7 @@ class CatalogStubBuilder {
                         oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName()),
                         schemaEntry.getKey(), t.getName(),
                         0L, null, 0L, 0L, null, 0L,   // scans
-                        0L, 0L, 0L, 0L,               // ins, upd, del, hot_upd
+                        t.getTupInserted(), t.getTupUpdated(), t.getTupDeleted(), 0L, // ins, upd, del, hot_upd
                         (long) t.getRows().size(), 0L, // live, dead
                         0L, 0L,                        // mod_since_analyze, ins_since_vacuum
                         null, null, null, null,         // last vacuum/analyze
@@ -286,6 +286,8 @@ class CatalogStubBuilder {
                 col("idx_tup_fetch", DataType.BIGINT)
         );
         Table table = new Table("pg_stat_user_indexes", cols);
+        // Track which indexes we've already added (to avoid duplicates)
+        Set<String> addedIndexes = new java.util.HashSet<>();
         // Populate with explicit indexes (zero stats)
         for (Map.Entry<String, List<String>> idx : database.getIndexColumns().entrySet()) {
             String indexName = idx.getKey();
@@ -298,12 +300,32 @@ class CatalogStubBuilder {
                 else tableName = parts[0];
             }
             if (tableName != null) {
+                addedIndexes.add(indexName.toLowerCase());
                 table.insertRow(new Object[]{
                         oids.oid("rel:" + indexSchema + "." + tableName),
                         oids.oid("rel:" + indexSchema + "." + indexName),
                         indexSchema, tableName, indexName,
                         0L, null, 0L, 0L
                 });
+            }
+        }
+        // Also populate from constraint-based indexes (PK, UNIQUE) on user tables
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                Table t = tableEntry.getValue();
+                for (Map.Entry<String, TableIndex> idxEntry : t.getIndexes().entrySet()) {
+                    String constraintName = idxEntry.getKey();
+                    if (!addedIndexes.contains(constraintName.toLowerCase())) {
+                        addedIndexes.add(constraintName.toLowerCase());
+                        table.insertRow(new Object[]{
+                                oids.oid("rel:" + schemaName + "." + t.getName()),
+                                oids.oid("rel:" + schemaName + "." + constraintName),
+                                schemaName, t.getName(), constraintName,
+                                0L, null, 0L, 0L
+                        });
+                    }
+                }
             }
         }
         return table;
@@ -344,13 +366,48 @@ class CatalogStubBuilder {
         int numBackends = database.getActiveSessions().size();
         table.insertRow(new Object[]{
                 oids.oid("db:memgres"), "memgres", numBackends,
-                0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                database.getXactCommitCount(), 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
                 0L, null,    // checksum_failures, checksum_last_failure
                 0.0, 0.0,   // blk_read_time, blk_write_time
                 0.0, 0.0, 0.0, // session_time, active_time, idle_in_transaction_time
                 (long) numBackends, 0L, 0L, 0L, // sessions, abandoned, fatal, killed
                 null
         });
+        return table;
+    }
+
+    Table buildPgStatistic() {
+        List<Column> cols = Cols.listOf(
+                col("starelid", DataType.INTEGER),
+                col("staattnum", DataType.SMALLINT),
+                col("stainherit", DataType.BOOLEAN),
+                col("stanullfrac", DataType.REAL),
+                col("stawidth", DataType.INTEGER),
+                col("stadistinct", DataType.REAL)
+        );
+        Table table = new Table("pg_statistic", cols);
+        // Populate with rows for tables that have been ANALYZEd
+        for (String schemaTable : database.getAnalyzedTables()) {
+            String[] parts = schemaTable.split("\\.", 2);
+            if (parts.length < 2) continue;
+            String schemaName = parts[0];
+            String tableName = parts[1];
+            Schema schema = database.getSchema(schemaName);
+            if (schema == null) continue;
+            Table t = schema.getTable(tableName);
+            if (t == null) continue;
+            int relOid = oids.oid("rel:" + schemaTable);
+            for (int i = 0; i < t.getColumns().size(); i++) {
+                table.insertRow(new Object[]{
+                        relOid,
+                        (short)(i + 1),
+                        false,
+                        0.0f,
+                        0,
+                        -1.0f
+                });
+            }
+        }
         return table;
     }
 
@@ -1086,7 +1143,17 @@ class CatalogStubBuilder {
                 col("owner", DataType.TEXT),
                 col("database", DataType.TEXT)
         );
-        return new Table("pg_prepared_xacts", cols); // empty, no 2PC support
+        Table table = new Table("pg_prepared_xacts", cols);
+        for (Database.PreparedTransaction pt : database.getPreparedTransactions().values()) {
+            table.insertRow(new Object[]{
+                    (int) pt.transactionId,
+                    pt.gid,
+                    formatTimestamptz(pt.prepared),
+                    pt.owner,
+                    pt.database
+            });
+        }
+        return table;
     }
 
     Table buildPgCursors(Session session) {

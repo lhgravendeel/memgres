@@ -170,6 +170,10 @@ class SessionExecutor {
                 if (param.equalsIgnoreCase("ALL")) {
                     guc.resetAll();
                 } else {
+                    // PG rejects RESET of unknown flat params with 42704
+                    if (!param.contains(".") && !guc.isKnown(param)) {
+                        throw new MemgresException("unrecognized configuration parameter \"" + param + "\"", "42704");
+                    }
                     guc.reset(param);
                 }
             }
@@ -248,6 +252,17 @@ class SessionExecutor {
             if (val != null && val.startsWith("table:")) {
                 String tblName = val.substring("table:".length());
                 executor.resolveTable(executor.defaultSchema(), tblName);
+                // Record analyzed table for pg_statistic
+                if (name.equals("analyze")) {
+                    executor.database.recordAnalyzedTable(executor.defaultSchema() + "." + tblName);
+                }
+            } else if (name.equals("analyze")) {
+                // ANALYZE without a table name: analyze all tables
+                for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
+                    for (String tableName : schemaEntry.getValue().getTables().keySet()) {
+                        executor.database.recordAnalyzedTable(schemaEntry.getKey() + "." + tableName);
+                    }
+                }
             }
             return QueryResult.message(QueryResult.Type.SET, name.equals("analyze") ? "ANALYZE" : "VACUUM");
         }
@@ -363,9 +378,11 @@ class SessionExecutor {
                 "security_label", "analyze", "vacuum",
                 "cluster", "checkpoint", "load");
 
-        // Accept unknown SET parameters silently because pg_dump and other tools send many
-        // PG-specific SET commands (synchronize_seqscans, lock_timeout, etc.) that are
-        // no-ops for Memgres but must not cause errors.
+        // PG rejects unknown flat (non-dotted) parameter names with 42704.
+        // Dotted names (e.g. my_ext.setting) are allowed as custom variables.
+        if (guc != null && !internalNames.contains(name) && !name.contains(".") && !guc.isKnown(name)) {
+            throw new MemgresException("unrecognized configuration parameter \"" + name + "\"", "42704");
+        }
 
         if (guc != null && !internalNames.contains(name)) {
             String value = stmt.value();

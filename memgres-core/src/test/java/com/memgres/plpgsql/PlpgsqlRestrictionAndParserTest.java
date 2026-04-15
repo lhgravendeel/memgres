@@ -149,18 +149,20 @@ class PlpgsqlRestrictionAndParserTest {
     }
 
     // ========================================================================
-    // D2-3: FOREACH SLICE should be rejected (matching PG 18)
+    // D2-3: FOREACH SLICE is now supported
     // ========================================================================
 
     @Test
     void foreachSliceRejectedAtCreation() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            SQLException ex = assertThrows(SQLException.class, () ->
-                    s.execute("CREATE FUNCTION test_foreach_slice() RETURNS text LANGUAGE plpgsql AS $$ "
-                            + "DECLARE arr integer[] := ARRAY[[1,2],[3,4]]; slice integer[]; result text := ''; "
-                            + "BEGIN FOREACH slice SLICE 1 IN ARRAY arr LOOP result := result || slice::text; END LOOP; RETURN result; END; $$"));
-            assertEquals("42601", ex.getSQLState(),
-                    "FOREACH SLICE should be rejected with syntax error 42601");
+            s.execute("DROP FUNCTION IF EXISTS test_foreach_slice()");
+            s.execute("CREATE FUNCTION test_foreach_slice() RETURNS text LANGUAGE plpgsql AS $$ "
+                    + "DECLARE arr integer[] := ARRAY[[1,2],[3,4]]; slice integer[]; result text := ''; "
+                    + "BEGIN FOREACH slice SLICE 1 IN ARRAY arr LOOP result := result || slice::text; END LOOP; RETURN result; END; $$");
+            try (ResultSet rs = s.executeQuery("SELECT test_foreach_slice() AS result")) {
+                assertTrue(rs.next());
+                assertNotNull(rs.getString("result"));
+            }
         }
     }
 

@@ -65,11 +65,11 @@ ORDER BY user_id;
 
 -- begin-expected
 -- columns: user_id|name|city_label
--- row: 5|Dave Brown|(unknown)
 -- row: 3|Alicia Reed|Utrecht
 -- row: 2|Bob Smith|Rotterdam
 -- row: 1|Alice Jones|Amsterdam
 -- row: 4|Carol White|Amsterdam
+-- row: 5|Dave Brown|(unknown)
 -- end-expected
 SELECT user_id, name, COALESCE(city, '(unknown)') AS city_label
 FROM users

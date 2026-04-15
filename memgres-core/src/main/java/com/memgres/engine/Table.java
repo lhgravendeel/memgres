@@ -25,6 +25,11 @@ public class Table {
     // Hash indexes keyed by constraint name (for PK, UNIQUE constraints)
     private final Map<String, TableIndex> indexes = new ConcurrentHashMap<>();
 
+    // DML statistics counters for pg_stat_user_tables
+    private final AtomicLong tupInserted = new AtomicLong(0);
+    private final AtomicLong tupUpdated = new AtomicLong(0);
+    private final AtomicLong tupDeleted = new AtomicLong(0);
+
     // Inheritance
     private Table parentTable;
     private final List<Table> children = new CopyOnWriteArrayList<>();
@@ -606,4 +611,12 @@ public class Table {
     public void setRlsForced(boolean forced) { this.rlsForced = forced; }
     public List<RlsPolicy> getRlsPolicies() { return rlsPolicies; }
     public void addRlsPolicy(RlsPolicy policy) { rlsPolicies.add(policy); }
+
+    // DML statistics
+    public long getTupInserted() { return tupInserted.get(); }
+    public long getTupUpdated() { return tupUpdated.get(); }
+    public long getTupDeleted() { return tupDeleted.get(); }
+    public void incrementTupInserted(long count) { tupInserted.addAndGet(count); }
+    public void incrementTupUpdated(long count) { tupUpdated.addAndGet(count); }
+    public void incrementTupDeleted(long count) { tupDeleted.addAndGet(count); }
 }

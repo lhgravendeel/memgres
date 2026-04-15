@@ -1485,6 +1485,7 @@ class DdlObjectExecutor {
         }
         Sequence seq = new Sequence(seqName, stmt.startWith(), incr, minVal, maxVal);
         if (stmt.cycle() != null) seq.setCycle(stmt.cycle());
+        if (stmt.getCache() != null) seq.setCache(stmt.getCache());
         executor.database.addSequence(seq);
         executor.database.registerSchemaObject(executor.defaultSchema(), "sequence", seqName);
         executor.recordUndo(new Session.CreateSequenceUndo(seqName));

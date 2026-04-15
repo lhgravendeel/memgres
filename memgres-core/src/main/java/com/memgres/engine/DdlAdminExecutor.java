@@ -67,9 +67,28 @@ class DdlAdminExecutor {
                 case ROLLBACK_TO_SAVEPOINT:
                     executor.session.rollbackToSavepoint(stmt.savepointName());
                     break;
-                case PREPARE_TRANSACTION:
-                case COMMIT_PREPARED:
+                case PREPARE_TRANSACTION: {
+                    String gid = stmt.savepointName();
+                    Database.PreparedTransaction pt = executor.session.prepareTransaction(gid);
+                    executor.database.addPreparedTransaction(pt);
+                    break;
+                }
+                case COMMIT_PREPARED: {
+                    String gid = stmt.savepointName();
+                    Database.PreparedTransaction pt = executor.database.removePreparedTransaction(gid);
+                    if (pt != null) {
+                        Session.commitPreparedTransaction(pt);
+                    }
+                    // If pt is null, treat as no-op (compatible with shim 2PC support)
+                    break;
+                }
                 case ROLLBACK_PREPARED: {
+                    String gid = stmt.savepointName();
+                    Database.PreparedTransaction pt = executor.database.removePreparedTransaction(gid);
+                    if (pt != null) {
+                        Session.rollbackPreparedTransaction(executor.database, pt);
+                    }
+                    // If pt is null, treat as no-op (compatible with shim 2PC support)
                     break;
                 }
             }

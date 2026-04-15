@@ -35,6 +35,26 @@ class DmlExecutor {
         return role != null && role.equalsIgnoreCase("replica");
     }
 
+    /** Record row metadata (xmin, cmin) for system column support. */
+    void recordRowMeta(String schema, Table table, Object[] row) {
+        if (executor.session != null && executor.database != null) {
+            String tableKey = (schema != null ? schema : "public") + "." + table.getName();
+            long xmin = executor.session.getTransactionId();
+            long cmin = executor.session.getCommandId();
+            executor.database.setRowInsertMeta(tableKey, row, xmin, cmin);
+        }
+    }
+
+    /** Record row metadata update (new ctid after UPDATE). */
+    void recordRowUpdateMeta(String schema, Table table, Object[] row) {
+        if (executor.session != null && executor.database != null) {
+            String tableKey = (schema != null ? schema : "public") + "." + table.getName();
+            long xmin = executor.session.getTransactionId();
+            long cmin = executor.session.getCommandId();
+            executor.database.setRowUpdateMeta(tableKey, row, xmin, cmin);
+        }
+    }
+
     /** Push CTE scope, execute action, pop CTE scope. DRYs INSERT/UPDATE/DELETE CTE handling. */
     private <T> T withCteScope(List<SelectStmt.CommonTableExpr> withClauses, java.util.function.Supplier<T> action) {
         boolean pushed = false;
@@ -430,6 +450,7 @@ class DmlExecutor {
                 targetTable.getWriteLock().unlock();
             }
             recordInsertUndo(stmt.schema(), targetTable.getName(), row);
+            recordRowMeta(stmt.schema(), targetTable, row);
             inserted++;
             insertedRows.add(Arrays.copyOf(row, row.length));
 
@@ -444,6 +465,9 @@ class DmlExecutor {
 
         // Fire statement-level AFTER triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, table, insertedRows, null);
+
+        // Track DML statistics
+        if (inserted > 0) table.incrementTupInserted(inserted);
 
         if (stmt.returning() != null && !stmt.returning().isEmpty()) {
             List<Column> retCols = buildReturningColumns(stmt.returning(), table);
@@ -586,6 +610,7 @@ class DmlExecutor {
                     table.getWriteLock().unlock();
                 }
                 recordInsertUndo(null, stmt.table(), row);
+                recordRowMeta(null, table, row);
                 inserted++;
             }
             return QueryResult.command(QueryResult.Type.INSERT, inserted);
@@ -681,6 +706,7 @@ class DmlExecutor {
             table.getWriteLock().unlock();
         }
         recordInsertUndo(null, stmt.table(), row);
+        recordRowMeta(null, table, row);
 
         // Fire AFTER INSERT triggers
         if (triggers != null && !triggers.isEmpty()) {
@@ -832,6 +858,7 @@ class DmlExecutor {
                 validationHelper.validateDomainChecks(newRow, table);
                 recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
                 table.updateRowInPlace(row, oldRow, newRow);
+                recordRowUpdateMeta(stmt.schema(), table, row);
                 executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
                 if (stmt.returning() != null && !stmt.returning().isEmpty()) {
@@ -841,6 +868,8 @@ class DmlExecutor {
             int count = updated.size();
             // Fire statement-level AFTER UPDATE triggers
             triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, null, null);
+            // Track DML statistics
+            if (count > 0) table.incrementTupUpdated(count);
             if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                 return QueryResult.returning(QueryResult.Type.UPDATE,
                         buildReturningColumns(stmt.returning(), table), returningRows, count);
@@ -888,6 +917,7 @@ class DmlExecutor {
             recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
 
             table.updateRowInPlace(row, oldRow, newRow);
+            recordRowUpdateMeta(stmt.schema(), table, row);
 
             // Handle FK ON UPDATE cascades
             executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
@@ -903,6 +933,9 @@ class DmlExecutor {
 
         // Fire statement-level AFTER UPDATE triggers
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, null, null);
+
+        // Track DML statistics
+        if (!rows.isEmpty()) table.incrementTupUpdated(rows.size());
 
         if (stmt.returning() != null && !stmt.returning().isEmpty()) {
             return QueryResult.returning(QueryResult.Type.UPDATE,
@@ -1076,6 +1109,8 @@ class DmlExecutor {
             for (Table t : allTables) {
                 count += t.deleteAll();
             }
+            // Track DML statistics
+            if (count > 0) table.incrementTupDeleted(count);
             if (hasReturning) {
                 return QueryResult.returning(QueryResult.Type.DELETE,
                         buildReturningColumns(stmt.returning(), table), returningRows, count);
@@ -1197,6 +1232,9 @@ class DmlExecutor {
 
         // Fire statement-level AFTER DELETE triggers
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, table, null, null);
+
+        // Track DML statistics
+        if (deleted > 0) table.incrementTupDeleted(deleted);
 
         if (hasReturning) {
             return QueryResult.returning(QueryResult.Type.DELETE,

@@ -427,42 +427,54 @@ class PlpgsqlAdvancedTest {
      * Memgres: OK 0 rows affected
      */
     /**
-     * Stmt 21: PG 18 rejects FOREACH SLICE with 42601 syntax error.
+     * Stmt 21: FOREACH SLICE is valid PL/pgSQL and should create successfully.
      */
     @Test
     void testStmt21_foreachSlice1CreateShouldFail() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            SQLException ex = assertThrows(SQLException.class, () ->
-                    s.execute("""
-                        CREATE OR REPLACE FUNCTION pla_foreach_slice1_test() RETURNS text
-                        LANGUAGE plpgsql AS $$
-                        DECLARE
-                          arr integer[] := ARRAY[[1,2],[3,4],[5,6]];
-                          slice integer[];
-                          result text := '';
-                        BEGIN
-                          FOREACH slice SLICE 1 IN ARRAY arr LOOP
-                            result := result || slice::text || ';';
-                          END LOOP;
-                          RETURN result;
-                        END;
-                        $$
-                    """));
-            assertEquals("42601", ex.getSQLState(),
-                    "FOREACH SLICE should be rejected with 42601");
+            s.execute("""
+                CREATE OR REPLACE FUNCTION pla_foreach_slice1_test() RETURNS text
+                LANGUAGE plpgsql AS $$
+                DECLARE
+                  arr integer[] := ARRAY[[1,2],[3,4],[5,6]];
+                  slice integer[];
+                  result text := '';
+                BEGIN
+                  FOREACH slice SLICE 1 IN ARRAY arr LOOP
+                    result := result || slice::text || ';';
+                  END LOOP;
+                  RETURN result;
+                END;
+                $$
+            """);
         }
     }
 
     /**
-     * Stmt 22: Since FOREACH SLICE creation fails, calling it should fail with 42883.
+     * Stmt 22: FOREACH SLICE function should execute and return results.
      */
     @Test
     void testStmt22_foreachSlice1CallShouldFail() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            SQLException ex = assertThrows(SQLException.class, () ->
-                    s.executeQuery("SELECT pla_foreach_slice1() AS result"));
-            assertEquals("42883", ex.getSQLState(),
-                    "Function should not exist since creation was rejected");
+            s.execute("""
+                CREATE OR REPLACE FUNCTION pla_foreach_slice1_call_test() RETURNS text
+                LANGUAGE plpgsql AS $$
+                DECLARE
+                  arr integer[] := ARRAY[[1,2],[3,4],[5,6]];
+                  slice integer[];
+                  result text := '';
+                BEGIN
+                  FOREACH slice SLICE 1 IN ARRAY arr LOOP
+                    result := result || slice::text || ';';
+                  END LOOP;
+                  RETURN result;
+                END;
+                $$
+            """);
+            try (ResultSet rs = s.executeQuery("SELECT pla_foreach_slice1_call_test() AS result")) {
+                assertTrue(rs.next());
+                assertNotNull(rs.getString("result"));
+            }
         }
     }
 

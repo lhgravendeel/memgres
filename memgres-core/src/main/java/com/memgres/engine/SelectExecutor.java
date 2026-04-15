@@ -22,6 +22,13 @@ class SelectExecutor {
     final SelectCteExecutor cteExecutor;
     final SelectSetOpExecutor setOpExecutor;
 
+    /** Check if a column name is a PostgreSQL system column. */
+    static boolean isSystemColumn(String name) {
+        String lc = name.toLowerCase();
+        return lc.equals("tableoid") || lc.equals("ctid") || lc.equals("xmin")
+                || lc.equals("xmax") || lc.equals("cmin") || lc.equals("cmax");
+    }
+
     private static final Set<String> AGGREGATE_FUNCTIONS = Cols.setOf(
             "count", "sum", "avg", "min", "max", "string_agg", "array_agg",
             "bool_and", "bool_or", "every",
@@ -113,7 +120,7 @@ class SelectExecutor {
         if ((simpleFrom || hasJoins) && !baseBindings.isEmpty()) {
             for (SelectStmt.SelectTarget target : stmt.targets()) {
                 if (target.expr() instanceof ColumnRef && ((ColumnRef) target.expr()).column() != null && !"*".equals(((ColumnRef) target.expr()).column())
-                        && !"tableoid".equalsIgnoreCase(((ColumnRef) target.expr()).column())) {
+                        && !isSystemColumn(((ColumnRef) target.expr()).column())) {
                     ColumnRef cr = (ColumnRef) target.expr();
                     if (cr.table() == null) {
                         int matchCount = 0;
@@ -520,7 +527,15 @@ class SelectExecutor {
                     if (va == null && vb == null) cmp = 0;
                     else if (va == null) cmp = item.nullsFirst() != null && item.nullsFirst() ? -1 : 1;
                     else if (vb == null) cmp = item.nullsFirst() != null && item.nullsFirst() ? 1 : -1;
-                    else cmp = executor.compareValues(va, vb);
+                    else {
+                        String collation = item.expr() instanceof CollateExpr
+                                ? ((CollateExpr) item.expr()).collation() : null;
+                        if (collation != null && va instanceof String && vb instanceof String) {
+                            cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb, collation);
+                        } else {
+                            cmp = executor.compareValues(va, vb);
+                        }
+                    }
                     if (item.descending()) cmp = -cmp;
                     if (cmp != 0) return cmp;
                 }
@@ -937,9 +952,13 @@ class SelectExecutor {
     private void sortContexts(List<RowContext> contexts, List<SelectStmt.OrderByItem> resolvedOrderBy) {
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
             List<CustomEnum> enumLookups = new ArrayList<>();
+            List<String> collationLookups = new ArrayList<>();
             for (SelectStmt.OrderByItem item : resolvedOrderBy) {
                 CustomEnum ce = resolveEnumForExpr(item.expr(), contexts);
                 enumLookups.add(ce);
+                // Extract explicit COLLATE collation name if present
+                collationLookups.add(item.expr() instanceof CollateExpr
+                        ? ((CollateExpr) item.expr()).collation() : null);
             }
             contexts.sort((ctxA, ctxB) -> {
                 for (int idx = 0; idx < resolvedOrderBy.size(); idx++) {
@@ -959,7 +978,12 @@ class SelectExecutor {
                     if (ce != null) {
                         cmp = Integer.compare(ce.ordinal(va.toString()), ce.ordinal(vb.toString()));
                     } else {
-                        cmp = executor.compareValues(va, vb);
+                        String collation = collationLookups.get(idx);
+                        if (collation != null && va instanceof String && vb instanceof String) {
+                            cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb, collation);
+                        } else {
+                            cmp = executor.compareValues(va, vb);
+                        }
                     }
                     if (item.descending()) cmp = -cmp;
                     if (cmp != 0) return cmp;
@@ -1172,7 +1196,15 @@ class SelectExecutor {
                         if (va == null && vb == null) cmp = 0;
                         else if (va == null) cmp = item.nullsFirst() != null && item.nullsFirst() ? -1 : 1;
                         else if (vb == null) cmp = item.nullsFirst() != null && item.nullsFirst() ? 1 : -1;
-                        else cmp = executor.compareValues(va, vb);
+                        else {
+                            String collation = item.expr() instanceof CollateExpr
+                                    ? ((CollateExpr) item.expr()).collation() : null;
+                            if (collation != null && va instanceof String && vb instanceof String) {
+                                cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb, collation);
+                            } else {
+                                cmp = executor.compareValues(va, vb);
+                            }
+                        }
                         if (item.descending()) cmp = -cmp;
                         if (cmp != 0) return cmp;
                     }

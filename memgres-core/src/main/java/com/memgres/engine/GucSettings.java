@@ -86,6 +86,7 @@ public class GucSettings {
         DEFAULTS.put("idle_in_transaction_session_timeout", "0");
         DEFAULTS.put("statement_timeout", "0");
         DEFAULTS.put("lock_timeout", "0");
+        DEFAULTS.put("transaction_timeout", "0");
         DEFAULTS.put("row_security", "on");
         DEFAULTS.put("check_function_bodies", "on");
         DEFAULTS.put("default_tablespace", "");
@@ -95,6 +96,7 @@ public class GucSettings {
         DEFAULTS.put("max_parallel_workers_per_gather", "2");
         DEFAULTS.put("jit", "off");
         DEFAULTS.put("integer_datetimes", "on");
+        DEFAULTS.put("synchronize_seqscans", "on");
 
         // Float/numeric display (commonly set by JDBC drivers)
         DEFAULTS.put("extra_float_digits", "3");
@@ -155,7 +157,7 @@ public class GucSettings {
     /** Set of timeout parameters whose display value should be human-formatted by PG. */
     private static final Set<String> TIMEOUT_PARAMS = Cols.setOf(
         "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout",
-        "idle_session_timeout", "authentication_timeout");
+        "idle_session_timeout", "authentication_timeout", "transaction_timeout");
 
     /**
      * Get a parameter value formatted for display (SHOW).

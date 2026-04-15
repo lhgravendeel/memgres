@@ -117,6 +117,12 @@ public class RowContext {
         if ("tableoid".equalsIgnoreCase(columnName)) {
             return resolveTableoid(tableQualifier);
         }
+        // Handle system columns: ctid, xmin, xmax, cmin, cmax
+        String lcCol = columnName.toLowerCase();
+        if (lcCol.equals("ctid") || lcCol.equals("xmin") || lcCol.equals("xmax")
+                || lcCol.equals("cmin") || lcCol.equals("cmax")) {
+            return resolveSystemColumn(tableQualifier, lcCol);
+        }
 
         if (tableQualifier != null) {
             TableBinding b = getBinding(tableQualifier);
@@ -174,6 +180,45 @@ public class RowContext {
     }
 
     /**
+     * Resolve system columns (ctid, xmin, xmax, cmin, cmax) for a row.
+     */
+    private Object resolveSystemColumn(String tableQualifier, String colName) {
+        TableBinding b;
+        if (tableQualifier != null) {
+            b = getBinding(tableQualifier);
+            if (b == null) {
+                throw new MemgresException("missing FROM-clause entry for table \"" + tableQualifier + "\"", "42P01");
+            }
+        } else {
+            if (bindings.isEmpty()) {
+                throw new MemgresException("column \"" + colName + "\" does not exist", "42703");
+            }
+            b = bindings.get(0);
+        }
+        Table table = b.sourceTable();
+        Object[] row = b.row();
+        if (colName.equals("ctid")) {
+            // Return a SystemColumnRef so ExprEvaluator can compute with metadata
+            return new SystemColumnRef(table, row, "ctid");
+        }
+        // xmin, xmax, cmin, cmax: look up from row metadata
+        return new SystemColumnRef(table, row, colName);
+    }
+
+    /** Marker for deferred system column resolution (xmin/xmax/cmin/cmax). */
+    public static final class SystemColumnRef {
+        public final Table table;
+        public final Object[] row;
+        public final String column;
+
+        public SystemColumnRef(Table table, Object[] row, String column) {
+            this.table = table;
+            this.row = row;
+            this.column = column;
+        }
+    }
+
+    /**
      * A marker object holding a reference to the source table for tableoid resolution.
      * The AstExecutor/CastEvaluator will resolve this to the actual OID integer.
      */
@@ -213,6 +258,11 @@ public class RowContext {
         if ("tableoid".equalsIgnoreCase(columnName)) {
             return new Column("tableoid", DataType.INTEGER, false, false, null);
         }
+        // System columns
+        String lc = columnName.toLowerCase();
+        if (lc.equals("ctid")) return new Column("ctid", DataType.TEXT, false, false, null);
+        if (lc.equals("xmin") || lc.equals("xmax")) return new Column(lc, DataType.BIGINT, false, false, null);
+        if (lc.equals("cmin") || lc.equals("cmax")) return new Column(lc, DataType.INTEGER, false, false, null);
 
         if (tableQualifier != null) {
             TableBinding b = getBinding(tableQualifier);
