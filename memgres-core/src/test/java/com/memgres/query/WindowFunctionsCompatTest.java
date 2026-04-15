@@ -1,4 +1,4 @@
-package com.memgres.compat16;
+package com.memgres.query;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
@@ -141,6 +141,33 @@ class WindowFunctionsCompatTest {
             BigDecimal cumDist = rs.getBigDecimal("cum_dist");
             assertNotNull(cumDist, "cume_dist should not be NULL");
             assertEquals(new BigDecimal("0.33"), cumDist);
+        }
+    }
+
+    @Test
+    @DisplayName("named WINDOW with deterministic ORDER BY should produce correct ranks")
+    void testNamedWindowDeterministicOrdering() throws Exception {
+        String sql = "SELECT id, dept, rank() OVER dept_w AS dept_rank, "
+                + "rank() OVER global_w AS global_rank "
+                + "FROM wf_data "
+                + "WINDOW dept_w AS (PARTITION BY dept ORDER BY salary), "
+                + "global_w AS (ORDER BY salary) "
+                + "ORDER BY salary, id";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            for (int i = 0; i < 4; i++) assertTrue(rs.next());
+            // Row 5: id=1 (eng, 80000)
+            assertTrue(rs.next());
+            assertEquals(1, rs.getInt("id"));
+            assertEquals("eng", rs.getString("dept"));
+            assertEquals(1, rs.getInt("dept_rank"), "id=1 should be rank 1 in eng");
+            assertEquals(5, rs.getInt("global_rank"), "salary 80000 should be rank 5 globally");
+            // Row 6: id=6 (sales, 80000)
+            assertTrue(rs.next());
+            assertEquals(6, rs.getInt("id"));
+            assertEquals("sales", rs.getString("dept"));
+            assertEquals(3, rs.getInt("dept_rank"), "id=6 should be rank 3 in sales");
+            assertEquals(5, rs.getInt("global_rank"), "salary 80000 should also be rank 5");
         }
     }
 }

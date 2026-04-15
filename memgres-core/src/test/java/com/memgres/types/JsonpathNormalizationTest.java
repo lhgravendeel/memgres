@@ -1,14 +1,16 @@
-package com.memgres.compat16;
+package com.memgres.types;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
 
 import java.sql.*;
-import java.math.BigDecimal;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-class StatisticalAggregatesCompatTest {
+/**
+ * PG normalizes jsonpath output by quoting all object keys.
+ */
+class JsonpathNormalizationTest {
     static Memgres memgres;
     static Connection conn;
 
@@ -28,16 +30,13 @@ class StatisticalAggregatesCompatTest {
     }
 
     @Test
-    @DisplayName("covar_pop with single row should return 0.00 not NULL")
-    void testCovarPopSingleRow() throws Exception {
+    @DisplayName("jsonpath should quote object keys")
+    void testJsonpathQuotesKeys() throws Exception {
         try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery(
-                     "SELECT round(covar_pop(y, x)::numeric, 2) AS cov_pop " +
-                     "FROM (VALUES (1::double precision, 2::double precision)) AS t(x, y)")) {
+             ResultSet rs = stmt.executeQuery("SELECT '$.store.book[*].author'::jsonpath AS jp")) {
             assertTrue(rs.next());
-            BigDecimal result = rs.getBigDecimal("cov_pop");
-            assertNotNull(result, "covar_pop should return 0.00 for a single row, not NULL");
-            assertEquals(new BigDecimal("0.00"), result);
+            assertEquals("$.\"store\".\"book\"[*].\"author\"", rs.getString("jp"),
+                    "jsonpath output should quote object keys like PG");
         }
     }
 }

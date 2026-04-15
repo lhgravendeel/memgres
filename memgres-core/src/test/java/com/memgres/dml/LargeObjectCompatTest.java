@@ -1,4 +1,4 @@
-package com.memgres.compat16;
+package com.memgres.dml;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
@@ -111,6 +111,35 @@ class LargeObjectCompatTest {
                 "$$ LANGUAGE plpgsql");
 
             stmt.execute(
+                "CREATE OR REPLACE FUNCTION lo_seek_tell_test() RETURNS text AS $$\n" +
+                "DECLARE loid oid; fd integer; pos integer; result bytea;\n" +
+                "BEGIN\n" +
+                "  loid := lo_from_bytea(0, 'ABCDEFGH'::bytea);\n" +
+                "  fd := lo_open(loid, x'20000'::int);\n" +
+                "  PERFORM lo_lseek(fd, 5, 0);\n" +
+                "  pos := lo_tell(fd);\n" +
+                "  result := loread(fd, 3);\n" +
+                "  PERFORM lo_close(fd);\n" +
+                "  PERFORM lo_unlink(loid);\n" +
+                "  RETURN pos::text || ':' || convert_from(result, 'UTF8');\n" +
+                "END; $$ LANGUAGE plpgsql");
+
+            stmt.execute(
+                "CREATE OR REPLACE FUNCTION lo_write_roundtrip() RETURNS text LANGUAGE plpgsql AS $$\n" +
+                "DECLARE loid oid; fd integer; data bytea;\n" +
+                "BEGIN\n" +
+                "  loid := lo_creat(-1);\n" +
+                "  fd := lo_open(loid, x'20000'::integer);\n" +
+                "  PERFORM lowrite(fd, 'Test data'::bytea);\n" +
+                "  PERFORM lo_close(fd);\n" +
+                "  fd := lo_open(loid, x'40000'::integer);\n" +
+                "  data := loread(fd, 9);\n" +
+                "  PERFORM lo_close(fd);\n" +
+                "  PERFORM lo_unlink(loid);\n" +
+                "  RETURN convert_from(data, 'UTF8');\n" +
+                "END; $$");
+
+            stmt.execute(
                 "CREATE OR REPLACE FUNCTION lo_metadata_test() RETURNS boolean AS $$\n" +
                 "DECLARE\n" +
                 "  loid oid;\n" +
@@ -198,6 +227,27 @@ class LargeObjectCompatTest {
              ResultSet rs = stmt.executeQuery("SELECT lo_metadata_test() AS result")) {
             assertTrue(rs.next());
             assertTrue(rs.getBoolean("result"));
+        }
+    }
+
+    @Test
+    @DisplayName("lo_tell should report current position after lo_lseek")
+    void lo_seek_tell_test() throws Exception {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT lo_seek_tell_test() AS result")) {
+            assertTrue(rs.next());
+            assertEquals("5:FGH", rs.getString("result"),
+                    "lo_tell should return 5 after lseek to 5, loread should return 'FGH'");
+        }
+    }
+
+    @Test
+    @DisplayName("lowrite persists data through close/reopen cycle")
+    void lo_write_roundtrip() throws Exception {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT lo_write_roundtrip() AS result")) {
+            assertTrue(rs.next());
+            assertEquals("Test data", rs.getString("result"));
         }
     }
 
