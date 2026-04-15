@@ -1730,13 +1730,7 @@ public class PlpgsqlExecutor {
             // Parens are required so that subscript like (ARRAY[...])[1] is valid PG syntax
             // (bare ARRAY[...][1] is a syntax error in PG)
             sb.append("(ARRAY[");
-            for (int i = 0; i < list.size(); i++) {
-                if (i > 0) sb.append(",");
-                Object elem = list.get(i);
-                if (elem == null) sb.append("NULL");
-                else if (elem instanceof Number || elem instanceof Boolean) sb.append(elem);
-                else sb.append("'").append(elem.toString().replace("'", "''")).append("'");
-            }
+            appendListElements(sb, list);
             sb.append("])");
         } else if (val instanceof PgInterval) {
             sb.append("'").append(val.toString().replace("'", "''")).append("'::interval");
@@ -1750,6 +1744,21 @@ public class PlpgsqlExecutor {
             sb.append("'").append(val.toString().replace("'", "''")).append("'::time");
         } else {
             sb.append("'").append(val.toString().replace("'", "''")).append("'");
+        }
+    }
+
+    private void appendListElements(StringBuilder sb, java.util.List<?> list) {
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append(",");
+            Object elem = list.get(i);
+            if (elem == null) sb.append("NULL");
+            else if (elem instanceof java.util.List<?>) {
+                sb.append("ARRAY[");
+                appendListElements(sb, (java.util.List<?>) elem);
+                sb.append("]");
+            }
+            else if (elem instanceof Number || elem instanceof Boolean) sb.append(elem);
+            else sb.append("'").append(elem.toString().replace("'", "''")).append("'");
         }
     }
 

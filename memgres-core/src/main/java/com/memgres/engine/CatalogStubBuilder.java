@@ -188,6 +188,7 @@ class CatalogStubBuilder {
                 col("min_value", DataType.BIGINT),
                 col("max_value", DataType.BIGINT),
                 col("increment_by", DataType.BIGINT),
+                col("cache_size", DataType.BIGINT),
                 col("cycle", DataType.BOOLEAN)
         );
         Table table = new Table("pg_sequences", cols);
@@ -213,10 +214,11 @@ class CatalogStubBuilder {
             long maxValue = seq != null ? seq.getMaxValue() : getDefaultSeqMax(seqDataType);
             long incrementBy = seq != null ? seq.getIncrementBy() : 1L;
             boolean cycle = seq != null && seq.isCycle();
+            long cacheSize = seq != null ? (long) seq.getCache() : 1L;
             table.insertRow(new Object[]{
                     "public", seqName, "memgres", typeName,
                     startWith, minValue, maxValue,
-                    incrementBy, cycle
+                    incrementBy, cacheSize, cycle
             });
         }
         return table;

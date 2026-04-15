@@ -353,7 +353,9 @@ class DdlTableParser {
             }
             if (parser.matchKeyword("COLLATE")) {
                 if (!parser.isClauseKeyword()) {
-                    parser.readIdentifier();
+                    String collation = parser.readIdentifier();
+                    if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
+                    ExpressionParser.validateCollationStatic(collation, parser.peek());
                 }
                 continue;
             }

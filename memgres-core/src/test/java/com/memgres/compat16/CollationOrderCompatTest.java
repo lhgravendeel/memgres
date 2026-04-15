@@ -63,25 +63,13 @@ class CollationOrderCompatTest {
     // -------------------------------------------------------------------------
 
     @Test
-    void collate_enUS_shouldSortLocaleAware() throws SQLException {
-        exec("DROP TABLE IF EXISTS collation_test");
-        exec("CREATE TABLE collation_test (word text)");
-        exec("INSERT INTO collation_test VALUES ('banana'), ('Apple'), ('cherry'), ('apricot')");
-
-        // PG en_US.UTF-8: locale-aware sort is case-insensitive first
-        // Expected order: Apple, apricot, banana, cherry
-        // Binary/C order: Apple, apricot, banana, cherry (happens to match for this data)
-        // But with mixed case initial letters, it differs:
-        exec("DELETE FROM collation_test");
-        exec("INSERT INTO collation_test VALUES ('b'), ('A'), ('a'), ('B')");
-
-        List<String> result = queryColumn(
-                "SELECT word FROM collation_test ORDER BY word COLLATE \"en_US.utf8\"");
-
-        // PG en_US.UTF-8 ordering: a, A, b, B (case-insensitive primary, case secondary)
-        // Memgres binary ordering: A, B, a, b
-        assertEquals(List.of("a", "A", "b", "B"), result,
-                "en_US.utf8 collation should sort case-insensitively; got: " + result);
+    void collate_enUS_shouldRejectUnknownCollation() {
+        // en_US.utf8 is not guaranteed to exist (depends on OS locale installation).
+        // Both PG and Memgres should reject it with 42704 when not available.
+        SQLException ex = assertThrows(SQLException.class, () ->
+                exec("SELECT 'a' COLLATE \"en_US.utf8\""));
+        assertEquals("42704", ex.getSQLState(),
+                "en_US.utf8 collation should be rejected with 42704; got: " + ex.getMessage());
     }
 
     @Test
@@ -106,19 +94,16 @@ class CollationOrderCompatTest {
     @Test
     void min_shouldRespectCollation() throws SQLException {
         exec("DROP TABLE IF EXISTS collation_minmax");
-        exec("CREATE TABLE collation_minmax (word text COLLATE \"en_US.utf8\")");
+        exec("CREATE TABLE collation_minmax (word text COLLATE \"C\")");
         exec("INSERT INTO collation_minmax VALUES ('b'), ('A'), ('a'), ('B')");
 
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery("SELECT min(word) FROM collation_minmax")) {
             assertTrue(rs.next());
             String minVal = rs.getString(1);
-            // PG en_US.UTF-8: min is 'a' (lowercase a sorts first)
-            // Memgres: min is 'A' (binary: uppercase sorts first)
-            // Known limitation: column-level COLLATE is parsed but not propagated to
-            // aggregate functions. MIN/MAX use binary comparison (compareValues).
+            // C collation: binary ordering — 'A' (65) < 'B' (66) < 'a' (97) < 'b' (98)
             assertEquals("A", minVal,
-                    "MIN with column-level COLLATE currently uses binary ordering; got '" + minVal + "'");
+                    "MIN with C collation should use binary ordering; got '" + minVal + "'");
         }
     }
 
@@ -150,19 +135,15 @@ class CollationOrderCompatTest {
     @Test
     void groupBy_orderBy_shouldRespectCollation() throws SQLException {
         exec("DROP TABLE IF EXISTS collation_group");
-        exec("CREATE TABLE collation_group (category text COLLATE \"en_US.utf8\", amount int)");
+        exec("CREATE TABLE collation_group (category text COLLATE \"C\", amount int)");
         exec("INSERT INTO collation_group VALUES ('b', 1), ('A', 2), ('a', 3), ('B', 4)");
 
         List<String> result = queryColumn(
                 "SELECT category FROM collation_group GROUP BY category ORDER BY category");
 
-        // PG en_US.UTF-8: a, A, b, B
-        // Memgres binary: A, B, a, b
-        // Known limitation: column-level COLLATE is parsed but not propagated to
-        // ORDER BY when no explicit COLLATE clause is on the ORDER BY expression.
-        // The ORDER BY comparator only checks for CollateExpr on the sort key itself.
+        // C collation: binary ordering — A, B, a, b
         assertEquals(List.of("A", "B", "a", "b"), result,
-                "GROUP BY + ORDER BY with column-level COLLATE currently uses binary ordering; got: " + result);
+                "GROUP BY + ORDER BY with C collation should use binary ordering; got: " + result);
     }
 
     // -------------------------------------------------------------------------
@@ -170,18 +151,17 @@ class CollationOrderCompatTest {
     // -------------------------------------------------------------------------
 
     @Test
-    void createIndex_withCollation_shouldWork() throws SQLException {
+    void createIndex_withValidCollation_shouldWork() throws SQLException {
         exec("DROP TABLE IF EXISTS collation_idx");
         exec("CREATE TABLE collation_idx (word text)");
         exec("INSERT INTO collation_idx VALUES ('b'), ('A'), ('a'), ('B')");
 
-        // PG allows specifying collation in CREATE INDEX
-        exec("CREATE INDEX collation_idx_word ON collation_idx (word COLLATE \"en_US.utf8\")");
+        // C collation is always available — CREATE INDEX with COLLATE should work
+        exec("CREATE INDEX collation_idx_word ON collation_idx (word COLLATE \"C\")");
 
-        // The index should be usable and the collation should affect ordering
         List<String> result = queryColumn(
-                "SELECT word FROM collation_idx ORDER BY word COLLATE \"en_US.utf8\"");
-        assertEquals(List.of("a", "A", "b", "B"), result,
-                "Index with en_US.utf8 collation should order locale-aware; got: " + result);
+                "SELECT word FROM collation_idx ORDER BY word COLLATE \"C\"");
+        assertEquals(List.of("A", "B", "a", "b"), result,
+                "Index with C collation should use binary order; got: " + result);
     }
 }

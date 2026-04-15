@@ -120,7 +120,7 @@ public class SystemCatalog implements OidSupplier {
 
         // information_schema tables
         if ("information_schema".equals(sch)) {
-            return infoSchemaBuilder.build(tbl);
+            return infoSchemaBuilder.build(tbl, session);
         }
 
         return null;

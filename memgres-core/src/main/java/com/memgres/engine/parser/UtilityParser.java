@@ -1084,6 +1084,9 @@ class UtilityParser {
             return new SetStmt("reset", "ALL");
         }
         String param = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            param = param + "." + parser.readIdentifier();
+        }
         return new SetStmt("reset", param);
     }
 

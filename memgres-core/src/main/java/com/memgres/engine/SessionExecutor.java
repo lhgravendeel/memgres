@@ -417,7 +417,7 @@ class SessionExecutor {
             String lv = value.toLowerCase().trim();
             if (!lv.equals("on") && !lv.equals("off") && !lv.equals("true") && !lv.equals("false")
                     && !lv.equals("yes") && !lv.equals("no") && !lv.equals("1") && !lv.equals("0")) {
-                throw new MemgresException("invalid value for parameter \"" + name + "\": \"" + value + "\"", "22023");
+                throw new MemgresException("parameter \"" + name + "\" requires a Boolean value", "22023");
             }
             return;
         }

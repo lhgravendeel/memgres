@@ -28,17 +28,25 @@ public class InfoSchemaBuilder {
 
     private final Database database;
     private final OidSupplier oids;
+    /** Session passed into {@link #build} – used for catalog name resolution. */
+    private Session currentSession;
 
     public InfoSchemaBuilder(Database database, OidSupplier oids) {
         this.database = database;
         this.oids = oids;
     }
 
+    /** Returns the catalog name derived from the session's database name, falling back to "memgres". */
+    private String catalogName() {
+        return currentSession != null ? currentSession.getDatabaseName() : "memgres";
+    }
+
     /**
      * Build the information_schema table for the given table name.
      * Returns an empty table for unrecognized names.
      */
-    public Table build(String tableName) {
+    public Table build(String tableName, Session session) {
+        this.currentSession = session;
         switch (tableName) {
             case "tables":
                 return buildIsTables();
@@ -92,7 +100,7 @@ public class InfoSchemaBuilder {
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             for (String tableName : schemaEntry.getValue().getTables().keySet()) {
                 table.insertRow(new Object[]{
-                        "memgres", schemaEntry.getKey(), tableName, "BASE TABLE",
+                        catalogName(), schemaEntry.getKey(), tableName, "BASE TABLE",
                         null, null, null, null, null, "YES", "NO"
                 });
             }
@@ -101,7 +109,7 @@ public class InfoSchemaBuilder {
         for (Database.ViewDef vd : database.getViews().values()) {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             table.insertRow(new Object[]{
-                    "memgres", vSchema, vd.name(), "VIEW",
+                    catalogName(), vSchema, vd.name(), "VIEW",
                     null, null, null, null, null, "NO", "NO"
             });
         }
@@ -215,7 +223,7 @@ public class InfoSchemaBuilder {
             }
 
             isTable.insertRow(new Object[]{
-                    "memgres",                              // table_catalog
+                    catalogName(),                           // table_catalog
                     schemaName,                             // table_schema
                     t.getName(),                            // table_name
                     col.getName(),                          // column_name
@@ -234,7 +242,7 @@ public class InfoSchemaBuilder {
                     null, null, null,                       // character_set_*
                     null, null, null,                       // collation_*
                     null, null, null,                       // domain_*
-                    "memgres",                              // udt_catalog
+                    catalogName(),                           // udt_catalog
                     udtSchema,                              // udt_schema
                     udtName,                                // udt_name
                     null, null, null,                       // scope_*
@@ -261,10 +269,10 @@ public class InfoSchemaBuilder {
         );
         Table table = new Table("schemata", cols);
         for (String schemaName : database.getSchemas().keySet()) {
-            table.insertRow(new Object[]{"memgres", schemaName, "memgres", null, null, null});
+            table.insertRow(new Object[]{catalogName(), schemaName, "memgres", null, null, null});
         }
-        table.insertRow(new Object[]{"memgres", "pg_catalog", "memgres", null, null, null});
-        table.insertRow(new Object[]{"memgres", "information_schema", "memgres", null, null, null});
+        table.insertRow(new Object[]{catalogName(), "pg_catalog", "memgres", null, null, null});
+        table.insertRow(new Object[]{catalogName(), "information_schema", "memgres", null, null, null});
         return table;
     }
 
@@ -310,8 +318,8 @@ public class InfoSchemaBuilder {
                             throw new IllegalStateException("Unknown constraint type: " + sc.getType());
                     }
                     table.insertRow(new Object[]{
-                            "memgres", schemaEntry.getKey(), sc.getName(),
-                            "memgres", schemaEntry.getKey(), t.getName(),
+                            catalogName(), schemaEntry.getKey(), sc.getName(),
+                            catalogName(), schemaEntry.getKey(), t.getName(),
                             type, "NO", "NO", sc.isNotEnforced() ? "NO" : "YES"
                     });
                 }
@@ -329,8 +337,8 @@ public class InfoSchemaBuilder {
                     if (!col.isNullable() && !isPromotedUnique) {
                         String conname = t.getName() + "_" + col.getName() + "_not_null";
                         table.insertRow(new Object[]{
-                                "memgres", schemaEntry.getKey(), conname,
-                                "memgres", schemaEntry.getKey(), t.getName(),
+                                catalogName(), schemaEntry.getKey(), conname,
+                                catalogName(), schemaEntry.getKey(), t.getName(),
                                 "CHECK", "NO", "NO", "YES"
                         });
                     }
@@ -367,8 +375,8 @@ public class InfoSchemaBuilder {
                             posInUnique = i + 1;
                         }
                         table.insertRow(new Object[]{
-                                "memgres", schemaEntry.getKey(), sc.getName(),
-                                "memgres", schemaEntry.getKey(), t.getName(),
+                                catalogName(), schemaEntry.getKey(), sc.getName(),
+                                catalogName(), schemaEntry.getKey(), t.getName(),
                                 sc.getColumns().get(i), i + 1, posInUnique
                         });
                     }
@@ -400,8 +408,8 @@ public class InfoSchemaBuilder {
                     // Find the referenced PK/unique constraint name
                     String refConstraintName = CatalogHelper.findReferencedConstraintName(CatalogHelper.findTable(database, sc.getReferencesTable()));
                     table.insertRow(new Object[]{
-                            "memgres", schemaEntry.getKey(), sc.getName(),
-                            "memgres", schemaEntry.getKey(), refConstraintName,
+                            catalogName(), schemaEntry.getKey(), sc.getName(),
+                            catalogName(), schemaEntry.getKey(), refConstraintName,
                             "NONE",
                             CatalogHelper.fkActionToString(sc.getOnUpdate()),
                             CatalogHelper.fkActionToString(sc.getOnDelete())
@@ -510,10 +518,10 @@ public class InfoSchemaBuilder {
             String routineDefinition = fn.getBody();
 
             table.insertRow(new Object[]{
-                    "memgres",           // specific_catalog
+                    catalogName(),       // specific_catalog
                     schema,              // specific_schema
                     specificName,        // specific_name
-                    "memgres",           // routine_catalog
+                    catalogName(),       // routine_catalog
                     schema,              // routine_schema
                     fn.getName(),        // routine_name
                     routineType,         // routine_type
@@ -538,7 +546,7 @@ public class InfoSchemaBuilder {
                     null,                // datetime_precision
                     null,                // interval_type
                     null,                // interval_precision
-                    "memgres",           // type_udt_catalog
+                    catalogName(),       // type_udt_catalog
                     "pg_catalog",        // type_udt_schema
                     returnType,          // type_udt_name
                     null,                // scope_catalog
@@ -615,7 +623,7 @@ public class InfoSchemaBuilder {
             Sequence seq = database.getSequence(seqName);
             if (seq != null) {
                 table.insertRow(new Object[]{
-                        "memgres", "public", seqName, "bigint", 64,
+                        catalogName(), "public", seqName, "bigint", 64,
                         String.valueOf(seq.getStartWith()),
                         String.valueOf(seq.getMinValue()),
                         String.valueOf(seq.getMaxValue()),
@@ -648,7 +656,7 @@ public class InfoSchemaBuilder {
                 viewDef = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
             }
             table.insertRow(new Object[]{
-                    "memgres", vSchema, vd.name(), viewDef, "NONE", "NO", "NO", "NO", "NO", "NO"
+                    catalogName(), vSchema, vd.name(), viewDef, "NONE", "NO", "NO", "NO", "NO", "NO"
             });
         }
         return table;
@@ -668,7 +676,7 @@ public class InfoSchemaBuilder {
         for (Map.Entry<String, DomainType> entry : database.getDomains().entrySet()) {
             DomainType d = entry.getValue();
             table.insertRow(new Object[]{
-                    "memgres", "public", entry.getKey(),
+                    catalogName(), "public", entry.getKey(),
                     CatalogHelper.pgTypeName(d.getBaseType()), null, null, null
             });
         }
@@ -688,7 +696,7 @@ public class InfoSchemaBuilder {
                 for (StoredConstraint sc : tableEntry.getValue().getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.CHECK && sc.getName() != null) {
                         table.insertRow(new Object[]{
-                                "memgres", schemaEntry.getKey(), sc.getName(),
+                                catalogName(), schemaEntry.getKey(), sc.getName(),
                                 sc.getCheckExpr() != null ? sc.getCheckExpr().toString() : ""
                         });
                     }
@@ -715,8 +723,8 @@ public class InfoSchemaBuilder {
                     if (sc.getName() != null && sc.getColumns() != null) {
                         for (String col : sc.getColumns()) {
                             table.insertRow(new Object[]{
-                                    "memgres", schemaEntry.getKey(), tableEntry.getKey(), col,
-                                    "memgres", schemaEntry.getKey(), sc.getName()
+                                    catalogName(), schemaEntry.getKey(), tableEntry.getKey(), col,
+                                    catalogName(), schemaEntry.getKey(), sc.getName()
                             });
                         }
                     }
@@ -741,8 +749,8 @@ public class InfoSchemaBuilder {
                 for (StoredConstraint sc : tableEntry.getValue().getConstraints()) {
                     if (sc.getName() != null) {
                         table.insertRow(new Object[]{
-                                "memgres", schemaEntry.getKey(), tableEntry.getKey(),
-                                "memgres", schemaEntry.getKey(), sc.getName()
+                                catalogName(), schemaEntry.getKey(), tableEntry.getKey(),
+                                catalogName(), schemaEntry.getKey(), sc.getName()
                         });
                     }
                 }

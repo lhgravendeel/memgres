@@ -64,24 +64,27 @@ SELECT xmin IS NOT NULL AS has_xmin FROM syscol_data WHERE id = 1;
 SELECT xmax = 0 AS xmax_zero FROM syscol_data WHERE id = 1;
 
 -- ============================================================================
--- 4. cmin should be queryable
+-- 4. cmin should be queryable (type is cid, no >= operator)
 -- ============================================================================
+
+-- note: PG's cmin has type cid which has no >= operator for integer comparison.
+-- note: Use IS NOT NULL instead to test queryability.
 
 -- begin-expected
 -- columns: has_cmin
 -- row: true
 -- end-expected
-SELECT cmin >= 0 AS has_cmin FROM syscol_data WHERE id = 1;
+SELECT cmin IS NOT NULL AS has_cmin FROM syscol_data WHERE id = 1;
 
 -- ============================================================================
--- 5. cmax should be queryable
+-- 5. cmax should be queryable (type is cid, no >= operator)
 -- ============================================================================
 
 -- begin-expected
 -- columns: has_cmax
 -- row: true
 -- end-expected
-SELECT cmax >= 0 AS has_cmax FROM syscol_data WHERE id = 1;
+SELECT cmax IS NOT NULL AS has_cmax FROM syscol_data WHERE id = 1;
 
 -- ============================================================================
 -- 6. ctid in WHERE clause should select exactly one row
@@ -100,11 +103,14 @@ WHERE ctid = (SELECT ctid FROM syscol_data WHERE id = 1);
 -- 7. Rows inserted in same statement share same xmin
 -- ============================================================================
 
+-- note: PG's xmin has type xid which has no ordering operator, so
+-- count(DISTINCT xmin) fails. Use xmin equality check instead.
+
 -- begin-expected
 -- columns: same_xmin
 -- row: true
 -- end-expected
-SELECT count(DISTINCT xmin) = 1 AS same_xmin FROM syscol_data;
+SELECT (SELECT xmin FROM syscol_data WHERE id = 1) = (SELECT xmin FROM syscol_data WHERE id = 2) AS same_xmin;
 
 -- ============================================================================
 -- Cleanup

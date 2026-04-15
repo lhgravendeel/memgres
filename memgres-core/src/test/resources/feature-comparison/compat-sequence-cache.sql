@@ -43,10 +43,10 @@ SELECT nextval('seq_cache_basic') AS v2;
 -- ============================================================================
 
 -- begin-expected
--- columns: cache_value
+-- columns: cache_size
 -- row: 10
 -- end-expected
-SELECT cache_value FROM pg_sequences WHERE sequencename = 'seq_cache_basic';
+SELECT cache_size FROM pg_sequences WHERE sequencename = 'seq_cache_basic';
 
 -- ============================================================================
 -- 3. CACHE 1 should behave normally (no gaps in single session)

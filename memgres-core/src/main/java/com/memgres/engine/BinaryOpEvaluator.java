@@ -44,6 +44,25 @@ class BinaryOpEvaluator {
         return false;
     }
 
+    private static boolean isCastToTextType(Expression expr) {
+        if (expr instanceof CastExpr) {
+            String tn = ((CastExpr) expr).typeName().toLowerCase();
+            return tn.equals("text") || tn.equals("varchar") || tn.startsWith("character varying");
+        }
+        return false;
+    }
+
+    private static boolean isConcatExprWithTextCast(Expression expr) {
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            if (bin.op() == BinaryExpr.BinOp.CONCAT) {
+                return isCastToTextType(bin.left()) || isCastToTextType(bin.right())
+                        || isConcatExprWithTextCast(bin.left()) || isConcatExprWithTextCast(bin.right());
+            }
+        }
+        return false;
+    }
+
     Object evalBinary(BinaryExpr bin, RowContext ctx) {
         // Short-circuit for AND/OR with three-valued logic
         if (bin.op() == BinaryExpr.BinOp.AND) {
@@ -86,6 +105,16 @@ class BinaryOpEvaluator {
                 String opSym = bin.op() == BinaryExpr.BinOp.CONCAT ? "||" : "-";
                 throw new MemgresException("operator does not exist: json " + opSym + " json", "42883");
             }
+        }
+
+        // When || has an operand explicitly cast to text, force text concatenation
+        // to avoid heuristic array detection on strings like "{1,2}"
+        if (bin.op() == BinaryExpr.BinOp.CONCAT && left != null && right != null
+                && !(left instanceof byte[]) && !(right instanceof byte[])
+                && !(left instanceof List) && !(right instanceof List)
+                && (isCastToTextType(bin.left()) || isCastToTextType(bin.right())
+                    || isConcatExprWithTextCast(bin.left()) || isConcatExprWithTextCast(bin.right()))) {
+            return left.toString() + right.toString();
         }
 
         // Operator type mismatch validation (before coercion)

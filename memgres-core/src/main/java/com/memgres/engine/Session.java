@@ -125,7 +125,7 @@ public class Session {
 
     /** Get next value from a sequence, using session-level cache if CACHE > 1. */
     public long nextvalCached(Sequence seq) {
-        if (seq.getCache() <= 1) {
+        if (seq.getCache() <= 1 || seq.isCycle()) {
             return seq.nextVal();
         }
         String key = seq.getName().toLowerCase();

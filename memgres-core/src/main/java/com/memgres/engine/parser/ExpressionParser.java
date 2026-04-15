@@ -830,7 +830,7 @@ public class ExpressionParser {
     }
 
     private static final java.util.Set<String> KNOWN_COLLATIONS = Cols.setOf(
-            "c", "posix", "default", "ucs_basic", "en_us", "en_us.utf-8", "en_us.utf8",
+            "c", "posix", "default", "ucs_basic",
             "pg_catalog.c", "pg_catalog.posix", "pg_catalog.default",
             "pg_catalog.\"c\"", "pg_catalog.\"posix\"", "pg_catalog.\"default\"",
             "\"c\"", "\"posix\"", "\"default\"", "\"ucs_basic\"",
@@ -838,11 +838,15 @@ public class ExpressionParser {
     );
 
     private void validateCollation(String collation) {
+        validateCollationStatic(collation, peek());
+    }
+
+    static void validateCollationStatic(String collation, Token errorToken) {
         String lower = collation.toLowerCase();
         String unquoted = lower.replace("\"", "");
         if (!KNOWN_COLLATIONS.contains(unquoted) && !KNOWN_COLLATIONS.contains(lower)) {
             throw new ParseException("collation \"" + collation + "\" for encoding \"UTF8\" does not exist",
-                    peek(), "42704");
+                    errorToken, "42704");
         }
     }
 

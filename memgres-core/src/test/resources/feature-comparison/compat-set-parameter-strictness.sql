@@ -93,7 +93,7 @@ SELECT current_setting('bogus_nonexistent_setting', true);
 -- ============================================================================
 
 -- begin-expected-error
--- message-like: invalid value
+-- message-like: requires a Boolean value
 -- end-expected-error
 SET enable_seqscan = 'maybe';
 
