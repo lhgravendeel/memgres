@@ -500,24 +500,113 @@ class CatalogSystemFunctions {
                 return Cols.listOf();
             case "lo_creat":
             case "lo_create":
-                return 1L;
-            case "lo_from_bytea":
-                return 1L;
+                return executor.database.getLargeObjectStore().loFromBytea(0, new byte[0]);
+            case "lo_from_bytea": {
+                long reqOid = 0;
+                byte[] data = new byte[0];
+                if (fn.args().size() >= 2) {
+                    Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
+                    reqOid = ((Number) oidArg).longValue();
+                    Object dataArg = executor.evalExpr(fn.args().get(1), ctx);
+                    if (dataArg instanceof byte[]) data = (byte[]) dataArg;
+                    else if (dataArg instanceof String) data = ((String) dataArg).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                }
+                return executor.database.getLargeObjectStore().loFromBytea(reqOid, data);
+            }
             case "lo_import":
                 return 1L;
             case "lo_export":
                 return 1;
-            case "lo_unlink":
-                return 1;
-            case "lo_get":
-                return new byte[0];
-            case "lo_put": {
-                return null; 
+            case "lo_unlink": {
+                requireArgs(fn, 1);
+                Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
+                long loid = ((Number) oidArg).longValue();
+                return executor.database.getLargeObjectStore().loUnlink(loid);
             }
-            case "loread":
-                return new byte[0];
-            case "lowrite":
-                return 0;
+            case "lo_get": {
+                requireArgs(fn, 1);
+                Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
+                long loid = ((Number) oidArg).longValue();
+                if (fn.args().size() >= 3) {
+                    Object offArg = executor.evalExpr(fn.args().get(1), ctx);
+                    Object lenArg = executor.evalExpr(fn.args().get(2), ctx);
+                    int offset = ((Number) offArg).intValue();
+                    int length = ((Number) lenArg).intValue();
+                    return executor.database.getLargeObjectStore().loGet(loid, offset, length);
+                }
+                return executor.database.getLargeObjectStore().loGet(loid);
+            }
+            case "lo_put": {
+                requireArgs(fn, 3);
+                Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object offArg = executor.evalExpr(fn.args().get(1), ctx);
+                Object dataArg = executor.evalExpr(fn.args().get(2), ctx);
+                long loid = ((Number) oidArg).longValue();
+                int offset = ((Number) offArg).intValue();
+                byte[] data;
+                if (dataArg instanceof byte[]) data = (byte[]) dataArg;
+                else if (dataArg instanceof String) data = ((String) dataArg).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                else data = new byte[0];
+                executor.database.getLargeObjectStore().loPut(loid, offset, data);
+                return null;
+            }
+            case "lo_open": {
+                requireArgs(fn, 2);
+                Object oidArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object modeArg = executor.evalExpr(fn.args().get(1), ctx);
+                long loid = ((Number) oidArg).longValue();
+                int mode = ((Number) modeArg).intValue();
+                return executor.database.getLargeObjectStore().loOpen(loid, mode);
+            }
+            case "loread": {
+                requireArgs(fn, 2);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object lenArg = executor.evalExpr(fn.args().get(1), ctx);
+                int fd = ((Number) fdArg).intValue();
+                int len = ((Number) lenArg).intValue();
+                return executor.database.getLargeObjectStore().loRead(fd, len);
+            }
+            case "lo_close": {
+                requireArgs(fn, 1);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                int fd = ((Number) fdArg).intValue();
+                return executor.database.getLargeObjectStore().loClose(fd);
+            }
+            case "lo_lseek": {
+                requireArgs(fn, 3);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object offArg = executor.evalExpr(fn.args().get(1), ctx);
+                Object whenceArg = executor.evalExpr(fn.args().get(2), ctx);
+                int fd = ((Number) fdArg).intValue();
+                int offset = ((Number) offArg).intValue();
+                int whence = ((Number) whenceArg).intValue();
+                return executor.database.getLargeObjectStore().loLseek(fd, offset, whence);
+            }
+            case "lo_tell": {
+                requireArgs(fn, 1);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                int fd = ((Number) fdArg).intValue();
+                return executor.database.getLargeObjectStore().loTell(fd);
+            }
+            case "lo_truncate": {
+                requireArgs(fn, 2);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object lenArg = executor.evalExpr(fn.args().get(1), ctx);
+                int fd = ((Number) fdArg).intValue();
+                int len = ((Number) lenArg).intValue();
+                return executor.database.getLargeObjectStore().loTruncate(fd, len);
+            }
+            case "lowrite": {
+                requireArgs(fn, 2);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object dataArg = executor.evalExpr(fn.args().get(1), ctx);
+                int fd = ((Number) fdArg).intValue();
+                byte[] data;
+                if (dataArg instanceof byte[]) data = (byte[]) dataArg;
+                else if (dataArg instanceof String) data = ((String) dataArg).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                else data = new byte[0];
+                return executor.database.getLargeObjectStore().loWrite(fd, data);
+            }
             case "pg_event_trigger_ddl_commands":
             case "pg_event_trigger_dropped_objects":
                 return null;

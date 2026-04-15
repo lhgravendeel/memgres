@@ -27,6 +27,7 @@ public enum DataType {
     TIMESTAMP(1114, "timestamp"),
     TIMESTAMPTZ(1184, "timestamptz"),
     TIME(1083, "time"),
+    TIMETZ(1266, "timetz"),
     INTERVAL(1186, "interval"),
 
     // Network types
@@ -162,6 +163,9 @@ public enum DataType {
             case "time":
             case "time without time zone":
                 return TIME;
+            case "timetz":
+            case "time with time zone":
+                return TIMETZ;
             case "interval":
                 return INTERVAL;
             case "bytea":
@@ -180,9 +184,6 @@ public enum DataType {
                 return SMALLSERIAL;
             case "money":
                 return MONEY;
-            case "timetz":
-            case "time with time zone":
-                return TIME;
             case "inet":
                 return INET;
             case "cidr":
@@ -282,6 +283,7 @@ public enum DataType {
             case TIMESTAMP: return "timestamp without time zone";
             case TIMESTAMPTZ: return "timestamp with time zone";
             case TIME: return "time without time zone";
+            case TIMETZ: return "time with time zone";
             case INTERVAL: return "interval";
             case BYTEA: return "bytea";
             case UUID: return "uuid";

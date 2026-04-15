@@ -39,7 +39,7 @@ class SelectExecutor {
     static final Set<String> SRF_FUNCTION_NAMES = Cols.setOf("generate_series", "unnest", "regexp_matches",
             "json_array_elements", "jsonb_array_elements", "json_object_keys", "jsonb_object_keys",
             "json_array_elements_text", "jsonb_array_elements_text", "generate_subscripts",
-            "jsonb_path_query", "aclexplode", "string_to_table");
+            "jsonb_path_query", "aclexplode", "string_to_table", "regexp_split_to_table");
     private static final Set<String> SRF_FUNCTIONS = SRF_FUNCTION_NAMES;
 
     SelectExecutor(AstExecutor executor) {
@@ -466,6 +466,44 @@ class SelectExecutor {
             }
         }
 
+        // Apply WITH TIES on contexts before projection (needs access to ORDER BY expressions)
+        if (stmt.withTies() && resolvedOrderBy != null && !resolvedOrderBy.isEmpty()
+                && stmt.limit() != null && !hasSrf) {
+            // Apply OFFSET on contexts
+            if (stmt.offset() != null) {
+                int off = executor.toInt(executor.evalExpr(stmt.offset(), null));
+                if (off < 0) throw new MemgresException("OFFSET must not be negative", "2201X");
+                if (off > 0 && off < contexts.size()) {
+                    contexts = new ArrayList<>(contexts.subList(off, contexts.size()));
+                } else if (off >= contexts.size()) {
+                    contexts = new ArrayList<>();
+                }
+            }
+            // Apply LIMIT WITH TIES on contexts
+            int lim = executor.toInt(executor.evalExpr(stmt.limit(), null));
+            if (lim < 0) throw new MemgresException("LIMIT must not be negative", "2201W");
+            if (lim < contexts.size() && !contexts.isEmpty()) {
+                RowContext lastCtx = contexts.get(lim - 1);
+                int end = lim;
+                while (end < contexts.size()) {
+                    RowContext candidateCtx = contexts.get(end);
+                    boolean tied = true;
+                    for (SelectStmt.OrderByItem item : resolvedOrderBy) {
+                        Object va = executor.evalExpr(item.expr(), lastCtx);
+                        Object vb = executor.evalExpr(item.expr(), candidateCtx);
+                        if (va == null && vb == null) continue;
+                        if (va == null || vb == null) { tied = false; break; }
+                        if (executor.compareValues(va, vb) != 0) { tied = false; break; }
+                    }
+                    if (!tied) break;
+                    end++;
+                }
+                contexts = new ArrayList<>(contexts.subList(0, end));
+            } else if (lim == 0) {
+                contexts = new ArrayList<>();
+            }
+        }
+
         // Project
         List<Object[]> resultRows = projectRows(contexts, projections, srfIndices);
 
@@ -491,7 +529,11 @@ class SelectExecutor {
         }
 
         resultRows = applyDistinct(stmt, resultRows);
-        resultRows = applyOffsetAndLimit(stmt, resultRows);
+        // Skip applyOffsetAndLimit if WITH TIES was already applied on contexts
+        if (!(stmt.withTies() && resolvedOrderBy != null && !resolvedOrderBy.isEmpty()
+                && stmt.limit() != null && !hasSrf)) {
+            resultRows = applyOffsetAndLimit(stmt, resultRows);
+        }
 
         return QueryResult.select(resultColumns, resultRows);
     }
@@ -557,6 +599,11 @@ class SelectExecutor {
                 if (containsWindowFunction(when.condition()) || containsWindowFunction(when.result())) return true;
             }
             return c.elseExpr() != null && containsWindowFunction(c.elseExpr());
+        }
+        if (expr instanceof FunctionCallExpr) {
+            for (Expression arg : ((FunctionCallExpr) expr).args()) {
+                if (containsWindowFunction(arg)) return true;
+            }
         }
         return false;
     }
@@ -728,7 +775,33 @@ class SelectExecutor {
             int lim = executor.toInt(executor.evalExpr(stmt.limit(), null));
             if (lim < 0) throw new MemgresException("LIMIT must not be negative", "2201W");
             if (lim < resultRows.size()) {
-                resultRows = new ArrayList<>(resultRows.subList(0, lim));
+                if (stmt.withTies() && stmt.orderBy() != null && !stmt.orderBy().isEmpty() && !resultRows.isEmpty()) {
+                    // WITH TIES: include additional rows tied with the last row by ORDER BY values
+                    Object[] lastRow = resultRows.get(lim - 1);
+                    // Resolve ORDER BY column indices
+                    int[] obIndices = new int[stmt.orderBy().size()];
+                    for (int oi = 0; oi < stmt.orderBy().size(); oi++) {
+                        obIndices[oi] = resolveOrderByToColumnIndex(stmt.orderBy().get(oi).expr(), stmt.targets());
+                    }
+                    int end = lim;
+                    while (end < resultRows.size()) {
+                        Object[] candidate = resultRows.get(end);
+                        boolean tied = true;
+                        for (int obIdx : obIndices) {
+                            if (obIdx < 0) continue;
+                            Object va = obIdx < lastRow.length ? lastRow[obIdx] : null;
+                            Object vb = obIdx < candidate.length ? candidate[obIdx] : null;
+                            if (va == null && vb == null) continue;
+                            if (va == null || vb == null) { tied = false; break; }
+                            if (executor.compareValues(va, vb) != 0) { tied = false; break; }
+                        }
+                        if (!tied) break;
+                        end++;
+                    }
+                    resultRows = new ArrayList<>(resultRows.subList(0, end));
+                } else {
+                    resultRows = new ArrayList<>(resultRows.subList(0, lim));
+                }
             }
         }
         return resultRows;

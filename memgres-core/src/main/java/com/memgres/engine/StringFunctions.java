@@ -623,10 +623,28 @@ class StringFunctions {
                     return new ArrayList<>();
                 }
                 if (delim == null) {
-                    return Cols.listOf(str.toString());
+                    // NULL delimiter: split into individual characters
+                    String s = str.toString();
+                    List<Object> chars = new ArrayList<>();
+                    for (int i = 0; i < s.length(); i++) {
+                        chars.add(String.valueOf(s.charAt(i)));
+                    }
+                    return chars;
                 }
                 String[] parts = str.toString().split(java.util.regex.Pattern.quote(delim.toString()), -1);
-                return new ArrayList<>(Arrays.asList((Object[]) parts));
+                List<Object> result = new ArrayList<>(Arrays.asList((Object[]) parts));
+                if (fn.args().size() > 2) {
+                    Object nullStr = executor.evalExpr(fn.args().get(2), ctx);
+                    if (nullStr != null) {
+                        String ns = nullStr.toString();
+                        for (int i = 0; i < result.size(); i++) {
+                            if (ns.equals(result.get(i))) {
+                                result.set(i, null);
+                            }
+                        }
+                    }
+                }
+                return result;
             }
             case "encode": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);

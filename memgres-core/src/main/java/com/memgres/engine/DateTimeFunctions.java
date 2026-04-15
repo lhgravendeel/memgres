@@ -69,7 +69,7 @@ class DateTimeFunctions {
                 int minute = executor.toInt(executor.evalExpr(fn.args().get(4), ctx));
                 double sec = executor.toDouble(executor.evalExpr(fn.args().get(5), ctx));
                 int secs = (int) sec;
-                int nanos = (int) ((sec - secs) * 1_000_000_000);
+                int nanos = (int) Math.round((sec - secs) * 1_000_000_000);
                 return java.time.LocalDateTime.of(year, month, day, hour, minute, secs, nanos);
             }
             case "make_timestamptz": {
@@ -80,7 +80,7 @@ class DateTimeFunctions {
                 int minute = executor.toInt(executor.evalExpr(fn.args().get(4), ctx));
                 double sec = executor.toDouble(executor.evalExpr(fn.args().get(5), ctx));
                 int secs = (int) sec;
-                int nanos = (int) ((sec - secs) * 1_000_000_000);
+                int nanos = (int) Math.round((sec - secs) * 1_000_000_000);
                 String tz = fn.args().size() > 6 ? executor.evalExpr(fn.args().get(6), ctx).toString() : "UTC";
                 java.time.ZoneId zone = java.time.ZoneId.of(tz);
                 return java.time.LocalDateTime.of(year, month, day, hour, minute, secs, nanos).atZone(zone).toOffsetDateTime();
@@ -90,7 +90,7 @@ class DateTimeFunctions {
                 int minute = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                 double sec = executor.toDouble(executor.evalExpr(fn.args().get(2), ctx));
                 int secs = (int) sec;
-                int nanos = (int) ((sec - secs) * 1_000_000_000);
+                int nanos = (int) Math.round((sec - secs) * 1_000_000_000);
                 return java.time.LocalTime.of(hour, minute, secs, nanos);
             }
             case "isfinite": {

@@ -55,8 +55,9 @@ class MathFunctions {
                 double val = executor.toDouble(arg);
                 if (fn.args().size() > 1) {
                     int scale = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
-                    double factor = Math.pow(10, scale);
-                    return Math.round(val * factor) / factor;
+                    java.math.BigDecimal bd = java.math.BigDecimal.valueOf(val)
+                            .setScale(scale, java.math.RoundingMode.HALF_UP);
+                    return bd;
                 }
                 return (long) Math.round(val);
             }

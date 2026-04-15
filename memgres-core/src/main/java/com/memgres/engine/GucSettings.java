@@ -169,6 +169,12 @@ public class GucSettings {
         if (TIMEOUT_PARAMS.contains(key)) {
             return formatTimeoutForDisplay(val);
         }
+        // PG always displays boolean GUC values in lowercase (on/off)
+        if (val.equalsIgnoreCase("on") || val.equalsIgnoreCase("off")
+                || val.equalsIgnoreCase("true") || val.equalsIgnoreCase("false")
+                || val.equalsIgnoreCase("yes") || val.equalsIgnoreCase("no")) {
+            return val.toLowerCase();
+        }
         return val;
     }
 

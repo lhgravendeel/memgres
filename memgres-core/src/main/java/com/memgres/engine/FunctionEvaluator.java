@@ -92,8 +92,8 @@ class FunctionEvaluator {
         }
 
         // Expand VARIADIC args: NamedArgExpr("__variadic__", arrayExpr) → expand array to individual args
-        boolean hasVariadic = fn.args().stream().anyMatch(a -> a instanceof NamedArgExpr && ((NamedArgExpr) a).name().equals("__variadic__"));
-        if (hasVariadic) {
+        boolean callUsedVariadic = fn.args().stream().anyMatch(a -> a instanceof NamedArgExpr && ((NamedArgExpr) a).name().equals("__variadic__"));
+        if (callUsedVariadic) {
             List<Expression> expandedArgs = new ArrayList<>();
             for (Expression arg : fn.args()) {
                 if (arg instanceof NamedArgExpr && ((NamedArgExpr) arg).name().equals("__variadic__")) {
@@ -671,7 +671,28 @@ class FunctionEvaluator {
                 if (dimsArg instanceof List<?>) dimsList = (List<?>) dimsArg;
                 else if (dimsArg instanceof String && ((String) dimsArg).startsWith("{")) dimsList = parseSimplePgArray((String) dimsArg);
                 else return null;
-                return buildFilledArray(fillVal, dimsList, 0);
+                String filled = buildFilledArray(fillVal, dimsList, 0);
+                if (fn.args().size() > 2) {
+                    Object lbArg = executor.evalExpr(fn.args().get(2), ctx);
+                    if (lbArg != null) {
+                        List<?> lbList;
+                        if (lbArg instanceof List<?>) lbList = (List<?>) lbArg;
+                        else if (lbArg instanceof String && ((String) lbArg).startsWith("{")) lbList = parseSimplePgArray((String) lbArg);
+                        else lbList = null;
+                        if (lbList != null) {
+                            StringBuilder prefix = new StringBuilder();
+                            for (int di = 0; di < dimsList.size(); di++) {
+                                int lb = di < lbList.size() ? ((Number) lbList.get(di)).intValue() : 1;
+                                int dimSize = ((Number) dimsList.get(di)).intValue();
+                                int ub = lb + dimSize - 1;
+                                prefix.append("[").append(lb).append(":").append(ub).append("]");
+                            }
+                            prefix.append("=");
+                            filled = prefix.toString() + filled;
+                        }
+                    }
+                }
+                return filled;
             }
             case "trim_array": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
@@ -754,12 +775,12 @@ class FunctionEvaluator {
             }
             case "cardinality": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
-                if (arr instanceof List<?>) return ((List<?>) arr).size();
+                if (arr instanceof List<?>) return countLeafElements((List<?>) arr);
                 if (arr != null) {
                     String s = arr.toString().trim();
                     if (s.equals("{}")) return 0;
                     if (s.startsWith("{") && s.endsWith("}")) {
-                        return parseSimplePgArray(s).size();
+                        return countLeafElementsFromString(s);
                     }
                 }
                 return null;
@@ -953,13 +974,30 @@ class FunctionEvaluator {
             case "array_position": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
+                int startPos = 1;
+                if (fn.args().size() > 2) {
+                    Object startArg = executor.evalExpr(fn.args().get(2), ctx);
+                    if (startArg != null) startPos = ((Number) startArg).intValue();
+                }
                 if (arr instanceof List<?>) {
                     List<?> la = (List<?>) arr;
-                    for (int ai = 0; ai < la.size(); ai++) {
+                    for (int ai = Math.max(startPos - 1, 0); ai < la.size(); ai++) {
                         if (TypeCoercion.areEqual(la.get(ai), elem)) return ai + 1; // 1-based
                     }
                 }
-                return 0;
+                return null;
+            }
+            case "array_positions": {
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                Object elem = executor.evalExpr(fn.args().get(1), ctx);
+                List<Object> positions = new ArrayList<>();
+                if (arr instanceof List<?>) {
+                    List<?> la = (List<?>) arr;
+                    for (int ai = 0; ai < la.size(); ai++) {
+                        if (TypeCoercion.areEqual(la.get(ai), elem)) positions.add(ai + 1);
+                    }
+                }
+                return TypeCoercion.formatPgArray(positions);
             }
             case "array_replace": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
@@ -1279,6 +1317,13 @@ class FunctionEvaluator {
                             }
                         }
                         userFunc = executor.database.resolveFunction(lookupName, fn.args().size(), argTypeHints);
+                        // When explicit VARIADIC was used and the array was empty,
+                        // expansion yields 0 variadic args. Resolution rejects this
+                        // because it looks like no variadic args were provided.
+                        // Retry with argCount+1 to simulate the empty array as one arg.
+                        if (userFunc == null && callUsedVariadic && fn.args().isEmpty()) {
+                            userFunc = executor.database.resolveFunction(lookupName, 1, argTypeHints);
+                        }
                     } else {
                         userFunc = null;
                     }
@@ -1603,6 +1648,25 @@ class FunctionEvaluator {
         String t = s.trim();
         if (t.equalsIgnoreCase("infinity") || t.equalsIgnoreCase("-infinity") || t.equalsIgnoreCase("nan")) return true;
         try { Double.parseDouble(t); return true; } catch (NumberFormatException e) { return false; }
+    }
+
+    /** Recursively count all leaf elements in a nested list. */
+    private static int countLeafElements(List<?> list) {
+        int count = 0;
+        for (Object elem : list) {
+            if (elem instanceof List<?>) count += countLeafElements((List<?>) elem);
+            else count++;
+        }
+        return count;
+    }
+
+    /** Count all leaf elements from a PG array string like {{1,2},{3,4}}. */
+    private static int countLeafElementsFromString(String s) {
+        // Count commas outside of nested braces at the deepest level
+        // Simple approach: strip all braces and count comma-separated elements
+        String stripped = s.replaceAll("[{}]", "");
+        if (stripped.isEmpty()) return 0;
+        return stripped.split(",", -1).length;
     }
 
     /** Build a filled multi-dimensional array string. */

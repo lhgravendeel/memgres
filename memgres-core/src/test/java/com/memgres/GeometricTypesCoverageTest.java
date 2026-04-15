@@ -198,8 +198,9 @@ class GeometricTypesCoverageTest {
     }
 
     @Test
-    void lseg_center() throws SQLException {
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+    void lseg_center() {
+        // PG: center(lseg) does not exist as a function
+        assertThrows(SQLException.class, () -> query1("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     @Test
@@ -262,9 +263,9 @@ class GeometricTypesCoverageTest {
     }
 
     @Test
-    void lseg_center_function_alt() throws SQLException {
-        // center function for lseg
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+    void lseg_center_function_alt() {
+        // PG: center(lseg) does not exist as a function
+        assertThrows(SQLException.class, () -> query1("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     // ========================================================================
@@ -548,19 +549,21 @@ class GeometricTypesCoverageTest {
     }
 
     @Test
-    void polygon_area() throws SQLException {
-        assertEquals(12.0, queryDouble("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')"), 0.01);
+    void polygon_area() {
+        // PG: area(polygon) does not exist as a function
+        assertThrows(SQLException.class, () -> queryDouble("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')"));
     }
 
     @Test
-    void polygon_area_triangle() throws SQLException {
-        // Triangle with vertices (0,0),(4,0),(0,3) has area 6
-        assertEquals(6.0, queryDouble("SELECT area(polygon '((0,0),(4,0),(0,3))')"), 0.01);
+    void polygon_area_triangle() {
+        // PG: area(polygon) does not exist as a function
+        assertThrows(SQLException.class, () -> queryDouble("SELECT area(polygon '((0,0),(4,0),(0,3))')"));
     }
 
     @Test
-    void polygon_center() throws SQLException {
-        assertEquals("(1,1)", query1("SELECT center(polygon '((0,0),(2,0),(2,2),(0,2))')"));
+    void polygon_center() {
+        // PG: center(polygon) does not exist as a function
+        assertThrows(SQLException.class, () -> query1("SELECT center(polygon '((0,0),(2,0),(2,2),(0,2))')"));
     }
 
     @Test
@@ -852,8 +855,9 @@ class GeometricTypesCoverageTest {
     }
 
     @Test
-    void measurement_center_lseg_function() throws SQLException {
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+    void measurement_center_lseg_function() {
+        // PG: center(lseg) does not exist as a function
+        assertThrows(SQLException.class, () -> query1("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     @Test
@@ -1061,8 +1065,9 @@ class GeometricTypesCoverageTest {
     }
 
     @Test
-    void polygon_unit_square_area() throws SQLException {
-        assertEquals(1.0, queryDouble("SELECT area(polygon '((0,0),(1,0),(1,1),(0,1))')"), 0.01);
+    void polygon_unit_square_area() {
+        // PG: area(polygon) does not exist as a function
+        assertThrows(SQLException.class, () -> queryDouble("SELECT area(polygon '((0,0),(1,0),(1,1),(0,1))')"));
     }
 
     @Test
@@ -1072,8 +1077,10 @@ class GeometricTypesCoverageTest {
 
     @Test
     void box_distance() throws SQLException {
-        // Distance between non-overlapping boxes
+        // PG: box <-> box computes distance between the centers of the boxes
+        // Center of (0,0)-(1,1) = (0.5, 0.5), center of (3,3)-(4,4) = (3.5, 3.5)
+        // Distance = sqrt((3.5-0.5)^2 + (3.5-0.5)^2) = sqrt(18)
         double dist = queryDouble("SELECT box '((1,1),(0,0))' <-> box '((4,4),(3,3))'");
-        assertEquals(Math.sqrt(8), dist, 0.01);
+        assertEquals(Math.sqrt(18), dist, 0.01);
     }
 }

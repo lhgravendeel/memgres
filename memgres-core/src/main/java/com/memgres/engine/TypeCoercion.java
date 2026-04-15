@@ -52,6 +52,7 @@ public final class TypeCoercion {
                 return TypeCategory.BOOLEAN;
             case DATE:
             case TIME:
+            case TIMETZ:
             case TIMESTAMP:
             case TIMESTAMPTZ:
             case INTERVAL:
@@ -232,6 +233,8 @@ public final class TypeCoercion {
                 return toLocalDate(value);
             case TIME:
                 return toLocalTime(value);
+            case TIMETZ:
+                return toTimeTz(value);
             case TIMESTAMP:
                 return toLocalDateTime(value);
             case TIMESTAMPTZ:
@@ -392,6 +395,13 @@ public final class TypeCoercion {
     }
 
     public static Integer toInteger(Object val) {
+        if (val instanceof AstExecutor.PgBitString) {
+            String bits = ((AstExecutor.PgBitString) val).bits();
+            long lv = Long.parseLong(bits, 2);
+            if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
+                throw new MemgresException("integer out of range", "22003");
+            return (int) lv;
+        }
         if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
         if (val instanceof RegtypeValue) return ((RegtypeValue) val).oid();
         if (val instanceof RegprocValue) return ((RegprocValue) val).oid();

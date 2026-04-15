@@ -29,7 +29,7 @@ class PgWireValueFormatter {
         } else if (val instanceof LocalTime) {
             LocalTime t = (LocalTime) val;
             return t.getNano() != 0
-                    ? t.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS"))
+                    ? stripTrailingFracZeros(t.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
                     : t.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
         } else if (val instanceof LocalDate) {
             LocalDate ld = (LocalDate) val;
@@ -44,7 +44,7 @@ class PgWireValueFormatter {
             LocalDateTime dt = (LocalDateTime) val;
             String datestyle = guc != null ? guc.get("datestyle") : "ISO, MDY";
             String timePart = dt.getNano() != 0
-                    ? dt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS"))
+                    ? stripTrailingFracZeros(dt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
                     : dt.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
             if (datestyle != null && datestyle.toLowerCase().contains("german")) {
                 return dt.format(DateTimeFormatter.ofPattern("dd.MM.yyyy")) + " " + timePart;
@@ -52,7 +52,7 @@ class PgWireValueFormatter {
                 return dt.format(DateTimeFormatter.ofPattern("MM/dd/yyyy")) + " " + timePart;
             }
             return dt.getNano() != 0
-                    ? dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS"))
+                    ? stripTrailingFracZeros(dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS")))
                     : dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
         } else if (val instanceof OffsetDateTime) {
             OffsetDateTime odt = (OffsetDateTime) val;
@@ -67,7 +67,7 @@ class PgWireValueFormatter {
             }
             String datestyle = guc != null ? guc.get("datestyle") : "ISO, MDY";
             String timePart = odt.getNano() != 0
-                    ? odt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS"))
+                    ? stripTrailingFracZeros(odt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
                     : odt.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
             String offsetStr = formatPgOffset(odt.getOffset());
             if (datestyle != null && datestyle.toLowerCase().contains("german")) {
@@ -76,7 +76,7 @@ class PgWireValueFormatter {
                 return odt.format(DateTimeFormatter.ofPattern("MM/dd/yyyy")) + " " + timePart + offsetStr;
             }
             String datePart = odt.getNano() != 0
-                    ? odt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS"))
+                    ? stripTrailingFracZeros(odt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS")))
                     : odt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
             return datePart + formatPgOffset(odt.getOffset());
         } else if (val instanceof PgInterval) {
@@ -151,6 +151,31 @@ class PgWireValueFormatter {
         } else {
             return val.toString();
         }
+    }
+
+    /** Strip trailing zeros from the fractional-seconds part of a formatted timestamp/time string. */
+    private static String stripTrailingFracZeros(String s) {
+        int dotIdx = s.lastIndexOf('.');
+        if (dotIdx < 0) return s;
+        int end = s.length();
+        // Find where non-digit suffix starts (e.g. offset like +00)
+        int fracEnd = end;
+        for (int i = dotIdx + 1; i < end; i++) {
+            if (!Character.isDigit(s.charAt(i))) {
+                fracEnd = i;
+                break;
+            }
+        }
+        // Strip trailing zeros in the fractional part
+        int last = fracEnd;
+        while (last > dotIdx + 1 && s.charAt(last - 1) == '0') {
+            last--;
+        }
+        if (last == dotIdx + 1) {
+            // All fractional digits are zero — remove the dot too
+            return s.substring(0, dotIdx) + s.substring(fracEnd);
+        }
+        return s.substring(0, last) + s.substring(fracEnd);
     }
 
     /** Format a timezone offset like PG: +00 when minutes==0, +05:30 otherwise. */

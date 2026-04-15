@@ -468,12 +468,32 @@ class SelectAggregateEvaluator {
                 if (osa.args().isEmpty()) return null;
                 Object fractionObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
                 if (fractionObj == null) return null;
+                // Handle array argument: compute percentile for each element
+                if (fractionObj instanceof java.util.List) {
+                    java.util.List<?> fractions = (java.util.List<?>) fractionObj;
+                    java.util.List<Object> results = new java.util.ArrayList<>();
+                    for (Object f : fractions) {
+                        if (f == null) { results.add(null); continue; }
+                        double fv;
+                        try { fv = executor.toDouble(f); } catch (Exception e) {
+                            throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
+                        }
+                        if (fv < 0.0 || fv > 1.0)
+                            throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
+                        if (vals.isEmpty()) { results.add(null); continue; }
+                        int idx = (int) Math.ceil(fv * vals.size()) - 1;
+                        if (idx < 0) idx = 0;
+                        if (idx >= vals.size()) idx = vals.size() - 1;
+                        results.add(vals.get(idx));
+                    }
+                    return results;
+                }
                 double fraction;
                 try { fraction = executor.toDouble(fractionObj); } catch (Exception e) {
-                    throw new MemgresException("percentile fraction must be between 0 and 1", "22023");
+                    throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                 }
                 if (fraction < 0.0 || fraction > 1.0)
-                    throw new MemgresException("percentile fraction must be between 0 and 1", "22023");
+                    throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                 if (vals.isEmpty()) return null;
                 int idx = (int) Math.ceil(fraction * vals.size()) - 1;
                 if (idx < 0) idx = 0;
@@ -484,12 +504,42 @@ class SelectAggregateEvaluator {
                 if (osa.args().isEmpty()) return null;
                 Object fractionObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
                 if (fractionObj == null) return null;
+                // Handle array argument: compute percentile for each element
+                if (fractionObj instanceof java.util.List) {
+                    java.util.List<?> fractions = (java.util.List<?>) fractionObj;
+                    java.util.List<Object> results = new java.util.ArrayList<>();
+                    for (Object f : fractions) {
+                        if (f == null) { results.add(null); continue; }
+                        double fv;
+                        try { fv = executor.toDouble(f); } catch (Exception e) {
+                            throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
+                        }
+                        if (fv < 0.0 || fv > 1.0)
+                            throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
+                        if (vals.isEmpty()) { results.add(null); continue; }
+                        if (vals.size() == 1) { results.add(vals.get(0)); continue; }
+                        double pos = fv * (vals.size() - 1);
+                        int lo = (int) Math.floor(pos);
+                        int hi = (int) Math.ceil(pos);
+                        if (lo == hi) { results.add(vals.get(lo)); continue; }
+                        double loVal = executor.toDouble(vals.get(lo));
+                        double hiVal = executor.toDouble(vals.get(hi));
+                        double r = loVal + (hiVal - loVal) * (pos - lo);
+                        if (r == Math.floor(r) && !Double.isInfinite(r)) {
+                            long lr = (long) r;
+                            if (lr >= Integer.MIN_VALUE && lr <= Integer.MAX_VALUE) { results.add((int) lr); continue; }
+                            results.add(lr); continue;
+                        }
+                        results.add(r);
+                    }
+                    return results;
+                }
                 double fraction;
                 try { fraction = executor.toDouble(fractionObj); } catch (Exception e) {
-                    throw new MemgresException("percentile fraction must be between 0 and 1", "22023");
+                    throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                 }
                 if (fraction < 0.0 || fraction > 1.0)
-                    throw new MemgresException("percentile fraction must be between 0 and 1", "22023");
+                    throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                 if (vals.isEmpty()) return null;
                 if (vals.size() == 1) return vals.get(0);
                 double pos = fraction * (vals.size() - 1);
@@ -1299,7 +1349,7 @@ class SelectAggregateEvaluator {
                     yVals.add(vy instanceof BigDecimal ? ((BigDecimal) vy) : BigDecimal.valueOf(((Number) vy).doubleValue()));
                 }
             }
-            if (xVals.size() < 2) return null;
+            if (xVals.isEmpty()) return null;
             BigDecimal n = BigDecimal.valueOf(xVals.size());
             BigDecimal xSum = xVals.stream().reduce(BigDecimal.ZERO, BigDecimal::add);
             BigDecimal ySum = yVals.stream().reduce(BigDecimal.ZERO, BigDecimal::add);

@@ -404,8 +404,23 @@ class SelectWindowEvaluator {
                         throw new MemgresException("ntile requires a positive argument, found " + numBuckets, "22023");
                     }
                     int partSize = sortedPartition.size();
+                    // PG ntile: each row gets bucket (i+1) when numBuckets >= partSize,
+                    // otherwise first (partSize % numBuckets) buckets get ceil rows, rest get floor rows.
                     for (int i = 0; i < partSize; i++) {
-                        long bucket = ((long) i * numBuckets) / partSize + 1;
+                        long bucket;
+                        if (numBuckets >= partSize) {
+                            bucket = i + 1;
+                        } else {
+                            int largeBucketCount = partSize % numBuckets; // buckets with one extra row
+                            int smallBucketSize = partSize / numBuckets;
+                            int largeBucketSize = smallBucketSize + 1;
+                            int largeBucketTotal = largeBucketCount * largeBucketSize;
+                            if (i < largeBucketTotal) {
+                                bucket = (i / largeBucketSize) + 1;
+                            } else {
+                                bucket = largeBucketCount + (i - largeBucketTotal) / smallBucketSize + 1;
+                            }
+                        }
                         results[sortedPartition.get(i)] = bucket;
                     }
                     break;
@@ -473,10 +488,31 @@ class SelectWindowEvaluator {
                 case "nth_value": {
                     Expression arg = wf.args().get(0);
                     int nth = wf.args().size() > 1 ? executor.toInt(executor.evalExpr(wf.args().get(1), null)) : 1;
-                    Object nthVal = (nth >= 1 && nth <= sortedPartition.size()) ?
-                            executor.evalExpr(arg, contexts.get(sortedPartition.get(nth - 1))) : null;
-                    for (int idx : sortedPartition) {
-                        results[idx] = nthVal;
+                    boolean hasOrderBy = wf.orderBy() != null && !wf.orderBy().isEmpty();
+                    boolean hasFrame = wf.frame() != null;
+                    for (int i = 0; i < sortedPartition.size(); i++) {
+                        int frameStart, frameEnd;
+                        if (hasFrame) {
+                            frameStart = resolveFrameBound(wf.frame().start(), i, sortedPartition.size(),
+                                    wf.frame().type(), wf.orderBy(), contexts, sortedPartition, true);
+                            frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size(),
+                                    wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
+                        } else if (hasOrderBy) {
+                            // Default frame with ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            frameStart = 0;
+                            frameEnd = i;
+                        } else {
+                            frameStart = 0;
+                            frameEnd = sortedPartition.size() - 1;
+                        }
+                        frameStart = Math.max(0, frameStart);
+                        frameEnd = Math.min(sortedPartition.size() - 1, frameEnd);
+                        int frameSize = frameEnd - frameStart + 1;
+                        if (nth >= 1 && nth <= frameSize) {
+                            results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameStart + nth - 1)));
+                        } else {
+                            results[sortedPartition.get(i)] = null;
+                        }
                     }
                     break;
                 }
@@ -595,12 +631,102 @@ class SelectWindowEvaluator {
                     }
                 }
                 return currentIdx;
-            case PRECEDING:
-                return currentIdx - executor.toInt(executor.evalExpr(bound.offset(), null));
-            case FOLLOWING:
-                return currentIdx + executor.toInt(executor.evalExpr(bound.offset(), null));
+            case PRECEDING: {
+                int offsetVal = executor.toInt(executor.evalExpr(bound.offset(), null));
+                if (frameType == WindowFuncExpr.FrameType.RANGE) {
+                    return resolveRangeOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, -offsetVal, isStartBound);
+                } else if (frameType == WindowFuncExpr.FrameType.GROUPS) {
+                    return resolveGroupsOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, -offsetVal, isStartBound);
+                }
+                return currentIdx - offsetVal;
+            }
+            case FOLLOWING: {
+                int offsetVal = executor.toInt(executor.evalExpr(bound.offset(), null));
+                if (frameType == WindowFuncExpr.FrameType.RANGE) {
+                    return resolveRangeOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, offsetVal, isStartBound);
+                } else if (frameType == WindowFuncExpr.FrameType.GROUPS) {
+                    return resolveGroupsOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, offsetVal, isStartBound);
+                }
+                return currentIdx + offsetVal;
+            }
             default:
                 throw new IllegalStateException("Unknown bound type: " + bound.boundType());
+        }
+    }
+
+    /**
+     * For RANGE frame with numeric offset: find the boundary index by comparing ORDER BY values.
+     * direction is negative for PRECEDING, positive for FOLLOWING.
+     */
+    private int resolveRangeOffsetBound(List<SelectStmt.OrderByItem> orderBy,
+                                         List<RowContext> contexts,
+                                         List<Integer> sortedPartition,
+                                         int currentIdx, int partitionSize,
+                                         int direction, boolean isStartBound) {
+        if (orderBy == null || orderBy.isEmpty()) return isStartBound ? 0 : partitionSize - 1;
+        // Use first ORDER BY expression for RANGE comparison
+        Expression orderExpr = orderBy.get(0).expr();
+        Object currentVal = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(currentIdx)));
+        double currentNum = currentVal == null ? Double.NaN : ((Number) currentVal).doubleValue();
+        double boundaryVal = currentNum + direction; // direction already has sign
+
+        if (isStartBound) {
+            // Find first row >= boundaryVal (for ascending)
+            for (int i = 0; i < partitionSize; i++) {
+                Object v = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(i)));
+                if (v != null) {
+                    double d = ((Number) v).doubleValue();
+                    if (orderBy.get(0).descending() ? d <= boundaryVal : d >= boundaryVal) return i;
+                }
+            }
+            return partitionSize; // no rows in range
+        } else {
+            // Find last row <= boundaryVal (for ascending)
+            for (int i = partitionSize - 1; i >= 0; i--) {
+                Object v = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(i)));
+                if (v != null) {
+                    double d = ((Number) v).doubleValue();
+                    if (orderBy.get(0).descending() ? d >= boundaryVal : d <= boundaryVal) return i;
+                }
+            }
+            return -1; // no rows in range
+        }
+    }
+
+    /**
+     * For GROUPS frame with offset: find the boundary by counting peer groups.
+     * direction is negative for PRECEDING, positive for FOLLOWING.
+     */
+    private int resolveGroupsOffsetBound(List<SelectStmt.OrderByItem> orderBy,
+                                          List<RowContext> contexts,
+                                          List<Integer> sortedPartition,
+                                          int currentIdx, int partitionSize,
+                                          int direction, boolean isStartBound) {
+        // First, identify peer group boundaries
+        List<int[]> groups = new ArrayList<>(); // each element is [startIdx, endIdx]
+        int gStart = 0;
+        for (int i = 1; i <= partitionSize; i++) {
+            if (i == partitionSize || !orderByValuesEqual(orderBy, contexts,
+                    sortedPartition.get(i), sortedPartition.get(gStart))) {
+                groups.add(new int[]{gStart, i - 1});
+                gStart = i;
+            }
+        }
+        // Find which group the current row belongs to
+        int currentGroup = -1;
+        for (int g = 0; g < groups.size(); g++) {
+            if (currentIdx >= groups.get(g)[0] && currentIdx <= groups.get(g)[1]) {
+                currentGroup = g;
+                break;
+            }
+        }
+        int targetGroup = currentGroup + direction;
+        if (isStartBound) {
+            targetGroup = Math.max(0, targetGroup);
+            return groups.get(targetGroup)[0];
+        } else {
+            targetGroup = Math.min(groups.size() - 1, targetGroup);
+            return groups.get(targetGroup)[1];
         }
     }
 

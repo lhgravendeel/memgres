@@ -105,10 +105,13 @@ class SelectCteExecutor {
             for (Object[] row : allRows) seenKeys.add(Arrays.deepToString(row));
         }
 
-        boolean depthFirstSearch = cte.searchColumn() != null && cte.searchDepthFirst();
+        boolean hasSearch = cte.searchColumn() != null;
+        boolean depthFirstSearch = hasSearch && cte.searchDepthFirst();
+        boolean hasCycle = cte.cycleColumn() != null;
+
+        // Resolve SEARCH BY column indices
         int[] searchByIndices = null;
-        List<List<Object>> ordcolPaths = depthFirstSearch ? new ArrayList<>() : null;
-        if (depthFirstSearch && cte.searchByColumns() != null) {
+        if (hasSearch && cte.searchByColumns() != null) {
             searchByIndices = new int[cte.searchByColumns().size()];
             for (int si = 0; si < cte.searchByColumns().size(); si++) {
                 String sbyCol = cte.searchByColumns().get(si).toLowerCase();
@@ -121,6 +124,28 @@ class SelectCteExecutor {
                 }
                 if (searchByIndices[si] == -1) searchByIndices[si] = 0;
             }
+        }
+
+        // Resolve CYCLE BY column indices
+        int[] cycleByIndices = null;
+        if (hasCycle && cte.cycleByColumns() != null) {
+            cycleByIndices = new int[cte.cycleByColumns().size()];
+            for (int ci2 = 0; ci2 < cte.cycleByColumns().size(); ci2++) {
+                String cbyCol = cte.cycleByColumns().get(ci2).toLowerCase();
+                cycleByIndices[ci2] = -1;
+                for (int ci = 0; ci < columns.size(); ci++) {
+                    if (columns.get(ci).getName().equalsIgnoreCase(cbyCol)) {
+                        cycleByIndices[ci2] = ci;
+                        break;
+                    }
+                }
+                if (cycleByIndices[ci2] == -1) cycleByIndices[ci2] = 0;
+            }
+        }
+
+        // Track search paths for ordering (both DFS and BFS)
+        List<List<Object>> ordcolPaths = hasSearch ? new ArrayList<>() : null;
+        if (hasSearch) {
             for (Object[] row : allRows) {
                 List<Object> path = new ArrayList<>();
                 path.add(extractSearchKey(row, searchByIndices));
@@ -128,7 +153,21 @@ class SelectCteExecutor {
             }
         }
 
-        List<List<Object>> workingSetPaths = depthFirstSearch ? new ArrayList<>(ordcolPaths) : null;
+        // Track cycle paths for cycle detection during recursion
+        // Each row gets a list of ancestor cycle key values
+        List<List<Object>> cyclePaths = hasCycle ? new ArrayList<>() : null;
+        List<Boolean> isCycleFlags = hasCycle ? new ArrayList<>() : null;
+        if (hasCycle) {
+            for (Object[] row : allRows) {
+                List<Object> path = new ArrayList<>();
+                path.add(extractSearchKey(row, cycleByIndices));
+                cyclePaths.add(path);
+                isCycleFlags.add(false);
+            }
+        }
+
+        List<List<Object>> workingSetSearchPaths = hasSearch ? new ArrayList<>(ordcolPaths) : null;
+        List<List<Object>> workingSetCyclePaths = hasCycle ? new ArrayList<>(cyclePaths) : null;
 
         String cteLower = cte.name().toLowerCase();
         executor.executingCtes.add(cteLower);
@@ -140,11 +179,131 @@ class SelectCteExecutor {
             Table previousTable = targetSchema.getTable(cteName);
 
             if (depthFirstSearch) {
+                // DFS: process one parent row at a time
                 List<Object[]> newRows = new ArrayList<>();
-                List<List<Object>> newPaths = new ArrayList<>();
+                List<List<Object>> newSearchPaths = hasSearch ? new ArrayList<>() : null;
+                List<List<Object>> newCyclePaths = hasCycle ? new ArrayList<>() : null;
                 for (int pi = 0; pi < workingSet.size(); pi++) {
                     Object[] parentRow = workingSet.get(pi);
-                    List<Object> parentPath = workingSetPaths.get(pi);
+
+                    // Skip recursion for rows already marked as cycle
+                    if (hasCycle) {
+                        // Find this row's global index
+                        int parentGlobalIdx = allRows.indexOf(parentRow);
+                        if (parentGlobalIdx >= 0 && parentGlobalIdx < isCycleFlags.size()
+                                && isCycleFlags.get(parentGlobalIdx)) {
+                            continue;
+                        }
+                    }
+
+                    Table singleRowTable = new Table(cteName, columns);
+                    singleRowTable.insertRow(parentRow);
+                    targetSchema.addTable(singleRowTable);
+
+                    try {
+                        QueryResult iterResult = executor.executeStatement(setOp.right());
+
+                        if (iter == 0 && pi == 0) {
+                            validateIterationResult(iterResult, columns, setOp.right());
+                        }
+
+                        List<Object> parentCyclePath = (hasCycle && workingSetCyclePaths != null)
+                                ? workingSetCyclePaths.get(pi) : null;
+
+                        for (Object[] row : iterResult.getRows()) {
+                            if (isUnionAll || seenKeys.add(Arrays.deepToString(row))) {
+                                boolean childIsCycle = false;
+                                if (hasCycle && parentCyclePath != null) {
+                                    Object childKey = extractSearchKey(row, cycleByIndices);
+                                    for (Object ancestorKey : parentCyclePath) {
+                                        if (java.util.Objects.equals(ancestorKey, childKey)) {
+                                            childIsCycle = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // Always emit the row (PG emits cycle rows with is_cycle=true)
+                                allRows.add(row);
+
+                                if (hasCycle) {
+                                    isCycleFlags.add(childIsCycle);
+                                }
+
+                                // Add search path for all rows (needed for ordcol indexing)
+                                if (hasSearch) {
+                                    List<Object> parentSearchPath = workingSetSearchPaths.get(pi);
+                                    List<Object> childSearchPath = new ArrayList<>(parentSearchPath);
+                                    childSearchPath.add(extractSearchKey(row, searchByIndices));
+                                    ordcolPaths.add(childSearchPath);
+                                    if (!childIsCycle) {
+                                        newSearchPaths.add(childSearchPath);
+                                    }
+                                }
+
+                                // Add cycle path for all rows (needed for is_cycle/path indexing)
+                                if (hasCycle) {
+                                    List<Object> childCyclePath = new ArrayList<>(parentCyclePath);
+                                    Object childKey = extractSearchKey(row, cycleByIndices);
+                                    childCyclePath.add(childKey);
+                                    cyclePaths.add(childCyclePath);
+                                    if (!childIsCycle) {
+                                        newCyclePaths.add(childCyclePath);
+                                    }
+                                }
+
+                                if (childIsCycle) {
+                                    // Don't recurse from cycle rows — but the row IS emitted
+                                    continue;
+                                }
+
+                                // Non-cycle row: add to working set for further recursion
+                                newRows.add(row);
+                            }
+                        }
+                    } finally {
+                        targetSchema.removeTable(cteName);
+                        if (previousTable != null) targetSchema.addTable(previousTable);
+                    }
+                }
+                workingSet = newRows;
+                workingSetSearchPaths = newSearchPaths;
+                workingSetCyclePaths = newCyclePaths;
+            } else {
+                // BFS: process entire working set at once
+                // Filter out cycle-marked rows from working set
+                List<Object[]> nonCycleWorkingSet = workingSet;
+                if (hasCycle) {
+                    nonCycleWorkingSet = new ArrayList<>();
+                    List<List<Object>> nonCyclePaths = new ArrayList<>();
+                    int wsOffset = allRows.size() - workingSet.size();
+                    for (int wi = 0; wi < workingSet.size(); wi++) {
+                        int globalIdx = wsOffset + wi;
+                        if (globalIdx < isCycleFlags.size() && isCycleFlags.get(globalIdx)) {
+                            continue; // Skip cycle-marked rows
+                        }
+                        nonCycleWorkingSet.add(workingSet.get(wi));
+                        if (workingSetCyclePaths != null && wi < workingSetCyclePaths.size()) {
+                            nonCyclePaths.add(workingSetCyclePaths.get(wi));
+                        }
+                    }
+                    workingSetCyclePaths = nonCyclePaths;
+                }
+
+                if (nonCycleWorkingSet.isEmpty()) {
+                    workingSet = nonCycleWorkingSet;
+                    continue;
+                }
+
+                // BFS with per-parent cycle detection: process each parent individually
+                // to properly track cycle paths per ancestry chain
+                List<Object[]> newRows = new ArrayList<>();
+                List<List<Object>> newCyclePaths = hasCycle ? new ArrayList<>() : null;
+
+                for (int pi = 0; pi < nonCycleWorkingSet.size(); pi++) {
+                    Object[] parentRow = nonCycleWorkingSet.get(pi);
+                    List<Object> parentCyclePath = (hasCycle && workingSetCyclePaths != null && pi < workingSetCyclePaths.size())
+                            ? workingSetCyclePaths.get(pi) : null;
 
                     Table singleRowTable = new Table(cteName, columns);
                     singleRowTable.insertRow(parentRow);
@@ -159,12 +318,49 @@ class SelectCteExecutor {
 
                         for (Object[] row : iterResult.getRows()) {
                             if (isUnionAll || seenKeys.add(Arrays.deepToString(row))) {
-                                newRows.add(row);
+                                boolean childIsCycle = false;
+                                if (hasCycle && parentCyclePath != null) {
+                                    Object childKey = extractSearchKey(row, cycleByIndices);
+                                    for (Object ancestorKey : parentCyclePath) {
+                                        if (java.util.Objects.equals(ancestorKey, childKey)) {
+                                            childIsCycle = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // Always emit the row (PG emits cycle rows with is_cycle=true)
                                 allRows.add(row);
-                                List<Object> childPath = new ArrayList<>(parentPath);
-                                childPath.add(extractSearchKey(row, searchByIndices));
-                                ordcolPaths.add(childPath);
-                                newPaths.add(childPath);
+
+                                if (hasCycle) {
+                                    isCycleFlags.add(childIsCycle);
+                                }
+
+                                // Add search path for all rows (needed for ordcol indexing)
+                                if (hasSearch) {
+                                    List<Object> searchPath = new ArrayList<>();
+                                    searchPath.add(extractSearchKey(row, searchByIndices));
+                                    ordcolPaths.add(searchPath);
+                                }
+
+                                // Add cycle path for all rows
+                                if (hasCycle) {
+                                    List<Object> childCyclePath = parentCyclePath != null
+                                            ? new ArrayList<>(parentCyclePath) : new ArrayList<>();
+                                    Object childKey = extractSearchKey(row, cycleByIndices);
+                                    childCyclePath.add(childKey);
+                                    cyclePaths.add(childCyclePath);
+                                    if (!childIsCycle) {
+                                        newCyclePaths.add(childCyclePath);
+                                    }
+                                }
+
+                                if (childIsCycle) {
+                                    // Don't recurse from cycle rows
+                                    continue;
+                                }
+
+                                newRows.add(row);
                             }
                         }
                     } finally {
@@ -172,32 +368,9 @@ class SelectCteExecutor {
                         if (previousTable != null) targetSchema.addTable(previousTable);
                     }
                 }
+
                 workingSet = newRows;
-                workingSetPaths = newPaths;
-            } else {
-                Table workingTable = new Table(cteName, columns);
-                for (Object[] row : workingSet) workingTable.insertRow(row);
-                targetSchema.addTable(workingTable);
-
-                try {
-                    QueryResult iterResult = executor.executeStatement(setOp.right());
-
-                    if (iter == 0) {
-                        validateIterationResult(iterResult, columns, setOp.right());
-                    }
-
-                    List<Object[]> newRows = new ArrayList<>();
-                    for (Object[] row : iterResult.getRows()) {
-                        if (isUnionAll || seenKeys.add(Arrays.deepToString(row))) {
-                            newRows.add(row);
-                            allRows.add(row);
-                        }
-                    }
-                    workingSet = newRows;
-                } finally {
-                    targetSchema.removeTable(cteName);
-                    if (previousTable != null) targetSchema.addTable(previousTable);
-                }
+                workingSetCyclePaths = newCyclePaths;
             }
         }
 
@@ -208,16 +381,26 @@ class SelectCteExecutor {
         }
 
         // Add SEARCH ordering column if declared
-        if (cte.searchColumn() != null) {
+        if (hasSearch) {
             String scol = cte.searchColumn();
             List<Column> extCols = new ArrayList<>(columns);
             if (depthFirstSearch && ordcolPaths != null) {
-                extCols.add(new Column(scol, DataType.TEXT, true, false, null));
+                // For DFS: sort rows by their search path (element-wise) and assign integer ordcol
+                // Build index array sorted by path comparison
+                Integer[] indices = new Integer[allRows.size()];
+                for (int i = 0; i < indices.length; i++) indices[i] = i;
+                Arrays.sort(indices, (a, b) -> compareSearchPaths(ordcolPaths.get(a), ordcolPaths.get(b)));
+                // Assign ordcol based on sorted position
+                int[] ordcolValues = new int[allRows.size()];
+                for (int rank = 0; rank < indices.length; rank++) {
+                    ordcolValues[indices[rank]] = rank;
+                }
+                extCols.add(new Column(scol, DataType.INTEGER, true, false, null));
                 List<Object[]> extRows = new ArrayList<>();
                 for (int i = 0; i < allRows.size(); i++) {
                     Object[] orig = allRows.get(i);
                     Object[] ext = Arrays.copyOf(orig, orig.length + 1);
-                    ext[orig.length] = formatRecordArray(ordcolPaths.get(i));
+                    ext[orig.length] = ordcolValues[i];
                     extRows.add(ext);
                 }
                 columns = extCols;
@@ -237,7 +420,7 @@ class SelectCteExecutor {
         }
 
         // Add CYCLE column and path column if declared
-        if (cte.cycleColumn() != null) {
+        if (hasCycle) {
             String ccol = cte.cycleColumn();
             String pathcol = cte.cyclePathColumn() != null ? cte.cyclePathColumn() : "path";
             List<Column> extCols = new ArrayList<>(columns);
@@ -245,33 +428,14 @@ class SelectCteExecutor {
             extCols.add(new Column(pathcol, DataType.TEXT, true, false, null));
 
             List<Object[]> extRows = new ArrayList<>();
-            if (ordcolPaths != null) {
-                for (int i = 0; i < allRows.size(); i++) {
-                    Object[] orig = allRows.get(i);
-                    List<Object> path = ordcolPaths.get(i);
-                    Object lastKey = path.get(path.size() - 1);
-                    boolean isCycle = false;
-                    for (int j = 0; j < path.size() - 1; j++) {
-                        if (java.util.Objects.equals(path.get(j), lastKey)) {
-                            isCycle = true;
-                            break;
-                        }
-                    }
-                    Object[] ext = Arrays.copyOf(orig, orig.length + 2);
-                    ext[orig.length] = isCycle;
-                    ext[orig.length + 1] = formatRecordArray(path);
-                    extRows.add(ext);
-                }
-            } else {
-                Set<String> cycleCheck = new HashSet<>();
-                for (Object[] orig : allRows) {
-                    String key = Arrays.deepToString(orig);
-                    boolean isCycle = !cycleCheck.add(key);
-                    Object[] ext = Arrays.copyOf(orig, orig.length + 2);
-                    ext[orig.length] = isCycle;
-                    ext[orig.length + 1] = key;
-                    extRows.add(ext);
-                }
+            for (int i = 0; i < allRows.size(); i++) {
+                Object[] orig = allRows.get(i);
+                boolean isCycle = i < isCycleFlags.size() ? isCycleFlags.get(i) : false;
+                List<Object> path = i < cyclePaths.size() ? cyclePaths.get(i) : Collections.singletonList(null);
+                Object[] ext = Arrays.copyOf(orig, orig.length + 2);
+                ext[orig.length] = isCycle;
+                ext[orig.length + 1] = formatRecordArray(path);
+                extRows.add(ext);
             }
             columns = extCols;
             allRows = extRows;
@@ -309,6 +473,32 @@ class SelectCteExecutor {
             }
         }
         validateRecursiveTermTypes(columns, recursiveTerm);
+    }
+
+    /** Compare two search paths element-wise for DFS ordering. */
+    @SuppressWarnings("unchecked")
+    static int compareSearchPaths(List<Object> a, List<Object> b) {
+        int len = Math.min(a.size(), b.size());
+        for (int i = 0; i < len; i++) {
+            Object va = a.get(i);
+            Object vb = b.get(i);
+            if (va == null && vb == null) continue;
+            if (va == null) return -1;
+            if (vb == null) return 1;
+            if (va instanceof Comparable && vb instanceof Comparable) {
+                try {
+                    int cmp = ((Comparable) va).compareTo(vb);
+                    if (cmp != 0) return cmp;
+                } catch (ClassCastException e) {
+                    int cmp = String.valueOf(va).compareTo(String.valueOf(vb));
+                    if (cmp != 0) return cmp;
+                }
+            } else {
+                int cmp = String.valueOf(va).compareTo(String.valueOf(vb));
+                if (cmp != 0) return cmp;
+            }
+        }
+        return Integer.compare(a.size(), b.size());
     }
 
     static String formatRecordArray(List<Object> path) {

@@ -551,24 +551,32 @@ class NoopDdlCoverageTest {
     }
 
     @Test void testLoUnlink() throws SQLException {
-        String result = query1("SELECT lo_unlink(1)");
+        String oid = query1("SELECT lo_from_bytea(0, '\\x'::bytea)");
+        String result = query1("SELECT lo_unlink(" + oid + ")");
         assertNotNull(result);
     }
 
     @Test void testLoGet() throws SQLException {
         // lo_get returns bytea
-        ResultSet rs = stmt.executeQuery("SELECT lo_get(1)");
+        String oid = query1("SELECT lo_from_bytea(0, '\\x48656c6c6f'::bytea)");
+        ResultSet rs = stmt.executeQuery("SELECT lo_get(" + oid + ")");
         assertTrue(rs.next());
         assertNotNull(rs.getObject(1));
     }
 
     @Test void testLoWrite() throws SQLException {
-        String result = query1("SELECT lowrite(0, '\\x48656c6c6f'::bytea)");
+        String oid = query1("SELECT lo_from_bytea(0, '\\x'::bytea)");
+        String fd = query1("SELECT lo_open(" + oid + ", 131072)"); // INV_WRITE = 0x20000
+        String result = query1("SELECT lowrite(" + fd + ", '\\x48656c6c6f'::bytea)");
         assertNotNull(result);
+        assertEquals("5", result); // 5 bytes written
+        query1("SELECT lo_close(" + fd + ")");
     }
 
     @Test void testLoRead() throws SQLException {
-        ResultSet rs = stmt.executeQuery("SELECT loread(0, 10)");
+        String oid = query1("SELECT lo_from_bytea(0, '\\x48656c6c6f'::bytea)");
+        String fd = query1("SELECT lo_open(" + oid + ", 262144)");
+        ResultSet rs = stmt.executeQuery("SELECT loread(" + fd + ", 10)");
         assertTrue(rs.next());
         assertNotNull(rs.getObject(1));
     }

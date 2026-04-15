@@ -23,6 +23,41 @@ public final class SelectStmt implements Statement {
     public final List<CommonTableExpr> withClauses;
     public final List<List<Expression>> groupingSets;
     public final LockClause lockClause;
+    public final boolean withTies;
+
+    public SelectStmt(
+            boolean distinct,
+            List<Expression> distinctOn,
+            List<SelectTarget> targets,
+            List<FromItem> from,
+            Expression where,
+            List<Expression> groupBy,
+            Expression having,
+            List<WindowDef> windowDefs,
+            List<OrderByItem> orderBy,
+            Expression limit,
+            Expression offset,
+            List<CommonTableExpr> withClauses,
+            List<List<Expression>> groupingSets,
+            LockClause lockClause,
+            boolean withTies
+    ) {
+        this.distinct = distinct;
+        this.distinctOn = distinctOn;
+        this.targets = targets;
+        this.from = from;
+        this.where = where;
+        this.groupBy = groupBy;
+        this.having = having;
+        this.windowDefs = windowDefs;
+        this.orderBy = orderBy;
+        this.limit = limit;
+        this.offset = offset;
+        this.withClauses = withClauses;
+        this.groupingSets = groupingSets;
+        this.lockClause = lockClause;
+        this.withTies = withTies;
+    }
 
     public SelectStmt(
             boolean distinct,
@@ -40,20 +75,7 @@ public final class SelectStmt implements Statement {
             List<List<Expression>> groupingSets,
             LockClause lockClause
     ) {
-        this.distinct = distinct;
-        this.distinctOn = distinctOn;
-        this.targets = targets;
-        this.from = from;
-        this.where = where;
-        this.groupBy = groupBy;
-        this.having = having;
-        this.windowDefs = windowDefs;
-        this.orderBy = orderBy;
-        this.limit = limit;
-        this.offset = offset;
-        this.withClauses = withClauses;
-        this.groupingSets = groupingSets;
-        this.lockClause = lockClause;
+        this(distinct, distinctOn, targets, from, where, groupBy, having, windowDefs, orderBy, limit, offset, withClauses, groupingSets, lockClause, false);
     }
 
     /** Canonical constructor without lockClause (backward compatibility). */
@@ -426,6 +448,31 @@ public final class SelectStmt implements Statement {
         public final List<String> searchByColumns;
         public final String cycleColumn;
         public final String cyclePathColumn;
+        public final List<String> cycleByColumns;
+
+        public CommonTableExpr(
+                String name,
+                List<String> columnNames,
+                Statement query,
+                boolean recursive,
+                String searchColumn,
+                boolean searchDepthFirst,
+                List<String> searchByColumns,
+                String cycleColumn,
+                String cyclePathColumn,
+                List<String> cycleByColumns
+        ) {
+            this.name = name;
+            this.columnNames = columnNames;
+            this.query = query;
+            this.recursive = recursive;
+            this.searchColumn = searchColumn;
+            this.searchDepthFirst = searchDepthFirst;
+            this.searchByColumns = searchByColumns;
+            this.cycleColumn = cycleColumn;
+            this.cyclePathColumn = cyclePathColumn;
+            this.cycleByColumns = cycleByColumns;
+        }
 
         public CommonTableExpr(
                 String name,
@@ -438,20 +485,12 @@ public final class SelectStmt implements Statement {
                 String cycleColumn,
                 String cyclePathColumn
         ) {
-            this.name = name;
-            this.columnNames = columnNames;
-            this.query = query;
-            this.recursive = recursive;
-            this.searchColumn = searchColumn;
-            this.searchDepthFirst = searchDepthFirst;
-            this.searchByColumns = searchByColumns;
-            this.cycleColumn = cycleColumn;
-            this.cyclePathColumn = cyclePathColumn;
+            this(name, columnNames, query, recursive, searchColumn, searchDepthFirst, searchByColumns, cycleColumn, cyclePathColumn, null);
         }
 
         /** Compact constructor for backward compat */
         public CommonTableExpr(String name, List<String> columnNames, Statement query, boolean recursive) {
-            this(name, columnNames, query, recursive, null, false, null, null, null);
+            this(name, columnNames, query, recursive, null, false, null, null, null, null);
         }
 
         public String name() { return name; }
@@ -463,6 +502,7 @@ public final class SelectStmt implements Statement {
         public List<String> searchByColumns() { return searchByColumns; }
         public String cycleColumn() { return cycleColumn; }
         public String cyclePathColumn() { return cyclePathColumn; }
+        public List<String> cycleByColumns() { return cycleByColumns; }
 
         @Override
         public boolean equals(Object o) {
@@ -550,6 +590,7 @@ public final class SelectStmt implements Statement {
     public List<CommonTableExpr> withClauses() { return withClauses; }
     public List<List<Expression>> groupingSets() { return groupingSets; }
     public LockClause lockClause() { return lockClause; }
+    public boolean withTies() { return withTies; }
 
     @Override
     public boolean equals(Object o) {

@@ -203,13 +203,13 @@ class BinaryOpEvaluator {
                 if (lBitsXor != null && rBitsXor != null) {
                     return new AstExecutor.PgBitString(AstExecutor.bitwiseBitString(lBitsXor, rBitsXor, '#'));
                 }
-                // Geometric intersection: lseg # lseg
+                // Geometric intersection: lseg # lseg, box # box
                 if (left instanceof String && right instanceof String
                         && GeometricOperations.isGeometricString(((String) left))) {
                     String rs = (String) right;
                     String ls = (String) left;
-                    GeometricOperations.PgPoint pt = GeometricOperations.intersection(ls, rs);
-                    return pt != null ? GeometricOperations.format(pt) : null;
+                    Object result = GeometricOperations.intersectionGeneral(ls, rs);
+                    return result != null ? GeometricOperations.format(result) : null;
                 }
                 return (int)(executor.toLong(left) ^ executor.toLong(right));
             }
@@ -450,6 +450,10 @@ class BinaryOpEvaluator {
                 String rs = right.toString();
                 boolean looksLikePgArrayL = ls.trim().startsWith("{") && ls.trim().endsWith("}") && !ls.trim().startsWith("{\"");
                 boolean looksLikePgArrayR = rs.trim().startsWith("{") && rs.trim().endsWith("}") && !rs.trim().startsWith("{\"");
+                // PG does NOT support || for multirange types
+                if (RangeOperations.isMultirangeOrEmpty(ls) || RangeOperations.isMultirangeOrEmpty(rs)) {
+                    throw new MemgresException("operator does not exist: multirange || multirange", "42883");
+                }
                 // PG array string || scalar = array append
                 if (looksLikePgArrayL && !looksLikePgArrayR) {
                     List<Object> arr = new ArrayList<>(FunctionEvaluator.parseSimplePgArray(ls));
@@ -469,9 +473,11 @@ class BinaryOpEvaluator {
                     arr.addAll(FunctionEvaluator.parseSimplePgArray(rs));
                     return TypeCoercion.formatPgArray(arr);
                 }
-                if ((ls.trim().startsWith("{") || ls.trim().startsWith("[")) &&
-                    (rs.trim().startsWith("{") || rs.trim().startsWith("["))) {
-                    return JsonOperations.concatenate(ls, rs);
+                if ((ls.trim().startsWith("{") || ls.trim().startsWith("["))) {
+                    // Check for JSON concatenation
+                    if ((rs.trim().startsWith("{") || rs.trim().startsWith("["))) {
+                        return JsonOperations.concatenate(ls, rs);
+                    }
                 }
                 return ls + rs;
             }
@@ -1041,13 +1047,13 @@ class BinaryOpEvaluator {
                 if (lBitsXor2 != null && rBitsXor2 != null) {
                     return new AstExecutor.PgBitString(AstExecutor.bitwiseBitString(lBitsXor2, rBitsXor2, '#'));
                 }
-                // Geometric intersection: lseg # lseg
+                // Geometric intersection: lseg # lseg, box # box
                 if (left instanceof String && right instanceof String
                         && GeometricOperations.isGeometricString(((String) left))) {
                     String rs = (String) right;
                     String ls = (String) left;
-                    GeometricOperations.PgPoint pt = GeometricOperations.intersection(ls, rs);
-                    return pt != null ? GeometricOperations.format(pt) : null;
+                    Object result = GeometricOperations.intersectionGeneral(ls, rs);
+                    return result != null ? GeometricOperations.format(result) : null;
                 }
                 return (int)(executor.toLong(left) ^ executor.toLong(right));
             }
