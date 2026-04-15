@@ -106,17 +106,8 @@ class DateTimeArithmetic {
 
         // Multirange + Multirange → union
         if (left instanceof String && right instanceof String
-                && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
-            return RangeOperations.multirangeUnion((String) left, (String) right);
-        }
-        // Multirange + Range → add range to multirange
-        if (left instanceof String && right instanceof String
-                && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isRangeString(((String) right))) {
-            return RangeOperations.multirangeUnion((String) left, "{" + right + "}");
-        }
-        if (left instanceof String && right instanceof String
-                && RangeOperations.isRangeString(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
-            return RangeOperations.multirangeUnion("{" + left + "}", (String) right);
+                && (RangeOperations.isMultirangeOrEmpty(((String) left)) || RangeOperations.isMultirangeOrEmpty(((String) right)))) {
+            return RangeOperations.multirangeUnion(((String) left), ((String) right));
         }
         // Range + Range → union
         if (left instanceof String && right instanceof String

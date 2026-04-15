@@ -127,6 +127,40 @@ class LargeObjectStore {
     }
 
     /**
+     * lo_tell(fd): return current position of an open large object.
+     */
+    int loTell(int fd) {
+        FdState state = openFds.get(fd);
+        if (state == null) {
+            throw new MemgresException("invalid large-object descriptor: " + fd, "42704");
+        }
+        return state.position;
+    }
+
+    /**
+     * lowrite(fd, data): write data at current position of open large object.
+     * Returns the number of bytes written.
+     */
+    int loWrite(int fd, byte[] data) {
+        FdState state = openFds.get(fd);
+        if (state == null) {
+            throw new MemgresException("invalid large-object descriptor: " + fd, "42704");
+        }
+        byte[] existing = objects.get(state.oid);
+        if (existing == null) {
+            throw new MemgresException("large object " + state.oid + " does not exist", "42704");
+        }
+        int needed = state.position + data.length;
+        if (needed > existing.length) {
+            existing = Arrays.copyOf(existing, needed);
+        }
+        System.arraycopy(data, 0, existing, state.position, data.length);
+        objects.put(state.oid, existing);
+        state.position += data.length;
+        return data.length;
+    }
+
+    /**
      * lo_close(fd): close a file descriptor.
      */
     int loClose(int fd) {

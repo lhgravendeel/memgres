@@ -450,6 +450,10 @@ class BinaryOpEvaluator {
                 String rs = right.toString();
                 boolean looksLikePgArrayL = ls.trim().startsWith("{") && ls.trim().endsWith("}") && !ls.trim().startsWith("{\"");
                 boolean looksLikePgArrayR = rs.trim().startsWith("{") && rs.trim().endsWith("}") && !rs.trim().startsWith("{\"");
+                // PG does NOT support || for multirange types
+                if (RangeOperations.isMultirangeOrEmpty(ls) || RangeOperations.isMultirangeOrEmpty(rs)) {
+                    throw new MemgresException("operator does not exist: multirange || multirange", "42883");
+                }
                 // PG array string || scalar = array append
                 if (looksLikePgArrayL && !looksLikePgArrayR) {
                     List<Object> arr = new ArrayList<>(FunctionEvaluator.parseSimplePgArray(ls));
@@ -469,9 +473,11 @@ class BinaryOpEvaluator {
                     arr.addAll(FunctionEvaluator.parseSimplePgArray(rs));
                     return TypeCoercion.formatPgArray(arr);
                 }
-                if ((ls.trim().startsWith("{") || ls.trim().startsWith("[")) &&
-                    (rs.trim().startsWith("{") || rs.trim().startsWith("["))) {
-                    return JsonOperations.concatenate(ls, rs);
+                if ((ls.trim().startsWith("{") || ls.trim().startsWith("["))) {
+                    // Check for JSON concatenation
+                    if ((rs.trim().startsWith("{") || rs.trim().startsWith("["))) {
+                        return JsonOperations.concatenate(ls, rs);
+                    }
                 }
                 return ls + rs;
             }

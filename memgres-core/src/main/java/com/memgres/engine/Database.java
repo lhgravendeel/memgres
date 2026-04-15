@@ -459,12 +459,24 @@ public class Database {
         if (overloads.size() == 1) {
             if (argTypeHints == null || argTypeHints.isEmpty()
                     || argTypeHints.stream().allMatch(h -> h == null)) {
-                return overloads.get(0);
+                // For VARIADIC functions with unknown types, reject if no variadic args provided
+                PgFunction single = overloads.get(0);
+                boolean hasVariadic = single.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
+                if (hasVariadic) {
+                    long nonVariadicCount = single.getParams().stream()
+                            .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
+                            .count();
+                    if (argCount <= nonVariadicCount) return null;
+                }
+                return single;
             }
             PgFunction f = overloads.get(0);
+            // For VARIADIC functions, reject if no args provided for the variadic parameter
+            boolean fHasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
             List<PgFunction.Param> inputParams = f.getParams().stream()
                     .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
                     .collect(Collectors.toList());
+            if (fHasVariadic && argCount <= inputParams.size()) return null;
             boolean hasIncompatible = false;
             for (int i = 0; i < argTypeHints.size() && i < inputParams.size(); i++) {
                 String hint = argTypeHints.get(i);
@@ -486,8 +498,9 @@ public class Database {
                     .collect(Collectors.toList());
             boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
             if (hasVariadic) {
-                // VARIADIC: argCount must be >= non-variadic input count
-                if (argCount < inputParams.size()) continue;
+                // VARIADIC functions require at least one arg beyond the non-variadic params
+                // PG rejects calls where no args are provided for the VARIADIC parameter
+                if (argCount <= inputParams.size()) continue;
             } else {
                 if (inputParams.size() != argCount) continue;
             }
@@ -508,16 +521,21 @@ public class Database {
         // When type hints exist and no overload matched, the call is genuinely unresolvable
         // (e.g., fn_to_drop(integer) was dropped, fn_to_drop(text) remains, calling fn_to_drop(1)).
         if (argTypeHints == null || argTypeHints.isEmpty() || argTypeHints.stream().allMatch(h -> h == null)) {
+            // First pass: prefer non-variadic exact matches
             for (PgFunction f : overloads) {
                 long inputCount = f.getParams().stream()
                         .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
                         .count();
                 boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
-                if (hasVariadic) {
-                    if (argCount >= inputCount) return f;
-                } else {
-                    if (inputCount == argCount) return f;
-                }
+                if (!hasVariadic && inputCount == argCount) return f;
+            }
+            // Second pass: allow VARIADIC only when extra args are provided beyond the required params
+            for (PgFunction f : overloads) {
+                long inputCount = f.getParams().stream()
+                        .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
+                        .count();
+                boolean hasVariadic = f.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
+                if (hasVariadic && argCount > inputCount) return f;
             }
             return overloads.get(0); // fallback to first
         }

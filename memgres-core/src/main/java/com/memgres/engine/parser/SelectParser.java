@@ -168,6 +168,8 @@ class SelectParser {
         List<SelectStmt.CommonTableExpr> withClauses = null;
         if (parser.checkKeyword("WITH")) {
             withClauses = parseWithClause();
+            // Consume optional SEARCH/CYCLE clauses (can appear in subquery context)
+            consumeSearchCycleClauses(withClauses);
         }
 
         Statement body = parseSelectBody();
@@ -517,9 +519,10 @@ class SelectParser {
      * Parse a WITH statement: WITH ... [SEARCH ... ] [CYCLE ... ] SELECT|INSERT|UPDATE|DELETE.
      * Parses the WITH clause first, then dispatches to the correct DML parser.
      */
-    Statement parseWithStatement() {
-        List<SelectStmt.CommonTableExpr> ctes = parseWithClause();
-        // Consume optional SEARCH BREADTH|DEPTH FIRST BY col SET ordcol
+    /**
+     * Consume optional SEARCH and CYCLE clauses after a WITH clause and attach to last CTE.
+     */
+    private void consumeSearchCycleClauses(List<SelectStmt.CommonTableExpr> ctes) {
         String searchCol = null;
         boolean searchDepthFirst = false;
         List<String> searchByColumns = null;
@@ -532,32 +535,29 @@ class SelectParser {
             }
             parser.matchKeyword("FIRST");
             parser.expectKeyword("BY");
-            searchByColumns = parser.parseIdentifierList(); // columns
+            searchByColumns = parser.parseIdentifierList();
             parser.expectKeyword("SET");
-            searchCol = parser.readIdentifier(); // ordering column name
+            searchCol = parser.readIdentifier();
         }
-        // Consume optional CYCLE col SET is_cycle [TO val DEFAULT val] USING path
         String cycleCol = null;
         String cyclePathCol = null;
         List<String> cycleByColumns = null;
         if (parser.checkKeyword("CYCLE")) {
             parser.advance(); // CYCLE
-            cycleByColumns = parser.parseIdentifierList(); // tracked columns
+            cycleByColumns = parser.parseIdentifierList();
             parser.expectKeyword("SET");
-            cycleCol = parser.readIdentifier(); // cycle column name
+            cycleCol = parser.readIdentifier();
             if (parser.matchKeyword("TO")) {
-                parser.parseExpression(); // cycle value
+                parser.parseExpression();
                 parser.expectKeyword("DEFAULT");
-                parser.parseExpression(); // default value
+                parser.parseExpression();
             }
             parser.expectKeyword("USING");
-            cyclePathCol = parser.readIdentifier(); // path column name
+            cyclePathCol = parser.readIdentifier();
         }
-        // Attach SEARCH/CYCLE metadata to last CTE
         if ((searchCol != null || cycleCol != null) && !ctes.isEmpty()) {
             int last = ctes.size() - 1;
             SelectStmt.CommonTableExpr origCte = ctes.get(last);
-            // SEARCH/CYCLE clauses are only valid on recursive CTEs
             if (!origCte.recursive()) {
                 throw new com.memgres.engine.MemgresException(
                     "WITH query \"" + origCte.name() + "\" is not recursive", "42601");
@@ -565,6 +565,11 @@ class SelectParser {
             ctes.set(last, new SelectStmt.CommonTableExpr(origCte.name(), origCte.columnNames(),
                     origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns, cycleCol, cyclePathCol, cycleByColumns));
         }
+    }
+
+    Statement parseWithStatement() {
+        List<SelectStmt.CommonTableExpr> ctes = parseWithClause();
+        consumeSearchCycleClauses(ctes);
         Token next = parser.peek();
         if (next.type() == TokenType.KEYWORD) {
             switch (next.value()) {

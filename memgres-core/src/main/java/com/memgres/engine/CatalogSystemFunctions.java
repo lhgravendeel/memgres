@@ -582,6 +582,12 @@ class CatalogSystemFunctions {
                 int whence = ((Number) whenceArg).intValue();
                 return executor.database.getLargeObjectStore().loLseek(fd, offset, whence);
             }
+            case "lo_tell": {
+                requireArgs(fn, 1);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                int fd = ((Number) fdArg).intValue();
+                return executor.database.getLargeObjectStore().loTell(fd);
+            }
             case "lo_truncate": {
                 requireArgs(fn, 2);
                 Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -590,8 +596,17 @@ class CatalogSystemFunctions {
                 int len = ((Number) lenArg).intValue();
                 return executor.database.getLargeObjectStore().loTruncate(fd, len);
             }
-            case "lowrite":
-                return 0;
+            case "lowrite": {
+                requireArgs(fn, 2);
+                Object fdArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object dataArg = executor.evalExpr(fn.args().get(1), ctx);
+                int fd = ((Number) fdArg).intValue();
+                byte[] data;
+                if (dataArg instanceof byte[]) data = (byte[]) dataArg;
+                else if (dataArg instanceof String) data = ((String) dataArg).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                else data = new byte[0];
+                return executor.database.getLargeObjectStore().loWrite(fd, data);
+            }
             case "pg_event_trigger_ddl_commands":
             case "pg_event_trigger_dropped_objects":
                 return null;

@@ -402,8 +402,8 @@ ORDER BY id;
 -- row: 7, hr, 1, 2
 -- row: 5, sales, 2, 3
 -- row: 8, hr, 2, 4
--- row: 6, sales, 3, 5
 -- row: 1, eng, 1, 5
+-- row: 6, sales, 3, 5
 -- row: 2, eng, 2, 7
 -- row: 3, eng, 3, 8
 -- end-expected
@@ -413,7 +413,7 @@ SELECT id, dept,
 FROM wf_data
 WINDOW dept_w AS (PARTITION BY dept ORDER BY salary),
        global_w AS (ORDER BY salary)
-ORDER BY salary;
+ORDER BY salary, id;
 
 -- ============================================================================
 -- 23. percent_rank() and cume_dist() window functions

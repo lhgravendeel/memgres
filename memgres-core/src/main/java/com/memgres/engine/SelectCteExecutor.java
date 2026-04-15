@@ -209,54 +209,56 @@ class SelectCteExecutor {
 
                         List<Object> parentCyclePath = (hasCycle && workingSetCyclePaths != null)
                                 ? workingSetCyclePaths.get(pi) : null;
-                        boolean parentCausedCycle = false;
 
                         for (Object[] row : iterResult.getRows()) {
                             if (isUnionAll || seenKeys.add(Arrays.deepToString(row))) {
+                                boolean childIsCycle = false;
                                 if (hasCycle && parentCyclePath != null) {
                                     Object childKey = extractSearchKey(row, cycleByIndices);
-                                    // Check if child's cycle key is in ancestor path
-                                    boolean isCycle = false;
                                     for (Object ancestorKey : parentCyclePath) {
                                         if (java.util.Objects.equals(ancestorKey, childKey)) {
-                                            isCycle = true;
+                                            childIsCycle = true;
                                             break;
                                         }
                                     }
-                                    if (isCycle) {
-                                        // Don't emit cycle row; mark the parent as is_cycle=true
-                                        parentCausedCycle = true;
-                                        continue; // skip this child row
-                                    }
                                 }
 
-                                newRows.add(row);
+                                // Always emit the row (PG emits cycle rows with is_cycle=true)
                                 allRows.add(row);
 
+                                if (hasCycle) {
+                                    isCycleFlags.add(childIsCycle);
+                                }
+
+                                // Add search path for all rows (needed for ordcol indexing)
                                 if (hasSearch) {
                                     List<Object> parentSearchPath = workingSetSearchPaths.get(pi);
                                     List<Object> childSearchPath = new ArrayList<>(parentSearchPath);
                                     childSearchPath.add(extractSearchKey(row, searchByIndices));
                                     ordcolPaths.add(childSearchPath);
-                                    newSearchPaths.add(childSearchPath);
+                                    if (!childIsCycle) {
+                                        newSearchPaths.add(childSearchPath);
+                                    }
                                 }
 
+                                // Add cycle path for all rows (needed for is_cycle/path indexing)
                                 if (hasCycle) {
                                     List<Object> childCyclePath = new ArrayList<>(parentCyclePath);
                                     Object childKey = extractSearchKey(row, cycleByIndices);
                                     childCyclePath.add(childKey);
                                     cyclePaths.add(childCyclePath);
-                                    newCyclePaths.add(childCyclePath);
-                                    isCycleFlags.add(false);
+                                    if (!childIsCycle) {
+                                        newCyclePaths.add(childCyclePath);
+                                    }
                                 }
-                            }
-                        }
 
-                        if (parentCausedCycle && hasCycle) {
-                            // Mark parent's is_cycle flag
-                            int parentGlobalIdx = allRows.indexOf(parentRow);
-                            if (parentGlobalIdx >= 0 && parentGlobalIdx < isCycleFlags.size()) {
-                                isCycleFlags.set(parentGlobalIdx, true);
+                                if (childIsCycle) {
+                                    // Don't recurse from cycle rows — but the row IS emitted
+                                    continue;
+                                }
+
+                                // Non-cycle row: add to working set for further recursion
+                                newRows.add(row);
                             }
                         }
                     } finally {
@@ -293,83 +295,82 @@ class SelectCteExecutor {
                     continue;
                 }
 
-                Table workingTable = new Table(cteName, columns);
-                for (Object[] row : nonCycleWorkingSet) workingTable.insertRow(row);
-                targetSchema.addTable(workingTable);
+                // BFS with per-parent cycle detection: process each parent individually
+                // to properly track cycle paths per ancestry chain
+                List<Object[]> newRows = new ArrayList<>();
+                List<List<Object>> newCyclePaths = hasCycle ? new ArrayList<>() : null;
 
-                try {
-                    QueryResult iterResult = executor.executeStatement(setOp.right());
+                for (int pi = 0; pi < nonCycleWorkingSet.size(); pi++) {
+                    Object[] parentRow = nonCycleWorkingSet.get(pi);
+                    List<Object> parentCyclePath = (hasCycle && workingSetCyclePaths != null && pi < workingSetCyclePaths.size())
+                            ? workingSetCyclePaths.get(pi) : null;
 
-                    if (iter == 0) {
-                        validateIterationResult(iterResult, columns, setOp.right());
-                    }
+                    Table singleRowTable = new Table(cteName, columns);
+                    singleRowTable.insertRow(parentRow);
+                    targetSchema.addTable(singleRowTable);
 
-                    // Collect global seen set for BFS cycle detection
-                    Set<Object> globalSeenCycleKeys = null;
-                    if (hasCycle) {
-                        globalSeenCycleKeys = new HashSet<>();
-                        for (List<Object> cp : cyclePaths) {
-                            globalSeenCycleKeys.addAll(cp);
+                    try {
+                        QueryResult iterResult = executor.executeStatement(setOp.right());
+
+                        if (iter == 0 && pi == 0) {
+                            validateIterationResult(iterResult, columns, setOp.right());
                         }
-                    }
 
-                    List<Object[]> newRows = new ArrayList<>();
-                    List<List<Object>> newCyclePaths = hasCycle ? new ArrayList<>() : null;
-                    // Track which parent rows caused cycles (for marking is_cycle)
-                    Set<Integer> cycleParentIndices = hasCycle ? new HashSet<>() : null;
-
-                    for (Object[] row : iterResult.getRows()) {
-                        if (isUnionAll || seenKeys.add(Arrays.deepToString(row))) {
-                            if (hasCycle && globalSeenCycleKeys != null) {
-                                Object childKey = extractSearchKey(row, cycleByIndices);
-                                if (globalSeenCycleKeys.contains(childKey)) {
-                                    // Cycle detected - don't emit this row
-                                    // Find which parent produced this child and mark it
-                                    // In BFS we can't easily determine the parent, so mark all
-                                    // working set parents that could have produced this
-                                    // Actually, we need to find the parent. The child came from
-                                    // the recursive query JOIN, so its src matches a parent's node.
-                                    // Since we can't easily determine the exact parent, mark any
-                                    // parent whose cycle key matches the child's src.
-                                    // For simplicity, find parents in the working set that could link to this child.
-                                    int wsOffset2 = allRows.size() - nonCycleWorkingSet.size();
-                                    for (int wi = 0; wi < nonCycleWorkingSet.size(); wi++) {
-                                        // Check if this parent is the one that produced the cycle child
-                                        // We can't easily determine this without tracking the join,
-                                        // so find parents that haven't been marked yet
-                                        int gIdx = wsOffset2 + wi;
-                                        // Just mark the parent(s) that could have generated this cycle
+                        for (Object[] row : iterResult.getRows()) {
+                            if (isUnionAll || seenKeys.add(Arrays.deepToString(row))) {
+                                boolean childIsCycle = false;
+                                if (hasCycle && parentCyclePath != null) {
+                                    Object childKey = extractSearchKey(row, cycleByIndices);
+                                    for (Object ancestorKey : parentCyclePath) {
+                                        if (java.util.Objects.equals(ancestorKey, childKey)) {
+                                            childIsCycle = true;
+                                            break;
+                                        }
                                     }
-                                    continue; // Skip cycle row
                                 }
-                            }
 
-                            newRows.add(row);
-                            allRows.add(row);
+                                // Always emit the row (PG emits cycle rows with is_cycle=true)
+                                allRows.add(row);
 
-                            if (hasSearch) {
-                                List<Object> searchPath = new ArrayList<>();
-                                searchPath.add(extractSearchKey(row, searchByIndices));
-                                ordcolPaths.add(searchPath);
-                            }
+                                if (hasCycle) {
+                                    isCycleFlags.add(childIsCycle);
+                                }
 
-                            if (hasCycle) {
-                                Object childKey = extractSearchKey(row, cycleByIndices);
-                                List<Object> childCyclePath = new ArrayList<>();
-                                childCyclePath.add(childKey);
-                                cyclePaths.add(childCyclePath);
-                                newCyclePaths.add(childCyclePath);
-                                isCycleFlags.add(false);
+                                // Add search path for all rows (needed for ordcol indexing)
+                                if (hasSearch) {
+                                    List<Object> searchPath = new ArrayList<>();
+                                    searchPath.add(extractSearchKey(row, searchByIndices));
+                                    ordcolPaths.add(searchPath);
+                                }
+
+                                // Add cycle path for all rows
+                                if (hasCycle) {
+                                    List<Object> childCyclePath = parentCyclePath != null
+                                            ? new ArrayList<>(parentCyclePath) : new ArrayList<>();
+                                    Object childKey = extractSearchKey(row, cycleByIndices);
+                                    childCyclePath.add(childKey);
+                                    cyclePaths.add(childCyclePath);
+                                    if (!childIsCycle) {
+                                        newCyclePaths.add(childCyclePath);
+                                    }
+                                }
+
+                                if (childIsCycle) {
+                                    // Don't recurse from cycle rows
+                                    continue;
+                                }
+
+                                newRows.add(row);
                             }
                         }
+                    } finally {
+                        targetSchema.removeTable(cteName);
+                        if (previousTable != null) targetSchema.addTable(previousTable);
                     }
-
-                    workingSet = newRows;
-                    workingSetCyclePaths = newCyclePaths;
-                } finally {
-                    targetSchema.removeTable(cteName);
-                    if (previousTable != null) targetSchema.addTable(previousTable);
                 }
+
+                workingSet = newRows;
+                workingSetCyclePaths = newCyclePaths;
             }
         }
 

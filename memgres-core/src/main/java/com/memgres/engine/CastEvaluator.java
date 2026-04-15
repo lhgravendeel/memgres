@@ -429,7 +429,7 @@ class CastEvaluator {
             case "macaddr8":
                 return val.toString();
             case "jsonpath":
-                return val.toString();
+                return normalizeJsonpath(val.toString());
             case "xid": {
                 // xid is a transaction ID, essentially an unsigned 32-bit integer
                 if (val instanceof Number) return ((Number) val).longValue();
@@ -840,6 +840,43 @@ class CastEvaluator {
             }
         }
         sb.append("}");
+        return sb.toString();
+    }
+
+    /**
+     * Normalize a jsonpath string to PG format: quote all member accessor keys.
+     * E.g. $.store.book[*].author → $."store"."book"[*]."author"
+     */
+    static String normalizeJsonpath(String jp) {
+        if (jp == null || jp.isEmpty()) return jp;
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < jp.length()) {
+            char c = jp.charAt(i);
+            if (c == '.' && i + 1 < jp.length()) {
+                sb.append('.');
+                i++;
+                char next = jp.charAt(i);
+                if (next == '.' || next == '*' || next == '"') {
+                    // recursive descent (..), wildcard (.*), or already quoted
+                    sb.append(next);
+                    i++;
+                } else if (next == '[') {
+                    sb.append(next);
+                    i++;
+                } else {
+                    // member accessor — read the key name and quote it
+                    int start = i;
+                    while (i < jp.length() && jp.charAt(i) != '.' && jp.charAt(i) != '[' && jp.charAt(i) != ' ') {
+                        i++;
+                    }
+                    sb.append('"').append(jp, start, i).append('"');
+                }
+            } else {
+                sb.append(c);
+                i++;
+            }
+        }
         return sb.toString();
     }
 }

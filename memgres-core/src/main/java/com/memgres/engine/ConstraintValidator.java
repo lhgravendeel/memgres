@@ -610,11 +610,28 @@ class ConstraintValidator {
                                     }
                                 }
                                 if (matches) {
-                                    throw new MemgresException(
+                                    StringBuilder detailSb = new StringBuilder("Key (");
+                                    for (int i = 0; i < refColNames.size(); i++) {
+                                        if (i > 0) detailSb.append(", ");
+                                        detailSb.append(refColNames.get(i));
+                                    }
+                                    detailSb.append(")=(");
+                                    for (int i = 0; i < parentVals.length; i++) {
+                                        if (i > 0) detailSb.append(", ");
+                                        detailSb.append(parentVals[i]);
+                                    }
+                                    detailSb.append(") is still referenced from table \"")
+                                            .append(childTable.getName()).append("\".");
+                                    MemgresException ex = new MemgresException(
                                             "update or delete on table \"" + parentTable.getName() +
                                                     "\" violates foreign key constraint \"" + sc.getName() +
                                                     "\" on table \"" + childTable.getName() + "\"",
                                             "23503");
+                                    ex.setDetail(detailSb.toString());
+                                    ex.setConstraint(sc.getName());
+                                    ex.setTable(childTable.getName());
+                                    ex.setSchema(schema.getName());
+                                    throw ex;
                                 }
                             }
                             break;

@@ -97,8 +97,8 @@ class RecursiveCteCompatTest {
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
             assertTrue(rs.next(), "Expected a result row");
-            assertEquals(6, rs.getInt("cnt"),
-                    "Cycle detection should limit breadth-first traversal to 6 rows");
+            assertEquals(7, rs.getInt("cnt"),
+                    "Cycle detection should produce 7 rows (6 non-cycle + 1 cycle)");
         }
     }
 
@@ -117,8 +117,8 @@ class RecursiveCteCompatTest {
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
             assertTrue(rs.next(), "Expected a result row");
-            assertEquals(5, rs.getInt("non_cycle_cnt"),
-                    "Cycle detection should yield 5 non-cycle rows in depth-first traversal");
+            assertEquals(6, rs.getInt("non_cycle_cnt"),
+                    "Cycle detection should yield 6 non-cycle rows in depth-first traversal");
         }
     }
 }

@@ -92,8 +92,8 @@ class FunctionEvaluator {
         }
 
         // Expand VARIADIC args: NamedArgExpr("__variadic__", arrayExpr) → expand array to individual args
-        boolean hasVariadic = fn.args().stream().anyMatch(a -> a instanceof NamedArgExpr && ((NamedArgExpr) a).name().equals("__variadic__"));
-        if (hasVariadic) {
+        boolean callUsedVariadic = fn.args().stream().anyMatch(a -> a instanceof NamedArgExpr && ((NamedArgExpr) a).name().equals("__variadic__"));
+        if (callUsedVariadic) {
             List<Expression> expandedArgs = new ArrayList<>();
             for (Expression arg : fn.args()) {
                 if (arg instanceof NamedArgExpr && ((NamedArgExpr) arg).name().equals("__variadic__")) {
@@ -1317,6 +1317,13 @@ class FunctionEvaluator {
                             }
                         }
                         userFunc = executor.database.resolveFunction(lookupName, fn.args().size(), argTypeHints);
+                        // When explicit VARIADIC was used and the array was empty,
+                        // expansion yields 0 variadic args. Resolution rejects this
+                        // because it looks like no variadic args were provided.
+                        // Retry with argCount+1 to simulate the empty array as one arg.
+                        if (userFunc == null && callUsedVariadic && fn.args().isEmpty()) {
+                            userFunc = executor.database.resolveFunction(lookupName, 1, argTypeHints);
+                        }
                     } else {
                         userFunc = null;
                     }
