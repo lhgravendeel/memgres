@@ -400,6 +400,16 @@ class ExprEvaluator {
             if (ref.column().equalsIgnoreCase("ctid")) {
                 return "(0,0)"; // stub: return a fixed ctid value
             }
+            // For single-column SRF tables, resolve the alias to the scalar value
+            // (e.g., SELECT elem::int FROM jsonb_array_elements(...) AS elem)
+            {
+                Object singleCol = resolveSingleColumnTableRef(ref.column(), ctx);
+                if (singleCol != null) return singleCol == SINGLE_COL_NULL ? null : singleCol;
+                for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
+                    singleCol = resolveSingleColumnTableRef(ref.column(), it.next());
+                    if (singleCol != null) return singleCol == SINGLE_COL_NULL ? null : singleCol;
+                }
+            }
             // Check if the column name matches a table alias (whole-row reference, e.g. ROW_TO_JSON(row))
             {
                 Object wholeRow = resolveWholeRowRef(ref.column(), ctx);
@@ -506,6 +516,24 @@ class ExprEvaluator {
             record.put(b.table().getColumns().get(i).getName(), b.row()[i]);
         }
         return record;
+    }
+
+    private static final Object SINGLE_COL_NULL = new Object();
+
+    /**
+     * For single-column tables (e.g., SRF results like jsonb_array_elements),
+     * when the alias matches the table name, return the scalar value.
+     * This matches PG behavior for `SELECT elem::int FROM func() AS elem`.
+     * Returns SINGLE_COL_NULL sentinel if found but value is null; returns null if no match.
+     */
+    private Object resolveSingleColumnTableRef(String name, RowContext ctx) {
+        RowContext.TableBinding b = ctx.getBinding(name);
+        if (b == null) return null;
+        if (b.table().getColumns().size() == 1) {
+            Object val = b.row()[0];
+            return val != null ? val : SINGLE_COL_NULL;
+        }
+        return null;
     }
 
     /**

@@ -39,6 +39,7 @@ public class Database {
     private final Map<String, String> indexMethods = new ConcurrentHashMap<>(); // index name → access method (btree, hash, etc.)
     private final Map<String, Map<String, String>> indexReloptions = new ConcurrentHashMap<>(); // index name → storage params
     private final NotificationManager notificationManager = new NotificationManager();
+    private final LargeObjectStore largeObjectStore = new LargeObjectStore();
     private DatabaseRegistry databaseRegistry;
 
     // Row locks: maps table name to (row identity -> list of lock entries)
@@ -250,6 +251,10 @@ public class Database {
 
     public NotificationManager getNotificationManager() {
         return notificationManager;
+    }
+
+    public LargeObjectStore getLargeObjectStore() {
+        return largeObjectStore;
     }
 
     public DatabaseRegistry getDatabaseRegistry() {

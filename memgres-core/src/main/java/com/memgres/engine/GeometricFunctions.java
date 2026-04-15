@@ -29,6 +29,12 @@ class GeometricFunctions {
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
             case "area": {
+                // PG: area() only works on box, circle, path. NOT polygon.
+                String argTypeName = getArgCastType(fn.args().get(0));
+                if ("polygon".equals(argTypeName)) {
+                    throw new MemgresException(
+                        "function area(polygon) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 requireGeometric(arg, "area");
@@ -37,6 +43,16 @@ class GeometricFunctions {
             case "center": {
                 if (fn.args().size() != 1) {
                     throw new MemgresException("function center() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                }
+                // PG: center() only works on box, circle. NOT lseg, polygon, path.
+                String argTypeName = getArgCastType(fn.args().get(0));
+                if ("lseg".equals(argTypeName)) {
+                    throw new MemgresException(
+                        "function center(lseg) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                }
+                if ("polygon".equals(argTypeName)) {
+                    throw new MemgresException(
+                        "function center(polygon) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
                 }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -190,6 +206,15 @@ class GeometricFunctions {
                 return arg == null ? null : GeometricOperations.format(GeometricOperations.parseLine(arg.toString()));
             }
             case "polygon": {
+                if (fn.args().size() == 2) {
+                    // polygon(npts, circle) - create polygon with npts vertices from circle
+                    Object nptsObj = executor.evalExpr(fn.args().get(0), ctx);
+                    Object circleObj = executor.evalExpr(fn.args().get(1), ctx);
+                    if (nptsObj == null || circleObj == null) return null;
+                    int npts = ((Number) nptsObj).intValue();
+                    GeometricOperations.PgCircle circle = GeometricOperations.toCircle(circleObj.toString());
+                    return GeometricOperations.format(GeometricOperations.toPolygon(circle, npts));
+                }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 if (arg instanceof java.util.List<?>) {
@@ -260,5 +285,16 @@ class GeometricFunctions {
             default:
                 return NOT_HANDLED;
         }
+    }
+
+    /**
+     * Extract the type name from a CastExpr argument (e.g., polygon '(...)' -> "polygon").
+     * Returns null if the argument is not a type cast.
+     */
+    private String getArgCastType(Expression expr) {
+        if (expr instanceof CastExpr) {
+            return ((CastExpr) expr).typeName().toLowerCase();
+        }
+        return null;
     }
 }

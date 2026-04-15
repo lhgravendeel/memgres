@@ -381,6 +381,14 @@ class DdlObjectExecutor {
                 if (fp.defaultExpr() != null) {
                     validateDefaultExpr(fp.defaultExpr());
                 }
+                // PL/pgSQL: reject sqlstate and sqlerrm as parameter names (they are implicit CONSTANT variables)
+                if ("plpgsql".equalsIgnoreCase(stmt.language()) && fp.name() != null) {
+                    String lowerName = fp.name().toLowerCase();
+                    if ("sqlstate".equals(lowerName) || "sqlerrm".equals(lowerName)) {
+                        throw new MemgresException(
+                                "variable \"" + fp.name() + "\" is declared CONSTANT", "42601");
+                    }
+                }
                 params.add(new PgFunction.Param(fp.name(), fp.typeName(), fp.mode(), fp.defaultExpr()));
             }
         }

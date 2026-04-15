@@ -7,6 +7,13 @@ package com.memgres.engine;
 public class MemgresException extends RuntimeException {
 
     private final String sqlState;
+    private String detail;
+    private String hint;
+    private String column;
+    private String constraint;
+    private String datatype;
+    private String table;
+    private String schema;
 
     public MemgresException(String message) {
         super(message);
@@ -21,6 +28,21 @@ public class MemgresException extends RuntimeException {
     public String getSqlState() {
         return sqlState;
     }
+
+    public String getDetail() { return detail; }
+    public void setDetail(String detail) { this.detail = detail; }
+    public String getHint() { return hint; }
+    public void setHint(String hint) { this.hint = hint; }
+    public String getColumn() { return column; }
+    public void setColumn(String column) { this.column = column; }
+    public String getConstraint() { return constraint; }
+    public void setConstraint(String constraint) { this.constraint = constraint; }
+    public String getDatatype() { return datatype; }
+    public void setDatatype(String datatype) { this.datatype = datatype; }
+    public String getTable() { return table; }
+    public void setTable(String table) { this.table = table; }
+    public String getSchema() { return schema; }
+    public void setSchema(String schema) { this.schema = schema; }
 
     /**
      * Infer a SQLSTATE code from common error message patterns.

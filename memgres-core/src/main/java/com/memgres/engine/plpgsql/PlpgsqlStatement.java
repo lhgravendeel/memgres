@@ -701,24 +701,42 @@ public interface PlpgsqlStatement {
         public final List<String> argExprs;
         public final String errcode;
         public final String hint;
+        public final String detail;
+        public final String column;
+        public final String constraint;
+        public final String datatype;
+        public final String table;
+        public final String schema;
 
         public RaiseStmt(
                 String level,
                 String format,
                 List<String> argExprs,
                 String errcode,
-                String hint
+                String hint,
+                String detail,
+                String column,
+                String constraint,
+                String datatype,
+                String table,
+                String schema
         ) {
             this.level = level;
             this.format = format;
             this.argExprs = argExprs;
             this.errcode = errcode;
             this.hint = hint;
+            this.detail = detail;
+            this.column = column;
+            this.constraint = constraint;
+            this.datatype = datatype;
+            this.table = table;
+            this.schema = schema;
         }
 
-        /** Backwards-compatible constructor without hint. */
+        /** Backwards-compatible constructor without extra options. */
         RaiseStmt(String level, String format, List<String> argExprs, String errcode) {
-            this(level, format, argExprs, errcode, null);
+            this(level, format, argExprs, errcode, null, null, null, null, null, null, null);
         }
 
         public String level() { return level; }
@@ -726,6 +744,12 @@ public interface PlpgsqlStatement {
         public List<String> argExprs() { return argExprs; }
         public String errcode() { return errcode; }
         public String hint() { return hint; }
+        public String detail() { return detail; }
+        public String column() { return column; }
+        public String constraint() { return constraint; }
+        public String datatype() { return datatype; }
+        public String table() { return table; }
+        public String schema() { return schema; }
 
         @Override
         public boolean equals(Object o) {
@@ -1048,6 +1072,68 @@ public interface PlpgsqlStatement {
 
         @Override
         public String toString() { return "RollbackStmt[chain=" + chain + "]"; }
+    }
+
+    /** A WHEN clause inside a PL/pgSQL CASE statement. */
+    public static final class CaseWhenClause {
+        public final String whenExpr;
+        public final List<PlpgsqlStatement> body;
+
+        public CaseWhenClause(String whenExpr, List<PlpgsqlStatement> body) {
+            this.whenExpr = whenExpr;
+            this.body = body;
+        }
+
+        public String whenExpr() { return whenExpr; }
+        public List<PlpgsqlStatement> body() { return body; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            CaseWhenClause that = (CaseWhenClause) o;
+            return java.util.Objects.equals(whenExpr, that.whenExpr)
+                && java.util.Objects.equals(body, that.body);
+        }
+
+        @Override
+        public int hashCode() { return java.util.Objects.hash(whenExpr, body); }
+
+        @Override
+        public String toString() { return "CaseWhenClause[whenExpr=" + whenExpr + ", body=" + body + "]"; }
+    }
+
+    /** PL/pgSQL CASE statement (searched or simple). */
+    public static final class CaseStmt implements PlpgsqlStatement {
+        public final String searchExpr; // null for searched CASE, non-null for simple CASE
+        public final List<CaseWhenClause> whenClauses;
+        public final List<PlpgsqlStatement> elseBody;
+
+        public CaseStmt(String searchExpr, List<CaseWhenClause> whenClauses, List<PlpgsqlStatement> elseBody) {
+            this.searchExpr = searchExpr;
+            this.whenClauses = whenClauses;
+            this.elseBody = elseBody;
+        }
+
+        public String searchExpr() { return searchExpr; }
+        public List<CaseWhenClause> whenClauses() { return whenClauses; }
+        public List<PlpgsqlStatement> elseBody() { return elseBody; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            CaseStmt that = (CaseStmt) o;
+            return java.util.Objects.equals(searchExpr, that.searchExpr)
+                && java.util.Objects.equals(whenClauses, that.whenClauses)
+                && java.util.Objects.equals(elseBody, that.elseBody);
+        }
+
+        @Override
+        public int hashCode() { return java.util.Objects.hash(searchExpr, whenClauses, elseBody); }
+
+        @Override
+        public String toString() { return "CaseStmt[searchExpr=" + searchExpr + ", whenClauses=" + whenClauses + ", elseBody=" + elseBody + "]"; }
     }
 
     /** ABORT in a procedure body — unsupported transaction command (PG raises 0A000 at runtime). */

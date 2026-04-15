@@ -121,6 +121,12 @@ public class PlpgsqlParser {
 
             String name = readIdent();
 
+            // PL/pgSQL: reject sqlstate and sqlerrm as user variable names (they are implicit CONSTANT variables)
+            if ("sqlstate".equalsIgnoreCase(name) || "sqlerrm".equalsIgnoreCase(name)) {
+                throw new MemgresException(
+                        "variable \"" + name + "\" is declared CONSTANT", "42601");
+            }
+
             if (checkKw("CURSOR")) {
                 advance();
                 // PG 18: CURSOR WITH HOLD is not valid in PL/pgSQL
@@ -244,6 +250,8 @@ public class PlpgsqlParser {
                     return parseFor(null);
                 case "FOREACH":
                     return parseForeach(null);
+                case "CASE":
+                    return parseCase();
                 case "EXIT":
                     return parseExit();
                 case "CONTINUE":
@@ -331,6 +339,37 @@ public class PlpgsqlParser {
         match(TokenType.SEMICOLON);
 
         return new PlpgsqlStatement.IfStmt(condition, thenBody, elsifs, elseBody);
+    }
+
+    private PlpgsqlStatement parseCase() {
+        matchKw("CASE");
+        // Determine if this is a simple CASE (has search expression) or searched CASE
+        // Simple CASE: CASE expr WHEN val THEN ... END CASE;
+        // Searched CASE: CASE WHEN bool_expr THEN ... END CASE;
+        String searchExpr = null;
+        if (!checkKw("WHEN")) {
+            searchExpr = collectUntilKeyword("WHEN");
+        }
+
+        List<PlpgsqlStatement.CaseWhenClause> whenClauses = new ArrayList<>();
+        while (checkKw("WHEN")) {
+            advance(); // consume WHEN
+            String whenExpr = collectUntilKeyword("THEN");
+            matchKw("THEN");
+            List<PlpgsqlStatement> body = parseStatements("WHEN", "ELSE", "END");
+            whenClauses.add(new PlpgsqlStatement.CaseWhenClause(whenExpr, body));
+        }
+
+        List<PlpgsqlStatement> elseBody = Cols.listOf();
+        if (matchKw("ELSE")) {
+            elseBody = parseStatements("END");
+        }
+
+        matchKw("END");
+        matchKw("CASE");
+        match(TokenType.SEMICOLON);
+
+        return new PlpgsqlStatement.CaseStmt(searchExpr, whenClauses, elseBody);
     }
 
     private PlpgsqlStatement parseLoop(String label) {
@@ -521,9 +560,17 @@ public class PlpgsqlParser {
     private PlpgsqlStatement parseRaise() {
         matchKw("RAISE");
         String level = "EXCEPTION";
+        String errcode = null;
         if (checkKw("NOTICE") || checkKw("WARNING") || checkKw("EXCEPTION")
                 || checkKw("INFO") || checkKw("LOG") || checkKw("DEBUG")) {
             level = advance().value().toUpperCase();
+        } else if (checkKw("SQLSTATE")) {
+            // RAISE SQLSTATE 'XXXXX' ...
+            advance(); // consume SQLSTATE
+            level = "EXCEPTION";
+            if (check(TokenType.STRING_LITERAL)) {
+                errcode = advance().value();
+            }
         } else if (!check(TokenType.STRING_LITERAL) && !check(TokenType.SEMICOLON) && !checkKw("USING")) {
             // Named condition: RAISE division_by_zero; or RAISE unique_violation USING MESSAGE = '...'
             level = readIdent();
@@ -531,8 +578,13 @@ public class PlpgsqlParser {
 
         String format = null;
         List<String> args = new ArrayList<>();
-        String errcode = null;
         String hint = null;
+        String detail = null;
+        String column = null;
+        String constraint = null;
+        String datatype = null;
+        String table = null;
+        String schema = null;
 
         if (check(TokenType.STRING_LITERAL)) {
             format = advance().value();
@@ -546,26 +598,23 @@ public class PlpgsqlParser {
             while (!check(TokenType.SEMICOLON) && !isAtEnd()) {
                 String key = readIdent();
                 if (match(TokenType.EQUALS) || match(TokenType.COLON_EQUALS)) {
-                    if (key.equalsIgnoreCase("ERRCODE")) {
-                        if (check(TokenType.STRING_LITERAL)) {
-                            errcode = advance().value();
-                        } else {
-                            errcode = readIdent();
-                        }
-                    } else if (key.equalsIgnoreCase("HINT")) {
-                        if (check(TokenType.STRING_LITERAL)) {
-                            hint = advance().value();
-                        } else {
-                            hint = collectUntilMulti(",", ";");
-                        }
-                    } else if (key.equalsIgnoreCase("MESSAGE")) {
-                        if (check(TokenType.STRING_LITERAL)) {
-                            format = advance().value();
-                        } else {
-                            format = collectUntilMulti(",", ";");
-                        }
+                    String val;
+                    if (check(TokenType.STRING_LITERAL)) {
+                        val = advance().value();
                     } else {
-                        advance(); // skip value for other keys (DETAIL, COLUMN, etc.)
+                        val = collectUntilMulti(",", ";");
+                    }
+                    switch (key.toUpperCase()) {
+                        case "ERRCODE": errcode = val; break;
+                        case "MESSAGE": format = val; break;
+                        case "HINT": hint = val; break;
+                        case "DETAIL": detail = val; break;
+                        case "COLUMN": column = val; break;
+                        case "CONSTRAINT": constraint = val; break;
+                        case "DATATYPE": datatype = val; break;
+                        case "TABLE": table = val; break;
+                        case "SCHEMA": schema = val; break;
+                        default: break;
                     }
                 }
                 match(TokenType.COMMA);
@@ -573,7 +622,8 @@ public class PlpgsqlParser {
         }
 
         match(TokenType.SEMICOLON);
-        return new PlpgsqlStatement.RaiseStmt(level, format, args, errcode, hint);
+        return new PlpgsqlStatement.RaiseStmt(level, format, args, errcode, hint,
+                detail, column, constraint, datatype, table, schema);
     }
 
     // ---- PERFORM ----
@@ -1001,6 +1051,8 @@ public class PlpgsqlParser {
         } else if (t.type() == TokenType.DOLLAR_STRING_LITERAL) {
             // Preserve dollar-quoted strings as string literals
             sb.append("'").append(t.value().replace("'", "''")).append("'");
+        } else if (t.type() == TokenType.BIT_STRING_LITERAL) {
+            sb.append("B'").append(t.value()).append("'");
         } else {
             sb.append(t.value());
         }

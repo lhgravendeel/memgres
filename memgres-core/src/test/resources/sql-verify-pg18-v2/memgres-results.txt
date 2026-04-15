@@ -54,7 +54,7 @@ SQL: INSERT INTO no_such_table VALUES (1)
 ERROR [42P01]: ERROR: relation "no_such_table" does not exist
 --- STMT 16 ---
 SQL: SELECT * FROM
-ERROR [42601]: ERROR: Expected identifier at position 13 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 13 near ''
 --- STMT 17 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
@@ -165,16 +165,16 @@ COLUMNS:
 ROW: 
 --- STMT 26 ---
 SQL: SELECT ,1
-ERROR [42601]: ERROR: Unexpected token in expression at position 7 near ','
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 7 near ','
 --- STMT 27 ---
 SQL: SELECT 1 1
-ERROR [42601]: ERROR: syntax error at or near "1" at position 9 near '1'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "1" at position 9 near '1'
 --- STMT 28 ---
 SQL: SELECT (1
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 9 near ''
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found EOF at position 9 near ''
 --- STMT 29 ---
 SQL: SELECT 1)
-ERROR [42601]: ERROR: syntax error at or near ")" at position 8 near ')'
+ERROR [42601]: ERROR: syntax error: syntax error at or near ")" at position 8 near ')'
 --- STMT 30 ---
 SQL: SELECT FROM pg_class
 RESULT: 0 columns, 121 rows
@@ -302,37 +302,37 @@ ROW:
 ROW: 
 --- STMT 31 ---
 SQL: SELECT 1 FROM FROM pg_class
-ERROR [42601]: ERROR: syntax error at or near "FROM" at position 14 near 'FROM'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "FROM" at position 14 near 'FROM'
 --- STMT 32 ---
 SQL: SELECT SELECT 1
-ERROR [42601]: ERROR: syntax error at or near "1" at position 14 near '1'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "1" at position 14 near '1'
 --- STMT 33 ---
 SQL: INSERT INTO "MixedCase" VALUES (1,2,3,)
-ERROR [42601]: ERROR: Unexpected token in expression at position 38 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 38 near ')'
 --- STMT 34 ---
 SQL: CREATE TABLE bad1(,a int)
-ERROR [42601]: ERROR: Expected identifier at position 18 near ','
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 18 near ','
 --- STMT 35 ---
 SQL: CREATE TABLE bad2(a int,, b int)
-ERROR [42601]: ERROR: Expected identifier at position 24 near ','
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 24 near ','
 --- STMT 36 ---
 SQL: CREATE TABLE bad3(a int b int)
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found IDENTIFIER at position 24 near 'b'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found IDENTIFIER at position 24 near 'b'
 --- STMT 37 ---
 SQL: CREATE TABLE bad4(a int DEFAULT)
-ERROR [42601]: ERROR: Unexpected token in expression at position 31 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 31 near ')'
 --- STMT 38 ---
 SQL: CREATE TABLE bad5(a int NOT)
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found KEYWORD at position 24 near 'NOT'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found KEYWORD at position 24 near 'NOT'
 --- STMT 39 ---
 SQL: CREATE TABLE bad6(a int CONSTRAINT)
-ERROR [42601]: ERROR: Expected identifier at position 34 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 34 near ')'
 --- STMT 40 ---
 SQL: CREATE TABLE bad7(a int PRIMARY)
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found KEYWORD at position 24 near 'PRIMARY'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found KEYWORD at position 24 near 'PRIMARY'
 --- STMT 41 ---
 SQL: CREATE TABLE bad8(a int REFERENCES)
-ERROR [42601]: ERROR: Expected identifier at position 34 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 34 near ')'
 --- STMT 42 ---
 SQL: SELECT 'unterminated; SELECT $$unterminated; SELECT E'bad\q'; SELECT 1 + * 2; SELECT (SELECT 1; SELECT CASE WHEN TRUE THEN 1 ELSE END; SELECT CASE WHEN THEN 1 END; SELECT ARRAY[1,2,]; SELECT ROW(1,2,)...
 ERROR [42601]: Unterminated string literal started at position 1,449 in SQL SELECT 'unterminated;
@@ -484,7 +484,7 @@ COLUMNS: ?column?
 ROW: ab
 --- STMT 34 ---
 SQL: -- operator invocation SELECT 1 + 2, - 5, @ -5, 5 !
-ERROR [42601]: ERROR: syntax error at or near "!" at position 51 near '!'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "!" at position 51 near '!'
 --- STMT 35 ---
 SQL: SELECT OPERATOR(pg_catalog.+)(1,2)
 ERROR [42883]: ERROR: operator does not exist: integer + integer
@@ -510,7 +510,7 @@ SQL: SELECT ARRAY[1,'x']
 ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
 --- STMT 42 ---
 SQL: SELECT ARRAY[1,2][1][2]
-ERROR [42601]: ERROR: syntax error at or near "[" at position 17 near '['
+ERROR [42601]: ERROR: syntax error: syntax error at or near "[" at position 17 near '['
 --- STMT 43 ---
 SQL: SELECT ROW(1) = ROW(1,2)
 ERROR [42601]: ERROR: cannot compare row values of different sizes
@@ -522,13 +522,13 @@ SQL: SELECT 'abc'::int
 ERROR [22P02]: ERROR: invalid input syntax for type integer: "abc"
 --- STMT 46 ---
 SQL: SELECT d COLLATE no_such_collation FROM exprs
-ERROR [42704]: ERROR: collation "no_such_collation" for encoding "UTF8" does not exist at position 35 near 'FROM'
+ERROR [42704]: ERROR: syntax error: collation "no_such_collation" for encoding "UTF8" does not exist at position 35 near 'FROM'
 --- STMT 47 ---
 SQL: SELECT OPERATOR(no_such_schema.+)(1,2)
 ERROR [3F000]: ERROR: schema "no_such_schema" does not exist
 --- STMT 48 ---
 SQL: SELECT 5 ! !
-ERROR [42601]: ERROR: syntax error at or near "!" at position 9 near '!'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "!" at position 9 near '!'
 --- STMT 49 ---
 SQL: SELECT (SELECT ROW(1,2)).x
 ERROR [42703]: ERROR: could not identify column "x" in record data type
@@ -600,7 +600,7 @@ COLUMNS: array
 ROW: {}
 --- STMT 64 ---
 SQL: SELECT ARRAY[]
-ERROR [42P18]: ERROR: cannot determine type of empty array at position 14 near ''
+ERROR [42P18]: ERROR: syntax error: cannot determine type of empty array at position 14 near ''
 --- STMT 65 ---
 SQL: SELECT ARRAY[NULL]
 RESULT: 1 columns, 1 rows
@@ -652,7 +652,7 @@ COLUMNS: pg_typeof
 ROW: numeric
 --- STMT 75 ---
 SQL: SELECT 1 UNION ALL SELECT 'x'
-ERROR [22P02]: ERROR: UNION types int4 and text cannot be matched
+ERROR [22P02]: ERROR: invalid input syntax for type int4: "x"
 --- STMT 76 ---
 SQL: SELECT CASE WHEN true THEN ROW(1,'a')::pair ELSE ROW(2,'b')::pair END
 ERROR [42704]: ERROR: type "pair" does not exist
@@ -819,7 +819,7 @@ COLUMNS: substring
 ROW: ab
 --- STMT 33 ---
 SQL: SELECT count(*) FILTER (a > 1)
-ERROR [42601]: ERROR: Expected keyword WHERE at position 24 near 'a'
+ERROR [42601]: ERROR: syntax error: Expected keyword WHERE at position 24 near 'a'
 --- STMT 34 ---
 SQL: SELECT sum(a ORDER BY b) FROM ftab
 RESULT: 1 columns, 1 rows
@@ -852,7 +852,7 @@ SQL: SELECT lag() OVER (ORDER BY a) FROM ftab
 ERROR [42883]: ERROR: function lag() does not exist
 --- STMT 41 ---
 SQL: SELECT sum(a) OVER (PARTITION BY ORDER BY a) FROM ftab
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found KEYWORD at position 39 near 'BY'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found KEYWORD at position 39 near 'BY'
 --- STMT 42 ---
 SQL: SELECT string_agg(c) FROM ftab
 ERROR [42883]: ERROR: function string_agg(text) does not exist
@@ -906,7 +906,7 @@ SQL: SELECT nth_value(b, 2) OVER (ORDER BY a NULLS LAST ROWS BETWEEN UNBOUNDED P
 ERROR [42P01]: ERROR: relation "ftab" does not exist
 --- STMT 59 ---
 SQL: SELECT namedemo(DEFAULT => 1)
-ERROR [42601]: ERROR: DEFAULT is not allowed in this context at position 16 near 'DEFAULT'
+ERROR [42601]: ERROR: syntax error: DEFAULT is not allowed in this context at position 16 near 'DEFAULT'
 --- STMT 60 ---
 SQL: SELECT namedemo(a := 1, b := 'x')
 ERROR [42883]: ERROR: function namedemo(integer, text) does not exist
@@ -1057,7 +1057,7 @@ COLUMNS: ?column?
 ROW: t
 --- STMT 31 ---
 SQL: SELECT CAST(ROW(2,'b') AS pair).x
-ERROR [42601]: ERROR: syntax error at or near "." at position 31 near '.'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "." at position 31 near '.'
 --- STMT 32 ---
 SQL: SELECT 1/2, 1::numeric/2, 1::float8/2
 RESULT: 3 columns, 1 rows
@@ -1246,7 +1246,7 @@ SQL: CREATE TYPE bad_enum AS ENUM ()
 ERROR [42501]: ERROR: permission denied for schema pg_catalog
 --- STMT 41 ---
 SQL: CREATE DOMAIN bad_domain AS int CHECK ()
-ERROR [42601]: ERROR: Unexpected token in expression at position 39 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 39 near ')'
 --- STMT 42 ---
 SQL: ALTER TABLE tt ADD COLUMN a text
 ERROR [42701]: ERROR: column "a" of relation "tt" already exists
@@ -1336,10 +1336,10 @@ SQL: -- more DDL failure cases CREATE TABLE part_bad PARTITION OF part_t FOR VAL
 ERROR [42501]: ERROR: permission denied for schema pg_catalog
 --- STMT 71 ---
 SQL: CREATE TABLE bad_inh() INHERITS ()
-ERROR [42601]: ERROR: Expected identifier at position 33 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 33 near ')'
 --- STMT 72 ---
 SQL: CREATE MATERIALIZED VIEW mv_bad AS
-ERROR [42601]: ERROR: Expected keyword SELECT at position 34 near ''
+ERROR [42601]: ERROR: syntax error: Expected keyword SELECT at position 34 near ''
 --- STMT 73 ---
 SQL: ALTER TABLE child_inh ALTER COLUMN nope TYPE text
 ERROR [42P01]: ERROR: relation "child_inh" does not exist
@@ -1761,10 +1761,10 @@ SQL: SELECT grouping(a) FROM s
 ERROR [42803]: ERROR: GROUPING is not supported without GROUPING SETS, ROLLUP, or CUBE
 --- STMT 30 ---
 SQL: SELECT DISTINCT ON () * FROM s
-ERROR [42601]: ERROR: Unexpected token in expression at position 20 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 20 near ')'
 --- STMT 31 ---
 SQL: SELECT * FROM s FETCH FIRST WITH TIES
-ERROR [42601]: ERROR: syntax error at or near "ties" at position 33 near 'ties'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "TIES" at position 33 near 'TIES'
 --- STMT 32 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
@@ -1803,7 +1803,7 @@ SQL: -- more bad cases SELECT DISTINCT ON (b) a, b FROM s ORDER BY a
 ERROR [42P01]: ERROR: relation "s" does not exist
 --- STMT 43 ---
 SQL: SELECT b, sum(c) FROM s GROUP BY ROLLUP ()
-ERROR [42601]: ERROR: syntax error at or near ")" at position 42 near ''
+ERROR [42601]: ERROR: syntax error: syntax error at or near ")" at position 42 near ''
 --- STMT 44 ---
 SQL: SELECT * FROM (VALUES (1), (2)) AS v(a) ORDER BY 2
 ERROR [42P10]: ERROR: ORDER BY position 2 is not in select list
@@ -1929,7 +1929,7 @@ ROW: 4
 ROW: 5
 --- STMT 24 ---
 SQL: -- bad joins/subqueries/CTEs SELECT * FROM j1 JOIN j2
-ERROR [42601]: ERROR: JOIN requires ON or USING clause at position 54 near ''
+ERROR [42601]: ERROR: syntax error: JOIN requires ON or USING clause at position 54 near ''
 --- STMT 25 ---
 SQL: SELECT * FROM j1 JOIN j2 ON j1.nope = j2.id
 ERROR [42703]: ERROR: column j1.nope does not exist
@@ -1941,10 +1941,10 @@ SQL: SELECT * FROM j1 WHERE id = (SELECT j1_id FROM j2)
 ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
 --- STMT 28 ---
 SQL: SELECT * FROM j1 WHERE id IN ()
-ERROR [42601]: ERROR: Unexpected token in expression at position 30 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 30 near ')'
 --- STMT 29 ---
 SQL: WITH c AS () SELECT 1
-ERROR [42601]: ERROR: Expected keyword SELECT at position 11 near ')'
+ERROR [42601]: ERROR: syntax error: Expected keyword SELECT at position 11 near ')'
 --- STMT 30 ---
 SQL: WITH RECURSIVE r(n) AS (SELECT 'x' UNION ALL SELECT n + 1 FROM r) SELECT * FROM r
 ERROR [42883]: ERROR: operator does not exist: text + integer
@@ -2417,7 +2417,7 @@ COLUMNS: int4
 ROW: [0:2]={1,2,3}
 --- STMT 43 ---
 SQL: SELECT ARRAY[[1,2],[3,4]][1:2][1:1]
-ERROR [42601]: ERROR: syntax error at or near "[" at position 25 near '['
+ERROR [42601]: ERROR: syntax error: syntax error at or near "[" at position 25 near '['
 --- STMT 44 ---
 SQL: SELECT int4range(NULL, 5)
 RESULT: 1 columns, 1 rows
@@ -2661,13 +2661,13 @@ SQL: EXECUTE p1(1)
 ERROR [42601]: ERROR: wrong number of parameters for prepared statement "p1": expected 2, got 1
 --- STMT 39 ---
 SQL: EXECUTE p2('x')
-ERROR [22P02]: ERROR: operator does not exist: text = integer
+ERROR [22P02]: ERROR: invalid input syntax for type int: "x"
 --- STMT 40 ---
 SQL: SELECT ((SELECT comp FROM gap)).x
 ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
 --- STMT 41 ---
 SQL: SELECT txt COLLATE no_such_collation FROM gap
-ERROR [42704]: ERROR: collation "no_such_collation" for encoding "UTF8" does not exist at position 37 near 'FROM'
+ERROR [42704]: ERROR: syntax error: collation "no_such_collation" for encoding "UTF8" does not exist at position 37 near 'FROM'
 --- STMT 42 ---
 SQL: SELECT fmix(b => 2)
 ERROR [42883]: ERROR: function fmix(b => integer) does not exist
@@ -2951,7 +2951,7 @@ SQL: SELECT decode('xyz', 'hex')
 ERROR [22023]: ERROR: invalid hexadecimal data: odd number of digits
 --- STMT 58 ---
 SQL: SELECT U&'bad\0G'
-ERROR [42601]: ERROR: invalid Unicode escape value at position 7 near 'bad\0G'
+ERROR [42601]: ERROR: syntax error: invalid Unicode escape value at position 7 near 'bad\0G'
 --- STMT 59 ---
 SQL: SELECT substring('abc' FROM 'x')
 RESULT: 1 columns, 1 rows
@@ -3105,13 +3105,13 @@ SQL: REFRESH MATERIALIZED VIEW CONCURRENTLY mv_base
 OK: 0 rows affected
 --- STMT 42 ---
 SQL: -- bad trigger/rule/view cases CREATE TRIGGER bad_timing DURING INSERT ON base_t FOR EACH ROW EXECUTE FUNCTION audit_base_t()
-ERROR [42601]: ERROR: Expected BEFORE, AFTER, or INSTEAD OF at position 58 near 'during'
+ERROR [42601]: ERROR: syntax error: Expected BEFORE, AFTER, or INSTEAD OF at position 58 near 'during'
 --- STMT 43 ---
 SQL: CREATE TRIGGER bad_event AFTER UPSERT ON base_t FOR EACH ROW EXECUTE FUNCTION audit_base_t()
 ERROR [42601]: ERROR: syntax error at or near "upsert"
 --- STMT 44 ---
 SQL: CREATE TRIGGER bad_row_stmt AFTER INSERT ON base_t FOR EACH ROW FOR EACH STATEMENT EXECUTE FUNCTION audit_base_t()
-ERROR [42601]: ERROR: Expected keyword EXECUTE at position 64 near 'FOR'
+ERROR [42601]: ERROR: syntax error: Expected keyword EXECUTE at position 64 near 'FOR'
 --- STMT 45 ---
 SQL: CREATE TRIGGER bad_missing_func AFTER INSERT ON base_t FOR EACH ROW EXECUTE FUNCTION no_such_trigger_fn()
 ERROR [42883]: ERROR: function no_such_trigger_fn() does not exist
@@ -3129,7 +3129,7 @@ SQL: CREATE RULE bad_rule2 AS ON INSERT TO base_t DO ALSO SELECT 1
 OK: 0 rows affected
 --- STMT 50 ---
 SQL: CREATE VIEW bad_view AS
-ERROR [42601]: ERROR: Expected keyword SELECT at position 23 near ''
+ERROR [42601]: ERROR: syntax error: Expected keyword SELECT at position 23 near ''
 --- STMT 51 ---
 SQL: CREATE VIEW bad_view2 AS SELECT * FROM no_such_table
 ERROR [42P01]: ERROR: relation "no_such_table" does not exist
@@ -3290,7 +3290,7 @@ SQL: ALTER TABLE p_range ATTACH PARTITION p_range_1_100 FOR VALUES FROM (1) TO (
 ERROR [42809]: ERROR: table "p_range_1_100" is already a partition of "p_range"
 --- STMT 44 ---
 SQL: CREATE TABLE inh_bad() INHERITS ()
-ERROR [42601]: ERROR: Expected identifier at position 33 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 33 near ')'
 --- STMT 45 ---
 SQL: ALTER TABLE inh_parent INHERIT no_such_parent
 ERROR [42P01]: ERROR: relation "no_such_parent" does not exist
@@ -3728,12 +3728,12 @@ ROW: Seq Scan on admin_t\n  Sort Key: (...)
 SQL: EXPLAIN ANALYZE SELECT * FROM admin_t WHERE id = 1
 RESULT: 1 columns, 6 rows
 COLUMNS: QUERY PLAN
-ROW: Seq Scan on admin_t  (cost=0.00..1.02 rows=2 width=0) (actual time=0.179..0.179 rows=1 loops=1)
+ROW: Seq Scan on admin_t  (cost=0.00..1.02 rows=2 width=0) (actual time=0.136..0.136 rows=1 loops=1)
 ROW:   Filter: (...)
 ROW:   Rows Removed by Filter: 0
 ROW:   Output: (...)
-ROW: Planning Time: 0.043 ms
-ROW: Execution Time: 0.432 ms
+ROW: Planning Time: 0.042 ms
+ROW: Execution Time: 0.421 ms
 --- STMT 24 ---
 SQL: ANALYZE admin_t
 OK: 0 rows affected
@@ -3850,19 +3850,19 @@ COLUMNS: no_such_guc
 ROW: 1
 --- STMT 60 ---
 SQL: LISTEN
-ERROR [42601]: ERROR: Expected identifier at position 6 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 6 near ''
 --- STMT 61 ---
 SQL: NOTIFY
-ERROR [42601]: ERROR: Expected identifier at position 6 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 6 near ''
 --- STMT 62 ---
 SQL: UNLISTEN no_such_chan, other
-ERROR [42601]: ERROR: syntax error at or near "," at position 21 near ','
+ERROR [42601]: ERROR: syntax error: syntax error at or near "," at position 21 near ','
 --- STMT 63 ---
 SQL: EXPLAIN ()
 ERROR [42601]: ERROR: syntax error at end of input
 --- STMT 64 ---
 SQL: VACUUM (NOTANOPTION) admin_t
-ERROR [42601]: ERROR: unrecognized VACUUM option "notanoption" at position 8 near 'notanoption'
+ERROR [42601]: ERROR: syntax error: unrecognized VACUUM option "notanoption" at position 8 near 'notanoption'
 --- STMT 65 ---
 SQL: ALTER VIEW no_such_view RENAME COLUMN a TO b
 ERROR [42P01]: ERROR: view "no_such_view" does not exist
@@ -4096,13 +4096,13 @@ ROW: 5 | 3 | {1,3,4,5}
 SQL: -- SEARCH / CYCLE WITH RECURSIVE graph(src, dst) AS ( SELECT src, dst FROM edges ), search_graph(id, path) AS ( SELECT 1, ARRAY[1] UNION ALL SELECT e.dst, sg.path || e.dst FROM search_graph sg JOIN gr...
 RESULT: 5 columns, 7 rows
 COLUMNS: id, path, ordcol, is_cycle, cycle_path
-ROW: 5 | {1,2,4,5} | {(1),(2),(4),(5)} | f | {(1),(2),(4),(5)}
-ROW: 4 | {1,2,4} | {(1),(2),(4)} | f | {(1),(2),(4)}
-ROW: 2 | {1,2} | {(1),(2)} | f | {(1),(2)}
-ROW: 5 | {1,3,4,5} | {(1),(3),(4),(5)} | f | {(1),(3),(4),(5)}
-ROW: 4 | {1,3,4} | {(1),(3),(4)} | f | {(1),(3),(4)}
-ROW: 3 | {1,3} | {(1),(3)} | f | {(1),(3)}
-ROW: 1 | {1} | {(1)} | f | {(1)}
+ROW: 1 | {1} | 0 | f | {(1)}
+ROW: 2 | {1,2} | 1 | f | {(1),(2)}
+ROW: 4 | {1,2,4} | 2 | f | {(1),(2),(4)}
+ROW: 5 | {1,2,4,5} | 3 | f | {(1),(2),(4),(5)}
+ROW: 3 | {1,3} | 4 | f | {(1),(3)}
+ROW: 4 | {1,3,4} | 5 | f | {(1),(3),(4)}
+ROW: 5 | {1,3,4,5} | 6 | f | {(1),(3),(4),(5)}
 --- STMT 14 ---
 SQL: -- data-modifying CTEs CREATE TABLE cte_t(id int PRIMARY KEY, v text)
 OK: 0 rows affected
@@ -4179,7 +4179,7 @@ OK: 20 rows affected
 SQL: SELECT count(*) FROM sample_t TABLESAMPLE SYSTEM (50)
 RESULT: 1 columns, 1 rows
 COLUMNS: count
-ROW: 11
+ROW: 9
 --- STMT 28 ---
 SQL: SELECT count(*) FROM sample_t TABLESAMPLE BERNOULLI (50) REPEATABLE (123)
 RESULT: 1 columns, 1 rows
@@ -4200,7 +4200,7 @@ SQL: WITH RECURSIVE bad2(n) AS ( SELECT 1 UNION ALL SELECT 'x' FROM bad2 ) SELEC
 ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
 --- STMT 32 ---
 SQL: WITH RECURSIVE bad3(n) AS ( SELECT 1 UNION ALL SELECT n + 1 FROM bad3 WHERE n < 2 ) SEARCH BREADTH FIRST SET ord SELECT * FROM bad3
-ERROR [42601]: ERROR: Expected keyword BY at position 116 near 'SET'
+ERROR [42601]: ERROR: syntax error: Expected keyword BY at position 116 near 'SET'
 --- STMT 33 ---
 SQL: SELECT * FROM generate_series('x', 'y')
 ERROR [42725]: ERROR: function generate_series(unknown, unknown) is not unique
@@ -4209,7 +4209,7 @@ SQL: SELECT * FROM unnest()
 ERROR [42883]: ERROR: function unnest() does not exist
 --- STMT 35 ---
 SQL: SELECT * FROM ROWS FROM ()
-ERROR [42601]: ERROR: Expected identifier at position 25 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 25 near ')'
 --- STMT 36 ---
 SQL: SELECT * FROM sample_t TABLESAMPLE SYSTEM (-1)
 ERROR [2202H]: ERROR: tablesample percentage must not be negative
@@ -4766,192 +4766,192 @@ RESULT: 1 columns, 0 rows
 COLUMNS: b
 --- STMT 12 ---
 SQL: SELECT a, FROM p
-ERROR [42601]: ERROR: syntax error at or near "FROM" at position 10 near 'FROM'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "FROM" at position 10 near 'FROM'
 --- STMT 13 ---
 SQL: SELECT FROM p WHERE a = 1
 RESULT: 0 columns, 0 rows
 COLUMNS: 
 --- STMT 14 ---
 SQL: SELECT * FROM p WHERE a = 1 ORDER BY b GROUP BY a
-ERROR [42601]: ERROR: syntax error at or near "GROUP" at position 39 near 'GROUP'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "GROUP" at position 39 near 'GROUP'
 --- STMT 15 ---
 SQL: SELECT * FROM p GROUP BY a WHERE a = 1
-ERROR [42601]: ERROR: syntax error at or near "WHERE" at position 27 near 'WHERE'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "WHERE" at position 27 near 'WHERE'
 --- STMT 16 ---
 SQL: SELECT * FROM p HAVING a = 1 GROUP BY a
-ERROR [42601]: ERROR: syntax error at or near "GROUP" at position 29 near 'GROUP'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "GROUP" at position 29 near 'GROUP'
 --- STMT 17 ---
 SQL: SELECT * FROM p LIMIT 1 ORDER BY a
-ERROR [42601]: ERROR: syntax error at or near "ORDER" at position 24 near 'ORDER'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "ORDER" at position 24 near 'ORDER'
 --- STMT 18 ---
 SQL: SELECT * FROM p OFFSET 1 LIMIT
-ERROR [42601]: ERROR: Unexpected token in expression at position 30 near ''
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 30 near ''
 --- STMT 19 ---
 SQL: SELECT * FROM p FETCH FIRST 1 ROW ONLY OFFSET 1
 RESULT: 2 columns, 0 rows
 COLUMNS: a, b
 --- STMT 20 ---
 SQL: SELECT DISTINCT DISTINCT a FROM p
-ERROR [42601]: ERROR: syntax error at or near "DISTINCT" at position 16 near 'DISTINCT'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "DISTINCT" at position 16 near 'DISTINCT'
 --- STMT 21 ---
 SQL: SELECT ALL DISTINCT a FROM p
-ERROR [42601]: ERROR: syntax error at or near "DISTINCT" at position 11 near 'DISTINCT'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "DISTINCT" at position 11 near 'DISTINCT'
 --- STMT 22 ---
 SQL: INSERT INTO p VALUES (1, 'x')
 OK: 1 rows affected
 --- STMT 23 ---
 SQL: INSERT INTO p (a b) VALUES (1, 'x')
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found IDENTIFIER at position 17 near 'b'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found IDENTIFIER at position 17 near 'b'
 --- STMT 24 ---
 SQL: INSERT INTO p VALUES (1 'x')
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found STRING_LITERAL at position 24 near 'x'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found STRING_LITERAL at position 24 near 'x'
 --- STMT 25 ---
 SQL: INSERT INTO p SELECT FROM p
 OK: 1 rows affected
 --- STMT 26 ---
 SQL: INSERT INTO p DEFAULT VALUES VALUES
-ERROR [42601]: ERROR: syntax error at or near "VALUES" at position 29 near 'VALUES'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "VALUES" at position 29 near 'VALUES'
 --- STMT 27 ---
 SQL: INSERT INTO p OVERRIDING SYSTEM VALUE DEFAULT VALUES
-ERROR [42601]: ERROR: cannot use DEFAULT VALUES with OVERRIDING clause at position 52 near ''
+ERROR [42601]: ERROR: syntax error: cannot use DEFAULT VALUES with OVERRIDING clause at position 52 near ''
 --- STMT 28 ---
 SQL: INSERT INTO p RETURNING
-ERROR [42601]: ERROR: Expected VALUES, DEFAULT VALUES, or SELECT at position 14 near 'RETURNING'
+ERROR [42601]: ERROR: syntax error: Expected VALUES, DEFAULT VALUES, or SELECT at position 14 near 'RETURNING'
 --- STMT 29 ---
 SQL: UPDATE p SET a = 1 b = 'x'
-ERROR [42601]: ERROR: syntax error at or near "b" at position 19 near 'b'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "b" at position 19 near 'b'
 --- STMT 30 ---
 SQL: UPDATE p SET (a, b) = (1, 'x', 'y')
-ERROR [42601]: ERROR: Expected identifier at position 13 near '('
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 13 near '('
 --- STMT 31 ---
 SQL: UPDATE p SET a = DEFAULT WHERE RETURNING a
-ERROR [42601]: ERROR: syntax error at or near "a" at position 41 near 'a'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "a" at position 41 near 'a'
 --- STMT 32 ---
 SQL: UPDATE p FROM p SET a = 1
-ERROR [42601]: ERROR: Expected keyword SET at position 14 near 'p'
+ERROR [42601]: ERROR: syntax error: Expected keyword SET at position 14 near 'p'
 --- STMT 33 ---
 SQL: UPDATE ONLY p, p2 SET a = 1
-ERROR [42601]: ERROR: Expected keyword SET at position 13 near ','
+ERROR [42601]: ERROR: syntax error: Expected keyword SET at position 13 near ','
 --- STMT 34 ---
 SQL: DELETE FROM p WHERE USING p
-ERROR [42601]: ERROR: syntax error at or near "p" at position 26 near 'p'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "p" at position 26 near 'p'
 --- STMT 35 ---
 SQL: DELETE FROM p USING p WHERE RETURNING a
-ERROR [42601]: ERROR: syntax error at or near "a" at position 38 near 'a'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "a" at position 38 near 'a'
 --- STMT 36 ---
 SQL: DELETE ONLY FROM p WHERE a = 1
-ERROR [42601]: ERROR: Expected keyword FROM at position 7 near 'ONLY'
+ERROR [42601]: ERROR: syntax error: Expected keyword FROM at position 7 near 'ONLY'
 --- STMT 37 ---
 SQL: MERGE INTO p USING p s ON p.a = s.a WHEN THEN UPDATE SET a = 1
-ERROR [42601]: ERROR: Expected MATCHED or NOT MATCHED after WHEN at position 41 near 'THEN'
+ERROR [42601]: ERROR: syntax error: Expected MATCHED or NOT MATCHED after WHEN at position 41 near 'THEN'
 --- STMT 38 ---
 SQL: MERGE INTO p USING p s ON p.a = s.a WHEN MATCHED UPDATE SET a = 1
-ERROR [42601]: ERROR: Expected keyword THEN at position 49 near 'UPDATE'
+ERROR [42601]: ERROR: syntax error: Expected keyword THEN at position 49 near 'UPDATE'
 --- STMT 39 ---
 SQL: MERGE INTO p USING p s ON p.a = s.a WHEN NOT MATCHED THEN INSERT VALUES ()
-ERROR [42601]: ERROR: Unexpected token in expression at position 73 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 73 near ')'
 --- STMT 40 ---
 SQL: MERGE INTO p USING p s ON p.a = s.a RETURNING *
-ERROR [42601]: ERROR: MERGE statement requires at least one WHEN clause at position 36 near 'RETURNING'
+ERROR [42601]: ERROR: syntax error: MERGE statement requires at least one WHEN clause at position 36 near 'RETURNING'
 --- STMT 41 ---
 SQL: WITH w AS (SELECT 1) INSERT INTO p VALUES (1, 'x') RETURNING
-ERROR [42601]: ERROR: syntax error at or near "" at position 60 near ''
+ERROR [42601]: ERROR: syntax error: syntax error at or near "" at position 60 near ''
 --- STMT 42 ---
 SQL: WITH RECURSIVE w AS (SELECT 1 UNION ALL) SELECT * FROM w
-ERROR [42601]: ERROR: Expected keyword SELECT at position 39 near ')'
+ERROR [42601]: ERROR: syntax error: Expected keyword SELECT at position 39 near ')'
 --- STMT 43 ---
 SQL: WITH w AS MATERIALIZED SELECT 1
-ERROR [42601]: ERROR: Expected LEFT_PAREN but found KEYWORD at position 10 near 'MATERIALIZED'
+ERROR [42601]: ERROR: syntax error: Expected LEFT_PAREN but found KEYWORD at position 10 near 'MATERIALIZED'
 --- STMT 44 ---
 SQL: WITH w AS (SELECT 1) SEARCH DEPTH FIRST BY a SET ord SELECT * FROM w
 ERROR [42601]: ERROR: WITH query "w" is not recursive
 --- STMT 45 ---
 SQL: CREATE TABLE q (a int,)
-ERROR [42601]: ERROR: Expected identifier at position 22 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 22 near ')'
 --- STMT 46 ---
 SQL: CREATE TABLE q2 (a int b text)
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found IDENTIFIER at position 23 near 'b'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found IDENTIFIER at position 23 near 'b'
 --- STMT 47 ---
 SQL: CREATE TABLE q3 (LIKE p INCLUDING)
-ERROR [42601]: ERROR: Expected identifier at position 33 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 33 near ')'
 --- STMT 48 ---
 SQL: CREATE TABLE q4 PARTITION BY RANGE (a)
-ERROR [42601]: ERROR: Expected LEFT_PAREN but found KEYWORD at position 16 near 'PARTITION'
+ERROR [42601]: ERROR: syntax error: Expected LEFT_PAREN but found KEYWORD at position 16 near 'PARTITION'
 --- STMT 49 ---
 SQL: CREATE VIEW vv AS SELECT
 OK: 0 rows affected
 --- STMT 50 ---
 SQL: CREATE VIEW vv2 AS SELECT * FROM p WITH CHECK
-ERROR [42601]: ERROR: Expected keyword OPTION at position 45 near ''
+ERROR [42601]: ERROR: syntax error: Expected keyword OPTION at position 45 near ''
 --- STMT 51 ---
 SQL: CREATE MATERIALIZED VIEW mv AS WITH DATA SELECT 1
-ERROR [42601]: ERROR: Expected keyword AS at position 41 near 'SELECT'
+ERROR [42601]: ERROR: syntax error: Expected keyword AS at position 41 near 'SELECT'
 --- STMT 52 ---
 SQL: CREATE INDEX idx ON p USING (a)
-ERROR [42601]: ERROR: Expected identifier at position 28 near '('
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 28 near '('
 --- STMT 53 ---
 SQL: CREATE INDEX idx2 ON p (a WHERE a > 1)
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found KEYWORD at position 26 near 'WHERE'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found KEYWORD at position 26 near 'WHERE'
 --- STMT 54 ---
 SQL: CREATE UNIQUE INDEX idx3 ON p ()
-ERROR [42601]: ERROR: Expected identifier at position 31 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 31 near ')'
 --- STMT 55 ---
 SQL: CREATE TRIGGER tr AFTER ON p FOR EACH ROW EXECUTE FUNCTION now()
-ERROR [42601]: ERROR: Expected keyword ON at position 27 near 'p'
+ERROR [42601]: ERROR: syntax error: Expected keyword ON at position 27 near 'p'
 --- STMT 56 ---
 SQL: CREATE RULE r AS ON TO p DO INSTEAD NOTHING
-ERROR [42601]: ERROR: Expected keyword TO at position 23 near 'p'
+ERROR [42601]: ERROR: syntax error: Expected keyword TO at position 23 near 'p'
 --- STMT 57 ---
 SQL: ALTER TABLE p ALTER a TYPE int
 OK: 0 rows affected
 --- STMT 58 ---
 SQL: ALTER TABLE p ADD COLUMN c int DEFAULT
-ERROR [42601]: ERROR: Unexpected token in expression at position 38 near ''
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 38 near ''
 --- STMT 59 ---
 SQL: ALTER TABLE p RENAME a TO b
 ERROR [42701]: ERROR: column "b" of relation "p" already exists
 --- STMT 60 ---
 SQL: ALTER TABLE p ADD CONSTRAINT c CHECK a > 0
-ERROR [42601]: ERROR: Expected LEFT_PAREN but found IDENTIFIER at position 37 near 'a'
+ERROR [42601]: ERROR: syntax error: Expected LEFT_PAREN but found IDENTIFIER at position 37 near 'a'
 --- STMT 61 ---
 SQL: ALTER TABLE p DROP CONSTRAINT
-ERROR [42601]: ERROR: Expected identifier at position 29 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 29 near ''
 --- STMT 62 ---
 SQL: ALTER TABLE p ATTACH PARTITION p FOR VALUES FROM (1) TO
-ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 55 near ''
+ERROR [42601]: ERROR: syntax error: Expected LEFT_PAREN but found EOF at position 55 near ''
 --- STMT 63 ---
 SQL: ALTER TABLE p ALTER COLUMN a SET GENERATED ALWAYS
 ERROR [55000]: ERROR: column "a" of relation "p" is not an identity column
 --- STMT 64 ---
 SQL: CREATE FUNCTION f(a int DEFAULT) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$
-ERROR [42601]: ERROR: syntax error at or near ")" at position 31 near ')'
+ERROR [42601]: ERROR: syntax error: syntax error at or near ")" at position 31 near ')'
 --- STMT 65 ---
 SQL: CREATE FUNCTION f2(a int, b text DEFAULT 'x',) RETURNS int LANGUAGE SQL AS $$ SELECT 1 $$
-ERROR [42601]: ERROR: Expected identifier at position 45 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 45 near ')'
 --- STMT 66 ---
 SQL: CREATE PROCEDURE proc(a int AS $$ SELECT 1 $$ LANGUAGE SQL
-ERROR [42601]: ERROR: Expected RIGHT_PAREN but found KEYWORD at position 28 near 'AS'
+ERROR [42601]: ERROR: syntax error: Expected RIGHT_PAREN but found KEYWORD at position 28 near 'AS'
 --- STMT 67 ---
 SQL: DO LANGUAGE plpgsql $$ BEGIN END $$
 OK: 0 rows affected
 --- STMT 68 ---
 SQL: PREPARE stmt AS SELECT $
-ERROR [42601]: ERROR: syntax error at or near "$" at position 23 near '$'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "$" at position 23 near '$'
 --- STMT 69 ---
 SQL: PREPARE stmt2(int,) AS SELECT 1
-ERROR [42601]: ERROR: Expected identifier at position 18 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 18 near ')'
 --- STMT 70 ---
 SQL: EXECUTE stmt(,)
-ERROR [42601]: ERROR: Unexpected token in expression at position 13 near ','
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 13 near ','
 --- STMT 71 ---
 SQL: DEALLOCATE PREPARE stmt
 ERROR [26000]: ERROR: prepared statement "stmt" does not exist
 --- STMT 72 ---
 SQL: SELECT ARRAY[]
-ERROR [42P18]: ERROR: cannot determine type of empty array at position 14 near ''
+ERROR [42P18]: ERROR: syntax error: cannot determine type of empty array at position 14 near ''
 --- STMT 73 ---
 SQL: SELECT ARRAY[1,2,]
-ERROR [42601]: ERROR: Unexpected token in expression at position 17 near ']'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 17 near ']'
 --- STMT 74 ---
 SQL: SELECT ROW()
 RESULT: 1 columns, 1 rows
@@ -4959,22 +4959,22 @@ COLUMNS: row
 ROW: ()
 --- STMT 75 ---
 SQL: SELECT ROW(,1)
-ERROR [42601]: ERROR: Unexpected token in expression at position 11 near ','
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 11 near ','
 --- STMT 76 ---
 SQL: SELECT (ROW(1,2)).
-ERROR [42601]: ERROR: Expected identifier at position 18 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 18 near ''
 --- STMT 77 ---
 SQL: SELECT CAST(1 AS)
-ERROR [42601]: ERROR: Expected identifier at position 16 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 16 near ')'
 --- STMT 78 ---
 SQL: SELECT OPERATOR(pg_catalog.+)()
-ERROR [42601]: ERROR: Unexpected token in expression at position 30 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 30 near ')'
 --- STMT 79 ---
 SQL: SELECT OPERATOR(pg_catalog.+)(1,)
-ERROR [42601]: ERROR: Unexpected token in expression at position 32 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 32 near ')'
 --- STMT 80 ---
 SQL: SELECT COLLATE "C"
-ERROR [42601]: ERROR: syntax error at or near "COLLATE" at position 7 near 'COLLATE'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "COLLATE" at position 7 near 'COLLATE'
 --- STMT 81 ---
 SQL: SELECT a COLLATE FROM p
 RESULT: 1 columns, 2 rows
@@ -4983,16 +4983,16 @@ ROW: 1
 ROW: NULL
 --- STMT 82 ---
 SQL: SELECT * FROM generate_series() WITH ORDINALITY AS
-ERROR [42601]: ERROR: Expected identifier at position 50 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 50 near ''
 --- STMT 83 ---
 SQL: SELECT * FROM ROWS FROM (generate_series(1,2),) AS x(a,b)
-ERROR [42601]: ERROR: Expected identifier at position 46 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 46 near ')'
 --- STMT 84 ---
 SQL: SELECT xmlparse( '<x/>' )
-ERROR [42601]: ERROR: Expected keyword CONTENT at position 17 near '<x/>'
+ERROR [42601]: ERROR: syntax error: Expected keyword CONTENT at position 17 near '<x/>'
 --- STMT 85 ---
 SQL: SELECT to_tsquery('english', )
-ERROR [42601]: ERROR: Unexpected token in expression at position 29 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 29 near ')'
 --- STMT 86 ---
 SQL: SELECT format('%', 'x')
 ERROR [22023]: ERROR: unterminated format() type specifier
@@ -5153,7 +5153,7 @@ ROW: äbcabc
 ROW: NULL
 --- STMT 32 ---
 SQL: SELECT a COLLATE no_such_coll FROM t
-ERROR [42704]: ERROR: collation "no_such_coll" for encoding "UTF8" does not exist at position 30 near 'FROM'
+ERROR [42704]: ERROR: syntax error: collation "no_such_coll" for encoding "UTF8" does not exist at position 30 near 'FROM'
 --- STMT 33 ---
 SQL: SELECT greatest()
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -5267,7 +5267,7 @@ SQL: SELECT substring('abc')
 ERROR [42883]: ERROR: function substring(text) does not exist
 --- STMT 25 ---
 SQL: SELECT overlay('abc' placing 'x')
-ERROR [42601]: ERROR: Expected keyword FROM at position 32 near ')'
+ERROR [42601]: ERROR: syntax error: Expected keyword FROM at position 32 near ')'
 --- STMT 26 ---
 SQL: SELECT lower()
 ERROR [42883]: ERROR: function lower() does not exist
@@ -5311,7 +5311,7 @@ COLUMNS: jsonb_set
 ROW: NULL
 --- STMT 39 ---
 SQL: -- empty inputs / odd but useful cases SELECT xmlforest()
-ERROR [42601]: ERROR: Unexpected token in expression at position 57 near ')'
+ERROR [42601]: ERROR: syntax error: Unexpected token in expression at position 57 near ')'
 --- STMT 40 ---
 SQL: SELECT format('%s', NULL)
 RESULT: 1 columns, 1 rows
@@ -5700,25 +5700,25 @@ SQL: UNLISTEN "MixedCase"
 OK: 0 rows affected
 --- STMT 18 ---
 SQL: NOTIFY compat_chan, NULL
-ERROR [42601]: ERROR: syntax error at or near "NULL" at position 20 near 'NULL'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "NULL" at position 20 near 'NULL'
 --- STMT 19 ---
 SQL: NOTIFY compat_chan, repeat('x', 9000)
-ERROR [42601]: ERROR: syntax error at or near "repeat" at position 20 near 'repeat'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "repeat" at position 20 near 'repeat'
 --- STMT 20 ---
 SQL: LISTEN ""
-ERROR [42601]: ERROR: zero-length delimited identifier at position 7 near ''
+ERROR [42601]: ERROR: syntax error: zero-length delimited identifier at position 7 near ''
 --- STMT 21 ---
 SQL: LISTEN "bad name"
 OK: 0 rows affected
 --- STMT 22 ---
 SQL: LISTEN 123
-ERROR [42601]: ERROR: Expected identifier at position 7 near '123'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 7 near '123'
 --- STMT 23 ---
 SQL: NOTIFY
-ERROR [42601]: ERROR: Expected identifier at position 6 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 6 near ''
 --- STMT 24 ---
 SQL: UNLISTEN no_such_chan, other
-ERROR [42601]: ERROR: syntax error at or near "," at position 21 near ','
+ERROR [42601]: ERROR: syntax error: syntax error at or near "," at position 21 near ','
 --- STMT 25 ---
 SQL: -- LOCK / SET / SHOW / RESET LOCK TABLE admin_t IN ROW EXCLUSIVE MODE
 ERROR [25P01]: ERROR: LOCK TABLE can only be used in transaction blocks
@@ -5764,13 +5764,13 @@ SQL: SET TIME ZONE 123456
 ERROR [22023]: ERROR: unrecognized time zone name: "123456"
 --- STMT 38 ---
 SQL: SET search_path =
-ERROR [42601]: ERROR: syntax error at or near end of input at position 17 near ''
+ERROR [42601]: ERROR: syntax error: syntax error at or near end of input at position 17 near ''
 --- STMT 39 ---
 SQL: SHOW
-ERROR [42601]: ERROR: Expected identifier at position 4 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 4 near ''
 --- STMT 40 ---
 SQL: RESET
-ERROR [42601]: ERROR: Expected identifier at position 5 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 5 near ''
 --- STMT 41 ---
 SQL: -- COMMENT ON more object kinds CREATE SEQUENCE admin_seq START 1
 OK: 0 rows affected
@@ -5827,10 +5827,10 @@ SQL: COPY (SELECT * FROM admin_t) TO STDOUT
 ERROR [42P01]: ERROR: relation "admin_t" does not exist
 --- STMT 59 ---
 SQL: COPY TO STDOUT
-ERROR [42601]: ERROR: Expected keyword TO at position 8 near 'stdout'
+ERROR [42601]: ERROR: syntax error: Expected keyword TO at position 8 near 'stdout'
 --- STMT 60 ---
 SQL: COPY admin_t () TO STDOUT
-ERROR [42601]: ERROR: Expected identifier at position 14 near ')'
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 14 near ')'
 --- STMT 61 ---
 SQL: COPY admin_t TO STDOUT WITH (FORMAT no_such)
 ERROR [42P01]: ERROR: relation "admin_t" does not exist
@@ -6180,18 +6180,18 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a1'), ('B', 'b1') RETURNING id, code, note, updated_at
 RESULT: 4 columns, 2 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a1 | 2026-04-10 17:58:13.304145+00
-ROW: 2 | B | b1 | 2026-04-10 17:58:13.304145+00
+ROW: 1 | A | a1 | 2026-04-14 22:56:14.293404+00
+ROW: 2 | B | b1 | 2026-04-14 22:56:14.293404+00
 --- STMT 12 ---
 SQL: -- returning / generated-key shaped cases INSERT INTO upsert_t(code) VALUES ('C') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 3 | C | d | 2026-04-10 17:58:13.304729+00
+ROW: 3 | C | d | 2026-04-14 22:56:14.294022+00
 --- STMT 13 ---
 SQL: INSERT INTO upsert_t(id, code, note) OVERRIDING SYSTEM VALUE VALUES (100, 'SYS', 'sys') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 100 | SYS | sys | 2026-04-10 17:58:13.305187+00
+ROW: 100 | SYS | sys | 2026-04-14 22:56:14.294297+00
 --- STMT 14 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED BY DEFAULT
 OK: 0 rows affected
@@ -6199,7 +6199,7 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(id, code, note) VALUES (200, 'MAN', 'manual') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 200 | MAN | manual | 2026-04-10 17:58:13.305833+00
+ROW: 200 | MAN | manual | 2026-04-14 22:56:14.294625+00
 --- STMT 16 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED ALWAYS
 OK: 0 rows affected
@@ -6211,12 +6211,12 @@ COLUMNS: id, code, note, updated_at
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a3') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note, updated_at = CURRENT_TIMESTAMP RETURNING id, code, note, updated_at
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-04-10 17:58:13.315902+00
+ROW: 1 | A | a3 | 2026-04-14 22:56:14.301658+00
 --- STMT 19 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('B', 'b2') ON CONFLICT ON CONSTRAINT upsert_t_code_key DO UPDATE SET note = EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 2 | B | b2 | 2026-04-10 17:58:13.304145+00
+ROW: 2 | B | b2 | 2026-04-14 22:56:14.293404+00
 --- STMT 20 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd1'), ('E', 'e1') RETURNING id, code, note
 RESULT: 3 columns, 2 rows
@@ -6227,7 +6227,7 @@ ROW: 8 | E | e1
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd2') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note WHERE upsert_t.note <> EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 7 | D | d2 | 2026-04-10 17:58:13.317006+00
+ROW: 7 | D | d2 | 2026-04-14 22:56:14.302848+00
 --- STMT 22 ---
 SQL: UPDATE upsert_t SET note = note WHERE code = 'A' RETURNING id, code, note
 RESULT: 3 columns, 1 rows
@@ -6245,13 +6245,13 @@ COLUMNS: id, code, note, updated_at
 SQL: SELECT * FROM upsert_t ORDER BY id
 RESULT: 4 columns, 7 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-04-10 17:58:13.315902+00
-ROW: 2 | B | b2 | 2026-04-10 17:58:13.304145+00
-ROW: 3 | C | d | 2026-04-10 17:58:13.304729+00
-ROW: 7 | D | d2 | 2026-04-10 17:58:13.317006+00
-ROW: 8 | E | e1 | 2026-04-10 17:58:13.317006+00
-ROW: 100 | SYS | sys | 2026-04-10 17:58:13.305187+00
-ROW: 200 | MAN | manual | 2026-04-10 17:58:13.305833+00
+ROW: 1 | A | a3 | 2026-04-14 22:56:14.301658+00
+ROW: 2 | B | b2 | 2026-04-14 22:56:14.293404+00
+ROW: 3 | C | d | 2026-04-14 22:56:14.294022+00
+ROW: 7 | D | d2 | 2026-04-14 22:56:14.302848+00
+ROW: 8 | E | e1 | 2026-04-14 22:56:14.302848+00
+ROW: 100 | SYS | sys | 2026-04-14 22:56:14.294297+00
+ROW: 200 | MAN | manual | 2026-04-14 22:56:14.294625+00
 --- STMT 26 ---
 SQL: -- bad upsert / returning cases INSERT INTO upsert_t(code, note) VALUES ('A', 'dup') ON CONFLICT (note) DO NOTHING
 ERROR [42P10]: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification
@@ -6587,7 +6587,7 @@ OK: 3 rows affected
 SQL: -- common app-shaped datetime and filter expressions SELECT CURRENT_DATE, CURRENT_TIMESTAMP, LOCALTIMESTAMP
 RESULT: 3 columns, 1 rows
 COLUMNS: current_date, current_timestamp, localtimestamp
-ROW: 2026-04-10 | 2026-04-10 17:58:13.386786+00 | 2026-04-10 17:58:13.386896
+ROW: 2026-04-14 | 2026-04-14 22:56:14.367062+00 | 2026-04-14 22:56:14.367147
 --- STMT 13 ---
 SQL: SELECT date_trunc('day', created_at), date_trunc('hour', local_ts) FROM app_t ORDER BY id
 RESULT: 2 columns, 3 rows
@@ -6911,7 +6911,7 @@ SQL: DO $$ BEGIN BEGIN EXECUTE 'INSERT INTO compat.do_t VALUES (1, ''dup'', CURR
 OK: 0 rows affected
 --- STMT 18 ---
 SQL: -- bad dynamic SQL / DO cases DO $$ BEGIN EXECUTE 'CREATE TABLE compat.x('; END $$
-ERROR [42601]: ERROR: Expected identifier at position 22 near ''
+ERROR [42601]: ERROR: syntax error: Expected identifier at position 22 near ''
 --- STMT 19 ---
 SQL: DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$
 ERROR [P0001]: ERROR: boom
@@ -7049,10 +7049,10 @@ ROW: 2 | ready | 5 | 1 | b
 ROW: 3 | done | 1 | 0 | c
 --- STMT 26 ---
 SQL: SELECT * FROM work_item FOR no_such_lock
-ERROR [42601]: ERROR: syntax error at or near "no_such_lock" at position 28 near 'no_such_lock'
+ERROR [42601]: ERROR: syntax error: syntax error at or near "no_such_lock" at position 28 near 'no_such_lock'
 --- STMT 27 ---
 SQL: SELECT * FROM work_item ORDER BY id FOR UPDATE OF no_such_table
-ERROR [42P01]: ERROR: relation "no_such_table" in FOR UPDATE clause not found in FROM clause at position 63 near ''
+ERROR [42P01]: ERROR: syntax error: relation "no_such_table" in FOR UPDATE clause not found in FROM clause at position 63 near ''
 --- STMT 28 ---
 SQL: WITH next_item AS ( SELECT id FROM work_item WHERE status = 'ready' LIMIT 1 ) UPDATE work_item SET status = 'running' FROM next_item WHERE work_item.id = (SELECT id FROM next_item) RETURNING nope
 ERROR [42703]: ERROR: column nope does not exist
@@ -7442,7 +7442,7 @@ RESULT: 4 columns, 3 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
 ROW: 2 | 20 | b | NULL
-ROW: 3 | 10 | c | 2026-04-10 17:58:13.494717+00
+ROW: 3 | 10 | c | 2026-04-14 22:56:14.491848+00
 --- STMT 17 ---
 SQL: ALTER TABLE tenant_data FORCE ROW LEVEL SECURITY
 OK: 0 rows affected
@@ -7451,7 +7451,7 @@ SQL: SELECT * FROM tenant_data ORDER BY id
 RESULT: 4 columns, 2 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
-ROW: 3 | 10 | c | 2026-04-10 17:58:13.494717+00
+ROW: 3 | 10 | c | 2026-04-14 22:56:14.491848+00
 --- STMT 19 ---
 SQL: ALTER POLICY tenant_select_pol ON tenant_data USING (tenant_id = current_setting('compat.tenant_id')::int AND deleted_at IS NULL)
 OK: 0 rows affected
@@ -7471,7 +7471,7 @@ SQL: -- bad policy / RLS cases CREATE POLICY bad_pol ON tenant_data USING (tenan
 OK: 0 rows affected
 --- STMT 24 ---
 SQL: CREATE POLICY bad_cmd_pol ON tenant_data FOR UPSERT USING (true)
-ERROR [42601]: ERROR: unrecognized row security command type "upsert" at position 47 near 'upsert'
+ERROR [42601]: ERROR: syntax error: unrecognized row security command type "upsert" at position 47 near 'upsert'
 --- STMT 25 ---
 SQL: ALTER POLICY no_such_pol ON tenant_data USING (true)
 ERROR [42704]: ERROR: policy "no_such_pol" for table "tenant_data" does not exist
@@ -7480,7 +7480,7 @@ SQL: DROP POLICY no_such_pol ON tenant_data
 ERROR [42704]: ERROR: policy "no_such_pol" for table "tenant_data" does not exist
 --- STMT 27 ---
 SQL: ALTER TABLE tenant_data DISABLE ROW SECURITY
-ERROR [42601]: ERROR: Expected keyword LEVEL at position 36 near 'SECURITY'
+ERROR [42601]: ERROR: syntax error: Expected keyword LEVEL at position 36 near 'SECURITY'
 --- STMT 28 ---
 SQL: ALTER TABLE tenant_data NO FORCE ROW LEVEL SECURITY
 OK: 0 rows affected
@@ -7764,23 +7764,23 @@ OK: 4 rows affected
 SQL: -- common repository query shapes SELECT * FROM repo_account WHERE id = 1
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-10 17:58:13.544312+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-14 22:56:14.54631+00
 --- STMT 15 ---
 SQL: SELECT * FROM repo_account WHERE email = 'a@example.com'
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-10 17:58:13.544312+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-14 22:56:14.54631+00
 --- STMT 16 ---
 SQL: SELECT * FROM repo_account WHERE deleted_at IS NULL ORDER BY id
 RESULT: 6 columns, 2 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-10 17:58:13.544312+00
-ROW: 2 | b@example.com | f | NULL | 0 | 2026-04-10 17:58:13.544312+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-14 22:56:14.54631+00
+ROW: 2 | b@example.com | f | NULL | 0 | 2026-04-14 22:56:14.54631+00
 --- STMT 17 ---
 SQL: SELECT * FROM repo_account WHERE active IS TRUE ORDER BY id
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-10 17:58:13.544312+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-14 22:56:14.54631+00
 --- STMT 18 ---
 SQL: SELECT EXISTS (SELECT 1 FROM repo_account WHERE email = 'missing@example.com')
 RESULT: 1 columns, 1 rows
@@ -7801,21 +7801,21 @@ ROW: 2 | 1 | 40.00
 SQL: SELECT o.* FROM repo_order o WHERE o.account_id = 1 ORDER BY o.created_at DESC, o.id DESC LIMIT 2 OFFSET 0
 RESULT: 5 columns, 2 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 3 | 1 | done | 30.00 | 2026-04-10 17:58:13.544531+00
-ROW: 2 | 1 | open | 20.00 | 2026-04-10 17:58:13.544531+00
+ROW: 3 | 1 | done | 30.00 | 2026-04-14 22:56:14.546574+00
+ROW: 2 | 1 | open | 20.00 | 2026-04-14 22:56:14.546574+00
 --- STMT 22 ---
 SQL: SELECT o.* FROM repo_order o WHERE (o.created_at, o.id) < (CURRENT_TIMESTAMP, 999999) ORDER BY o.created_at DESC, o.id DESC LIMIT 10
 RESULT: 5 columns, 4 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 4 | 2 | open | 40.00 | 2026-04-10 17:58:13.544531+00
-ROW: 3 | 1 | done | 30.00 | 2026-04-10 17:58:13.544531+00
-ROW: 2 | 1 | open | 20.00 | 2026-04-10 17:58:13.544531+00
-ROW: 1 | 1 | open | 10.00 | 2026-04-10 17:58:13.544531+00
+ROW: 4 | 2 | open | 40.00 | 2026-04-14 22:56:14.546574+00
+ROW: 3 | 1 | done | 30.00 | 2026-04-14 22:56:14.546574+00
+ROW: 2 | 1 | open | 20.00 | 2026-04-14 22:56:14.546574+00
+ROW: 1 | 1 | open | 10.00 | 2026-04-14 22:56:14.546574+00
 --- STMT 23 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 1 | 2026-04-10 17:58:13.544312+00
+ROW: 1 | a@example.com | t | NULL | 1 | 2026-04-14 22:56:14.54631+00
 --- STMT 24 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 0 rows
@@ -7824,7 +7824,7 @@ COLUMNS: id, email, active, deleted_at, version, created_at
 SQL: INSERT INTO repo_account(email, active) VALUES ('d@example.com', true) ON CONFLICT (email) DO NOTHING RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 4 | d@example.com | t | NULL | 0 | 2026-04-10 17:58:13.548231+00
+ROW: 4 | d@example.com | t | NULL | 0 | 2026-04-14 22:56:14.551994+00
 --- STMT 26 ---
 SQL: SELECT ra.id, ra.email, ro.id AS order_id, ro.status, ro.total FROM repo_account ra LEFT JOIN repo_order ro ON ro.account_id = ra.id WHERE ra.deleted_at IS NULL ORDER BY ra.id, ro.id
 RESULT: 5 columns, 5 rows

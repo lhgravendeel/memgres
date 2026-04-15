@@ -49,6 +49,7 @@ class SelectParser {
         }
 
         // UNION/EXCEPT loop (left-associative)
+        boolean lastRightWasParenthesized = false;
         while (parser.checkKeyword("UNION") || parser.checkKeyword("EXCEPT")) {
             SetOpStmt.SetOpType opType;
             if (parser.checkKeyword("UNION")) { parser.advance(); opType = SetOpStmt.SetOpType.UNION; }
@@ -60,8 +61,10 @@ class SelectParser {
             Statement right;
             if (parser.check(TokenType.LEFT_PAREN)) {
                 parser.advance(); right = parser.parseSelect(); parser.expect(TokenType.RIGHT_PAREN);
+                lastRightWasParenthesized = true;
             } else {
                 right = parser.parseSelect();
+                lastRightWasParenthesized = false;
             }
 
             // Right side may have higher-precedence INTERSECT
@@ -71,7 +74,10 @@ class SelectParser {
         }
 
         // Transfer ORDER BY/LIMIT/OFFSET from rightmost leaf to outermost SetOpStmt
-        left = bubbleUpTrailingClauses(left);
+        // but NOT if the right side was explicitly parenthesized (the LIMIT belongs to the inner SELECT)
+        if (!lastRightWasParenthesized) {
+            left = bubbleUpTrailingClauses(left);
+        }
 
         // Also check for explicit ORDER BY/LIMIT/OFFSET tokens after the set ops
         if (left instanceof SetOpStmt) {
@@ -171,14 +177,14 @@ class SelectParser {
             if (withClauses != null && ctas.query() instanceof SelectStmt) {
                 SelectStmt sel = (SelectStmt) ctas.query();
                 SelectStmt withSel = new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
-                        sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), withClauses, sel.groupingSets(), sel.lockClause());
+                        sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), withClauses, sel.groupingSets(), sel.lockClause(), sel.withTies());
                 return new CreateTableAsStmt(ctas.schema(), ctas.name(), ctas.ifNotExists(), ctas.temporary(), withSel, ctas.withData());
             }
             return ctas;
         }
         SelectStmt sel = (SelectStmt) body;
         return new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
-                sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), withClauses, sel.groupingSets(), sel.lockClause());
+                sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), withClauses, sel.groupingSets(), sel.lockClause(), sel.withTies());
     }
 
     /**
@@ -356,7 +362,8 @@ class SelectParser {
             parser.matchKeyword("ROWS");
         }
 
-        // FETCH FIRST|NEXT [n] ROW|ROWS ONLY (SQL standard equivalent of LIMIT)
+        // FETCH FIRST|NEXT [n] ROW|ROWS {ONLY | WITH TIES} (SQL standard equivalent of LIMIT)
+        boolean withTies = false;
         if (parser.matchKeyword("FETCH")) {
             parser.matchKeyword("FIRST");
             parser.matchKeyword("NEXT");
@@ -367,7 +374,12 @@ class SelectParser {
             }
             parser.matchKeyword("ROW");
             parser.matchKeyword("ROWS");
-            parser.matchKeyword("ONLY");
+            if (parser.matchKeyword("WITH")) {
+                parser.expectKeyword("TIES");
+                withTies = true;
+            } else {
+                parser.matchKeyword("ONLY");
+            }
             // PG also allows OFFSET after FETCH: FETCH FIRST 3 ROWS ONLY OFFSET 2
             if (offset == null && parser.matchKeyword("OFFSET")) {
                 offset = parseLimitOffsetExpr();
@@ -447,7 +459,7 @@ class SelectParser {
             offset = parseLimitOffsetExpr();
         }
 
-        SelectStmt select = new SelectStmt(distinct, distinctOn, targets, from, where, groupBy, having, windowDefs, orderBy, limit, offset, null, groupingSets, lockClause);
+        SelectStmt select = new SelectStmt(distinct, distinctOn, targets, from, where, groupBy, having, windowDefs, orderBy, limit, offset, null, groupingSets, lockClause, withTies);
         if (selectIntoTable != null) {
             return new CreateTableAsStmt(selectIntoSchema, selectIntoTable, false, selectIntoTemp, select, true);
         }
@@ -527,9 +539,10 @@ class SelectParser {
         // Consume optional CYCLE col SET is_cycle [TO val DEFAULT val] USING path
         String cycleCol = null;
         String cyclePathCol = null;
+        List<String> cycleByColumns = null;
         if (parser.checkKeyword("CYCLE")) {
             parser.advance(); // CYCLE
-            parser.parseIdentifierList(); // tracked columns
+            cycleByColumns = parser.parseIdentifierList(); // tracked columns
             parser.expectKeyword("SET");
             cycleCol = parser.readIdentifier(); // cycle column name
             if (parser.matchKeyword("TO")) {
@@ -550,7 +563,7 @@ class SelectParser {
                     "WITH query \"" + origCte.name() + "\" is not recursive", "42601");
             }
             ctes.set(last, new SelectStmt.CommonTableExpr(origCte.name(), origCte.columnNames(),
-                    origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns, cycleCol, cyclePathCol));
+                    origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns, cycleCol, cyclePathCol, cycleByColumns));
         }
         Token next = parser.peek();
         if (next.type() == TokenType.KEYWORD) {
@@ -564,14 +577,14 @@ class SelectParser {
                         if (ctas.query() instanceof SelectStmt) {
                             SelectStmt innerSel = (SelectStmt) ctas.query();
                             SelectStmt withSel = new SelectStmt(innerSel.distinct(), innerSel.distinctOn(), innerSel.targets(), innerSel.from(),
-                                    innerSel.where(), innerSel.groupBy(), innerSel.having(), innerSel.windowDefs(), innerSel.orderBy(), innerSel.limit(), innerSel.offset(), ctes, innerSel.groupingSets(), innerSel.lockClause());
+                                    innerSel.where(), innerSel.groupBy(), innerSel.having(), innerSel.windowDefs(), innerSel.orderBy(), innerSel.limit(), innerSel.offset(), ctes, innerSel.groupingSets(), innerSel.lockClause(), innerSel.withTies());
                             return new CreateTableAsStmt(ctas.schema(), ctas.name(), ctas.ifNotExists(), ctas.temporary(), withSel, ctas.withData());
                         }
                         return ctas;
                     }
                     SelectStmt sel = (SelectStmt) body;
                     return new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
-                            sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), ctes, sel.groupingSets(), sel.lockClause());
+                            sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), sel.orderBy(), sel.limit(), sel.offset(), ctes, sel.groupingSets(), sel.lockClause(), sel.withTies());
                 }
                 case "INSERT":
                     return parser.parseInsert(ctes);
@@ -697,16 +710,10 @@ class SelectParser {
                 && !parser.isAtEnd() && !parser.check(TokenType.SEMICOLON));
 
         // Cross product all parts
-        // When any GROUPING SETS part contains the empty set (), we also preserve it
-        // in the result (as a grand total row). This matches PG behavior where
-        // GROUP BY a, GROUPING SETS ((b), ()) -> GROUPING SETS((a,b), (a), ())
+        // e.g. GROUP BY a, GROUPING SETS ((b), ()) -> GROUPING SETS((a,b), (a))
+        // The empty set () in GROUPING SETS cross-products with plain col 'a' to produce (a),
+        // not a separate grand total row.
         List<List<Expression>> result = Cols.listOf(Cols.listOf()); // start with one empty set
-        boolean hasEmptySetInGroupingSets = false;
-        for (List<List<Expression>> part : parts) {
-            for (List<Expression> set : part) {
-                if (set.isEmpty()) { hasEmptySetInGroupingSets = true; break; }
-            }
-        }
         for (List<List<Expression>> part : parts) {
             List<List<Expression>> newResult = new ArrayList<>();
             for (List<Expression> existing : result) {
@@ -717,17 +724,6 @@ class SelectParser {
                 }
             }
             result = newResult;
-        }
-        // If any GROUPING SETS contained an empty set () and we have plain expressions,
-        // PG also includes a grand total row (empty set)
-        if (hasEmptySetInGroupingSets) {
-            // Check if the result already contains an empty set
-            boolean hasEmpty = result.stream().anyMatch(List::isEmpty);
-            if (!hasEmpty) {
-                List<List<Expression>> resultWithEmpty = new ArrayList<>(result);
-                resultWithEmpty.add(new ArrayList<>());
-                return resultWithEmpty;
-            }
         }
         return result;
     }
@@ -906,10 +902,45 @@ class SelectParser {
         return item;
     }
 
+    /**
+     * Check if the current LEFT_PAREN is an extra wrapping paren ((SELECT ...)) vs a
+     * parenthesized UNION operand ((SELECT ...) UNION ALL ...). Returns true if it's
+     * an extra wrapper (matching ) is followed by another ) or end, not by UNION/INTERSECT/EXCEPT).
+     */
+    boolean isExtraWrappingParen() {
+        // Scan ahead to find the matching ) for the current (, then check what follows
+        int depth = 1;
+        int lookPos = parser.pos + 1;
+        while (lookPos < parser.tokens.size() && depth > 0) {
+            if (parser.tokens.get(lookPos).type() == TokenType.LEFT_PAREN) depth++;
+            else if (parser.tokens.get(lookPos).type() == TokenType.RIGHT_PAREN) depth--;
+            lookPos++;
+        }
+        // lookPos is now past the matching )
+        if (lookPos >= parser.tokens.size()) return true; // end of tokens, treat as extra
+        Token afterClose = parser.tokens.get(lookPos);
+        if (afterClose.type() == TokenType.KEYWORD) {
+            String kw = afterClose.value();
+            // If UNION/INTERSECT/EXCEPT follows, this is a set-op operand, not an extra wrapper
+            if (kw.equals("UNION") || kw.equals("INTERSECT") || kw.equals("EXCEPT")) {
+                return false;
+            }
+            // If AS follows, the ) ends the subquery and AS introduces an alias — not an extra wrapper
+            if (kw.equals("AS")) {
+                return false;
+            }
+        }
+        // If an identifier follows, it's an alias for the subquery — not an extra wrapper
+        if (afterClose.type() == TokenType.IDENTIFIER || afterClose.type() == TokenType.QUOTED_IDENTIFIER) {
+            return false;
+        }
+        return true;
+    }
+
     /** Check if a LEFT_PAREN starts a subquery (SELECT/VALUES/WITH) vs a parenthesized FROM item. */
     boolean isSubqueryStart() {
         // Check if immediately after the opening ( we have SELECT/VALUES/WITH/UPDATE/DELETE/INSERT
-        // Only check ONE level to distinguish (SELECT ...) from ((subq) JOIN ...)
+        // Also check through one level of nested parens for ((SELECT ...) UNION ALL ...) patterns
         if (parser.pos >= parser.tokens.size()) return false;
         Token first = parser.tokens.get(parser.pos);
         if (first.type() != TokenType.LEFT_PAREN) return false;
@@ -920,6 +951,44 @@ class SelectParser {
             String kw = second.value();
             return kw.equals("SELECT") || kw.equals("VALUES") || kw.equals("WITH")
                     || kw.equals("UPDATE") || kw.equals("DELETE") || kw.equals("INSERT");
+        }
+        // Check for nested parens: ((SELECT ...) UNION ALL ...)
+        if (second.type() == TokenType.LEFT_PAREN) {
+            // Scan ahead to find matching ) for the inner ( and check if UNION/INTERSECT/EXCEPT follows
+            int depth = 1;
+            int lookPos = parser.pos + 2;
+            while (lookPos < parser.tokens.size() && depth > 0) {
+                if (parser.tokens.get(lookPos).type() == TokenType.LEFT_PAREN) depth++;
+                else if (parser.tokens.get(lookPos).type() == TokenType.RIGHT_PAREN) depth--;
+                lookPos++;
+            }
+            // lookPos is now past the matching ) for the inner (
+            if (lookPos < parser.tokens.size()) {
+                Token afterInner = parser.tokens.get(lookPos);
+                if (afterInner.type() == TokenType.KEYWORD) {
+                    String kw = afterInner.value();
+                    if (kw.equals("UNION") || kw.equals("INTERSECT") || kw.equals("EXCEPT")) {
+                        return true;
+                    }
+                }
+                // If the inner ( matching ) is followed by an identifier or AS, the inner ( is a
+                // subquery with an alias, and the outer ( is a parenthesized FROM item — not a subquery start.
+                if (afterInner.type() == TokenType.IDENTIFIER || afterInner.type() == TokenType.QUOTED_IDENTIFIER) {
+                    return false;
+                }
+                if (afterInner.type() == TokenType.KEYWORD && afterInner.value().equals("AS")) {
+                    return false;
+                }
+            }
+            // Also check if the inner content starts with SELECT/VALUES/WITH
+            if (parser.pos + 2 < parser.tokens.size()) {
+                Token third = parser.tokens.get(parser.pos + 2);
+                if (third.type() == TokenType.KEYWORD) {
+                    String kw = third.value();
+                    return kw.equals("SELECT") || kw.equals("VALUES") || kw.equals("WITH")
+                            || kw.equals("UPDATE") || kw.equals("DELETE") || kw.equals("INSERT");
+                }
+            }
         }
         return false;
     }
@@ -1041,8 +1110,9 @@ class SelectParser {
             if (isSubqueryStart()) {
                 parser.advance();
                 // Handle extra nested parens: ((SELECT ...))
+                // But NOT parenthesized UNION operands: ((SELECT ...) UNION ALL ...)
                 int extraParens = 0;
-                while (parser.check(TokenType.LEFT_PAREN) && isSubqueryStart()) {
+                while (parser.check(TokenType.LEFT_PAREN) && isSubqueryStart() && isExtraWrappingParen()) {
                     parser.advance();
                     extraParens++;
                 }
@@ -1075,6 +1145,13 @@ class SelectParser {
                             }
                         }
                     }
+                } else if (parser.check(TokenType.LEFT_PAREN)) {
+                    // Parenthesized SELECT union: ((SELECT ...) UNION ALL (SELECT ...))
+                    parser.advance(); // consume inner (
+                    subStmt = parser.parseSelect();
+                    subStmt = tryParseSetOp(subStmt);
+                    parser.expect(TokenType.RIGHT_PAREN); // consume inner )
+                    subStmt = tryParseSetOp(subStmt);
                 } else {
                     subStmt = parser.parseSelect();
                     subStmt = tryParseSetOp(subStmt);

@@ -543,8 +543,7 @@ public class ExpressionParser {
         if (match(TokenType.EXCL_TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_MATCH, parseAddition());
         if (match(TokenType.EXCL_TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_IMATCH, parseAddition());
 
-        // Geometric operators
-        if (match(TokenType.DISTANCE)) return new BinaryExpr(left, BinaryExpr.BinOp.DISTANCE, parseAddition());
+        // Geometric operators (DISTANCE is handled in parseAddition for correct precedence)
         if (match(TokenType.APPROX_EQUAL)) return new BinaryExpr(left, BinaryExpr.BinOp.APPROX_EQUAL, parseAddition());
         if (match(TokenType.GEO_BELOW)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_BELOW, parseAddition());
         if (match(TokenType.GEO_ABOVE)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_ABOVE, parseAddition());
@@ -603,6 +602,9 @@ public class ExpressionParser {
                 left = new BinaryExpr(left, BinaryExpr.BinOp.SUBTRACT, parseBitOr());
             } else if (match(TokenType.CONCAT)) {
                 left = new BinaryExpr(left, BinaryExpr.BinOp.CONCAT, parseBitOr());
+            } else if (match(TokenType.DISTANCE)) {
+                // <-> operator: higher precedence than comparison, same as addition
+                left = new BinaryExpr(left, BinaryExpr.BinOp.DISTANCE, parseBitOr());
             } else if (check(TokenType.CUSTOM_OPERATOR)) {
                 // User-defined multi-char operators: same precedence as addition (left-associative)
                 String opSymbol = advance().value();
@@ -803,7 +805,20 @@ public class ExpressionParser {
             }
         }
 
+        // PG rejects FILTER on ordered-set aggregates after a cast as a syntax error (42601).
+        // e.g. percentile_cont(0.5) WITHIN GROUP (ORDER BY val)::integer FILTER (WHERE ...)
+        if (checkKeyword("FILTER") && containsOrderedSetAgg(expr)) {
+            throw new ParseException("FILTER is not implemented for ordered-set aggregates", peek());
+        }
+
         return expr;
+    }
+
+    /** Check if the expression is or wraps an OrderedSetAggExpr (e.g. through CastExpr). */
+    private boolean containsOrderedSetAgg(Expression expr) {
+        if (expr instanceof OrderedSetAggExpr) return true;
+        if (expr instanceof CastExpr) return containsOrderedSetAgg(((CastExpr) expr).expr());
+        return false;
     }
 
     private static final java.util.Set<String> KNOWN_COLLATIONS = Cols.setOf(

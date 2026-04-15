@@ -51,6 +51,7 @@ class FromFunctionResolver {
         if (fname.equals("pg_get_sequence_data") || fname.equals("pg_catalog.pg_get_sequence_data"))
             return resolvePgGetSequenceData(alias, colAliases, evalArgs);
         if (fname.equals("string_to_table")) return resolveStringToTable(alias, colAliases, evalArgs);
+        if (fname.equals("regexp_split_to_table")) return resolveRegexpSplitToTable(alias, colAliases, evalArgs);
         if (fname.startsWith("__tablesample__:")) return resolveTablesample(fname, alias, evalArgs);
         if (fname.equals("__rows_from__")) return resolveRowsFrom(funcFrom, alias, colAliases);
 
@@ -146,6 +147,32 @@ class FromFunctionResolver {
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
             }
+        }
+        return contexts;
+    }
+
+    // ---- regexp_split_to_table ----
+
+    private List<RowContext> resolveRegexpSplitToTable(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.size() < 2) throw new MemgresException("function regexp_split_to_table() requires at least 2 arguments", "42883");
+        Object strObj = evalArgs.get(0);
+        Object patternObj = evalArgs.get(1);
+        if (strObj == null) return new ArrayList<>();
+        String str = strObj.toString();
+        String pattern = patternObj != null ? patternObj.toString() : "";
+        String flags = evalArgs.size() > 2 && evalArgs.get(2) != null ? evalArgs.get(2).toString() : "";
+        int regexFlags = 0;
+        if (flags.contains("i")) regexFlags |= java.util.regex.Pattern.CASE_INSENSITIVE;
+        String colName = firstColAlias(colAliases, alias);
+        Column col = new Column(colName, DataType.TEXT, true, false, null);
+        Table virtualTable = new Table(alias, Cols.listOf(col));
+        List<RowContext> contexts = new ArrayList<>();
+        String[] parts = java.util.regex.Pattern.compile(pattern, regexFlags).split(str, -1);
+        for (String part : parts) {
+            if (part.isEmpty()) continue; // PG skips empty strings from split
+            Object[] row = new Object[]{ part };
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
         }
         return contexts;
     }

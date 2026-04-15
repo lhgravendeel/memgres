@@ -17,14 +17,31 @@ class ConstraintValidator {
         this.executor = executor;
     }
 
+    /** Find the schema name that contains the given table. */
+    private String findSchemaName(Table table) {
+        if (executor.database == null) return null;
+        for (Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
+            if (entry.getValue().getTable(table.getName()) == table) {
+                return entry.getKey();
+            }
+        }
+        return null;
+    }
+
     void validateConstraints(Table table, Object[] row, Object[] excludeRow) {
         // 1. NOT NULL enforcement
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
             if (!col.isNullable() && row[i] == null) {
-                throw new MemgresException(
+                MemgresException ex = new MemgresException(
                         "null value in column \"" + col.getName() + "\" violates not-null constraint",
                         "23502");
+                ex.setColumn(col.getName());
+                ex.setTable(table.getName());
+                String schema = findSchemaName(table);
+                if (schema != null) ex.setSchema(schema);
+                ex.setDetail("Failing row contains (" + formatRow(row) + ").");
+                throw ex;
             }
         }
 
@@ -134,9 +151,15 @@ class ConstraintValidator {
                     }
                 }
                 if (allMatch) {
-                    throw new MemgresException(
+                    MemgresException ex = new MemgresException(
                             "duplicate key value violates unique constraint \"" + constraintName + "\"",
                             "23505");
+                    ex.setConstraint(constraintName);
+                    ex.setTable(table.getName());
+                    String schema = findSchemaName(table);
+                    if (schema != null) ex.setSchema(schema);
+                    ex.setDetail("Key already exists.");
+                    throw ex;
                 }
             }
             return;
@@ -178,9 +201,15 @@ class ConstraintValidator {
             if (idx != null) {
                 Object[] conflict = idx.findConflict(newRow, excludeRow);
                 if (conflict != null) {
-                    throw new MemgresException(
+                    MemgresException ex = new MemgresException(
                             "duplicate key value violates unique constraint \"" + constraintName + "\"",
                             "23505");
+                    ex.setConstraint(constraintName);
+                    ex.setTable(table.getName());
+                    String schema = findSchemaName(table);
+                    if (schema != null) ex.setSchema(schema);
+                    ex.setDetail("Key already exists.");
+                    throw ex;
                 }
                 return;
             }
@@ -209,9 +238,15 @@ class ConstraintValidator {
                 }
             }
             if (allMatch) {
-                throw new MemgresException(
+                MemgresException ex = new MemgresException(
                         "duplicate key value violates unique constraint \"" + constraintName + "\"",
                         "23505");
+                ex.setConstraint(constraintName);
+                ex.setTable(table.getName());
+                String schema = findSchemaName(table);
+                if (schema != null) ex.setSchema(schema);
+                ex.setDetail("Key already exists.");
+                throw ex;
             }
         }
     }
@@ -222,10 +257,14 @@ class ConstraintValidator {
         RowContext ctx = new RowContext(table, null, evalRow);
         Object result = executor.evalExpr(sc.getCheckExpr(), ctx);
         if (result instanceof Boolean && !((Boolean) result)) {
-            Boolean b = (Boolean) result;
-            throw new MemgresException(
+            MemgresException ex = new MemgresException(
                     "new row violates check constraint \"" + sc.getName() + "\"",
                     "23514");
+            ex.setConstraint(sc.getName());
+            ex.setTable(table.getName());
+            String schema = findSchemaName(table);
+            if (schema != null) ex.setSchema(schema);
+            throw ex;
         }
     }
 
@@ -343,10 +382,27 @@ class ConstraintValidator {
         }
 
         if (!found) {
-            throw new MemgresException(
+            MemgresException ex = new MemgresException(
                     "insert or update on table \"" + table.getName() +
                             "\" violates foreign key constraint \"" + sc.getName() + "\"",
                     "23503");
+            ex.setConstraint(sc.getName());
+            ex.setTable(table.getName());
+            String schema = findSchemaName(table);
+            if (schema != null) ex.setSchema(schema);
+            StringBuilder detailSb = new StringBuilder("Key (");
+            for (int i = 0; i < sc.getColumns().size(); i++) {
+                if (i > 0) detailSb.append(", ");
+                detailSb.append(sc.getColumns().get(i));
+            }
+            detailSb.append(")=(");
+            for (int i = 0; i < fkColIndices.length; i++) {
+                if (i > 0) detailSb.append(", ");
+                detailSb.append(fkVals[i]);
+            }
+            detailSb.append(") is not present in table \"").append(sc.getReferencesTable()).append("\".");
+            ex.setDetail(detailSb.toString());
+            throw ex;
         }
     }
 
@@ -728,6 +784,16 @@ class ConstraintValidator {
     boolean valuesEqual(Object a, Object b) {
         if (a == null || b == null) return a == b;
         return TypeCoercion.areEqual(a, b);
+    }
+
+    /** Format a row as a comma-separated string for error detail messages. */
+    private String formatRow(Object[] row) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < row.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(row[i] == null ? "null" : row[i].toString());
+        }
+        return sb.toString();
     }
 
     /**
@@ -1187,4 +1253,5 @@ class ConstraintValidator {
         if (value instanceof List) return "integer[]";
         return "text";
     }
+
 }

@@ -821,7 +821,11 @@ class CatalogStubBuilder {
                 col("lomowner", DataType.INTEGER),
                 col("lomacl", DataType.ACLITEM_ARRAY)
         );
-        return new Table("pg_largeobject_metadata", cols);
+        Table t = new Table("pg_largeobject_metadata", cols);
+        for (Long loid : database.getLargeObjectStore().getOids()) {
+            t.insertRow(new Object[]{ loid.intValue(), 10, null });
+        }
+        return t;
     }
 
     Table buildPgShdepend() {

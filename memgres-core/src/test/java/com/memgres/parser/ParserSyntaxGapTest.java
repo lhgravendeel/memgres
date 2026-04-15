@@ -294,8 +294,8 @@ class ParserSyntaxGapTest {
         // PG allows mixing: GROUP BY a, GROUPING SETS ((b), ())
         int rows = queryRowCount(
                 "SELECT a, b, sum(c) FROM gs_data GROUP BY a, GROUPING SETS ((b), ())");
-        // For each a value, we get groups (b) and (), so 3 * (2+1) = 9
-        assertEquals(9, rows);
+        // For each a value, we get groups (b) and (): (1,x),(1,y),(1,null),(2,x),(2,y),(2,null),(3,x),(3,null) = 8
+        assertEquals(8, rows);
     }
 
     // ========================================================================

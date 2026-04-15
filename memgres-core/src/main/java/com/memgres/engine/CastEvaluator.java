@@ -221,7 +221,7 @@ class CastEvaluator {
                     }
                     // Format like PG: yyyy-MM-dd HH:mm:ss+ZZ
                     String timePart = odt.getNano() != 0
-                            ? odt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS"))
+                            ? stripTrailingFracZeros(odt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
                             : odt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
                     String offsetStr = odt.getOffset().toString();
                     if (offsetStr.equals("Z")) offsetStr = "+00";
@@ -326,7 +326,12 @@ class CastEvaluator {
             case "datemultirange":
             case "tsmultirange":
             case "tstzmultirange": {
+                boolean isTsMultirange = typeName.equals("tsmultirange") || typeName.equals("tstzmultirange");
                 String s = val.toString().trim();
+                // For tsmultirange/tstzmultirange: normalize date-only bounds to timestamp format
+                if (isTsMultirange) {
+                    s = RangeOperations.normalizeDateBoundsToTimestamp(s);
+                }
                 // Implicit cast: range → multirange (wrap single range)
                 if (RangeOperations.isRangeString(s)) {
                     RangeOperations.PgRange parsed = RangeOperations.parse(s);
@@ -422,6 +427,8 @@ class CastEvaluator {
             }
             case "macaddr":
             case "macaddr8":
+                return val.toString();
+            case "jsonpath":
                 return val.toString();
             case "xid": {
                 // xid is a transaction ID, essentially an unsigned 32-bit integer
@@ -546,8 +553,8 @@ class CastEvaluator {
                 if (procOid == 0) {
                     procOid = executor.systemCatalog.getOid("proc:" + oidLookupName.toLowerCase());
                 }
-                if (procOid != 0) return procOid;
-                return procName;
+                if (procOid != 0) return new RegprocValue(procOid, procName);
+                return new RegprocValue(0, procName);
             }
             case "regtype": {
                 // ::regtype converts a type name to its OID or name
@@ -602,7 +609,7 @@ class CastEvaluator {
                             break;
                         case "timetz":
                         case "time with time zone":
-                            dt = DataType.TIME;
+                            dt = DataType.TIMETZ;
                             break;
                         default:
                             dt = null;
@@ -784,6 +791,28 @@ class CastEvaluator {
             result.add(part.trim());
         }
         return result;
+    }
+
+    /** Strip trailing zeros from the fractional-seconds part of a formatted timestamp/time string. */
+    private static String stripTrailingFracZeros(String s) {
+        int dotIdx = s.lastIndexOf('.');
+        if (dotIdx < 0) return s;
+        int end = s.length();
+        int fracEnd = end;
+        for (int i = dotIdx + 1; i < end; i++) {
+            if (!Character.isDigit(s.charAt(i))) {
+                fracEnd = i;
+                break;
+            }
+        }
+        int last = fracEnd;
+        while (last > dotIdx + 1 && s.charAt(last - 1) == '0') {
+            last--;
+        }
+        if (last == dotIdx + 1) {
+            return s.substring(0, dotIdx) + s.substring(fracEnd);
+        }
+        return s.substring(0, last) + s.substring(fracEnd);
     }
 
     /** Format a Java List as a PostgreSQL array literal string {e1,e2,...}. */

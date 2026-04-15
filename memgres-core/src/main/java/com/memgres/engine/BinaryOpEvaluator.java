@@ -203,13 +203,13 @@ class BinaryOpEvaluator {
                 if (lBitsXor != null && rBitsXor != null) {
                     return new AstExecutor.PgBitString(AstExecutor.bitwiseBitString(lBitsXor, rBitsXor, '#'));
                 }
-                // Geometric intersection: lseg # lseg
+                // Geometric intersection: lseg # lseg, box # box
                 if (left instanceof String && right instanceof String
                         && GeometricOperations.isGeometricString(((String) left))) {
                     String rs = (String) right;
                     String ls = (String) left;
-                    GeometricOperations.PgPoint pt = GeometricOperations.intersection(ls, rs);
-                    return pt != null ? GeometricOperations.format(pt) : null;
+                    Object result = GeometricOperations.intersectionGeneral(ls, rs);
+                    return result != null ? GeometricOperations.format(result) : null;
                 }
                 return (int)(executor.toLong(left) ^ executor.toLong(right));
             }
@@ -1041,13 +1041,13 @@ class BinaryOpEvaluator {
                 if (lBitsXor2 != null && rBitsXor2 != null) {
                     return new AstExecutor.PgBitString(AstExecutor.bitwiseBitString(lBitsXor2, rBitsXor2, '#'));
                 }
-                // Geometric intersection: lseg # lseg
+                // Geometric intersection: lseg # lseg, box # box
                 if (left instanceof String && right instanceof String
                         && GeometricOperations.isGeometricString(((String) left))) {
                     String rs = (String) right;
                     String ls = (String) left;
-                    GeometricOperations.PgPoint pt = GeometricOperations.intersection(ls, rs);
-                    return pt != null ? GeometricOperations.format(pt) : null;
+                    Object result = GeometricOperations.intersectionGeneral(ls, rs);
+                    return result != null ? GeometricOperations.format(result) : null;
                 }
                 return (int)(executor.toLong(left) ^ executor.toLong(right));
             }

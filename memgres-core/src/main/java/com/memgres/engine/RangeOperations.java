@@ -1,5 +1,8 @@
 package com.memgres.engine;
 
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 /**
  * PG range type support: int4range, int8range, numrange, daterange, tsrange, tstzrange.
  * Ranges are stored as canonical string form: "[lower,upper)" with inclusive/exclusive bounds.
@@ -158,7 +161,10 @@ public class RangeOperations {
         long lo = Math.min(aLo, bLo);
         long hi = Math.max(aHi, bHi);
         if (lo == hi) return new PgRange(null, null, true, false, true);
-        return new PgRange(lo, hi, true, false, false);
+        // Preserve string representations from the range that contributes the bound
+        String loStr = (aLo <= bLo) ? a.lowerStr : b.lowerStr;
+        String hiStr = (aHi >= bHi) ? a.upperStr : b.upperStr;
+        return new PgRange(lo, hi, true, false, false, loStr, hiStr);
     }
 
     /** Intersection of two ranges (PG * operator). Returns empty if no overlap. */
@@ -185,7 +191,10 @@ public class RangeOperations {
         long lo = Math.min(aLo, bLo);
         long hi = Math.max(aHi, bHi);
         if (lo == hi) return new PgRange(null, null, true, false, true);
-        return new PgRange(lo, hi, true, false, false);
+        // Preserve string representations from the range that contributes the bound
+        String loStr = (aLo <= bLo) ? a.lowerStr : b.lowerStr;
+        String hiStr = (aHi >= bHi) ? a.upperStr : b.upperStr;
+        return new PgRange(lo, hi, true, false, false, loStr, hiStr);
     }
 
     /**
@@ -452,10 +461,12 @@ public class RangeOperations {
         if (s.charAt(0) != '{' || s.charAt(s.length() - 1) != '}') return false;
         String inner = s.substring(1, s.length() - 1).trim();
         if (inner.isEmpty()) return false; // empty '{}' is ambiguous, treat as JSON/array, not multirange
-        // Exclude JSON objects (contain quoted keys with colons)
-        if (inner.contains("\"")) return false;
         // Check that inner content starts with a range literal bracket
         if (inner.charAt(0) != '[' && inner.charAt(0) != '(') return false;
+        // Exclude JSON objects (contain quoted keys with colons but no range brackets)
+        // Multiranges can contain quoted bounds (e.g., timestamps like "2024-01-01 00:00:00"),
+        // so only exclude when the content doesn't start with a range bracket.
+        // Since we already checked that inner starts with [ or (, this is a valid range/multirange.
         // Extract the first element and validate it's actually a range (not a record like "(1)")
         // Ranges can use mixed brackets (e.g. [1,5) or (1,5]), so find the first ']' or ')' after a comma
         int commaIdx = inner.indexOf(',');
@@ -660,6 +671,27 @@ public class RangeOperations {
         // b is in the middle — two pieces
         out.add(new PgRange(aLo, bLo, true, false, false));
         out.add(new PgRange(bHi, aHi, true, false, false));
+    }
+
+    /**
+     * Normalize date-only bounds (YYYY-MM-DD) to timestamp format (YYYY-MM-DD HH:MM:SS)
+     * for tsmultirange/tstzmultirange types.
+     */
+    public static String normalizeDateBoundsToTimestamp(String s) {
+        Pattern datePattern = Pattern.compile("\"(\\d{4}-\\d{2}-\\d{2})\"");
+
+        Matcher m = datePattern.matcher(s);
+        StringBuilder sb = new StringBuilder();
+
+        int last = 0;
+        while (m.find()) {
+            sb.append(s, last, m.start());
+            sb.append("\"").append(m.group(1)).append(" 00:00:00\"");
+            last = m.end();
+        }
+        sb.append(s, last, s.length());
+
+        return sb.toString();
     }
 
     /** Sort and merge overlapping/adjacent ranges. */

@@ -229,8 +229,62 @@ class CatalogMetadataFunctions {
             case "shobj_description":
                 return null;
             case "pg_describe_object": {
-                for (Expression a : fn.args()) executor.evalExpr(a, ctx);
-                return "";
+                if (fn.args().size() < 3) {
+                    for (Expression a : fn.args()) executor.evalExpr(a, ctx);
+                    return "";
+                }
+                Object classIdVal = executor.evalExpr(fn.args().get(0), ctx);
+                Object objIdVal = executor.evalExpr(fn.args().get(1), ctx);
+                Object objSubIdVal = executor.evalExpr(fn.args().get(2), ctx);
+                if (classIdVal == null || objIdVal == null) return "";
+                int classId = executor.toInt(classIdVal);
+                int objId = executor.toInt(objIdVal);
+                switch (classId) {
+                    case 1255: { // pg_proc
+                        // Look up function by OID
+                        for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
+                            if (entry.getValue() == objId && entry.getKey().startsWith("proc:")) {
+                                String funcName = entry.getKey().substring(5); // strip "proc:"
+                                // Build argument type list from the actual function definition
+                                PgFunction pgFunc = executor.database.getFunction(funcName);
+                                if (pgFunc != null && pgFunc.getParams() != null && !pgFunc.getParams().isEmpty()) {
+                                    StringBuilder sb = new StringBuilder("function ");
+                                    sb.append(funcName).append("(");
+                                    for (int i = 0; i < pgFunc.getParams().size(); i++) {
+                                        if (i > 0) sb.append(", ");
+                                        sb.append(pgFunc.getParams().get(i).typeName);
+                                    }
+                                    sb.append(")");
+                                    return sb.toString();
+                                }
+                                return "function " + funcName + "()";
+                            }
+                        }
+                        return "";
+                    }
+                    case 1259: { // pg_class
+                        for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
+                            if (entry.getValue() == objId && entry.getKey().startsWith("rel:")) {
+                                String fullKey = entry.getKey().substring(4); // strip "rel:"
+                                // Extract table name from schema.table
+                                String tableName = fullKey.contains(".") ? fullKey.substring(fullKey.lastIndexOf('.') + 1) : fullKey;
+                                return "table " + tableName;
+                            }
+                        }
+                        return "";
+                    }
+                    case 2615: { // pg_namespace
+                        for (Map.Entry<String, Integer> entry : executor.systemCatalog.getOidMap().entrySet()) {
+                            if (entry.getValue() == objId && entry.getKey().startsWith("ns:")) {
+                                String schemaName = entry.getKey().substring(3); // strip "ns:"
+                                return "schema " + schemaName;
+                            }
+                        }
+                        return "";
+                    }
+                    default:
+                        return "";
+                }
             }
             case "_pg_expandarray": {
                 if (fn.args().isEmpty()) return null;

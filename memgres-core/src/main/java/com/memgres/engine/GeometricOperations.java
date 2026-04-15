@@ -753,19 +753,10 @@ public final class GeometricOperations {
         if (a instanceof PgPoint && b instanceof PgCircle) return Math.max(0, distancePointPoint(((PgPoint) a), ((PgCircle) b).center) - ((PgCircle) b).radius);
         if (a instanceof PgCircle && b instanceof PgPoint) return Math.max(0, distancePointPoint(((PgPoint) b), ((PgCircle) a).center) - ((PgCircle) a).radius);
         if (a instanceof PgBox && b instanceof PgBox) {
-            PgBox bb = (PgBox) b;
-            PgBox ba = (PgBox) a;
-            // Distance between two boxes: min distance between any pair of edges
-            if (overlapsBoxBox(ba, bb)) return 0;
-            double d = Double.MAX_VALUE;
-            PgLseg[] edgesA = boxEdges(ba);
-            PgLseg[] edgesB = boxEdges(bb);
-            for (PgLseg ea : edgesA) {
-                for (PgLseg eb : edgesB) {
-                    d = Math.min(d, distanceLsegLseg(ea, eb));
-                }
-            }
-            return d;
+            // PG: box <-> box computes distance between the centers of the boxes
+            PgPoint ca = center((PgBox) a);
+            PgPoint cb = center((PgBox) b);
+            return distancePointPoint(ca, cb);
         }
         throw new MemgresException("distance not supported between " + a.getClass().getSimpleName() + " and " + b.getClass().getSimpleName(), "42883");
     }
@@ -1244,6 +1235,21 @@ public final class GeometricOperations {
         return new PgPoint(x, y);
     }
 
+    public static Object intersectionGeneral(Object a, Object b) {
+        if (a instanceof PgBox && b instanceof PgBox) return boxIntersection(((PgBox) a), ((PgBox) b));
+        return intersection(a, b);
+    }
+
+    /** Box intersection: returns the overlapping region as a box, or null if no overlap. */
+    public static PgBox boxIntersection(PgBox a, PgBox b) {
+        double lowX = Math.max(a.low.x, b.low.x);
+        double lowY = Math.max(a.low.y, b.low.y);
+        double highX = Math.min(a.high.x, b.high.x);
+        double highY = Math.min(a.high.y, b.high.y);
+        if (lowX > highX || lowY > highY) return null;
+        return new PgBox(new PgPoint(highX, highY), new PgPoint(lowX, lowY));
+    }
+
     public static PgPoint intersection(Object a, Object b) {
         if (a instanceof PgLseg && b instanceof PgLseg) return lsegIntersectionPoint(((PgLseg) a), ((PgLseg) b));
         if (a instanceof PgLine && b instanceof PgLine) return lineLineIntersection(((PgLine) a), ((PgLine) b));
@@ -1378,7 +1384,13 @@ public final class GeometricOperations {
     }
 
     public static PgBox toBox(PgCircle c) {
-        return boundBox(c);
+        // PG: box(circle) returns the inscribed square, not the bounding box.
+        // The inscribed square has side = r * sqrt(2), half-side = r / sqrt(2).
+        double half = c.radius / Math.sqrt(2.0);
+        return new PgBox(
+            new PgPoint(c.center.x + half, c.center.y + half),
+            new PgPoint(c.center.x - half, c.center.y - half)
+        );
     }
 
     public static PgBox toBox(PgPolygon p) {
@@ -1497,6 +1509,10 @@ public final class GeometricOperations {
     /**
      * Auto-detect geometric type from string and parse it.
      */
+    public static Object autoDetectPublic(String s) {
+        return autoDetect(s);
+    }
+
     private static Object autoDetect(String s) {
         s = s.trim();
         if (s.startsWith("<")) return parseCircle(s);
@@ -1751,6 +1767,10 @@ public final class GeometricOperations {
 
     public static PgPoint intersection(String a, String b) {
         return intersection((Object) autoDetect(a), (Object) autoDetect(b));
+    }
+
+    public static Object intersectionGeneral(String a, String b) {
+        return intersectionGeneral((Object) autoDetect(a), (Object) autoDetect(b));
     }
 
     public static boolean intersects(String a, String b) {

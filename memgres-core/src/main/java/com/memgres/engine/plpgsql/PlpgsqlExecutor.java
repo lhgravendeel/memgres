@@ -515,6 +515,7 @@ public class PlpgsqlExecutor {
                         Scope handlerScope = new Scope(scope);
                         handlerScope.declare("sqlerrm", e.getMessage());
                         handlerScope.declare("sqlstate", sqlState);
+                        populateDiagnosticScope(handlerScope, e);
                         try {
                             executeStatements(handler.body(), handlerScope);
                         } catch (ReturnSignal rs) {
@@ -581,6 +582,9 @@ public class PlpgsqlExecutor {
         } else if (stmt instanceof PlpgsqlStatement.Assignment) {
             PlpgsqlStatement.Assignment a = (PlpgsqlStatement.Assignment) stmt;
             executeAssignment(a, scope);
+        } else if (stmt instanceof PlpgsqlStatement.CaseStmt) {
+            PlpgsqlStatement.CaseStmt c = (PlpgsqlStatement.CaseStmt) stmt;
+            executeCase(c, scope);
         } else if (stmt instanceof PlpgsqlStatement.IfStmt) {
             PlpgsqlStatement.IfStmt i = (PlpgsqlStatement.IfStmt) stmt;
             executeIf(i, scope);
@@ -739,6 +743,66 @@ public class PlpgsqlExecutor {
         if (!stmt.elseBody().isEmpty()) {
             executeStatements(stmt.elseBody(), scope);
         }
+    }
+
+    private void executeCase(PlpgsqlStatement.CaseStmt stmt, Scope scope) {
+        if (stmt.searchExpr() != null) {
+            // Simple CASE: evaluate search expression once, compare with each WHEN value
+            Object searchVal = evalExpr(stmt.searchExpr(), scope);
+            // PG uses = comparison, so NULL never matches anything (NULL = NULL is NULL, not true)
+            if (searchVal != null) {
+                for (PlpgsqlStatement.CaseWhenClause when : stmt.whenClauses()) {
+                    // WHEN may have comma-separated values (e.g. WHEN 1, 2, 3 THEN)
+                    String whenExprStr = when.whenExpr().trim();
+                    String[] parts = splitCommaValues(whenExprStr);
+                    for (String part : parts) {
+                        Object whenVal = evalExpr(part.trim(), scope);
+                        if (whenVal != null && (searchVal.equals(whenVal)
+                                || String.valueOf(searchVal).equals(String.valueOf(whenVal)))) {
+                            executeStatements(when.body(), scope);
+                            return;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Searched CASE: each WHEN is a boolean expression
+            for (PlpgsqlStatement.CaseWhenClause when : stmt.whenClauses()) {
+                if (isTruthy(evalExpr(when.whenExpr(), scope))) {
+                    executeStatements(when.body(), scope);
+                    return;
+                }
+            }
+        }
+        // No WHEN matched
+        if (!stmt.elseBody().isEmpty()) {
+            executeStatements(stmt.elseBody(), scope);
+        } else {
+            throw new MemgresException("case not found", "20000");
+        }
+    }
+
+    private String[] splitCommaValues(String expr) {
+        // Split on commas that are not inside parentheses or quotes
+        List<String> parts = new ArrayList<>();
+        int depth = 0;
+        boolean inQuote = false;
+        int start = 0;
+        for (int i = 0; i < expr.length(); i++) {
+            char c = expr.charAt(i);
+            if (c == '\'' && !inQuote) inQuote = true;
+            else if (c == '\'' && inQuote) inQuote = false;
+            else if (!inQuote) {
+                if (c == '(') depth++;
+                else if (c == ')') depth--;
+                else if (c == ',' && depth == 0) {
+                    parts.add(expr.substring(start, i));
+                    start = i + 1;
+                }
+            }
+        }
+        parts.add(expr.substring(start));
+        return parts.toArray(new String[0]);
     }
 
     private void executeLoop(PlpgsqlStatement.LoopStmt stmt, Scope scope) {
@@ -963,6 +1027,17 @@ public class PlpgsqlExecutor {
     // ---- RAISE ----
 
     private void executeRaise(PlpgsqlStatement.RaiseStmt stmt, Scope scope) {
+        // Bare RAISE: re-raise the current exception
+        if (stmt.format() == null && stmt.argExprs().isEmpty() && stmt.errcode() == null
+                && stmt.level().equals("EXCEPTION")) {
+            String sqlState = scope.has("sqlstate") ? String.valueOf(scope.get("sqlstate")) : "P0001";
+            String msg = scope.has("sqlerrm") ? String.valueOf(scope.get("sqlerrm")) : "PL/pgSQL exception";
+            MemgresException ex = new MemgresException(msg, sqlState);
+            if (scope.has("__pg_detail")) ex.setDetail(String.valueOf(scope.get("__pg_detail")));
+            if (scope.has("__pg_hint")) ex.setHint(String.valueOf(scope.get("__pg_hint")));
+            throw ex;
+        }
+
         String message = formatRaiseMessage(stmt.format(), stmt.argExprs(), scope);
         String hint = stmt.hint();
         switch (stmt.level()) {
@@ -978,22 +1053,33 @@ public class PlpgsqlExecutor {
                 break;
             case "DEBUG":
                 LOG.debug("PL/pgSQL {}: {}", stmt.level(), message);
-                // DEBUG messages are below client_min_messages threshold, so do not send to client
                 break;
-            case "EXCEPTION":
+            case "EXCEPTION": {
                 String sqlState = "P0001";
                 if (stmt.errcode() != null) sqlState = conditionToSqlState(stmt.errcode());
-                throw new MemgresException(message != null ? message : "PL/pgSQL exception", sqlState);
-            default:
+                MemgresException ex = new MemgresException(message != null ? message : "PL/pgSQL exception", sqlState);
+                if (stmt.detail() != null) ex.setDetail(stmt.detail());
+                if (hint != null) ex.setHint(hint);
+                if (stmt.column() != null) ex.setColumn(stmt.column());
+                if (stmt.constraint() != null) ex.setConstraint(stmt.constraint());
+                if (stmt.datatype() != null) ex.setDatatype(stmt.datatype());
+                if (stmt.table() != null) ex.setTable(stmt.table());
+                if (stmt.schema() != null) ex.setSchema(stmt.schema());
+                throw ex;
+            }
+            default: {
                 // Named condition: RAISE division_by_zero, RAISE unique_violation, etc.
                 String condState = conditionToSqlState(stmt.level().toLowerCase());
                 if (!condState.equals("P0001") || stmt.level().contains("_")) {
-                    // It's a known condition name; raise as exception with that SQLSTATE
                     String msg = message != null ? message : stmt.level().replace("_", " ");
                     if (stmt.errcode() != null) condState = conditionToSqlState(stmt.errcode());
-                    throw new MemgresException(msg, condState);
+                    MemgresException ex = new MemgresException(msg, condState);
+                    if (stmt.detail() != null) ex.setDetail(stmt.detail());
+                    if (hint != null) ex.setHint(hint);
+                    throw ex;
                 }
                 break;
+            }
         }
     }
 
@@ -1079,11 +1165,22 @@ public class PlpgsqlExecutor {
         QueryResult result = astExecutor.execute(sql);
         scope.lastRowCount = result.getAffectedRows();
 
-        if (stmt.intoVars() != null && !result.getRows().isEmpty()) {
-            setFromRow(scope, stmt.intoVars(), result);
-            scope.set("found", true);
-        } else if (stmt.intoVars() != null) {
-            scope.set("found", false);
+        if (stmt.intoVars() != null) {
+            int rowCount = result.getRows().size();
+            if (stmt.strict()) {
+                if (rowCount == 0) {
+                    throw new MemgresException("query returned no rows", "P0002");
+                }
+                if (rowCount > 1) {
+                    throw new MemgresException("query returned more than one row", "P0003");
+                }
+            }
+            if (!result.getRows().isEmpty()) {
+                setFromRow(scope, stmt.intoVars(), result);
+                scope.set("found", true);
+            } else {
+                scope.set("found", false);
+            }
         }
     }
 
@@ -1219,11 +1316,28 @@ public class PlpgsqlExecutor {
                         value = scope.has("sqlstate") ? scope.get("sqlstate") : null;
                         break;
                     case "MESSAGE_TEXT":
-                    case "PG_EXCEPTION_DETAIL":
                         value = scope.has("sqlerrm") ? scope.get("sqlerrm") : null;
                         break;
+                    case "PG_EXCEPTION_DETAIL":
+                        value = scope.has("__pg_detail") ? scope.get("__pg_detail") : "";
+                        break;
                     case "PG_EXCEPTION_HINT":
-                        value = "";
+                        value = scope.has("__pg_hint") ? scope.get("__pg_hint") : "";
+                        break;
+                    case "COLUMN_NAME":
+                        value = scope.has("__pg_column") ? scope.get("__pg_column") : "";
+                        break;
+                    case "CONSTRAINT_NAME":
+                        value = scope.has("__pg_constraint") ? scope.get("__pg_constraint") : "";
+                        break;
+                    case "PG_DATATYPE_NAME":
+                        value = scope.has("__pg_datatype") ? scope.get("__pg_datatype") : "";
+                        break;
+                    case "TABLE_NAME":
+                        value = scope.has("__pg_table") ? scope.get("__pg_table") : "";
+                        break;
+                    case "SCHEMA_NAME":
+                        value = scope.has("__pg_schema") ? scope.get("__pg_schema") : "";
                         break;
                     case "PG_EXCEPTION_CONTEXT":
                     case "PG_CONTEXT":
@@ -1600,6 +1714,8 @@ public class PlpgsqlExecutor {
         }
         if (t.type() == TokenType.STRING_LITERAL) {
             sb.append("'").append(t.value().replace("'", "''")).append("'");
+        } else if (t.type() == TokenType.BIT_STRING_LITERAL) {
+            sb.append("B'").append(t.value()).append("'");
         } else {
             sb.append(t.value());
         }
@@ -1676,10 +1792,16 @@ public class PlpgsqlExecutor {
             String condLower = cond.toLowerCase().trim();
             if (condLower.equals("others")) return !"P0004".equals(sqlState);
             if (condLower.startsWith("sqlstate ")) {
-                if (sqlState.equals(condLower.substring(9).trim().replace("'", ""))) return true;
+                if (sqlState.equalsIgnoreCase(condLower.substring(9).trim().replace("'", ""))) return true;
                 continue;
             }
-            if (conditionToSqlState(condLower).equals(sqlState)) return true;
+            String condSqlState = conditionToSqlState(condLower);
+            if (condSqlState.equals(sqlState)) return true;
+            // Class-level matching: if condition SQLSTATE ends with "000", match by first 2 chars
+            if (condSqlState.length() == 5 && condSqlState.substring(2).equals("000")
+                    && sqlState.length() == 5 && sqlState.substring(0, 2).equals(condSqlState.substring(0, 2))) {
+                return true;
+            }
         }
         return false;
     }
@@ -1746,9 +1868,90 @@ public class PlpgsqlExecutor {
                 return "22023";
             case "object_not_in_prerequisite_state":
                 return "55000";
+            case "insufficient_privilege":
+                return "42501";
+            case "deadlock_detected":
+                return "40P01";
+            case "lock_not_available":
+                return "55P03";
+            case "invalid_cursor_state":
+                return "24000";
+            case "invalid_transaction_state":
+                return "25000";
+            case "null_value_not_allowed":
+                return "22004";
+            case "invalid_regular_expression":
+                return "2201B";
+            case "datetime_field_overflow":
+                return "22008";
+            case "object_in_use":
+                return "55006";
+            case "program_limit_exceeded":
+                return "54000";
+            case "case_not_found":
+                return "20000";
+            case "with_check_option_violation":
+                return "44000";
+            case "triggered_action_exception":
+                return "09000";
+            case "plpgsql_error":
+                return "P0000";
+            case "invalid_escape_sequence":
+                return "22025";
+            case "name_too_long":
+                return "42622";
+            case "external_routine_exception":
+                return "38000";
+            case "syntax_error_or_access_rule_violation":
+                return "42000";
+            case "exclusion_violation":
+                return "23P01";
+            case "restrict_violation":
+                return "23001";
+            case "cardinality_violation":
+                return "21000";
+            case "transaction_rollback":
+                return "40000";
+            case "operator_intervention":
+                return "57000";
+            case "query_canceled":
+                return "57014";
+            case "connection_exception":
+                return "08000";
+            case "config_file_error":
+                return "F0000";
+            case "invalid_sql_statement_name":
+                return "26000";
             default:
                 return condition.length() == 5 ? condition : "P0001";
         }
+    }
+
+    private void populateDiagnosticScope(Scope scope, MemgresException e) {
+        if (e.getDetail() != null) scope.declare("__pg_detail", e.getDetail());
+        if (e.getHint() != null) scope.declare("__pg_hint", e.getHint());
+        String column = e.getColumn();
+        String constraint = e.getConstraint();
+        String table = e.getTable();
+        // Extract constraint/table from error message if not explicitly set
+        String msg = e.getMessage();
+        if (msg != null) {
+            if (constraint == null) {
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                        "violates (?:unique |check |foreign key )?constraint \"([^\"]+)\"").matcher(msg);
+                if (m.find()) constraint = m.group(1);
+            }
+            if (table == null) {
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                        "relation \"([^\"]+)\"").matcher(msg);
+                if (m.find()) table = m.group(1);
+            }
+        }
+        if (column != null) scope.declare("__pg_column", column);
+        if (constraint != null) scope.declare("__pg_constraint", constraint);
+        if (e.getDatatype() != null) scope.declare("__pg_datatype", e.getDatatype());
+        if (table != null) scope.declare("__pg_table", table);
+        if (e.getSchema() != null) scope.declare("__pg_schema", e.getSchema());
     }
 
     private String mapJavaExceptionToSqlState(RuntimeException e) {

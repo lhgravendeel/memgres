@@ -48,6 +48,40 @@ class DateTimeArithmetic {
             return dateTimeAdd(rt, iv);
         }
 
+        // timetz (String) + interval: parse timetz string, add interval, preserve offset
+        if (left instanceof String && right instanceof PgInterval) {
+            String s = (String) left;
+            if (s.contains("+") || (s.lastIndexOf('-') > s.indexOf(':'))) {
+                // Looks like a timetz string (e.g., "12:30:00+00")
+                try {
+                    int plusIdx = s.lastIndexOf('+');
+                    int minusIdx = s.lastIndexOf('-');
+                    int tzIdx = Math.max(plusIdx, minusIdx);
+                    if (tzIdx > 0) {
+                        String timePart = s.substring(0, tzIdx);
+                        String offsetPart = s.substring(tzIdx);
+                        LocalTime lt = LocalTime.parse(timePart);
+                        PgInterval iv = (PgInterval) right;
+                        long totalMicros = iv.getMicroseconds();
+                        long totalSeconds = totalMicros / 1_000_000;
+                        lt = lt.plusHours(totalSeconds / 3600);
+                        lt = lt.plusMinutes((totalSeconds % 3600) / 60);
+                        lt = lt.plusSeconds(totalSeconds % 60);
+                        String resultTime = lt.toString();
+                        if (resultTime.length() == 5) resultTime += ":00";
+                        return resultTime + offsetPart;
+                    }
+                } catch (Exception ignored) { /* fall through to other handlers */ }
+            }
+        }
+        // interval + timetz (String): commutative
+        if (left instanceof PgInterval && right instanceof String) {
+            String s = (String) right;
+            if (s.contains("+") || (s.lastIndexOf('-') > s.indexOf(':'))) {
+                return dateTimeAdd(right, left);
+            }
+        }
+
         // integer + interval: PG rejects this (operator does not exist: integer + interval)
         if (left instanceof Number && !(left instanceof Float) && !(left instanceof Double)
                 && right instanceof PgInterval) {
