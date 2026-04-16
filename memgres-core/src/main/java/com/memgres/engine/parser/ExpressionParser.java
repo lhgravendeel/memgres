@@ -733,6 +733,23 @@ public class ExpressionParser {
         return parsePostfix();
     }
 
+    /**
+     * Parse a primary expression and eagerly absorb any immediately-following
+     * {@code ::type} casts. Used for the right-hand operand of JSON postfix
+     * operators ({@code ->}, {@code ->>}, {@code #>}, {@code #>>}, {@code #-})
+     * so that {@code a #- '{b,c}'::text[]} parses as {@code a #- ('{b,c}'::text[])}
+     * rather than {@code (a #- '{b,c}')::text[]}. PG's type-cast operator binds
+     * tighter than any binary operator.
+     */
+    private Expression parsePrimaryWithCasts() {
+        Expression expr = parsePrimary();
+        while (match(TokenType.CAST)) {
+            String typeName = parseTypeName();
+            expr = new CastExpr(expr, typeName);
+        }
+        return expr;
+    }
+
     private Expression parsePostfix() {
         Expression expr = parsePrimary();
 
@@ -742,15 +759,15 @@ public class ExpressionParser {
                 String typeName = parseTypeName();
                 expr = new CastExpr(expr, typeName);
             } else if (match(TokenType.JSON_ARROW)) {
-                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_ARROW, parsePrimary());
+                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_ARROW, parsePrimaryWithCasts());
             } else if (match(TokenType.JSON_ARROW_TEXT)) {
-                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_ARROW_TEXT, parsePrimary());
+                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_ARROW_TEXT, parsePrimaryWithCasts());
             } else if (match(TokenType.JSON_HASH_ARROW)) {
-                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_HASH_ARROW, parsePrimary());
+                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_HASH_ARROW, parsePrimaryWithCasts());
             } else if (match(TokenType.JSON_HASH_ARROW_TEXT)) {
-                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_HASH_ARROW_TEXT, parsePrimary());
+                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_HASH_ARROW_TEXT, parsePrimaryWithCasts());
             } else if (match(TokenType.JSON_DELETE_PATH)) {
-                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_DELETE_PATH, parsePrimary());
+                expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_DELETE_PATH, parsePrimaryWithCasts());
             } else if (check(TokenType.LEFT_BRACKET)) {
                 // PG rejects ARRAY[...][n] (bare array literal subscript); requires (ARRAY[...])[n]
                 if (expr instanceof ArrayExpr && !((ArrayExpr) expr).isRow()

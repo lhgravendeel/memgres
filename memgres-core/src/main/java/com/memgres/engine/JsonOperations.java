@@ -366,6 +366,10 @@ public final class JsonOperations {
             result.add(inner.substring(valStart, valEnd).trim());
             i = valEnd;
             while (i < inner.length() && (inner.charAt(i) == ',' || Character.isWhitespace(inner.charAt(i)))) i++;
+            // Safety: guarantee forward progress. If findValueEnd made no progress
+            // (e.g., the current char is a stray '}' or ']' from malformed input),
+            // advance past it so we cannot spin forever and OOM via unbounded add().
+            if (i == valStart) i++;
         }
         return result;
     }

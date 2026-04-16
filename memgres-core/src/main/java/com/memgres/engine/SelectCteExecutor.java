@@ -170,6 +170,7 @@ class SelectCteExecutor {
         List<List<Object>> workingSetCyclePaths = hasCycle ? new ArrayList<>(cyclePaths) : null;
 
         String cteLower = cte.name().toLowerCase();
+        detectMutualRecursionCycle(cte, cteLower);
         executor.executingCtes.add(cteLower);
         int maxIterations = 1000;
         try {
@@ -568,5 +569,94 @@ class SelectCteExecutor {
             return lit.literalType() == Literal.LiteralType.INTEGER || lit.literalType() == Literal.LiteralType.FLOAT;
         }
         return false;
+    }
+
+    /**
+     * Detect mutual recursion cycles among RECURSIVE CTEs in the same WITH scope.
+     * PostgreSQL does not support mutual recursion between WITH items; throw a
+     * 0A000 (feature_not_supported) error up-front rather than spinning through
+     * a non-terminating fixed-point iteration.
+     */
+    private void detectMutualRecursionCycle(SelectStmt.CommonTableExpr cte, String cteLower) {
+        Map<String, SelectStmt.CommonTableExpr> scope = null;
+        for (Map<String, SelectStmt.CommonTableExpr> s : executor.cteStack) {
+            if (s.containsKey(cteLower)) { scope = s; break; }
+        }
+        if (scope == null || scope.size() < 2) return;
+
+        Map<String, Set<String>> deps = new HashMap<>();
+        Set<String> scopeNames = scope.keySet();
+        for (Map.Entry<String, SelectStmt.CommonTableExpr> e : scope.entrySet()) {
+            SelectStmt.CommonTableExpr c = e.getValue();
+            if (!c.recursive() || !(c.query() instanceof SetOpStmt)) {
+                deps.put(e.getKey(), Collections.emptySet());
+                continue;
+            }
+            SetOpStmt so = (SetOpStmt) c.query();
+            Set<String> refs = new HashSet<>();
+            collectSiblingRefs(so.right(), scopeNames, refs);
+            refs.remove(e.getKey());
+            deps.put(e.getKey(), refs);
+        }
+
+        Set<String> visited = new HashSet<>();
+        Deque<String> stack = new ArrayDeque<>();
+        for (String next : deps.getOrDefault(cteLower, Collections.emptySet())) stack.push(next);
+        while (!stack.isEmpty()) {
+            String cur = stack.pop();
+            if (cur.equals(cteLower)) {
+                throw new MemgresException(
+                        "mutual recursion between WITH items involving \""
+                                + cte.name() + "\" is not supported", "0A000");
+            }
+            if (!visited.add(cur)) continue;
+            for (String next : deps.getOrDefault(cur, Collections.emptySet())) stack.push(next);
+        }
+    }
+
+    /**
+     * Walk an AST fragment (statement/expression/list) via reflection and collect
+     * unqualified TableRef names that match any sibling CTE name in scope. Used
+     * only for mutual-recursion cycle detection — correctness of reflection walk
+     * is bounded by the recursive-term tree size.
+     */
+    private static void collectSiblingRefs(Object node, Set<String> scopeNames, Set<String> out) {
+        if (node == null) return;
+        Deque<Object> stack = new ArrayDeque<>();
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        stack.push(node);
+        while (!stack.isEmpty()) {
+            Object cur = stack.pop();
+            if (cur == null || !seen.add(cur)) continue;
+            if (cur instanceof SelectStmt.TableRef) {
+                SelectStmt.TableRef tr = (SelectStmt.TableRef) cur;
+                if (tr.schema() == null && tr.table() != null) {
+                    String lc = tr.table().toLowerCase();
+                    if (scopeNames.contains(lc)) out.add(lc);
+                }
+                continue;
+            }
+            if (cur instanceof String || cur instanceof Number || cur instanceof Boolean
+                    || cur instanceof Character || cur instanceof Enum) continue;
+            if (cur instanceof Collection) {
+                for (Object item : (Collection<?>) cur) stack.push(item);
+                continue;
+            }
+            if (cur instanceof Map) {
+                for (Object item : ((Map<?, ?>) cur).values()) stack.push(item);
+                continue;
+            }
+            Class<?> cls = cur.getClass();
+            Package pkg = cls.getPackage();
+            if (pkg == null || !pkg.getName().startsWith("com.memgres")) continue;
+            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(cur);
+                    if (v != null) stack.push(v);
+                } catch (IllegalAccessException | RuntimeException ignored) { }
+            }
+        }
     }
 }
