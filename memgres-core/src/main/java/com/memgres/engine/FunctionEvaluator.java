@@ -409,7 +409,12 @@ class FunctionEvaluator {
                 if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
                 Sequence seq = resolveSequence(seqName);
                 if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
-                long nv = seq.nextVal();
+                long nv;
+                if (executor.session != null && seq.getCache() > 1) {
+                    nv = executor.session.nextvalCached(seq);
+                } else {
+                    nv = seq.nextVal();
+                }
                 executor.lastSequenceValue = nv;
                 return nv;
             }

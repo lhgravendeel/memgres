@@ -339,9 +339,18 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     session.setQueryState(stmt);
                     QueryResult result = executeWithCancel(stmt);
                     session.setIdleState();
+                    // Count autocommit statements as committed transactions
+                    if (!session.isExplicitTransactionBlock()) {
+                        database.incrementXactCommit();
+                    }
                     sendQueryResult(ctx, result);
                 } catch (MemgresException e) {
-                    sendErrorSimple(ctx, e.getSqlState(), e.getMessage());
+                    if (e.getDetail() != null || e.getSchema() != null || e.getTable() != null
+                            || e.getConstraint() != null || e.getColumn() != null) {
+                        sendErrorWithDetails(ctx, e, false);
+                    } else {
+                        sendErrorSimple(ctx, e.getSqlState(), e.getMessage());
+                    }
                     batchFailed = true;
                 } catch (ArithmeticException e) {
                     String errMsg = e.getMessage() != null ? e.getMessage() : "arithmetic error";
@@ -679,7 +688,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                             try {
                                 executeWithCancel(s, portal.paramValues());
                             } catch (MemgresException e) {
-                                sendExtendedError(ctx, e.getSqlState(), e.getMessage());
+                                if (e.getDetail() != null || e.getConstraint() != null) {
+                                    sendErrorWithDetails(ctx, e, true);
+                                    errorPendingUntilSync = true;
+                                } else {
+                                    sendExtendedError(ctx, e.getSqlState(), e.getMessage());
+                                }
                                 return;
                             }
                         }
@@ -730,7 +744,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             }
         } catch (MemgresException e) {
             LOG.warn("[PROTO] Execute ERROR {}: {} | {}", e.getSqlState(), e.getMessage(), sqlSnip);
-            sendExtendedError(ctx, e.getSqlState(), e.getMessage());
+            if (e.getDetail() != null || e.getConstraint() != null) {
+                sendErrorWithDetails(ctx, e, true);
+                errorPendingUntilSync = true;
+            } else {
+                sendExtendedError(ctx, e.getSqlState(), e.getMessage());
+            }
         } catch (ArithmeticException e) {
             String errMsg = e.getMessage() != null ? e.getMessage() : "arithmetic error";
             LOG.warn("[PROTO] Execute ARITH ERROR: {} | {}", errMsg, sqlSnip);
@@ -1006,6 +1025,43 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
     /** Send an error for simple query protocol (no error flag). */
     static void sendErrorSimple(ChannelHandlerContext ctx, String sqlState, String message) {
         sendError(ctx, sqlState, message, false);
+    }
+
+    /** Send an error with full diagnostic fields from a MemgresException. */
+    static void sendErrorWithDetails(ChannelHandlerContext ctx, MemgresException ex, boolean isExtended) {
+        ByteBuf buf = ctx.alloc().buffer();
+        buf.writeByte('E');
+        int lengthIdx = buf.writerIndex();
+        buf.writeInt(0);
+        buf.writeByte('S');
+        PgWireValueFormatter.writeCString(buf, "ERROR");
+        buf.writeByte('C');
+        PgWireValueFormatter.writeCString(buf, ex.getSqlState() != null ? ex.getSqlState() : "XX000");
+        buf.writeByte('M');
+        PgWireValueFormatter.writeCString(buf, ex.getMessage());
+        if (ex.getDetail() != null) {
+            buf.writeByte('D');
+            PgWireValueFormatter.writeCString(buf, ex.getDetail());
+        }
+        if (ex.getSchema() != null) {
+            buf.writeByte('s');
+            PgWireValueFormatter.writeCString(buf, ex.getSchema());
+        }
+        if (ex.getTable() != null) {
+            buf.writeByte('t');
+            PgWireValueFormatter.writeCString(buf, ex.getTable());
+        }
+        if (ex.getColumn() != null) {
+            buf.writeByte('c');
+            PgWireValueFormatter.writeCString(buf, ex.getColumn());
+        }
+        if (ex.getConstraint() != null) {
+            buf.writeByte('n');
+            PgWireValueFormatter.writeCString(buf, ex.getConstraint());
+        }
+        buf.writeByte(0);
+        buf.setInt(lengthIdx, buf.writerIndex() - lengthIdx);
+        ctx.write(buf);
     }
 
     /** Send an error for extended query protocol (sets error flag to skip until Sync). */

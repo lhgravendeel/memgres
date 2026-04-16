@@ -644,7 +644,10 @@ public class Lexer {
                     pos += 2;
                 } else {
                     pos++; // skip closing "
-                    return new Token(TokenType.QUOTED_IDENTIFIER, sb.toString(), start);
+                    // PG truncates identifiers to NAMEDATALEN-1 = 63 bytes
+                    String qid = sb.toString();
+                    if (qid.length() > 63) qid = qid.substring(0, 63);
+                    return new Token(TokenType.QUOTED_IDENTIFIER, qid, start);
                 }
             } else {
                 sb.append(c);
@@ -717,6 +720,9 @@ public class Lexer {
         if (KEYWORDS.contains(upper)) {
             return new Token(TokenType.KEYWORD, upper, start);
         }
-        return new Token(TokenType.IDENTIFIER, word.toLowerCase(), start);
+        // PG truncates identifiers to NAMEDATALEN-1 = 63 bytes
+        String id = word.toLowerCase();
+        if (id.length() > 63) id = id.substring(0, 63);
+        return new Token(TokenType.IDENTIFIER, id, start);
     }
 }

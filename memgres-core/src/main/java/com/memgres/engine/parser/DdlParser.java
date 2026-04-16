@@ -889,7 +889,7 @@ class DdlParser {
     }
 
     private void parseSequenceOptions(Long[] startWith, Long[] incrementBy, Long[] minValue,
-                                      Long[] maxValue, Boolean[] cycle) {
+                                      Long[] maxValue, Boolean[] cycle, Integer[] cache) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeywords("START", "WITH")) { startWith[0] = readSeqLong(); continue; }
             if (parser.matchKeyword("START")) { startWith[0] = readSeqLong(); continue; }
@@ -899,7 +899,7 @@ class DdlParser {
             if (parser.matchKeyword("MAXVALUE")) { maxValue[0] = readSeqLong(); continue; }
             if (parser.matchKeywords("NO", "MINVALUE")) { continue; }
             if (parser.matchKeywords("NO", "MAXVALUE")) { continue; }
-            if (parser.matchKeyword("CACHE")) { parser.advance(); continue; }
+            if (parser.matchKeyword("CACHE")) { cache[0] = (int) readSeqLong(); continue; }
             if (parser.matchKeyword("CYCLE")) { cycle[0] = true; continue; }
             if (parser.matchKeywords("NO", "CYCLE")) { cycle[0] = false; continue; }
             if (parser.matchKeywords("OWNED", "BY")) {
@@ -918,8 +918,11 @@ class DdlParser {
         if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
         Long[] startWith = {null}, incrementBy = {null}, minValue = {null}, maxValue = {null};
         Boolean[] cycle = {null};
-        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle);
-        return new CreateSequenceStmt(name, ifNotExists, startWith[0], incrementBy[0], minValue[0], maxValue[0], cycle[0], temporary);
+        Integer[] cache = {null};
+        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache);
+        CreateSequenceStmt stmt = new CreateSequenceStmt(name, ifNotExists, startWith[0], incrementBy[0], minValue[0], maxValue[0], cycle[0], temporary);
+        stmt.setCache(cache[0]);
+        return stmt;
     }
 
     AlterSequenceStmt parseAlterSequence() {
@@ -940,7 +943,8 @@ class DdlParser {
                 return new AlterSequenceStmt(name, parser.readIdentifier());
             }
             int saved = parser.pos;
-            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle);
+            Integer[] cache = {null};
+            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache);
             if (parser.pos == saved) break;
         }
         return new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0], maxValue[0], startWith[0], cycle[0]);

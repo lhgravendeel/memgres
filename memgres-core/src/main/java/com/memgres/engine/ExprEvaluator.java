@@ -357,6 +357,7 @@ class ExprEvaluator {
                                     ? outer.resolveColumn(ref.table(), ref.column())
                                     : outer.resolveColumn(null, ref.column());
                                 if (result instanceof RowContext.TableoidRef) return resolveTableoidRef(result);
+                                if (result instanceof RowContext.SystemColumnRef) return resolveSystemColumnRef(result);
                                 return result;
                             } catch (MemgresException e) {
                                 if (!"42703".equals(e.getSqlState()) && !"42P01".equals(e.getSqlState())) throw e;
@@ -389,6 +390,9 @@ class ExprEvaluator {
                 if (result instanceof RowContext.TableoidRef) {
                     return resolveTableoidRef(result);
                 }
+                if (result instanceof RowContext.SystemColumnRef) {
+                    return resolveSystemColumnRef(result);
+                }
                 return result;
             }
             // Not found in current context, try special columns
@@ -397,8 +401,14 @@ class ExprEvaluator {
                     return resolveTableoidRef(ctx.resolveColumn(null, "tableoid"));
                 } catch (MemgresException ignored) { /* fall through to outer contexts */ }
             }
-            if (ref.column().equalsIgnoreCase("ctid")) {
-                return "(0,0)"; // stub: return a fixed ctid value
+            // System columns: ctid, xmin, xmax, cmin, cmax are handled by RowContext.resolveColumn
+            if (ref.column().equalsIgnoreCase("ctid") || ref.column().equalsIgnoreCase("xmin")
+                    || ref.column().equalsIgnoreCase("xmax") || ref.column().equalsIgnoreCase("cmin")
+                    || ref.column().equalsIgnoreCase("cmax")) {
+                try {
+                    Object val = ctx.resolveColumn(null, ref.column());
+                    return resolveSystemColumnRef(val);
+                } catch (MemgresException ignored) { /* fall through to outer contexts */ }
             }
             // For single-column SRF tables, resolve the alias to the scalar value
             // (e.g., SELECT elem::int FROM jsonb_array_elements(...) AS elem)
@@ -459,6 +469,9 @@ class ExprEvaluator {
                 if (result instanceof RowContext.TableoidRef) {
                     return resolveTableoidRef(result);
                 }
+                if (result instanceof RowContext.SystemColumnRef) {
+                    return resolveSystemColumnRef(result);
+                }
                 return result;
             }
             // Try outer contexts (for correlated subqueries / LATERAL joins)
@@ -499,6 +512,37 @@ class ExprEvaluator {
                 }
             }
             return executor.systemCatalog.getOid("rel:" + schemaName + "." + tableName);
+        }
+        return val;
+    }
+
+    /**
+     * Resolve a SystemColumnRef to its actual value (xmin/xmax/cmin/cmax).
+     */
+    private Object resolveSystemColumnRef(Object val) {
+        if (val instanceof RowContext.SystemColumnRef) {
+            RowContext.SystemColumnRef ref = (RowContext.SystemColumnRef) val;
+            String schemaName = "public";
+            for (Map.Entry<String, Schema> e : executor.database.getSchemas().entrySet()) {
+                if (e.getValue().getTable(ref.table.getName()) == ref.table) {
+                    schemaName = e.getKey();
+                    break;
+                }
+            }
+            String tableKey = schemaName + "." + ref.table.getName();
+            Map<Object[], long[]> meta = executor.database.getRowMeta(tableKey);
+            long[] rowMeta = meta.get(ref.row);
+            switch (ref.column) {
+                case "xmin": return rowMeta != null ? rowMeta[0] : 0L;
+                case "xmax": return rowMeta != null ? rowMeta[1] : 0L;
+                case "cmin": return rowMeta != null ? (int) rowMeta[2] : 0;
+                case "cmax": return rowMeta != null ? (int) rowMeta[3] : 0;
+                case "ctid": {
+                    long ctidNum = rowMeta != null && rowMeta.length > 4 ? rowMeta[4] : 0;
+                    return "(0," + ctidNum + ")";
+                }
+                default: return 0L;
+            }
         }
         return val;
     }

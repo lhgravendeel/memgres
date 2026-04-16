@@ -112,8 +112,9 @@ class DdlIndexParser {
             }
             columns.add(col);
             if (parser.matchKeyword("COLLATE")) {
-                parser.readIdentifierOrString();
-                if (parser.match(TokenType.DOT)) parser.readIdentifierOrString();
+                String collation = parser.readIdentifierOrString();
+                if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifierOrString();
+                ExpressionParser.validateCollationStatic(collation, parser.peek());
             }
             if (!parser.isAtEnd() && (parser.check(TokenType.IDENTIFIER) || parser.check(TokenType.KEYWORD))
                     && !parser.checkKeyword("ASC") && !parser.checkKeyword("DESC")

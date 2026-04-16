@@ -55,13 +55,16 @@ class ForeachSliceAndFunctionBodyTest {
     }
 
     @Test
-    void foreachSlice1StillRejected() throws SQLException {
+    void foreachSlice1Allowed() throws SQLException {
         try (Statement s = conn.createStatement()) {
-            SQLException ex = assertThrows(SQLException.class, () ->
-                    s.execute("CREATE FUNCTION test_fs1() RETURNS text LANGUAGE plpgsql AS $$ "
-                            + "DECLARE arr integer[] := ARRAY[[1,2],[3,4]]; slice integer[]; result text := ''; "
-                            + "BEGIN FOREACH slice SLICE 1 IN ARRAY arr LOOP result := result || slice::text; END LOOP; RETURN result; END; $$"));
-            assertEquals("42601", ex.getSQLState());
+            s.execute("CREATE FUNCTION test_fs1() RETURNS text LANGUAGE plpgsql AS $$ "
+                    + "DECLARE arr integer[] := ARRAY[[1,2],[3,4]]; slice integer[]; result text := ''; "
+                    + "BEGIN FOREACH slice SLICE 1 IN ARRAY arr LOOP result := result || array_to_string(slice, ',') || ';'; END LOOP; RETURN result; END; $$");
+            try (ResultSet rs = s.executeQuery("SELECT test_fs1()")) {
+                assertTrue(rs.next());
+                assertEquals("1,2;3,4;", rs.getString(1), "SLICE 1 should iterate over 1D sub-arrays");
+            }
+            s.execute("DROP FUNCTION test_fs1()");
         }
     }
 

@@ -1004,40 +1004,92 @@ public final class TypeCoercion {
     }
 
     /**
-     * PostgreSQL-like locale-aware string comparison.
-     * Emulates glibc strcoll() behavior for en_US.UTF-8 where:
+     * Default string comparison using binary/codepoint ordering.
+     * This is the standard comparison used throughout the engine for WHERE clauses,
+     * equality checks, ILIKE, SIMILAR TO, IN, etc.
+     */
+    static int pgStringCompare(String a, String b) {
+        return a.compareTo(b);
+    }
+
+    /**
+     * Locale-aware string comparison that emulates glibc strcoll() behavior
+     * for en_US.UTF-8 where:
      * - Letters are compared case-insensitively at primary level
      * - Digits sort after letters at primary level
      * - Punctuation/symbols sort after digits
-     * - Case is used as a secondary tiebreaker (uppercase before lowercase)
+     * - Case is used as a secondary tiebreaker (lowercase before uppercase)
      * - Original codepoint is the final tiebreaker
+     *
+     * This should only be used when an explicit COLLATE clause is present.
      */
-    static int pgStringCompare(String a, String b) {
+    static int pgLocaleAwareCompare(String a, String b) {
         int len = Math.min(a.length(), b.length());
+        int caseTiebreaker = 0; // first case difference found (secondary level)
         for (int i = 0; i < len; i++) {
             char ca = a.charAt(i);
             char cb = b.charAt(i);
             if (ca == cb) continue;
-            int wa = pgCharWeight(ca);
-            int wb = pgCharWeight(cb);
+            int wa = pgCharPrimaryWeight(ca);
+            int wb = pgCharPrimaryWeight(cb);
             if (wa != wb) return Integer.compare(wa, wb);
+            // Same primary weight but different characters: record case tiebreaker
+            if (caseTiebreaker == 0) {
+                // In en_US.UTF-8, lowercase sorts before uppercase
+                caseTiebreaker = pgCharCaseWeight(ca) - pgCharCaseWeight(cb);
+            }
         }
-        return Integer.compare(a.length(), b.length());
+        int lenCmp = Integer.compare(a.length(), b.length());
+        if (lenCmp != 0) return lenCmp;
+        return caseTiebreaker;
     }
 
     /**
-     * Compute a collation weight for a character that emulates PostgreSQL's
-     * default locale collation ordering: letters (case-insensitive) < digits < symbols/punctuation.
+     * Compute the primary collation weight for a character that emulates PostgreSQL's
+     * en_US.UTF-8 locale ordering: letters (case-insensitive) < digits < symbols/punctuation.
+     * Letters are folded to lowercase so that 'a' and 'A' have the same primary weight.
      */
-    private static int pgCharWeight(char c) {
-        if (Character.isLetterOrDigit(c)) {
-            // Alphanumeric characters: use standard codepoint ordering (C locale).
-            // This preserves uppercase-before-lowercase and digit-before-letter ordering.
-            return c;
+    private static int pgCharPrimaryWeight(char c) {
+        if (Character.isLetter(c)) {
+            // Fold to lowercase for case-insensitive primary comparison.
+            return Character.toLowerCase(c);
+        }
+        if (Character.isDigit(c)) {
+            // Digits sort after all letters: offset past the letter range.
+            return 0x8000 + c;
         }
         // Non-alphanumeric (punctuation, symbols, whitespace): sort after all alphanumeric characters.
-        // This matches PostgreSQL's en_US.UTF-8 collation where symbols sort after letters/digits.
         return 0x10000 + c;
+    }
+
+    /**
+     * Secondary (case) weight: lowercase sorts before uppercase in en_US.UTF-8.
+     */
+    private static int pgCharCaseWeight(char c) {
+        if (Character.isLowerCase(c)) return 0;
+        if (Character.isUpperCase(c)) return 1;
+        return 2; // other (digits, symbols)
+    }
+
+    /**
+     * Returns true if the given collation name represents a binary/C collation.
+     */
+    static boolean isBinaryCollation(String collation) {
+        if (collation == null) return false;
+        String lower = collation.toLowerCase().replace("\"", "");
+        return lower.equals("c") || lower.equals("posix");
+    }
+
+    /**
+     * Compare two strings using the specified collation.
+     * For "C"/"POSIX" collations, uses binary (codepoint) ordering.
+     * For locale-aware collations (en_US.utf8, default, etc.), uses pgStringCompare.
+     */
+    static int compareStringsWithCollation(String a, String b, String collation) {
+        if (isBinaryCollation(collation)) {
+            return a.compareTo(b);
+        }
+        return pgLocaleAwareCompare(a, b);
     }
 
     /**

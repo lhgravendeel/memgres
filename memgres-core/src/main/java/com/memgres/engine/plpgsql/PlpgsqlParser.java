@@ -457,13 +457,13 @@ public class PlpgsqlParser {
     private PlpgsqlStatement parseForeach(String label) {
         matchKw("FOREACH");
         String varName = readIdent();
+        int sliceDepth = 0;
         if (matchKw("SLICE")) {
-            // PG 18: SLICE 0 is valid (same as no SLICE), SLICE N>0 is rejected
             String sliceVal = advance().value();
             try {
-                int n = Integer.parseInt(sliceVal);
-                if (n > 0) {
-                    throw new MemgresException("syntax error at or near \"SLICE\"", "42601");
+                sliceDepth = Integer.parseInt(sliceVal);
+                if (sliceDepth < 0) {
+                    throw new MemgresException("FOREACH SLICE depth must not be negative", "42601");
                 }
             } catch (NumberFormatException e) {
                 throw new MemgresException("syntax error at or near \"SLICE\"", "42601");
@@ -477,7 +477,7 @@ public class PlpgsqlParser {
         matchKw("END");
         matchKw("LOOP");
         match(TokenType.SEMICOLON);
-        return new PlpgsqlStatement.ForeachStmt(label, varName, arrayExpr, body);
+        return new PlpgsqlStatement.ForeachStmt(label, varName, sliceDepth, arrayExpr, body);
     }
 
     private PlpgsqlStatement parseExit() {

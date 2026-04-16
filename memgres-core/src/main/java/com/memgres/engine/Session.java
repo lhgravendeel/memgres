@@ -120,6 +120,57 @@ public class Session {
     // Transaction timestamp: frozen at BEGIN for now()/current_timestamp stability
     private java.time.OffsetDateTime transactionTimestamp = null;
 
+    // Per-session sequence cache: seq name -> [nextCachedValue, cacheEnd]
+    private final Map<String, long[]> sequenceCache = new LinkedHashMap<>();
+
+    /** Get next value from a sequence, using session-level cache if CACHE > 1. */
+    public long nextvalCached(Sequence seq) {
+        if (seq.getCache() <= 1 || seq.isCycle()) {
+            return seq.nextVal();
+        }
+        String key = seq.getName().toLowerCase();
+        long[] cached = sequenceCache.get(key);
+        if (cached != null && cached[0] < cached[1]) {
+            // Return next value from cache block
+            long val = cached[0];
+            cached[0] += seq.getIncrementBy();
+            return val;
+        }
+        // Allocate new cache block: get base value from shared sequence
+        long base = seq.nextVal();
+        // Advance sequence by (cache-1) more to reserve the block
+        for (int i = 1; i < seq.getCache(); i++) {
+            seq.nextVal();
+        }
+        long end = base + seq.getIncrementBy() * seq.getCache();
+        sequenceCache.put(key, new long[]{base + seq.getIncrementBy(), end});
+        return base;
+    }
+
+    /** Clear session sequence cache (on disconnect). */
+    public void clearSequenceCache() { sequenceCache.clear(); }
+
+    // Transaction ID (assigned from Database.allocateTransactionId() at BEGIN)
+    private long transactionId = 0;
+    // Command counter within current transaction (incremented per statement)
+    private long commandId = 0;
+
+    /** Get the current transaction ID, allocating one if needed (for autocommit DML). */
+    public long getTransactionId() {
+        if (transactionId == 0) {
+            transactionId = database.allocateTransactionId();
+        }
+        return transactionId;
+    }
+    /** Get the current command ID within the transaction. */
+    public long getCommandId() { return commandId; }
+    /** Increment command counter (called before each statement execution). */
+    public void incrementCommandId() { commandId++; }
+    /** Reset virtual transaction ID after autocommit statement completes. */
+    public void resetAutocommitTxId() {
+        if (status == TransactionStatus.IDLE) { transactionId = 0; commandId = 0; }
+    }
+
     /** Stored prepared statement. inferredParamCount is the max $N index found in body when no explicit types are given. */
         public static final class PreparedStmt {
         public final String name;
@@ -265,6 +316,10 @@ public class Session {
 
         public void setPosition(int pos) { this.position = pos; }
     }
+
+    // SSI: tables read and written by this serializable transaction (for write-skew detection)
+    private final Set<String> ssiReadTables = ConcurrentHashMap.newKeySet();
+    private final Set<String> ssiWriteTables = ConcurrentHashMap.newKeySet();
 
     // MVCC: uncommitted inserts per table (schema.table -> set of row references)
     // ConcurrentHashMap + ConcurrentHashMap.newKeySet inner sets for thread-safe cross-session reads.
@@ -499,6 +554,8 @@ public class Session {
         }
         status = TransactionStatus.IN_TRANSACTION;
         transactionTimestamp = java.time.OffsetDateTime.now();
+        transactionId = database.allocateTransactionId();
+        commandId = 0;
         undoLog.clear();
         savepoints.clear();
     }
@@ -509,6 +566,19 @@ public class Session {
     }
 
     public void commit() {
+        // SSI write-skew detection: must happen before any commit side effects
+        try {
+            checkSsiConflicts();
+        } catch (MemgresException e) {
+            // SSI conflict detected, rollback
+            rollback();
+            throw e;
+        }
+        // Record committed SSI info for future transactions to check against
+        if (isSerializable() && !ssiWriteTables.isEmpty()) {
+            database.recordCommittedSsiTransaction(
+                new HashSet<>(ssiReadTables), new HashSet<>(ssiWriteTables));
+        }
         // Validate deferred constraints before committing
         try {
             // First, validate deferred PK/UNIQUE constraints (whole-table scan, deduplicated)
@@ -534,11 +604,14 @@ public class Session {
             rollback();
             throw e;
         }
+        // Clear SSI tracking
+        clearSsiState();
         // Swap MVCC maps to new empty instances (atomic from cross-session readers' perspective)
         uncommittedInserts = new ConcurrentHashMap<>();
         uncommittedUpdates = new ConcurrentHashMap<>();
         uncommittedDeletes = new ConcurrentHashMap<>();
         rrSnapshots.clear();
+        rrSnapshotTaken = false;
         // Clear transaction-scoped GUC overrides (SET LOCAL)
         gucSettings.clearTransactionOverrides();
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
@@ -583,14 +656,18 @@ public class Session {
         transactionTimestamp = null;
         explicitTransactionBlock = false;
         status = TransactionStatus.IDLE;
+        database.incrementXactCommit();
     }
 
     public void rollback() {
+        // Clear SSI tracking
+        clearSsiState();
         // Swap MVCC maps to new empty instances (atomic from cross-session readers' perspective)
         uncommittedInserts = new ConcurrentHashMap<>();
         uncommittedUpdates = new ConcurrentHashMap<>();
         uncommittedDeletes = new ConcurrentHashMap<>();
         rrSnapshots.clear();
+        rrSnapshotTaken = false;
         // Clear transaction-scoped GUC overrides (SET LOCAL)
         gucSettings.clearTransactionOverrides();
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
@@ -620,6 +697,80 @@ public class Session {
         transactionTimestamp = null;
         explicitTransactionBlock = false;
         status = TransactionStatus.IDLE;
+    }
+
+    /**
+     * Prepare the current transaction for two-phase commit.
+     * Detaches the uncommitted state and undo log from this session and returns them
+     * packaged in a PreparedTransaction, then resets the session to IDLE.
+     */
+    public Database.PreparedTransaction prepareTransaction(String gid) {
+        if (status != TransactionStatus.IN_TRANSACTION) {
+            throw new MemgresException("PREPARE TRANSACTION can only be used in transaction blocks", "25P01");
+        }
+        Map<String, Set<Object[]>> capturedInserts = uncommittedInserts;
+        Map<String, Map<Object[], Object[]>> capturedUpdates = uncommittedUpdates;
+        Map<String, List<Object[]>> capturedDeletes = uncommittedDeletes;
+        List<UndoEntry> capturedUndo = new ArrayList<>(undoLog);
+
+        String owner = connectingUser != null ? connectingUser : "memgres";
+        String dbName = databaseName != null ? databaseName : "memgres";
+
+        Database.PreparedTransaction pt = new Database.PreparedTransaction(
+                gid, transactionId, java.time.OffsetDateTime.now(),
+                owner, dbName,
+                capturedUndo, capturedInserts, capturedUpdates, capturedDeletes);
+
+        uncommittedInserts = new ConcurrentHashMap<>();
+        uncommittedUpdates = new ConcurrentHashMap<>();
+        uncommittedDeletes = new ConcurrentHashMap<>();
+        rrSnapshots.clear();
+        rrSnapshotTaken = false;
+        gucSettings.clearTransactionOverrides();
+        gucSettings.reset("transaction_read_only");
+        gucSettings.reset("transaction_isolation");
+        undoLog.clear();
+        savepoints.clear();
+        deferredFkChecks.clear();
+        allConstraintsDeferred = false;
+        allConstraintsImmediate = false;
+        deferredConstraintNames.clear();
+        immediateConstraintNames.clear();
+        deferredNotifications.clear();
+        savepointNotifCounts.clear();
+        savepointMvccSnapshots.clear();
+        onCommitDropTables.clear();
+        releaseXactAdvisoryLocks();
+        database.unlockAllRows(this);
+        destroyNonHoldableCursors();
+        transactionTimestamp = null;
+        explicitTransactionBlock = false;
+        status = TransactionStatus.IDLE;
+
+        return pt;
+    }
+
+    /**
+     * Commit a previously prepared transaction. Clears its MVCC uncommitted maps
+     * (making changes permanent) without applying undo.
+     */
+    public static void commitPreparedTransaction(Database.PreparedTransaction pt) {
+        pt.uncommittedInserts.clear();
+        pt.uncommittedUpdates.clear();
+        pt.uncommittedDeletes.clear();
+    }
+
+    /**
+     * Rollback a previously prepared transaction. Applies the undo log in reverse
+     * to revert all changes, then clears MVCC maps.
+     */
+    public static void rollbackPreparedTransaction(Database db, Database.PreparedTransaction pt) {
+        for (int i = pt.undoLog.size() - 1; i >= 0; i--) {
+            pt.undoLog.get(i).undo(db);
+        }
+        pt.uncommittedInserts.clear();
+        pt.uncommittedUpdates.clear();
+        pt.uncommittedDeletes.clear();
     }
 
     // MVCC map snapshots per savepoint — used to restore MVCC state on ROLLBACK TO SAVEPOINT
@@ -1060,6 +1211,7 @@ public class Session {
         if (status == TransactionStatus.IN_TRANSACTION) {
             uncommittedInserts.computeIfAbsent(schemaTable,
                     k -> Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()))).add(row);
+            if (isSerializable()) ssiWriteTables.add(schemaTable);
         }
     }
 
@@ -1070,6 +1222,7 @@ public class Session {
                     k -> Collections.synchronizedMap(new IdentityHashMap<>()));
             // Only record the FIRST (original) old value; don't overwrite with intermediate values
             tableUpdates.putIfAbsent(row, oldValues);
+            if (isSerializable()) ssiWriteTables.add(schemaTable);
         }
     }
 
@@ -1078,6 +1231,7 @@ public class Session {
         if (status == TransactionStatus.IN_TRANSACTION) {
             uncommittedDeletes.computeIfAbsent(schemaTable,
                     k -> Collections.synchronizedList(new ArrayList<>())).addAll(rows);
+            if (isSerializable()) ssiWriteTables.add(schemaTable);
         }
     }
 
@@ -1121,6 +1275,11 @@ public class Session {
         }
     }
 
+    // Flag: true once the first RR/SERIALIZABLE snapshot has been taken in this transaction.
+    // Once set, all subsequent table reads that don't already have a snapshot use current visible rows
+    // (which is correct because no committed changes from other transactions should be visible).
+    private boolean rrSnapshotTaken = false;
+
     /** Get or create a REPEATABLE READ snapshot for a table. Returns null if not in RR mode. */
     public List<Object[]> getOrCreateRRSnapshot(String schemaTable, List<Object[]> currentVisibleRows) {
         String isolation = getEffectiveIsolationLevel();
@@ -1130,14 +1289,47 @@ public class Session {
         if (status != TransactionStatus.IN_TRANSACTION) {
             return null; // Not in a transaction
         }
-        return rrSnapshots.computeIfAbsent(schemaTable, k -> {
-            // Deep copy the visible rows for the snapshot
-            List<Object[]> snapshot = new ArrayList<>(currentVisibleRows.size());
-            for (Object[] row : currentVisibleRows) {
-                snapshot.add(Arrays.copyOf(row, row.length));
+        // PG takes a transaction-wide snapshot at the first statement.
+        // On first snapshot, eagerly snapshot ALL user tables so subsequent reads
+        // see a consistent point-in-time across all tables.
+        if (!rrSnapshotTaken) {
+            rrSnapshotTaken = true;
+            snapshotAllTables();
+        }
+        // Use putIfAbsent with the MVCC-visible rows from the caller.
+        // snapshotAllTables() provides a fast pre-population, but its snapshots
+        // don't account for uncommitted changes from other sessions.  The very
+        // first read for each table comes through applyMvccVisibility which
+        // already filtered out uncommitted changes, so always prefer the
+        // caller-supplied rows over what snapshotAllTables stored.
+        List<Object[]> snapshot = new ArrayList<>(currentVisibleRows.size());
+        for (Object[] row : currentVisibleRows) {
+            snapshot.add(Arrays.copyOf(row, row.length));
+        }
+        rrSnapshots.put(schemaTable, snapshot);
+        return snapshot;
+    }
+
+    /** Whether this transaction has taken its initial snapshot (for RR/SERIALIZABLE). */
+    public boolean isRRSnapshotTaken() { return rrSnapshotTaken; }
+
+    /** Eagerly snapshot all user tables for transaction-wide consistency. */
+    private void snapshotAllTables() {
+        if (database == null) return;
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                String key = schemaName + "." + tableEntry.getKey();
+                if (!rrSnapshots.containsKey(key)) {
+                    List<Object[]> rows = tableEntry.getValue().getRows();
+                    List<Object[]> snapshot = new ArrayList<>(rows.size());
+                    for (Object[] row : rows) {
+                        snapshot.add(Arrays.copyOf(row, row.length));
+                    }
+                    rrSnapshots.put(key, snapshot);
+                }
             }
-            return snapshot;
-        });
+        }
     }
 
     /** Check if a REPEATABLE READ snapshot already exists for this table. */
@@ -1169,6 +1361,70 @@ public class Session {
         if ("on".equalsIgnoreCase(val)) return true;
         val = gucSettings.get("transaction_read_only");
         return "on".equalsIgnoreCase(val);
+    }
+
+    /** Check if the current transaction uses SERIALIZABLE isolation. */
+    public boolean isSerializable() {
+        return "serializable".equals(getEffectiveIsolationLevel());
+    }
+
+    /** Track that this serializable transaction read from a table. */
+    public void trackSsiRead(String schemaTable) {
+        if (status == TransactionStatus.IN_TRANSACTION && isSerializable()) {
+            ssiReadTables.add(schemaTable);
+        }
+    }
+
+    /** Get SSI read tables (for cross-session conflict detection). */
+    public Set<String> getSsiReadTables() { return ssiReadTables; }
+
+    /** Get SSI write tables (for cross-session conflict detection). */
+    public Set<String> getSsiWriteTables() { return ssiWriteTables; }
+
+    /**
+     * SSI write-skew detection at commit time.
+     * Checks for rw-conflict cycles with recently committed serializable transactions.
+     * The first transaction to commit always succeeds; subsequent conflicting ones fail.
+     * If a dangerous structure is found, throws serialization_failure (40001).
+     */
+    private void checkSsiConflicts() {
+        if (!isSerializable()) return;
+        if (ssiWriteTables.isEmpty()) return; // read-only txn, no conflict possible
+
+        // Check against recently committed serializable transactions for rw-conflict cycles
+        for (Database.CommittedSsiInfo info : database.getRecentlyCommittedSsiTransactions()) {
+            // Check for rw-conflict cycle:
+            // this read X, other wrote X (rw-dependency: this -> other)
+            // AND other read Y, this wrote Y (rw-dependency: other -> this)
+            // This forms a cycle, meaning write-skew anomaly
+            boolean thisReadOtherWrote = false;
+            for (String table : ssiReadTables) {
+                if (info.writeTables().contains(table)) {
+                    thisReadOtherWrote = true;
+                    break;
+                }
+            }
+            if (!thisReadOtherWrote) continue;
+
+            boolean otherReadThisWrote = false;
+            for (String table : info.readTables()) {
+                if (ssiWriteTables.contains(table)) {
+                    otherReadThisWrote = true;
+                    break;
+                }
+            }
+            if (otherReadThisWrote) {
+                throw new MemgresException(
+                    "could not serialize access due to read/write dependencies among transactions",
+                    "40001");
+            }
+        }
+    }
+
+    /** Clear SSI tracking state (called on commit/rollback). */
+    private void clearSsiState() {
+        ssiReadTables.clear();
+        ssiWriteTables.clear();
     }
 
     // ---- Undo log ----

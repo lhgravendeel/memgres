@@ -892,8 +892,14 @@ public class PlpgsqlExecutor {
         List<?> list = arrayObj instanceof List ? (List<?>) arrayObj
                 : arrayObj instanceof Object[] ? Arrays.asList((Object[]) arrayObj) : Cols.listOf();
 
+        int sliceDepth = stmt.sliceDepth();
+
+        // When sliceDepth > 0, iterate over sub-arrays at the given depth.
+        // For example, SLICE 1 on a 2D array [[1,2],[3,4],[5,6]] yields [1,2], [3,4], [5,6].
+        List<?> slices = sliceDepth > 0 ? sliceArray(list, sliceDepth) : list;
+
         scope.declare(stmt.varName(), null);
-        for (Object element : list) {
+        for (Object element : slices) {
             scope.set(stmt.varName(), element);
             try {
                 executeStatements(stmt.body(), scope);
@@ -905,6 +911,52 @@ public class PlpgsqlExecutor {
                 throw c;
             }
         }
+    }
+
+    /**
+     * Slices a nested list structure at the given depth.
+     * For depth 1, a 2D list [[1,2],[3,4]] returns [[1,2],[3,4]] (each top-level element is a slice).
+     * For depth 2, a 3D list [[[1,2],[3,4]],[[5,6],[7,8]]] returns [[[1,2],[3,4]],[[5,6],[7,8]]].
+     * Essentially, we iterate at (ndim - sliceDepth) levels deep and collect sub-arrays of sliceDepth dimensions.
+     */
+    @SuppressWarnings("unchecked")
+    private List<?> sliceArray(List<?> list, int sliceDepth) {
+        // Determine nesting depth of the array
+        int ndim = arrayDepth(list);
+        if (sliceDepth >= ndim) {
+            // SLICE depth equals or exceeds array dimensions: return the whole array as a single slice
+            return Cols.listOf(list);
+        }
+        // We need to descend (ndim - sliceDepth - 1) levels, then collect elements at that level.
+        // For SLICE 1 on a 2D array (ndim=2): descend 0 levels, collect top-level elements (each is a 1D sub-array).
+        int levelsToDescend = ndim - sliceDepth - 1;
+        List<Object> result = new ArrayList<>();
+        collectSlices(list, levelsToDescend, result);
+        return result;
+    }
+
+    private void collectSlices(List<?> list, int levelsToDescend, List<Object> result) {
+        if (levelsToDescend <= 0) {
+            // Each element at this level is a slice
+            for (Object element : list) {
+                result.add(element);
+            }
+        } else {
+            for (Object element : list) {
+                if (element instanceof List) {
+                    collectSlices((List<?>) element, levelsToDescend - 1, result);
+                } else {
+                    result.add(element);
+                }
+            }
+        }
+    }
+
+    private int arrayDepth(Object obj) {
+        if (obj instanceof List && !((List<?>) obj).isEmpty()) {
+            return 1 + arrayDepth(((List<?>) obj).get(0));
+        }
+        return 0;
     }
 
     private void executeExit(PlpgsqlStatement.ExitStmt stmt, Scope scope) {
@@ -1678,13 +1730,7 @@ public class PlpgsqlExecutor {
             // Parens are required so that subscript like (ARRAY[...])[1] is valid PG syntax
             // (bare ARRAY[...][1] is a syntax error in PG)
             sb.append("(ARRAY[");
-            for (int i = 0; i < list.size(); i++) {
-                if (i > 0) sb.append(",");
-                Object elem = list.get(i);
-                if (elem == null) sb.append("NULL");
-                else if (elem instanceof Number || elem instanceof Boolean) sb.append(elem);
-                else sb.append("'").append(elem.toString().replace("'", "''")).append("'");
-            }
+            appendListElements(sb, list);
             sb.append("])");
         } else if (val instanceof PgInterval) {
             sb.append("'").append(val.toString().replace("'", "''")).append("'::interval");
@@ -1698,6 +1744,21 @@ public class PlpgsqlExecutor {
             sb.append("'").append(val.toString().replace("'", "''")).append("'::time");
         } else {
             sb.append("'").append(val.toString().replace("'", "''")).append("'");
+        }
+    }
+
+    private void appendListElements(StringBuilder sb, java.util.List<?> list) {
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append(",");
+            Object elem = list.get(i);
+            if (elem == null) sb.append("NULL");
+            else if (elem instanceof java.util.List<?>) {
+                sb.append("ARRAY[");
+                appendListElements(sb, (java.util.List<?>) elem);
+                sb.append("]");
+            }
+            else if (elem instanceof Number || elem instanceof Boolean) sb.append(elem);
+            else sb.append("'").append(elem.toString().replace("'", "''")).append("'");
         }
     }
 

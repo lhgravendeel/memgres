@@ -446,18 +446,26 @@ public interface PlpgsqlStatement {
         public static final class ForeachStmt implements PlpgsqlStatement {
         public final String label;
         public final String varName;
+        public final int sliceDepth;
         public final String arrayExpr;
         public final List<PlpgsqlStatement> body;
 
-        public ForeachStmt(String label, String varName, String arrayExpr, List<PlpgsqlStatement> body) {
+        public ForeachStmt(String label, String varName, int sliceDepth, String arrayExpr, List<PlpgsqlStatement> body) {
             this.label = label;
             this.varName = varName;
+            this.sliceDepth = sliceDepth;
             this.arrayExpr = arrayExpr;
             this.body = body;
         }
 
+        /** Backward-compatible constructor (sliceDepth defaults to 0). */
+        public ForeachStmt(String label, String varName, String arrayExpr, List<PlpgsqlStatement> body) {
+            this(label, varName, 0, arrayExpr, body);
+        }
+
         public String label() { return label; }
         public String varName() { return varName; }
+        public int sliceDepth() { return sliceDepth; }
         public String arrayExpr() { return arrayExpr; }
         public List<PlpgsqlStatement> body() { return body; }
 
@@ -466,7 +474,8 @@ public interface PlpgsqlStatement {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             ForeachStmt that = (ForeachStmt) o;
-            return java.util.Objects.equals(label, that.label)
+            return sliceDepth == that.sliceDepth
+                && java.util.Objects.equals(label, that.label)
                 && java.util.Objects.equals(varName, that.varName)
                 && java.util.Objects.equals(arrayExpr, that.arrayExpr)
                 && java.util.Objects.equals(body, that.body);
@@ -474,12 +483,12 @@ public interface PlpgsqlStatement {
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(label, varName, arrayExpr, body);
+            return java.util.Objects.hash(label, varName, sliceDepth, arrayExpr, body);
         }
 
         @Override
         public String toString() {
-            return "ForeachStmt[label=" + label + ", " + "varName=" + varName + ", " + "arrayExpr=" + arrayExpr + ", " + "body=" + body + "]";
+            return "ForeachStmt[label=" + label + ", " + "varName=" + varName + ", " + "sliceDepth=" + sliceDepth + ", " + "arrayExpr=" + arrayExpr + ", " + "body=" + body + "]";
         }
     }
 

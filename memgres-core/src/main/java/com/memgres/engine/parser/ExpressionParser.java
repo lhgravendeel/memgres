@@ -706,6 +706,14 @@ public class ExpressionParser {
             advance(); advance(); // consume | /
             return new UnaryExpr(UnaryExpr.UnaryOp.SQRT, parseUnary());
         }
+        // !~ as unary prefix operator (user-defined): !~ expr
+        // EXCL_TILDE is normally a binary NOT-regex-match operator, but when used
+        // in prefix position it must be treated as a custom unary operator.
+        if (check(TokenType.EXCL_TILDE)) {
+            advance();
+            Expression right = parseUnary();
+            return new CustomOperatorExpr(null, "!~", null, right);
+        }
         // Custom multi-char prefix operator (user-defined): ~~> expr
         // Must check after ||/ and |/ to avoid intercepting built-in prefix operators
         if (check(TokenType.CUSTOM_OPERATOR)) {
@@ -822,7 +830,7 @@ public class ExpressionParser {
     }
 
     private static final java.util.Set<String> KNOWN_COLLATIONS = Cols.setOf(
-            "c", "posix", "default", "ucs_basic", "en_us", "en_us.utf-8", "en_us.utf8",
+            "c", "posix", "default", "ucs_basic",
             "pg_catalog.c", "pg_catalog.posix", "pg_catalog.default",
             "pg_catalog.\"c\"", "pg_catalog.\"posix\"", "pg_catalog.\"default\"",
             "\"c\"", "\"posix\"", "\"default\"", "\"ucs_basic\"",
@@ -830,11 +838,15 @@ public class ExpressionParser {
     );
 
     private void validateCollation(String collation) {
+        validateCollationStatic(collation, peek());
+    }
+
+    static void validateCollationStatic(String collation, Token errorToken) {
         String lower = collation.toLowerCase();
         String unquoted = lower.replace("\"", "");
         if (!KNOWN_COLLATIONS.contains(unquoted) && !KNOWN_COLLATIONS.contains(lower)) {
             throw new ParseException("collation \"" + collation + "\" for encoding \"UTF8\" does not exist",
-                    peek(), "42704");
+                    errorToken, "42704");
         }
     }
 

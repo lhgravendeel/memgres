@@ -158,7 +158,7 @@ class ConstraintValidator {
                     ex.setTable(table.getName());
                     String schema = findSchemaName(table);
                     if (schema != null) ex.setSchema(schema);
-                    ex.setDetail("Key already exists.");
+                    ex.setDetail(buildKeyDetail(columns, newVals));
                     throw ex;
                 }
             }
@@ -208,7 +208,7 @@ class ConstraintValidator {
                     ex.setTable(table.getName());
                     String schema = findSchemaName(table);
                     if (schema != null) ex.setSchema(schema);
-                    ex.setDetail("Key already exists.");
+                    ex.setDetail(buildKeyDetail(columns, newVals));
                     throw ex;
                 }
                 return;
@@ -245,10 +245,26 @@ class ConstraintValidator {
                 ex.setTable(table.getName());
                 String schema = findSchemaName(table);
                 if (schema != null) ex.setSchema(schema);
-                ex.setDetail("Key already exists.");
+                ex.setDetail(buildKeyDetail(columns, newVals));
                 throw ex;
             }
         }
+    }
+
+    /** Build PG-style DETAIL string: "Key (col1, col2)=(val1, val2) already exists." */
+    private String buildKeyDetail(List<String> columns, Object[] vals) {
+        StringBuilder sb = new StringBuilder("Key (");
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(columns.get(i));
+        }
+        sb.append(")=(");
+        for (int i = 0; i < vals.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(vals[i] == null ? "null" : vals[i]);
+        }
+        sb.append(") already exists.");
+        return sb.toString();
     }
 
     private void validateCheck(Table table, Object[] row, StoredConstraint sc) {

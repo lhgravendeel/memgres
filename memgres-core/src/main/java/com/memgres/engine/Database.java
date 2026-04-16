@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -41,6 +42,12 @@ public class Database {
     private final NotificationManager notificationManager = new NotificationManager();
     private final LargeObjectStore largeObjectStore = new LargeObjectStore();
     private DatabaseRegistry databaseRegistry;
+
+    // Transaction commit counter for pg_stat_database
+    private final AtomicLong xactCommitCount = new AtomicLong(0);
+
+    // Set of analyzed table names (schema.table) for pg_statistic
+    private final Set<String> analyzedTables = ConcurrentHashMap.newKeySet();
 
     // Row locks: maps table name to (row identity -> list of lock entries)
     private final Map<String, Map<Object[], List<LockEntry>>> rowLocks = new ConcurrentHashMap<>();
@@ -108,6 +115,56 @@ public class Database {
     // Object ownership: "objectType:objectName" -> owner role name (lowercase)
     private final Map<String, String> objectOwners = new ConcurrentHashMap<>();
 
+    // Two-phase commit: prepared transactions keyed by GID
+    private final Map<String, PreparedTransaction> preparedTransactions = new ConcurrentHashMap<>();
+
+    /** Represents a prepared (two-phase) transaction ready to be committed or rolled back by any session. */
+    public static class PreparedTransaction {
+        public final String gid;
+        public final long transactionId;
+        public final java.time.OffsetDateTime prepared;
+        public final String owner;
+        public final String database;
+        public final List<Session.UndoEntry> undoLog;
+        public final Map<String, Set<Object[]>> uncommittedInserts;
+        public final Map<String, Map<Object[], Object[]>> uncommittedUpdates;
+        public final Map<String, List<Object[]>> uncommittedDeletes;
+
+        public PreparedTransaction(String gid, long transactionId, java.time.OffsetDateTime prepared,
+                                   String owner, String database,
+                                   List<Session.UndoEntry> undoLog,
+                                   Map<String, Set<Object[]>> uncommittedInserts,
+                                   Map<String, Map<Object[], Object[]>> uncommittedUpdates,
+                                   Map<String, List<Object[]>> uncommittedDeletes) {
+            this.gid = gid;
+            this.transactionId = transactionId;
+            this.prepared = prepared;
+            this.owner = owner;
+            this.database = database;
+            this.undoLog = undoLog;
+            this.uncommittedInserts = uncommittedInserts;
+            this.uncommittedUpdates = uncommittedUpdates;
+            this.uncommittedDeletes = uncommittedDeletes;
+        }
+    }
+
+    /** Store a prepared transaction. Throws if the GID already exists. */
+    public void addPreparedTransaction(PreparedTransaction pt) {
+        if (preparedTransactions.putIfAbsent(pt.gid, pt) != null) {
+            throw new MemgresException("transaction identifier \"" + pt.gid + "\" is already in use", "42710");
+        }
+    }
+
+    /** Retrieve and remove a prepared transaction by GID. Returns null if not found. */
+    public PreparedTransaction removePreparedTransaction(String gid) {
+        return preparedTransactions.remove(gid);
+    }
+
+    /** Get all currently prepared transactions (for pg_prepared_xacts view). */
+    public Map<String, PreparedTransaction> getPreparedTransactions() {
+        return preparedTransactions;
+    }
+
     // Default ACL entries from ALTER DEFAULT PRIVILEGES
     private final List<DefaultAclEntry> defaultAcls = new ArrayList<>();
 
@@ -152,8 +209,78 @@ public class Database {
 
     public List<DefaultAclEntry> getDefaultAcls() { return defaultAcls; }
 
+    // Global transaction ID counter (monotonically increasing, like PG's xid)
+    private final AtomicLong nextTransactionId = new AtomicLong(1);
+
+    /** Allocate the next global transaction ID. */
+    public long allocateTransactionId() { return nextTransactionId.getAndIncrement(); }
+
+    // Per-table row metadata for system columns (xmin, xmax, cmin, cmax)
+    // Key: row identity (Object[]), Value: [xmin, xmax, cmin, cmax]
+    private final Map<String, Map<Object[], long[]>> tableRowMeta = new ConcurrentHashMap<>();
+
+    /** Get or create the row metadata map for a given table key (schema.table). */
+    public Map<Object[], long[]> getRowMeta(String tableKey) {
+        return tableRowMeta.computeIfAbsent(tableKey, k -> new IdentityHashMap<>());
+    }
+
+    // Per-table ctid counter for generating unique tuple IDs
+    private final Map<String, AtomicLong> tableCtidCounters = new ConcurrentHashMap<>();
+
+    /** Record xmin/cmin metadata for a newly inserted row. */
+    public void setRowInsertMeta(String tableKey, Object[] row, long xmin, long cmin) {
+        long ctid = tableCtidCounters.computeIfAbsent(tableKey, k -> new AtomicLong(0)).incrementAndGet();
+        getRowMeta(tableKey).put(row, new long[]{xmin, 0, cmin, 0, ctid});
+    }
+
+    /** Update xmin metadata for an updated row (new ctid). */
+    public void setRowUpdateMeta(String tableKey, Object[] row, long xmin, long cmin) {
+        long ctid = tableCtidCounters.computeIfAbsent(tableKey, k -> new AtomicLong(0)).incrementAndGet();
+        getRowMeta(tableKey).put(row, new long[]{xmin, 0, cmin, 0, ctid});
+    }
+
+    /** Remove row metadata (on delete). */
+    public void removeRowMeta(String tableKey, Object[] row) {
+        Map<Object[], long[]> meta = tableRowMeta.get(tableKey);
+        if (meta != null) meta.remove(row);
+    }
+
     // Active sessions registry (for MVCC visibility)
     private final Set<Session> activeSessions = ConcurrentHashMap.newKeySet();
+
+    // SSI: recently committed serializable transactions (for write-skew detection across commits)
+    private final List<CommittedSsiInfo> recentlyCommittedSsi =
+            java.util.Collections.synchronizedList(new ArrayList<>());
+
+    /** Info about a recently committed serializable transaction's read/write sets. */
+    public static class CommittedSsiInfo {
+        private final Set<String> readTables;
+        private final Set<String> writeTables;
+        private final long commitTime;
+
+        public CommittedSsiInfo(Set<String> readTables, Set<String> writeTables) {
+            this.readTables = readTables;
+            this.writeTables = writeTables;
+            this.commitTime = System.currentTimeMillis();
+        }
+
+        public Set<String> readTables() { return readTables; }
+        public Set<String> writeTables() { return writeTables; }
+        public long commitTime() { return commitTime; }
+    }
+
+    /** Record a committed serializable transaction's read/write sets. */
+    public void recordCommittedSsiTransaction(Set<String> readTables, Set<String> writeTables) {
+        recentlyCommittedSsi.add(new CommittedSsiInfo(readTables, writeTables));
+        // Prune old entries (keep last 60 seconds)
+        long cutoff = System.currentTimeMillis() - 60_000;
+        recentlyCommittedSsi.removeIf(info -> info.commitTime() < cutoff);
+    }
+
+    /** Get recently committed serializable transactions. */
+    public List<CommittedSsiInfo> getRecentlyCommittedSsiTransactions() {
+        return new ArrayList<>(recentlyCommittedSsi);
+    }
 
     // Connection tracking
     private final AtomicInteger activeConnections = new AtomicInteger(0);
@@ -227,6 +354,14 @@ public class Database {
     public Set<Session> getActiveSessions() {
         return activeSessions;
     }
+
+    // Transaction commit counter
+    public void incrementXactCommit() { xactCommitCount.incrementAndGet(); }
+    public long getXactCommitCount() { return xactCommitCount.get(); }
+
+    // Analyzed tables tracking
+    public void recordAnalyzedTable(String schemaTable) { analyzedTables.add(schemaTable); }
+    public Set<String> getAnalyzedTables() { return analyzedTables; }
 
     /** Get advisory locks map (for pg_locks). */
     public Map<Long, Set<Session>> getAdvisoryLocks() {

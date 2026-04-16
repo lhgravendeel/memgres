@@ -811,6 +811,9 @@ class FromResolver {
                                                   String schemaTableKey, Session currentSession) {
         Database db = executor.database;
 
+        // SSI: track that this serializable transaction read from this table
+        currentSession.trackSsiRead(schemaTableKey);
+
         Set<Object[]> otherUncommittedInserts = Collections.newSetFromMap(new IdentityHashMap<>());
         Map<Object[], Object[]> otherUncommittedUpdates = new IdentityHashMap<>();
         List<Object[]> otherUncommittedDeletes = new ArrayList<>();

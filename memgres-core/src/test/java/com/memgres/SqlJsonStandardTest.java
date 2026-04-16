@@ -1473,8 +1473,8 @@ class SqlJsonStandardTest {
         exec("INSERT INTO ij_sel VALUES ('{\"a\":1}'),('not json'),('[1,2]')");
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery("SELECT data IS JSON AS is_j FROM ij_sel ORDER BY data")) {
-            assertTrue(rs.next()); assertEquals("f", rs.getString(1)); // 'not json'
             assertTrue(rs.next()); assertEquals("t", rs.getString(1)); // '[1,2]'
+            assertTrue(rs.next()); assertEquals("f", rs.getString(1)); // 'not json'
             assertTrue(rs.next()); assertEquals("t", rs.getString(1)); // '{"a":1}'
             assertFalse(rs.next());
         }

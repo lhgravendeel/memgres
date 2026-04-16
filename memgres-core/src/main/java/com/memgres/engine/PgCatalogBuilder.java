@@ -223,6 +223,8 @@ public class PgCatalogBuilder {
                 return stubs.buildPgSeclabel(tableName);
             case "pg_transform":
                 return stubs.buildPgTransform();
+            case "pg_statistic":
+                return stubs.buildPgStatistic();
             case "pg_statistic_ext":
                 return stubs.buildPgStatisticExt();
             case "pg_publication_rel":
