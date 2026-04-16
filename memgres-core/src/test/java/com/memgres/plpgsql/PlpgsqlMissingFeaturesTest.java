@@ -1,4 +1,4 @@
-package com.memgres.compat16;
+package com.memgres.plpgsql;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
@@ -314,5 +314,36 @@ class PlpgsqlMissingFeaturesTest {
             assertEquals(1, rs.getInt(1),
                     "First insert should be committed, second rolled back");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // FOREACH SLICE array→text: slice::text should yield clean PG array literals
+    // -------------------------------------------------------------------------
+
+    @Test
+    void foreachSlice_arrayToText_shouldFormatCorrectly() throws SQLException {
+        exec("DROP FUNCTION IF EXISTS fs_format()");
+        exec("CREATE FUNCTION fs_format() RETURNS text LANGUAGE plpgsql AS $$\n"
+                + "DECLARE\n"
+                + "  arr integer[] := ARRAY[[1,2],[3,4],[5,6]];\n"
+                + "  slice integer[];\n"
+                + "  result text := '';\n"
+                + "BEGIN\n"
+                + "  FOREACH slice SLICE 1 IN ARRAY arr LOOP\n"
+                + "    result := result || slice::text || ';';\n"
+                + "  END LOOP;\n"
+                + "  RETURN result;\n"
+                + "END;\n"
+                + "$$");
+
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT fs_format()")) {
+            assertTrue(rs.next());
+            String result = rs.getString(1);
+            assertEquals("{1,2};{3,4};{5,6};", result,
+                    "FOREACH SLICE 1 should produce clean array literals; got: " + result);
+        }
+
+        exec("DROP FUNCTION fs_format()");
     }
 }

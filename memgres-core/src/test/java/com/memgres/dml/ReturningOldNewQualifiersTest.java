@@ -1,4 +1,4 @@
-package com.memgres.compat16;
+package com.memgres.dml;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * These tests assert PG 18 behavior and are expected to fail on Memgres.
  */
-class ReturningOldNewTest {
+class ReturningOldNewQualifiersTest {
 
     static Memgres memgres;
     static Connection conn;

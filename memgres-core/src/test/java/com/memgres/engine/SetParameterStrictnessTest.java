@@ -1,4 +1,4 @@
-package com.memgres.compat16;
+package com.memgres.engine;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
@@ -178,5 +178,33 @@ class SetParameterStrictnessTest {
             assertEquals("42704", e.getSQLState(),
                     "RESET unknown param should produce 42704, got: " + e.getSQLState());
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // RESET with dotted (custom namespaced) parameters
+    // -------------------------------------------------------------------------
+
+    @Test
+    void resetDottedParam_shouldSucceed() throws SQLException {
+        // Custom variables with a dot (myapp.custom_setting) are always allowed
+        try (Statement s = conn.createStatement()) {
+            s.execute("SET myapp.custom_setting = 'value'");
+            s.execute("RESET myapp.custom_setting");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Boolean GUC error wording should match PG ("requires a Boolean value")
+    // -------------------------------------------------------------------------
+
+    @Test
+    void booleanGuc_invalidValue_shouldSayRequiresBoolean() {
+        SQLException ex = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.execute("SET enable_seqscan = 'maybe'");
+            }
+        });
+        assertTrue(ex.getMessage().contains("requires a Boolean value"),
+                "Error should say 'requires a Boolean value'; got: " + ex.getMessage());
     }
 }

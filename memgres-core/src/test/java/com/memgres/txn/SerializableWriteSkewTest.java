@@ -1,4 +1,4 @@
-package com.memgres.compat16;
+package com.memgres.txn;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
