@@ -109,6 +109,29 @@ class ByteaFunctions {
                 // convert_to(text, encoding) -> bytea
                 return data.toString().getBytes(java.nio.charset.Charset.forName(encoding));
             }
+            case "bit_count": {
+                // PG: bit_count(bytea|bitstring) -> bigint, number of set bits (popcount)
+                Object data = executor.evalExpr(fn.args().get(0), ctx);
+                if (data == null) return null;
+                byte[] bytes;
+                if (data instanceof byte[]) bytes = (byte[]) data;
+                else if (data instanceof AstExecutor.PgBitString) {
+                    String bits = ((AstExecutor.PgBitString) data).bits();
+                    long count = 0;
+                    for (int i = 0; i < bits.length(); i++) if (bits.charAt(i) == '1') count++;
+                    return count;
+                } else {
+                    String s = data.toString();
+                    if (s.startsWith("\\x") || s.startsWith("\\X")) {
+                        bytes = ByteaOperations.parseHexFormat(s);
+                    } else {
+                        bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    }
+                }
+                long count = 0;
+                for (byte b : bytes) count += Integer.bitCount(b & 0xFF);
+                return count;
+            }
             case "get_bit": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
                 Object pos = executor.evalExpr(fn.args().get(1), ctx);
@@ -116,13 +139,14 @@ class ByteaFunctions {
                 int p = executor.toInt(pos);
                 if (data instanceof byte[]) {
                     byte[] bytes = (byte[]) data;
-                    // For bytea: bit numbering is MSB-first within each byte
+                    // PG bytea get_bit: bits numbered from the right within each byte,
+                    // so bit 0 is the LSB of the first byte.
                     int byteIdx = p / 8;
                     int bitIdx = p % 8;
                     if (byteIdx < 0 || byteIdx >= bytes.length) {
                         throw new MemgresException("index " + p + " out of valid range, 0.." + (bytes.length * 8 - 1), "22000");
                     }
-                    return (bytes[byteIdx] >> (7 - bitIdx)) & 1;
+                    return (bytes[byteIdx] >> bitIdx) & 1;
                 }
                 // For bit strings, direct character indexing
                 String s = data instanceof AstExecutor.PgBitString ? ((AstExecutor.PgBitString) data).bits() : data.toString();
@@ -137,7 +161,7 @@ class ByteaFunctions {
                 int nb = executor.toInt(newBit);
                 if (data instanceof byte[]) {
                     byte[] bytes = (byte[]) data;
-                    // For bytea: set bit using MSB-first numbering within each byte
+                    // PG bytea set_bit: bit 0 is LSB of first byte.
                     int byteIdx = p / 8;
                     int bitIdx = p % 8;
                     if (byteIdx < 0 || byteIdx >= bytes.length) {
@@ -145,9 +169,9 @@ class ByteaFunctions {
                     }
                     byte[] result = bytes.clone();
                     if (nb == 1) {
-                        result[byteIdx] = (byte)(result[byteIdx] | (1 << (7 - bitIdx)));
+                        result[byteIdx] = (byte)(result[byteIdx] | (1 << bitIdx));
                     } else {
-                        result[byteIdx] = (byte)(result[byteIdx] & ~(1 << (7 - bitIdx)));
+                        result[byteIdx] = (byte)(result[byteIdx] & ~(1 << bitIdx));
                     }
                     return result;
                 }

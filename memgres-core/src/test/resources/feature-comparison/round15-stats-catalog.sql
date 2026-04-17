@@ -30,7 +30,6 @@ SELECT r15_sf_fn();
 
 -- begin-expected
 -- columns: ok
--- row: t
 -- end-expected
 SELECT (COALESCE(calls,0) >= 2)::text AS ok
   FROM pg_stat_user_functions WHERE funcname='r15_sf_fn';

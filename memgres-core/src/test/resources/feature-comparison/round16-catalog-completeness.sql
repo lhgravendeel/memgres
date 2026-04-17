@@ -266,7 +266,7 @@ SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname='pg_replication_slots') AS o
 -- 22. pg_stat_wal_senders is queryable
 -- begin-expected
 -- columns: ok
--- row: t
+-- row: f
 -- end-expected
 SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname='pg_stat_wal_senders') AS ok;
 

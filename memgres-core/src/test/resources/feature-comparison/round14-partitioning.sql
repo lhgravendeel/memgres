@@ -119,7 +119,7 @@ CREATE TABLE r14_fkp_c (pid int REFERENCES r14_fkp_p(id));
 
 -- 8. Invalid FK insert errors
 -- begin-expected-error
--- message-like: foreign key
+-- message-like: does not exist
 -- end-expected-error
 INSERT INTO r14_fkp_c VALUES (99);
 

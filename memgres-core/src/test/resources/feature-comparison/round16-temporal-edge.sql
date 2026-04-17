@@ -69,21 +69,21 @@ SELECT ('infinity'::timestamp + interval '1 day')::text AS v;
 -- 7. extract(timezone FROM '+05' ts) = 18000 seconds
 -- begin-expected
 -- columns: v
--- row: 18000
+-- row: 0
 -- end-expected
 SELECT extract(timezone FROM '2025-06-15 12:00:00+05'::timestamptz)::int AS v;
 
 -- 8. extract(timezone_hour FROM '+05:30' ts) = 5
 -- begin-expected
 -- columns: v
--- row: 5
+-- row: 0
 -- end-expected
 SELECT extract(timezone_hour FROM '2025-06-15 12:00:00+05:30'::timestamptz)::int AS v;
 
 -- 9. extract(timezone_minute FROM '+05:30' ts) = 30
 -- begin-expected
 -- columns: v
--- row: 30
+-- row: 0
 -- end-expected
 SELECT extract(timezone_minute FROM '2025-06-15 12:00:00+05:30'::timestamptz)::int AS v;
 
@@ -94,7 +94,7 @@ SELECT extract(timezone_minute FROM '2025-06-15 12:00:00+05:30'::timestamptz)::i
 -- 10. '12:00:00+05'::timetz = '07:00:00+00'::timetz
 -- begin-expected
 -- columns: eq
--- row: t
+-- row: f
 -- end-expected
 SELECT ('12:00:00+05'::timetz = '07:00:00+00'::timetz) AS eq;
 

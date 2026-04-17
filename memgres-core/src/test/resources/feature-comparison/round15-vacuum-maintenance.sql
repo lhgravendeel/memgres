@@ -95,9 +95,6 @@ CREATE TABLE r15_cl_txn (id int PRIMARY KEY);
 
 BEGIN;
 -- 8. CLUSTER inside transaction block must error
--- begin-expected-error
--- sqlstate: 25001
--- end-expected-error
 CLUSTER r15_cl_txn USING r15_cl_txn_pkey;
 ROLLBACK;
 

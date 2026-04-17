@@ -167,7 +167,7 @@ SELECT count(*)::int AS n FROM information_schema.columns
 -- 18. daticulocale present
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::int AS n FROM information_schema.columns
  WHERE table_schema='pg_catalog' AND table_name='pg_database'

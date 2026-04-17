@@ -624,6 +624,13 @@ class ExprEvaluator {
         Object leftVal = cop.left() != null ? evalExpr(cop.left(), ctx) : null;
         Object rightVal = evalExpr(cop.right(), ctx);
 
+        // Built-in text operators that aren't registered as user PgOperator.
+        // ^@ is PG 11+ starts-with on text (treated as STRICT).
+        if ("^@".equals(cop.opSymbol()) && cop.left() != null) {
+            if (leftVal == null || rightVal == null) return null;
+            return leftVal.toString().startsWith(rightVal.toString());
+        }
+
         // Determine arg type names for operator lookup
         String leftType = cop.left() != null ? AstExecutor.pgTypeNameOf(leftVal) : "NONE";
         String rightType = AstExecutor.pgTypeNameOf(rightVal);

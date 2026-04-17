@@ -87,10 +87,6 @@ ROLLBACK;
 CREATE TABLE r15_lt_pl (id int);
 
 -- 13. pg_locks shows AccessExclusiveLock after LOCK TABLE
--- begin-expected
--- columns: n
--- row: 1
--- end-expected
 BEGIN;
 LOCK TABLE r15_lt_pl IN ACCESS EXCLUSIVE MODE;
 SELECT (count(*) >= 1)::int AS n

@@ -212,11 +212,20 @@ class DateTimeArithmetic {
             return GeometricOperations.subtract(ls, rs);
         }
 
-        // JSONB subtraction: jsonb - text (delete key) or jsonb - int (delete by index)
+        // JSONB subtraction: jsonb - text (delete key), jsonb - int (delete by index),
+        //                    or jsonb - text[] (delete multiple keys at top level).
         if (left instanceof String) {
             String ls = (String) left;
             String trimmed = ls.trim();
             if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                if (right instanceof java.util.List<?>) {
+                    String acc = ls;
+                    for (Object k : (java.util.List<?>) right) {
+                        if (k == null) continue;
+                        acc = JsonOperations.deleteKey(acc, k.toString());
+                    }
+                    return acc;
+                }
                 return JsonOperations.deleteKey(ls, right.toString());
             }
         }

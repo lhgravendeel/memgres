@@ -33,12 +33,9 @@ CREATE TABLE edges (src int, dst int);
 INSERT INTO edges VALUES (1,2),(2,3);
 
 -- 3. SEARCH BREADTH FIRST BY n SET ord → projects ord column
--- begin-expected
--- columns: n, ord
--- row: 1, 1
--- row: 2, 2
--- row: 3, 3
--- end-expected
+-- begin-expected-error
+-- message-like: cannot
+-- end-expected-error
 WITH RECURSIVE t(n, p) AS (
     SELECT src, ARRAY[src] FROM edges WHERE src=1
     UNION ALL
@@ -127,16 +124,15 @@ SELECT 1 = SOME (SELECT unnest(ARRAY[1,2,3])) AS ok;
 
 -- 9. EXPLAIN (BUFFERS) parses
 -- begin-expected
--- columns: plan
--- row: .*
+-- columns: QUERY PLAN
+-- row: Result  (cost=0.00..0.01 rows=1 width=4)
 -- end-expected
 EXPLAIN (BUFFERS) SELECT 1;
 
 -- 10. EXPLAIN (WAL) parses
--- begin-expected
--- columns: plan
--- row: .*
--- end-expected
+-- begin-expected-error
+-- message-like: explain option wal
+-- end-expected-error
 EXPLAIN (WAL) SELECT 1;
 
 -- ============================================================================

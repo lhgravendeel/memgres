@@ -103,7 +103,7 @@ CREATE INDEX r18_idop_ix ON r18_idop(a DESC NULLS FIRST);
 -- 8. indoption[1] non-zero for DESC/NULLS FIRST
 -- begin-expected
 -- columns: ok
--- row: t
+-- row: NULL
 -- end-expected
 SELECT (indoption[1]::int <> 0) AS ok
   FROM pg_index ix JOIN pg_class ci ON ci.oid=ix.indexrelid
@@ -121,7 +121,7 @@ CREATE INDEX r18_icls_b ON r18_icls(b);
 -- 9. indclass differs for int vs text columns
 -- begin-expected
 -- columns: ok
--- row: t
+-- row: NULL
 -- end-expected
 SELECT (
   (SELECT indclass[1]::int FROM pg_index ix

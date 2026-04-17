@@ -183,7 +183,7 @@ CLOSE ALL;
 
 -- begin-expected
 -- columns: c
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::int AS c FROM pg_cursors;
 

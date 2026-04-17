@@ -1311,6 +1311,7 @@ class CatalogMetadataFunctions {
             case "has_schema_privilege":
             case "has_table_privilege":
             case "has_database_privilege":
+            case "has_parameter_privilege":
             case "pg_has_role":
             case "acldefault":
             case "pg_table_is_visible":
@@ -1330,6 +1331,7 @@ class CatalogMetadataFunctions {
             case "currval":
             case "setval":
             case "lastval":
+            case "pg_sequence_last_value":
             case "txid_current":
             case "pg_current_xact_id":
             case "to_regclass":

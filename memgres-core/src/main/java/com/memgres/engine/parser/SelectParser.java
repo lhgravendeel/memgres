@@ -626,6 +626,13 @@ class SelectParser {
             }
 
             parser.expectKeyword("AS");
+            // Optional MATERIALIZED / NOT MATERIALIZED inlining hint (PG 12+).
+            // Memgres doesn't exploit the hint for planning, but must accept it.
+            if (parser.matchKeyword("NOT")) {
+                parser.expectKeyword("MATERIALIZED");
+            } else {
+                parser.matchKeyword("MATERIALIZED");
+            }
             parser.expect(TokenType.LEFT_PAREN);
 
             // Parse the CTE body: can be SELECT, set operation, or writable (INSERT/UPDATE/DELETE with RETURNING)

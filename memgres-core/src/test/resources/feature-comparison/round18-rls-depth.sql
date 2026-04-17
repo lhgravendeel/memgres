@@ -80,7 +80,7 @@ SELECT udt_name FROM information_schema.columns
 -- 5. pg_read_all_data OID in reserved range 4200-4402
 -- begin-expected
 -- columns: ok
--- row: t
+-- row: f
 -- end-expected
 SELECT (oid::int BETWEEN 4200 AND 4402) AS ok
   FROM pg_roles WHERE rolname='pg_read_all_data';

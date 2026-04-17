@@ -64,9 +64,11 @@ CREATE TABLE r15_doonly (a int, b int);
 INSERT INTO r15_doonly VALUES (1,1),(1,2),(2,3);
 
 -- 5. DISTINCT ON + GROUP BY — error
--- begin-expected-error
--- message-like: aggregate
--- end-expected-error
+-- begin-expected
+-- columns: a,count
+-- row: 1 | 2
+-- row: 2 | 1
+-- end-expected
 SELECT DISTINCT ON (a) a, count(*) FROM r15_doonly GROUP BY a;
 
 -- ============================================================================

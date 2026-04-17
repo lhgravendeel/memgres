@@ -136,7 +136,7 @@ CREATE CAST (text AS r14_dom_text) WITHOUT FUNCTION AS IMPLICIT;
 -- 14. Binary-coercible cast
 -- begin-expected
 -- columns: c
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::text AS c FROM pg_cast c
   JOIN pg_type t ON c.casttarget = t.oid

@@ -232,6 +232,31 @@ class MathFunctions {
                 while (temp != 0) { long t = temp; temp = gcd % temp; gcd = t; }
                 return Math.abs(a / gcd * b);
             }
+            case "scale": {
+                // PG: scale(numeric) -> integer: number of decimal digits in the fractional part.
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                BigDecimal bd = arg instanceof BigDecimal ? (BigDecimal) arg : new BigDecimal(arg.toString());
+                return Math.max(0, bd.scale());
+            }
+            case "min_scale": {
+                // PG: min_scale(numeric) -> smallest scale that preserves the value.
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                BigDecimal bd = arg instanceof BigDecimal ? (BigDecimal) arg : new BigDecimal(arg.toString());
+                BigDecimal stripped = bd.stripTrailingZeros();
+                return Math.max(0, stripped.scale());
+            }
+            case "trim_scale": {
+                // PG: trim_scale(numeric) -> numeric with trailing zeros stripped from fractional part.
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                BigDecimal bd = arg instanceof BigDecimal ? (BigDecimal) arg : new BigDecimal(arg.toString());
+                BigDecimal stripped = bd.stripTrailingZeros();
+                // Match PG: zero scale means no fractional part, not scientific notation like 1E+2
+                if (stripped.scale() < 0) stripped = stripped.setScale(0);
+                return stripped;
+            }
             case "width_bucket": {
                 double val = executor.toDouble(executor.evalExpr(fn.args().get(0), ctx));
                 double lo = executor.toDouble(executor.evalExpr(fn.args().get(1), ctx));

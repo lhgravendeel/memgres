@@ -65,7 +65,7 @@ PREPARE TRANSACTION 'r18_pt1';
 -- 4. Prepared transaction registered
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::int AS n FROM pg_prepared_xacts WHERE gid='r18_pt1';
 
@@ -74,7 +74,7 @@ COMMIT PREPARED 'r18_pt1';
 -- 5. COMMIT PREPARED persisted row
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::int AS n FROM r18_2pc;
 

@@ -51,9 +51,6 @@ CREATE TABLE r16_copyenc (s text);
 -- ============================================================================
 
 -- 4. Header "wrong_name,b" must error when target columns are (a,b)
--- begin-expected-error
--- message-like: header
--- end-expected-error
 CREATE TABLE r16_hdrmatch (a int, b int);
 -- COPY r16_hdrmatch (a, b) FROM STDIN WITH (FORMAT csv, HEADER MATCH);
 -- wrong_name,b

@@ -50,8 +50,8 @@ INSERT INTO r18_anyv VALUES (1,10),(1,20),(2,30);
 -- 5. any_value aggregate returns a member of the group
 -- begin-expected
 -- columns: g,ok
--- row: 1,t
--- row: 2,t
+-- row: 1 | t
+-- row: 2 | t
 -- end-expected
 SELECT g,
        (any_value(v) IN (10,20,30)) AS ok
@@ -66,7 +66,7 @@ SELECT g,
 -- 6. has_largeobject_privilege registered
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 3
 -- end-expected
 SELECT count(*)::int AS n FROM pg_proc WHERE proname='has_largeobject_privilege';
 

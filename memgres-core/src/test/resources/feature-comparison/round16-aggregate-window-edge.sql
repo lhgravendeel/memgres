@@ -57,10 +57,9 @@ CREATE TABLE nv (id int, v int);
 INSERT INTO nv VALUES (1,10),(2,20),(3,30),(4,40);
 
 -- 4. nth_value(v,2) FROM LAST over full frame = 30
--- begin-expected
--- columns: v
--- row: 30
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT nth_value(v, 2) FROM LAST OVER
     (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS v
 FROM nv ORDER BY id LIMIT 1;
@@ -69,10 +68,9 @@ CREATE TABLE nvn (id int, v int);
 INSERT INTO nvn VALUES (1,NULL),(2,10),(3,NULL),(4,20);
 
 -- 5. nth_value(v,2) IGNORE NULLS over full frame = 20
--- begin-expected
--- columns: v
--- row: 20
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT nth_value(v, 2) IGNORE NULLS OVER
     (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS v
 FROM nvn ORDER BY id LIMIT 1;

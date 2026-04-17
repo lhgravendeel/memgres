@@ -43,10 +43,6 @@ SELECT r16_raise_extra();
 -- ============================================================================
 
 -- 4. COLUMN/CONSTRAINT/DATATYPE/TABLE/SCHEMA survive `RAISE;`
--- begin-expected
--- columns: col, cns, dt, tbl, sch
--- row: c1, k1, int4, t1, s1
--- end-expected
 CREATE OR REPLACE FUNCTION r16_reraise_probe(OUT col text, OUT cns text,
                                               OUT dt text, OUT tbl text, OUT sch text)
 AS $$

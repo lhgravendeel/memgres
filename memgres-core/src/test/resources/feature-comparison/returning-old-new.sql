@@ -635,8 +635,8 @@ INSERT INTO ron_partitioned VALUES (50, 'mid', 50) RETURNING NEW.*;
 
 -- UPDATE across partition boundary concept: update within same partition
 -- begin-expected
--- columns: old_val, new_val
--- row: low, LOW-UPDATED
+-- columns: old_val,new_val
+-- row: low | LOW-UPDATED
 -- end-expected
 UPDATE ron_partitioned SET val = 'LOW-UPDATED' WHERE id = 1
 RETURNING OLD.val AS old_val, NEW.val AS new_val;

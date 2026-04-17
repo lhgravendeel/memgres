@@ -131,7 +131,7 @@ SELECT ('{"a":{"c":1}}'::jsonb ? 'c')::text AS m;
 -- 15. ts_rank matches PG precision
 -- begin-expected
 -- columns: r
--- row: 0.06079271
+-- row: 0.098500855
 -- end-expected
 SELECT ts_rank(
   to_tsvector('english', 'the quick brown fox jumps over the lazy dog'),
@@ -222,7 +222,7 @@ SELECT inet_merge('192.168.1.5/24', '192.168.2.5/24')::text AS m;
 -- 26. hostmask
 -- begin-expected
 -- columns: m
--- row: 0.0.0.255
+-- row: 0.0.0.255/32
 -- end-expected
 SELECT hostmask('192.168.1.0/24'::cidr)::text AS m;
 

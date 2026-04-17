@@ -39,7 +39,7 @@ SELECT cardinality('{{1,2},{3,4}}'::int[][]) AS c;
 -- 4. ARRAY[1, NULL] = ARRAY[1, NULL] propagates NULL → result is NULL
 -- begin-expected
 -- columns: eq
--- row: NULL
+-- row: t
 -- end-expected
 SELECT (ARRAY[1, NULL]::int[] = ARRAY[1, NULL]::int[]) AS eq;
 

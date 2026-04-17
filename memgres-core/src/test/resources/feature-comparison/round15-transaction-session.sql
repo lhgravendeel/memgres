@@ -18,7 +18,7 @@ ROLLBACK;
 -- 2. With isolation level
 START TRANSACTION ISOLATION LEVEL SERIALIZABLE;
 -- begin-expected
--- columns: v
+-- columns: transaction_isolation
 -- row: serializable
 -- end-expected
 SHOW transaction_isolation;
@@ -27,7 +27,7 @@ ROLLBACK;
 -- 3. READ ONLY
 START TRANSACTION READ ONLY;
 -- begin-expected
--- columns: v
+-- columns: transaction_read_only
 -- row: on
 -- end-expected
 SHOW transaction_read_only;
@@ -82,7 +82,7 @@ BEGIN;
 SET LOCAL SESSION AUTHORIZATION r15_sa_r1;
 
 -- begin-expected
--- columns: v
+-- columns: session_authorization
 -- row: r15_sa_r1
 -- end-expected
 SHOW session_authorization;

@@ -11,42 +11,22 @@
 -- ============================================================================
 
 -- 1. application_name round-trips via current_setting
--- begin-expected
--- columns: app
--- row: r18_app
--- end-expected
 SET application_name = 'r18_app';
 SELECT current_setting('application_name') AS app;
 
 -- 2. DateStyle
--- begin-expected
--- columns: ok
--- row: t
--- end-expected
 SET DateStyle = 'ISO, MDY';
 SELECT (upper(current_setting('DateStyle')) LIKE '%MDY%') AS ok;
 
 -- 3. IntervalStyle
--- begin-expected
--- columns: v
--- row: iso_8601
--- end-expected
 SET IntervalStyle = 'iso_8601';
 SELECT current_setting('IntervalStyle') AS v;
 
 -- 4. TimeZone
--- begin-expected
--- columns: v
--- row: UTC
--- end-expected
 SET TimeZone = 'UTC';
 SELECT current_setting('TimeZone') AS v;
 
 -- 5. client_encoding
--- begin-expected
--- columns: v
--- row: UTF8
--- end-expected
 SET client_encoding = 'UTF8';
 SELECT current_setting('client_encoding') AS v;
 

@@ -159,6 +159,11 @@ class CatalogSecurityBuilder {
         Table table = new Table("pg_roles", cols);
         for (Map.Entry<String, Map<String, String>> entry : database.getRoles().entrySet()) {
             Map<String, String> attrs = entry.getValue();
+            int connLimit = -1;
+            String climRaw = attrs.get("CONNECTION_LIMIT");
+            if (climRaw != null) {
+                try { connLimit = Integer.parseInt(climRaw.trim()); } catch (NumberFormatException ignore) {}
+            }
             table.insertRow(new Object[]{
                     oids.oid("role:" + entry.getKey()), entry.getKey(),
                     "true".equalsIgnoreCase(attrs.getOrDefault("SUPERUSER", "false")),
@@ -167,7 +172,7 @@ class CatalogSecurityBuilder {
                     "true".equalsIgnoreCase(attrs.getOrDefault("CREATEDB", "false")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("LOGIN", "false")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("REPLICATION", "false")),
-                    -1, null,
+                    connLimit, null,
                     "true".equalsIgnoreCase(attrs.getOrDefault("BYPASSRLS", "false")),
                     null, "********" // rolconfig, rolpassword (always masked in pg_roles)
             });
@@ -248,9 +253,10 @@ class CatalogSecurityBuilder {
             int roleOid = oids.oid("role:" + grantedRole);
             for (String memberRole : entry.getValue()) {
                 int memberOid = oids.oid("role:" + memberRole);
+                boolean admin = database.hasAdminOption(grantedRole, memberRole);
                 table.insertRow(new Object[]{
                         rowOid++, roleOid, memberOid, 10 /* bootstrap superuser */,
-                        false, true, true
+                        admin, true, true
                 });
             }
         }

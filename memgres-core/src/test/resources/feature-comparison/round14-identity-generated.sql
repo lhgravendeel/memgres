@@ -15,7 +15,7 @@ CREATE TABLE r14_os (id int GENERATED ALWAYS AS IDENTITY, v text);
 
 -- 1. Without OVERRIDING, insert into ALWAYS errors
 -- begin-expected-error
--- message-like: GENERATED ALWAYS
+-- message-like: cannot
 -- end-expected-error
 INSERT INTO r14_os (id, v) VALUES (100, 'a');
 

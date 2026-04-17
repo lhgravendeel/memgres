@@ -14,8 +14,8 @@ SET search_path = r14_json, public;
 -- 1. Scalar columns
 -- begin-expected
 -- columns: a,b
--- row: 1,x
--- row: 2,y
+-- row: 1 | x
+-- row: 2 | y
 -- end-expected
 SELECT a, b FROM JSON_TABLE(
   '[{"a":1,"b":"x"},{"a":2,"b":"y"}]'::jsonb, '$[*]'
@@ -24,8 +24,8 @@ SELECT a, b FROM JSON_TABLE(
 -- 2. NESTED PATH
 -- begin-expected
 -- columns: a,tag
--- row: 1,x
--- row: 1,y
+-- row: 1 | x
+-- row: 1 | y
 -- end-expected
 SELECT a, tag FROM JSON_TABLE(
   '{"rows":[{"a":1,"tags":["x","y"]}]}'::jsonb, '$.rows[*]'
@@ -35,9 +35,9 @@ SELECT a, tag FROM JSON_TABLE(
 -- 3. FOR ORDINALITY
 -- begin-expected
 -- columns: n,v
--- row: 1,10
--- row: 2,20
--- row: 3,30
+-- row: 1 | 10
+-- row: 2 | 20
+-- row: 3 | 30
 -- end-expected
 SELECT n, v FROM JSON_TABLE('[10,20,30]'::jsonb, '$[*]'
   COLUMNS (n FOR ORDINALITY, v int PATH '$')) ORDER BY n;
@@ -187,7 +187,7 @@ SELECT ('{"a":1}'::jsonb @@ '$.a == 1')::text AS v;
 -- 20. JSON_ARRAYAGG
 -- begin-expected
 -- columns: v
--- row: [1,2,3]
+-- row: [1, 2, 3]
 -- end-expected
 SELECT JSON_ARRAYAGG(x) AS v FROM (VALUES (1),(2),(3)) t(x);
 

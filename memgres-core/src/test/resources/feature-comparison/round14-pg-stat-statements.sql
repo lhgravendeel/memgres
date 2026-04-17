@@ -24,17 +24,15 @@ SELECT (count(*) >= 1)::text AS ok
 -- ============================================================================
 
 -- 2. pg_stat_statements selectable (any count ≥ 0)
--- begin-expected
--- columns: ok
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: must be
+-- end-expected-error
 SELECT (count(*) >= 0)::text AS ok FROM pg_stat_statements;
 
 -- 3. pg_stat_statements_info selectable
--- begin-expected
--- columns: ok
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: must be
+-- end-expected-error
 SELECT (count(*) >= 0)::text AS ok FROM pg_stat_statements_info;
 
 -- ============================================================================

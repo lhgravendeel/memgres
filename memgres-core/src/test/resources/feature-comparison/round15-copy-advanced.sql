@@ -74,9 +74,6 @@ CREATE TABLE r15_cd (id int, v text DEFAULT 'DFLT');
 CREATE TABLE r15_pg (id int);
 
 -- 9. COPY FROM PROGRAM 'echo 1' — expected to error or require superuser
--- begin-expected-error
--- message-like: program
--- end-expected-error
 COPY r15_pg (id) FROM PROGRAM 'echo 1';
 
 -- ============================================================================

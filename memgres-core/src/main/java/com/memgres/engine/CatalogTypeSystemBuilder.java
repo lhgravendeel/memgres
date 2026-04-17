@@ -38,9 +38,25 @@ class CatalogTypeSystemBuilder {
         );
         Table table = new Table("pg_collation", cols);
         int pgCatalogNs = oids.oid("ns:pg_catalog");
+        // Built-in libc collations always present in PG
         table.insertRow(new Object[]{ oids.oid("collation:default"), "default", pgCatalogNs, 10, "d", true, -1, null, null, null, null, 1 });
         table.insertRow(new Object[]{ oids.oid("collation:C"), "C", pgCatalogNs, 10, "c", true, -1, null, "C", "C", null, 1 });
         table.insertRow(new Object[]{ oids.oid("collation:POSIX"), "POSIX", pgCatalogNs, 10, "c", true, -1, null, "POSIX", "POSIX", null, 1 });
+        // Default-shipped libc locale names. Memgres maps all of these to
+        // Java's locale-aware comparison so COLLATE "en_US.utf8" never errors
+        // out with 42704, even on minimal systems where the libc locale is
+        // not installed. collversion is reported as a Java version tag to
+        // survive information_schema.collations existence checks.
+        String javaColl = "java-" + System.getProperty("java.version", "17");
+        table.insertRow(new Object[]{ oids.oid("collation:C.UTF-8"), "C.UTF-8", pgCatalogNs, 10, "c", true, 6, null, "C.UTF-8", "C.UTF-8", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:C.utf8"), "C.utf8", pgCatalogNs, 10, "c", true, 6, null, "C.UTF-8", "C.UTF-8", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en_US"), "en_US", pgCatalogNs, 10, "c", true, 6, null, "en_US", "en_US", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en_US.UTF-8"), "en_US.UTF-8", pgCatalogNs, 10, "c", true, 6, null, "en_US.UTF-8", "en_US.UTF-8", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en_US.utf8"), "en_US.utf8", pgCatalogNs, 10, "c", true, 6, null, "en_US.UTF-8", "en_US.UTF-8", javaColl, 1 });
+        // ICU-provider collations (PG 10+ default on many distros)
+        table.insertRow(new Object[]{ oids.oid("collation:und-x-icu"), "und-x-icu", pgCatalogNs, 10, "i", true, -1, "und", null, null, javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en-US-x-icu"), "en-US-x-icu", pgCatalogNs, 10, "i", true, -1, "en-US", null, null, javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en-x-icu"), "en-x-icu", pgCatalogNs, 10, "i", true, -1, "en", null, null, javaColl, 1 });
         return table;
     }
 

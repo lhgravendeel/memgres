@@ -396,6 +396,7 @@ class CatalogSystemFunctions {
             case "has_type_privilege":
             case "has_foreign_data_wrapper_privilege":
             case "has_language_privilege":
+            case "has_parameter_privilege":
                 return true;
             case "pg_has_role": {
                 String pgHasRoleUser;

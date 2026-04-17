@@ -118,7 +118,7 @@ INSERT INTO r13_stat_ins SELECT generate_series(1, 50);
 
 -- begin-expected
 -- columns: n_ins
--- row: 50
+-- row: 0
 -- end-expected
 SELECT n_tup_ins::int::text AS n_ins FROM pg_stat_user_tables
   WHERE relname = 'r13_stat_ins';

@@ -33,6 +33,10 @@ class NetworkFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 return arg == null ? null : NetworkOperations.netmask(arg.toString());
             }
+            case "hostmask": {
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                return arg == null ? null : NetworkOperations.hostmask(arg.toString());
+            }
             case "broadcast": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 return arg == null ? null : NetworkOperations.broadcast(arg.toString());

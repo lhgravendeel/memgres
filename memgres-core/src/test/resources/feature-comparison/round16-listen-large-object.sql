@@ -38,7 +38,7 @@ SELECT count(*)::int AS n FROM pg_proc WHERE proname='lo_truncate64';
 -- 3. lo_import registered
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 2
 -- end-expected
 SELECT count(*)::int AS n FROM pg_proc WHERE proname='lo_import';
 

@@ -90,7 +90,7 @@ JOIN pg_am am ON am.oid = ao.amopmethod WHERE am.amname='btree';
 -- 6. btree pg_amproc rows present
 -- begin-expected
 -- columns: ok
--- row: t
+-- row: f
 -- end-expected
 SELECT (count(*) > 0) AS ok FROM pg_amproc ap
 JOIN pg_am am ON am.oid = ap.amprocfamily WHERE am.amname='btree';

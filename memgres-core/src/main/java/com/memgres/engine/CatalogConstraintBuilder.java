@@ -37,6 +37,12 @@ class CatalogConstraintBuilder {
                 col("conindid", DataType.INTEGER),
                 col("confupdtype", DataType.CHAR),
                 col("confdeltype", DataType.CHAR),
+                col("confmatchtype", DataType.CHAR),
+                col("conpfeqop", DataType.INT4_ARRAY),
+                col("conppeqop", DataType.INT4_ARRAY),
+                col("conffeqop", DataType.INT4_ARRAY),
+                col("confdelsetcols", DataType.INT4_ARRAY),
+                col("coninhcount", DataType.INTEGER),
                 col("connoinherit", DataType.BOOLEAN),
                 col("conenforced", DataType.BOOLEAN),
                 col("conbin", DataType.TEXT),
@@ -113,6 +119,26 @@ class CatalogConstraintBuilder {
                     }
                     // In PG, connoinherit is true for PK/UNIQUE/CHECK, false for FK
                     boolean connoinherit = sc.getType() != StoredConstraint.Type.FOREIGN_KEY;
+                    // FK-only fields: confmatchtype defaults to 's' (SIMPLE) for standard PG foreign keys
+                    String confmatchtype = " ";
+                    List<Object> conpfeqop = null;
+                    List<Object> conppeqop = null;
+                    List<Object> conffeqop = null;
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
+                        confmatchtype = "s"; // SIMPLE (MATCH SIMPLE is PG default)
+                        // One OID per referenced column; we don't track the real operator OID,
+                        // but PG guarantees these arrays are non-empty for FKs.
+                        int n = conkey == null ? 0 : conkey.size();
+                        conpfeqop = new java.util.ArrayList<>();
+                        conppeqop = new java.util.ArrayList<>();
+                        conffeqop = new java.util.ArrayList<>();
+                        for (int i = 0; i < n; i++) {
+                            // 96 = OID for integer equality operator int4eq — acts as a sentinel non-zero OID
+                            conpfeqop.add(96);
+                            conppeqop.add(96);
+                            conffeqop.add(96);
+                        }
+                    }
                     table.insertRow(new Object[]{
                             oids.oid("con:" + t.getName() + "." + sc.getName()),
                             sc.getName(),
@@ -126,6 +152,7 @@ class CatalogConstraintBuilder {
                             true, conindid,
                             confupdtype,
                             confdeltype,
+                            confmatchtype, conpfeqop, conppeqop, conffeqop, null /*confdelsetcols*/, 0 /*coninhcount*/,
                             connoinherit,
                             !sc.isNotEnforced(), // conenforced: true = enforced (default), false = not enforced
                             null, null, false, 0, 0, 1 // conbin, conexclop, conperiod, conparentid, contypid, xmin
@@ -157,7 +184,9 @@ class CatalogConstraintBuilder {
                                 null,
                                 false, false, true,
                                 true, 0,
-                                " ", " ", false,
+                                " ", " ",
+                                " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                                false,
                                 true, // conenforced
                                 null, null, false, 0, 0, 1
                         });
@@ -183,7 +212,9 @@ class CatalogConstraintBuilder {
                         null, null, // conkey, confkey
                         false, false, true,
                         true, 0,
-                        " ", " ", true, // connoinherit = true for domain constraints
+                        " ", " ",
+                        " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                        true, // connoinherit = true for domain constraints
                         true, // conenforced
                         dom.getCheckExpression(), null, false, 0, domTypeOid, 1
                 });
@@ -199,7 +230,9 @@ class CatalogConstraintBuilder {
                         null, null,
                         false, false, true,
                         true, 0,
-                        " ", " ", true,
+                        " ", " ",
+                        " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                        true,
                         true, // conenforced
                         nc.rawCheckExpr(), null, false, 0, domTypeOid, 1
                 });
@@ -216,7 +249,9 @@ class CatalogConstraintBuilder {
                         null, null,
                         false, false, true,
                         true, 0,
-                        " ", " ", true,
+                        " ", " ",
+                        " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                        true,
                         true, // conenforced
                         null, null, false, 0, domTypeOid, 1
                 });

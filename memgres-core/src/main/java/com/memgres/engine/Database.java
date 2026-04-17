@@ -99,6 +99,9 @@ public class Database {
     // Role memberships: granted role (lowercase) -> set of member roles (lowercase)
     private final Map<String, Set<String>> roleMemberships = new ConcurrentHashMap<>();
 
+    // admin_option flag: "grantedRole|memberRole" (lowercase) -> true if GRANT ... WITH ADMIN OPTION was used
+    private final Map<String, Boolean> roleAdminOptions = new ConcurrentHashMap<>();
+
     // Granted privileges: role (lowercase) -> set of "privilege:objectType:objectName" entries
     private final Map<String, Set<String>> rolePrivileges = new ConcurrentHashMap<>();
 
@@ -1389,8 +1392,21 @@ public class Database {
     // ---- Role membership ----
 
     public void addRoleMembership(String grantedRole, String memberRole) {
+        addRoleMembership(grantedRole, memberRole, false);
+    }
+
+    public void addRoleMembership(String grantedRole, String memberRole, boolean withAdminOption) {
         roleMemberships.computeIfAbsent(grantedRole.toLowerCase(), k -> ConcurrentHashMap.newKeySet())
                 .add(memberRole.toLowerCase());
+        String key = grantedRole.toLowerCase() + "|" + memberRole.toLowerCase();
+        if (withAdminOption) {
+            roleAdminOptions.put(key, true);
+        }
+    }
+
+    public boolean hasAdminOption(String grantedRole, String memberRole) {
+        return Boolean.TRUE.equals(
+                roleAdminOptions.get(grantedRole.toLowerCase() + "|" + memberRole.toLowerCase()));
     }
 
     public void removeRoleMembership(String grantedRole, String memberRole) {

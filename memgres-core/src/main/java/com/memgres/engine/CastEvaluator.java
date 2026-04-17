@@ -209,6 +209,9 @@ class CastEvaluator {
                 if (val instanceof RegtypeValue) {
                     return ((RegtypeValue) val).name();
                 }
+                if (val instanceof RegnamespaceValue) {
+                    return ((RegnamespaceValue) val).name();
+                }
                 // For OffsetDateTime, apply session timezone conversion (PG behavior for timestamptz::text)
                 if (val instanceof java.time.OffsetDateTime && executor.session != null) {
                     java.time.OffsetDateTime odt = (java.time.OffsetDateTime) val;
@@ -236,7 +239,16 @@ class CastEvaluator {
                     return ((Boolean) val) ? "true" : "false";
                 }
                 if (val instanceof byte[]) {
-                    return new String((byte[]) val, java.nio.charset.StandardCharsets.UTF_8);
+                    // PG bytea::text uses the bytea_output format (default: hex, "\x..").
+                    byte[] b = (byte[]) val;
+                    StringBuilder bhex = new StringBuilder(2 + b.length * 2);
+                    bhex.append("\\x");
+                    for (byte bb : b) {
+                        String hex = Integer.toHexString(bb & 0xFF);
+                        if (hex.length() == 1) bhex.append('0');
+                        bhex.append(hex);
+                    }
+                    return bhex.toString();
                 }
                 return val.toString();
             }
@@ -427,6 +439,20 @@ class CastEvaluator {
             }
             case "macaddr":
             case "macaddr8":
+                return val.toString();
+            case "regconfig":
+            case "regdictionary":
+            case "regrole":
+            case "regoper":
+            case "regoperator":
+                // reg* OID types — we don't track real OIDs for these internal objects;
+                // preserve the input name as-is so the cast round-trips to the same text.
+                return val.toString();
+            case "pg_lsn":
+                // PG log sequence number — preserve the 'X/Y' hex textual form
+                return val.toString();
+            case "tid":
+                // tuple identifier; preserve as-is
                 return val.toString();
             case "jsonpath":
                 return normalizeJsonpath(val.toString());
@@ -696,11 +722,24 @@ class CastEvaluator {
                 return TypeCoercion.toInteger(val);
             }
             case "regnamespace": {
-                // ::regnamespace converts a schema name to its OID
-                if (val instanceof Number) return val;
+                // ::regnamespace wraps the schema name so it renders as the name
+                // but still equals() its OID for comparisons against pg_namespace.oid.
+                if (val instanceof RegnamespaceValue) return val;
+                if (val instanceof Number) {
+                    int nsOid = ((Number) val).intValue();
+                    // Reverse-lookup name from OID; fall back to numeric text.
+                    String nm = null;
+                    for (java.util.Map.Entry<String, Integer> e : executor.systemCatalog.getOidMap().entrySet()) {
+                        if (e.getValue() == nsOid && e.getKey().startsWith("ns:")) {
+                            nm = e.getKey().substring(3);
+                            break;
+                        }
+                    }
+                    return new RegnamespaceValue(nsOid, nm != null ? nm : String.valueOf(nsOid));
+                }
                 String nsName = val.toString().trim();
                 int nsOid = executor.systemCatalog.getOid("ns:" + nsName);
-                return nsOid;
+                return new RegnamespaceValue(nsOid, nsName);
             }
             default: {
                 // Check if it's a domain type

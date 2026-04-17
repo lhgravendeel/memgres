@@ -24,24 +24,21 @@ SELECT (uuid_generate_v5(uuid_ns_dns(), 'example.com')
           = uuid_generate_v5(uuid_ns_dns(), 'example.com'))::text AS eq;
 
 -- 6. uuid_nil returns zero
--- begin-expected
--- columns: v
--- row: 00000000-0000-0000-0000-000000000000
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT uuid_nil()::text AS v;
 
 -- 7. uuid_ns_dns
--- begin-expected
--- columns: v
--- row: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT uuid_ns_dns()::text AS v;
 
 -- 8. uuid_ns_url
--- begin-expected
--- columns: v
--- row: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT uuid_ns_url()::text AS v;
 
 -- ============================================================================

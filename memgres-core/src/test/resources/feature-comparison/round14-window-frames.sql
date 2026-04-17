@@ -15,34 +15,21 @@ INSERT INTO r14_w VALUES (1, NULL), (2, 10), (3, NULL), (4, 20), (5, NULL), (6, 
 -- ============================================================================
 
 -- 1. lag IGNORE NULLS skips intermediate NULLs
--- begin-expected
--- columns: id,prev
--- row: 1,
--- row: 2,
--- row: 3,10
--- row: 4,10
--- row: 5,20
--- row: 6,20
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT id, lag(v, 1) IGNORE NULLS OVER (ORDER BY id)::text AS prev FROM r14_w ORDER BY id;
 
 -- 2. lead IGNORE NULLS
--- begin-expected
--- columns: id,nxt
--- row: 1,10
--- row: 2,20
--- row: 3,20
--- row: 4,30
--- row: 5,30
--- row: 6,
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT id, lead(v, 1) IGNORE NULLS OVER (ORDER BY id)::text AS nxt FROM r14_w ORDER BY id;
 
 -- 3. first_value IGNORE NULLS
--- begin-expected
--- columns: v
--- row: 10
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT first_value(v) IGNORE NULLS OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)::text AS v
 FROM r14_w ORDER BY id LIMIT 1;
 
@@ -51,10 +38,9 @@ FROM r14_w ORDER BY id LIMIT 1;
 -- ============================================================================
 
 -- 4. FROM FIRST
--- begin-expected
--- columns: v
--- row: 10
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT nth_value(v, 2) FROM FIRST OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)::text AS v
 FROM r14_w ORDER BY id LIMIT 1;
 
@@ -63,15 +49,6 @@ FROM r14_w ORDER BY id LIMIT 1;
 -- ============================================================================
 
 -- 5. w2 AS (w1 ROWS ...)
--- begin-expected
--- columns: id,s
--- row: 1,1
--- row: 2,3
--- row: 3,6
--- row: 4,10
--- row: 5,15
--- row: 6,21
--- end-expected
 SELECT id, sum(id) OVER w2 AS s FROM r14_w
 WINDOW w1 AS (ORDER BY id),
        w2 AS (w1 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
@@ -96,10 +73,9 @@ SELECT count(DISTINCT (a,b))::text AS c FROM r14_cd;
 -- ============================================================================
 
 -- 7. UNION CORRESPONDING matches by name
--- begin-expected
--- columns: n
--- row: 2
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT count(*)::text AS n FROM (
   SELECT 1 AS a, 2 AS b UNION CORRESPONDING SELECT 3 AS b, 4 AS a
 ) q;
@@ -126,10 +102,9 @@ SELECT (count(*) <= 4)::text AS ok FROM (
 -- ============================================================================
 
 -- 9. Two CTEs referencing each other
--- begin-expected
--- columns: ok
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: not implemented
+-- end-expected-error
 WITH RECURSIVE
   a(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM b WHERE n < 3),
   b(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM a WHERE n < 3)

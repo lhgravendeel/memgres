@@ -13,7 +13,7 @@ CREATE TYPE r18_jpr AS (a int, b text);
 -- 1. json_populate_record yields typed row
 -- begin-expected
 -- columns: a,b
--- row: 7,x
+-- row: 7 | x
 -- end-expected
 SELECT a, b
   FROM json_populate_record(null::r18_jpr, '{"a":7,"b":"x"}'::json);
@@ -25,7 +25,7 @@ SELECT a, b
 -- 2. jsonb_to_record with (int,int) returns integers
 -- begin-expected
 -- columns: a,b
--- row: 1,2
+-- row: 1 | 2
 -- end-expected
 SELECT a, b
   FROM jsonb_to_record('{"a":1,"b":2}'::jsonb) AS x(a int, b int);
@@ -46,10 +46,9 @@ SELECT row_to_json(x) AS j FROM (SELECT 1 AS a, 'y' AS b) x;
 -- ============================================================================
 
 -- 4. 2-arg form parses and pretty-prints
--- begin-expected
--- columns: ok
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT (row_to_json(x, true) LIKE E'%\n%') AS ok FROM (SELECT 1 AS a) x;
 
 -- ============================================================================

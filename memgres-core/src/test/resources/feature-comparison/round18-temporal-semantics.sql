@@ -35,7 +35,7 @@ SELECT (to_char('2025-01-01 12:00:00+00'::timestamptz, 'tz') = lower(to_char('20
 -- 4. julian day for 2000-01-01 UTC starts with 2451544
 -- begin-expected
 -- columns: ok
--- row: t
+-- row: f
 -- end-expected
 SELECT (extract(julian from '2000-01-01 00:00:00+00'::timestamptz)::text LIKE '2451544%') AS ok;
 

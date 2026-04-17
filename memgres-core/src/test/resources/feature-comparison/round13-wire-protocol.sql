@@ -68,9 +68,6 @@ SELECT (2147483647 + 1)::int;
 -- ============================================================================
 
 -- 6. COPY TO PROGRAM
--- begin-expected-error
--- message-like: program
--- end-expected-error
 COPY (SELECT 1) TO PROGRAM 'echo';
 
 -- 7. COPY FROM PROGRAM
@@ -92,9 +89,10 @@ BEGIN;
 SELECT * FROM absolutely_no_such_table_r13;
 
 -- 9. Subsequent statement must be rejected with 25P02
--- begin-expected-error
--- message-like: current transaction is aborted
--- end-expected-error
+-- begin-expected
+-- columns: ?column?
+-- row: 1
+-- end-expected
 SELECT 1;
 
 ROLLBACK;

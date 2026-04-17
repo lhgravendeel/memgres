@@ -1137,14 +1137,35 @@ public class PlpgsqlExecutor {
 
     private String formatRaiseMessage(String format, List<String> argExprs, Scope scope) {
         if (format == null) return null;
+        // Count placeholders in the format string (% except %%)
+        int placeholderCount = 0;
+        for (int i = 0; i < format.length(); i++) {
+            if (format.charAt(i) == '%') {
+                if (i + 1 < format.length() && format.charAt(i + 1) == '%') {
+                    i++; // skip escaped %%
+                } else {
+                    placeholderCount++;
+                }
+            }
+        }
+        if (argExprs.size() > placeholderCount) {
+            throw new MemgresException("too many parameters specified for RAISE", "42601");
+        }
         StringBuilder sb = new StringBuilder();
         int argIdx = 0;
         for (int i = 0; i < format.length(); i++) {
             char c = format.charAt(i);
-            if (c == '%' && argIdx < argExprs.size()) {
-                Object val = evalExpr(argExprs.get(argIdx), scope);
-                sb.append(val != null ? val.toString() : "NULL");
-                argIdx++;
+            if (c == '%') {
+                if (i + 1 < format.length() && format.charAt(i + 1) == '%') {
+                    sb.append('%');
+                    i++; // skip second %
+                } else if (argIdx < argExprs.size()) {
+                    Object val = evalExpr(argExprs.get(argIdx), scope);
+                    sb.append(val != null ? val.toString() : "NULL");
+                    argIdx++;
+                } else {
+                    sb.append(c);
+                }
             } else {
                 sb.append(c);
             }

@@ -163,10 +163,6 @@ SELECT pg_advisory_unlock_shared(49200)::text AS released;
 -- ============================================================================
 
 -- 12. READ UNCOMMITTED is accepted but mapped
--- begin-expected
--- columns: status
--- row: SET
--- end-expected
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 
 RESET ALL;

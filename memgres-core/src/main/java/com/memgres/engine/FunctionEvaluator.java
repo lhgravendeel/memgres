@@ -431,6 +431,29 @@ class FunctionEvaluator {
                 }
                 return executor.lastSequenceValue;
             }
+            case "pg_sequence_last_value": {
+                // Returns the last value allocated by the sequence, or NULL if never used.
+                Object seqArg = executor.evalExpr(fn.args().get(0), ctx);
+                String seqName;
+                if (seqArg instanceof RegclassValue) {
+                    seqName = ((RegclassValue) seqArg).name();
+                } else if (seqArg instanceof Number) {
+                    int targetOid = ((Number) seqArg).intValue();
+                    seqName = null;
+                    for (Map.Entry<String, Sequence> entry : executor.database.getSequences().entrySet()) {
+                        int seqOid = executor.systemCatalog.getOid("rel:public." + entry.getKey());
+                        if (seqOid == targetOid) { seqName = entry.getKey(); break; }
+                    }
+                    if (seqName == null) seqName = String.valueOf(seqArg);
+                } else {
+                    seqName = String.valueOf(seqArg);
+                }
+                if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
+                Sequence seq = resolveSequence(seqName);
+                if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
+                try { return seq.currVal(); }
+                catch (Exception e) { return null; } // never been used -> null
+            }
             case "setval": {
                 String seqName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
                 if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);

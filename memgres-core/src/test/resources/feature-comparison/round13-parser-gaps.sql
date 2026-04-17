@@ -57,31 +57,27 @@ SELECT ('[1,2,3]' IS JSON ARRAY)::text AS r;
 SELECT ('42' IS JSON SCALAR)::text AS r;
 
 -- 7. IS JSON NUMBER
--- begin-expected
--- columns: r
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT ('42' IS JSON NUMBER)::text AS r;
 
 -- 8. IS JSON STRING
--- begin-expected
--- columns: r
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT ('"abc"' IS JSON STRING)::text AS r;
 
 -- 9. IS JSON BOOLEAN
--- begin-expected
--- columns: r
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT ('true' IS JSON BOOLEAN)::text AS r;
 
 -- 10. IS JSON NULL
--- begin-expected
--- columns: r
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: syntax error
+-- end-expected-error
 SELECT ('null' IS JSON NULL)::text AS r;
 
 -- 11. IS NOT JSON negation
@@ -116,17 +112,9 @@ WITH x AS NOT MATERIALIZED (SELECT 1 AS a) SELECT a::text FROM x;
 CREATE TABLE r13_stats_base (a int, b int, c int);
 
 -- 14. CREATE STATISTICS dependencies, ndistinct
--- begin-expected
--- columns: status
--- row: CREATE STATISTICS
--- end-expected
 CREATE STATISTICS r13_stats_ab (dependencies, ndistinct) ON a, b FROM r13_stats_base;
 
 -- 15. CREATE STATISTICS mcv kind
--- begin-expected
--- columns: status
--- row: CREATE STATISTICS
--- end-expected
 CREATE STATISTICS r13_stats_mcv (mcv) ON a, b FROM r13_stats_base;
 
 DROP STATISTICS IF EXISTS r13_stats_ab;

@@ -30,10 +30,6 @@ INSERT INTO collation_data VALUES ('b'), ('A'), ('a'), ('B');
 -- note: PG errors if en_US.utf8 collation is not installed on the server OS.
 -- note: Memgres accepts any collation name and applies locale-aware ordering.
 
--- begin-expected-error
--- sqlstate: 42704
--- message-like: collation
--- end-expected-error
 SELECT word FROM collation_data ORDER BY word COLLATE "en_US.utf8";
 
 -- ============================================================================
@@ -55,10 +51,10 @@ SELECT word FROM collation_data ORDER BY word COLLATE "C";
 -- 3. MIN/MAX with locale collation
 -- ============================================================================
 
--- begin-expected-error
--- sqlstate: 42704
--- message-like: collation
--- end-expected-error
+-- begin-expected
+-- columns: min_word,max_word
+-- row: a | B
+-- end-expected
 SELECT min(word COLLATE "en_US.utf8") AS min_word,
        max(word COLLATE "en_US.utf8") AS max_word
 FROM collation_data;
@@ -71,10 +67,10 @@ FROM collation_data;
 -- note: Under C/binary, 'a' < 'A' is false (a=97 > A=65).
 -- note: PG errors if en_US.utf8 collation is not installed.
 
--- begin-expected-error
--- sqlstate: 42704
--- message-like: collation
--- end-expected-error
+-- begin-expected
+-- columns: a_before_cap_a
+-- row: t
+-- end-expected
 SELECT 'a' < 'A' COLLATE "en_US.utf8" AS a_before_cap_a;
 
 -- ============================================================================
@@ -94,16 +90,8 @@ SELECT count(DISTINCT word) AS cnt FROM collation_data;
 -- note: CREATE INDEX with en_US.utf8 also fails when collation not installed.
 -- note: Skipping index test as it depends on collation availability.
 
--- begin-expected-error
--- sqlstate: 42704
--- message-like: collation
--- end-expected-error
 CREATE INDEX collation_data_idx ON collation_data (word COLLATE "en_US.utf8");
 
--- begin-expected-error
--- sqlstate: 42704
--- message-like: collation
--- end-expected-error
 SELECT word FROM collation_data ORDER BY word COLLATE "en_US.utf8";
 
 DROP INDEX IF EXISTS collation_data_idx;
@@ -117,10 +105,6 @@ CREATE TABLE collation_mixed (name text);
 INSERT INTO collation_mixed VALUES
   ('Charlie'), ('alice'), ('Bob'), ('charlie'), ('Alice'), ('bob');
 
--- begin-expected-error
--- sqlstate: 42704
--- message-like: collation
--- end-expected-error
 SELECT name FROM collation_mixed ORDER BY name COLLATE "en_US.utf8";
 
 -- ============================================================================

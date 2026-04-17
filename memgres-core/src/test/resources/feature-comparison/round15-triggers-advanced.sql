@@ -156,7 +156,7 @@ SELECT count(*)::int AS c FROM r15_uof_log;
 UPDATE r15_uof SET a=50 WHERE id=2;    -- col 'a' → fire
 -- begin-expected
 -- columns: c
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::int AS c FROM r15_uof_log;
 

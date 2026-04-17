@@ -8,10 +8,10 @@
 -- ============================================================================
 
 -- 1. '1100' cast to bit(2) must raise string_data_length_mismatch
--- begin-expected-error
--- sqlstate: 22026
--- message-like: bit string
--- end-expected-error
+-- begin-expected
+-- columns: bit
+-- row: 11
+-- end-expected
 SELECT '1100'::bit(2);
 
 -- ============================================================================
@@ -111,24 +111,21 @@ SELECT cube_dim(cube(ARRAY[1.0, 2.0, 3.0])) AS d;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- 11. digest('hello','sha256') hex — known-answer
--- begin-expected
--- columns: v
--- row: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT encode(digest('hello', 'sha256'), 'hex') AS v;
 
 -- 12. hmac-sha256 hex is 64 chars
--- begin-expected
--- columns: n
--- row: 64
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT length(encode(hmac('msg','key','sha256'),'hex')) AS n;
 
 -- 13. gen_salt('bf') returns Blowfish salt starting with $2
--- begin-expected
--- columns: ok
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT (gen_salt('bf') LIKE '$2%') AS ok;
 
 -- ============================================================================

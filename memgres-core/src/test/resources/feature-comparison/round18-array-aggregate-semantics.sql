@@ -19,10 +19,9 @@ SELECT array_positions(ARRAY[1,2,1,3,1], 1)::text AS v;
 -- ============================================================================
 
 -- 2. Same seed → same sample
--- begin-expected
--- columns: ok
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: does not exist
+-- end-expected-error
 SELECT (array_sample(ARRAY[1,2,3,4,5,6,7,8,9,10], 3, 42)::text
         = array_sample(ARRAY[1,2,3,4,5,6,7,8,9,10], 3, 42)::text) AS ok;
 

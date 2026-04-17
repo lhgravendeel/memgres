@@ -10,7 +10,7 @@
 -- 1. pg_log_backend_memory_contexts returns boolean
 -- begin-expected
 -- columns: r
--- row: .*
+-- row: t
 -- end-expected
 SELECT pg_log_backend_memory_contexts(pg_backend_pid()) AS r;
 
@@ -19,10 +19,9 @@ SELECT pg_log_backend_memory_contexts(pg_backend_pid()) AS r;
 -- ============================================================================
 
 -- 2. pg_promote returns boolean
--- begin-expected
--- columns: r
--- row: .*
--- end-expected
+-- begin-expected-error
+-- message-like: recovery is not
+-- end-expected-error
 SELECT pg_promote(false, 0) AS r;
 
 -- 3. pg_wal_replay_pause exists in pg_proc
@@ -79,7 +78,7 @@ SELECT (pg_tablespace_size('pg_default') >= 0) AS ok;
 -- 8. has_parameter_privilege returns boolean
 -- begin-expected
 -- columns: r
--- row: .*
+-- row: t
 -- end-expected
 SELECT has_parameter_privilege(current_user, 'work_mem', 'SET') AS r;
 

@@ -9,8 +9,8 @@
 
 -- 1. Default value
 -- begin-expected
--- columns: v
--- row: 3
+-- columns: extra_float_digits
+-- row: 1
 -- end-expected
 SHOW extra_float_digits;
 
@@ -32,7 +32,7 @@ SET extra_float_digits = 3;
 
 -- 4. Default format
 -- begin-expected
--- columns: v
+-- columns: bytea_output
 -- row: hex
 -- end-expected
 SHOW bytea_output;
@@ -70,7 +70,7 @@ SET bytea_output = 'hex';
 
 -- 8. Default
 -- begin-expected
--- columns: v
+-- columns: IntervalStyle
 -- row: postgres
 -- end-expected
 SHOW IntervalStyle;
@@ -137,7 +137,7 @@ SET DateStyle = 'ISO, MDY';
 
 -- 17. standard_conforming_strings default on
 -- begin-expected
--- columns: v
+-- columns: standard_conforming_strings
 -- row: on
 -- end-expected
 SHOW standard_conforming_strings;

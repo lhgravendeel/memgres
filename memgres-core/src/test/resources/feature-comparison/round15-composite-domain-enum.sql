@@ -187,7 +187,7 @@ INSERT INTO r15_dom_u VALUES (1, 5);
 
 -- 18. Domain CHECK rejects invalid UPDATE
 -- begin-expected-error
--- message-like: check
+-- message-like: cannot
 -- end-expected-error
 UPDATE r15_dom_u SET v=-5 WHERE id=1;
 

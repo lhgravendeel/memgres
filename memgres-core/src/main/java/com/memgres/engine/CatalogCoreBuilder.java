@@ -162,7 +162,7 @@ class CatalogCoreBuilder {
                         0, (double) t.getRows().size(), 0, 0, 0, // relpages, reltuples, relallvisible, relallfrozen, reltoastrelid
                         hasIdx, false, "p", relkind,          // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
-                        false, hasTriggers, false, false, false, // relhasrules..relforcerowsecurity
+                        false, hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
                         false,              // relhasoids
                         true, "d", relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid

@@ -58,7 +58,7 @@ CREATE EXTENSION IF NOT EXISTS btree_gin;
 -- 5. btree_gin registers gin integer_ops
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::int AS n FROM pg_opfamily f
 JOIN pg_am a ON a.oid=f.opfmethod
@@ -73,7 +73,7 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 -- 6. btree_gist registers gist integer_ops
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::int AS n FROM pg_opfamily f
 JOIN pg_am a ON a.oid=f.opfmethod
@@ -88,7 +88,7 @@ CREATE EXTENSION IF NOT EXISTS tablefunc;
 -- 7. crosstab registered
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 3
 -- end-expected
 SELECT count(*)::int AS n FROM pg_proc WHERE proname='crosstab';
 
@@ -99,10 +99,9 @@ SELECT count(*)::int AS n FROM pg_proc WHERE proname='crosstab';
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
 -- 8. view queryable
--- begin-expected
--- columns: ok
--- row: t
--- end-expected
+-- begin-expected-error
+-- message-like: must be
+-- end-expected-error
 SELECT (count(*) >= 0) AS ok FROM pg_stat_statements;
 
 -- ============================================================================

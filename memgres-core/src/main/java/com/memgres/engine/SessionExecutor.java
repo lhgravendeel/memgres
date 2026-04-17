@@ -529,7 +529,7 @@ class SessionExecutor {
             if (s.privileges() != null && s.grantees() != null) {
                 for (String grantedRole : s.privileges()) {
                     for (String member : s.grantees()) {
-                        executor.database.addRoleMembership(grantedRole, member);
+                        executor.database.addRoleMembership(grantedRole, member, s.withAdminOption());
                     }
                 }
             }

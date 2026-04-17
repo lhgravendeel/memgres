@@ -41,7 +41,7 @@ CREATE ROLE r16_fs_u;
 
 -- 3. GRANT USAGE ON FOREIGN SERVER parses (error must NOT be 42601)
 -- begin-expected-error
--- message-like: foreign server
+-- message-like: does not exist
 -- end-expected-error
 GRANT USAGE ON FOREIGN SERVER nonexistent TO r16_fs_u;
 

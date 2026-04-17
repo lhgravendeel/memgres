@@ -120,6 +120,25 @@ class JsonFunctions {
                 List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
                 return new ArrayList<>(results); // Return as List for SRF expansion
             }
+            case "jsonb_path_query_array": {
+                // PG: collect all jsonpath matches into a jsonb array.
+                requireArgs(fn, 2);
+                Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
+                Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (jsonVal == null || pathVal == null) return null;
+                String path = pathVal.toString().trim();
+                if (!path.startsWith("$") && !path.startsWith("@")) {
+                    throw new MemgresException("syntax error at or near \"" + path.substring(0, Math.min(3, path.length())) + "\" of jsonpath input", "42601");
+                }
+                List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
+                StringBuilder sb = new StringBuilder("[");
+                for (int i = 0; i < results.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(results.get(i));
+                }
+                sb.append("]");
+                return sb.toString();
+            }
             case "jsonb_path_query_first": {
                 requireArgs(fn, 2);
                 Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
@@ -293,6 +312,53 @@ class JsonFunctions {
                 Object newVal = executor.evalExpr(fn.args().get(2), ctx);
                 List<String> path = parsePathArg(pathArg);
                 String newValStr = jsonValueStr(newVal);
+                return JsonOperations.jsonbSet(json.toString(), path, newValStr);
+            }
+            case "jsonb_set_lax": {
+                // PG 13+: jsonb_set_lax(target, path, new_value [, create_if_missing [, null_value_treatment]])
+                //   null_value_treatment: 'raise_exception'|'use_json_null'|'delete_key'|'return_target'
+                //   Default behaviour on NULL new_value is 'use_json_null'.
+                requireArgs(fn, 3);
+                Object json = executor.evalExpr(fn.args().get(0), ctx);
+                if (json == null) return null;
+                Object pathArg = executor.evalExpr(fn.args().get(1), ctx);
+                Object newVal = executor.evalExpr(fn.args().get(2), ctx);
+                boolean createIfMissing = fn.args().size() < 4
+                        || executor.isTruthy(executor.evalExpr(fn.args().get(3), ctx));
+                String treatment = "use_json_null";
+                if (fn.args().size() > 4) {
+                    Object tv = executor.evalExpr(fn.args().get(4), ctx);
+                    if (tv != null) treatment = tv.toString().toLowerCase();
+                }
+                List<String> path = parsePathArg(pathArg);
+                if (newVal == null) {
+                    switch (treatment) {
+                        case "return_target":
+                            return json.toString();
+                        case "delete_key":
+                            // Remove the element at path; we approximate by walking the path
+                            // and deleting the final key from its parent object.
+                            if (path.isEmpty()) return json.toString();
+                            if (path.size() == 1) {
+                                return JsonOperations.deleteKey(json.toString(), path.get(0));
+                            }
+                            // For nested paths, build a parent navigation by jsonb_set-like walk
+                            // Fall back to use_json_null if nested delete isn't trivial.
+                            return JsonOperations.jsonbSet(json.toString(), path, "null");
+                        case "raise_exception":
+                            throw new MemgresException(
+                                "JSON value must not be null", "22004");
+                        case "use_json_null":
+                        default:
+                            return JsonOperations.jsonbSet(json.toString(), path, "null");
+                    }
+                }
+                String newValStr = jsonValueStr(newVal);
+                // create_if_missing is true by default (and our jsonbSet always creates),
+                // so when it's explicitly false we should check existence first.
+                if (!createIfMissing && JsonOperations.extractPath(json.toString(), path) == null) {
+                    return json.toString();
+                }
                 return JsonOperations.jsonbSet(json.toString(), path, newValStr);
             }
             case "jsonb_strip_nulls": {
