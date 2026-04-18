@@ -14,17 +14,23 @@ public class RlsPolicy {
     private final Expression usingExpr;
     private final Expression withCheckExpr;
     private final List<String> roles; // target roles (null or empty = PUBLIC/all roles)
+    private final String policyType; // PERMISSIVE (default) or RESTRICTIVE
 
     public RlsPolicy(String name, String command, Expression usingExpr, Expression withCheckExpr) {
-        this(name, command, usingExpr, withCheckExpr, null);
+        this(name, command, usingExpr, withCheckExpr, null, "PERMISSIVE");
     }
 
     public RlsPolicy(String name, String command, Expression usingExpr, Expression withCheckExpr, List<String> roles) {
+        this(name, command, usingExpr, withCheckExpr, roles, "PERMISSIVE");
+    }
+
+    public RlsPolicy(String name, String command, Expression usingExpr, Expression withCheckExpr, List<String> roles, String policyType) {
         this.name = name;
         this.command = command;
         this.usingExpr = usingExpr;
         this.withCheckExpr = withCheckExpr;
         this.roles = roles;
+        this.policyType = policyType != null ? policyType : "PERMISSIVE";
     }
 
     public String getName() { return name; }
@@ -32,6 +38,9 @@ public class RlsPolicy {
     public Expression getUsingExpr() { return usingExpr; }
     public Expression getWithCheckExpr() { return withCheckExpr; }
     public List<String> getRoles() { return roles; }
+    public String getPolicyType() { return policyType; }
+    public boolean isPermissive() { return "PERMISSIVE".equalsIgnoreCase(policyType); }
+    public boolean isRestrictive() { return "RESTRICTIVE".equalsIgnoreCase(policyType); }
 
     public boolean appliesTo(String operation) {
         if (command.equalsIgnoreCase("ALL")) return true;

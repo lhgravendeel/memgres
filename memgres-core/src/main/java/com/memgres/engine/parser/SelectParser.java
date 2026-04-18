@@ -57,10 +57,18 @@ class SelectParser {
 
             boolean all = parser.matchKeyword("ALL");
             parser.matchKeyword("DISTINCT");
+            // PG: CORRESPONDING [BY (col, ...)] - match columns by name
+            if (!parser.matchKeyword("CORRESPONDING")) parser.matchIdentifier("CORRESPONDING");
+            if (parser.matchKeyword("BY")) {
+                // consume column list
+                parser.expect(TokenType.LEFT_PAREN);
+                parser.parseIdentifierList();
+                parser.expect(TokenType.RIGHT_PAREN);
+            }
 
             Statement right;
             if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance(); right = parser.parseSelect(); parser.expect(TokenType.RIGHT_PAREN);
+                parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
                 lastRightWasParenthesized = true;
             } else {
                 right = parser.parseSelect();
@@ -105,6 +113,13 @@ class SelectParser {
             parser.advance();
             boolean all = parser.matchKeyword("ALL");
             parser.matchKeyword("DISTINCT");
+            // PG: CORRESPONDING [BY (col, ...)]
+            if (!parser.matchKeyword("CORRESPONDING")) parser.matchIdentifier("CORRESPONDING");
+            if (parser.matchKeyword("BY")) {
+                parser.expect(TokenType.LEFT_PAREN);
+                parser.parseIdentifierList();
+                parser.expect(TokenType.RIGHT_PAREN);
+            }
 
             Statement right;
             if (parser.check(TokenType.LEFT_PAREN)) {
@@ -282,9 +297,21 @@ class SelectParser {
         if (parser.matchKeywords("GROUP", "BY")) {
             if (sawOrderBy) throw new ParseException("syntax error at or near \"GROUP\"", parser.peek());
             if (sawLimit) throw new ParseException("syntax error at or near \"GROUP\"", parser.peek());
+            // GROUP BY DISTINCT: consume the optional DISTINCT modifier (deduplicates grouping sets)
+            boolean groupByDistinct = parser.matchKeyword("DISTINCT");
             // Parse potentially multiple GROUP BY elements that may include GROUPING SETS/ROLLUP/CUBE
             groupingSets = parseGroupByClause();
             if (groupingSets != null) {
+                // GROUP BY DISTINCT: deduplicate grouping sets
+                if (groupByDistinct) {
+                    List<List<Expression>> deduped = new ArrayList<>();
+                    java.util.Set<String> seenSets = new java.util.LinkedHashSet<>();
+                    for (List<Expression> gs : groupingSets) {
+                        String key = gs.toString();
+                        if (seenSets.add(key)) deduped.add(gs);
+                    }
+                    groupingSets = deduped;
+                }
                 // Extract "representative" groupBy columns (all columns appearing in any set, for validation)
                 java.util.Set<String> seen = new java.util.LinkedHashSet<>();
                 List<Expression> allCols = new ArrayList<>();
@@ -316,6 +343,24 @@ class SelectParser {
                 String winName = parser.readIdentifier();
                 parser.expectKeyword("AS");
                 parser.expect(TokenType.LEFT_PAREN);
+                // Check for base window name reference: w2 AS (w1 ORDER BY ...)
+                String winRefName = null;
+                if (parser.peek().type() == TokenType.IDENTIFIER
+                        && !parser.checkKeyword("PARTITION") && !parser.checkKeyword("ORDER")
+                        && !parser.checkKeyword("ROWS") && !parser.checkKeyword("RANGE")
+                        && !parser.checkKeyword("GROUPS")) {
+                    // Could be a base window name. Peek ahead to disambiguate.
+                    int saved = parser.position();
+                    String maybeRef = parser.readIdentifier();
+                    // If followed by PARTITION BY, ORDER BY, frame, or ), it's a base window ref
+                    if (parser.checkKeyword("PARTITION") || parser.checkKeyword("ORDER")
+                            || parser.checkKeyword("ROWS") || parser.checkKeyword("RANGE")
+                            || parser.checkKeyword("GROUPS") || parser.check(TokenType.RIGHT_PAREN)) {
+                        winRefName = maybeRef;
+                    } else {
+                        parser.resetPosition(saved);
+                    }
+                }
                 List<Expression> winPartitionBy = null;
                 List<SelectStmt.OrderByItem> winOrderBy = null;
                 WindowFuncExpr.FrameClause winFrame = null;
@@ -329,7 +374,7 @@ class SelectParser {
                     winFrame = parser.parseWindowFrame();
                 }
                 parser.expect(TokenType.RIGHT_PAREN);
-                windowDefs.add(new SelectStmt.WindowDef(winName, winPartitionBy, winOrderBy, winFrame));
+                windowDefs.add(new SelectStmt.WindowDef(winName, winRefName, winPartitionBy, winOrderBy, winFrame));
             } while (parser.match(TokenType.COMMA));
         }
 
@@ -1231,6 +1276,11 @@ class SelectParser {
             }
         }
 
+        // XMLTABLE(xpath PASSING xml_expr COLUMNS col type PATH xpath, ...) AS alias
+        if (parser.checkIdentCI("XMLTABLE")) {
+            return parseXmlTableFromItem(lateral);
+        }
+
         // JSON_TABLE(expr, path COLUMNS (...)) AS alias
         if (parser.checkKeyword("JSON_TABLE")) {
             return parseJsonTableFromItem(lateral);
@@ -1279,10 +1329,13 @@ class SelectParser {
                 parser.advance();
                 colAliases = new ArrayList<>();
                 while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    colAliases.add(parser.readIdentifier()); // column name
+                    String colName = parser.readIdentifier(); // column name
                     // Optional type name
                     if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
-                        parser.parseTypeName(); // column type, consumed but not stored
+                        String typeName = parser.parseTypeName(); // column type
+                        colAliases.add(colName + " " + typeName);
+                    } else {
+                        colAliases.add(colName);
                     }
                     parser.match(TokenType.COMMA);
                 }
@@ -1549,6 +1602,74 @@ class SelectParser {
         JsonTableExpr jtExpr = new JsonTableExpr(input, path, columns, passing, onError);
         // Store as FunctionFrom with the JsonTableExpr packed into args
         return new SelectStmt.FunctionFrom("__json_table__", Cols.listOf(jtExpr), alias, null);
+    }
+
+    // ---- XMLTABLE FROM item ----
+
+    private SelectStmt.FromItem parseXmlTableFromItem(boolean lateral) {
+        parser.advance(); // consume XMLTABLE
+        parser.expect(TokenType.LEFT_PAREN);
+        // Parse XPath expression (string literal)
+        Expression xpath = parser.parseExpression();
+        // PASSING clause
+        Expression xmlDoc = null;
+        if (parser.matchKeyword("PASSING")) {
+            xmlDoc = parser.parseExpression();
+        }
+        // COLUMNS clause
+        parser.expectKeyword("COLUMNS");
+        List<String> colNames = new ArrayList<>();
+        List<String> colTypes = new ArrayList<>();
+        List<Expression> colPaths = new ArrayList<>();
+        do {
+            String colName = parser.readIdentifier();
+            // FOR ORDINALITY
+            if (parser.matchKeywords("FOR", "ORDINALITY")) {
+                colNames.add(colName);
+                colTypes.add("integer");
+                colPaths.add(null);
+                continue;
+            }
+            String typeName = parser.parseTypeName();
+            Expression pathExpr = null;
+            if (parser.matchKeyword("PATH")) {
+                pathExpr = parser.parseExpression();
+            }
+            // Optional DEFAULT and NOT NULL clauses
+            if (parser.matchKeyword("DEFAULT")) {
+                parser.parseExpression(); // consume default expr
+            }
+            parser.matchKeywords("NOT", "NULL");
+            colNames.add(colName);
+            colTypes.add(typeName);
+            colPaths.add(pathExpr);
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        // Alias
+        String alias = null;
+        if (parser.matchKeyword("AS")) {
+            alias = parser.readIdentifier();
+        } else if (!parser.isAtEnd() && (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER)) {
+            alias = parser.readIdentifier();
+        }
+        // Pack as FunctionFrom with special name "__xmltable__"
+        // Encode xpath, xmlDoc, colNames, colTypes, colPaths into args
+        List<Expression> args = new ArrayList<>();
+        args.add(xpath);
+        if (xmlDoc != null) args.add(xmlDoc);
+        // Store column metadata as string literals
+        for (int i = 0; i < colNames.size(); i++) {
+            String pathStr;
+            if (colPaths.get(i) != null && colPaths.get(i) instanceof Literal) {
+                pathStr = ((Literal) colPaths.get(i)).value();
+            } else if (colPaths.get(i) != null) {
+                pathStr = colPaths.get(i).toString();
+            } else {
+                pathStr = colNames.get(i);
+            }
+            args.add(new Literal(Literal.LiteralType.STRING, colNames.get(i) + ":" + colTypes.get(i) + ":" + pathStr));
+        }
+        return new SelectStmt.FunctionFrom("__xmltable__", args, alias, null);
     }
 
     private List<JsonTableExpr.JsonTableColumn> parseJsonTableColumns() {

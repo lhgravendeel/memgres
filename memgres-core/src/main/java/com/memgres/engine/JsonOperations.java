@@ -239,19 +239,24 @@ public final class JsonOperations {
 
     /** Strip null values from JSON object */
     public static String stripNulls(String json) {
+        return stripNulls(json, false);
+    }
+
+    /** Strip null values from JSON object, optionally in compact mode (no spaces). */
+    public static String stripNulls(String json, boolean compact) {
         json = json.trim();
         if (json.startsWith("{")) {
             Map<String, String> map = parseObjectKeys(json);
             map.entrySet().removeIf(e -> "null".equals(e.getValue().trim()));
             for (Map.Entry<String, String> entry : map.entrySet()) {
-                entry.setValue(stripNulls(entry.getValue()));
+                entry.setValue(stripNulls(entry.getValue(), compact));
             }
-            return mapToJson(map);
+            return mapToJson(map, compact);
         }
         if (json.startsWith("[")) {
             List<String> elems = parseArrayElements(json);
             for (int i = 0; i < elems.size(); i++) {
-                elems.set(i, stripNulls(elems.get(i)));
+                elems.set(i, stripNulls(elems.get(i), compact));
             }
             return elemsToJsonArray(elems);
         }

@@ -3,7 +3,7 @@ package com.memgres.engine.parser.ast;
 import java.util.List;
 
 /**
- * CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] name ON [schema.]table [USING method] (columns...) [INCLUDE (cols)] [WHERE cond]
+ * CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] name ON [schema.]table [USING method] (columns...) [INCLUDE (cols)] [NULLS NOT DISTINCT] [WHERE cond]
  */
 public final class CreateIndexStmt implements Statement {
     public final String name;
@@ -16,6 +16,38 @@ public final class CreateIndexStmt implements Statement {
     public final String method;
     public final List<String> includeColumns;
     public final String whereClause;
+    /** Per-column options: opclass, DESC, NULLS FIRST/LAST (parallel to columns). */
+    public final List<String> columnOptions;
+    /** NULLS NOT DISTINCT (PG 15+ for unique indexes). */
+    public final boolean nullsNotDistinct;
+
+    public CreateIndexStmt(
+            String name,
+            String schema,
+            String table,
+            List<String> columns,
+            boolean unique,
+            boolean ifNotExists,
+            boolean concurrently,
+            String method,
+            List<String> includeColumns,
+            String whereClause,
+            List<String> columnOptions,
+            boolean nullsNotDistinct
+    ) {
+        this.name = name;
+        this.schema = schema;
+        this.table = table;
+        this.columns = columns;
+        this.unique = unique;
+        this.ifNotExists = ifNotExists;
+        this.concurrently = concurrently;
+        this.method = method;
+        this.includeColumns = includeColumns;
+        this.whereClause = whereClause;
+        this.columnOptions = columnOptions;
+        this.nullsNotDistinct = nullsNotDistinct;
+    }
 
     public CreateIndexStmt(
             String name,
@@ -29,28 +61,19 @@ public final class CreateIndexStmt implements Statement {
             List<String> includeColumns,
             String whereClause
     ) {
-        this.name = name;
-        this.schema = schema;
-        this.table = table;
-        this.columns = columns;
-        this.unique = unique;
-        this.ifNotExists = ifNotExists;
-        this.concurrently = concurrently;
-        this.method = method;
-        this.includeColumns = includeColumns;
-        this.whereClause = whereClause;
+        this(name, schema, table, columns, unique, ifNotExists, concurrently, method, includeColumns, whereClause, null, false);
     }
 
     public CreateIndexStmt(String name, String table, List<String> columns,
                            boolean unique, boolean ifNotExists, boolean concurrently) {
-        this(name, null, table, columns, unique, ifNotExists, concurrently, null, null, null);
+        this(name, null, table, columns, unique, ifNotExists, concurrently, null, null, null, null, false);
     }
 
     /** Constructor without schema (backwards compatible). */
     public CreateIndexStmt(String name, String table, List<String> columns,
                            boolean unique, boolean ifNotExists, boolean concurrently,
                            String method, List<String> includeColumns, String whereClause) {
-        this(name, null, table, columns, unique, ifNotExists, concurrently, method, includeColumns, whereClause);
+        this(name, null, table, columns, unique, ifNotExists, concurrently, method, includeColumns, whereClause, null, false);
     }
 
     public String name() { return name; }
@@ -63,6 +86,8 @@ public final class CreateIndexStmt implements Statement {
     public String method() { return method; }
     public List<String> includeColumns() { return includeColumns; }
     public String whereClause() { return whereClause; }
+    public List<String> columnOptions() { return columnOptions; }
+    public boolean nullsNotDistinct() { return nullsNotDistinct; }
 
     @Override
     public boolean equals(Object o) {
@@ -78,16 +103,18 @@ public final class CreateIndexStmt implements Statement {
             && concurrently == that.concurrently
             && java.util.Objects.equals(method, that.method)
             && java.util.Objects.equals(includeColumns, that.includeColumns)
-            && java.util.Objects.equals(whereClause, that.whereClause);
+            && java.util.Objects.equals(whereClause, that.whereClause)
+            && java.util.Objects.equals(columnOptions, that.columnOptions)
+            && nullsNotDistinct == that.nullsNotDistinct;
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(name, schema, table, columns, unique, ifNotExists, concurrently, method, includeColumns, whereClause);
+        return java.util.Objects.hash(name, schema, table, columns, unique, ifNotExists, concurrently, method, includeColumns, whereClause, columnOptions, nullsNotDistinct);
     }
 
     @Override
     public String toString() {
-        return "CreateIndexStmt[name=" + name + ", " + "schema=" + schema + ", " + "table=" + table + ", " + "columns=" + columns + ", " + "unique=" + unique + ", " + "ifNotExists=" + ifNotExists + ", " + "concurrently=" + concurrently + ", " + "method=" + method + ", " + "includeColumns=" + includeColumns + ", " + "whereClause=" + whereClause + "]";
+        return "CreateIndexStmt[name=" + name + ", " + "schema=" + schema + ", " + "table=" + table + ", " + "columns=" + columns + ", " + "unique=" + unique + ", " + "ifNotExists=" + ifNotExists + ", " + "concurrently=" + concurrently + ", " + "method=" + method + ", " + "includeColumns=" + includeColumns + ", " + "whereClause=" + whereClause + ", " + "columnOptions=" + columnOptions + ", " + "nullsNotDistinct=" + nullsNotDistinct + "]";
     }
 }

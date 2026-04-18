@@ -14,6 +14,8 @@ public class MemgresException extends RuntimeException {
     private String datatype;
     private String table;
     private String schema;
+    private int position; // 1-based character position in the query (P field)
+    private String pgContext; // PL/pgSQL exception context (function name + line)
 
     public MemgresException(String message) {
         super(message);
@@ -43,6 +45,10 @@ public class MemgresException extends RuntimeException {
     public void setTable(String table) { this.table = table; }
     public String getSchema() { return schema; }
     public void setSchema(String schema) { this.schema = schema; }
+    public int getPosition() { return position; }
+    public void setPosition(int position) { this.position = position; }
+    public String getPgContext() { return pgContext; }
+    public void setPgContext(String pgContext) { this.pgContext = pgContext; }
 
     /**
      * Infer a SQLSTATE code from common error message patterns.

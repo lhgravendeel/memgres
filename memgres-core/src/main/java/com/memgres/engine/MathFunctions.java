@@ -61,8 +61,29 @@ class MathFunctions {
                 }
                 return (long) Math.round(val);
             }
-            case "random":
+            case "random": {
+                if (fn.args().size() == 2) {
+                    // random(min, max) → random integer in [min, max] inclusive
+                    long min = executor.toLong(executor.evalExpr(fn.args().get(0), ctx));
+                    long max = executor.toLong(executor.evalExpr(fn.args().get(1), ctx));
+                    if (min > max) throw new com.memgres.engine.MemgresException(
+                            "lower bound must be less than or equal to upper bound", "22023");
+                    return min + (long) (Math.random() * (max - min + 1));
+                }
                 return Math.random();
+            }
+            case "random_normal": {
+                // random_normal(mean, stddev) → returns random normal distributed value
+                double mean = 0.0;
+                double stddev = 1.0;
+                if (fn.args().size() >= 1) {
+                    mean = executor.toDouble(executor.evalExpr(fn.args().get(0), ctx));
+                }
+                if (fn.args().size() >= 2) {
+                    stddev = executor.toDouble(executor.evalExpr(fn.args().get(1), ctx));
+                }
+                return mean + stddev * new java.util.Random().nextGaussian();
+            }
             case "setseed": {
                 executor.evalExpr(fn.args().get(0), ctx);
                 return "";
@@ -70,6 +91,14 @@ class MathFunctions {
             case "trunc": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
+                // macaddr trunc: zero out the last 3 bytes
+                if (arg instanceof String) {
+                    String s = ((String) arg).trim().toLowerCase();
+                    if (s.matches("[0-9a-f]{2}(:[0-9a-f]{2}){5}")) {
+                        String[] parts = s.split(":");
+                        return parts[0] + ":" + parts[1] + ":" + parts[2] + ":00:00:00";
+                    }
+                }
                 double val = executor.toDouble(arg);
                 if (fn.args().size() > 1) {
                     int scale = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
@@ -83,6 +112,11 @@ class MathFunctions {
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
                 if (a == null || b == null) return null;
                 if (a instanceof Integer && b instanceof Integer) return ((Integer) a) % ((Integer) b);
+                if (a instanceof BigDecimal || b instanceof BigDecimal) {
+                    BigDecimal bdA = a instanceof BigDecimal ? (BigDecimal) a : new BigDecimal(a.toString());
+                    BigDecimal bdB = b instanceof BigDecimal ? (BigDecimal) b : new BigDecimal(b.toString());
+                    return bdA.remainder(bdB);
+                }
                 return executor.toLong(a) % executor.toLong(b);
             }
             case "power":
@@ -206,8 +240,10 @@ class MathFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 long n = executor.toLong(arg);
-                long result = 1;
-                for (long i = 2; i <= n; i++) result *= i;
+                if (n < 0) throw new MemgresException("factorial of a negative number is undefined", "2201F");
+                // Use BigDecimal for exact large results (PG returns numeric for factorial)
+                java.math.BigDecimal result = java.math.BigDecimal.ONE;
+                for (long i = 2; i <= n; i++) result = result.multiply(java.math.BigDecimal.valueOf(i));
                 return result;
             }
             case "div": {
@@ -230,7 +266,15 @@ class MathFunctions {
                 long gcd = a;
                 long temp = b;
                 while (temp != 0) { long t = temp; temp = gcd % temp; gcd = t; }
-                return Math.abs(a / gcd * b);
+                long div = a / gcd;
+                // Check for overflow: use Math.multiplyHigh or manual check
+                long result;
+                try {
+                    result = Math.multiplyExact(Math.abs(div), Math.abs(b));
+                } catch (ArithmeticException e) {
+                    throw new MemgresException("bigint out of range", "22003");
+                }
+                return result;
             }
             case "scale": {
                 // PG: scale(numeric) -> integer: number of decimal digits in the fractional part.
@@ -258,6 +302,26 @@ class MathFunctions {
                 return stripped;
             }
             case "width_bucket": {
+                if (fn.args().size() == 2) {
+                    // Array variant: width_bucket(operand, thresholds_array)
+                    double val = executor.toDouble(executor.evalExpr(fn.args().get(0), ctx));
+                    Object arrayArg = executor.evalExpr(fn.args().get(1), ctx);
+                    java.util.List<?> thresholds;
+                    if (arrayArg instanceof java.util.List<?>) {
+                        thresholds = (java.util.List<?>) arrayArg;
+                    } else if (arrayArg instanceof Object[]) {
+                        thresholds = java.util.Arrays.asList((Object[]) arrayArg);
+                    } else {
+                        throw new com.memgres.engine.MemgresException(
+                            "width_bucket second argument must be an array", "42804");
+                    }
+                    // Return 0 if below all thresholds, N+1 if above all, else 1-based bucket index
+                    for (int i = 0; i < thresholds.size(); i++) {
+                        double threshold = executor.toDouble(thresholds.get(i));
+                        if (val < threshold) return i;
+                    }
+                    return thresholds.size();
+                }
                 double val = executor.toDouble(executor.evalExpr(fn.args().get(0), ctx));
                 double lo = executor.toDouble(executor.evalExpr(fn.args().get(1), ctx));
                 double hi = executor.toDouble(executor.evalExpr(fn.args().get(2), ctx));

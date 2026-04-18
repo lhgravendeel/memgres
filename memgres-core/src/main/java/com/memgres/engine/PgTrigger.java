@@ -17,15 +17,26 @@ public class PgTrigger {
     private final String newTransitionTable; // REFERENCING NEW TABLE AS name
     private final String oldTransitionTable; // REFERENCING OLD TABLE AS name
     private final boolean forEachStatement; // FOR EACH STATEMENT (vs FOR EACH ROW)
+    private final String whenClause; // WHEN (condition) clause text
+    private final boolean deferrable; // CONSTRAINT TRIGGER ... DEFERRABLE
+    private final boolean initiallyDeferred; // DEFERRABLE INITIALLY DEFERRED
     private String schemaName; // schema where the trigger's table lives
+    private boolean disabled; // true when ALTER TABLE ... DISABLE TRIGGER sets this
 
     public PgTrigger(String name, Timing timing, Event event, String tableName, String functionName) {
-        this(name, timing, event, tableName, functionName, null, null, null, false);
+        this(name, timing, event, tableName, functionName, null, null, null, false, null, false, false);
     }
 
     public PgTrigger(String name, Timing timing, Event event, String tableName, String functionName,
                      java.util.List<String> updateColumns, String newTransitionTable, String oldTransitionTable,
                      boolean forEachStatement) {
+        this(name, timing, event, tableName, functionName, updateColumns, newTransitionTable, oldTransitionTable,
+                forEachStatement, null, false, false);
+    }
+
+    public PgTrigger(String name, Timing timing, Event event, String tableName, String functionName,
+                     java.util.List<String> updateColumns, String newTransitionTable, String oldTransitionTable,
+                     boolean forEachStatement, String whenClause, boolean deferrable, boolean initiallyDeferred) {
         this.name = name;
         this.timing = timing;
         this.event = event;
@@ -35,6 +46,9 @@ public class PgTrigger {
         this.newTransitionTable = newTransitionTable;
         this.oldTransitionTable = oldTransitionTable;
         this.forEachStatement = forEachStatement;
+        this.whenClause = whenClause;
+        this.deferrable = deferrable;
+        this.initiallyDeferred = initiallyDeferred;
     }
 
     public String getName() {
@@ -79,5 +93,25 @@ public class PgTrigger {
 
     public void setSchemaName(String schemaName) {
         this.schemaName = schemaName;
+    }
+
+    public boolean isDisabled() {
+        return disabled;
+    }
+
+    public void setDisabled(boolean disabled) {
+        this.disabled = disabled;
+    }
+
+    public String getWhenClause() {
+        return whenClause;
+    }
+
+    public boolean isDeferrable() {
+        return deferrable;
+    }
+
+    public boolean isInitiallyDeferred() {
+        return initiallyDeferred;
     }
 }

@@ -118,7 +118,8 @@ class Round14LocaleCollationTest {
             exec("CREATE COLLATION r14_coll_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)");
             // Non-deterministic case-insensitive collation
             String v = scalarString("SELECT ('ABC' = 'abc' COLLATE r14_coll_ci)::text");
-            assertEquals("t", v, "case-insensitive equality via non-deterministic collation");
+            // PG boolean::text returns "true"/"false"
+            assertEquals("true", v, "case-insensitive equality via non-deterministic collation");
         } catch (SQLException e) {
             String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase();
             assertFalse(msg.contains("syntax"),
@@ -191,7 +192,7 @@ class Round14LocaleCollationTest {
     @Test
     void is_normalized_predicate() throws SQLException {
         // PG 13+: IS NFC NORMALIZED
-        assertEquals("t", scalarString("SELECT ('abc' IS NFC NORMALIZED)::text"));
+        assertEquals("true", scalarString("SELECT ('abc' IS NFC NORMALIZED)::text"));
     }
 
     // =========================================================================
@@ -246,13 +247,13 @@ class Round14LocaleCollationTest {
     @Test
     void unicode_assigned_assigned_codepoint() throws SQLException {
         // 'A' is assigned
-        assertEquals("t", scalarString("SELECT unicode_assigned('A')::text"));
+        assertEquals("true", scalarString("SELECT unicode_assigned('A')::text"));
     }
 
     @Test
     void unicode_assigned_unassigned_codepoint() throws SQLException {
         // U+E0000 is unassigned
-        assertEquals("f", scalarString("SELECT unicode_assigned(U&'\\+0E0000')::text"));
+        assertEquals("false", scalarString("SELECT unicode_assigned(U&'\\+0E0000')::text"));
     }
 
     // =========================================================================

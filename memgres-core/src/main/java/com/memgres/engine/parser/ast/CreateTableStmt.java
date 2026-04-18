@@ -15,6 +15,7 @@ public final class CreateTableStmt implements Statement {
     public final String name;
     public final boolean ifNotExists;
     public final boolean temporary;
+    public final boolean unlogged;
     public final List<ColumnDef> columns;
     public final List<TableConstraint> constraints;
     public final List<String> inherits;
@@ -24,12 +25,14 @@ public final class CreateTableStmt implements Statement {
     public final List<String> partitionBounds;
     public final List<String> likeTables;
     public final String onCommitAction;
+    public final java.util.Map<String, String> withOptions;
 
     public CreateTableStmt(
             String schema,
             String name,
             boolean ifNotExists,
             boolean temporary,
+            boolean unlogged,
             List<ColumnDef> columns,
             List<TableConstraint> constraints,
             List<String> inherits,
@@ -40,10 +43,32 @@ public final class CreateTableStmt implements Statement {
             List<String> likeTables,
             String onCommitAction
     ) {
+        this(schema, name, ifNotExists, temporary, unlogged, columns, constraints, inherits,
+                partitionBy, partitionColumn, partitionOfParent, partitionBounds, likeTables, onCommitAction, null);
+    }
+
+    public CreateTableStmt(
+            String schema,
+            String name,
+            boolean ifNotExists,
+            boolean temporary,
+            boolean unlogged,
+            List<ColumnDef> columns,
+            List<TableConstraint> constraints,
+            List<String> inherits,
+            String partitionBy,
+            String partitionColumn,
+            String partitionOfParent,
+            List<String> partitionBounds,
+            List<String> likeTables,
+            String onCommitAction,
+            java.util.Map<String, String> withOptions
+    ) {
         this.schema = schema;
         this.name = name;
         this.ifNotExists = ifNotExists;
         this.temporary = temporary;
+        this.unlogged = unlogged;
         this.columns = columns;
         this.constraints = constraints;
         this.inherits = inherits;
@@ -53,12 +78,13 @@ public final class CreateTableStmt implements Statement {
         this.partitionBounds = partitionBounds;
         this.likeTables = likeTables;
         this.onCommitAction = onCommitAction;
+        this.withOptions = withOptions;
     }
 
     /** Backward-compatible constructor without inheritance/partitioning. */
     public CreateTableStmt(String schema, String name, boolean ifNotExists, boolean temporary,
                            List<ColumnDef> columns, List<TableConstraint> constraints) {
-        this(schema, name, ifNotExists, temporary, columns, constraints, null, null, null, null, null, null, null);
+        this(schema, name, ifNotExists, temporary, false, columns, constraints, null, null, null, null, null, null, null);
     }
 
     /** Constructor without LIKE or onCommitAction. */
@@ -66,7 +92,7 @@ public final class CreateTableStmt implements Statement {
                            List<ColumnDef> columns, List<TableConstraint> constraints,
                            List<String> inherits, String partitionBy, String partitionColumn,
                            String partitionOfParent, List<String> partitionBounds) {
-        this(schema, name, ifNotExists, temporary, columns, constraints, inherits,
+        this(schema, name, ifNotExists, temporary, false, columns, constraints, inherits,
                 partitionBy, partitionColumn, partitionOfParent, partitionBounds, null, null);
     }
 
@@ -76,7 +102,7 @@ public final class CreateTableStmt implements Statement {
                            List<String> inherits, String partitionBy, String partitionColumn,
                            String partitionOfParent, List<String> partitionBounds,
                            List<String> likeTables) {
-        this(schema, name, ifNotExists, temporary, columns, constraints, inherits,
+        this(schema, name, ifNotExists, temporary, false, columns, constraints, inherits,
                 partitionBy, partitionColumn, partitionOfParent, partitionBounds, likeTables, null);
     }
 
@@ -84,6 +110,7 @@ public final class CreateTableStmt implements Statement {
     public String name() { return name; }
     public boolean ifNotExists() { return ifNotExists; }
     public boolean temporary() { return temporary; }
+    public boolean unlogged() { return unlogged; }
     public List<ColumnDef> columns() { return columns; }
     public List<TableConstraint> constraints() { return constraints; }
     public List<String> inherits() { return inherits; }
@@ -93,6 +120,7 @@ public final class CreateTableStmt implements Statement {
     public List<String> partitionBounds() { return partitionBounds; }
     public List<String> likeTables() { return likeTables; }
     public String onCommitAction() { return onCommitAction; }
+    public java.util.Map<String, String> withOptions() { return withOptions; }
 
     @Override
     public boolean equals(Object o) {

@@ -75,8 +75,27 @@ class DdlRoleParser {
             return new AlterRoleStmt(name, newName, Cols.mapOf());
         }
 
-        // ALTER ROLE name SET param = value / TO value / RESET param, no-op
-        if (parser.matchKeyword("SET") || parser.matchKeyword("RESET")) {
+        // ALTER ROLE name SET param = value / TO value
+        if (parser.matchKeyword("SET")) {
+            String param = parser.readIdentifier();
+            Map<String, String> options = new LinkedHashMap<>();
+            if (parser.match(TokenType.EQUALS) || parser.matchKeyword("TO")) {
+                StringBuilder valBuf = new StringBuilder();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+                    Token vt = parser.advance();
+                    if (valBuf.length() > 0) valBuf.append(" ");
+                    if (vt.type() == TokenType.STRING_LITERAL) {
+                        valBuf.append(vt.value());
+                    } else {
+                        valBuf.append(vt.value());
+                    }
+                }
+                options.put("SET_CONFIG", param + "=" + valBuf.toString().trim());
+            }
+            return new AlterRoleStmt(name, null, options);
+        }
+        // ALTER ROLE name RESET param, no-op
+        if (parser.matchKeyword("RESET")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new AlterRoleStmt(name, null, Cols.mapOf());
         }

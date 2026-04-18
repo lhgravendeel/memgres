@@ -228,7 +228,7 @@ class Round13TypeFunctionGapsTest {
     /** jsonb_path_match returns a boolean result for path with boolean expression. */
     @Test
     void jsonb_path_match_trueCondition() throws SQLException {
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT jsonb_path_match('{\"a\":1}'::jsonb, '$.a == 1')::text"));
     }
 
@@ -351,7 +351,7 @@ class Round13TypeFunctionGapsTest {
     /** inet_same_family returns true when both addresses are same IP family. */
     @Test
     void inet_same_family_bothIpv4() throws SQLException {
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT inet_same_family('1.2.3.4'::inet, '5.6.7.8'::inet)::text"));
     }
 

@@ -51,10 +51,10 @@ SELECT word FROM collation_data ORDER BY word COLLATE "C";
 -- 3. MIN/MAX with locale collation
 -- ============================================================================
 
--- begin-expected
--- columns: min_word,max_word
--- row: a | B
--- end-expected
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: collation
+-- end-expected-error
 SELECT min(word COLLATE "en_US.utf8") AS min_word,
        max(word COLLATE "en_US.utf8") AS max_word
 FROM collation_data;
@@ -67,10 +67,10 @@ FROM collation_data;
 -- note: Under C/binary, 'a' < 'A' is false (a=97 > A=65).
 -- note: PG errors if en_US.utf8 collation is not installed.
 
--- begin-expected
--- columns: a_before_cap_a
--- row: t
--- end-expected
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: collation
+-- end-expected-error
 SELECT 'a' < 'A' COLLATE "en_US.utf8" AS a_before_cap_a;
 
 -- ============================================================================

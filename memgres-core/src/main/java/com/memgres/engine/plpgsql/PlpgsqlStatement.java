@@ -1145,6 +1145,34 @@ public interface PlpgsqlStatement {
         public String toString() { return "CaseStmt[searchExpr=" + searchExpr + ", whenClauses=" + whenClauses + ", elseBody=" + elseBody + "]"; }
     }
 
+    /** FOR rec IN EXECUTE 'sql' [USING expr, ...] LOOP ... END LOOP */
+    public static final class ForExecuteStmt implements PlpgsqlStatement {
+        public final String label;
+        public final String varName;
+        public final String sqlExpr;
+        public final List<String> usingExprs;
+        public final List<PlpgsqlStatement> body;
+
+        public ForExecuteStmt(String label, String varName, String sqlExpr, List<String> usingExprs, List<PlpgsqlStatement> body) {
+            this.label = label;
+            this.varName = varName;
+            this.sqlExpr = sqlExpr;
+            this.usingExprs = usingExprs;
+            this.body = body;
+        }
+
+        public String label() { return label; }
+        public String varName() { return varName; }
+        public String sqlExpr() { return sqlExpr; }
+        public List<String> usingExprs() { return usingExprs; }
+        public List<PlpgsqlStatement> body() { return body; }
+
+        @Override
+        public String toString() {
+            return "ForExecuteStmt[label=" + label + ", varName=" + varName + ", sqlExpr=" + sqlExpr + ", usingExprs=" + usingExprs + "]";
+        }
+    }
+
     /** ABORT in a procedure body — unsupported transaction command (PG raises 0A000 at runtime). */
     public static final class AbortStmt implements PlpgsqlStatement {
         @Override

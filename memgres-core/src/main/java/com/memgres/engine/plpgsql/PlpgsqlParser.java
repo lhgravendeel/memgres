@@ -414,6 +414,22 @@ public class PlpgsqlParser {
             matchKw("LOOP");
             match(TokenType.SEMICOLON);
             return new PlpgsqlStatement.ForStmt(label, varName, lower, upper, step, reverse, body);
+        } else if (checkKw("EXECUTE")) {
+            // FOR rec IN EXECUTE 'sql' [USING expr, ...] LOOP ... END LOOP
+            matchKw("EXECUTE");
+            String sqlExpr = collectUntilMulti("LOOP", "USING");
+            List<String> usingExprs = new ArrayList<>();
+            if (matchKw("USING")) {
+                do {
+                    usingExprs.add(collectUntilMulti(",", "LOOP"));
+                } while (match(TokenType.COMMA));
+            }
+            matchKw("LOOP");
+            List<PlpgsqlStatement> body = parseStatements("END");
+            matchKw("END");
+            matchKw("LOOP");
+            match(TokenType.SEMICOLON);
+            return new PlpgsqlStatement.ForExecuteStmt(label, varName, sqlExpr, usingExprs, body);
         } else {
             String sql = collectUntilKeyword("LOOP");
             matchKw("LOOP");

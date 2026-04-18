@@ -21,6 +21,8 @@ public final class CopyStmt implements Statement {
     public final String escape;                 // CSV escape character (default = quote)
     public final List<String> forceQuote;       // CSV FORCE_QUOTE column list
     public final List<String> forceNotNull;     // CSV FORCE_NOT_NULL column list
+    public final List<String> forceNull;        // CSV FORCE_NULL column list
+    public final boolean headerMatch;           // HEADER MATCH option
     public final boolean freeze;                // FREEZE option
     public final String encoding;               // ENCODING option
     public final String whereClause;            // WHERE clause for COPY TO
@@ -42,6 +44,8 @@ public final class CopyStmt implements Statement {
             String escape,
             List<String> forceQuote,
             List<String> forceNotNull,
+            List<String> forceNull,
+            boolean headerMatch,
             boolean freeze,
             String encoding,
             String whereClause,
@@ -62,6 +66,8 @@ public final class CopyStmt implements Statement {
         this.escape = escape;
         this.forceQuote = forceQuote;
         this.forceNotNull = forceNotNull;
+        this.forceNull = forceNull;
+        this.headerMatch = headerMatch;
         this.freeze = freeze;
         this.encoding = encoding;
         this.whereClause = whereClause;
@@ -76,8 +82,20 @@ public final class CopyStmt implements Statement {
                     String quote, String escape, List<String> forceQuote, List<String> forceNotNull,
                     boolean freeze, String encoding, String whereClause) {
         this(table, columns, isFrom, source, format, delimiter, nullString, header,
-             inlineData, subquery, quote, escape, forceQuote, forceNotNull, freeze, encoding,
+             inlineData, subquery, quote, escape, forceQuote, forceNotNull, null, false, freeze, encoding,
              whereClause, null, null);
+    }
+
+    /** Constructor with onError/defaultString but without forceNull/headerMatch. */
+    public CopyStmt(String table, List<String> columns, boolean isFrom, String source,
+                    String format, String delimiter, String nullString, boolean header,
+                    List<List<String>> inlineData, Statement subquery,
+                    String quote, String escape, List<String> forceQuote, List<String> forceNotNull,
+                    boolean freeze, String encoding, String whereClause,
+                    String onError, String defaultString) {
+        this(table, columns, isFrom, source, format, delimiter, nullString, header,
+             inlineData, subquery, quote, escape, forceQuote, forceNotNull, null, false, freeze, encoding,
+             whereClause, onError, defaultString);
     }
 
     /** Constructor without new options (backward-compatible). */
@@ -109,6 +127,8 @@ public final class CopyStmt implements Statement {
     public String escape() { return escape; }
     public List<String> forceQuote() { return forceQuote; }
     public List<String> forceNotNull() { return forceNotNull; }
+    public List<String> forceNull() { return forceNull; }
+    public boolean headerMatch() { return headerMatch; }
     public boolean freeze() { return freeze; }
     public String encoding() { return encoding; }
     public String whereClause() { return whereClause; }

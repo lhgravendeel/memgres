@@ -13,6 +13,7 @@ public class Sequence {
     private long minValue;
     private long maxValue;
     private boolean cycle;
+    private String dataType = "bigint";
     private int cache = 1;
     private final AtomicLong currentValue;
     private volatile boolean called = false;
@@ -126,6 +127,8 @@ public class Sequence {
     public synchronized void setMaxValue(long max) { this.maxValue = max; }
     public synchronized void setStartWith(long start) { this.startWith = start; }
     public synchronized void setCycle(boolean cycle) { this.cycle = cycle; }
+    public String getDataType() { return dataType; }
+    public void setDataType(String dataType) { this.dataType = dataType; }
     public int getCache() { return cache; }
     public synchronized void setCache(int cache) { this.cache = Math.max(1, cache); }
 }

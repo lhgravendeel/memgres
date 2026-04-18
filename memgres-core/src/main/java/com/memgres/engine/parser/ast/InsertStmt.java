@@ -82,6 +82,7 @@ public final class InsertStmt implements Statement {
         public final List<SetClause> doUpdate;
         public final Expression whereClause;
         public final List<String> conflictExpressions;
+        public final Expression doUpdateWhereClause;
 
         public OnConflict(
                 List<String> columns,
@@ -91,12 +92,25 @@ public final class InsertStmt implements Statement {
                 Expression whereClause,
                 List<String> conflictExpressions
         ) {
+            this(columns, constraint, doNothing, doUpdate, whereClause, conflictExpressions, null);
+        }
+
+        public OnConflict(
+                List<String> columns,
+                String constraint,
+                boolean doNothing,
+                List<SetClause> doUpdate,
+                Expression whereClause,
+                List<String> conflictExpressions,
+                Expression doUpdateWhereClause
+        ) {
             this.columns = columns;
             this.constraint = constraint;
             this.doNothing = doNothing;
             this.doUpdate = doUpdate;
             this.whereClause = whereClause;
             this.conflictExpressions = conflictExpressions;
+            this.doUpdateWhereClause = doUpdateWhereClause;
         }
 
         /** Convenience constructor without WHERE clause. */
@@ -114,6 +128,7 @@ public final class InsertStmt implements Statement {
         public List<SetClause> doUpdate() { return doUpdate; }
         public Expression whereClause() { return whereClause; }
         public List<String> conflictExpressions() { return conflictExpressions; }
+        public Expression doUpdateWhereClause() { return doUpdateWhereClause; }
 
         @Override
         public boolean equals(Object o) {

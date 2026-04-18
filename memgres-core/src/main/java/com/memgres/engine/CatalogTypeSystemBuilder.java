@@ -31,6 +31,7 @@ class CatalogTypeSystemBuilder {
                 col("collisdeterministic", DataType.BOOLEAN),
                 col("collencoding", DataType.INTEGER),
                 col("colllocale", DataType.TEXT),
+                col("colliculocale", DataType.TEXT),
                 col("collcollate", DataType.TEXT),
                 col("collctype", DataType.TEXT),
                 col("collversion", DataType.TEXT),
@@ -39,24 +40,37 @@ class CatalogTypeSystemBuilder {
         Table table = new Table("pg_collation", cols);
         int pgCatalogNs = oids.oid("ns:pg_catalog");
         // Built-in libc collations always present in PG
-        table.insertRow(new Object[]{ oids.oid("collation:default"), "default", pgCatalogNs, 10, "d", true, -1, null, null, null, null, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:C"), "C", pgCatalogNs, 10, "c", true, -1, null, "C", "C", null, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:POSIX"), "POSIX", pgCatalogNs, 10, "c", true, -1, null, "POSIX", "POSIX", null, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:default"), "default", pgCatalogNs, 10, "d", true, -1, null, null, null, null, null, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:C"), "C", pgCatalogNs, 10, "c", true, -1, null, null, "C", "C", null, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:POSIX"), "POSIX", pgCatalogNs, 10, "c", true, -1, null, null, "POSIX", "POSIX", null, 1 });
         // Default-shipped libc locale names. Memgres maps all of these to
         // Java's locale-aware comparison so COLLATE "en_US.utf8" never errors
         // out with 42704, even on minimal systems where the libc locale is
         // not installed. collversion is reported as a Java version tag to
         // survive information_schema.collations existence checks.
         String javaColl = "java-" + System.getProperty("java.version", "17");
-        table.insertRow(new Object[]{ oids.oid("collation:C.UTF-8"), "C.UTF-8", pgCatalogNs, 10, "c", true, 6, null, "C.UTF-8", "C.UTF-8", javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:C.utf8"), "C.utf8", pgCatalogNs, 10, "c", true, 6, null, "C.UTF-8", "C.UTF-8", javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en_US"), "en_US", pgCatalogNs, 10, "c", true, 6, null, "en_US", "en_US", javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en_US.UTF-8"), "en_US.UTF-8", pgCatalogNs, 10, "c", true, 6, null, "en_US.UTF-8", "en_US.UTF-8", javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en_US.utf8"), "en_US.utf8", pgCatalogNs, 10, "c", true, 6, null, "en_US.UTF-8", "en_US.UTF-8", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:C.UTF-8"), "C.UTF-8", pgCatalogNs, 10, "c", true, 6, null, null, "C.UTF-8", "C.UTF-8", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:C.utf8"), "C.utf8", pgCatalogNs, 10, "c", true, 6, null, null, "C.UTF-8", "C.UTF-8", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en_US"), "en_US", pgCatalogNs, 10, "c", true, 6, null, null, "en_US", "en_US", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en_US.UTF-8"), "en_US.UTF-8", pgCatalogNs, 10, "c", true, 6, null, null, "en_US.UTF-8", "en_US.UTF-8", javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en_US.utf8"), "en_US.utf8", pgCatalogNs, 10, "c", true, 6, null, null, "en_US.UTF-8", "en_US.UTF-8", javaColl, 1 });
         // ICU-provider collations (PG 10+ default on many distros)
-        table.insertRow(new Object[]{ oids.oid("collation:und-x-icu"), "und-x-icu", pgCatalogNs, 10, "i", true, -1, "und", null, null, javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en-US-x-icu"), "en-US-x-icu", pgCatalogNs, 10, "i", true, -1, "en-US", null, null, javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en-x-icu"), "en-x-icu", pgCatalogNs, 10, "i", true, -1, "en", null, null, javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:und-x-icu"), "und-x-icu", pgCatalogNs, 10, "i", true, -1, "und", "und", null, null, javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en-US-x-icu"), "en-US-x-icu", pgCatalogNs, 10, "i", true, -1, "en-US", "en-US", null, null, javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en-x-icu"), "en-x-icu", pgCatalogNs, 10, "i", true, -1, "en", "en", null, null, javaColl, 1 });
+        // User-defined collations (from CREATE COLLATION)
+        for (java.util.Map.Entry<String, Database.CollationDef> entry : database.getUserCollations().entrySet()) {
+            Database.CollationDef coll = entry.getValue();
+            int publicNs = oids.oid("ns:public");
+            String icuLocale = "i".equals(coll.provider) ? coll.locale : null;
+            table.insertRow(new Object[]{
+                    oids.oid("collation:" + coll.name), coll.name, publicNs, 10, coll.provider,
+                    coll.deterministic, 6, coll.locale, icuLocale,
+                    coll.lcCollate != null ? coll.lcCollate : coll.locale,
+                    coll.lcCtype != null ? coll.lcCtype : coll.locale,
+                    javaColl, 1
+            });
+        }
         return table;
     }
 
@@ -78,6 +92,15 @@ class CatalogTypeSystemBuilder {
         table.insertRow(new Object[]{3912, 1082, 4534, 0, 0, 0, 0}); // daterange   → date,    datemultirange
         table.insertRow(new Object[]{3908, 1114, 4535, 0, 0, 0, 0}); // tsrange     → timestamp, tsmultirange
         table.insertRow(new Object[]{3910, 1184, 4536, 0, 0, 0, 0}); // tstzrange   → timestamptz, tstzmultirange
+
+        // User-defined range types
+        for (Map.Entry<String, String> entry : database.getRangeTypes().entrySet()) {
+            String rangeName = entry.getKey();
+            String subtypeName = entry.getValue();
+            int rangeTypeOid = oids.oid("type:" + rangeName);
+            int subtypeOid = resolveTypeOid(subtypeName);
+            table.insertRow(new Object[]{rangeTypeOid, subtypeOid, 0, 0, 0, 0, 0});
+        }
         return table;
     }
 
@@ -97,6 +120,14 @@ class CatalogTypeSystemBuilder {
         Table table = new Table("pg_extension", cols);
         int pgCatalogNs = oids.oid("ns:pg_catalog");
         table.insertRow(new Object[]{oids.oid("ext:plpgsql"), "plpgsql", 10, pgCatalogNs, false, "1.0", null, null, 1});
+        // Add user-installed extensions
+        for (java.util.Map.Entry<String, String> entry : database.getInstalledExtensions().entrySet()) {
+            String extName = entry.getKey();
+            String extVersion = entry.getValue();
+            String extSchema = database.getExtensionSchema(extName);
+            int extNs = (extSchema != null) ? oids.oid("ns:" + extSchema) : pgCatalogNs;
+            table.insertRow(new Object[]{oids.oid("ext:" + extName), extName, 10, extNs, false, extVersion, null, null, 1});
+        }
         return table;
     }
 
@@ -332,6 +363,11 @@ class CatalogTypeSystemBuilder {
         };
         for (int[] c : moreExplicit) table.insertRow(new Object[]{castOid++, c[0], c[1], 0, "e", "i", 1});
 
+        // User-defined casts
+        for (Object[] uc : database.getUserDefinedCasts()) {
+            table.insertRow(new Object[]{castOid++, uc[0], uc[1], uc[2], uc[3], uc[4], 1});
+        }
+
         return table;
     }
 
@@ -349,11 +385,10 @@ class CatalogTypeSystemBuilder {
         int pgCatalogNs = oids.oid("ns:pg_catalog");
         int publicNs = oids.oid("ns:public");
 
-        // Bootstrap built-in binary operators
+        // Bootstrap built-in binary operators (non-comparison operators without type info)
         String[][] builtinBinary = {
                 {"+", "b"}, {"-", "b"}, {"*", "b"}, {"/", "b"}, {"%", "b"},
-                {"=", "b"}, {"<>", "b"}, {"!=", "b"}, {"<", "b"}, {">", "b"},
-                {"<=", "b"}, {">=", "b"}, {"||", "b"}, {"&&", "b"},
+                {"||", "b"}, {"&&", "b"},
                 {"~~", "b"}, {"!~~", "b"}, {"~~*", "b"}, {"!~~*", "b"},
                 {"~", "b"}, {"!~", "b"}, {"~*", "b"}, {"!~*", "b"},
                 {"@>", "b"}, {"<@", "b"}, {"?", "b"}, {"?|", "b"}, {"?&", "b"},
@@ -365,6 +400,29 @@ class CatalogTypeSystemBuilder {
             int opOid = oids.oid("operator:pg_catalog." + op[0]);
             table.insertRow(new Object[]{opOid, op[0], pgCatalogNs, 10,
                     op[1], 0, 0, 0, 0, 0, 0, 0, 0, false, false, 1});
+        }
+
+        // Comparison operators with int4 type info and non-zero oprcode.
+        // The generic versions (=, <>, !=, <, >, <=, >=) are emitted here with
+        // oprleft/oprright pointing to int4 (OID 23) so queries like
+        // "SELECT ... FROM pg_operator WHERE oprname='=' AND oprleft=23" work.
+        // Format: {oprname, oprleft, oprright, oprresult, oprcodeFuncName}
+        String[][] compOps = {
+                {"=",  "23", "23", "16", "int4eq"},
+                {"<>", "23", "23", "16", "int4ne"},
+                {"!=", "23", "23", "16", "int4ne"},
+                {"<",  "23", "23", "16", "int4lt"},
+                {">",  "23", "23", "16", "int4gt"},
+                {"<=", "23", "23", "16", "int4le"},
+                {">=", "23", "23", "16", "int4ge"},
+        };
+        for (String[] top : compOps) {
+            int topOid = oids.oid("operator:pg_catalog." + top[0]);
+            int opcodeOid = oids.oid("proc:" + top[4]);
+            table.insertRow(new Object[]{topOid, top[0], pgCatalogNs, 10,
+                    "b", Integer.parseInt(top[1]), Integer.parseInt(top[2]), Integer.parseInt(top[3]),
+                    opcodeOid, 0, 0, 0, 0,
+                    "=".equals(top[0]), "=".equals(top[0]), 1});
         }
 
         // User-defined operators
@@ -500,6 +558,29 @@ class CatalogTypeSystemBuilder {
         table.insertRow(new Object[]{oids.oid("opclass:hash_bool_ops"), "bool_ops", pgCatalogNs, 10,
                 oids.oid("opfamily:hash_bool_ops"), DataType.BOOLEAN.getOid(), 0, true, 405, 1});
 
+        // text_pattern_ops (btree, non-default for text)
+        table.insertRow(new Object[]{oids.oid("opclass:text_pattern_ops"), "text_pattern_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:text_pattern_ops"), DataType.TEXT.getOid(), 0, false, 403, 1});
+        // varchar_pattern_ops (btree, non-default for varchar)
+        table.insertRow(new Object[]{oids.oid("opclass:varchar_pattern_ops"), "varchar_pattern_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:text_pattern_ops"), DataType.VARCHAR.getOid(), 0, false, 403, 1});
+
+        // GIN operator classes
+        table.insertRow(new Object[]{oids.oid("opclass:gin_tsvector_ops"), "tsvector_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:gin_tsvector_ops"), oids.oid("type:tsvector"), 0, true, 2742, 1});
+        table.insertRow(new Object[]{oids.oid("opclass:gin_jsonb_ops"), "jsonb_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:gin_jsonb_ops"), DataType.JSONB.getOid(), 0, true, 2742, 1});
+        table.insertRow(new Object[]{oids.oid("opclass:gin_array_ops"), "array_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:gin_array_ops"), 0, 0, true, 2742, 1});
+
+        // GIST operator classes
+        table.insertRow(new Object[]{oids.oid("opclass:gist_point_ops"), "point_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:gist_point_ops"), oids.oid("type:point"), 0, true, 783, 1});
+        table.insertRow(new Object[]{oids.oid("opclass:gist_box_ops"), "box_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:gist_box_ops"), oids.oid("type:box"), 0, true, 783, 1});
+        table.insertRow(new Object[]{oids.oid("opclass:gist_inet_ops"), "inet_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:gist_inet_ops"), oids.oid("type:inet"), 0, false, 783, 1});
+
         // User-defined operator classes
         int publicNsOpc = oids.oid("ns:public");
         for (Map.Entry<String, PgOperatorClass> entry : database.getUserOperatorClasses().entrySet()) {
@@ -541,6 +622,16 @@ class CatalogTypeSystemBuilder {
         table.insertRow(new Object[]{oids.oid("opfamily:hash_integer_ops"), "integer_ops", pgCatalogNs, 10, 405, 1});
         table.insertRow(new Object[]{oids.oid("opfamily:hash_text_ops"), "text_ops", pgCatalogNs, 10, 405, 1});
         table.insertRow(new Object[]{oids.oid("opfamily:hash_bool_ops"), "bool_ops", pgCatalogNs, 10, 405, 1});
+        // Pattern ops families
+        table.insertRow(new Object[]{oids.oid("opfamily:text_pattern_ops"), "text_pattern_ops", pgCatalogNs, 10, 403, 1});
+        // GIN operator families
+        table.insertRow(new Object[]{oids.oid("opfamily:gin_tsvector_ops"), "tsvector_ops", pgCatalogNs, 10, 2742, 1});
+        table.insertRow(new Object[]{oids.oid("opfamily:gin_jsonb_ops"), "jsonb_ops", pgCatalogNs, 10, 2742, 1});
+        table.insertRow(new Object[]{oids.oid("opfamily:gin_array_ops"), "array_ops", pgCatalogNs, 10, 2742, 1});
+        // GIST operator families
+        table.insertRow(new Object[]{oids.oid("opfamily:gist_point_ops"), "point_ops", pgCatalogNs, 10, 783, 1});
+        table.insertRow(new Object[]{oids.oid("opfamily:gist_box_ops"), "box_ops", pgCatalogNs, 10, 783, 1});
+        table.insertRow(new Object[]{oids.oid("opfamily:gist_inet_ops"), "inet_ops", pgCatalogNs, 10, 783, 1});
 
         // User-defined operator families
         int publicNsOpf = oids.oid("ns:public");
@@ -571,6 +662,27 @@ class CatalogTypeSystemBuilder {
                 col("aggcombinefn", DataType.INTEGER), col("aggserialfn", DataType.INTEGER),
                 col("aggdeserialfn", DataType.INTEGER), col("xmin", DataType.INTEGER));
         Table table = new Table("pg_aggregate", cols);
+
+        // Built-in aggregate entries (matching pg_proc built-in aggregate functions)
+        String[] builtinAggs = {"count", "sum", "avg", "min", "max", "array_agg",
+                "string_agg", "bool_and", "bool_or", "every", "json_agg", "jsonb_agg",
+                "json_object_agg", "jsonb_object_agg", "xmlagg", "bit_and", "bit_or"};
+        for (String aggName : builtinAggs) {
+            int aggOid = oids.oid("proc:" + aggName);
+            table.insertRow(new Object[]{
+                    aggOid, 0,         // aggfnoid, aggtransfn
+                    0, 0,              // aggtranstype, aggfinalfn
+                    null, 0,           // agginitval, aggsortop
+                    false, 0,          // aggfinalextra, aggtransspace
+                    0, 0,              // aggmtransfn, aggminvtransfn
+                    0, 0,              // aggmtranstype, aggmtransspace
+                    0, false,          // aggmfinalfn, aggmfinalextra
+                    null, "n",         // aggminitval, aggkind (normal)
+                    (short) 0,         // aggnumdirectargs
+                    0, 0,              // aggcombinefn, aggserialfn
+                    0, 1               // aggdeserialfn, xmin
+            });
+        }
 
         // Populate with user-defined aggregates
         for (Map.Entry<String, PgAggregate> entry : database.getUserAggregates().entrySet()) {
@@ -610,8 +722,25 @@ class CatalogTypeSystemBuilder {
                 colNN("oid", DataType.INTEGER), col("amopfamily", DataType.INTEGER),
                 col("amoplefttype", DataType.INTEGER), col("amoprighttype", DataType.INTEGER),
                 col("amopstrategy", DataType.SMALLINT), col("amopopr", DataType.INTEGER),
-                col("amopsortfamily", DataType.INTEGER), col("xmin", DataType.INTEGER));
-        return new Table("pg_amop", cols);
+                col("amopmethod", DataType.INTEGER), col("amopsortfamily", DataType.INTEGER),
+                col("xmin", DataType.INTEGER));
+        Table table = new Table("pg_amop", cols);
+        int btreeAm = 403;
+        int int4Type = 23;
+        int textType = 25;
+        // btree integer_ops: strategies 1-5 (less, leq, eq, geq, gt)
+        int intFamOid = oids.oid("opfamily:integer_ops");
+        for (short strat = 1; strat <= 5; strat++) {
+            table.insertRow(new Object[]{oids.oid("amop:int:" + strat), intFamOid,
+                    int4Type, int4Type, strat, 0, btreeAm, 0, 1});
+        }
+        // btree text_ops: strategies 1-5
+        int textFamOid = oids.oid("opfamily:text_ops");
+        for (short strat = 1; strat <= 5; strat++) {
+            table.insertRow(new Object[]{oids.oid("amop:text:" + strat), textFamOid,
+                    textType, textType, strat, 0, btreeAm, 0, 1});
+        }
+        return table;
     }
 
     Table buildPgAmproc() {
@@ -620,6 +749,17 @@ class CatalogTypeSystemBuilder {
                 col("amproclefttype", DataType.INTEGER), col("amprocrighttype", DataType.INTEGER),
                 col("amprocnum", DataType.SMALLINT), col("amproc", DataType.INTEGER),
                 col("xmin", DataType.INTEGER));
-        return new Table("pg_amproc", cols);
+        Table table = new Table("pg_amproc", cols);
+        int int4Type = 23;
+        int textType = 25;
+        // btree support functions: procnum 1 = compare function
+        // Use btree AM OID (403) as amprocfamily for stub compatibility with
+        // simple joins like JOIN pg_am ON am.oid = amprocfamily
+        int btreeAm = 403;
+        table.insertRow(new Object[]{oids.oid("amproc:int:1"), btreeAm,
+                int4Type, int4Type, (short) 1, 0, 1});
+        table.insertRow(new Object[]{oids.oid("amproc:text:1"), btreeAm,
+                textType, textType, (short) 1, 0, 1});
+        return table;
     }
 }

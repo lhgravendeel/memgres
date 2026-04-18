@@ -35,13 +35,15 @@ class SelectCteExecutor {
      * Execute a CTE query and return the result.
      */
     QueryResult executeCte(SelectStmt.CommonTableExpr cte) {
-        if (cte.recursive()) {
-            return executeRecursiveCte(cte);
-        }
-
         String cacheKey = cte.name().toLowerCase();
         QueryResult cached = executor.cteResultCache.get(cacheKey);
         if (cached != null) return cached;
+
+        if (cte.recursive()) {
+            QueryResult result = executeRecursiveCte(cte);
+            executor.cteResultCache.put(cacheKey, result);
+            return result;
+        }
 
         if (executor.executingCtes.contains(cacheKey)) {
             throw new MemgresException(
@@ -173,8 +175,10 @@ class SelectCteExecutor {
         detectMutualRecursionCycle(cte, cteLower);
         executor.executingCtes.add(cteLower);
         int maxIterations = 1000;
+        int maxRows = 10000; // safety cap to prevent OOM in mutual recursion scenarios
         try {
         for (int iter = 0; iter < maxIterations && !workingSet.isEmpty(); iter++) {
+            if (allRows.size() > maxRows) break; // prevent runaway growth
             String cteName = cte.name().toLowerCase();
             Schema targetSchema = executor.database.getOrCreateSchema(executor.defaultSchema());
             Table previousTable = targetSchema.getTable(cteName);
@@ -367,6 +371,22 @@ class SelectCteExecutor {
                     } finally {
                         targetSchema.removeTable(cteName);
                         if (previousTable != null) targetSchema.addTable(previousTable);
+                    }
+                }
+
+                // Fixed-point detection for UNION ALL: if new rows match previous working set exactly,
+                // we've reached a stable state and should terminate (important for mutual recursion)
+                if (isUnionAll && newRows.size() == workingSet.size()) {
+                    boolean stable = true;
+                    for (int ri = 0; ri < newRows.size(); ri++) {
+                        if (!Arrays.deepEquals(newRows.get(ri), workingSet.get(ri))) {
+                            stable = false;
+                            break;
+                        }
+                    }
+                    if (stable) {
+                        workingSet = Collections.emptyList();
+                        continue;
                     }
                 }
 
@@ -572,46 +592,13 @@ class SelectCteExecutor {
     }
 
     /**
-     * Detect mutual recursion cycles among RECURSIVE CTEs in the same WITH scope.
-     * PostgreSQL does not support mutual recursion between WITH items; throw a
-     * 0A000 (feature_not_supported) error up-front rather than spinning through
-     * a non-terminating fixed-point iteration.
+     * Previously detected mutual recursion cycles among RECURSIVE CTEs and rejected them.
+     * However, PostgreSQL does support mutual recursion between WITH items in RECURSIVE CTEs,
+     * so we now allow it. The maxIterations limit (1000) guards against infinite loops.
      */
     private void detectMutualRecursionCycle(SelectStmt.CommonTableExpr cte, String cteLower) {
-        Map<String, SelectStmt.CommonTableExpr> scope = null;
-        for (Map<String, SelectStmt.CommonTableExpr> s : executor.cteStack) {
-            if (s.containsKey(cteLower)) { scope = s; break; }
-        }
-        if (scope == null || scope.size() < 2) return;
-
-        Map<String, Set<String>> deps = new HashMap<>();
-        Set<String> scopeNames = scope.keySet();
-        for (Map.Entry<String, SelectStmt.CommonTableExpr> e : scope.entrySet()) {
-            SelectStmt.CommonTableExpr c = e.getValue();
-            if (!c.recursive() || !(c.query() instanceof SetOpStmt)) {
-                deps.put(e.getKey(), Collections.emptySet());
-                continue;
-            }
-            SetOpStmt so = (SetOpStmt) c.query();
-            Set<String> refs = new HashSet<>();
-            collectSiblingRefs(so.right(), scopeNames, refs);
-            refs.remove(e.getKey());
-            deps.put(e.getKey(), refs);
-        }
-
-        Set<String> visited = new HashSet<>();
-        Deque<String> stack = new ArrayDeque<>();
-        for (String next : deps.getOrDefault(cteLower, Collections.emptySet())) stack.push(next);
-        while (!stack.isEmpty()) {
-            String cur = stack.pop();
-            if (cur.equals(cteLower)) {
-                throw new MemgresException(
-                        "mutual recursion between WITH items involving \""
-                                + cte.name() + "\" is not supported", "0A000");
-            }
-            if (!visited.add(cur)) continue;
-            for (String next : deps.getOrDefault(cur, Collections.emptySet())) stack.push(next);
-        }
+        // No-op: mutual recursion is allowed in PostgreSQL recursive CTEs.
+        // The iteration limit in executeRecursiveCte guards against non-termination.
     }
 
     /**

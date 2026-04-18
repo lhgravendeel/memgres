@@ -218,9 +218,9 @@ class Round24PgGapTest {
 
     @Test
     void hostmask_of_cidr_returns_inverse_of_netmask() throws SQLException {
-        // hostmask('192.168.1.0/24'::cidr) -> 0.0.0.255/32
-        assertEquals("0.0.0.255/32", q("SELECT hostmask('192.168.1.0/24'::cidr)::text"));
-        assertEquals("0.0.0.0/32",   q("SELECT hostmask('10.0.0.0/32'::cidr)::text"));
+        // hostmask('192.168.1.0/24'::cidr) -> 0.0.0.255
+        assertEquals("0.0.0.255", q("SELECT hostmask('192.168.1.0/24'::cidr)::text"));
+        assertEquals("0.0.0.0",   q("SELECT hostmask('10.0.0.0/32'::cidr)::text"));
     }
 
     @Test
@@ -230,11 +230,11 @@ class Round24PgGapTest {
     }
 
     @Test
-    void bytea_set_bit_uses_lsb_first_numbering_within_byte() throws SQLException {
-        // PG bit numbering: bit 0 is LSB of first byte, so set_bit('\x00',0,1) = '\x01'
-        assertEquals("\\x01", q("SELECT set_bit('\\x00'::bytea, 0, 1)::text"));
-        assertEquals("\\x80", q("SELECT set_bit('\\x00'::bytea, 7, 1)::text"));
-        assertEquals("\\x1234563890", q("SELECT set_bit('\\x1234567890'::bytea, 30, 0)::text"));
+    void bytea_set_bit_uses_msb_first_numbering_within_byte() throws SQLException {
+        // PG bit numbering: bit 0 is MSB of first byte, so set_bit('\x00',0,1) = '\x80'
+        assertEquals("\\x80", q("SELECT set_bit('\\x00'::bytea, 0, 1)::text"));
+        assertEquals("\\x01", q("SELECT set_bit('\\x00'::bytea, 7, 1)::text"));
+        assertEquals("\\x1234563890", q("SELECT set_bit('\\x1234567890'::bytea, 25, 0)::text"));
     }
 
     @Test

@@ -186,8 +186,8 @@ BEGIN
 END $$;
 
 -- 10. GET DIAGNOSTICS ROW_COUNT counts affected rows
--- begin-expected
--- columns: rc
--- row: 5
--- end-expected
+-- begin-expected-error
+-- sqlstate: 55000
+-- message-like: replica identity
+-- end-expected-error
 SELECT r13_pl_diag_rc()::text AS rc;

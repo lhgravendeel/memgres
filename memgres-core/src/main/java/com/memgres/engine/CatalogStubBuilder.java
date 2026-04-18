@@ -115,9 +115,11 @@ class CatalogStubBuilder {
             }
             boolean isUnique = database.isUniqueIndex(indexName);
             String method = database.getIndexMethod(indexName);
-            String indexDef = "CREATE " + (isUnique ? "UNIQUE " : "") + "INDEX " + indexName
-                    + " ON " + (tableName != null ? tableName : "unknown")
-                    + " USING " + method + " (" + String.join(", ", indexCols) + ")";
+            String indexDef = buildIndexDef(indexName, tableName, isUnique, method,
+                    indexCols, database.getIndexColumnOptions(indexName),
+                    database.getIndexIncludeColumns(indexName),
+                    database.isIndexNullsNotDistinct(indexName),
+                    database.getIndexWhereClause(indexName));
             table.insertRow(new Object[]{schemaName, tableName, indexName, null, indexDef});
             addedIndexes.add(indexName.toLowerCase());
         }
@@ -142,6 +144,53 @@ class CatalogStubBuilder {
             }
         }
         return table;
+    }
+
+    /**
+     * Build the CREATE INDEX definition string including all PG options:
+     * opclass, DESC, NULLS FIRST/LAST, INCLUDE, NULLS NOT DISTINCT, WHERE.
+     */
+    static String buildIndexDef(String indexName, String tableName, boolean isUnique,
+                                String method, List<String> indexCols, List<String> columnOptions,
+                                List<String> includeColumns, boolean nullsNotDistinct, String whereClause) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("CREATE ").append(isUnique ? "UNIQUE " : "").append("INDEX ").append(indexName)
+          .append(" ON ").append(tableName != null ? tableName : "unknown")
+          .append(" USING ").append(method != null ? method : "btree").append(" (");
+        for (int i = 0; i < indexCols.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(indexCols.get(i));
+            if (columnOptions != null && i < columnOptions.size()) {
+                String opts = columnOptions.get(i);
+                if (opts != null && !opts.isEmpty()) {
+                    // Parse stored options: "opclass:xxx DESC NULLS FIRST"
+                    for (String part : opts.split(" ")) {
+                        if (part.startsWith("opclass:")) {
+                            sb.append(' ').append(part.substring(8));
+                        } else if ("DESC".equals(part)) {
+                            sb.append(" DESC");
+                        } else if ("NULLS".equals(part)) {
+                            // Will be followed by FIRST or LAST
+                        } else if ("FIRST".equals(part)) {
+                            sb.append(" NULLS FIRST");
+                        } else if ("LAST".equals(part)) {
+                            sb.append(" NULLS LAST");
+                        }
+                    }
+                }
+            }
+        }
+        sb.append(')');
+        if (includeColumns != null && !includeColumns.isEmpty()) {
+            sb.append(" INCLUDE (").append(String.join(", ", includeColumns)).append(')');
+        }
+        if (nullsNotDistinct) {
+            sb.append(" NULLS NOT DISTINCT");
+        }
+        if (whereClause != null && !whereClause.isEmpty()) {
+            sb.append(" WHERE ").append(whereClause);
+        }
+        return sb.toString();
     }
 
     Table buildPgSequence() {
@@ -189,7 +238,8 @@ class CatalogStubBuilder {
                 col("max_value", DataType.BIGINT),
                 col("increment_by", DataType.BIGINT),
                 col("cache_size", DataType.BIGINT),
-                col("cycle", DataType.BOOLEAN)
+                col("cycle", DataType.BOOLEAN),
+                col("last_value", DataType.BIGINT)
         );
         Table table = new Table("pg_sequences", cols);
         for (String seqName : getSequenceNames(database)) {
@@ -215,10 +265,11 @@ class CatalogStubBuilder {
             long incrementBy = seq != null ? seq.getIncrementBy() : 1L;
             boolean cycle = seq != null && seq.isCycle();
             long cacheSize = seq != null ? (long) seq.getCache() : 1L;
+            Long lastValue = (seq != null && seq.isCalled()) ? seq.currValRaw() : null;
             table.insertRow(new Object[]{
                     "public", seqName, "memgres", typeName,
                     startWith, minValue, maxValue,
-                    incrementBy, cacheSize, cycle
+                    incrementBy, cacheSize, cycle, lastValue
             });
         }
         return table;
@@ -260,6 +311,8 @@ class CatalogStubBuilder {
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 Table t = tableEntry.getValue();
+                String lastVac = formatTimestamptz(t.getLastVacuum());
+                String lastAna = formatTimestamptz(t.getLastAnalyze());
                 table.insertRow(new Object[]{
                         oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName()),
                         schemaEntry.getKey(), t.getName(),
@@ -267,7 +320,7 @@ class CatalogStubBuilder {
                         t.getTupInserted(), t.getTupUpdated(), t.getTupDeleted(), 0L, // ins, upd, del, hot_upd
                         (long) t.getRows().size(), 0L, // live, dead
                         0L, 0L,                        // mod_since_analyze, ins_since_vacuum
-                        null, null, null, null,         // last vacuum/analyze
+                        lastVac, null, lastAna, null,   // last vacuum/analyze
                         0L, 0L, 0L, 0L                 // counts
                 });
             }
@@ -285,7 +338,9 @@ class CatalogStubBuilder {
                 col("idx_scan", DataType.BIGINT),
                 col("last_idx_scan", DataType.TIMESTAMPTZ),
                 col("idx_tup_read", DataType.BIGINT),
-                col("idx_tup_fetch", DataType.BIGINT)
+                col("idx_tup_fetch", DataType.BIGINT),
+                col("idx_blks_read", DataType.BIGINT),
+                col("idx_blks_hit", DataType.BIGINT)
         );
         Table table = new Table("pg_stat_user_indexes", cols);
         // Track which indexes we've already added (to avoid duplicates)
@@ -303,11 +358,18 @@ class CatalogStubBuilder {
             }
             if (tableName != null) {
                 addedIndexes.add(indexName.toLowerCase());
+                long idxScan = 0L;
+                Schema sch = database.getSchemas().get(indexSchema);
+                if (sch != null) {
+                    Table tbl = sch.getTable(tableName);
+                    if (tbl != null) idxScan = tbl.getIdxScanCount();
+                }
                 table.insertRow(new Object[]{
                         oids.oid("rel:" + indexSchema + "." + tableName),
                         oids.oid("rel:" + indexSchema + "." + indexName),
                         indexSchema, tableName, indexName,
-                        0L, null, 0L, 0L
+                        idxScan, null, 0L, 0L,
+                        0L, 0L
                 });
             }
         }
@@ -324,7 +386,8 @@ class CatalogStubBuilder {
                                 oids.oid("rel:" + schemaName + "." + t.getName()),
                                 oids.oid("rel:" + schemaName + "." + constraintName),
                                 schemaName, t.getName(), constraintName,
-                                0L, null, 0L, 0L
+                                t.getIdxScanCount(), null, 0L, 0L,
+                                0L, 0L
                         });
                     }
                 }
@@ -362,7 +425,8 @@ class CatalogStubBuilder {
                 col("sessions_abandoned", DataType.BIGINT),
                 col("sessions_fatal", DataType.BIGINT),
                 col("sessions_killed", DataType.BIGINT),
-                col("stats_reset", DataType.TIMESTAMPTZ)
+                col("stats_reset", DataType.TIMESTAMPTZ),
+                col("parallel_workers_launched", DataType.BIGINT)
         );
         Table table = new Table("pg_stat_database", cols);
         int numBackends = database.getActiveSessions().size();
@@ -373,7 +437,8 @@ class CatalogStubBuilder {
                 0.0, 0.0,   // blk_read_time, blk_write_time
                 0.0, 0.0, 0.0, // session_time, active_time, idle_in_transaction_time
                 (long) numBackends, 0L, 0L, 0L, // sessions, abandoned, fatal, killed
-                null
+                null,
+                0L           // parallel_workers_launched
         });
         return table;
     }
@@ -770,6 +835,14 @@ class CatalogStubBuilder {
         int pgCatNs = oids.oid("ns:pg_catalog");
         table.insertRow(new Object[]{3765, "simple", pgCatNs, 10, 3727, null});
         table.insertRow(new Object[]{12676, "english_stem", pgCatNs, 10, 3726, "language = 'english'"});
+        // User-created text search dictionaries
+        int oidCounter = 91000;
+        int publicNs = oids.oid("ns:public");
+        for (Map.Entry<String, Database.TsDictDef> entry : database.getTsDicts().entrySet()) {
+            Database.TsDictDef dict = entry.getValue();
+            int tmplOid = "simple".equalsIgnoreCase(dict.template) ? 3727 : 3726;
+            table.insertRow(new Object[]{oidCounter++, dict.name.toLowerCase(), publicNs, 10, tmplOid, dict.options});
+        }
         return table;
     }
 
@@ -785,6 +858,7 @@ class CatalogStubBuilder {
         int pgCatNs = oids.oid("ns:pg_catalog");
         table.insertRow(new Object[]{3727, "simple", pgCatNs, 0, 0});
         table.insertRow(new Object[]{3726, "snowball", pgCatNs, 0, 0});
+        table.insertRow(new Object[]{3730, "synonym", pgCatNs, 0, 0});
         return table;
     }
 
@@ -800,6 +874,13 @@ class CatalogStubBuilder {
         int pgCatNs = oids.oid("ns:pg_catalog");
         table.insertRow(new Object[]{3748, "simple", pgCatNs, 10, 3722});
         table.insertRow(new Object[]{3764, "english", pgCatNs, 10, 3722});
+        // User-created text search configurations
+        int oidCounter = 90000;
+        for (Map.Entry<String, Database.TsConfigDef> entry : database.getTsConfigs().entrySet()) {
+            Database.TsConfigDef cfg = entry.getValue();
+            int publicNs = oids.oid("ns:public");
+            table.insertRow(new Object[]{oidCounter++, cfg.name.toLowerCase(), publicNs, 10, 3722});
+        }
         return table;
     }
 
@@ -810,7 +891,53 @@ class CatalogStubBuilder {
                 colNN("mapseqno", DataType.INTEGER),
                 colNN("mapdict", DataType.INTEGER)
         );
-        return new Table("pg_ts_config_map", cols);
+        Table table = new Table("pg_ts_config_map", cols);
+        // Default mappings for 'english' config (OID 3764)
+        // Map common token types to english_stem dictionary (OID 12676)
+        table.insertRow(new Object[]{3764, 1, 1, 12676}); // asciiword
+        table.insertRow(new Object[]{3764, 2, 1, 12676}); // word
+        // User-created config mappings
+        int oidCounter = 90000;
+        for (Map.Entry<String, String> entry : database.getTsConfigMaps().entrySet()) {
+            String[] keyParts = entry.getKey().split("\0", 2);
+            String cfgName = keyParts[0];
+            String tokenType = keyParts[1];
+            // Look up config OID
+            int cfgOid = findTsConfigOid(cfgName, oidCounter);
+            // Map token type name to an integer
+            int tokenTypeId = mapTokenTypeName(tokenType);
+            table.insertRow(new Object[]{cfgOid, tokenTypeId, 1, 3765});
+        }
+        return table;
+    }
+
+    private int findTsConfigOid(String cfgName, int startOid) {
+        if ("simple".equalsIgnoreCase(cfgName)) return 3748;
+        if ("english".equalsIgnoreCase(cfgName)) return 3764;
+        int oid = 90000;
+        for (String key : database.getTsConfigs().keySet()) {
+            if (key.equalsIgnoreCase(cfgName)) return oid;
+            oid++;
+        }
+        return startOid;
+    }
+
+    private int mapTokenTypeName(String name) {
+        switch (name.toLowerCase()) {
+            case "asciiword": return 1;
+            case "word": return 2;
+            case "numword": return 3;
+            case "email": return 4;
+            case "url": return 5;
+            case "host": return 6;
+            case "sfloat": return 7;
+            case "version": return 8;
+            case "hyphword": return 9;
+            case "numhword": return 10;
+            case "asciihword": return 11;
+            case "blank": return 12;
+            default: return 1;
+        }
     }
 
     // ---------------------------------------------------------------
@@ -933,7 +1060,176 @@ class CatalogStubBuilder {
                 col("stxkind", DataType.TEXT),
                 col("stxstattarget", DataType.INTEGER)
         );
-        return new Table("pg_statistic_ext", cols);
+        Table table = new Table("pg_statistic_ext", cols);
+        int pgCatalogNs = oids.oid("ns:public");
+        for (ExtendedStatistic es : database.getAllExtendedStatistics().values()) {
+            int statOid = oids.oid("stat:" + es.getName());
+            int relOid = oids.oid("rel:public." + es.getTableName());
+            // Build stxkeys as space-separated attnum list (simplified: use 1-based column indices)
+            StringBuilder keys = new StringBuilder();
+            Table refTable = null;
+            for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
+                refTable = se.getValue().getTable(es.getTableName());
+                if (refTable != null) break;
+            }
+            for (int i = 0; i < es.getColumns().size(); i++) {
+                if (i > 0) keys.append(" ");
+                String colName = es.getColumns().get(i);
+                int attnum = i + 1;
+                if (refTable != null && !colName.startsWith("(")) {
+                    int idx = refTable.getColumnIndex(colName);
+                    if (idx >= 0) attnum = idx + 1;
+                }
+                keys.append(attnum);
+            }
+            // Build stxkind as char array string, e.g., "{d,f,m}"
+            StringBuilder kindStr = new StringBuilder("{");
+            if (es.getKinds().isEmpty()) {
+                kindStr.append("d,f,m"); // default: all kinds
+            } else {
+                for (int i = 0; i < es.getKinds().size(); i++) {
+                    if (i > 0) kindStr.append(",");
+                    String k = es.getKinds().get(i);
+                    switch (k) {
+                        case "ndistinct": kindStr.append("d"); break;
+                        case "dependencies": kindStr.append("f"); break;
+                        case "mcv": kindStr.append("m"); break;
+                        default: kindStr.append(k.charAt(0)); break;
+                    }
+                }
+            }
+            kindStr.append("}");
+            table.insertRow(new Object[]{
+                    statOid, relOid, es.getName(), pgCatalogNs,
+                    10, // stxowner (superuser)
+                    keys.toString(),
+                    kindStr.toString(),
+                    es.getStattarget()
+            });
+        }
+        return table;
+    }
+
+    Table buildPgStatisticExtData() {
+        List<Column> cols = Cols.listOf(
+                colNN("stxoid", DataType.INTEGER),
+                col("stxdndistinct", DataType.TEXT),
+                col("stxddependencies", DataType.TEXT),
+                col("stxdmcv", DataType.BYTEA),
+                col("stxdexpr", DataType.TEXT)
+        );
+        Table table = new Table("pg_statistic_ext_data", cols);
+        for (ExtendedStatistic es : database.getAllExtendedStatistics().values()) {
+            if (es.isAnalyzed()) {
+                int statOid = oids.oid("stat:" + es.getName());
+                table.insertRow(new Object[]{
+                        statOid, null, null, null, null
+                });
+            }
+        }
+        return table;
+    }
+
+    Table buildPgStats() {
+        List<Column> cols = Cols.listOf(
+                col("schemaname", DataType.TEXT),
+                col("tablename", DataType.TEXT),
+                col("attname", DataType.TEXT),
+                col("inherited", DataType.BOOLEAN),
+                col("null_frac", DataType.REAL),
+                col("avg_width", DataType.INTEGER),
+                col("n_distinct", DataType.REAL),
+                col("most_common_vals", DataType.TEXT),
+                col("most_common_freqs", DataType.TEXT),
+                col("histogram_bounds", DataType.TEXT),
+                col("correlation", DataType.REAL),
+                col("most_common_elems", DataType.TEXT),
+                col("most_common_elem_freqs", DataType.TEXT),
+                col("elem_count_histogram", DataType.TEXT)
+        );
+        Table table = new Table("pg_stats", cols);
+        // Populate stats for all analyzed tables
+        for (String schemaTable : database.getAnalyzedTables()) {
+            String[] parts = schemaTable.split("\\.", 2);
+            if (parts.length != 2) continue;
+            String schemaName = parts[0];
+            String tableName = parts[1];
+            Schema schema = database.getSchema(schemaName);
+            if (schema == null) continue;
+            Table srcTable = schema.getTable(tableName);
+            if (srcTable == null) continue;
+            for (Column col : srcTable.getColumns()) {
+                // Compute basic statistics from table data
+                java.util.Set<Object> distinctVals = new java.util.HashSet<>();
+                int nullCount = 0;
+                long totalWidth = 0;
+                int colIdx = srcTable.getColumnIndex(col.getName());
+                for (Object[] row : srcTable.getRows()) {
+                    Object val = (colIdx >= 0 && colIdx < row.length) ? row[colIdx] : null;
+                    if (val == null) {
+                        nullCount++;
+                    } else {
+                        distinctVals.add(val);
+                        totalWidth += val.toString().length();
+                    }
+                }
+                int totalRows = srcTable.getRows().size();
+                float nullFrac = totalRows > 0 ? (float) nullCount / totalRows : 0f;
+                int avgWidth = (totalRows - nullCount) > 0 ? (int) (totalWidth / (totalRows - nullCount)) : 0;
+                float nDistinct = distinctVals.size();
+                table.insertRow(new Object[]{
+                        schemaName, tableName, col.getName(), false,
+                        nullFrac, avgWidth, nDistinct,
+                        null, null, null, 0.0f, null, null, null
+                });
+            }
+        }
+        return table;
+    }
+
+    Table buildPgStatsExt() {
+        List<Column> cols = Cols.listOf(
+                col("schemaname", DataType.TEXT),
+                col("tablename", DataType.TEXT),
+                col("statistics_name", DataType.TEXT),
+                col("attnames", DataType.TEXT),
+                col("kinds", DataType.TEXT),
+                col("exprs", DataType.TEXT)
+        );
+        Table table = new Table("pg_stats_ext", cols);
+        for (ExtendedStatistic es : database.getAllExtendedStatistics().values()) {
+            // Find schema for the table
+            String schemaName = "public";
+            for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
+                if (se.getValue().getTable(es.getTableName()) != null) {
+                    schemaName = se.getKey();
+                    break;
+                }
+            }
+            // Build attnames as PG array string
+            StringBuilder attnames = new StringBuilder("{");
+            for (int i = 0; i < es.getColumns().size(); i++) {
+                if (i > 0) attnames.append(",");
+                attnames.append(es.getColumns().get(i));
+            }
+            attnames.append("}");
+            // Build kinds as PG array string
+            StringBuilder kinds = new StringBuilder("{");
+            for (int i = 0; i < es.getKinds().size(); i++) {
+                if (i > 0) kinds.append(",");
+                kinds.append(es.getKinds().get(i));
+            }
+            kinds.append("}");
+            table.insertRow(new Object[]{
+                    schemaName,
+                    es.getTableName(),
+                    es.getName(),
+                    attnames.toString(),
+                    kinds.toString(),
+                    null // exprs
+            });
+        }
+        return table;
     }
 
     Table buildPgPublicationRel() {
@@ -944,7 +1240,16 @@ class CatalogStubBuilder {
                 col("prqual", DataType.TEXT),
                 col("prattrs", DataType.TEXT)
         );
-        return new Table("pg_publication_rel", cols);
+        Table table = new Table("pg_publication_rel", cols);
+        int seq = 60000;
+        for (Database.PubDef pub : database.getPublications().values()) {
+            int pubOid = oids.oid("pub:" + pub.name);
+            for (String tblName : pub.tables) {
+                int relOid = oids.oid("rel:public." + tblName);
+                table.insertRow(new Object[]{ seq++, pubOid, relOid, null, null });
+            }
+        }
+        return table;
     }
 
     Table buildPgPublicationNamespace() {
@@ -1055,6 +1360,21 @@ class CatalogStubBuilder {
                 }
             }
         }
+        // Index inheritance from ALTER INDEX ... ATTACH PARTITION
+        for (Map.Entry<String, String> entry : database.getIndexParentMap().entrySet()) {
+            String childIdx = entry.getKey();
+            String parentIdx = entry.getValue();
+            // Resolve OIDs for child and parent indexes
+            int childOid = 0;
+            int parentOid = 0;
+            for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
+                if (childOid == 0) childOid = oids.oid("rel:" + se.getKey() + "." + childIdx);
+                if (parentOid == 0) parentOid = oids.oid("rel:" + se.getKey() + "." + parentIdx);
+            }
+            if (childOid != 0 && parentOid != 0) {
+                table.insertRow(new Object[]{ childOid, parentOid, 1, false });
+            }
+        }
         return table;
     }
 
@@ -1077,13 +1397,45 @@ class CatalogStubBuilder {
         return new Table("pg_event_trigger", cols);
     }
 
+    Table buildPgEventTriggerPopulated() {
+        Table table = buildPgEventTrigger();
+        int seq = 50000;
+        for (PgEventTrigger et : database.getAllEventTriggers().values()) {
+            int etOid = oids.oid("evttrigger:" + et.getName());
+            if (etOid == 0) etOid = seq++;
+            // Resolve function OID
+            int funcOid = oids.oid("func:" + et.getFunctionName());
+            String tagsStr = null;
+            if (et.getTags() != null && !et.getTags().isEmpty()) {
+                StringBuilder sb = new StringBuilder("{");
+                for (int i = 0; i < et.getTags().size(); i++) {
+                    if (i > 0) sb.append(",");
+                    sb.append("\"").append(et.getTags().get(i)).append("\"");
+                }
+                sb.append("}");
+                tagsStr = sb.toString();
+            }
+            table.insertRow(new Object[]{
+                    etOid, et.getName(), et.getEvent(), 10 /* superuser oid */,
+                    funcOid, String.valueOf(et.getEnabled()), tagsStr, 1
+            });
+        }
+        return table;
+    }
+
     Table buildPgForeignDataWrapper() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.INTEGER), colNN("fdwname", DataType.TEXT),
                 col("fdwowner", DataType.INTEGER), col("fdwhandler", DataType.INTEGER),
                 col("fdwvalidator", DataType.INTEGER), col("fdwacl", DataType.ACLITEM_ARRAY),
                 col("fdwoptions", DataType.TEXT), col("xmin", DataType.INTEGER));
-        return new Table("pg_foreign_data_wrapper", cols);
+        Table table = new Table("pg_foreign_data_wrapper", cols);
+        for (Database.FdwWrapper w : database.getForeignDataWrappers().values()) {
+            table.insertRow(new Object[]{
+                    oids.oid("fdw:" + w.name), w.name, 10, 0, 0, null, w.options, 1
+            });
+        }
+        return table;
     }
 
     Table buildPgForeignServer() {
@@ -1093,7 +1445,14 @@ class CatalogStubBuilder {
                 col("srvtype", DataType.TEXT), col("srvversion", DataType.TEXT),
                 col("srvoptions", DataType.TEXT), col("srvacl", DataType.ACLITEM_ARRAY),
                 col("xmin", DataType.INTEGER));
-        return new Table("pg_foreign_server", cols);
+        Table table = new Table("pg_foreign_server", cols);
+        for (Database.FdwServer s : database.getForeignServers().values()) {
+            int fdwOid = oids.oid("fdw:" + s.fdwName);
+            table.insertRow(new Object[]{
+                    oids.oid("srv:" + s.name), s.name, 10, fdwOid, null, null, s.options, null, 1
+            });
+        }
+        return table;
     }
 
     Table buildPgUserMapping() {
@@ -1101,14 +1460,50 @@ class CatalogStubBuilder {
                 colNN("oid", DataType.INTEGER), col("umuser", DataType.INTEGER),
                 col("umserver", DataType.INTEGER), col("umoptions", DataType.TEXT),
                 col("xmin", DataType.INTEGER));
-        return new Table("pg_user_mapping", cols);
+        Table table = new Table("pg_user_mapping", cols);
+        for (Database.FdwUserMapping m : database.getForeignUserMappings().values()) {
+            int serverOid = oids.oid("srv:" + m.serverName);
+            int userOid = "PUBLIC".equalsIgnoreCase(m.userName) ? 0 : oids.oid("role:" + m.userName);
+            table.insertRow(new Object[]{
+                    oids.oid("um:" + m.serverName + ":" + m.userName), userOid, serverOid, m.options, 1
+            });
+        }
+        return table;
+    }
+
+    Table buildPgUserMappings() {
+        List<Column> cols = Cols.listOf(
+                colNN("umid", DataType.INTEGER),
+                col("srvid", DataType.INTEGER),
+                col("srvname", DataType.TEXT),
+                col("umuser", DataType.INTEGER),
+                col("usename", DataType.TEXT),
+                col("umoptions", DataType.TEXT)
+        );
+        Table table = new Table("pg_user_mappings", cols);
+        for (Database.FdwUserMapping m : database.getForeignUserMappings().values()) {
+            int serverOid = oids.oid("srv:" + m.serverName);
+            int userOid = "PUBLIC".equalsIgnoreCase(m.userName) ? 0 : oids.oid("role:" + m.userName);
+            String displayName = "PUBLIC".equalsIgnoreCase(m.userName) ? null : m.userName;
+            table.insertRow(new Object[]{
+                    oids.oid("um:" + m.serverName + ":" + m.userName),
+                    serverOid, m.serverName, userOid, displayName, m.options
+            });
+        }
+        return table;
     }
 
     Table buildPgForeignTable() {
         List<Column> cols = Cols.listOf(
                 colNN("ftrelid", DataType.INTEGER), col("ftserver", DataType.INTEGER),
                 col("ftoptions", DataType.TEXT), col("xmin", DataType.INTEGER));
-        return new Table("pg_foreign_table", cols);
+        Table table = new Table("pg_foreign_table", cols);
+        for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
+            int relOid = oids.oid("rel:public." + ft.tableName);
+            int serverOid = oids.oid("srv:" + ft.serverName);
+            table.insertRow(new Object[]{ relOid, serverOid, ft.options, 1 });
+        }
+        return table;
     }
 
     /** pg_seclabels: security labels view. Empty but needs correct columns for catalog queries. */
@@ -1339,7 +1734,14 @@ class CatalogStubBuilder {
                 col("pubviaroot", DataType.BOOLEAN),
                 col("pubgencols", DataType.TEXT)
         );
-        return new Table("pg_publication", cols); // empty, no logical replication
+        Table table = new Table("pg_publication", cols);
+        for (Database.PubDef pub : database.getPublications().values()) {
+            table.insertRow(new Object[]{
+                    oids.oid("pub:" + pub.name), pub.name, 10,
+                    pub.allTables ? "t" : "f", "t", "t", "t", "t", "f", null
+            });
+        }
+        return table;
     }
 
     Table buildPgSubscription() {
@@ -1359,7 +1761,92 @@ class CatalogStubBuilder {
                 col("subrunasowner", DataType.BOOLEAN),
                 col("subfailover", DataType.BOOLEAN)
         );
-        return new Table("pg_subscription", cols); // empty
+        Table table = new Table("pg_subscription", cols);
+        for (Database.SubDef sub : database.getSubscriptions().values()) {
+            table.insertRow(new Object[]{
+                    oids.oid("sub:" + sub.name), oids.oid("db:memgres"), sub.name, 10,
+                    false, sub.conninfo, sub.name, "off",
+                    "{" + sub.publication + "}", "d", false, true, false, false
+            });
+        }
+        return table;
+    }
+
+    Table buildPgPublicationTables() {
+        List<Column> cols = Cols.listOf(
+                col("pubid", DataType.INTEGER),
+                col("pubname", DataType.TEXT),
+                col("schemaname", DataType.TEXT),
+                col("tablename", DataType.TEXT)
+        );
+        Table table = new Table("pg_publication_tables", cols);
+        for (Database.PubDef pub : database.getPublications().values()) {
+            int pubOid = oids.oid("pub:" + pub.name);
+            for (String tblName : pub.tables) {
+                table.insertRow(new Object[]{ pubOid, pub.name, "public", tblName });
+            }
+        }
+        return table;
+    }
+
+    Table buildPgReplicationSlots() {
+        List<Column> cols = Cols.listOf(
+                col("slot_name", DataType.TEXT),
+                col("plugin", DataType.TEXT),
+                col("slot_type", DataType.TEXT),
+                col("datoid", DataType.INTEGER),
+                col("database", DataType.TEXT),
+                col("temporary", DataType.BOOLEAN),
+                col("active", DataType.BOOLEAN),
+                col("active_pid", DataType.INTEGER),
+                col("xmin", DataType.INTEGER),
+                col("catalog_xmin", DataType.INTEGER),
+                col("restart_lsn", DataType.TEXT),
+                col("confirmed_flush_lsn", DataType.TEXT),
+                col("wal_status", DataType.TEXT),
+                col("safe_wal_size", DataType.BIGINT),
+                col("two_phase", DataType.BOOLEAN),
+                col("conflicting", DataType.BOOLEAN)
+        );
+        Table table = new Table("pg_replication_slots", cols);
+        for (Database.ReplicationSlot slot : database.getReplicationSlots().values()) {
+            table.insertRow(new Object[]{
+                    slot.slotName, slot.plugin, slot.slotType,
+                    oids.oid("db:memgres"), "memgres",
+                    false, false, null, null, null,
+                    "0/0", "0/0", "reserved", null, false, false
+            });
+        }
+        return table;
+    }
+
+    Table buildPgReplicationOrigin() {
+        List<Column> cols = Cols.listOf(
+                colNN("roident", DataType.INTEGER),
+                col("roname", DataType.TEXT)
+        );
+        return new Table("pg_replication_origin", cols);
+    }
+
+    Table buildPgReplicationOriginStatus() {
+        List<Column> cols = Cols.listOf(
+                col("local_id", DataType.INTEGER),
+                col("external_id", DataType.TEXT),
+                col("remote_lsn", DataType.TEXT),
+                col("local_lsn", DataType.TEXT)
+        );
+        return new Table("pg_replication_origin_status", cols);
+    }
+
+    Table buildPgStatSubscriptionStats() {
+        List<Column> cols = Cols.listOf(
+                col("subid", DataType.INTEGER),
+                col("subname", DataType.TEXT),
+                col("apply_error_count", DataType.BIGINT),
+                col("sync_error_count", DataType.BIGINT),
+                col("stats_reset", DataType.TIMESTAMPTZ)
+        );
+        return new Table("pg_stat_subscription_stats", cols);
     }
 
     Table buildPgMatviews() {
@@ -1382,6 +1869,218 @@ class CatalogStubBuilder {
                 col("rulename", DataType.TEXT),
                 col("definition", DataType.TEXT)
         );
-        return new Table("pg_rules", cols); // empty, no custom rules
+        Table table = new Table("pg_rules", cols);
+        for (java.util.Map.Entry<String, String[]> entry : database.getRuleDefinitions().entrySet()) {
+            String ruleName = entry.getKey();
+            String tableName = entry.getValue()[0];
+            String definition = entry.getValue()[1];
+            table.insertRow(new Object[]{"public", tableName, ruleName, definition});
+        }
+        return table;
+    }
+
+    Table buildPgStatStatements() {
+        List<Column> cols = Cols.listOf(
+                col("userid", DataType.INTEGER),
+                col("dbid", DataType.INTEGER),
+                col("toplevel", DataType.BOOLEAN),
+                col("queryid", DataType.BIGINT),
+                col("query", DataType.TEXT),
+                col("plans", DataType.BIGINT),
+                col("total_plan_time", DataType.DOUBLE_PRECISION),
+                col("min_plan_time", DataType.DOUBLE_PRECISION),
+                col("max_plan_time", DataType.DOUBLE_PRECISION),
+                col("mean_plan_time", DataType.DOUBLE_PRECISION),
+                col("stddev_plan_time", DataType.DOUBLE_PRECISION),
+                col("calls", DataType.BIGINT),
+                col("total_exec_time", DataType.DOUBLE_PRECISION),
+                col("min_exec_time", DataType.DOUBLE_PRECISION),
+                col("max_exec_time", DataType.DOUBLE_PRECISION),
+                col("mean_exec_time", DataType.DOUBLE_PRECISION),
+                col("stddev_exec_time", DataType.DOUBLE_PRECISION),
+                col("rows", DataType.BIGINT),
+                col("shared_blks_hit", DataType.BIGINT),
+                col("shared_blks_read", DataType.BIGINT),
+                col("shared_blks_dirtied", DataType.BIGINT),
+                col("shared_blks_written", DataType.BIGINT),
+                col("local_blks_hit", DataType.BIGINT),
+                col("local_blks_read", DataType.BIGINT),
+                col("local_blks_dirtied", DataType.BIGINT),
+                col("local_blks_written", DataType.BIGINT),
+                col("temp_blks_read", DataType.BIGINT),
+                col("temp_blks_written", DataType.BIGINT),
+                col("blk_read_time", DataType.DOUBLE_PRECISION),
+                col("blk_write_time", DataType.DOUBLE_PRECISION),
+                col("wal_records", DataType.BIGINT),
+                col("wal_fpi", DataType.BIGINT),
+                col("wal_bytes", DataType.NUMERIC),
+                col("jit_functions", DataType.BIGINT),
+                col("jit_generation_time", DataType.DOUBLE_PRECISION),
+                col("jit_inlining_count", DataType.BIGINT),
+                col("jit_inlining_time", DataType.DOUBLE_PRECISION),
+                col("jit_optimization_count", DataType.BIGINT),
+                col("jit_optimization_time", DataType.DOUBLE_PRECISION),
+                col("jit_emission_count", DataType.BIGINT),
+                col("jit_emission_time", DataType.DOUBLE_PRECISION)
+        );
+        return new Table("pg_stat_statements", cols); // empty, no tracked statements
+    }
+
+    Table buildPgStatStatementsInfo() {
+        List<Column> cols = Cols.listOf(
+                col("dealloc", DataType.BIGINT),
+                col("stats_reset", DataType.TIMESTAMPTZ)
+        );
+        Table table = new Table("pg_stat_statements_info", cols);
+        table.insertRow(new Object[]{0L, null});
+        return table;
+    }
+
+    Table buildPgStatArchiver() {
+        List<Column> cols = Cols.listOf(
+                col("archived_count", DataType.BIGINT),
+                col("last_archived_wal", DataType.TEXT),
+                col("last_archived_time", DataType.TIMESTAMPTZ),
+                col("failed_count", DataType.BIGINT),
+                col("last_failed_wal", DataType.TEXT),
+                col("last_failed_time", DataType.TIMESTAMPTZ),
+                col("stats_reset", DataType.TIMESTAMPTZ)
+        );
+        return new Table("pg_stat_archiver", cols); // empty, no archiver
+    }
+
+    Table buildPgStatIo() {
+        List<Column> cols = Cols.listOf(
+                col("backend_type", DataType.TEXT),
+                col("object", DataType.TEXT),
+                col("context", DataType.TEXT),
+                col("reads", DataType.BIGINT),
+                col("read_time", DataType.DOUBLE_PRECISION),
+                col("writes", DataType.BIGINT),
+                col("write_time", DataType.DOUBLE_PRECISION),
+                col("writebacks", DataType.BIGINT),
+                col("writeback_time", DataType.DOUBLE_PRECISION),
+                col("extends", DataType.BIGINT),
+                col("extend_time", DataType.DOUBLE_PRECISION),
+                col("op_bytes", DataType.BIGINT),
+                col("hits", DataType.BIGINT),
+                col("evictions", DataType.BIGINT),
+                col("reuses", DataType.BIGINT),
+                col("fsyncs", DataType.BIGINT),
+                col("fsync_time", DataType.DOUBLE_PRECISION),
+                col("stats_reset", DataType.TIMESTAMPTZ)
+        );
+        return new Table("pg_stat_io", cols); // empty, no I/O stats
+    }
+
+    Table buildPgStatUserFunctions() {
+        List<Column> cols = Cols.listOf(
+                col("funcid", DataType.INTEGER),
+                col("schemaname", DataType.TEXT),
+                col("funcname", DataType.TEXT),
+                col("calls", DataType.BIGINT),
+                col("total_time", DataType.DOUBLE_PRECISION),
+                col("self_time", DataType.DOUBLE_PRECISION)
+        );
+        Table table = new Table("pg_stat_user_functions", cols);
+        // Populate from registered user-defined functions that have been called
+        for (Map.Entry<String, PgFunction> fnEntry : database.getFunctions().entrySet()) {
+            PgFunction fn = fnEntry.getValue();
+            long calls = fn.getCallCount();
+            if (calls > 0) {
+                String schemaName = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
+                table.insertRow(new Object[]{
+                        oids.oid("func:" + schemaName + "." + fn.getName()),
+                        schemaName,
+                        fn.getName(),
+                        calls,
+                        0.0,  // total_time
+                        0.0   // self_time
+                });
+            }
+        }
+        return table;
+    }
+
+    Table buildPgLargeobject() {
+        List<Column> cols = Cols.listOf(
+                col("loid", DataType.INTEGER),
+                col("pageno", DataType.INTEGER),
+                col("data", DataType.BYTEA)
+        );
+        Table table = new Table("pg_largeobject", cols);
+        // Populate from large object store — each LO is split into 2048-byte pages
+        for (Long loid : database.getLargeObjectStore().getOids()) {
+            byte[] data = null;
+            try { data = database.getLargeObjectStore().loGet(loid); } catch (Exception ignored) {}
+            if (data == null || data.length == 0) {
+                // Even empty LOs have at least one page
+                table.insertRow(new Object[]{ loid.intValue(), 0, new byte[0] });
+            } else {
+                int pageSize = 2048;
+                int pageNo = 0;
+                for (int off = 0; off < data.length; off += pageSize) {
+                    int end = Math.min(off + pageSize, data.length);
+                    byte[] page = java.util.Arrays.copyOfRange(data, off, end);
+                    table.insertRow(new Object[]{ loid.intValue(), pageNo, page });
+                    pageNo++;
+                }
+            }
+        }
+        return table;
+    }
+
+    Table buildPgParameterAcl() {
+        List<Column> cols = Cols.listOf(
+                col("oid", DataType.INTEGER),
+                col("parname", DataType.TEXT),
+                col("paracl", DataType.TEXT_ARRAY)
+        );
+        return new Table("pg_parameter_acl", cols); // empty
+    }
+
+    Table buildPgBuffercache() {
+        List<Column> cols = Cols.listOf(
+                col("bufferid", DataType.INTEGER),
+                col("relfilenode", DataType.INTEGER),
+                col("reltablespace", DataType.INTEGER),
+                col("reldatabase", DataType.INTEGER),
+                col("relforknumber", DataType.SMALLINT),
+                col("relblocknumber", DataType.BIGINT),
+                col("isdirty", DataType.BOOLEAN),
+                col("usagecount", DataType.SMALLINT),
+                col("pinning_backends", DataType.INTEGER)
+        );
+        return new Table("pg_buffercache", cols); // empty, no buffer cache
+    }
+
+    Table buildPgStatWalSenders() {
+        List<Column> cols = Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("state", DataType.TEXT),
+                col("sent_lsn", DataType.TEXT),
+                col("write_lsn", DataType.TEXT),
+                col("flush_lsn", DataType.TEXT),
+                col("replay_lsn", DataType.TEXT),
+                col("write_lag", DataType.TEXT),
+                col("flush_lag", DataType.TEXT),
+                col("replay_lag", DataType.TEXT),
+                col("sync_priority", DataType.INTEGER),
+                col("sync_state", DataType.TEXT),
+                col("reply_time", DataType.TIMESTAMPTZ)
+        );
+        return new Table("pg_stat_wal_senders", cols); // empty, no WAL senders
+    }
+
+    Table buildPgIdentFileMappings() {
+        List<Column> cols = Cols.listOf(
+                col("map_number", DataType.INTEGER),
+                col("file_name", DataType.TEXT),
+                col("line_number", DataType.INTEGER),
+                col("map_name", DataType.TEXT),
+                col("sys_name", DataType.TEXT),
+                col("pg_username", DataType.TEXT)
+        );
+        return new Table("pg_ident_file_mappings", cols); // empty, no ident mappings
     }
 }

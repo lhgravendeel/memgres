@@ -315,8 +315,31 @@ class RangeFunctions {
                 String rBracket = hiObj == null ? ")" : (ui ? "]" : ")");
                 return lBracket + loStr + "," + hiStr + rBracket;
             }
-            default:
+            default: {
+                // Check for user-defined range type constructors
+                String subtype = executor.database.getRangeTypes().get(name);
+                if (subtype != null) {
+                    // User-defined range type constructor: treat like int4range
+                    Object loObj = executor.evalExpr(fn.args().get(0), ctx);
+                    Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
+                    String bounds = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
+                    // For integer subtypes, use canonical form
+                    String st = subtype.toLowerCase();
+                    if (st.equals("int4") || st.equals("integer") || st.equals("int") || st.equals("int8") || st.equals("bigint") || st.equals("smallint") || st.equals("int2")) {
+                        Integer lo = loObj == null ? null : executor.toInt(loObj);
+                        Integer hi = hiObj == null ? null : executor.toInt(hiObj);
+                        return RangeOperations.int4rangeNullable(lo, hi, bounds).toString();
+                    }
+                    boolean li = bounds.charAt(0) == '[';
+                    boolean ui = bounds.charAt(1) == ']';
+                    String loStr = loObj == null ? "" : loObj.toString();
+                    String hiStr = hiObj == null ? "" : hiObj.toString();
+                    String lBracket = loObj == null ? "(" : (li ? "[" : "(");
+                    String rBracket = hiObj == null ? ")" : (ui ? "]" : ")");
+                    return lBracket + loStr + "," + hiStr + rBracket;
+                }
                 return NOT_HANDLED;
+            }
         }
     }
 }

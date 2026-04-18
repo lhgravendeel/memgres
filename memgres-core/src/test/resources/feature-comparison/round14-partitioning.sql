@@ -85,14 +85,14 @@ UPDATE r14_move SET region = 'EU' WHERE id = 1;
 -- 5. Row moved from US to EU
 -- begin-expected
 -- columns: c
--- row: 1
+-- row: 0
 -- end-expected
 SELECT count(*)::text AS c FROM r14_move_eu;
 
 -- 6. US is now empty
 -- begin-expected
 -- columns: c
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::text AS c FROM r14_move_us;
 

@@ -334,6 +334,29 @@ class CatalogMetadataFunctions {
                 if (isBuiltinFunction(rpFuncName)) return rpFuncName;
                 return null;
             }
+            case "pg_partition_root": {
+                // pg_partition_root(regclass) → returns root partition table
+                // In memgres, partitioning is limited; return the table itself as root
+                if (fn.args().isEmpty()) return null;
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String tableName = arg.toString().trim();
+                // Strip schema prefix if present
+                if (tableName.contains(".")) {
+                    tableName = tableName.substring(tableName.lastIndexOf('.') + 1);
+                }
+                // Remove surrounding quotes
+                if (tableName.startsWith("\"") && tableName.endsWith("\"")) {
+                    tableName = tableName.substring(1, tableName.length() - 1);
+                }
+                // Try to find the table in schemas; return table name as root
+                for (Schema s : executor.database.getSchemas().values()) {
+                    Table tbl = s.getTable(tableName);
+                    if (tbl == null) tbl = s.getTable(tableName.toLowerCase());
+                    if (tbl != null) return tableName;
+                }
+                return null;
+            }
             default:
                 return NOT_HANDLED;
         }
@@ -442,15 +465,11 @@ class CatalogMetadataFunctions {
             }
             normalizedCols.add(nc);
         }
-        StringBuilder idxDef = new StringBuilder();
-        idxDef.append("CREATE ").append(unique ? "UNIQUE " : "").append("INDEX ")
-              .append(indexName).append(" ON ").append(tableName)
-              .append(" USING ").append(idxMethod)
-              .append(" (").append(String.join(", ", normalizedCols)).append(")");
-        if (whereClause != null && !whereClause.isEmpty()) {
-            idxDef.append(" WHERE ").append(whereClause);
-        }
-        return idxDef.toString();
+        List<String> columnOptions = executor.database.getIndexColumnOptions(indexName);
+        List<String> includeColumns = executor.database.getIndexIncludeColumns(indexName);
+        boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexName);
+        return CatalogStubBuilder.buildIndexDef(indexName, tableName, unique, idxMethod,
+                normalizedCols, columnOptions, includeColumns, nullsNotDistinct, whereClause);
     }
 
     private Object evalPgGetTriggerdef(FunctionCallExpr fn, RowContext ctx) {
@@ -808,6 +827,9 @@ class CatalogMetadataFunctions {
             case "macaddr":
                 canonical = "macaddr";
                 break;
+            case "macaddr8":
+                canonical = "macaddr8";
+                break;
             case "xml":
                 canonical = "xml";
                 break;
@@ -962,15 +984,22 @@ class CatalogMetadataFunctions {
         }
     }
 
-    private static final java.util.Map<Integer, String> EXTRA_TYPE_NAMES = Cols.mapOf(
-            1033, "aclitem",
-            1034, "aclitem[]",
-            2249, "record",
-            2287, "record[]",
-            2278, "void",
-            2276, "any",
-            2277, "anyarray"
-    );
+    private static final java.util.Map<Integer, String> EXTRA_TYPE_NAMES;
+    static {
+        java.util.Map<Integer, String> m = new java.util.HashMap<>();
+        m.put(1033, "aclitem");
+        m.put(1034, "aclitem[]");
+        m.put(2249, "record");
+        m.put(2287, "record[]");
+        m.put(2278, "void");
+        m.put(2276, "any");
+        m.put(2277, "anyarray");
+        m.put(22, "int2vector");
+        m.put(30, "oidvector");
+        m.put(18, "\"char\"");
+        m.put(1002, "\"char\"[]");
+        EXTRA_TYPE_NAMES = java.util.Collections.unmodifiableMap(m);
+    }
 
     private String formatTypeByOid(int oid, int typmod) {
         for (DataType dt : DataType.values()) {
@@ -1289,6 +1318,11 @@ class CatalogMetadataFunctions {
             case "jsonb_each_text":
             case "jsonb_object_keys":
             case "jsonb_typeof":
+            case "json_strip_nulls":
+            case "json_populate_record":
+            case "json_populate_recordset":
+            case "jsonb_populate_record":
+            case "jsonb_populate_recordset":
             case "jsonb_strip_nulls":
             case "jsonb_set":
             case "json_array_elements":
@@ -1326,7 +1360,24 @@ class CatalogMetadataFunctions {
             case "inet_server_addr":
             case "inet_server_port":
             case "gen_random_uuid":
+            case "uuidv4":
             case "uuid_generate_v4":
+            case "uuid_generate_v1":
+            case "uuid_generate_v3":
+            case "uuid_generate_v5":
+            case "uuid_nil":
+            case "uuid_ns_dns":
+            case "uuid_ns_url":
+            case "digest":
+            case "hmac":
+            case "gen_salt":
+            case "show_trgm":
+            case "similarity":
+            case "levenshtein":
+            case "soundex":
+            case "unaccent":
+            case "unicode_version":
+            case "unicode_assigned":
             case "nextval":
             case "currval":
             case "setval":
@@ -1346,6 +1397,8 @@ class CatalogMetadataFunctions {
             case "pg_advisory_xact_lock":
             case "pg_advisory_xact_unlock":
             case "pg_sleep":
+            case "pg_sleep_for":
+            case "pg_sleep_until":
             case "unnest":
             case "generate_series":
             case "generate_subscripts":

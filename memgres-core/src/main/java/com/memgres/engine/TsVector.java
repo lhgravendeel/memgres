@@ -13,6 +13,20 @@ import java.util.stream.Collectors;
  */
 public class TsVector {
 
+    static final Set<String> STOP_WORDS_SET = Cols.setOf(
+            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+            "on", "with", "at", "by", "from", "as", "into", "about", "between",
+            "through", "during", "before", "after", "above", "below",
+            "and", "but", "or", "nor", "not", "so", "yet",
+            "it", "its", "this", "that", "these", "those"
+    );
+
+    static boolean isStopWord(String word) {
+        return STOP_WORDS_SET.contains(word.toLowerCase());
+    }
+
     private static final Set<String> STOP_WORDS = Cols.setOf(
             "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
             "have", "has", "had", "do", "does", "did", "will", "would", "could",
@@ -282,6 +296,8 @@ public class TsVector {
 
         double res = 0.0;
         int matchCount = 0;
+        // Count total query terms for normalization (PG divides by query size)
+        int queryTermCount = countQueryTerms(query);
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             if (query.containsTerm(entry.getKey())) {
                 matchCount++;
@@ -321,11 +337,31 @@ public class TsVector {
             }
         }
         if (matchCount == 0) return 0.0;
-        // PG's calc_rank_or divides by size (total query terms), but for AND queries
-        // calc_rank_and produces higher scores for co-occurring terms.
-        // We approximate by not dividing, which ensures more matches = higher rank.
-        // For single-term queries this matches PG exactly.
+        // PG's calc_rank_or divides by the number of unique query terms
+        if (queryTermCount > 1) {
+            res /= queryTermCount;
+        }
         return (float) res; // PG returns float4 precision
+    }
+
+    /** Count the number of unique terms in a TsQuery (excluding NOT branches). */
+    private static int countQueryTerms(TsQuery query) {
+        Set<String> terms = new HashSet<>();
+        collectQueryTerms(query, terms);
+        return Math.max(terms.size(), 1);
+    }
+
+    private static void collectQueryTerms(TsQuery query, Set<String> terms) {
+        if (query == null) return;
+        if (query.getOp() == TsQuery.Op.TERM) {
+            String t = query.getTerm();
+            if (t != null && !t.isEmpty()) terms.add(t);
+        } else if (query.getOp() == TsQuery.Op.NOT) {
+            // Do not count terms inside NOT branches
+        } else {
+            collectQueryTerms(query.getLeft(), terms);
+            collectQueryTerms(query.getRight(), terms);
+        }
     }
 
     /** Cover density ranking that considers proximity of matched terms. */

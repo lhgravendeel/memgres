@@ -288,18 +288,38 @@ public final class TypeCoercion {
         } catch (MemgresException e) {
             // If the value looks like an array literal or is a List, store as-is
             if (value instanceof java.util.List || (value instanceof String && ((String) value).trim().startsWith("{"))) {
-                String s = (String) value;
+                validateArrayElements(value, type);
                 return value;
             }
             throw e;
         } catch (Exception e) {
             // If the value looks like an array literal or is a List, store as-is
             if (value instanceof java.util.List || (value instanceof String && ((String) value).trim().startsWith("{"))) {
-                String s = (String) value;
+                validateArrayElements(value, type);
                 return value;
             }
             throw new MemgresException(
                     "invalid input syntax for type " + type.getPgName() + ": \"" + value + "\"", "22P02");
+        }
+    }
+
+    /** Validate array elements match the expected array element type. */
+    private static void validateArrayElements(Object value, DataType type) {
+        if (type == DataType.INT4_ARRAY && value instanceof String) {
+            String s = ((String) value).trim();
+            if (s.startsWith("{") && s.endsWith("}")) {
+                String inner = s.substring(1, s.length() - 1);
+                if (!inner.isEmpty()) {
+                    for (String elem : inner.split(",")) {
+                        elem = elem.trim();
+                        if (elem.equalsIgnoreCase("NULL")) continue;
+                        try { Long.parseLong(elem); } catch (NumberFormatException e) {
+                            throw new MemgresException(
+                                    "invalid input syntax for type integer: \"" + elem + "\"", "22P02");
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -374,6 +394,26 @@ public final class TypeCoercion {
         return value;
     }
 
+    // ---- Out-of-range exception helpers (with datatype field for wire protocol) ----
+
+    private static MemgresException smallintOutOfRange() {
+        MemgresException e = new MemgresException("smallint out of range", "22003");
+        e.setDatatype("smallint");
+        return e;
+    }
+
+    private static MemgresException integerOutOfRange() {
+        MemgresException e = new MemgresException("integer out of range", "22003");
+        e.setDatatype("integer");
+        return e;
+    }
+
+    private static MemgresException bigintOutOfRange() {
+        MemgresException e = new MemgresException("bigint out of range", "22003");
+        e.setDatatype("bigint");
+        return e;
+    }
+
     // ---- Conversion helpers ----
 
     private static Short toShort(Object val) {
@@ -381,7 +421,7 @@ public final class TypeCoercion {
             Number n = (Number) val;
             long lv = n.longValue();
             if (lv < Short.MIN_VALUE || lv > Short.MAX_VALUE) {
-                throw new MemgresException("smallint out of range", "22003");
+                throw smallintOutOfRange();
             }
             return (short) lv;
         }
@@ -399,7 +439,7 @@ public final class TypeCoercion {
             String bits = ((AstExecutor.PgBitString) val).bits();
             long lv = Long.parseLong(bits, 2);
             if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
-                throw new MemgresException("integer out of range", "22003");
+                throw integerOutOfRange();
             return (int) lv;
         }
         if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
@@ -407,16 +447,16 @@ public final class TypeCoercion {
         if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
         if (val instanceof java.math.BigDecimal) {
             java.math.BigDecimal bd = (java.math.BigDecimal) val;
-            long lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
+            long lv = bd.setScale(0, java.math.RoundingMode.HALF_EVEN).longValueExact();
             if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
-                throw new MemgresException("integer out of range", "22003");
+                throw integerOutOfRange();
             return (int) lv;
         }
         if (val instanceof Number) {
             Number n = (Number) val;
             long lv = n.longValue();
             if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
-                throw new MemgresException("integer out of range", "22003");
+                throw integerOutOfRange();
             return (int) lv;
         }
         if (val instanceof Boolean) return ((Boolean) val) ? 1 : 0;
@@ -424,18 +464,19 @@ public final class TypeCoercion {
         if (s.isEmpty()) throw new MemgresException("invalid input syntax for type integer: \"\"", "22P02");
         try {
             if (s.contains(".")) {
-                long lv = Math.round(Double.parseDouble(s));
+                java.math.BigDecimal bd = new java.math.BigDecimal(s);
+                long lv = bd.setScale(0, java.math.RoundingMode.HALF_EVEN).longValueExact();
                 if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
-                    throw new MemgresException("integer out of range", "22003");
+                    throw integerOutOfRange();
                 return (int) lv;
             }
             long lv = Long.parseLong(s);
             if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
-                throw new MemgresException("integer out of range", "22003");
+                throw integerOutOfRange();
             return (int) lv;
         } catch (NumberFormatException e) {
             if (s.matches("[+-]?\\d+")) {
-                throw new MemgresException("integer out of range", "22003");
+                throw integerOutOfRange();
             }
             throw new MemgresException("invalid input syntax for type integer: \"" + val + "\"", "22P02");
         }
@@ -453,7 +494,7 @@ public final class TypeCoercion {
         } catch (NumberFormatException e) {
             // Distinguish out-of-range from bad syntax: if the string looks numeric but overflows, it's 22003
             if (s.matches("[+-]?\\d+")) {
-                throw new MemgresException("bigint out of range", "22003");
+                throw bigintOutOfRange();
             }
             throw new MemgresException("invalid input syntax for type bigint: \"" + val + "\"", "22P02");
         }
@@ -477,28 +518,31 @@ public final class TypeCoercion {
     public static Double toDouble(Object val) {
         if (val instanceof Number) return ((Number) val).doubleValue();
         String s = val.toString().trim();
-        switch (s) {
-            case "Infinity":
-                return Double.POSITIVE_INFINITY;
-            case "-Infinity":
-                return Double.NEGATIVE_INFINITY;
-            case "NaN":
-                return Double.NaN;
-            default:
-                return Double.parseDouble(s);
+        String lower = s.toLowerCase();
+        if (lower.equals("infinity") || lower.equals("inf") || lower.equals("+infinity") || lower.equals("+inf")) {
+            return Double.POSITIVE_INFINITY;
         }
+        if (lower.equals("-infinity") || lower.equals("-inf")) {
+            return Double.NEGATIVE_INFINITY;
+        }
+        if (lower.equals("nan")) {
+            return Double.NaN;
+        }
+        return Double.parseDouble(s);
     }
 
-    public static BigDecimal toMoney(Object val) {
-        if (val instanceof BigDecimal) return ((BigDecimal) val).setScale(2, RoundingMode.HALF_UP);
-        if (val instanceof Number) return BigDecimal.valueOf(((Number) val).doubleValue()).setScale(2, RoundingMode.HALF_UP);
+    public static PgMoney toMoney(Object val) {
+        if (val instanceof PgMoney) return (PgMoney) val;
+        if (val instanceof BigDecimal) return new PgMoney((BigDecimal) val);
+        if (val instanceof Number) return new PgMoney(BigDecimal.valueOf(((Number) val).doubleValue()));
         String s = val.toString().trim();
         // Strip '$' and ',' from money strings
         s = s.replace("$", "").replace(",", "");
-        return new BigDecimal(s).setScale(2, RoundingMode.HALF_UP);
+        return new PgMoney(new BigDecimal(s));
     }
 
     public static BigDecimal toBigDecimal(Object val) {
+        if (val instanceof PgMoney) return ((PgMoney) val).getValue();
         if (val instanceof BigDecimal) return ((BigDecimal) val);
         if (val instanceof Integer) return BigDecimal.valueOf(((Integer) val));
         if (val instanceof Long) return BigDecimal.valueOf(((Long) val));
@@ -516,7 +560,15 @@ public final class TypeCoercion {
 
     private static String toString(Object val) {
         if (val instanceof LocalDate) return ((LocalDate) val).toString();
-        if (val instanceof LocalDateTime) return ((LocalDateTime) val).toString();
+        if (val instanceof LocalDateTime) {
+            LocalDateTime dt = (LocalDateTime) val;
+            if (dt.getNano() != 0) {
+                String s = dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS"));
+                // Strip trailing zeros from fractional seconds
+                return s.replaceAll("0+$", "").replaceAll("\\.$", "");
+            }
+            return dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        }
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toString();
         if (val instanceof LocalTime) return ((LocalTime) val).toString();
         if (val instanceof PgInterval) return ((PgInterval) val).toString();
@@ -656,12 +708,24 @@ public final class TypeCoercion {
     }
 
     public static LocalDate toLocalDate(Object val) {
-        if (val instanceof LocalDate) return ((LocalDate) val);
+        if (val instanceof LocalDate) {
+            LocalDate d = (LocalDate) val;
+            if (d.getYear() == 0) throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
+            return d;
+        }
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalDate();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toLocalDate();
         String s = val.toString().trim();
+        // Reject year 0000 - PostgreSQL has no year zero
+        if (s.startsWith("0000-")) {
+            throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
+        }
         for (DateTimeFormatter fmt : DATE_FORMATS) {
-            try { return LocalDate.parse(s, fmt); } catch (DateTimeParseException e) { /* try next */ }
+            try {
+                LocalDate d = LocalDate.parse(s, fmt);
+                if (d.getYear() == 0) throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
+                return d;
+            } catch (DateTimeParseException e) { /* try next */ }
         }
         // Try parsing as timestamp then extracting date
         try { return LocalDateTime.parse(s).toLocalDate(); } catch (Exception e) { /* ignore */ }
@@ -798,6 +862,62 @@ public final class TypeCoercion {
         throw new MemgresException("date/time field value out of range: \"" + val + "\"", errCode);
     }
 
+    /**
+     * Check if a string looks like a timetz value (HH:MM:SS±offset).
+     */
+    private static final java.util.regex.Pattern TIMETZ_PATTERN =
+            java.util.regex.Pattern.compile("^\\d{1,2}:\\d{2}(:\\d{2}(\\.\\d+)?)?[+-]\\d{2}(:\\d{2})?$");
+
+    static boolean isTimeTzString(String s) {
+        return TIMETZ_PATTERN.matcher(s).matches();
+    }
+
+    /**
+     * Compare two timetz strings by normalizing to UTC.
+     */
+    static int compareTimeTz(String a, String b) {
+        long utcA = timeTzToUtcNanos(a);
+        long utcB = timeTzToUtcNanos(b);
+        return Long.compare(utcA, utcB);
+    }
+
+    private static long timeTzToUtcNanos(String s) {
+        // Parse time and offset, normalize to UTC
+        int signIdx = s.lastIndexOf('+');
+        if (signIdx < 1) signIdx = s.lastIndexOf('-');
+        // Find the sign that's part of offset (not part of time)
+        // The offset sign is after the time portion
+        int idx = -1;
+        for (int i = s.length() - 1; i >= 1; i--) {
+            char c = s.charAt(i);
+            if (c == '+' || c == '-') {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 1) return 0;
+        String timePart = s.substring(0, idx);
+        String offsetPart = s.substring(idx);
+        try {
+            LocalTime lt = LocalTime.parse(timePart);
+            // Parse offset: +HH or +HH:MM
+            int sign = offsetPart.charAt(0) == '-' ? -1 : 1;
+            String offVal = offsetPart.substring(1);
+            int offHours, offMinutes = 0;
+            if (offVal.contains(":")) {
+                String[] parts = offVal.split(":");
+                offHours = Integer.parseInt(parts[0]);
+                offMinutes = Integer.parseInt(parts[1]);
+            } else {
+                offHours = Integer.parseInt(offVal);
+            }
+            long offsetNanos = sign * (offHours * 3600L + offMinutes * 60L) * 1_000_000_000L;
+            return lt.toNanoOfDay() - offsetNanos;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     // Sentinel values for PG 'infinity' / '-infinity' timestamps
     public static final LocalDateTime TIMESTAMP_INFINITY = LocalDateTime.of(9999, 12, 31, 23, 59, 59);
     public static final LocalDateTime TIMESTAMP_NEG_INFINITY = LocalDateTime.of(-4713, 1, 1, 0, 0, 0);
@@ -912,12 +1032,24 @@ public final class TypeCoercion {
         // PgEnum: compare by ordinal when both are PgEnum, fall through to string otherwise
         if (a instanceof AstExecutor.PgEnum && b instanceof AstExecutor.PgEnum) return ((AstExecutor.PgEnum) a).compareTo(((AstExecutor.PgEnum) b));
 
+        // PgMoney comparison
+        if (a instanceof PgMoney && b instanceof PgMoney) return ((PgMoney) a).compareTo((PgMoney) b);
+        if (a instanceof PgMoney) return compare(((PgMoney) a).getValue(), b);
+        if (b instanceof PgMoney) return compare(a, ((PgMoney) b).getValue());
+
         // Both numbers: promote and compare
         if (a instanceof Number && b instanceof Number) {
+            // Handle NaN and Infinity for numeric type: NaN sorts as greatest (PG semantics)
+            double da = ((Number) a).doubleValue();
+            double db = ((Number) b).doubleValue();
+            if (Double.isNaN(da) || Double.isNaN(db) || Double.isInfinite(da) || Double.isInfinite(db)) {
+                // Use Double.compare which handles NaN (greatest) and Infinity correctly
+                return Double.compare(da, db);
+            }
             if (a instanceof BigDecimal || b instanceof BigDecimal) {
                 return toBigDecimal(a).compareTo(toBigDecimal(b));
             }
-            return Double.compare(((Number) a).doubleValue(), ((Number) b).doubleValue());
+            return Double.compare(da, db);
         }
 
         // Date/time comparisons
@@ -958,6 +1090,15 @@ public final class TypeCoercion {
             String sa = (String) a;
             Object coerced = toBytea(sa);
             if (coerced instanceof byte[]) return compareBytes((byte[]) coerced, bb);
+        }
+
+        // TimeTZ comparison: normalize to UTC before comparing
+        if (a instanceof String && b instanceof String) {
+            String sa = (String) a;
+            String sb = (String) b;
+            if (isTimeTzString(sa) && isTimeTzString(sb)) {
+                return compareTimeTz(sa, sb);
+            }
         }
 
         // Range/multirange comparison: compare by lower bound, then upper bound
@@ -1099,6 +1240,10 @@ public final class TypeCoercion {
         if (a == null && b == null) return true;
         if (a == null || b == null) return false;
         if (a.equals(b) || b.equals(a)) return true;
+        // TimeTZ strings: compare by UTC-normalized time
+        if (a instanceof String && b instanceof String && isTimeTzString((String) a) && isTimeTzString((String) b)) {
+            return compareTimeTz((String) a, (String) b) == 0;
+        }
         // PgEnum comparison: compare by label string
         if (a instanceof AstExecutor.PgEnum) return ((AstExecutor.PgEnum) a).label().equals(b instanceof AstExecutor.PgEnum ? ((AstExecutor.PgEnum) b).label() : b.toString());
         if (b instanceof AstExecutor.PgEnum) return ((AstExecutor.PgEnum) b).label().equals(a.toString());

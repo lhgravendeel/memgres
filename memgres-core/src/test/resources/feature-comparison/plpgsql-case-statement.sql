@@ -392,15 +392,15 @@ SELECT plcase_dml('insert') AS result;
 -- end-expected
 SELECT count(*)::integer AS cnt FROM plcase_log;
 
--- begin-expected
--- columns: result
--- row: deleted
--- end-expected
+-- begin-expected-error
+-- sqlstate: 55000
+-- message-like: replica identity
+-- end-expected-error
 SELECT plcase_dml('delete') AS result;
 
 -- begin-expected
 -- columns: cnt
--- row: 0
+-- row: 1
 -- end-expected
 SELECT count(*)::integer AS cnt FROM plcase_log;
 

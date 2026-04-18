@@ -563,13 +563,17 @@ class ConcurrencyTransactionTest {
 
     @Test void testCommitPrepared() throws SQLException {
         try (Connection c = connect(); Statement st = c.createStatement()) {
-            st.execute("COMMIT PREPARED 'test_xact_1'");
+            st.execute("BEGIN");
+            st.execute("PREPARE TRANSACTION 'test_xact_commit'");
+            st.execute("COMMIT PREPARED 'test_xact_commit'");
         }
     }
 
     @Test void testRollbackPrepared() throws SQLException {
         try (Connection c = connect(); Statement st = c.createStatement()) {
-            st.execute("ROLLBACK PREPARED 'test_xact_2'");
+            st.execute("BEGIN");
+            st.execute("PREPARE TRANSACTION 'test_xact_rollback'");
+            st.execute("ROLLBACK PREPARED 'test_xact_rollback'");
         }
     }
 

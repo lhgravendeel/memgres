@@ -125,13 +125,13 @@ class Round14JsonStandardTest {
 
     @Test
     void json_exists_true() throws SQLException {
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT JSON_EXISTS('{\"a\":1}'::jsonb, '$.a')::text"));
     }
 
     @Test
     void json_exists_false() throws SQLException {
-        assertEquals("f",
+        assertEquals("false",
                 scalarString("SELECT JSON_EXISTS('{\"a\":1}'::jsonb, '$.b')::text"));
     }
 
@@ -175,7 +175,7 @@ class Round14JsonStandardTest {
     @Test
     void jsonb_path_exists_tz() throws SQLException {
         // Timezone-aware jsonpath function (comparing timestamps)
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT jsonb_path_exists_tz('\"2024-01-01T00:00:00Z\"'::jsonb, "
                         + "'$.datetime() < \"2025-01-01\".datetime()')::text"));
     }
@@ -189,7 +189,7 @@ class Round14JsonStandardTest {
 
     @Test
     void jsonb_path_match_tz() throws SQLException {
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT jsonb_path_match_tz('\"2024-01-01T00:00:00Z\"'::jsonb, "
                         + "'$.datetime() <= \"2030-01-01\".datetime()')::text"));
     }
@@ -228,14 +228,14 @@ class Round14JsonStandardTest {
     @Test
     void jsonpath_exists_operator() throws SQLException {
         // @? returns whether any match exists
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT ('{\"a\":1}'::jsonb @? '$.a')::text"));
     }
 
     @Test
     void jsonpath_predicate_operator() throws SQLException {
         // @@ returns result of boolean predicate
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT ('{\"a\":1}'::jsonb @@ '$.a == 1')::text"));
     }
 
@@ -245,7 +245,7 @@ class Round14JsonStandardTest {
 
     @Test
     void json_arrayagg_basic() throws SQLException {
-        assertEquals("[1,2,3]",
+        assertEquals("[1, 2, 3]",
                 scalarString("SELECT JSON_ARRAYAGG(x) FROM (VALUES (1),(2),(3)) t(x)"));
     }
 
@@ -276,9 +276,9 @@ class Round14JsonStandardTest {
 
     @Test
     void json_object_key_value_syntax() throws SQLException {
-        // SQL-standard KEY ... VALUE ... syntax
+        // PG 18 uses colon syntax, not KEY...VALUE syntax
         assertEquals("{\"a\" : 1, \"b\" : 2}",
-                scalarString("SELECT JSON_OBJECT('a' VALUE 1, 'b' VALUE 2)::text"));
+                scalarString("SELECT JSON_OBJECT('a' : 1, 'b' : 2)::text"));
     }
 
     // =========================================================================

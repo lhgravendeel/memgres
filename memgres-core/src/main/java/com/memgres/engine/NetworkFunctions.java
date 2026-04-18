@@ -75,6 +75,21 @@ class NetworkFunctions {
                 }
                 return mac; // already macaddr8 format or pass through
             }
+            case "macaddr8_set7bit": {
+                // Set the 7th bit (universal/local bit) of a macaddr8 value
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String mac = arg.toString().toLowerCase().trim();
+                String[] parts = mac.split(":");
+                if (parts.length == 8) {
+                    // Set bit 1 (0x02) of the first octet (the 7th bit, counting from MSB as bit 0)
+                    int firstOctet = Integer.parseInt(parts[0], 16);
+                    firstOctet |= 0x02;
+                    parts[0] = String.format("%02x", firstOctet);
+                    return String.join(":", parts);
+                }
+                return mac;
+            }
             default:
                 return NOT_HANDLED;
         }

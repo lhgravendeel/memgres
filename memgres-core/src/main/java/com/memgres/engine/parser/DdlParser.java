@@ -56,7 +56,7 @@ class DdlParser {
         parser.matchKeyword("TRUSTED");
         parser.matchKeyword("PROCEDURAL");
 
-        if (parser.matchKeyword("TABLE")) return tableParser.parseCreateTable(temporary);
+        if (parser.matchKeyword("TABLE")) return tableParser.parseCreateTable(temporary, unlogged);
         if (parser.matchKeyword("TYPE")) return parseCreateType();
         if (parser.matchKeyword("FUNCTION")) return functionParser.parseCreateFunction(orReplace, false);
         if (parser.matchKeyword("PROCEDURE")) return functionParser.parseCreateFunction(orReplace, true);
@@ -75,8 +75,7 @@ class DdlParser {
         if (parser.matchKeyword("POLICY")) return policyParser.parseCreatePolicy();
         if (parser.matchKeyword("ROLE")) return roleParser.parseCreateRole(false);
         if (parser.matchKeywords("USER", "MAPPING")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("create_noop", "ok");
+            return parseCreateUserMapping();
         }
         if (parser.matchKeyword("USER")) return roleParser.parseCreateRole(true);
         if (unique) {
@@ -105,23 +104,52 @@ class DdlParser {
             return new SetStmt("create_noop", "ok");
         }
 
+        // CREATE EVENT TRIGGER
+        if (parser.matchKeywords("EVENT", "TRIGGER")) return parseCreateEventTrigger();
+
+        if (parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")) {
+            return parseCreateForeignDataWrapper();
+        }
+        if (parser.matchKeyword("SERVER")) {
+            return parseCreateServer();
+        }
+        if (parser.matchKeywords("FOREIGN", "TABLE")) {
+            return parseCreateForeignTable();
+        }
+        if (parser.matchKeyword("PUBLICATION")) {
+            return parseCreatePublication();
+        }
+        if (parser.matchKeyword("SUBSCRIPTION")) {
+            return parseCreateSubscription();
+        }
+
+        // Text Search DDL
+        if (parser.matchKeywords("TEXT", "SEARCH")) {
+            return parseCreateTextSearch();
+        }
+
+        // CREATE COLLATION
+        if (parser.matchKeyword("COLLATION")) {
+            return parseCreateCollation();
+        }
+
+        // CREATE CAST
+        if (parser.matchKeyword("CAST")) {
+            return parseCreateCast();
+        }
+
         // No-op CREATE targets (accepted but not functionally implemented)
-        if (parser.matchKeyword("COLLATION") || parser.matchKeyword("CAST")
-                || parser.matchKeyword("CONVERSION")
+        if (parser.matchKeyword("CONVERSION")
                 || parser.matchKeywords("DEFAULT", "CONVERSION")
-                || parser.matchKeywords("TEXT", "SEARCH")
-                || parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")
-                || parser.matchKeyword("SERVER")
-                || parser.matchKeywords("FOREIGN", "TABLE")
-                || parser.matchKeyword("PUBLICATION")
-                || parser.matchKeyword("SUBSCRIPTION")
                 || parser.matchKeyword("TABLESPACE")
-                || parser.matchKeywords("EVENT", "TRIGGER")
                 || parser.matchKeyword("TRANSFORM")
-                || parser.matchKeywords("ACCESS", "METHOD")
-                || parser.matchKeyword("STATISTICS")) {
+                || parser.matchKeywords("ACCESS", "METHOD")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("create_noop", "ok");
+        }
+
+        if (parser.matchKeyword("STATISTICS")) {
+            return parseCreateStatistics();
         }
 
         // CREATE DATABASE dbname [options...]
@@ -141,7 +169,7 @@ class DdlParser {
 
         if (parser.matchKeywords("USER", "MAPPING")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return new SetStmt("drop_user_mapping", "ok");
         }
         if (parser.matchKeyword("ROLE") || parser.matchKeyword("USER") || parser.matchKeyword("GROUP")) {
             return roleParser.parseDropRole();
@@ -195,22 +223,38 @@ class DdlParser {
         else if (parser.matchKeywords("OPERATOR", "FAMILY")) objectType = DropStmt.ObjectType.OPERATOR_FAMILY;
         else if (parser.matchKeyword("OPERATOR")) objectType = DropStmt.ObjectType.OPERATOR;
         else if (parser.matchKeywords("TEXT", "SEARCH")) {
-            parser.matchKeyword("CONFIGURATION");
-            parser.matchKeyword("DICTIONARY");
-            parser.matchKeyword("PARSER");
-            parser.matchKeyword("TEMPLATE");
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return parseDropTextSearch();
         }
-        else if (parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")
-                || parser.matchKeyword("SERVER")
-                || parser.matchKeywords("FOREIGN", "TABLE")) {
+        else if (parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")) {
+            boolean fdwIfExists = parser.matchKeywords("IF", "EXISTS");
+            String fdwName = parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return new SetStmt("drop_fdw", fdwName);
         }
-        else if (parser.matchKeyword("PUBLICATION") || parser.matchKeyword("SUBSCRIPTION")) {
+        else if (parser.matchKeyword("SERVER")) {
+            boolean srvIfExists = parser.matchKeywords("IF", "EXISTS");
+            String srvName = parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return new SetStmt("drop_server", srvName);
+        }
+        else if (parser.matchKeywords("FOREIGN", "TABLE")) {
+            boolean ftIfExists = parser.matchKeywords("IF", "EXISTS");
+            String ftName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) ftName = parser.readIdentifier();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("drop_foreign_table", ftName);
+        }
+        else if (parser.matchKeyword("PUBLICATION")) {
+            boolean pubIfExists = parser.matchKeywords("IF", "EXISTS");
+            String pubName = parser.readIdentifier();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("drop_publication", pubName);
+        }
+        else if (parser.matchKeyword("SUBSCRIPTION")) {
+            boolean subIfExists = parser.matchKeywords("IF", "EXISTS");
+            String subName = parser.readIdentifier();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("drop_subscription", subName);
         }
         else if (parser.matchKeyword("DATABASE")) {
             boolean ifExists = parser.matchKeywords("IF", "EXISTS");
@@ -243,8 +287,7 @@ class DdlParser {
             return new SetStmt("drop_noop", "ok");
         }
         else if (parser.matchKeywords("EVENT", "TRIGGER")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return parseDropEventTrigger();
         }
         else if (parser.matchKeyword("TRANSFORM")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
@@ -255,8 +298,11 @@ class DdlParser {
             return new SetStmt("drop_noop", "ok");
         }
         else if (parser.matchKeyword("STATISTICS")) {
+            boolean dropIfExists = parser.matchKeywords("IF", "EXISTS");
+            String statName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) statName = parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return new SetStmt("drop_statistics", statName);
         }
         else throw new ParseException("Unsupported DROP target", parser.peek());
 
@@ -265,10 +311,18 @@ class DdlParser {
         if (objectType == DropStmt.ObjectType.INDEX) parser.matchKeyword("CONCURRENTLY");
 
         if (objectType == DropStmt.ObjectType.CAST) {
-            if (parser.check(TokenType.LEFT_PAREN)) DdlTableParser.consumeUntilParen(parser);
+            String castName = "cast";
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                parser.advance(); // consume '('
+                String sourceType = parser.parseTypeName();
+                parser.expectKeyword("AS");
+                String targetType = parser.parseTypeName();
+                parser.expect(TokenType.RIGHT_PAREN);
+                castName = sourceType.toLowerCase() + "->" + targetType.toLowerCase();
+            }
             boolean cascade2 = parser.matchKeyword("CASCADE");
             parser.matchKeyword("RESTRICT");
-            return new DropStmt(objectType, "cast", null, ifExists, cascade2);
+            return new DropStmt(objectType, castName, null, ifExists, cascade2);
         }
 
         String name;
@@ -396,8 +450,7 @@ class DdlParser {
         if (parser.matchKeyword("POLICY")) return policyParser.parseAlterPolicy();
         if (parser.matchKeywords("DEFAULT", "PRIVILEGES")) return parseAlterDefaultPrivileges();
         if (parser.matchKeywords("TEXT", "SEARCH")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("alter_noop", "ok");
+            return parseAlterTextSearch();
         }
         if (parser.matchKeyword("GROUP")) return roleParser.parseAlterRole();
 
@@ -464,23 +517,60 @@ class DdlParser {
             return parseAlterIndex();
         }
 
-        // No-op ALTER targets
-        if (parser.matchKeyword("EXTENSION")
-                || parser.matchKeyword("AGGREGATE") || parser.matchKeyword("COLLATION")
-                || parser.matchKeyword("RULE") || parser.matchKeyword("CONVERSION")
-                || parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")
-                || parser.matchKeyword("SERVER")
-                || parser.matchKeywords("FOREIGN", "TABLE")
-                || parser.matchKeyword("PUBLICATION")
-                || parser.matchKeyword("SUBSCRIPTION")
-                || parser.matchKeyword("TABLESPACE")
-                || parser.matchKeyword("LANGUAGE")
-                || parser.matchKeywords("EVENT", "TRIGGER")
-                || parser.matchKeywords("LARGE", "OBJECT")
-                || parser.matchKeyword("TRANSFORM")
-                || parser.matchKeyword("STATISTICS")) {
+        // ALTER EVENT TRIGGER
+        if (parser.matchKeywords("EVENT", "TRIGGER")) return parseAlterEventTrigger();
+
+        if (parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_noop", "ok");
+        }
+        if (parser.matchKeyword("SERVER")) {
+            return parseAlterServer();
+        }
+        if (parser.matchKeywords("FOREIGN", "TABLE")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_noop", "ok");
+        }
+        if (parser.matchKeyword("PUBLICATION")) {
+            return parseAlterPublication();
+        }
+        if (parser.matchKeyword("SUBSCRIPTION")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_noop", "ok");
+        }
+
+        // ALTER EXTENSION — parse SET SCHEMA and UPDATE
+        if (parser.matchKeyword("EXTENSION")) {
+            String extName = parser.readIdentifierOrString();
+            if (parser.matchKeywords("SET", "SCHEMA")) {
+                String newSchema = parser.readIdentifierOrString();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new SetStmt("alter_extension_set_schema", extName + ":" + newSchema);
+            }
+            if (parser.matchKeyword("UPDATE")) {
+                // ALTER EXTENSION name UPDATE [TO version]
+                String toVersion = null;
+                if (parser.matchKeyword("TO")) {
+                    toVersion = parser.readIdentifierOrString();
+                }
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new SetStmt("alter_extension_update", extName + (toVersion != null ? ":" + toVersion : ""));
+            }
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_noop", "ok");
+        }
+        // No-op ALTER targets
+        if (parser.matchKeyword("AGGREGATE") || parser.matchKeyword("COLLATION")
+                || parser.matchKeyword("RULE") || parser.matchKeyword("CONVERSION")
+                || parser.matchKeyword("TABLESPACE")
+                || parser.matchKeyword("LANGUAGE")
+                || parser.matchKeywords("LARGE", "OBJECT")
+                || parser.matchKeyword("TRANSFORM")) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_noop", "ok");
+        }
+        if (parser.matchKeyword("STATISTICS")) {
+            return parseAlterStatistics();
         }
         parser.expectKeyword("TABLE");
 
@@ -543,9 +633,14 @@ class DdlParser {
             }
         }
 
-        parser.matchKeyword("DEFERRABLE");
+        boolean trigDeferrable = parser.matchKeyword("DEFERRABLE");
+        boolean trigInitiallyDeferred = false;
         if (parser.matchKeyword("INITIALLY")) {
-            if (!parser.matchKeyword("DEFERRED")) parser.matchKeyword("IMMEDIATE");
+            if (parser.matchKeyword("DEFERRED")) {
+                trigInitiallyDeferred = true;
+            } else {
+                parser.matchKeyword("IMMEDIATE");
+            }
         }
 
         parser.expectKeyword("FOR");
@@ -579,7 +674,8 @@ class DdlParser {
         parser.expect(TokenType.RIGHT_PAREN);
 
         return new CreateTriggerStmt(name, timing, events, table, tableSchema, funcName, orReplace, whenClause,
-                updateOfColumns.isEmpty() ? null : updateOfColumns, newTransitionTable, oldTransitionTable, !forEachRow);
+                updateOfColumns.isEmpty() ? null : updateOfColumns, newTransitionTable, oldTransitionTable, !forEachRow,
+                trigDeferrable, trigInitiallyDeferred);
     }
 
     // ---- CREATE VIEW ----
@@ -689,9 +785,18 @@ class DdlParser {
         }
         if (parser.matchKeyword("RANGE")) {
             parser.expect(TokenType.LEFT_PAREN);
-            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) parser.advance();
+            String rangeSubtype = null;
+            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                if (parser.checkIdentCI("SUBTYPE")) {
+                    parser.advance();
+                    parser.expect(TokenType.EQUALS);
+                    rangeSubtype = parser.parseTypeName();
+                } else {
+                    parser.advance();
+                }
+            }
             parser.expect(TokenType.RIGHT_PAREN);
-            return new CreateTypeStmt(name, Cols.listOf());
+            return new CreateTypeStmt(name, null, null, rangeSubtype);
         }
         parser.expect(TokenType.LEFT_PAREN);
         List<CreateTypeStmt.CompositeField> fields = new ArrayList<>();
@@ -709,7 +814,26 @@ class DdlParser {
     CreateExtensionStmt parseCreateExtension() {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String name = parser.readIdentifierOrString();
-        return new CreateExtensionStmt(name, ifNotExists);
+        // Parse optional WITH, SCHEMA, VERSION, CASCADE clauses
+        parser.matchKeyword("WITH"); // optional WITH keyword
+        String schema = null;
+        String version = null;
+        boolean cascade = false;
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            if (parser.matchKeyword("SCHEMA")) {
+                schema = parser.readIdentifierOrString();
+            } else if (parser.matchKeyword("VERSION")) {
+                version = parser.readIdentifierOrString();
+            } else if (parser.matchKeyword("CASCADE")) {
+                cascade = true;
+            } else if (parser.matchKeyword("FROM")) {
+                // FROM old_version — skip
+                parser.readIdentifierOrString();
+            } else {
+                break;
+            }
+        }
+        return new CreateExtensionStmt(name, ifNotExists, schema, version, cascade);
     }
 
     Statement parseCreateAggregate() {
@@ -865,6 +989,7 @@ class DdlParser {
         Expression defaultExpr = null;
         boolean notNull = false;
         Expression checkExpr = null;
+        String constraintName = null;
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeyword("DEFAULT")) { defaultExpr = parser.parseExpression(); }
             else if (parser.matchKeywords("NOT", "NULL")) { notNull = true; }
@@ -873,10 +998,10 @@ class DdlParser {
                 parser.expect(TokenType.LEFT_PAREN);
                 checkExpr = parser.parseExpression();
                 parser.expect(TokenType.RIGHT_PAREN);
-            } else if (parser.matchKeyword("CONSTRAINT")) { parser.readIdentifier(); }
+            } else if (parser.matchKeyword("CONSTRAINT")) { constraintName = parser.readIdentifier(); }
             else { break; }
         }
-        return new CreateDomainStmt(name, baseType, defaultExpr, notNull, checkExpr);
+        return new CreateDomainStmt(name, baseType, defaultExpr, notNull, checkExpr, constraintName);
     }
 
     // ---- SEQUENCE ----
@@ -889,7 +1014,7 @@ class DdlParser {
     }
 
     private void parseSequenceOptions(Long[] startWith, Long[] incrementBy, Long[] minValue,
-                                      Long[] maxValue, Boolean[] cycle, Integer[] cache) {
+                                      Long[] maxValue, Boolean[] cycle, Integer[] cache, String[] asType) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeywords("START", "WITH")) { startWith[0] = readSeqLong(); continue; }
             if (parser.matchKeyword("START")) { startWith[0] = readSeqLong(); continue; }
@@ -907,7 +1032,7 @@ class DdlParser {
                 parser.readIdentifier(); if (parser.match(TokenType.DOT)) { parser.readIdentifier(); if (parser.match(TokenType.DOT)) parser.readIdentifier(); }
                 continue;
             }
-            if (parser.matchKeyword("AS")) { parser.readIdentifier(); continue; }
+            if (parser.matchKeyword("AS")) { if (asType != null) asType[0] = parser.readIdentifier(); else parser.readIdentifier(); continue; }
             break;
         }
     }
@@ -919,9 +1044,11 @@ class DdlParser {
         Long[] startWith = {null}, incrementBy = {null}, minValue = {null}, maxValue = {null};
         Boolean[] cycle = {null};
         Integer[] cache = {null};
-        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache);
+        String[] asType = {null};
+        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType);
         CreateSequenceStmt stmt = new CreateSequenceStmt(name, ifNotExists, startWith[0], incrementBy[0], minValue[0], maxValue[0], cycle[0], temporary);
         stmt.setCache(cache[0]);
+        stmt.setAsType(asType[0]);
         return stmt;
     }
 
@@ -944,7 +1071,7 @@ class DdlParser {
             }
             int saved = parser.pos;
             Integer[] cache = {null};
-            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache);
+            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, null);
             if (parser.pos == saved) break;
         }
         return new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0], maxValue[0], startWith[0], cycle[0]);
@@ -994,13 +1121,20 @@ class DdlParser {
             Expression checkExpr = parser.parseExpression();
             String raw = buildRawSqlFromTokens(startPos, parser.pos);
             parser.expect(TokenType.RIGHT_PAREN);
-            return new AlterDomainStmt(domainName, "ADD_CONSTRAINT", null, constraintName, checkExpr, raw);
+            boolean notValid = parser.matchKeywords("NOT", "VALID");
+            return new AlterDomainStmt(domainName, "ADD_CONSTRAINT", null, constraintName, checkExpr, raw, notValid, null);
         }
         if (parser.matchKeywords("DROP", "CONSTRAINT")) {
             return new AlterDomainStmt(domainName, "DROP_CONSTRAINT", null, parser.readIdentifier(), null, null);
         }
         if (parser.matchKeywords("VALIDATE", "CONSTRAINT")) {
             return new AlterDomainStmt(domainName, "VALIDATE", null, parser.readIdentifier(), null, null);
+        }
+        if (parser.matchKeywords("RENAME", "CONSTRAINT")) {
+            String oldName = parser.readIdentifier();
+            parser.expectKeyword("TO");
+            String newName = parser.readIdentifier();
+            return new AlterDomainStmt(domainName, "RENAME_CONSTRAINT", null, oldName, null, null, false, newName);
         }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         return new AlterDomainStmt(domainName, "NO_OP", null, null, null, null);
@@ -1023,8 +1157,43 @@ class DdlParser {
             Token newVal = parser.expect(TokenType.STRING_LITERAL);
             return new AlterTypeStmt(typeName, AlterTypeStmt.Action.RENAME_VALUE, oldVal.value(), newVal.value(), false, null, null);
         }
+        if (parser.matchKeywords("RENAME", "ATTRIBUTE")) {
+            String attrName = parser.readIdentifier();
+            parser.expectKeyword("TO");
+            String newName = parser.readIdentifier();
+            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.RENAME_ATTRIBUTE, attrName, newName, false, null, null);
+        }
         if (parser.matchKeywords("RENAME", "TO"))
             return new AlterTypeStmt(typeName, AlterTypeStmt.Action.RENAME_TO, parser.readIdentifier(), null, false, null, null);
+        if (parser.matchKeywords("ADD", "ATTRIBUTE")) {
+            String attrName = parser.readIdentifier();
+            String attrType = parser.readIdentifier();
+            // Handle multi-word types like "double precision"
+            if (attrType.equalsIgnoreCase("double") && parser.matchKeyword("PRECISION")) {
+                attrType = "double precision";
+            } else if (attrType.equalsIgnoreCase("character") && parser.matchKeyword("VARYING")) {
+                attrType = "character varying";
+            }
+            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.ADD_ATTRIBUTE, attrName, attrType, false, null, null);
+        }
+        if (parser.matchKeywords("DROP", "ATTRIBUTE")) {
+            parser.matchKeywords("IF", "EXISTS");
+            String attrName = parser.readIdentifier();
+            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.DROP_ATTRIBUTE, attrName, null, false, null, null);
+        }
+        if (parser.matchKeywords("ALTER", "ATTRIBUTE")) {
+            String attrName = parser.readIdentifier();
+            parser.matchKeyword("SET"); // optional SET before DATA
+            parser.matchKeyword("DATA"); // optional DATA
+            parser.expectKeyword("TYPE");
+            String newType = parser.readIdentifier();
+            if (newType.equalsIgnoreCase("double") && parser.matchKeyword("PRECISION")) {
+                newType = "double precision";
+            } else if (newType.equalsIgnoreCase("character") && parser.matchKeyword("VARYING")) {
+                newType = "character varying";
+            }
+            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE, attrName, newType, false, null, null);
+        }
         if (parser.matchKeywords("SET", "SCHEMA"))
             return new AlterTypeStmt(typeName, AlterTypeStmt.Action.SET_SCHEMA, parser.readIdentifier(), null, false, null, null);
         if (parser.matchKeywords("OWNER", "TO"))
@@ -1630,5 +1799,585 @@ class DdlParser {
             }
         }
         return raw.toString();
+    }
+
+    // ---- CREATE EVENT TRIGGER ----
+
+    private static final java.util.Set<String> VALID_EVENT_TRIGGER_EVENTS = Cols.setOf(
+            "ddl_command_start", "ddl_command_end", "sql_drop", "table_rewrite");
+
+    Statement parseCreateEventTrigger() {
+        String name = parser.readIdentifier();
+        parser.expectKeyword("ON");
+        String event = parser.readIdentifier();
+        if (!VALID_EVENT_TRIGGER_EVENTS.contains(event)) {
+            throw new com.memgres.engine.MemgresException(
+                    "unrecognized event name \"" + event + "\"", "42601");
+        }
+        List<String> tags = null;
+        if (parser.matchKeyword("WHEN")) {
+            // WHEN TAG IN ('tag1', 'tag2', ...)
+            parser.readIdentifier(); // TAG
+            parser.expectKeyword("IN");
+            parser.match(TokenType.LEFT_PAREN);
+            tags = new ArrayList<>();
+            do {
+                Token t = parser.peek();
+                if (t.type() == TokenType.STRING_LITERAL) {
+                    tags.add(t.value());
+                    parser.advance();
+                } else {
+                    tags.add(parser.readIdentifier());
+                }
+            } while (parser.match(TokenType.COMMA));
+            parser.match(TokenType.RIGHT_PAREN);
+        }
+        parser.expectKeyword("EXECUTE");
+        if (!parser.matchKeyword("FUNCTION")) {
+            parser.expectKeyword("PROCEDURE");
+        }
+        String funcName = parser.readIdentifier();
+        parser.match(TokenType.LEFT_PAREN);
+        parser.match(TokenType.RIGHT_PAREN);
+        return new CreateEventTriggerStmt(name, event, tags, funcName);
+    }
+
+    // ---- DROP EVENT TRIGGER ----
+
+    Statement parseDropEventTrigger() {
+        boolean ifExists = parser.matchKeywords("IF", "EXISTS");
+        String name = parser.readIdentifier();
+        // optional CASCADE / RESTRICT
+        parser.matchKeyword("CASCADE");
+        parser.matchKeyword("RESTRICT");
+        return new DropEventTriggerStmt(name, ifExists);
+    }
+
+    // ---- ALTER EVENT TRIGGER ----
+
+    Statement parseAlterEventTrigger() {
+        String name = parser.readIdentifier();
+        if (parser.matchKeyword("DISABLE")) {
+            return new AlterEventTriggerStmt(name, AlterEventTriggerStmt.Action.DISABLE, null);
+        }
+        if (parser.matchKeyword("ENABLE")) {
+            if (parser.matchKeyword("REPLICA")) {
+                return new AlterEventTriggerStmt(name, AlterEventTriggerStmt.Action.ENABLE_REPLICA, null);
+            }
+            if (parser.matchKeyword("ALWAYS")) {
+                return new AlterEventTriggerStmt(name, AlterEventTriggerStmt.Action.ENABLE_ALWAYS, null);
+            }
+            return new AlterEventTriggerStmt(name, AlterEventTriggerStmt.Action.ENABLE, null);
+        }
+        if (parser.matchKeywords("RENAME", "TO")) {
+            String newName = parser.readIdentifier();
+            return new AlterEventTriggerStmt(name, AlterEventTriggerStmt.Action.RENAME, newName);
+        }
+        if (parser.matchKeywords("OWNER", "TO")) {
+            String newOwner = parser.readIdentifier();
+            return new AlterEventTriggerStmt(name, AlterEventTriggerStmt.Action.OWNER, newOwner);
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_noop", "ok");
+    }
+
+    // ---- CREATE STATISTICS ----
+
+    Statement parseCreateStatistics() {
+        boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier(); // skip schema
+
+        // Optional (kinds): (ndistinct, dependencies, mcv)
+        List<String> kinds = new ArrayList<>();
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance(); // (
+            do {
+                kinds.add(parser.readIdentifier().toLowerCase());
+            } while (parser.match(TokenType.COMMA));
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
+
+        parser.expectKeyword("ON");
+
+        // Parse columns/expressions: col1, col2, (expr1), ...
+        List<String> columns = new ArrayList<>();
+        do {
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                // Expression in parens
+                parser.advance();
+                StringBuilder expr = new StringBuilder();
+                int depth = 1;
+                while (!parser.isAtEnd() && depth > 0) {
+                    Token t = parser.peek();
+                    if (t.type() == TokenType.LEFT_PAREN) depth++;
+                    if (t.type() == TokenType.RIGHT_PAREN) {
+                        depth--;
+                        if (depth == 0) break;
+                    }
+                    if (expr.length() > 0) expr.append(" ");
+                    expr.append(parser.advance().value());
+                }
+                parser.expect(TokenType.RIGHT_PAREN);
+                columns.add("(" + expr + ")");
+            } else {
+                columns.add(parser.readIdentifier());
+            }
+        } while (parser.match(TokenType.COMMA));
+
+        parser.expectKeyword("FROM");
+        String tableName = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier();
+
+        // Encode: "create_statistics:name:table:col1,col2:kind1,kind2"
+        String kindsStr = kinds.isEmpty() ? "" : String.join(",", kinds);
+        String colsStr = String.join(",", columns);
+        return new SetStmt("create_statistics", name + "\0" + tableName + "\0" + colsStr + "\0" + kindsStr);
+    }
+
+    // ---- ALTER STATISTICS ----
+
+    Statement parseAlterStatistics() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+
+        if (parser.matchKeywords("RENAME", "TO")) {
+            String newName = parser.readIdentifier();
+            return new SetStmt("alter_statistics_rename", name + "\0" + newName);
+        }
+        if (parser.matchKeywords("SET", "STATISTICS")) {
+            String target = parser.advance().value();
+            return new SetStmt("alter_statistics_target", name + "\0" + target);
+        }
+        if (parser.matchKeywords("OWNER", "TO")) {
+            parser.readIdentifier();
+            return new SetStmt("alter_noop", "ok");
+        }
+        if (parser.matchKeywords("SET", "SCHEMA")) {
+            parser.readIdentifier();
+            return new SetStmt("alter_noop", "ok");
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_noop", "ok");
+    }
+
+    // ---- FDW DDL parsing ----
+
+    /** Parse OPTIONS (key 'value', ...) clause, returns PG array format {key=value,...} or null. */
+    private String parseOptionsClause() {
+        if (!parser.matchKeyword("OPTIONS")) return null;
+        parser.expect(TokenType.LEFT_PAREN);
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+            if (!first) sb.append(",");
+            first = false;
+            // Optional SET/ADD/DROP prefix for ALTER
+            parser.matchKeyword("SET");
+            parser.matchKeyword("ADD");
+            parser.matchKeyword("DROP");
+            String key = parser.readIdentifier();
+            String value = "";
+            if (parser.check(TokenType.STRING_LITERAL)) {
+                value = parser.advance().value();
+            }
+            sb.append(key).append("=").append(value);
+            parser.match(TokenType.COMMA);
+        }
+        parser.expect(TokenType.RIGHT_PAREN);
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private Statement parseCreateForeignDataWrapper() {
+        parser.matchKeywords("IF", "NOT", "EXISTS");
+        String name = parser.readIdentifier();
+        String options = null;
+        // Consume HANDLER, VALIDATOR, OPTIONS, NO HANDLER, NO VALIDATOR
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            if (parser.checkKeyword("OPTIONS")) {
+                options = parseOptionsClause();
+            } else if (parser.matchKeyword("HANDLER") || parser.matchKeyword("VALIDATOR")) {
+                parser.readIdentifier(); // handler/validator function name
+            } else if (parser.matchKeyword("NO")) {
+                parser.matchKeyword("HANDLER");
+                parser.matchKeyword("VALIDATOR");
+            } else {
+                break;
+            }
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("create_fdw", name + "\0" + (options != null ? options : ""));
+    }
+
+    private Statement parseCreateServer() {
+        parser.matchKeywords("IF", "NOT", "EXISTS");
+        String name = parser.readIdentifier();
+        // Optional TYPE 'type', VERSION 'version'
+        if (parser.matchKeyword("TYPE")) {
+            if (parser.check(TokenType.STRING_LITERAL)) parser.advance();
+        }
+        if (parser.matchKeyword("VERSION")) {
+            if (parser.check(TokenType.STRING_LITERAL)) parser.advance();
+        }
+        parser.expectKeyword("FOREIGN");
+        parser.expectKeyword("DATA");
+        parser.expectKeyword("WRAPPER");
+        String fdwName = parser.readIdentifier();
+        String options = parseOptionsClause();
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("create_server", name + "\0" + fdwName + "\0" + (options != null ? options : ""));
+    }
+
+    private Statement parseCreateUserMapping() {
+        parser.expectKeyword("FOR");
+        String userName;
+        if (parser.matchKeyword("PUBLIC")) {
+            userName = "PUBLIC";
+        } else if (parser.matchKeyword("CURRENT_USER") || parser.matchKeyword("CURRENT_ROLE")) {
+            userName = "memgres";
+        } else if (parser.matchKeyword("SESSION_USER")) {
+            userName = "memgres";
+        } else {
+            userName = parser.readIdentifier();
+        }
+        parser.expectKeyword("SERVER");
+        String serverName = parser.readIdentifier();
+        String options = parseOptionsClause();
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("create_user_mapping", serverName + "\0" + userName + "\0" + (options != null ? options : ""));
+    }
+
+    private Statement parseCreateForeignTable() {
+        parser.matchKeywords("IF", "NOT", "EXISTS");
+        String schema = null;
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) { schema = name; name = parser.readIdentifier(); }
+        // Parse columns
+        List<String> colDefs = new ArrayList<>(); // stored as "name\ttype"
+        if (parser.match(TokenType.LEFT_PAREN)) {
+            while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                String colName = parser.readIdentifier();
+                String colType = parser.parseTypeName();
+                colDefs.add(colName + "\t" + colType);
+                // Skip optional NOT NULL, DEFAULT, etc.
+                while (!parser.isAtEnd() && !parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                    parser.advance();
+                }
+                parser.match(TokenType.COMMA);
+            }
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
+        String serverName = "";
+        if (parser.matchKeyword("SERVER")) {
+            serverName = parser.readIdentifier();
+        }
+        String options = parseOptionsClause();
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        // Encode columns as col1\ttype1\ncol2\ttype2
+        String colStr = String.join("\n", colDefs);
+        return new SetStmt("create_foreign_table", name + "\0" + serverName + "\0" + (options != null ? options : "") + "\0" + colStr);
+    }
+
+    private Statement parseAlterServer() {
+        String name = parser.readIdentifier();
+        // Check for OPTIONS clause
+        if (parser.checkKeyword("OPTIONS")) {
+            String options = parseOptionsClause();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_server_options", name + "\0" + (options != null ? options : ""));
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_noop", "ok");
+    }
+
+    // ---- Publication / Subscription DDL parsing ----
+
+    private Statement parseCreatePublication() {
+        String name = parser.readIdentifier();
+        boolean allTables = false;
+        List<String> tables = new ArrayList<>();
+        String schemaName = null;
+        if (parser.matchKeywords("FOR", "ALL", "TABLES")) {
+            allTables = true;
+        } else if (parser.matchKeyword("FOR")) {
+            if (parser.matchKeywords("TABLES", "IN", "SCHEMA")) {
+                schemaName = parser.readIdentifier();
+            } else {
+                parser.matchKeyword("TABLE");
+                // Parse table list
+                do {
+                    parser.matchKeyword("ONLY");
+                    String tbl = parser.readIdentifier();
+                    if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+                    tables.add(tbl);
+                } while (parser.match(TokenType.COMMA));
+            }
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        // Encode: name\0allTables\0table1,table2\0schemaName
+        return new SetStmt("create_publication", name + "\0" + allTables + "\0" + String.join(",", tables)
+                + "\0" + (schemaName != null ? schemaName : ""));
+    }
+
+    private Statement parseAlterPublication() {
+        String name = parser.readIdentifier();
+        if (parser.matchKeywords("ADD", "TABLE")) {
+            List<String> tables = new ArrayList<>();
+            do {
+                parser.matchKeyword("ONLY");
+                String tbl = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+                tables.add(tbl);
+            } while (parser.match(TokenType.COMMA));
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_publication_add_table", name + "\0" + String.join(",", tables));
+        }
+        if (parser.matchKeywords("SET", "TABLE")) {
+            List<String> tables = new ArrayList<>();
+            do {
+                parser.matchKeyword("ONLY");
+                String tbl = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+                tables.add(tbl);
+            } while (parser.match(TokenType.COMMA));
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_publication_set_table", name + "\0" + String.join(",", tables));
+        }
+        if (parser.matchKeywords("DROP", "TABLE")) {
+            List<String> tables = new ArrayList<>();
+            do {
+                parser.matchKeyword("ONLY");
+                String tbl = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+                tables.add(tbl);
+            } while (parser.match(TokenType.COMMA));
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_publication_drop_table", name + "\0" + String.join(",", tables));
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_noop", "ok");
+    }
+
+    private Statement parseCreateSubscription() {
+        String name = parser.readIdentifier();
+        parser.expectKeyword("CONNECTION");
+        String conninfo = "";
+        if (parser.check(TokenType.STRING_LITERAL)) {
+            conninfo = parser.advance().value();
+        }
+        parser.expectKeyword("PUBLICATION");
+        String pubName = parser.readIdentifier();
+        // Consume optional WITH (...) clause
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("create_subscription", name + "\0" + conninfo + "\0" + pubName);
+    }
+
+    // ---------------------------------------------------------------
+    //  Text Search DDL
+    // ---------------------------------------------------------------
+
+    /** Match an identifier (non-keyword) case-insensitively. */
+    private boolean matchIdentCI(String val) {
+        if (parser.checkIdentCI(val)) {
+            parser.advance();
+            return true;
+        }
+        // Also try matchKeyword in case the token happens to be a keyword
+        return parser.matchKeyword(val);
+    }
+
+    private Statement parseCreateTextSearch() {
+        if (matchIdentCI("CONFIGURATION")) {
+            return parseCreateTextSearchConfiguration();
+        }
+        if (matchIdentCI("DICTIONARY")) {
+            return parseCreateTextSearchDictionary();
+        }
+        // PARSER / TEMPLATE – accept but no-op
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("create_noop", "ok");
+    }
+
+    private Statement parseCreateTextSearchConfiguration() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        parser.expect(TokenType.LEFT_PAREN);
+        String copyFrom = null;
+        String parserName = null;
+        while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+            if (parser.matchKeyword("COPY") || matchIdentCI("COPY")) {
+                parser.expect(TokenType.EQUALS);
+                copyFrom = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) copyFrom = parser.readIdentifier();
+            } else if (matchIdentCI("PARSER")) {
+                parser.expect(TokenType.EQUALS);
+                parserName = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) parserName = parser.readIdentifier();
+            } else {
+                parser.advance();
+            }
+            parser.match(TokenType.COMMA);
+        }
+        parser.expect(TokenType.RIGHT_PAREN);
+        // Encode: name \0 copyFrom \0 parserName
+        String val = name + "\0" + (copyFrom != null ? copyFrom : "") + "\0" + (parserName != null ? parserName : "");
+        return new SetStmt("create_ts_config", val);
+    }
+
+    private Statement parseCreateTextSearchDictionary() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        parser.expect(TokenType.LEFT_PAREN);
+        String template = null;
+        StringBuilder opts = new StringBuilder();
+        while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+            if (matchIdentCI("TEMPLATE")) {
+                parser.expect(TokenType.EQUALS);
+                template = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) template = parser.readIdentifier();
+            } else {
+                // Collect remaining options (e.g. STOPWORDS = english)
+                String key = parser.advance().value();
+                if (parser.match(TokenType.EQUALS)) {
+                    String val = parser.advance().value();
+                    if (opts.length() > 0) opts.append(", ");
+                    opts.append(key).append(" = ").append(val);
+                }
+            }
+            parser.match(TokenType.COMMA);
+        }
+        parser.expect(TokenType.RIGHT_PAREN);
+        String val = name + "\0" + (template != null ? template : "") + "\0" + opts;
+        return new SetStmt("create_ts_dict", val);
+    }
+
+    private Statement parseDropTextSearch() {
+        String tsType = "CONFIGURATION";
+        if (matchIdentCI("CONFIGURATION")) tsType = "CONFIGURATION";
+        else if (matchIdentCI("DICTIONARY")) tsType = "DICTIONARY";
+        else if (matchIdentCI("PARSER")) tsType = "PARSER";
+        else if (matchIdentCI("TEMPLATE")) tsType = "TEMPLATE";
+        boolean ifExists = parser.matchKeywords("IF", "EXISTS");
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        // consume CASCADE/RESTRICT
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("drop_ts_" + tsType.toLowerCase(), name);
+    }
+
+    private Statement parseAlterTextSearch() {
+        if (matchIdentCI("CONFIGURATION")) {
+            return parseAlterTextSearchConfiguration();
+        }
+        // For DICTIONARY / PARSER / TEMPLATE - no-op
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_noop", "ok");
+    }
+
+    private Statement parseAlterTextSearchConfiguration() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        // Look for ALTER MAPPING FOR ... WITH ...
+        // or ADD MAPPING FOR ... WITH ...
+        // or DROP MAPPING [IF EXISTS] FOR ...
+        if (parser.matchKeyword("ALTER") || parser.matchKeyword("ADD")) {
+            if (parser.matchKeyword("MAPPING") || matchIdentCI("MAPPING")) {
+                if (parser.matchKeyword("FOR")) {
+                    List<String> tokenTypes = new java.util.ArrayList<>();
+                    tokenTypes.add(parser.readIdentifier());
+                    while (parser.match(TokenType.COMMA)) {
+                        tokenTypes.add(parser.readIdentifier());
+                    }
+                    if (parser.matchKeyword("WITH")) {
+                        List<String> dicts = new java.util.ArrayList<>();
+                        dicts.add(parser.readIdentifier());
+                        while (parser.match(TokenType.COMMA)) {
+                            dicts.add(parser.readIdentifier());
+                        }
+                        // Encode: configName \0 tokenType1,tokenType2 \0 dict1,dict2
+                        String val = name + "\0" + String.join(",", tokenTypes) + "\0" + String.join(",", dicts);
+                        return new SetStmt("alter_ts_config_mapping", val);
+                    }
+                }
+            }
+        }
+        // Consume rest for other ALTER variants
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_noop", "ok");
+    }
+
+    // ---- CREATE COLLATION ----
+
+    private Statement parseCreateCollation() {
+        boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
+        String name = parser.readIdentifier();
+
+        // CREATE COLLATION name FROM existing_collation
+        if (parser.matchKeyword("FROM")) {
+            String from = parser.readIdentifier();
+            return new CreateCollationStmt(name, ifNotExists, from, new LinkedHashMap<>());
+        }
+
+        // CREATE COLLATION name (option = value, ...)
+        Map<String, String> options = new LinkedHashMap<>();
+        if (parser.match(TokenType.LEFT_PAREN)) {
+            do {
+                String optName = parser.readIdentifier().toLowerCase();
+                parser.expect(TokenType.EQUALS);
+                String optVal;
+                if (parser.check(TokenType.STRING_LITERAL)) {
+                    optVal = parser.advance().value();
+                } else if (parser.checkKeyword("TRUE") || parser.checkKeyword("FALSE")) {
+                    optVal = parser.advance().value().toLowerCase();
+                } else {
+                    optVal = parser.advance().value();
+                }
+                options.put(optName, optVal);
+            } while (parser.match(TokenType.COMMA));
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
+
+        return new CreateCollationStmt(name, ifNotExists, null, options);
+    }
+
+    // ---- CREATE CAST ----
+
+    private Statement parseCreateCast() {
+        parser.expect(TokenType.LEFT_PAREN);
+        String sourceType = parser.parseTypeName();
+        parser.expectKeyword("AS");
+        String targetType = parser.parseTypeName();
+        parser.expect(TokenType.RIGHT_PAREN);
+
+        String functionName = null;
+        if (parser.matchKeyword("WITH")) {
+            if (parser.matchKeyword("FUNCTION")) {
+                functionName = parser.readIdentifier();
+                // consume optional argument list
+                if (parser.match(TokenType.LEFT_PAREN)) {
+                    while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                        parser.advance();
+                    }
+                    parser.expect(TokenType.RIGHT_PAREN);
+                }
+            } else if (parser.matchKeyword("INOUT")) {
+                // WITH INOUT: I/O conversion cast
+                functionName = null;
+            }
+        } else if (parser.matchKeywords("WITHOUT", "FUNCTION")) {
+            functionName = null;
+        }
+
+        String castContext = "e"; // explicit by default
+        if (parser.matchKeyword("AS")) {
+            if (parser.matchKeyword("ASSIGNMENT")) {
+                castContext = "a";
+            } else if (parser.matchKeyword("IMPLICIT")) {
+                castContext = "i";
+            }
+        }
+
+        return new CreateCastStmt(sourceType, targetType, functionName, castContext);
     }
 }

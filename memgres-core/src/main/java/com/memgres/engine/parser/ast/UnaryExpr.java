@@ -13,7 +13,7 @@ public final class UnaryExpr implements Expression {
     }
 
     public enum UnaryOp {
-        NOT, NEGATE, POSITIVE, BIT_NOT, ABS, SQRT, CBRT
+        NOT, NEGATE, POSITIVE, BIT_NOT, ABS, SQRT, CBRT, GEO_IS_HORIZONTAL, GEO_IS_VERTICAL
     }
 
     public UnaryOp op() { return op; }

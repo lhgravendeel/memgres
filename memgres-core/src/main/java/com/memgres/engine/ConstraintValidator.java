@@ -376,23 +376,42 @@ class ConstraintValidator {
             if (val == null) return;
         }
 
+        // Collect all tables to search (include partitions for partitioned tables)
+        List<Table> searchTables = new java.util.ArrayList<>();
+        if (refTable.getPartitionStrategy() != null && !refTable.getPartitions().isEmpty()) {
+            DmlPartitionHelper.collectAllPartitionTables(refTable, searchTables);
+        } else {
+            searchTables.add(refTable);
+        }
+
         // Try O(1) index lookup on referenced table's PK/UNIQUE index
         boolean found = false;
-        TableIndex refIdx = findIndexForColumns(refTable, refColNames);
-        if (refIdx != null) {
-            found = refIdx.containsKey(fkVals);
-        } else {
-            for (Object[] refRow : refTable.getRows()) {
-                boolean allMatch = true;
-                for (int i = 0; i < refColIndices.length; i++) {
-                    if (!valuesEqual(fkVals[i], refRow[refColIndices[i]])) {
-                        allMatch = false;
+        for (Table searchTable : searchTables) {
+            if (found) break;
+            // Recompute ref column indices for each partition table (columns should match)
+            int[] stRefColIndices = new int[refColNames.size()];
+            boolean colsOk = true;
+            for (int i = 0; i < refColNames.size(); i++) {
+                stRefColIndices[i] = searchTable.getColumnIndex(refColNames.get(i));
+                if (stRefColIndices[i] < 0) { colsOk = false; break; }
+            }
+            if (!colsOk) continue;
+            TableIndex refIdx = findIndexForColumns(searchTable, refColNames);
+            if (refIdx != null) {
+                found = refIdx.containsKey(fkVals);
+            } else {
+                for (Object[] refRow : searchTable.getRows()) {
+                    boolean allMatch = true;
+                    for (int i = 0; i < stRefColIndices.length; i++) {
+                        if (!valuesEqual(fkVals[i], refRow[stRefColIndices[i]])) {
+                            allMatch = false;
+                            break;
+                        }
+                    }
+                    if (allMatch) {
+                        found = true;
                         break;
                     }
-                }
-                if (allMatch) {
-                    found = true;
-                    break;
                 }
             }
         }
@@ -572,6 +591,17 @@ class ConstraintValidator {
                             break;
                         }
                         case SET_NULL: {
+                            // Determine which child column indices to null
+                            int[] nullIndices;
+                            java.util.List<String> setNullCols = sc.getOnDeleteSetNullColumns();
+                            if (setNullCols != null && !setNullCols.isEmpty()) {
+                                nullIndices = new int[setNullCols.size()];
+                                for (int ni = 0; ni < setNullCols.size(); ni++) {
+                                    nullIndices[ni] = childTable.getColumnIndex(setNullCols.get(ni));
+                                }
+                            } else {
+                                nullIndices = childColIndices;
+                            }
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -583,7 +613,7 @@ class ConstraintValidator {
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
                                     Object[] newVals = Arrays.copyOf(childRow, childRow.length);
-                                    for (int idx : childColIndices) {
+                                    for (int idx : nullIndices) {
                                         newVals[idx] = null;
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
@@ -727,6 +757,17 @@ class ConstraintValidator {
                             break;
                         }
                         case SET_NULL: {
+                            // Determine which child column indices to null
+                            int[] updateNullIndices;
+                            java.util.List<String> updateSetNullCols = sc.getOnUpdateSetNullColumns();
+                            if (updateSetNullCols != null && !updateSetNullCols.isEmpty()) {
+                                updateNullIndices = new int[updateSetNullCols.size()];
+                                for (int ni = 0; ni < updateSetNullCols.size(); ni++) {
+                                    updateNullIndices[ni] = childTable.getColumnIndex(updateSetNullCols.get(ni));
+                                }
+                            } else {
+                                updateNullIndices = childColIndices;
+                            }
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -738,7 +779,7 @@ class ConstraintValidator {
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
                                     Object[] newVals = Arrays.copyOf(childRow, childRow.length);
-                                    for (int idx : childColIndices) {
+                                    for (int idx : updateNullIndices) {
                                         newVals[idx] = null;
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
@@ -909,7 +950,8 @@ class ConstraintValidator {
         // String - String: PG says "operator is not unique" (42725)
         if (op == BinaryExpr.BinOp.SUBTRACT && left instanceof String && right instanceof String
                 && !leftIsGeometric && !((String) left).trim().startsWith("{") && !((String) left).trim().startsWith("[")
-                && !RangeOperations.isRangeString(((String) left))) {
+                && !RangeOperations.isRangeString(((String) left))
+                && !isLsnString(((String) left).trim())) {
             String rs = (String) right;
             String ls = (String) left;
             throw new MemgresException("operator is not unique: unknown - unknown", "42725");
@@ -1285,6 +1327,11 @@ class ConstraintValidator {
         if (value instanceof AstExecutor.PgBitString) return "bit";
         if (value instanceof List) return "integer[]";
         return "text";
+    }
+
+    /** Check if a string matches the pg_lsn format: hex/hex (e.g., "0/4000000"). */
+    private static boolean isLsnString(String s) {
+        return s.matches("[0-9a-fA-F]+/[0-9a-fA-F]+");
     }
 
 }

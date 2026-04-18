@@ -133,9 +133,29 @@ class ExprSpecialFormParser {
         ep.advance();
         if (ep.check(TokenType.STRING_LITERAL)) {
             String val = ep.advance().value();
-            return new CastExpr(Literal.ofString(val), "interval");
+            // Check for optional interval qualifier: YEAR TO MONTH, DAY TO SECOND, etc.
+            String qualifier = parseIntervalQualifier();
+            return new CastExpr(Literal.ofString(val), qualifier != null ? "interval " + qualifier : "interval");
         }
         return new CastExpr(ep.parsePrimary(), "interval");
+    }
+
+    /**
+     * Parse optional interval qualifier: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND,
+     * or compound forms like YEAR TO MONTH, DAY TO SECOND, etc.
+     * Returns null if no qualifier is present.
+     */
+    private String parseIntervalQualifier() {
+        if (ep.checkIntervalField()) {
+            String field = ep.advance().value().toLowerCase();
+            if (ep.checkKeyword("TO") || ep.checkIdentCI("TO")) {
+                ep.advance(); // consume TO
+                String toField = ep.readIdentifier().toLowerCase();
+                return field + " to " + toField;
+            }
+            return field;
+        }
+        return null;
     }
 
     Expression parseTimestamp() {
@@ -293,11 +313,19 @@ class ExprSpecialFormParser {
     // ---- Window function parsing ----
 
     WindowFuncExpr parseWindowFunction(String name, List<Expression> args, boolean distinct, boolean star) {
+        return parseWindowFunction(name, args, distinct, star, false, false, null);
+    }
+
+    WindowFuncExpr parseWindowFunction(String name, List<Expression> args, boolean distinct, boolean star, boolean ignoreNulls) {
+        return parseWindowFunction(name, args, distinct, star, ignoreNulls, false, null);
+    }
+
+    WindowFuncExpr parseWindowFunction(String name, List<Expression> args, boolean distinct, boolean star, boolean ignoreNulls, boolean fromLast, Expression filter) {
         ep.expectKeyword("OVER");
 
         if (!ep.check(TokenType.LEFT_PAREN)) {
             String windowName = ep.readIdentifier();
-            return new WindowFuncExpr(name, args, distinct, star, null, null, null, windowName);
+            return new WindowFuncExpr(name, args, distinct, star, null, null, null, windowName, ignoreNulls, fromLast, filter);
         }
 
         ep.expect(TokenType.LEFT_PAREN);
@@ -317,7 +345,7 @@ class ExprSpecialFormParser {
         }
 
         ep.expect(TokenType.RIGHT_PAREN);
-        return new WindowFuncExpr(name, args, distinct, star, partitionBy, orderBy, frame);
+        return new WindowFuncExpr(name, args, distinct, star, partitionBy, orderBy, frame, null, ignoreNulls, fromLast, filter);
     }
 
     WindowFuncExpr.FrameClause parseWindowFrame() {
@@ -585,7 +613,11 @@ class ExprSpecialFormParser {
         Expression value = ep.parseExpression();
         ep.expectKeyword("AS");
         String typeName = ep.parseTypeName();
+        boolean indent = ep.matchKeyword("INDENT") || ep.matchIdentifier("INDENT");
         ep.expect(TokenType.RIGHT_PAREN);
+        if (indent) {
+            return new FunctionCallExpr("xmlserialize", Cols.listOf(Literal.ofString(mode), value, Literal.ofString(typeName), Literal.ofString("indent")));
+        }
         return new FunctionCallExpr("xmlserialize", Cols.listOf(Literal.ofString(mode), value, Literal.ofString(typeName)));
     }
 
@@ -904,11 +936,8 @@ class ExprSpecialFormParser {
         }
         List<Expression> args = new ArrayList<>();
         boolean nullOnNull = false;
-        // PG 18 rejects KEY...VALUE syntax in JSON_OBJECT — KEY is parsed as a type name,
-        // producing error 42704: type "key" does not exist. Only colon syntax is supported.
-        if (ep.checkKeyword("KEY")) {
-            throw new com.memgres.engine.MemgresException("type \"key\" does not exist", "42704");
-        }
+        // PG 18 uses colon syntax: JSON_OBJECT('key' : value, ...)
+        // KEY...VALUE syntax is NOT supported in PG 18 (KEY is parsed as a type name).
         do {
             Expression key;
             Expression val;
@@ -976,7 +1005,11 @@ class ExprSpecialFormParser {
             val = ep.parseExpression();
         } else {
             key = ep.parseExpression();
-            ep.expect(TokenType.COLON);
+            if (ep.checkKeyword("VALUE")) {
+                ep.advance(); // consume VALUE
+            } else {
+                ep.expect(TokenType.COLON);
+            }
             val = ep.parseExpression();
         }
         boolean nullOnNull = false;

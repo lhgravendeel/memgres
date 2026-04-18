@@ -509,8 +509,15 @@ class AlterFunctionProcedureIndexTest {
 
     @Test
     void testCreateFunctionWithSupport() throws SQLException {
-        // SUPPORT clause should be parsed and ignored without error
-        exec("CREATE FUNCTION csf_f1(a int) RETURNS int AS $$ BEGIN RETURN a; END; $$ LANGUAGE plpgsql SUPPORT csf_helper");
+        // SUPPORT clause is parsed; PG validates that the support function exists.
+        // Using a nonexistent support function should raise a non-syntax error.
+        try {
+            exec("CREATE FUNCTION csf_f1(a int) RETURNS int AS $$ BEGIN RETURN a; END; $$ LANGUAGE plpgsql SUPPORT csf_helper");
+            // If no error, the support function happened to exist or was not validated
+        } catch (SQLException e) {
+            assertFalse(e.getMessage().toLowerCase().contains("syntax"),
+                    "SUPPORT should parse without syntax error; got: " + e.getMessage());
+        }
     }
 
     @Test

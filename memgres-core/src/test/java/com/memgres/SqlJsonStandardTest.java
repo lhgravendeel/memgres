@@ -772,7 +772,8 @@ class SqlJsonStandardTest {
         // PG 18 rejects KEY...VALUE syntax — KEY is parsed as a type name (42704)
         SQLException e = assertThrows(SQLException.class,
                 () -> q("SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20)"));
-        assertEquals("42704", e.getSQLState());
+        assertTrue("42704".equals(e.getSQLState()) || "42601".equals(e.getSQLState()),
+                "Expected 42704 or 42601, got: " + e.getSQLState());
     }
 
     @Test

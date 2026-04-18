@@ -94,12 +94,12 @@ public final class NetworkOperations {
         return longToIp(mask);
     }
 
-    /** hostmask(inet): returns the host mask (bitwise complement of the netmask) as an inet /32. */
+    /** hostmask(inet): returns the host mask (bitwise complement of the netmask). */
     public static String hostmask(String inet) {
         int prefix = masklen(inet);
         long mask = prefix == 0 ? 0 : (0xFFFFFFFFL << (32 - prefix)) & 0xFFFFFFFFL;
         long hostMask = ~mask & 0xFFFFFFFFL;
-        return longToIp(hostMask) + "/32";
+        return longToIp(hostMask);
     }
 
     /** broadcast(inet): returns the broadcast address. */

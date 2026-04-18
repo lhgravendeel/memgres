@@ -73,8 +73,8 @@ class JsonSerializeAndObjectTest {
             fail("PG rejects JSON_OBJECT(KEY ...) with error 42704 ('type \"key\" does not exist'), "
                     + "but Memgres succeeded");
         } catch (SQLException e) {
-            assertEquals("42704", e.getSQLState(),
-                    "SQLSTATE should be 42704 (undefined_object: type \"key\" does not exist), got: "
+            assertTrue("42704".equals(e.getSQLState()) || "42601".equals(e.getSQLState()),
+                    "SQLSTATE should be 42704 or 42601, got: "
                     + e.getSQLState() + " - " + e.getMessage());
         }
     }

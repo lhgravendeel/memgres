@@ -16,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * Expected to fail today. Do not modify Memgres code in this turn.
  */
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class Round14EventTriggersTest {
 
     static Memgres memgres;
@@ -59,8 +60,9 @@ class Round14EventTriggersTest {
     // =========================================================================
 
     @Test
+    @Order(1)
     void pg_event_trigger_catalog_exists() throws SQLException {
-        // Must be queryable; empty by default.
+        // Must be queryable; empty by default (no event triggers created yet).
         assertEquals(0, scalarInt("SELECT count(*)::int FROM pg_event_trigger"));
     }
 

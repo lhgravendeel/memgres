@@ -66,7 +66,7 @@ class Round14AuthPrivilegesTest {
         exec("CREATE TABLE r14_auth_mt (id int)");
         exec("GRANT MAINTAIN ON TABLE r14_auth_mt TO r14_auth_m1");
         // has_table_privilege for MAINTAIN
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_table_privilege('r14_auth_m1','r14_auth_mt','MAINTAIN')::text"));
     }
 
@@ -77,7 +77,7 @@ class Round14AuthPrivilegesTest {
         exec("CREATE TABLE r14_auth_ms.t1 (id int)");
         exec("CREATE TABLE r14_auth_ms.t2 (id int)");
         exec("GRANT MAINTAIN ON ALL TABLES IN SCHEMA r14_auth_ms TO r14_auth_m2");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_table_privilege('r14_auth_m2','r14_auth_ms.t1','MAINTAIN')::text"));
     }
 
@@ -99,7 +99,7 @@ class Round14AuthPrivilegesTest {
         exec("CREATE ROLE r14_auth_p2");
         exec("GRANT ALTER SYSTEM ON PARAMETER work_mem TO r14_auth_p2");
         // has_parameter_privilege (PG 15+)
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_parameter_privilege('r14_auth_p2','work_mem','ALTER SYSTEM')::text"));
     }
 
@@ -113,10 +113,10 @@ class Round14AuthPrivilegesTest {
         exec("CREATE TABLE r14_auth_ct (id int, secret text)");
         exec("GRANT SELECT (id) ON r14_auth_ct TO r14_auth_c1");
         // has_column_privilege for id → true
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_column_privilege('r14_auth_c1','r14_auth_ct','id','SELECT')::text"));
         // has_column_privilege for secret → false
-        assertEquals("f",
+        assertEquals("false",
                 scalarString("SELECT has_column_privilege('r14_auth_c1','r14_auth_ct','secret','SELECT')::text"));
     }
 
@@ -125,9 +125,9 @@ class Round14AuthPrivilegesTest {
         exec("CREATE ROLE r14_auth_c2");
         exec("CREATE TABLE r14_auth_cu (id int, v int)");
         exec("GRANT UPDATE (v) ON r14_auth_cu TO r14_auth_c2");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_column_privilege('r14_auth_c2','r14_auth_cu','v','UPDATE')::text"));
-        assertEquals("f",
+        assertEquals("false",
                 scalarString("SELECT has_column_privilege('r14_auth_c2','r14_auth_cu','id','UPDATE')::text"));
     }
 
@@ -137,9 +137,9 @@ class Round14AuthPrivilegesTest {
         exec("CREATE TABLE r14_auth_cr (id int, v int)");
         exec("GRANT SELECT (id, v) ON r14_auth_cr TO r14_auth_c3");
         exec("REVOKE SELECT (v) ON r14_auth_cr FROM r14_auth_c3");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_column_privilege('r14_auth_c3','r14_auth_cr','id','SELECT')::text"));
-        assertEquals("f",
+        assertEquals("false",
                 scalarString("SELECT has_column_privilege('r14_auth_c3','r14_auth_cr','v','SELECT')::text"));
     }
 
@@ -153,7 +153,7 @@ class Round14AuthPrivilegesTest {
         exec("CREATE TABLE r14_auth_gb (id int)");
         // GRANTED BY must be a role the grantor is a member of
         exec("GRANT SELECT ON r14_auth_gb TO r14_auth_g1 GRANTED BY CURRENT_ROLE");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_table_privilege('r14_auth_g1','r14_auth_gb','SELECT')::text"));
     }
 
@@ -180,27 +180,27 @@ class Round14AuthPrivilegesTest {
     @Test
     void role_inherit_noinherit() throws SQLException {
         exec("CREATE ROLE r14_auth_ni WITH NOINHERIT");
-        assertEquals("f",
+        assertEquals("false",
                 scalarString("SELECT rolinherit::text FROM pg_roles WHERE rolname = 'r14_auth_ni'"));
         exec("ALTER ROLE r14_auth_ni INHERIT");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT rolinherit::text FROM pg_roles WHERE rolname = 'r14_auth_ni'"));
     }
 
     @Test
     void role_can_login_attribute() throws SQLException {
         exec("CREATE ROLE r14_auth_lg WITH LOGIN");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'r14_auth_lg'"));
         exec("CREATE ROLE r14_auth_nlg WITH NOLOGIN");
-        assertEquals("f",
+        assertEquals("false",
                 scalarString("SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'r14_auth_nlg'"));
     }
 
     @Test
     void role_replication_attribute() throws SQLException {
         exec("CREATE ROLE r14_auth_rep WITH REPLICATION");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT rolreplication::text FROM pg_roles WHERE rolname = 'r14_auth_rep'"));
     }
 
@@ -214,7 +214,7 @@ class Round14AuthPrivilegesTest {
         exec("CREATE ROLE r14_auth_a2");
         exec("GRANT r14_auth_a1 TO r14_auth_a2 WITH ADMIN OPTION");
         // pg_auth_members.admin_option
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT admin_option::text FROM pg_auth_members m "
                         + "JOIN pg_roles r ON m.roleid = r.oid "
                         + "JOIN pg_roles m2 ON m.member = m2.oid "
@@ -227,7 +227,7 @@ class Round14AuthPrivilegesTest {
         exec("CREATE TABLE r14_auth_got (id int)");
         exec("GRANT SELECT ON r14_auth_got TO r14_auth_go1 WITH GRANT OPTION");
         // has_table_privilege 'SELECT WITH GRANT OPTION'
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT has_table_privilege('r14_auth_go1','r14_auth_got','SELECT WITH GRANT OPTION')::text"));
     }
 
@@ -238,7 +238,7 @@ class Round14AuthPrivilegesTest {
     @Test
     void security_definer_function_pg_proc_flag() throws SQLException {
         exec("CREATE FUNCTION r14_auth_sd() RETURNS int AS 'SELECT 1' LANGUAGE SQL SECURITY DEFINER");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT prosecdef::text FROM pg_proc WHERE proname = 'r14_auth_sd'"));
     }
 
@@ -289,14 +289,14 @@ class Round14AuthPrivilegesTest {
         exec("CREATE ROLE r14_auth_hs");
         exec("CREATE SCHEMA r14_auth_hss");
         exec("GRANT USAGE ON SCHEMA r14_auth_hss TO r14_auth_hs");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_schema_privilege('r14_auth_hs','r14_auth_hss','USAGE')::text"));
     }
 
     @Test
     void has_database_privilege_function() throws SQLException {
         // CONNECT on current database
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT has_database_privilege(current_database(),'CONNECT')::text"));
     }
 
@@ -305,7 +305,7 @@ class Round14AuthPrivilegesTest {
         exec("CREATE ROLE r14_auth_hr1");
         exec("CREATE ROLE r14_auth_hr2");
         exec("GRANT r14_auth_hr1 TO r14_auth_hr2");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT pg_has_role('r14_auth_hr2','r14_auth_hr1','USAGE')::text"));
     }
 }

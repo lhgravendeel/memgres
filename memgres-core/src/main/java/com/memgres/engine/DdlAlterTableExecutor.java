@@ -48,6 +48,7 @@ class DdlAlterTableExecutor {
                 throw new MemgresException("column \"" + rename.newName() + "\" of relation \"" + stmt.table() + "\" already exists", "42701");
             }
             table.renameColumn(rename.oldName(), rename.newName());
+            rewriteDependentViews(stmt.table(), rename.oldName(), rename.newName());
             executor.recordUndo(new Session.RenameColumnUndo(schemaName, stmt.table(), rename.newName(), rename.oldName()));
         } else if (action instanceof AlterTableStmt.RenameTable) {
             AlterTableStmt.RenameTable rename = (AlterTableStmt.RenameTable) action;
@@ -136,8 +137,17 @@ class DdlAlterTableExecutor {
             Table parentTable = executor.resolveTable(schemaName, noInherit.parentTable());
             parentTable.removeChild(table);
             table.setParentTable(null);
+        } else if (action instanceof AlterTableStmt.DisableTrigger) {
+            AlterTableStmt.DisableTrigger dt = (AlterTableStmt.DisableTrigger) action;
+            setTriggerEnabled(table, dt.triggerName(), true);
+        } else if (action instanceof AlterTableStmt.EnableTrigger) {
+            AlterTableStmt.EnableTrigger et = (AlterTableStmt.EnableTrigger) action;
+            setTriggerEnabled(table, et.triggerName(), false);
         } else if (action instanceof AlterTableStmt.SetStorageParams) {
             // no-op
+        } else if (action instanceof AlterTableStmt.SetLogged) {
+            AlterTableStmt.SetLogged sl = (AlterTableStmt.SetLogged) action;
+            table.setUnlogged(!sl.logged());
         }
         return table;
     }
@@ -227,6 +237,10 @@ class DdlAlterTableExecutor {
             } catch (Exception ignored) {}
         }
 
+        // Mark column as having a missing value if it was added with a DEFAULT and the table has existing rows
+        if (evaluatedDefault != null && !table.getRows().isEmpty()) {
+            col.setAttHasMissing(true);
+        }
         table.addColumn(col, evaluatedDefault);
         executor.recordUndo(new Session.AddColumnUndo(schemaName, stmt.table(), def.name()));
 
@@ -353,6 +367,35 @@ class DdlAlterTableExecutor {
             table.alterColumnNullable(alterCol.column(), false);
         } else if (alterCol.action() instanceof AlterTableStmt.DropNotNull) {
             table.alterColumnNullable(alterCol.column(), true);
+        } else if (alterCol.action() instanceof AlterTableStmt.SetStatistics) {
+            AlterTableStmt.SetStatistics ss = (AlterTableStmt.SetStatistics) alterCol.action();
+            int colIdx = table.getColumnIndex(alterCol.column());
+            if (colIdx < 0) throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
+            table.getColumns().get(colIdx).setAttStattarget((short) ss.target());
+        } else if (alterCol.action() instanceof AlterTableStmt.SetStorage) {
+            AlterTableStmt.SetStorage ss = (AlterTableStmt.SetStorage) alterCol.action();
+            int colIdx = table.getColumnIndex(alterCol.column());
+            if (colIdx < 0) throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
+            String storageCode;
+            switch (ss.storageType().toUpperCase()) {
+                case "PLAIN": storageCode = "p"; break;
+                case "EXTERNAL": storageCode = "e"; break;
+                case "EXTENDED": storageCode = "x"; break;
+                case "MAIN": storageCode = "m"; break;
+                default: storageCode = "p"; break;
+            }
+            table.getColumns().get(colIdx).setAttStorageOverride(storageCode);
+        } else if (alterCol.action() instanceof AlterTableStmt.SetCompression) {
+            AlterTableStmt.SetCompression sc = (AlterTableStmt.SetCompression) alterCol.action();
+            int colIdx = table.getColumnIndex(alterCol.column());
+            if (colIdx < 0) throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
+            String compressionCode;
+            switch (sc.method().toLowerCase()) {
+                case "pglz": compressionCode = "p"; break;
+                case "lz4": compressionCode = "l"; break;
+                default: compressionCode = ""; break;
+            }
+            table.getColumns().get(colIdx).setAttCompression(compressionCode);
         } else if (alterCol.action() instanceof AlterTableStmt.ColumnNoOp) {
             // no-op
         }
@@ -728,6 +771,52 @@ class DdlAlterTableExecutor {
         table.addPartition(partition);
         if (attach.bounds() != null && !attach.bounds().isEmpty()) {
             ddl.tableExecutor.applyPartitionBounds(partition, table, attach.bounds(), attach.partitionName());
+        }
+    }
+
+    private void setTriggerEnabled(Table table, String triggerName, boolean disabled) {
+        List<PgTrigger> triggers = executor.database.getTriggersForTable(table.getName());
+        if ("ALL".equalsIgnoreCase(triggerName)) {
+            for (PgTrigger t : triggers) {
+                t.setDisabled(disabled);
+            }
+        } else {
+            for (PgTrigger t : triggers) {
+                if (t.getName().equalsIgnoreCase(triggerName)) {
+                    t.setDisabled(disabled);
+                }
+            }
+        }
+    }
+
+    /**
+     * After renaming a column, rewrite any view whose sourceSQL references
+     * the base table so that occurrences of the old column name are replaced
+     * with the new column name.  The view is then re-parsed and re-registered.
+     */
+    private void rewriteDependentViews(String tableName, String oldCol, String newCol) {
+        for (Database.ViewDef vd : new ArrayList<>(executor.database.getViews().values())) {
+            // Get SQL text from sourceSQL or unparse from the AST
+            String sql = vd.sourceSQL;
+            if (sql == null || sql.isEmpty()) {
+                sql = SqlUnparser.toSql(vd.query);
+            }
+            if (sql == null || sql.isEmpty()) continue;
+            String sqlLower = sql.toLowerCase();
+            if (!sqlLower.contains(tableName.toLowerCase())) continue;
+            if (!sqlLower.contains(oldCol.toLowerCase())) continue;
+            // Replace old column name with new, word-boundary aware
+            String updated = sql.replaceAll("(?i)\\b" + java.util.regex.Pattern.quote(oldCol) + "\\b", newCol);
+            if (updated.equals(sql)) continue;
+            try {
+                Statement parsed = com.memgres.engine.parser.Parser.parse(updated);
+                Database.ViewDef newView = new Database.ViewDef(
+                        vd.name, vd.schemaName, parsed, vd.orReplace, vd.materialized,
+                        vd.cachedColumns, vd.cachedRows, updated, vd.checkOption, vd.reloptions);
+                executor.database.addView(newView);
+            } catch (Exception ignored) {
+                // If re-parse fails, leave the view as-is
+            }
         }
     }
 }

@@ -124,7 +124,7 @@ class Round14RlsAdvancedTest {
         // Policy: only rows matching owner
         exec("CREATE POLICY r14_rls_fp ON r14_rls_f FOR SELECT USING (owner_name = current_user)");
         // pg_class.relforcerowsecurity = true
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT relforcerowsecurity::text FROM pg_class WHERE relname = 'r14_rls_f'"));
     }
 
@@ -134,7 +134,7 @@ class Round14RlsAdvancedTest {
         exec("ALTER TABLE r14_rls_nf ENABLE ROW LEVEL SECURITY");
         exec("ALTER TABLE r14_rls_nf FORCE ROW LEVEL SECURITY");
         exec("ALTER TABLE r14_rls_nf NO FORCE ROW LEVEL SECURITY");
-        assertEquals("f",
+        assertEquals("false",
                 scalarString("SELECT relforcerowsecurity::text FROM pg_class WHERE relname = 'r14_rls_nf'"));
     }
 
@@ -145,7 +145,7 @@ class Round14RlsAdvancedTest {
     @Test
     void bypassrls_role_attribute() throws SQLException {
         exec("CREATE ROLE r14_rls_bp WITH BYPASSRLS");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT rolbypassrls::text FROM pg_roles WHERE rolname = 'r14_rls_bp'"));
     }
 
@@ -153,7 +153,7 @@ class Round14RlsAdvancedTest {
     void alter_role_set_bypassrls() throws SQLException {
         exec("CREATE ROLE r14_rls_bp2");
         exec("ALTER ROLE r14_rls_bp2 WITH BYPASSRLS");
-        assertEquals("t",
+        assertEquals("true",
                 scalarString("SELECT rolbypassrls::text FROM pg_roles WHERE rolname = 'r14_rls_bp2'"));
     }
 

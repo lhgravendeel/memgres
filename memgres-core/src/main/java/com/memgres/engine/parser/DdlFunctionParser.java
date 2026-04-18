@@ -119,23 +119,28 @@ class DdlFunctionParser {
         boolean[] strictRef = {false};
         boolean[] leakproofRef = {false};
         String[] volatilityRef = {"VOLATILE"};
+        String[] parallelRef = {null};
+        double[] costRef = {-1};
+        double[] rowsRef = {-1};
+        String[] supportRef = {null};
         java.util.Map<String, String> setClauses = new java.util.LinkedHashMap<>();
+        boolean isAtomicBody = false;
 
         if (parser.matchKeyword("AS")) {
             body = readFunctionBody();
-            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses);
+            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses, parallelRef, costRef, rowsRef, supportRef);
             if (parser.matchKeyword("LANGUAGE")) {
                 language = parser.readIdentifierOrString();
             }
         } else if (parser.matchKeyword("LANGUAGE")) {
             language = parser.readIdentifierOrString();
-            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses);
+            parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses, parallelRef, costRef, rowsRef, supportRef);
             if (parser.matchKeyword("AS")) {
                 body = readFunctionBody();
             }
         }
 
-        parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses);
+        parseFunctionAttributes(secDefRef, strictRef, volatilityRef, leakproofRef, setClauses, parallelRef, costRef, rowsRef, supportRef);
 
         // SQL-standard function body: RETURN expr or BEGIN ATOMIC ... END (PG 14+)
         if (body == null && parser.checkKeyword("RETURN")) {
@@ -153,11 +158,16 @@ class DdlFunctionParser {
             }
             body = readBeginAtomicBody();
             language = "sql";
+            isAtomicBody = true;
         }
 
-        return new CreateFunctionStmt(name, schema, rawParams.toString().trim(), parsedParams,
+        CreateFunctionStmt result = new CreateFunctionStmt(name, schema, rawParams.toString().trim(), parsedParams,
                 returnType, body != null ? body : "", language, orReplace, isProcedure, secDefRef[0], strictRef[0],
-                leakproofRef[0], volatilityRef[0], setClauses.isEmpty() ? null : setClauses);
+                leakproofRef[0], volatilityRef[0], setClauses.isEmpty() ? null : setClauses,
+                parallelRef[0], costRef[0], rowsRef[0]);
+        result.atomicBody = isAtomicBody;
+        result.supportFunction = supportRef[0];
+        return result;
     }
 
     CallStmt parseCall() {
@@ -278,7 +288,9 @@ class DdlFunctionParser {
 
     private void parseFunctionAttributes(boolean[] securityDefinerRef, boolean[] strictRef,
                                           String[] volatilityRef, boolean[] leakproofRef,
-                                          java.util.Map<String, String> setClauses) {
+                                          java.util.Map<String, String> setClauses,
+                                          String[] parallelRef, double[] costRef, double[] rowsRef,
+                                          String[] supportRef) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
             Token t = parser.peek();
             if (t.type() == TokenType.KEYWORD) {
@@ -297,10 +309,19 @@ class DdlFunctionParser {
                         if ("DEFINER".equalsIgnoreCase(defOrInvoker)) securityDefinerRef[0] = true;
                         else securityDefinerRef[0] = false;
                     }
-                    if (kw.equals("COST")) parser.advance();
-                    if (kw.equals("ROWS")) parser.advance();
-                    if (kw.equals("PARALLEL")) parser.readIdentifier();
-                    if (kw.equals("SUPPORT")) parser.readIdentifier(); // consume support function name
+                    if (kw.equals("COST")) {
+                        String costVal = parser.advance().value();
+                        try { costRef[0] = Double.parseDouble(costVal); } catch (NumberFormatException e) { /* ignore */ }
+                    }
+                    if (kw.equals("ROWS")) {
+                        String rowsVal = parser.advance().value();
+                        try { rowsRef[0] = Double.parseDouble(rowsVal); } catch (NumberFormatException e) { /* ignore */ }
+                    }
+                    if (kw.equals("PARALLEL")) {
+                        String parallelVal = parser.readIdentifier().toUpperCase();
+                        parallelRef[0] = parallelVal;
+                    }
+                    if (kw.equals("SUPPORT")) supportRef[0] = parser.readIdentifier(); // consume support function name
                     if (kw.equals("LEAKPROOF")) { leakproofRef[0] = true; }
                     if (kw.equals("CALLED")) { parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = false; }
                     if (kw.equals("RETURNS")) { parser.matchKeyword("NULL"); parser.matchKeyword("ON"); parser.matchKeyword("NULL"); parser.matchKeyword("INPUT"); strictRef[0] = true; }

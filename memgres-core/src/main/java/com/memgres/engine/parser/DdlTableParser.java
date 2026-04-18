@@ -20,7 +20,7 @@ class DdlTableParser {
         this.parser = parser;
     }
 
-    Statement parseCreateTable(boolean temporary) {
+    Statement parseCreateTable(boolean temporary, boolean unlogged) {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
 
         String schema = null;
@@ -97,9 +97,9 @@ class DdlTableParser {
                 else if (parser.matchKeyword("LIST")) subPartBy = "LIST";
                 else { parser.expectKeyword("HASH"); subPartBy = "HASH"; }
                 parser.expect(TokenType.LEFT_PAREN);
-                StringBuilder subPartColBuf = new StringBuilder(parser.readIdentifier());
+                StringBuilder subPartColBuf = new StringBuilder(readPartitionElement());
                 while (parser.match(TokenType.COMMA)) {
-                    subPartColBuf.append(", ").append(parser.readIdentifier());
+                    subPartColBuf.append(", ").append(readPartitionElement());
                 }
                 subPartCol = subPartColBuf.toString();
                 parser.expect(TokenType.RIGHT_PAREN);
@@ -118,9 +118,20 @@ class DdlTableParser {
             // Empty, no columns
         } else do {
             if (parser.matchKeyword("LIKE")) {
-                likeTables.add(parser.readIdentifier());
+                String likeTableName = parser.readIdentifier();
+                StringBuilder likeOpts = new StringBuilder();
                 while (parser.matchKeyword("INCLUDING") || parser.matchKeyword("EXCLUDING")) {
-                    parser.readIdentifier();
+                    boolean including = parser.tokens.get(parser.pos - 1).value().equals("INCLUDING");
+                    String what = parser.readIdentifier().toUpperCase();
+                    if (including) {
+                        if (likeOpts.length() > 0) likeOpts.append(",");
+                        likeOpts.append(what);
+                    }
+                }
+                if (likeOpts.length() > 0) {
+                    likeTables.add(likeTableName + ":" + likeOpts);
+                } else {
+                    likeTables.add(likeTableName);
                 }
             } else if (isTableConstraintStart()) {
                 constraints.add(parseTableConstraint());
@@ -152,12 +163,27 @@ class DdlTableParser {
             else if (parser.matchKeyword("LIST")) partitionBy = "LIST";
             else { parser.expectKeyword("HASH"); partitionBy = "HASH"; }
             parser.expect(TokenType.LEFT_PAREN);
-            StringBuilder partColBuf = new StringBuilder(parser.readIdentifier());
+            StringBuilder partColBuf = new StringBuilder(readPartitionElement());
             while (parser.match(TokenType.COMMA)) {
-                partColBuf.append(", ").append(parser.readIdentifier());
+                partColBuf.append(", ").append(readPartitionElement());
             }
             partitionCol = partColBuf.toString();
             parser.expect(TokenType.RIGHT_PAREN);
+        }
+
+        // WITH (storage_parameter = value, ...)
+        java.util.Map<String, String> withOptions = null;
+        if (parser.matchKeyword("WITH")) {
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                withOptions = new java.util.LinkedHashMap<>();
+                do {
+                    String key = parser.readIdentifier();
+                    parser.expect(TokenType.EQUALS);
+                    String val = parser.advance().value();
+                    withOptions.put(key.toLowerCase(), val);
+                } while (parser.match(TokenType.COMMA));
+                parser.expect(TokenType.RIGHT_PAREN);
+            }
         }
 
         String onCommitAction = null;
@@ -171,9 +197,9 @@ class DdlTableParser {
             }
         }
 
-        return new CreateTableStmt(schema, name, ifNotExists, temporary, columns, constraints,
+        return new CreateTableStmt(schema, name, ifNotExists, temporary, unlogged, columns, constraints,
                 inherits, partitionBy, partitionCol, null, null,
-                likeTables.isEmpty() ? null : likeTables, onCommitAction);
+                likeTables.isEmpty() ? null : likeTables, onCommitAction, withOptions);
     }
 
     boolean isTableConstraintStart() {
@@ -223,6 +249,7 @@ class DdlTableParser {
         boolean deferrable = false;
         boolean initiallyDeferred = false;
         boolean colNotEnforced = false;
+        String colRefMatchType = null;
         Expression columnCheckExpr = null;
 
         while (true) {
@@ -263,6 +290,12 @@ class DdlTableParser {
                     refColumn = parser.readIdentifier();
                     parser.expect(TokenType.RIGHT_PAREN);
                 }
+                // MATCH FULL | MATCH PARTIAL | MATCH SIMPLE
+                if (parser.matchKeyword("MATCH")) {
+                    if (parser.matchKeyword("FULL")) colRefMatchType = "FULL";
+                    else if (parser.matchKeyword("PARTIAL")) colRefMatchType = "PARTIAL";
+                    else if (parser.matchKeyword("SIMPLE")) colRefMatchType = "SIMPLE";
+                }
                 while (parser.matchKeyword("ON")) {
                     if (parser.matchKeyword("DELETE")) {
                         refOnDelete = parseReferentialAction();
@@ -286,10 +319,11 @@ class DdlTableParser {
                 parser.expect(TokenType.LEFT_PAREN);
                 Expression checkExpr = parser.parseExpression();
                 parser.expect(TokenType.RIGHT_PAREN);
+                boolean colChkNoInherit = parser.matchKeywords("NO", "INHERIT");
                 boolean checkNotEnforced = parseNotEnforced();
                 columnCheckExpr = checkExpr;
                 pendingColumnChecks.add(new TableConstraint(null, TableConstraint.ConstraintType.CHECK,
-                        Cols.listOf(colName), checkExpr, null, null, null, null, false, false, false, checkNotEnforced, null));
+                        Cols.listOf(colName), checkExpr, null, null, null, null, false, false, false, checkNotEnforced, colChkNoInherit, null, null));
                 continue;
             }
             if (parser.matchKeyword("CONSTRAINT")) {
@@ -379,7 +413,7 @@ class DdlTableParser {
 
         return new ColumnDef(colName, typeName, precision, scale, notNull, pk, unique,
                 defaultExpr, refTable, refColumn, generatedExpr, generatedVirtual, identity, refOnDelete, refOnUpdate,
-                identityStart, identityIncrement, deferrable, initiallyDeferred, colNotEnforced, columnCheckExpr);
+                identityStart, identityIncrement, deferrable, initiallyDeferred, colNotEnforced, colRefMatchType, columnCheckExpr);
     }
 
     long[] parseSequenceOptionsInParens() {
@@ -483,7 +517,7 @@ class DdlTableParser {
             parser.expect(TokenType.LEFT_PAREN);
             Expression checkExpr = parser.parseExpression();
             parser.expect(TokenType.RIGHT_PAREN);
-            parser.matchKeywords("NO", "INHERIT");
+            boolean chkNoInherit = parser.matchKeywords("NO", "INHERIT");
             boolean chkDeferrable = false, chkInitiallyDeferred = false;
             if (parser.matchKeyword("DEFERRABLE")) {
                 chkDeferrable = true;
@@ -496,7 +530,7 @@ class DdlTableParser {
             }
             boolean checkNotEnforced = parseNotEnforced();
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.CHECK,
-                    null, checkExpr, null, null, null, null, false, chkDeferrable, chkInitiallyDeferred, checkNotEnforced, null);
+                    null, checkExpr, null, null, null, null, false, chkDeferrable, chkInitiallyDeferred, checkNotEnforced, chkNoInherit, null, null);
         }
 
         if (parser.matchKeywords("FOREIGN", "KEY")) {
@@ -511,6 +545,13 @@ class DdlTableParser {
                 parser.expect(TokenType.LEFT_PAREN);
                 refCols = parser.parseIdentifierList();
                 parser.expect(TokenType.RIGHT_PAREN);
+            }
+            // MATCH FULL | MATCH PARTIAL | MATCH SIMPLE
+            String fkMatchType = null;
+            if (parser.matchKeyword("MATCH")) {
+                if (parser.matchKeyword("FULL")) fkMatchType = "FULL";
+                else if (parser.matchKeyword("PARTIAL")) fkMatchType = "PARTIAL";
+                else if (parser.matchKeyword("SIMPLE")) fkMatchType = "SIMPLE";
             }
             String onDelete = null, onUpdate = null;
             while (parser.matchKeyword("ON")) {
@@ -530,7 +571,7 @@ class DdlTableParser {
             }
             boolean fkNotEnforced = parseNotEnforced();
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.FOREIGN_KEY,
-                    cols, null, refTable, refCols, onDelete, onUpdate, false, fkDeferrable, fkInitiallyDeferred, fkNotEnforced, null);
+                    cols, null, refTable, refCols, onDelete, onUpdate, false, fkDeferrable, fkInitiallyDeferred, fkNotEnforced, fkMatchType, null);
         }
 
         if (parser.matchKeyword("EXCLUDE")) {
@@ -595,7 +636,17 @@ class DdlTableParser {
     String parseReferentialAction() {
         if (parser.matchKeyword("CASCADE")) return "CASCADE";
         if (parser.matchKeywords("SET", "NULL")) {
-            if (parser.check(TokenType.LEFT_PAREN)) { consumeUntilParen(parser); }
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                parser.advance(); // consume '('
+                StringBuilder colList = new StringBuilder();
+                while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                    if (colList.length() > 0) colList.append(",");
+                    colList.append(parser.readIdentifier());
+                    parser.match(TokenType.COMMA);
+                }
+                parser.expect(TokenType.RIGHT_PAREN);
+                return "SET NULL:" + colList.toString();
+            }
             return "SET NULL";
         }
         if (parser.matchKeywords("SET", "DEFAULT")) {
@@ -615,6 +666,94 @@ class DdlTableParser {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Read a partition key element. This can be a simple column name or an expression
+     * like date_trunc('month', col). We capture raw SQL text, handling nested parens.
+     */
+    private String readPartitionElement() {
+        StringBuilder sb = new StringBuilder();
+        // Handle expression wrapped in parens, e.g., (lower(s))
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            sb.append("(");
+            parser.advance(); // consume (
+            int depth = 1;
+            while (!parser.isAtEnd() && depth > 0) {
+                Token t = parser.peek();
+                if (t.type() == TokenType.LEFT_PAREN) depth++;
+                if (t.type() == TokenType.RIGHT_PAREN) {
+                    depth--;
+                    if (depth == 0) { parser.advance(); break; }
+                }
+                if (t.type() == TokenType.STRING_LITERAL) {
+                    sb.append("'").append(t.value().replace("'", "''")).append("'");
+                } else {
+                    sb.append(t.value());
+                }
+                parser.advance();
+                if (depth > 0) {
+                    Token next = parser.peek();
+                    if (next.type() != TokenType.RIGHT_PAREN && next.type() != TokenType.COMMA
+                            && t.type() != TokenType.LEFT_PAREN && t.type() != TokenType.COMMA) {
+                        sb.append(" ");
+                    }
+                }
+            }
+            sb.append(")");
+            // Optional COLLATE or opclass after the element
+            if (parser.matchKeyword("COLLATE")) {
+                sb.append(" COLLATE ").append(parser.readIdentifier());
+            }
+            if (parser.peek().type() == TokenType.IDENTIFIER && !parser.check(TokenType.COMMA)
+                    && !parser.check(TokenType.RIGHT_PAREN)) {
+                sb.append(" ").append(parser.readIdentifier());
+            }
+            return sb.toString();
+        }
+        // Check if this looks like a function call or expression (identifier followed by LEFT_PAREN)
+        // or just a simple identifier
+        String firstName = parser.readIdentifier();
+        sb.append(firstName);
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            // This is a function call or expression with parens - capture it all
+            sb.append("(");
+            parser.advance(); // consume (
+            int depth = 1;
+            while (!parser.isAtEnd() && depth > 0) {
+                Token t = parser.peek();
+                if (t.type() == TokenType.LEFT_PAREN) depth++;
+                if (t.type() == TokenType.RIGHT_PAREN) {
+                    depth--;
+                    if (depth == 0) { parser.advance(); break; }
+                }
+                if (t.type() == TokenType.STRING_LITERAL) {
+                    sb.append("'").append(t.value().replace("'", "''")).append("'");
+                } else {
+                    sb.append(t.value());
+                }
+                parser.advance();
+                // Add separator space unless next is a comma, paren, or we just appended a paren
+                if (depth > 0) {
+                    Token next = parser.peek();
+                    if (next.type() != TokenType.RIGHT_PAREN && next.type() != TokenType.COMMA
+                            && t.type() != TokenType.LEFT_PAREN && t.type() != TokenType.COMMA) {
+                        sb.append(" ");
+                    }
+                }
+            }
+            sb.append(")");
+        }
+        // Optional COLLATE or opclass after the element
+        if (parser.matchKeyword("COLLATE")) {
+            sb.append(" COLLATE ").append(parser.readIdentifier());
+        }
+        // Optional operator class name
+        if (parser.peek().type() == TokenType.IDENTIFIER && !parser.check(TokenType.COMMA)
+                && !parser.check(TokenType.RIGHT_PAREN)) {
+            sb.append(" ").append(parser.readIdentifier());
+        }
+        return sb.toString();
     }
 
     // ---- Static utilities shared across parsers ----

@@ -63,7 +63,7 @@ public class Lexer {
             "NEW", "OLD", "RETURN",
             "DECLARE", "RAISE", "NOTICE", "EXCEPTION", "WARNING",
             // Misc
-            "ENUM", "ADD", "COLUMN", "RENAME", "OWNER", "GRANT", "REVOKE",
+            "ENUM", "ADD", "COLUMN", "RENAME", "OWNER", "GRANT", "REVOKE", "ATTRIBUTE",
             "TRUE", "FALSE", "COALESCE", "NULLIF", "GREATEST", "LEAST",
             "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP",
             "CURRENT_USER", "SESSION_USER", "CURRENT_ROLE", "CURRENT_CATALOG", "CURRENT_SCHEMA",
@@ -92,7 +92,7 @@ public class Lexer {
             "TIES", "OTHERS",
             "ATOMIC", "CHAIN",
             "ATTACH", "DETACH", "STATEMENT", "REFERENCING",
-            "MERGE", "MATCHED", "RESTART",
+            "MERGE", "MATCHED", "RESTART", "MATCH", "PARTIAL", "SIMPLE",
             "TRIM", "LEADING", "TRAILING", "BOTH",
             "UNKNOWN", "SYMMETRIC", "OVERRIDING",
             "AUTHORIZATION", "INCLUDING", "EXCLUDING",
@@ -124,8 +124,8 @@ public class Lexer {
             "KEEP", "OMIT", "QUOTES", "KEYS", "EMPTY",
             "COLUMNS", "ERROR", "PATH", "NESTED", "ABSENT",
             // No-op DDL targets
-            "SERVER", "MAPPING", "IMPORT",
-            "PUBLICATION", "SUBSCRIPTION",
+            "SERVER", "MAPPING", "IMPORT", "OPTIONS",
+            "PUBLICATION", "SUBSCRIPTION", "TABLES",
             "TABLESPACE",
             "TRANSFORM",
             "STATISTICS", "METHOD",
@@ -249,6 +249,13 @@ public class Lexer {
                 && pos + 2 < length && sql.charAt(pos + 2) == '\'') {
             pos += 2; // skip U&
             return readUnicodeStringLiteral(start);
+        }
+
+        // Unicode escape identifiers: U&"..."
+        if ((c == 'U' || c == 'u') && pos + 1 < length && sql.charAt(pos + 1) == '&'
+                && pos + 2 < length && sql.charAt(pos + 2) == '"') {
+            pos += 2; // skip U&
+            return readUnicodeIdentifier(start);
         }
 
         // Identifiers and keywords
@@ -396,6 +403,9 @@ public class Lexer {
             case "&&": return new Token(TokenType.OVERLAP, "&&", start);
             case "?|": return new Token(TokenType.JSONB_EXISTS_ANY, "?|", start);
             case "?&": return new Token(TokenType.JSONB_EXISTS_ALL, "?&", start);
+            case "?#": return new Token(TokenType.GEO_INTERSECTS, "?#", start);
+            case "##": return new Token(TokenType.GEO_CLOSEST_POINT, "##", start);
+            case "?-": return new Token(TokenType.GEO_IS_HORIZONTAL, "?-", start);
             case "#>": return new Token(TokenType.JSON_HASH_ARROW, "#>", start);
             case "#-": return new Token(TokenType.JSON_DELETE_PATH, "#-", start);
             case "&<": return new Token(TokenType.GEO_NOT_EXTEND_RIGHT, "&<", start);
@@ -418,6 +428,8 @@ public class Lexer {
             case "#>>": return new Token(TokenType.JSON_HASH_ARROW_TEXT, "#>>", start);
             case "!~~": return new Token(TokenType.NOT_DOUBLE_TILDE, "!~~", start);
             case "!~*": return new Token(TokenType.EXCL_TILDE_STAR, "!~*", start);
+            case "?||": return new Token(TokenType.GEO_PARALLEL, "?||", start);
+            case "?-|": return new Token(TokenType.GEO_PERPENDICULAR, "?-|", start);
             case "&<|": return new Token(TokenType.GEO_NOT_EXTEND_ABOVE, "&<|", start);
             case "~~*": return new Token(TokenType.DOUBLE_TILDE_STAR, "~~*", start);
             case "<->": return new Token(TokenType.DISTANCE, "<->", start);
@@ -546,6 +558,54 @@ public class Lexer {
             sb.append(val.charAt(i));
         }
         return new Token(TokenType.STRING_LITERAL, sb.toString(), start);
+    }
+
+    private Token readUnicodeIdentifier(int start) {
+        // Read the raw quoted identifier content first (pos is on the opening double-quote)
+        Token raw = readQuotedIdentifier(start);
+        // Process Unicode escapes: \XXXX (4-digit) or \+NNNNNN (6-digit) -> character
+        String val = raw.value();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < val.length(); i++) {
+            if (val.charAt(i) == '\\' && i + 1 < val.length()) {
+                // \+NNNNNN form (6-digit codepoint)
+                if (val.charAt(i + 1) == '+' && i + 7 < val.length()) {
+                    String hex = val.substring(i + 2, i + 8);
+                    boolean valid = true;
+                    for (char hc : hex.toCharArray()) {
+                        if (Character.digit(hc, 16) < 0) { valid = false; break; }
+                    }
+                    if (!valid) {
+                        throw new ParseException("invalid Unicode escape value",
+                                new Token(TokenType.ERROR, val, start));
+                    }
+                    int cp = Integer.parseInt(hex, 16);
+                    sb.appendCodePoint(cp);
+                    i += 7; // skip \+NNNNNN
+                    continue;
+                }
+                // \XXXX form (4-digit codepoint)
+                if (i + 4 < val.length()) {
+                    String hex = val.substring(i + 1, i + 5);
+                    boolean valid = true;
+                    for (char hc : hex.toCharArray()) {
+                        if (Character.digit(hc, 16) < 0) { valid = false; break; }
+                    }
+                    if (!valid) {
+                        throw new ParseException("invalid Unicode escape value",
+                                new Token(TokenType.ERROR, val, start));
+                    }
+                    int cp = Integer.parseInt(hex, 16);
+                    sb.appendCodePoint(cp);
+                    i += 4; // skip \XXXX
+                    continue;
+                }
+                throw new ParseException("invalid Unicode escape value",
+                        new Token(TokenType.ERROR, val, start));
+            }
+            sb.append(val.charAt(i));
+        }
+        return new Token(TokenType.QUOTED_IDENTIFIER, sb.toString(), start);
     }
 
     private Token readStringLiteral(int start) {

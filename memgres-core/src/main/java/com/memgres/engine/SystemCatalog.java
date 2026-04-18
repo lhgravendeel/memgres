@@ -136,6 +136,11 @@ public class SystemCatalog implements OidSupplier {
         return oid(key);
     }
 
+    /** Allocate and return the next available OID. */
+    public int nextOid() {
+        return oidCounter.getAndIncrement();
+    }
+
     /** Public accessor for the full OID map (used by pg_get_indexdef etc.). */
     @Override
     public Map<String, Integer> getOidMap() {

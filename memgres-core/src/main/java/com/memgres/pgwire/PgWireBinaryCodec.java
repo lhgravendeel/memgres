@@ -337,6 +337,78 @@ class PgWireBinaryCodec {
                     buf.writeBytes(raw);
                     break;
                 }
+                case BOX: {
+                    // PG binary box: 4 float8 values = 32 bytes (high.x, high.y, low.x, low.y)
+                    String s = val.toString().trim();
+                    // Parse "(x1,y1),(x2,y2)" format
+                    String cleaned = s.replaceAll("[()]", "");
+                    String[] parts = cleaned.split(",");
+                    double x1 = Double.parseDouble(parts[0].trim());
+                    double y1 = Double.parseDouble(parts[1].trim());
+                    double x2 = Double.parseDouble(parts[2].trim());
+                    double y2 = Double.parseDouble(parts[3].trim());
+                    // PG normalizes: high = max coords, low = min coords
+                    double hx = Math.max(x1, x2), hy = Math.max(y1, y2);
+                    double lx = Math.min(x1, x2), ly = Math.min(y1, y2);
+                    buf.writeInt(32);
+                    buf.writeLong(Double.doubleToLongBits(hx));
+                    buf.writeLong(Double.doubleToLongBits(hy));
+                    buf.writeLong(Double.doubleToLongBits(lx));
+                    buf.writeLong(Double.doubleToLongBits(ly));
+                    break;
+                }
+                case POINT: {
+                    // PG binary point: 2 float8 values = 16 bytes (x, y)
+                    String s = val.toString().trim();
+                    String cleaned = s.replaceAll("[()]", "");
+                    String[] parts = cleaned.split(",");
+                    double x = Double.parseDouble(parts[0].trim());
+                    double y = Double.parseDouble(parts[1].trim());
+                    buf.writeInt(16);
+                    buf.writeLong(Double.doubleToLongBits(x));
+                    buf.writeLong(Double.doubleToLongBits(y));
+                    break;
+                }
+                case TIMETZ: {
+                    // PG binary timetz: 8 bytes microseconds + 4 bytes UTC offset (seconds, negated)
+                    String s = val.toString().trim();
+                    OffsetTime ot;
+                    if (val instanceof OffsetTime) {
+                        ot = (OffsetTime) val;
+                    } else {
+                        // Normalize PG-style offset (e.g. +00, -05) to ISO format (+00:00, -05:00)
+                        String normalized = s.replaceAll("([+-])(\\d{2})$", "$1$2:00")
+                                              .replaceAll("([+-])(\\d)$", "$10$2:00");
+                        ot = OffsetTime.parse(normalized);
+                    }
+                    long micros = ot.toLocalTime().toNanoOfDay() / 1000;
+                    // PG stores offset as negated seconds from UTC (positive = west of Greenwich)
+                    int offsetSecs = -ot.getOffset().getTotalSeconds();
+                    buf.writeInt(12);
+                    buf.writeLong(micros);
+                    buf.writeInt(offsetSecs);
+                    break;
+                }
+                case MACADDR: {
+                    // PG binary macaddr: 6 bytes
+                    String s = val.toString().trim();
+                    String[] octets = s.split(":");
+                    buf.writeInt(6);
+                    for (int i = 0; i < 6; i++) {
+                        buf.writeByte(Integer.parseInt(octets[i], 16));
+                    }
+                    break;
+                }
+                case MACADDR8: {
+                    // PG binary macaddr8: 8 bytes
+                    String s = val.toString().trim();
+                    String[] octets = s.split(":");
+                    buf.writeInt(8);
+                    for (int i = 0; i < 8; i++) {
+                        buf.writeByte(Integer.parseInt(octets[i], 16));
+                    }
+                    break;
+                }
                 default: {
                     String text = PgWireValueFormatter.formatValue(val, null);
                     byte[] bytes = text.getBytes(StandardCharsets.UTF_8);

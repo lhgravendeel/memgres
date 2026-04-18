@@ -212,6 +212,14 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, "SET");
         }
 
+        if (name.equals("transaction_snapshot")) {
+            String snapshotId = stmt.value();
+            if (executor.session != null) {
+                executor.session.importSnapshot(executor.database, snapshotId);
+            }
+            return QueryResult.message(QueryResult.Type.SET, "SET");
+        }
+
         if (name.equals("reindex")) {
             String val = stmt.value();
             if (val != null && val.contains(":")) {
@@ -248,23 +256,310 @@ class SessionExecutor {
         }
 
         if (name.equals("analyze") || name.equals("vacuum")) {
+            // VACUUM cannot run inside a transaction block
+            if (name.equals("vacuum") && executor.session != null && executor.session.isInTransaction()) {
+                throw new MemgresException("VACUUM cannot run inside a transaction block", "25001");
+            }
             String val = stmt.value();
+            // For VACUUM, parse flags: "verbose,analyze,table:foo" or "verbose,ok"
+            boolean vacuumAnalyze = false;
+            boolean vacuumVerbose = false;
+            if (name.equals("vacuum") && val != null) {
+                if (val.contains("verbose,")) { vacuumVerbose = true; val = val.replace("verbose,", ""); }
+                if (val.contains("analyze,")) { vacuumAnalyze = true; val = val.replace("analyze,", ""); }
+            }
+            // Parse optional column list from ANALYZE value
+            String analyzeColumns = null;
+            if (val != null && val.contains(",columns:")) {
+                int idx = val.indexOf(",columns:");
+                analyzeColumns = val.substring(idx + ",columns:".length());
+                val = val.substring(0, idx);
+            }
+            java.time.OffsetDateTime now = java.time.OffsetDateTime.now();
             if (val != null && val.startsWith("table:")) {
                 String tblName = val.substring("table:".length());
-                executor.resolveTable(executor.defaultSchema(), tblName);
+                Table resolvedTable = executor.resolveTable(executor.defaultSchema(), tblName);
                 // Record analyzed table for pg_statistic
-                if (name.equals("analyze")) {
+                if (name.equals("analyze") || vacuumAnalyze) {
                     executor.database.recordAnalyzedTable(executor.defaultSchema() + "." + tblName);
+                    resolvedTable.setLastAnalyze(now);
+                }
+                if (name.equals("vacuum")) {
+                    resolvedTable.setLastVacuum(now);
+                }
+                if (name.equals("analyze")) {
+                    resolvedTable.setLastAnalyze(now);
                 }
             } else if (name.equals("analyze")) {
                 // ANALYZE without a table name: analyze all tables
                 for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
-                    for (String tableName : schemaEntry.getValue().getTables().keySet()) {
-                        executor.database.recordAnalyzedTable(schemaEntry.getKey() + "." + tableName);
+                    for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                        executor.database.recordAnalyzedTable(schemaEntry.getKey() + "." + tableEntry.getKey());
+                        tableEntry.getValue().setLastAnalyze(now);
+                    }
+                }
+            } else if (name.equals("vacuum")) {
+                // VACUUM without a table name: vacuum all tables
+                for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
+                    for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                        tableEntry.getValue().setLastVacuum(now);
+                        if (vacuumAnalyze) {
+                            executor.database.recordAnalyzedTable(schemaEntry.getKey() + "." + tableEntry.getKey());
+                            tableEntry.getValue().setLastAnalyze(now);
+                        }
                     }
                 }
             }
+            // Mark extended statistics as analyzed for the table(s)
+            if (name.equals("analyze") || vacuumAnalyze) {
+                for (ExtendedStatistic es : executor.database.getAllExtendedStatistics().values()) {
+                    if (val != null && val.startsWith("table:")) {
+                        String tblName = val.substring("table:".length());
+                        if (es.getTableName().equalsIgnoreCase(tblName)) {
+                            es.setAnalyzed(true);
+                        }
+                    } else {
+                        es.setAnalyzed(true);
+                    }
+                }
+            }
+            // VACUUM VERBOSE: emit NOTICE
+            if (vacuumVerbose && executor.session != null) {
+                String tblInfo = (val != null && val.startsWith("table:")) ? val.substring("table:".length()) : "all tables";
+                executor.session.addNotice("NOTICE", "00000",
+                        "vacuuming \"public." + tblInfo + "\"", null);
+            }
             return QueryResult.message(QueryResult.Type.SET, name.equals("analyze") ? "ANALYZE" : "VACUUM");
+        }
+
+        if (name.equals("cluster")) {
+            // CLUSTER cannot run inside a transaction block
+            if (executor.session != null && executor.session.isInTransaction()) {
+                throw new MemgresException("CLUSTER cannot run inside a transaction block", "25001");
+            }
+            String val = stmt.value();
+            // Parse table and index from value: "table:foo,index:bar"
+            if (val != null && val.contains("table:")) {
+                String tblName = null;
+                String idxName = null;
+                for (String part : val.split(",")) {
+                    if (part.startsWith("table:")) tblName = part.substring("table:".length());
+                    if (part.startsWith("index:")) idxName = part.substring("index:".length());
+                }
+                if (tblName != null) {
+                    executor.resolveTable(executor.defaultSchema(), tblName);
+                }
+                if (idxName != null) {
+                    executor.database.setClusteredIndex(idxName);
+                }
+            }
+            return QueryResult.message(QueryResult.Type.SET, "CLUSTER");
+        }
+
+        // ---- Text Search DDL handling ----
+        if (name.equals("create_ts_config")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String cfgName = parts[0];
+            String copyFrom = parts.length > 1 && !parts[1].isEmpty() ? parts[1] : null;
+            String parserName = parts.length > 2 && !parts[2].isEmpty() ? parts[2] : null;
+            executor.database.addTsConfig(new Database.TsConfigDef(cfgName, parserName, copyFrom));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("create_ts_dict")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String dictName = parts[0];
+            String template = parts.length > 1 && !parts[1].isEmpty() ? parts[1] : null;
+            String options = parts.length > 2 && !parts[2].isEmpty() ? parts[2] : null;
+            executor.database.addTsDict(new Database.TsDictDef(dictName, template, options));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_ts_configuration")) {
+            executor.database.removeTsConfig(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_ts_dictionary")) {
+            executor.database.removeTsDict(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_ts_parser") || name.equals("drop_ts_template")) {
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_ts_config_mapping")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String cfgName = parts[0];
+            String[] tokenTypes = parts[1].split(",");
+            String dictNames = parts[2]; // comma-separated dict names
+            for (String tt : tokenTypes) {
+                executor.database.addTsConfigMap(cfgName, tt.trim(), dictNames);
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+
+        // ---- FDW DDL handling ----
+        if (name.equals("create_fdw")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String fdwName = parts[0];
+            String options = parts.length > 1 && !parts[1].isEmpty() ? parts[1] : null;
+            executor.database.addForeignDataWrapper(new Database.FdwWrapper(fdwName, options));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_fdw")) {
+            executor.database.removeForeignDataWrapper(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("create_server")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String srvName = parts[0];
+            String fdwName = parts.length > 1 ? parts[1] : "";
+            String options = parts.length > 2 && !parts[2].isEmpty() ? parts[2] : null;
+            executor.database.addForeignServer(new Database.FdwServer(srvName, fdwName, options));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_server")) {
+            executor.database.removeForeignServer(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_server_options")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String srvName = parts[0];
+            String newOptions = parts.length > 1 && !parts[1].isEmpty() ? parts[1] : null;
+            Database.FdwServer srv = executor.database.getForeignServer(srvName);
+            if (srv != null) {
+                srv.options = newOptions != null ? newOptions : srv.options;
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("create_user_mapping")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String serverName = parts[0];
+            String userName = parts.length > 1 ? parts[1] : "PUBLIC";
+            String options = parts.length > 2 && !parts[2].isEmpty() ? parts[2] : null;
+            executor.database.addForeignUserMapping(new Database.FdwUserMapping(serverName, userName, options));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_user_mapping")) {
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("create_foreign_table")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String ftName = parts[0];
+            String serverName = parts.length > 1 ? parts[1] : "";
+            String options = parts.length > 2 && !parts[2].isEmpty() ? parts[2] : null;
+            String colStr = parts.length > 3 ? parts[3] : "";
+            java.util.List<String[]> columns = new java.util.ArrayList<>();
+            if (!colStr.isEmpty()) {
+                for (String colDef : colStr.split("\n")) {
+                    String[] colParts = colDef.split("\t", 2);
+                    columns.add(colParts);
+                }
+            }
+            executor.database.addForeignTable(new Database.FdwForeignTable(ftName, serverName, options, columns));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_foreign_table")) {
+            executor.database.removeForeignTable(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+
+        // ---- Publication / Subscription DDL handling ----
+        if (name.equals("create_publication")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String pubName = parts[0];
+            boolean allTables = parts.length > 1 && "true".equals(parts[1]);
+            java.util.List<String> tables = parts.length > 2 && !parts[2].isEmpty()
+                    ? java.util.Arrays.asList(parts[2].split(",")) : new java.util.ArrayList<>();
+            String schemaName = parts.length > 3 && !parts[3].isEmpty() ? parts[3] : null;
+            executor.database.addPublication(new Database.PubDef(pubName, allTables, tables, schemaName));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_publication_add_table")) {
+            String[] parts = stmt.value().split("\0", 2);
+            String pubName = parts[0];
+            String[] newTables = parts.length > 1 ? parts[1].split(",") : new String[0];
+            Database.PubDef pub = executor.database.getPublication(pubName);
+            if (pub != null) {
+                for (String t : newTables) {
+                    if (!t.isEmpty()) pub.tables.add(t);
+                }
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_publication_set_table")) {
+            String[] parts = stmt.value().split("\0", 2);
+            String pubName = parts[0];
+            String[] newTables = parts.length > 1 ? parts[1].split(",") : new String[0];
+            Database.PubDef pub = executor.database.getPublication(pubName);
+            if (pub != null) {
+                pub.tables.clear();
+                for (String t : newTables) {
+                    if (!t.isEmpty()) pub.tables.add(t);
+                }
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_publication_drop_table")) {
+            String[] parts = stmt.value().split("\0", 2);
+            String pubName = parts[0];
+            String[] dropTables = parts.length > 1 ? parts[1].split(",") : new String[0];
+            Database.PubDef pub = executor.database.getPublication(pubName);
+            if (pub != null) {
+                for (String t : dropTables) pub.tables.remove(t);
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_publication")) {
+            executor.database.removePublication(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("create_subscription")) {
+            // Subscriptions require an actual replication connection which memgres cannot provide.
+            // Store in catalog for DDL coverage compatibility.
+            String[] parts = stmt.value().split("\0", -1);
+            String subName = parts.length > 0 ? parts[0] : "";
+            String conninfo = parts.length > 1 ? parts[1] : "";
+            String pubName = parts.length > 2 ? parts[2] : "";
+            executor.database.addSubscription(new Database.SubDef(subName, conninfo, pubName));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_subscription")) {
+            executor.database.removeSubscription(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+
+        // CREATE STATISTICS
+        if (name.equals("create_statistics")) {
+            String[] parts = stmt.value().split("\0", -1);
+            String statName = parts[0];
+            String tableName = parts[1];
+            String colsStr = parts[2];
+            String kindsStr = parts.length > 3 ? parts[3] : "";
+            java.util.List<String> cols = colsStr.isEmpty() ? Cols.listOf() : java.util.Arrays.asList(colsStr.split(","));
+            java.util.List<String> kinds = kindsStr.isEmpty() ? Cols.listOf() : java.util.Arrays.asList(kindsStr.split(","));
+            ExtendedStatistic stat = new ExtendedStatistic(statName, tableName, cols, kinds);
+            executor.database.addExtendedStatistic(stat);
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_statistics_rename")) {
+            String[] parts = stmt.value().split("\0", 2);
+            ExtendedStatistic stat = executor.database.getExtendedStatistic(parts[0]);
+            if (stat != null) {
+                executor.database.removeExtendedStatistic(parts[0]);
+                stat.setName(parts[1]);
+                executor.database.addExtendedStatistic(stat);
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_statistics_target")) {
+            String[] parts = stmt.value().split("\0", 2);
+            ExtendedStatistic stat = executor.database.getExtendedStatistic(parts[0]);
+            if (stat != null) {
+                stat.setStattarget(Integer.parseInt(parts[1]));
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("drop_statistics")) {
+            executor.database.removeExtendedStatistic(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
         }
 
         // CREATE OPERATOR - silently accepted as no-op
@@ -372,8 +667,32 @@ class SessionExecutor {
             }
         }
 
+        if (name.equals("alter_extension_set_schema")) {
+            String val = stmt.value();
+            int colonIdx = val.indexOf(':');
+            if (colonIdx > 0) {
+                String extName = val.substring(0, colonIdx);
+                String newSchema = val.substring(colonIdx + 1);
+                executor.database.setExtensionSchema(extName, newSchema);
+            }
+            return QueryResult.message(QueryResult.Type.SET, "ALTER EXTENSION");
+        }
+        if (name.equals("alter_extension_update")) {
+            // No-op for now - just acknowledge
+            return QueryResult.message(QueryResult.Type.SET, "ALTER EXTENSION");
+        }
+
         Set<String> internalNames = Cols.setOf("constraints", "transaction",
                 "create_noop", "alter_noop", "drop_noop",
+                "create_statistics", "alter_statistics_rename", "alter_statistics_target", "drop_statistics",
+                "create_fdw", "drop_fdw", "create_server", "drop_server", "alter_server_options",
+                "create_user_mapping", "drop_user_mapping",
+                "create_foreign_table", "drop_foreign_table",
+                "create_publication", "alter_publication_add_table", "alter_publication_set_table",
+                "alter_publication_drop_table", "drop_publication",
+                "create_subscription", "drop_subscription",
+                "create_ts_config", "create_ts_dict", "drop_ts_configuration", "drop_ts_dictionary",
+                "drop_ts_parser", "drop_ts_template", "alter_ts_config_mapping",
                 "drop_owned", "reassign_owned", "do_block", "comment",
                 "security_label", "analyze", "vacuum",
                 "cluster", "checkpoint", "load");
@@ -396,6 +715,10 @@ class SessionExecutor {
                 validateGucValue(name, value);
             }
             if (stmt.isLocal()) {
+                if (executor.session != null && !executor.session.isInTransaction()) {
+                    executor.session.addNotice("WARNING", "25P01",
+                            "SET LOCAL can only be used in transaction blocks", null);
+                }
                 guc.setLocal(name, value);
             } else {
                 guc.set(name, value);
@@ -515,13 +838,24 @@ class SessionExecutor {
             table = table.substring(dot + 1);
         }
         executor.resolveTable(schema, table);
+        // Track the lock so pg_locks can expose it
+        String mode = stmt.lockMode() != null ? stmt.lockMode().toUpperCase() : "ACCESS EXCLUSIVE";
+        // Convert PG mode name to pg_locks mode column format (e.g. "ACCESS EXCLUSIVE" -> "AccessExclusiveLock")
+        StringBuilder modeName = new StringBuilder();
+        for (String word : mode.split("\\s+")) {
+            modeName.append(Character.toUpperCase(word.charAt(0))).append(word.substring(1).toLowerCase());
+        }
+        modeName.append("Lock");
+        String tableKey = schema + "." + table;
+        executor.session.addTableLock(tableKey, modeName.toString());
+        executor.database.acquireTableLock(tableKey, modeName.toString(), executor.session, stmt.nowait());
         return QueryResult.message(QueryResult.Type.SET, "LOCK TABLE");
     }
 
     // ---- GRANT / REVOKE ----
 
     private static final Set<String> TABLE_PRIVILEGES = Cols.setOf(
-            "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "ALL");
+            "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN", "ALL");
 
     QueryResult executeGrant(GrantStmt s) {
         if (s.isRoleGrant()) {
@@ -554,6 +888,7 @@ class SessionExecutor {
             for (String grantee : s.grantees()) {
                 String g = grantee.toLowerCase();
                 if (!g.equals("public") && !g.equals("test") && !g.equals("postgres")
+                        && !g.equals("current_user") && !g.equals("session_user") && !g.equals("current_role")
                         && !executor.database.getRoles().containsKey(g)) {
                     throw new MemgresException("role \"" + grantee + "\" does not exist", "42704");
                 }
@@ -579,17 +914,48 @@ class SessionExecutor {
         }
         // Track granted privileges for role dependency checks (DROP ROLE)
         if (s.objectName() != null && s.grantees() != null && s.objectType() != null) {
-            for (String grantee : s.grantees()) {
-                for (String priv : s.privileges()) {
-                    if (s.columns() != null && !s.columns().isEmpty()) {
-                        // Column-level grant: store as COLUMN objectType with "tableName.colName"
-                        for (String col : s.columns()) {
-                            executor.database.addRolePrivilege(grantee, priv, "COLUMN", s.objectName() + "." + col);
+            // Expand "ALL TABLES IN SCHEMA" to individual table grants
+            if (s.objectType().startsWith("ALL TABLES IN SCHEMA")) {
+                Schema schema = executor.database.getSchema(s.objectName());
+                if (schema != null) {
+                    for (String grantee : s.grantees()) {
+                        for (String priv : s.privileges()) {
+                            for (String tableName : schema.getTables().keySet()) {
+                                executor.database.addRolePrivilege(grantee, priv, "TABLE", tableName);
+                            }
                         }
-                    } else {
-                        executor.database.addRolePrivilege(grantee, priv, s.objectType(), s.objectName());
                     }
                 }
+            } else {
+                for (String grantee : s.grantees()) {
+                    for (String priv : s.privileges()) {
+                        if (s.columns() != null && !s.columns().isEmpty()) {
+                            // Column-level grant: store as COLUMN objectType with "tableName.colName"
+                            for (String col : s.columns()) {
+                                executor.database.addRolePrivilege(grantee, priv, "COLUMN", s.objectName() + "." + col);
+                            }
+                        } else {
+                            executor.database.addRolePrivilege(grantee, priv, s.objectType(), s.objectName());
+                        }
+                    }
+                }
+            }
+        }
+        // Record schema-level ACL for pg_namespace.nspacl
+        if ("SCHEMA".equals(s.objectType()) && s.objectName() != null && s.grantees() != null) {
+            String grantor = executor.currentRole();
+            for (String grantee : s.grantees()) {
+                StringBuilder aclItem = new StringBuilder();
+                aclItem.append(grantee).append("=");
+                for (String priv : s.privileges()) {
+                    switch (priv.toUpperCase()) {
+                        case "USAGE": aclItem.append("U"); break;
+                        case "CREATE": aclItem.append("C"); break;
+                        case "ALL": aclItem.append("UC"); break;
+                    }
+                }
+                aclItem.append("/").append(grantor);
+                executor.database.addSchemaAcl(s.objectName(), aclItem.toString());
             }
         }
         return QueryResult.message(QueryResult.Type.SET, "GRANT");
@@ -618,7 +984,25 @@ class SessionExecutor {
         if (s.objectName() != null && s.grantees() != null && s.objectType() != null) {
             for (String grantee : s.grantees()) {
                 for (String priv : s.privileges()) {
-                    executor.database.removeRolePrivilege(grantee, priv, s.objectType(), s.objectName());
+                    if (s.columns() != null && !s.columns().isEmpty()) {
+                        // Column-level revoke: remove COLUMN objectType with "tableName.colName"
+                        for (String col : s.columns()) {
+                            executor.database.removeRolePrivilege(grantee, priv, "COLUMN", s.objectName() + "." + col);
+                        }
+                    } else {
+                        executor.database.removeRolePrivilege(grantee, priv, s.objectType(), s.objectName());
+                    }
+                }
+            }
+            // CASCADE: also revoke matching privileges from all other roles on same object
+            if (s.cascade()) {
+                for (String priv : s.privileges()) {
+                    String suffixLower = ":" + s.objectType().toLowerCase() + ":" + s.objectName().toLowerCase();
+                    String prefixLower = priv.toLowerCase() + suffixLower;
+                    for (java.util.Map.Entry<String, java.util.Set<String>> entry
+                            : executor.database.getAllRolePrivileges().entrySet()) {
+                        entry.getValue().removeIf(p -> p.toLowerCase().equals(prefixLower));
+                    }
                 }
             }
         }

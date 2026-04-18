@@ -23,17 +23,22 @@ FROM names
 WHERE display_name % 'postgres'
 ORDER BY name_id;
 
--- begin-expected-error
--- message-like: function similarity
--- end-expected-error
+-- begin-expected
+-- columns: display_name|sim
+-- row: postgres|1.0000000
+-- row: postgress|0.7272727
+-- row: postgre|0.7000000
+-- row: mysql|0.0000000
+-- end-expected
 SELECT display_name,
        round(similarity(display_name, 'postgres')::numeric, 7) AS sim
 FROM names
 ORDER BY sim DESC, display_name;
 
--- begin-expected-error
--- message-like: function similarity
--- end-expected-error
+-- begin-expected
+-- columns: best_match
+-- row: postgres
+-- end-expected
 SELECT display_name AS best_match
 FROM names
 ORDER BY similarity(display_name, 'postgres') DESC, display_name

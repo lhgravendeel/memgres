@@ -32,6 +32,10 @@ class DdlObjectExecutor {
             executor.database.addCustomEnum(new CustomEnum(stmt.name(), stmt.enumLabels()));
             executor.database.registerSchemaObject(executor.defaultSchema(), "enum", stmt.name());
         }
+        if (stmt.rangeSubtype() != null) {
+            executor.database.addRangeType(stmt.name(), stmt.rangeSubtype());
+            executor.database.registerSchemaObject(executor.defaultSchema(), "range", stmt.name());
+        }
         if (stmt.compositeFields() != null) {
             if (executor.database.isCompositeType(stmt.name())) {
                 throw new MemgresException("type \"" + stmt.name() + "\" already exists", "42710");
@@ -45,6 +49,14 @@ class DdlObjectExecutor {
     // ---- ALTER TYPE ----
 
     QueryResult executeAlterType(AlterTypeStmt stmt) {
+        // Check if this is a composite type operation first
+        if (stmt.action() == AlterTypeStmt.Action.ADD_ATTRIBUTE
+                || stmt.action() == AlterTypeStmt.Action.DROP_ATTRIBUTE
+                || stmt.action() == AlterTypeStmt.Action.ALTER_ATTRIBUTE_TYPE
+                || stmt.action() == AlterTypeStmt.Action.RENAME_ATTRIBUTE) {
+            return executeAlterCompositeType(stmt);
+        }
+
         CustomEnum existing = executor.database.getCustomEnum(stmt.typeName());
         if (existing == null) throw new MemgresException("type \"" + stmt.typeName() + "\" does not exist", "42704");
 
@@ -87,6 +99,57 @@ class DdlObjectExecutor {
             case OWNER_TO: {
                 break;
             }
+        }
+        return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
+    }
+
+    private QueryResult executeAlterCompositeType(AlterTypeStmt stmt) {
+        List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(stmt.typeName());
+        if (fields == null) throw new MemgresException("type \"" + stmt.typeName() + "\" does not exist", "42704");
+
+        switch (stmt.action()) {
+            case ADD_ATTRIBUTE: {
+                List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>(fields);
+                newFields.add(new CreateTypeStmt.CompositeField(stmt.value(), stmt.newValue()));
+                executor.database.addCompositeType(stmt.typeName(), newFields);
+                break;
+            }
+            case DROP_ATTRIBUTE: {
+                List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
+                for (CreateTypeStmt.CompositeField f : fields) {
+                    if (!f.name().equalsIgnoreCase(stmt.value())) {
+                        newFields.add(f);
+                    }
+                }
+                executor.database.addCompositeType(stmt.typeName(), newFields);
+                break;
+            }
+            case ALTER_ATTRIBUTE_TYPE: {
+                List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
+                for (CreateTypeStmt.CompositeField f : fields) {
+                    if (f.name().equalsIgnoreCase(stmt.value())) {
+                        newFields.add(new CreateTypeStmt.CompositeField(f.name(), stmt.newValue()));
+                    } else {
+                        newFields.add(f);
+                    }
+                }
+                executor.database.addCompositeType(stmt.typeName(), newFields);
+                break;
+            }
+            case RENAME_ATTRIBUTE: {
+                List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
+                for (CreateTypeStmt.CompositeField f : fields) {
+                    if (f.name().equalsIgnoreCase(stmt.value())) {
+                        newFields.add(new CreateTypeStmt.CompositeField(stmt.newValue(), f.typeName()));
+                    } else {
+                        newFields.add(f);
+                    }
+                }
+                executor.database.addCompositeType(stmt.typeName(), newFields);
+                break;
+            }
+            default:
+                break;
         }
         return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
     }
@@ -370,6 +433,15 @@ class DdlObjectExecutor {
             validateTypeExists(baseRetType);
         }
 
+        // SUPPORT clause: validate the support function exists (PG validates at CREATE time)
+        if (stmt.supportFunction != null) {
+            String supportFn = stmt.supportFunction;
+            if (executor.database.getFunction(supportFn) == null
+                    && executor.database.getFunction(supportFn.toLowerCase()) == null) {
+                throw new MemgresException("function " + supportFn + " does not exist", "42883");
+            }
+        }
+
         List<PgFunction.Param> params = new ArrayList<>();
         if (stmt.parsedParams() != null) {
             for (CreateFunctionStmt.FuncParam fp : stmt.parsedParams()) {
@@ -489,6 +561,10 @@ class DdlObjectExecutor {
         pgFunc.setVolatility(stmt.volatility());
         pgFunc.setSetClauses(stmt.setClauses());
         pgFunc.setOwner(executor.sessionUser());
+        pgFunc.setAtomicBody(stmt.atomicBody);
+        if (stmt.parallel() != null) pgFunc.setParallel(stmt.parallel());
+        if (stmt.cost() >= 0) pgFunc.setCost(stmt.cost());
+        if (stmt.rows() >= 0) pgFunc.setRows(stmt.rows());
         executor.database.addFunction(pgFunc);
         executor.database.registerSchemaObject(funcSchema, "function", stmt.name());
         executor.database.setObjectOwner("function:" + stmt.name(), executor.sessionUser());
@@ -500,6 +576,8 @@ class DdlObjectExecutor {
         try {
             // Validate type casts, function calls, and sequences in SQL body text
             validateSqlBodyReferences(stmt.body());
+            // Validate collation references in SQL body (PG validates eagerly at CREATE time)
+            validateSqlBodyCollations(stmt.body());
             List<String> bodyStmts = splitSqlStatements(stmt.body());
             for (String bodyStr : bodyStmts) {
                 Statement parsed = com.memgres.engine.parser.Parser.parse(bodyStr);
@@ -519,6 +597,25 @@ class DdlObjectExecutor {
         } catch (Exception e) {
             String msg = e.getMessage();
             throw new MemgresException(msg != null ? msg : "syntax error in function body", "42601");
+        }
+    }
+
+    /**
+     * Validate collation references in SQL function body.
+     * PG eagerly validates COLLATE names at CREATE FUNCTION time for SQL-language functions.
+     */
+    private void validateSqlBodyCollations(String body) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\\bCOLLATE\\s+\"?([\\w.]+)\"?", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(body);
+        while (m.find()) {
+            String collation = m.group(1).toLowerCase();
+            if (collation.equals("c") || collation.equals("posix") || collation.equals("default")
+                    || collation.equals("ucs_basic") || collation.equals("unicode") || collation.equals("icu_root")
+                    || collation.startsWith("c.") || collation.startsWith("pg_catalog.")) {
+                continue;
+            }
+            if (executor.database.getCollation(collation) != null) continue;
+            throw new MemgresException("collation \"" + m.group(1) + "\" for encoding \"UTF8\" does not exist", "42704");
         }
     }
 
@@ -840,7 +937,7 @@ class DdlObjectExecutor {
                 "date_part", "date_trunc", "extract", "age", "make_interval",
                 "row_to_json", "json_build_object", "json_build_array",
                 "jsonb_build_object", "jsonb_build_array",
-                "generate_series", "pg_typeof", "pg_sleep").contains(name);
+                "generate_series", "pg_typeof", "pg_sleep", "pg_sleep_for", "pg_sleep_until").contains(name);
     }
 
     /**
@@ -1186,11 +1283,65 @@ class DdlObjectExecutor {
             PgTrigger trigger = new PgTrigger(
                     stmt.name(), timing, trigEvent, stmt.table(), stmt.functionName(),
                     trigEvent == PgTrigger.Event.UPDATE ? stmt.updateOfColumns() : null,
-                    stmt.newTransitionTable(), stmt.oldTransitionTable(), stmt.forEachStatement());
+                    stmt.newTransitionTable(), stmt.oldTransitionTable(), stmt.forEachStatement(),
+                    stmt.whenClause(), stmt.deferrable, stmt.initiallyDeferred);
             trigger.setSchemaName(triggerTableSchema);
             executor.database.addTrigger(trigger);
         }
         return QueryResult.command(QueryResult.Type.CREATE_TRIGGER, 0);
+    }
+
+    // ---- CREATE EVENT TRIGGER ----
+
+    QueryResult executeCreateEventTrigger(CreateEventTriggerStmt stmt) {
+        PgEventTrigger et = new PgEventTrigger(stmt.name(), stmt.event(), stmt.functionName(), stmt.tags());
+        executor.database.addEventTrigger(et);
+        return QueryResult.command(QueryResult.Type.CREATE_TRIGGER, 0);
+    }
+
+    // ---- ALTER EVENT TRIGGER ----
+
+    QueryResult executeAlterEventTrigger(AlterEventTriggerStmt stmt) {
+        PgEventTrigger et = executor.database.getEventTrigger(stmt.name());
+        if (et == null) {
+            // Silently succeed for compatibility (some tests expect no-op behavior)
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        switch (stmt.action()) {
+            case DISABLE:
+                et.setEnabled('D');
+                break;
+            case ENABLE:
+                et.setEnabled('O');
+                break;
+            case ENABLE_REPLICA:
+                et.setEnabled('R');
+                break;
+            case ENABLE_ALWAYS:
+                et.setEnabled('A');
+                break;
+            case RENAME:
+                executor.database.removeEventTrigger(stmt.name());
+                et.setName(stmt.newName());
+                executor.database.addEventTrigger(et);
+                break;
+            case OWNER:
+                // no-op for now (owner tracking not implemented)
+                break;
+        }
+        return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    // ---- DROP EVENT TRIGGER ----
+
+    QueryResult executeDropEventTrigger(DropEventTriggerStmt stmt) {
+        PgEventTrigger et = executor.database.getEventTrigger(stmt.name());
+        if (et == null) {
+            // Silently succeed for compatibility
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        executor.database.removeEventTrigger(stmt.name());
+        return QueryResult.command(QueryResult.Type.SET, 0);
     }
 
     // ---- DROP (generic) ----
@@ -1235,11 +1386,24 @@ class DdlObjectExecutor {
                 executor.database.removeAggregate(stmt.name());
                 break;
             }
-            case EXTENSION:
+            case EXTENSION: {
+                executor.database.removeExtension(stmt.name());
+                break;
+            }
             case COLLATION:
-            case CAST:
             case CONVERSION: {
                 break; // no-op
+            }
+            case CAST: {
+                // name is encoded as "sourceType->targetType"
+                String castName = stmt.name();
+                if (castName != null && castName.contains("->")) {
+                    String[] parts = castName.split("->");
+                    int srcOid = resolveTypeOid(parts[0].trim());
+                    int tgtOid = resolveTypeOid(parts[1].trim());
+                    executor.database.removeUserCast(srcOid, tgtOid);
+                }
+                break;
             }
             case OPERATOR: {
                 // name is encoded as "opname(leftarg,rightarg)" by the parser
@@ -1369,11 +1533,13 @@ class DdlObjectExecutor {
     private void dropType(DropStmt stmt) {
         CustomEnum existing = executor.database.getCustomEnum(stmt.name());
         boolean isComposite = executor.database.isCompositeType(stmt.name());
-        if (existing == null && !isComposite && !stmt.ifExists()) {
+        boolean isRange = executor.database.getRangeTypes().containsKey(stmt.name().toLowerCase());
+        if (existing == null && !isComposite && !isRange && !stmt.ifExists()) {
             throw new MemgresException("type \"" + stmt.name() + "\" does not exist", "42704");
         }
         if (existing != null) executor.database.removeCustomEnum(stmt.name());
         if (isComposite) executor.database.removeCompositeType(stmt.name());
+        if (isRange) executor.database.getRangeTypes().remove(stmt.name().toLowerCase());
     }
 
     private void dropSchema(DropStmt stmt) {
@@ -1485,6 +1651,7 @@ class DdlObjectExecutor {
         }
         Sequence seq = new Sequence(seqName, stmt.startWith(), incr, minVal, maxVal);
         if (stmt.cycle() != null) seq.setCycle(stmt.cycle());
+        if (stmt.getAsType() != null) seq.setDataType(stmt.getAsType().toLowerCase());
         if (stmt.getCache() != null) seq.setCache(stmt.getCache());
         executor.database.addSequence(seq);
         executor.database.registerSchemaObject(executor.defaultSchema(), "sequence", seqName);
@@ -1531,12 +1698,24 @@ class DdlObjectExecutor {
             else throw new MemgresException("type \"" + baseTypeName + "\" does not exist");
         }
 
-        executor.database.addDomain(new DomainType(
-                stmt.name(), baseType, baseTypeName, stmt.notNull(),
-                stmt.checkExpr() != null ? stmt.checkExpr().toString() : null,
-                stmt.checkExpr(),
-                stmt.defaultExpr() != null ? DdlExecutor.exprToDefaultString(stmt.defaultExpr()) : null
-        ));
+        String checkExprStr = stmt.checkExpr() != null ? stmt.checkExpr().toString() : null;
+        // If constraint has explicit name, store as named constraint; otherwise store as inline
+        if (stmt.constraintName() != null && stmt.checkExpr() != null) {
+            DomainType domain = new DomainType(
+                    stmt.name(), baseType, baseTypeName, stmt.notNull(),
+                    null, null,
+                    stmt.defaultExpr() != null ? DdlExecutor.exprToDefaultString(stmt.defaultExpr()) : null
+            );
+            domain.addConstraint(stmt.constraintName(), checkExprStr, stmt.checkExpr());
+            executor.database.addDomain(domain);
+        } else {
+            executor.database.addDomain(new DomainType(
+                    stmt.name(), baseType, baseTypeName, stmt.notNull(),
+                    checkExprStr,
+                    stmt.checkExpr(),
+                    stmt.defaultExpr() != null ? DdlExecutor.exprToDefaultString(stmt.defaultExpr()) : null
+            ));
+        }
         executor.database.registerSchemaObject(executor.defaultSchema(), "domain", stmt.name());
         return QueryResult.message(QueryResult.Type.SET, "CREATE DOMAIN");
     }
@@ -1566,22 +1745,24 @@ class DdlObjectExecutor {
                         if ("42883".equals(e.getSqlState())) throw e;
                     }
                 }
-                for (Schema schema : executor.database.getSchemas().values()) {
-                    for (Table table : schema.getTables().values()) {
-                        for (int ci = 0; ci < table.getColumns().size(); ci++) {
-                            Column col = table.getColumns().get(ci);
-                            if (stmt.domainName().equals(col.getDomainTypeName())) {
-                                Table valTable = new Table("_domain_check",
-                                        Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
-                                for (Object[] row : table.getRows()) {
-                                    Object val = row[ci];
-                                    if (val != null && stmt.checkExpr() != null) {
-                                        RowContext valCtx = new RowContext(valTable, null, new Object[]{val});
-                                        Object result = executor.evalExpr(stmt.checkExpr(), valCtx);
-                                        if (!executor.isTruthy(result)) {
-                                            throw new MemgresException(
-                                                    "value for domain " + stmt.domainName() + " violates check constraint \"" + stmt.constraintName() + "\"",
-                                                    "23514");
+                if (!stmt.notValid()) {
+                    for (Schema schema : executor.database.getSchemas().values()) {
+                        for (Table table : schema.getTables().values()) {
+                            for (int ci = 0; ci < table.getColumns().size(); ci++) {
+                                Column col = table.getColumns().get(ci);
+                                if (stmt.domainName().equals(col.getDomainTypeName())) {
+                                    Table valTable = new Table("_domain_check",
+                                            Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
+                                    for (Object[] row : table.getRows()) {
+                                        Object val = row[ci];
+                                        if (val != null && stmt.checkExpr() != null) {
+                                            RowContext valCtx = new RowContext(valTable, null, new Object[]{val});
+                                            Object result = executor.evalExpr(stmt.checkExpr(), valCtx);
+                                            if (!executor.isTruthy(result)) {
+                                                throw new MemgresException(
+                                                        "value for domain " + stmt.domainName() + " violates check constraint \"" + stmt.constraintName() + "\"",
+                                                        "23514");
+                                            }
                                         }
                                     }
                                 }
@@ -1589,13 +1770,40 @@ class DdlObjectExecutor {
                         }
                     }
                 }
-                domain.addConstraint(stmt.constraintName(), stmt.rawCheckExpr(), stmt.checkExpr());
+                domain.addConstraint(stmt.constraintName(), stmt.rawCheckExpr(), stmt.checkExpr(), !stmt.notValid());
                 break;
             }
             case "DROP_CONSTRAINT":
                 domain.removeConstraint(stmt.constraintName());
                 break;
             case "VALIDATE": {
+                boolean found = false;
+                for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
+                    if (nc.name().equalsIgnoreCase(stmt.constraintName())) {
+                        nc.setValidated(true);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    throw new MemgresException(
+                            "constraint \"" + stmt.constraintName() + "\" of domain \"" + stmt.domainName() + "\" does not exist", "42704");
+                }
+                break;
+            }
+            case "RENAME_CONSTRAINT": {
+                boolean found = false;
+                for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
+                    if (nc.name().equalsIgnoreCase(stmt.constraintName())) {
+                        nc.setName(stmt.newConstraintName());
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    throw new MemgresException(
+                            "constraint \"" + stmt.constraintName() + "\" of domain \"" + stmt.domainName() + "\" does not exist", "42704");
+                }
                 break;
             }
             case "NO_OP": {
@@ -1748,6 +1956,30 @@ class DdlObjectExecutor {
                 // Other errors (e.g., schema issues, table is a view); skip column validation
             }
         }
+        // For UNIQUE/PK indexes on partitioned tables, the index columns must include the partition key
+        if (s.unique() && s.table() != null && s.columns() != null) {
+            try {
+                String partSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
+                Table partTable = executor.resolveTable(partSchema, s.table());
+                if (partTable.getPartitionStrategy() != null && partTable.getPartitionColumn() != null) {
+                    String partCol = partTable.getPartitionColumn().toLowerCase();
+                    if (partCol.startsWith("(")) partCol = partCol.substring(1);
+                    if (partCol.endsWith(")")) partCol = partCol.substring(0, partCol.length() - 1);
+                    partCol = partCol.trim();
+                    boolean partColFound = false;
+                    for (String idxCol : s.columns()) {
+                        if (idxCol.toLowerCase().equals(partCol)) { partColFound = true; break; }
+                    }
+                    if (!partColFound) {
+                        throw new MemgresException("unique constraint on partitioned table must include all partitioning columns\n"
+                                + "  Detail: UNIQUE constraint missing column \"" + partCol + "\" which is part of the partition key.",
+                                "0A000");
+                    }
+                }
+            } catch (MemgresException e) {
+                if ("0A000".equals(e.getSqlState())) throw e;
+            }
+        }
         // For UNIQUE indexes, validate existing data for uniqueness before creating the index
         if (s.unique() && s.table() != null && s.columns() != null) {
             try {
@@ -1833,6 +2065,9 @@ class DdlObjectExecutor {
             String idxSchemaForMeta = s.schema() != null ? s.schema() : executor.defaultSchema();
             executor.database.addIndexMeta(s.name(), idxSchemaForMeta + "." + s.table(), s.unique(),
                     s.method(), s.whereClause());
+            executor.database.setIndexColumnOptions(s.name(), s.columnOptions());
+            executor.database.setIndexIncludeColumns(s.name(), s.includeColumns());
+            executor.database.setIndexNullsNotDistinct(s.name(), s.nullsNotDistinct());
             executor.database.registerSchemaObject(idxSchemaForMeta, "index", s.name());
             executor.recordUndo(new Session.CreateIndexUndo(s.name()));
             // Build a real TableIndex for simple column indexes (non-expression, non-partial)
@@ -1903,7 +2138,37 @@ class DdlObjectExecutor {
                     }
                 }
                 sc.setFromIndex(true);
+                if (s.nullsNotDistinct()) sc.setNullsNotDistinct(true);
                 idxTable.addConstraint(sc);
+                // For partitioned tables, also add the constraint to each partition
+                if (idxTable.getPartitionStrategy() != null && !idxTable.getPartitions().isEmpty()) {
+                    for (Table partition : idxTable.getPartitions()) {
+                        StoredConstraint partSc = StoredConstraint.unique(constraintName + "_" + partition.getName(), s.columns());
+                        if (s.whereClause() != null) {
+                            try {
+                                Expression predExpr2 = com.memgres.engine.parser.Parser.parseExpression(s.whereClause());
+                                partSc.setWhereExpr(predExpr2);
+                            } catch (Exception ignored2) {}
+                        }
+                        partSc.setFromIndex(true);
+                        if (s.nullsNotDistinct()) partSc.setNullsNotDistinct(true);
+                        partition.addConstraint(partSc);
+                        // Build index on partition too
+                        try {
+                            int[] pColIndices = new int[s.columns().size()];
+                            boolean pAllFound = true;
+                            for (int ci = 0; ci < s.columns().size(); ci++) {
+                                int idx = partition.getColumnIndex(s.columns().get(ci));
+                                if (idx < 0) { pAllFound = false; break; }
+                                pColIndices[ci] = idx;
+                            }
+                            if (pAllFound && partition.getIndex(s.name() + "_" + partition.getName()) == null) {
+                                TableIndex pIdx = new TableIndex(s.name() + "_" + partition.getName(), pColIndices, true);
+                                partition.buildIndex(pIdx);
+                            }
+                        } catch (Exception ignored3) {}
+                    }
+                }
             } catch (MemgresException ignored) {
                 // Table might not exist yet (e.g., on materialized views)
             }
@@ -1961,5 +2226,85 @@ class DdlObjectExecutor {
                 for (Expression arg : fn.args()) checkExprVirtualColumnRefs(arg, table);
             }
         }
+    }
+
+    // ---- CREATE COLLATION ----
+
+    QueryResult executeCreateCollation(CreateCollationStmt stmt) {
+        String name = stmt.name;
+        if (ddl.executor.database.getCollation(name) != null) {
+            if (stmt.ifNotExists) {
+                return QueryResult.message(QueryResult.Type.SET, "CREATE COLLATION");
+            }
+            throw new MemgresException("collation \"" + name + "\" already exists", "42710");
+        }
+
+        String provider = "c";
+        String locale = null;
+        String lcCollate = null;
+        String lcCtype = null;
+        boolean deterministic = true;
+
+        if (stmt.fromCollation != null) {
+            // CREATE COLLATION name FROM existing_collation
+            // Just register it with default libc provider
+            ddl.executor.database.addCollation(new Database.CollationDef(
+                    name, "c", null, null, null, true, stmt.fromCollation));
+            return QueryResult.message(QueryResult.Type.SET, "CREATE COLLATION");
+        }
+
+        for (java.util.Map.Entry<String, String> entry : stmt.options.entrySet()) {
+            switch (entry.getKey()) {
+                case "provider":
+                    String pv = entry.getValue().toLowerCase();
+                    if (pv.equals("icu")) provider = "i";
+                    else if (pv.equals("libc")) provider = "c";
+                    else provider = pv;
+                    break;
+                case "locale":
+                    locale = entry.getValue();
+                    break;
+                case "lc_collate":
+                    lcCollate = entry.getValue();
+                    break;
+                case "lc_ctype":
+                    lcCtype = entry.getValue();
+                    break;
+                case "deterministic":
+                    deterministic = !"false".equalsIgnoreCase(entry.getValue());
+                    break;
+            }
+        }
+
+        ddl.executor.database.addCollation(new Database.CollationDef(
+                name, provider, locale, lcCollate, lcCtype, deterministic, null));
+        return QueryResult.message(QueryResult.Type.SET, "CREATE COLLATION");
+    }
+
+    // ---- CREATE CAST ----
+
+    QueryResult executeCreateCast(CreateCastStmt stmt) {
+        // Resolve source and target type OIDs using DataType enum for built-in types
+        int sourceOid = resolveTypeOid(stmt.sourceType);
+        int targetOid = resolveTypeOid(stmt.targetType);
+        String castMethod = stmt.functionName != null ? "f" : "b";
+        int castFunc = 0; // 0 for binary coercible / without function
+        // Store in database for inclusion in pg_cast virtual table
+        executor.database.addUserCast(sourceOid, targetOid, castFunc, stmt.castContext, castMethod);
+        return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
+    }
+
+    /** Resolve a SQL type name to its OID, checking built-in types first, then domains/enums. */
+    private int resolveTypeOid(String typeName) {
+        DataType dt = DataType.fromPgName(typeName);
+        if (dt != null) return dt.getOid();
+        // Check domain types
+        DomainType dom = executor.database.getDomain(typeName.toLowerCase());
+        if (dom != null) return executor.systemCatalog.getOid("type:" + typeName.toLowerCase());
+        // Check enum types
+        if (executor.database.getCustomEnums().containsKey(typeName.toLowerCase()))
+            return executor.systemCatalog.getOid("type:" + typeName.toLowerCase());
+        // Fallback
+        return executor.systemCatalog.getOid("type:" + typeName.toLowerCase());
     }
 }

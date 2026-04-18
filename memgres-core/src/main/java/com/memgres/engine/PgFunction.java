@@ -107,4 +107,12 @@ public class PgFunction {
     public void setRows(double rows) { this.rows = rows; }
     public String getParallel() { return parallel; }
     public void setParallel(String parallel) { this.parallel = parallel; }
+
+    private boolean atomicBody;
+    public boolean isAtomicBody() { return atomicBody; }
+    public void setAtomicBody(boolean atomicBody) { this.atomicBody = atomicBody; }
+
+    private final java.util.concurrent.atomic.AtomicLong callCount = new java.util.concurrent.atomic.AtomicLong(0);
+    public long getCallCount() { return callCount.get(); }
+    public void incrementCallCount() { callCount.incrementAndGet(); }
 }

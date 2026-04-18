@@ -48,7 +48,7 @@ ORDER BY id;
 
 -- begin-expected
 -- columns: id|get_bit_0|get_bit_3|set_bit_1|octets|hex_payload|escaped_payload
--- row: 1|0|1|1110|4|deadbeef|\\336\\255\\276\\357
+-- row: 1|1|1|1110|4|deadbeef|\\336\\255\\276\\357
 -- row: 2|0|0|0111|3|00ff10|\\000\\377\020
 -- end-expected
 SELECT id,

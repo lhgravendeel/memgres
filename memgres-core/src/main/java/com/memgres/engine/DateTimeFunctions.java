@@ -23,17 +23,16 @@ class DateTimeFunctions {
                     if (arg == null) return null; // age(NULL) → NULL
                     // age(xid) → int4: transaction age (return small constant for memgres)
                     if (arg instanceof Number) return 1;
-                    java.time.LocalDate d = TypeCoercion.toLocalDate(arg);
-                    java.time.Period p = java.time.Period.between(d, java.time.LocalDate.now());
-                    return new PgInterval(p.getYears() * 12 + p.getMonths(), p.getDays(), 0);
+                    java.time.LocalDateTime dt1 = java.time.LocalDateTime.now();
+                    java.time.LocalDateTime dt2 = TypeCoercion.toLocalDateTime(arg);
+                    return computeAge(dt1, dt2);
                 }
                 Object a1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object a2 = executor.evalExpr(fn.args().get(1), ctx);
                 if (a1 == null || a2 == null) return null; // age(NULL, x) or age(x, NULL) → NULL
-                java.time.LocalDate d1 = TypeCoercion.toLocalDate(a1);
-                java.time.LocalDate d2 = TypeCoercion.toLocalDate(a2);
-                java.time.Period p = java.time.Period.between(d2, d1);
-                return new PgInterval(p.getYears() * 12 + p.getMonths(), p.getDays(), 0);
+                java.time.LocalDateTime dt1 = TypeCoercion.toLocalDateTime(a1);
+                java.time.LocalDateTime dt2 = TypeCoercion.toLocalDateTime(a2);
+                return computeAge(dt1, dt2);
             }
             case "date_part":
             case "extract": {
@@ -271,6 +270,20 @@ class DateTimeFunctions {
         }
     }
 
+    private PgInterval computeAge(java.time.LocalDateTime dt1, java.time.LocalDateTime dt2) {
+        java.time.Period p = java.time.Period.between(dt2.toLocalDate(), dt1.toLocalDate());
+        long timeMicros = java.time.Duration.between(dt2.toLocalTime(), dt1.toLocalTime()).toNanos() / 1000;
+        // If time part is negative but date part is positive, borrow a day
+        if (timeMicros < 0 && (p.getYears() > 0 || p.getMonths() > 0 || p.getDays() > 0)) {
+            p = p.minusDays(1);
+            timeMicros += 24L * 3600 * 1_000_000;
+        } else if (timeMicros > 0 && (p.getYears() < 0 || p.getMonths() < 0 || p.getDays() < 0)) {
+            p = p.plusDays(1);
+            timeMicros -= 24L * 3600 * 1_000_000;
+        }
+        return new PgInterval(p.getYears() * 12 + p.getMonths(), p.getDays(), timeMicros);
+    }
+
     private Object extractDatePart(String field, Object source) {
         if (source == null) return null;
         if (source instanceof PgInterval) {
@@ -294,8 +307,18 @@ class DateTimeFunctions {
                 case "second":
                 case "seconds":
                     return java.math.BigDecimal.valueOf((iv.getMicroseconds() % 60_000_000L)).divide(java.math.BigDecimal.valueOf(1_000_000), 6, java.math.RoundingMode.HALF_UP).stripTrailingZeros();
-                case "epoch":
-                    return java.math.BigDecimal.valueOf(iv.getMonths() * 30 * 86400L + iv.getDays() * 86400L).add(java.math.BigDecimal.valueOf(iv.getMicroseconds()).divide(java.math.BigDecimal.valueOf(1_000_000), 6, java.math.RoundingMode.HALF_UP)).stripTrailingZeros();
+                case "epoch": {
+                    // PG uses 2629800 seconds per month (= 365.25/12 * 86400), not 30*86400
+                    long totalSecs = (long) iv.getMonths() * 2629800L + (long) iv.getDays() * 86400L;
+                    java.math.BigDecimal secsPart = java.math.BigDecimal.valueOf(totalSecs);
+                    java.math.BigDecimal microsPart = java.math.BigDecimal.valueOf(iv.getMicroseconds())
+                            .divide(java.math.BigDecimal.valueOf(1_000_000), 6, java.math.RoundingMode.HALF_UP);
+                    java.math.BigDecimal result = secsPart.add(microsPart);
+                    // Use toPlainString-compatible representation: strip trailing fractional zeros but keep integer form
+                    result = result.stripTrailingZeros();
+                    if (result.scale() < 0) result = result.setScale(0);
+                    return result;
+                }
                 default:
                     throw new MemgresException("unit \"" + field + "\" not recognized for type interval", "22023");
             }
@@ -366,10 +389,39 @@ class DateTimeFunctions {
             case "millisecond":
             case "milliseconds":
                 return java.math.BigDecimal.valueOf(dt.getSecond() * 1000L + dt.getNano() / 1_000_000);
+            case "julian": {
+                // Julian Day Number: PostgreSQL returns a fractional Julian day where
+                // Julian days start at noon (12:00). Java's JulianFields.JULIAN_DAY
+                // gives the integer Julian day that starts at midnight, so we need to
+                // subtract 0.5 (to shift to the noon-based epoch) and then add
+                // the fractional time-of-day.
+                long julianDay = dt.toLocalDate().getLong(java.time.temporal.JulianFields.JULIAN_DAY);
+                long dayMicros = (dt.getHour() * 3600L + dt.getMinute() * 60L + dt.getSecond()) * 1_000_000L + dt.getNano() / 1000;
+                java.math.BigDecimal frac = java.math.BigDecimal.valueOf(dayMicros).divide(
+                        java.math.BigDecimal.valueOf(86400_000_000L), 6, java.math.RoundingMode.HALF_UP);
+                // Subtract 0.5 because Julian days begin at noon, not midnight
+                return java.math.BigDecimal.valueOf(julianDay)
+                        .subtract(new java.math.BigDecimal("0.5"))
+                        .add(frac).stripTrailingZeros();
+            }
             case "timezone":
             case "timezone_hour":
-            case "timezone_minute":
-                return java.math.BigDecimal.ZERO;
+            case "timezone_minute": {
+                int totalSeconds = 0;
+                if (originalSource instanceof java.time.OffsetDateTime) {
+                    totalSeconds = ((java.time.OffsetDateTime) originalSource).getOffset().getTotalSeconds();
+                }
+                switch (field) {
+                    case "timezone":
+                        return java.math.BigDecimal.valueOf(totalSeconds);
+                    case "timezone_hour":
+                        return java.math.BigDecimal.valueOf(totalSeconds / 3600);
+                    case "timezone_minute":
+                        return java.math.BigDecimal.valueOf((totalSeconds % 3600) / 60);
+                    default:
+                        return java.math.BigDecimal.ZERO;
+                }
+            }
             default:
                 throw new MemgresException("unit \"" + field + "\" not recognized for type timestamp without time zone", "22023");
         }
@@ -512,6 +564,59 @@ class DateTimeFunctions {
             }
             else if (rest.startsWith("am") || rest.startsWith("pm")) {
                 sb.append(dt.getHour() < 12 ? "am" : "pm"); i += 2;
+            }
+            else if (rest.startsWith("TZH")) {
+                if (source instanceof java.time.OffsetDateTime) {
+                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
+                    int totalSeconds = offset.getTotalSeconds();
+                    String sign = totalSeconds >= 0 ? "+" : "-";
+                    int hours = Math.abs(totalSeconds) / 3600;
+                    sb.append(String.format("%s%02d", sign, hours));
+                } else {
+                    sb.append("+00");
+                }
+                i += 3;
+            }
+            else if (rest.startsWith("TZM")) {
+                if (source instanceof java.time.OffsetDateTime) {
+                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
+                    int minutes = (Math.abs(offset.getTotalSeconds()) % 3600) / 60;
+                    sb.append(String.format("%02d", minutes));
+                } else {
+                    sb.append("00");
+                }
+                i += 3;
+            }
+            else if (rest.startsWith("TZ")) {
+                if (source instanceof java.time.OffsetDateTime) {
+                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
+                    if (offset.getTotalSeconds() == 0) {
+                        sb.append("UTC");
+                    } else {
+                        sb.append(offset.getId().replace("Z", "UTC"));
+                    }
+                } else {
+                    sb.append("UTC");
+                }
+                i += 2;
+            }
+            else if (rest.startsWith("OF")) {
+                if (source instanceof java.time.OffsetDateTime) {
+                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
+                    int totalSeconds = offset.getTotalSeconds();
+                    String sign = totalSeconds >= 0 ? "+" : "-";
+                    int absSeconds = Math.abs(totalSeconds);
+                    int hours = absSeconds / 3600;
+                    int minutes = (absSeconds % 3600) / 60;
+                    if (minutes != 0) {
+                        sb.append(String.format("%s%02d:%02d", sign, hours, minutes));
+                    } else {
+                        sb.append(String.format("%s%02d", sign, hours));
+                    }
+                } else {
+                    sb.append("+00");
+                }
+                i += 2;
             }
             else { sb.append(fmt.charAt(i)); i++; }
         }

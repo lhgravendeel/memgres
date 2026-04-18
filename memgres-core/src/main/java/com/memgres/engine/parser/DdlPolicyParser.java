@@ -69,6 +69,11 @@ class DdlPolicyParser {
         // ALTER POLICY name ON table RENAME TO newname
         if (parser.matchKeywords("RENAME", "TO")) {
             String newName = parser.readIdentifier();
+            // PG does not allow changing the command type via ALTER POLICY ... RENAME
+            if (parser.matchKeyword("FOR")) {
+                Token cmdToken = parser.advance();
+                throw new ParseException("syntax error at or near \"" + cmdToken.value() + "\"", cmdToken);
+            }
             return new AlterPolicyStmt(name, table, newName, null, null);
         }
 

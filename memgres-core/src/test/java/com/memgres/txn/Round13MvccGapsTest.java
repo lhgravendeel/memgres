@@ -249,10 +249,10 @@ class Round13MvccGapsTest {
     void shared_advisory_lock_allowsConcurrentSharedHolders() throws Exception {
         try (Connection a = newConn(); Connection b = newConn()) {
             // Both sessions acquire SHARED advisory lock on same ID.
-            assertTrue(Boolean.parseBoolean(
-                    scalarString(a, "SELECT pg_try_advisory_lock_shared(49127)::text")));
-            assertTrue(Boolean.parseBoolean(
-                    scalarString(b, "SELECT pg_try_advisory_lock_shared(49127)::text")),
+            assertEquals("true",
+                    scalarString(a, "SELECT pg_try_advisory_lock_shared(49127)::text"));
+            assertEquals("true",
+                    scalarString(b, "SELECT pg_try_advisory_lock_shared(49127)::text"),
                     "second shared advisory lock must succeed");
             try (Statement s = a.createStatement()) { s.execute("SELECT pg_advisory_unlock_shared(49127)"); }
             try (Statement s = b.createStatement()) { s.execute("SELECT pg_advisory_unlock_shared(49127)"); }
@@ -262,11 +262,11 @@ class Round13MvccGapsTest {
     @Test
     void exclusive_advisory_lock_blocksShared() throws Exception {
         try (Connection a = newConn(); Connection b = newConn()) {
-            assertTrue(Boolean.parseBoolean(
-                    scalarString(a, "SELECT pg_try_advisory_lock(49128)::text")));
+            assertEquals("true",
+                    scalarString(a, "SELECT pg_try_advisory_lock(49128)::text"));
             // Second session: shared lock should FAIL via try-variant.
-            assertFalse(Boolean.parseBoolean(
-                    scalarString(b, "SELECT pg_try_advisory_lock_shared(49128)::text")),
+            assertEquals("false",
+                    scalarString(b, "SELECT pg_try_advisory_lock_shared(49128)::text"),
                     "shared advisory must fail when another session holds exclusive");
             try (Statement s = a.createStatement()) { s.execute("SELECT pg_advisory_unlock(49128)"); }
         }

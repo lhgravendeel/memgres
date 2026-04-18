@@ -760,7 +760,7 @@ class SystemCatalogsCoverageTest {
     void testIsViewsIsUpdatable() throws SQLException {
         String upd = query1(
                 "SELECT is_updatable FROM information_schema.views WHERE table_name = 'active_users'");
-        assertEquals("NO", upd);
+        assertEquals("YES", upd);
     }
 
     // ---- information_schema.routines ----
@@ -1243,11 +1243,10 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testUnknownPgCatalogTableReturnsEmpty() throws SQLException {
-        try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT * FROM pg_nonexistent_table LIMIT 1")) {
-            // Should return empty result, not error
-            assertNotNull(rs.getMetaData());
-        }
+        // PG errors on unknown catalog tables with "relation does not exist"
+        assertThrows(SQLException.class,
+                () -> { try (Statement stmt = conn.createStatement();
+                         ResultSet rs = stmt.executeQuery("SELECT * FROM pg_nonexistent_table LIMIT 1")) {} });
     }
 
     @Test

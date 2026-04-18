@@ -29,6 +29,11 @@ public class Table {
     private final AtomicLong tupInserted = new AtomicLong(0);
     private final AtomicLong tupUpdated = new AtomicLong(0);
     private final AtomicLong tupDeleted = new AtomicLong(0);
+    private final AtomicLong idxScanCount = new AtomicLong(0);
+
+    // Maintenance timestamps for pg_stat_user_tables
+    private volatile java.time.OffsetDateTime lastVacuum;
+    private volatile java.time.OffsetDateTime lastAnalyze;
 
     // Inheritance
     private Table parentTable;
@@ -45,6 +50,12 @@ public class Table {
     private Integer partitionModulus;   // for HASH
     private Integer partitionRemainder; // for HASH
     private boolean defaultPartition;  // DEFAULT partition
+
+    // Storage parameters (WITH options, e.g. fillfactor=80)
+    private Map<String, String> reloptions;
+
+    // Unlogged table
+    private boolean unlogged;
 
     // Row-level security
     private boolean rlsEnabled;
@@ -273,6 +284,14 @@ public class Table {
         } finally {
             writeLock.unlock();
         }
+    }
+
+    /**
+     * Delete a single row from the table using identity comparison.
+     */
+    public void deleteRow(Object[] row) {
+        java.util.Set<Object[]> s = java.util.Collections.singleton(row);
+        deleteRows(s);
     }
 
     public void addColumn(Column column) {
@@ -576,6 +595,12 @@ public class Table {
         return null;
     }
 
+    // Unlogged
+    public boolean isUnlogged() { return unlogged; }
+    public void setUnlogged(boolean unlogged) { this.unlogged = unlogged; }
+    public Map<String, String> getReloptions() { return reloptions; }
+    public void setReloptions(Map<String, String> reloptions) { this.reloptions = reloptions; }
+
     // Inheritance
     public Table getParentTable() { return parentTable; }
     public void setParentTable(Table parent) { this.parentTable = parent; }
@@ -619,4 +644,12 @@ public class Table {
     public void incrementTupInserted(long count) { tupInserted.addAndGet(count); }
     public void incrementTupUpdated(long count) { tupUpdated.addAndGet(count); }
     public void incrementTupDeleted(long count) { tupDeleted.addAndGet(count); }
+    public long getIdxScanCount() { return idxScanCount.get(); }
+    public void incrementIdxScanCount() { idxScanCount.incrementAndGet(); }
+
+    // Maintenance timestamps
+    public java.time.OffsetDateTime getLastVacuum() { return lastVacuum; }
+    public void setLastVacuum(java.time.OffsetDateTime ts) { this.lastVacuum = ts; }
+    public java.time.OffsetDateTime getLastAnalyze() { return lastAnalyze; }
+    public void setLastAnalyze(java.time.OffsetDateTime ts) { this.lastAnalyze = ts; }
 }

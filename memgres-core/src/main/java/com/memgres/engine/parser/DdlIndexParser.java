@@ -40,6 +40,7 @@ class DdlIndexParser {
 
         parser.expect(TokenType.LEFT_PAREN);
         List<String> columns = parseIndexColumnList();
+        List<String> columnOptions = this.lastColumnOptions;
         parser.expect(TokenType.RIGHT_PAREN);
 
         List<String> includeColumns = null;
@@ -47,6 +48,18 @@ class DdlIndexParser {
             parser.expect(TokenType.LEFT_PAREN);
             includeColumns = parser.parseIdentifierList();
             parser.expect(TokenType.RIGHT_PAREN);
+        }
+
+        // Parse NULLS NOT DISTINCT (PG 15+) for unique indexes
+        boolean nullsNotDistinct = false;
+        if (parser.matchKeyword("NULLS")) {
+            if (parser.matchKeyword("NOT")) {
+                parser.expectKeyword("DISTINCT");
+                nullsNotDistinct = true;
+            } else {
+                // Could be NULLS DISTINCT (default), just consume
+                parser.matchKeyword("DISTINCT");
+            }
         }
 
         if (parser.matchKeyword("WITH")) {
@@ -75,11 +88,15 @@ class DdlIndexParser {
         }
 
         return new CreateIndexStmt(name, indexSchema, table, columns, unique, ifNotExists, concurrently,
-                method, includeColumns, whereClause);
+                method, includeColumns, whereClause, columnOptions, nullsNotDistinct);
     }
+
+    /** Parsed column options list, populated by parseIndexColumnList. */
+    List<String> lastColumnOptions;
 
     private List<String> parseIndexColumnList() {
         List<String> columns = new ArrayList<>();
+        List<String> columnOptions = new ArrayList<>();
         do {
             String col;
             if (parser.check(TokenType.LEFT_PAREN)) {
@@ -111,11 +128,13 @@ class DdlIndexParser {
                 }
             }
             columns.add(col);
+            StringBuilder opts = new StringBuilder();
             if (parser.matchKeyword("COLLATE")) {
                 String collation = parser.readIdentifierOrString();
                 if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifierOrString();
                 ExpressionParser.validateCollationStatic(collation, parser.peek());
             }
+            // Capture opclass name (e.g. text_pattern_ops)
             if (!parser.isAtEnd() && (parser.check(TokenType.IDENTIFIER) || parser.check(TokenType.KEYWORD))
                     && !parser.checkKeyword("ASC") && !parser.checkKeyword("DESC")
                     && !parser.checkKeyword("NULLS") && !parser.checkKeyword("INCLUDE") && !parser.checkKeyword("WHERE")
@@ -123,17 +142,31 @@ class DdlIndexParser {
                 Token next = parser.peek();
                 if (next.value().endsWith("_ops") || next.value().endsWith("_pattern_ops")
                         || next.value().contains("_")) {
-                    parser.advance();
+                    String opclass = parser.advance().value();
+                    if (opts.length() > 0) opts.append(' ');
+                    opts.append("opclass:").append(opclass);
                 }
             }
-            parser.matchKeyword("ASC");
-            parser.matchKeyword("DESC");
+            // Capture ASC/DESC
+            if (parser.matchKeyword("ASC")) {
+                // ASC is default, don't record
+            } else if (parser.matchKeyword("DESC")) {
+                if (opts.length() > 0) opts.append(' ');
+                opts.append("DESC");
+            }
+            // Capture NULLS FIRST/LAST
             if (parser.matchKeyword("NULLS")) {
-                if (!parser.matchKeyword("FIRST")) {
-                    parser.matchKeyword("LAST");
+                if (parser.matchKeyword("FIRST")) {
+                    if (opts.length() > 0) opts.append(' ');
+                    opts.append("NULLS FIRST");
+                } else if (parser.matchKeyword("LAST")) {
+                    if (opts.length() > 0) opts.append(' ');
+                    opts.append("NULLS LAST");
                 }
             }
+            columnOptions.add(opts.toString());
         } while (parser.match(TokenType.COMMA));
+        this.lastColumnOptions = columnOptions;
         return columns;
     }
 

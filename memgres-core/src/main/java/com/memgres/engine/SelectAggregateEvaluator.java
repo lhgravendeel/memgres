@@ -412,6 +412,12 @@ class SelectAggregateEvaluator {
                     case ARRAY: valid = s.startsWith("["); break;
                     case SCALAR: valid = !s.startsWith("{") && !s.startsWith("["); break;
                     case VALUE: break;
+                    case BOOLEAN: valid = s.equals("true") || s.equals("false"); break;
+                    case NULL: valid = s.equals("null"); break;
+                    case STRING: valid = s.startsWith("\"") && s.endsWith("\""); break;
+                    case NUMBER: valid = !s.startsWith("{") && !s.startsWith("[")
+                            && !s.startsWith("\"") && !s.equals("true") && !s.equals("false")
+                            && !s.equals("null"); break;
                 }
             }
             return ij.negated() ? !valid : valid;
@@ -478,6 +484,8 @@ class SelectAggregateEvaluator {
                         try { fv = executor.toDouble(f); } catch (Exception e) {
                             throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                         }
+                        if (Double.isNaN(fv))
+                            throw new MemgresException("percentile value NaN is not a valid number", "22023");
                         if (fv < 0.0 || fv > 1.0)
                             throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                         if (vals.isEmpty()) { results.add(null); continue; }
@@ -492,6 +500,8 @@ class SelectAggregateEvaluator {
                 try { fraction = executor.toDouble(fractionObj); } catch (Exception e) {
                     throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                 }
+                if (Double.isNaN(fraction))
+                    throw new MemgresException("percentile value NaN is not a valid number", "22023");
                 if (fraction < 0.0 || fraction > 1.0)
                     throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                 if (vals.isEmpty()) return null;
@@ -787,10 +797,23 @@ class SelectAggregateEvaluator {
                             sb.append(sv);
                         }
                     }
+                    else if (v instanceof AstExecutor.PgRow) {
+                        String sv = v.toString();
+                        sb.append("\"").append(sv.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                    }
                     else sb.append(v);
                 }
                 sb.append("}");
                 return sb.toString();
+            }
+            case "any_value": {
+                if (group.isEmpty()) return null;
+                Expression arg = fn.args().get(0);
+                for (RowContext ctx : group) {
+                    Object val = executor.evalExpr(arg, ctx);
+                    if (val != null) return val;
+                }
+                return null;
             }
             case "range_agg": {
                 // range_agg(anyrange) → multirange containing all input ranges, merged

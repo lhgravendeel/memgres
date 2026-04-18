@@ -23,7 +23,7 @@ class CastEvaluator {
         Cols.entry(114, "json"), Cols.entry(142, "xml"),
         Cols.entry(700, "real"), Cols.entry(701, "double precision"),
         Cols.entry(869, "inet"), Cols.entry(650, "cidr"),
-        Cols.entry(829, "macaddr"), Cols.entry(790, "money"),
+        Cols.entry(829, "macaddr"), Cols.entry(774, "macaddr8"), Cols.entry(790, "money"),
         Cols.entry(1042, "character"), Cols.entry(1043, "character varying"),
         Cols.entry(1082, "date"), Cols.entry(1083, "time without time zone"),
         Cols.entry(1114, "timestamp without time zone"),
@@ -143,6 +143,9 @@ class CastEvaluator {
                 String inner = valStr.substring(1, valStr.length() - 1).trim();
                 if (inner.isEmpty()) {
                     list = Cols.listOf();
+                } else if (inner.startsWith("{")) {
+                    // Nested array (2D+): split on top-level commas respecting brace depth
+                    list = parseTopLevelArrayElements(inner);
                 } else {
                     list = java.util.Arrays.asList(inner.split(","));
                 }
@@ -154,7 +157,15 @@ class CastEvaluator {
                 List<Object> castList = new ArrayList<>();
                 for (Object elem : list) {
                     if (elem == null) castList.add(null);
-                    else castList.add(applyCast(elem instanceof String ? ((String) elem).trim() : elem, elemType));
+                    else {
+                        String elemStr = elem instanceof String ? ((String) elem).trim() : elem.toString();
+                        // If the element is itself a sub-array literal (e.g., "{1,2}"), cast as elemType[]
+                        if (elemStr.startsWith("{") && elemStr.endsWith("}") && elem instanceof String) {
+                            castList.add(applyCast(elemStr, elemType + "[]"));
+                        } else {
+                            castList.add(applyCast(elem instanceof String ? elemStr : elem, elemType));
+                        }
+                    }
                 }
                 return castList;
             }
@@ -180,7 +191,7 @@ class CastEvaluator {
                     Double dv = TypeCoercion.toDouble(val);
                     if (dv.isInfinite() && !(val instanceof Double && ((Double) val).isInfinite())
                             && !(val instanceof Float && ((Float) val).isInfinite())
-                            && !(val instanceof String && (((String) val).trim().equalsIgnoreCase("infinity") || ((String) val).trim().equalsIgnoreCase("-infinity")))) {
+                            && !(val instanceof String && isInfinityLiteral(((String) val).trim()))) {
                         throw new MemgresException("\"" + val + "\" is out of range for type double precision", "22003");
                     }
                     return dv;
@@ -192,6 +203,11 @@ class CastEvaluator {
             case "decimal": {
                 if (val instanceof String && ((String) val).trim().equalsIgnoreCase("NaN")) return Double.NaN;
                 return TypeCoercion.toBigDecimal(val);
+            }
+            case "citext": {
+                // citext preserves original case but compares case-insensitively
+                if (val instanceof CitextValue) return val;
+                return new CitextValue(val.toString());
             }
             case "text":
             case "varchar":
@@ -234,13 +250,31 @@ class CastEvaluator {
                 if (val instanceof java.util.List<?>) {
                     return formatListAsPgArray((java.util.List<?>) val);
                 }
-                // Boolean to text: PG cast returns "true"/"false"
+                // Boolean to text: PG SELECT true::text → "true"
                 if (val instanceof Boolean) {
                     return ((Boolean) val) ? "true" : "false";
                 }
                 if (val instanceof byte[]) {
                     // PG bytea::text uses the bytea_output format (default: hex, "\x..").
                     byte[] b = (byte[]) val;
+                    String byteaOutput = (executor.session != null) ? executor.session.getGucSettings().get("bytea_output") : "hex";
+                    if ("escape".equalsIgnoreCase(byteaOutput)) {
+                        StringBuilder esc = new StringBuilder();
+                        for (byte bb : b) {
+                            int v = bb & 0xFF;
+                            if (v == 0x5C) { // backslash
+                                esc.append("\\\\");
+                            } else if (v >= 32 && v <= 126) {
+                                esc.append((char) v);
+                            } else {
+                                esc.append('\\');
+                                esc.append((char) ('0' + ((v >> 6) & 7)));
+                                esc.append((char) ('0' + ((v >> 3) & 7)));
+                                esc.append((char) ('0' + (v & 7)));
+                            }
+                        }
+                        return esc.toString();
+                    }
                     StringBuilder bhex = new StringBuilder(2 + b.length * 2);
                     bhex.append("\\x");
                     for (byte bb : b) {
@@ -249,6 +283,48 @@ class CastEvaluator {
                         bhex.append(hex);
                     }
                     return bhex.toString();
+                }
+                // LocalDateTime to text: PG uses space separator, not 'T'
+                if (val instanceof java.time.LocalDateTime) {
+                    java.time.LocalDateTime dt = (java.time.LocalDateTime) val;
+                    if (dt.getNano() != 0) {
+                        String s = dt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS"));
+                        return stripTrailingFracZeros(s);
+                    }
+                    return dt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+                }
+                // PG formats float8/float4 without trailing ".0" when the value is integral
+                if (val instanceof Double) {
+                    double d = (Double) val;
+                    if (Double.isNaN(d)) return "NaN";
+                    if (Double.isInfinite(d)) return d > 0 ? "Infinity" : "-Infinity";
+                    if (d == Math.floor(d) && !Double.isInfinite(d) && Math.abs(d) < 1e15) {
+                        return Long.toString((long) d);
+                    }
+                }
+                if (val instanceof Float) {
+                    float f = (Float) val;
+                    if (Float.isNaN(f)) return "NaN";
+                    if (Float.isInfinite(f)) return f > 0 ? "Infinity" : "-Infinity";
+                    if (f == Math.floor(f) && !Float.isInfinite(f) && Math.abs(f) < 1e7) {
+                        return Long.toString((long) f);
+                    }
+                }
+                // LocalDate to text: respect DateStyle GUC
+                if (val instanceof java.time.LocalDate) {
+                    java.time.LocalDate ld = (java.time.LocalDate) val;
+                    String datestyle = (executor.session != null) ? executor.session.getGucSettings().get("datestyle") : "ISO, MDY";
+                    if (datestyle != null && datestyle.toLowerCase().contains("german")) {
+                        return ld.format(java.time.format.DateTimeFormatter.ofPattern("dd.MM.yyyy"));
+                    } else if (datestyle != null && datestyle.toLowerCase().contains("sql")) {
+                        return ld.format(java.time.format.DateTimeFormatter.ofPattern("MM/dd/yyyy"));
+                    }
+                    return ld.toString();
+                }
+                // PgInterval to text: respect IntervalStyle GUC
+                if (val instanceof PgInterval) {
+                    String intervalStyle = (executor.session != null) ? executor.session.getGucSettings().get("intervalstyle") : "postgres";
+                    return ((PgInterval) val).toString(intervalStyle);
                 }
                 return val.toString();
             }
@@ -270,6 +346,19 @@ class CastEvaluator {
             case "timestamp with time zone":
                 return TypeCoercion.toOffsetDateTime(val);
             case "interval":
+            case "interval year to month":
+            case "interval day to second":
+            case "interval year":
+            case "interval month":
+            case "interval day":
+            case "interval hour":
+            case "interval minute":
+            case "interval second":
+            case "interval day to hour":
+            case "interval day to minute":
+            case "interval hour to minute":
+            case "interval hour to second":
+            case "interval minute to second":
                 return TypeCoercion.toInterval(val);
             case "money":
                 return TypeCoercion.toMoney(val);
@@ -286,14 +375,21 @@ class CastEvaluator {
             case "bit varying":
             case "varbit": {
                 String bitStr = val instanceof AstExecutor.PgBitString ? ((AstExecutor.PgBitString) val).bits() : val.toString();
-                // Handle bit(N) by padding or truncating to N bits
+                // Handle bit(N) by padding or raising error on truncation
                 if (lowerSpec.matches("bit\\(\\d+\\)")) {
                     int n = Integer.parseInt(lowerSpec.replaceAll(".*\\((\\d+)\\).*", "$1"));
                     if (bitStr.length() < n) {
                         // Pad with zeros on the right (PG behavior)
                         bitStr = bitStr + Strs.repeat("0", n - bitStr.length());
                     } else if (bitStr.length() > n) {
-                        bitStr = bitStr.substring(0, n);
+                        if (val instanceof AstExecutor.PgBitString) {
+                            // varbit → bit(n): truncate to first n bits (PG behavior)
+                            bitStr = bitStr.substring(0, n);
+                        } else {
+                            // string literal → bit(n): length mismatch is an error
+                            throw new MemgresException("bit string length " + bitStr.length()
+                                    + " does not match type bit(" + n + ")", "22026");
+                        }
                     }
                 }
                 return new AstExecutor.PgBitString(bitStr);
@@ -437,6 +533,9 @@ class CastEvaluator {
                 }
                 return inetStr;
             }
+            case "hstore":
+                if (val instanceof HstoreValue) return val;
+                return HstoreValue.parse(val.toString());
             case "macaddr":
             case "macaddr8":
                 return val.toString();
@@ -819,6 +918,35 @@ class CastEvaluator {
             return table;
         }
         return qualifiedName;
+    }
+
+    /** Check if a trimmed string is an infinity literal accepted by PostgreSQL. */
+    private static boolean isInfinityLiteral(String s) {
+        String lower = s.toLowerCase();
+        return lower.equals("infinity") || lower.equals("-infinity")
+                || lower.equals("+infinity") || lower.equals("inf")
+                || lower.equals("-inf") || lower.equals("+inf");
+    }
+
+    /**
+     * Parse top-level elements from a nested array inner string like "{1,2},{3,4}".
+     * Splits on commas that are at brace depth 0 only.
+     */
+    private static List<String> parseTopLevelArrayElements(String inner) {
+        List<String> result = new ArrayList<>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < inner.length(); i++) {
+            char c = inner.charAt(i);
+            if (c == '{') depth++;
+            else if (c == '}') depth--;
+            else if (c == ',' && depth == 0) {
+                result.add(inner.substring(start, i).trim());
+                start = i + 1;
+            }
+        }
+        result.add(inner.substring(start).trim());
+        return result;
     }
 
     /** Parse array elements from an inner string (between braces), handling quoted strings. */

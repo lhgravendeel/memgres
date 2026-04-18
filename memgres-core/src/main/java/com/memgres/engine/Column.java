@@ -23,6 +23,10 @@ public class Column {
     private final DataType arrayElementType; // For array columns, the element type (e.g., INTEGER for integer[])
     private int tableOid;    // PgWire RowDescription: source table OID (0 if not from a real table)
     private short attNum;    // PgWire RowDescription: column attribute number (0 if not from a real table)
+    private short attStattarget = -1;  // pg_attribute.attstattarget (-1 = use system default)
+    private String attStorageOverride;  // pg_attribute.attstorage override (null = use type default)
+    private String attCompression = "";  // pg_attribute.attcompression (empty = default, "p" = pglz, "l" = lz4)
+    private boolean attHasMissing;       // pg_attribute.atthasmissing (true when added via ALTER TABLE ADD COLUMN with DEFAULT)
 
     public Column(String name, DataType type, boolean nullable, boolean primaryKey, String defaultValue) {
         this(name, type, nullable, primaryKey, defaultValue, null, null, null, null, null, null, null);
@@ -102,4 +106,12 @@ public class Column {
     public void setTableOid(int tableOid) { this.tableOid = tableOid; }
     public short getAttNum() { return attNum; }
     public void setAttNum(short attNum) { this.attNum = attNum; }
+    public short getAttStattarget() { return attStattarget; }
+    public void setAttStattarget(short attStattarget) { this.attStattarget = attStattarget; }
+    public String getAttStorageOverride() { return attStorageOverride; }
+    public void setAttStorageOverride(String attStorageOverride) { this.attStorageOverride = attStorageOverride; }
+    public String getAttCompression() { return attCompression; }
+    public void setAttCompression(String attCompression) { this.attCompression = attCompression; }
+    public boolean isAttHasMissing() { return attHasMissing; }
+    public void setAttHasMissing(boolean attHasMissing) { this.attHasMissing = attHasMissing; }
 }

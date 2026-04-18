@@ -50,6 +50,7 @@ public class GucSettings {
         DEFAULTS.put("effective_cache_size", "4GB");
         DEFAULTS.put("max_connections", "100");
         DEFAULTS.put("max_worker_processes", "8");
+        DEFAULTS.put("max_prepared_transactions", "0");
 
         // Query planning
         DEFAULTS.put("random_page_cost", "4.0");
@@ -63,10 +64,25 @@ public class GucSettings {
         DEFAULTS.put("enable_mergejoin", "on");
         DEFAULTS.put("enable_nestloop", "on");
         DEFAULTS.put("enable_hashagg", "on");
+        DEFAULTS.put("enable_partitionwise_join", "off");
+        DEFAULTS.put("enable_presorted_aggregate", "on");
+        DEFAULTS.put("enable_incremental_sort", "on");
+        DEFAULTS.put("parallel_leader_participation", "on");
+        DEFAULTS.put("min_parallel_table_scan_size", "8MB");
+        DEFAULTS.put("plan_cache_mode", "auto");
+
+        // Statistics / monitoring
+        DEFAULTS.put("compute_query_id", "auto");
+        DEFAULTS.put("track_functions", "none");
+        DEFAULTS.put("track_activity_query_size", "1024");
 
         // Logging
         DEFAULTS.put("log_statement", "none");
         DEFAULTS.put("log_min_duration_statement", "-1");
+        DEFAULTS.put("log_lock_failures", "off");
+
+        // Replication / hot standby
+        DEFAULTS.put("in_hot_standby", "off");
 
         // WAL / Replication (not applicable, but return defaults)
         DEFAULTS.put("wal_level", "replica");
@@ -118,10 +134,23 @@ public class GucSettings {
 
     private final Map<String, String> sessionOverrides = new LinkedHashMap<>();
     private final Map<String, String> transactionOverrides = new LinkedHashMap<>();
+    private final Map<String, String> bootDefaults = new LinkedHashMap<>();
 
     /** Set a session-level parameter. */
     public void set(String name, String value) {
-        sessionOverrides.put(name.toLowerCase(), value);
+        // Normalize boolean-like values to lowercase (PG convention).
+        // The parser uppercases keywords like ON/OFF/TRUE/FALSE/YES/NO,
+        // but JDBC drivers expect lowercase for ParameterStatus messages.
+        String normalized = value;
+        if (normalized != null) {
+            String upper = normalized.trim().toUpperCase();
+            if ("ON".equals(upper) || "OFF".equals(upper)
+                    || "TRUE".equals(upper) || "FALSE".equals(upper)
+                    || "YES".equals(upper) || "NO".equals(upper)) {
+                normalized = normalized.trim().toLowerCase();
+            }
+        }
+        sessionOverrides.put(name.toLowerCase(), normalized);
     }
 
     /** Set a transaction-scoped (LOCAL) parameter that reverts on commit/rollback. */
@@ -144,12 +173,19 @@ public class GucSettings {
         sessionOverrides.clear();
     }
 
-    /** Get a parameter value (transaction override, then session override, then default). */
+    /** Set a boot-time default that overrides the static default (e.g., for session_authorization). */
+    public void setBootDefault(String name, String value) {
+        bootDefaults.put(name.toLowerCase(), value);
+    }
+
+    /** Get a parameter value (transaction override, then session override, then boot default, then static default). */
     public String get(String name) {
         String key = name.toLowerCase();
         String val = transactionOverrides.get(key);
         if (val != null) return val;
         val = sessionOverrides.get(key);
+        if (val != null) return val;
+        val = bootDefaults.get(key);
         if (val != null) return val;
         return DEFAULTS.getOrDefault(key, null);
     }

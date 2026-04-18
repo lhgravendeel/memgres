@@ -79,6 +79,23 @@ public class ExpressionParser {
         return false;
     }
 
+    /** Check if current token is an interval field name (YEAR, MONTH, DAY, HOUR, MINUTE, SECOND). */
+    protected boolean checkIntervalField() {
+        Token t = peek();
+        if (t.type() == TokenType.EOF) return false;
+        String v = t.value().toUpperCase();
+        return (t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER) &&
+                ("YEAR".equals(v) || "MONTH".equals(v) || "DAY".equals(v) ||
+                 "HOUR".equals(v) || "MINUTE".equals(v) || "SECOND".equals(v));
+    }
+
+    /** Check if current token is an identifier with the given value (case-insensitive). */
+    protected boolean checkIdentCI(String val) {
+        Token t = peek();
+        return (t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD) &&
+                t.value().equalsIgnoreCase(val);
+    }
+
     /**
      * Returns true if the current token is a SQL clause keyword (FROM, WHERE, GROUP, ORDER, etc.)
      * that should not be consumed as an identifier in contexts like bare COLLATE.
@@ -219,17 +236,34 @@ public class ExpressionParser {
                 if (matchKeyword("TIME")) sb.append(" TIME");
                 if (matchKeyword("ZONE")) sb.append(" ZONE");
             }
+        } else if (name.equalsIgnoreCase("INTERVAL")) {
+            // Handle INTERVAL qualifiers: INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, etc.
+            // Also INTERVAL YEAR, INTERVAL HOUR, etc. (single field)
+            if (checkIntervalField()) {
+                sb.append(" ").append(advance().value()); // consume field keyword
+                if (checkKeyword("TO") || checkIdentCI("TO")) {
+                    sb.append(" ").append(advance().value()); // consume TO
+                    // Consume the target field keyword
+                    sb.append(" ").append(readIdentifier());
+                }
+            }
         } else if (name.equalsIgnoreCase("BIT") && checkKeyword("VARYING")) {
             sb.append(" ").append(advance().value());
         }
 
         // Handle precision: (N) or (N,M), for types not already handled above
+        // PG allows negative scale in numeric(p,s), e.g. numeric(10,-2) rounds to hundreds
         if (check(TokenType.LEFT_PAREN)) {
             advance();
             sb.append("(");
             sb.append(advance().value()); // first number
             if (match(TokenType.COMMA)) {
                 sb.append(",");
+                // Handle optional minus sign for negative scale
+                if (check(TokenType.MINUS)) {
+                    advance();
+                    sb.append("-");
+                }
                 sb.append(advance().value()); // second number
             }
             expect(TokenType.RIGHT_PAREN);
@@ -257,6 +291,15 @@ public class ExpressionParser {
 
             if (matchKeyword("ASC")) { desc = false; }
             else if (matchKeyword("DESC")) { desc = true; }
+            else if (matchKeyword("USING")) {
+                // ORDER BY col USING <operator>: consume operator token(s)
+                // The operator determines sort direction: < means ASC, > means DESC
+                Token opTok = advance();
+                if (opTok.type() == TokenType.GREATER_THAN) {
+                    desc = true;
+                }
+                // else default ASC for <, and other operators
+            }
 
             if (matchKeyword("NULLS")) {
                 if (matchKeyword("FIRST")) { nullsFirst = true; }
@@ -417,6 +460,10 @@ public class ExpressionParser {
                 else if (matchKeyword("ARRAY")) jt = IsJsonExpr.JsonType.ARRAY;
                 else if (matchKeyword("SCALAR")) jt = IsJsonExpr.JsonType.SCALAR;
                 else if (matchKeyword("VALUE")) jt = IsJsonExpr.JsonType.VALUE;
+                else if (matchKeyword("BOOLEAN")) jt = IsJsonExpr.JsonType.BOOLEAN;
+                else if (matchKeyword("NULL")) jt = IsJsonExpr.JsonType.NULL;
+                else if (checkIdentCI("STRING")) { advance(); jt = IsJsonExpr.JsonType.STRING; }
+                else if (checkIdentCI("NUMBER")) { advance(); jt = IsJsonExpr.JsonType.NUMBER; }
                 boolean uniqueKeys = false;
                 if (matchKeywords("WITH", "UNIQUE")) {
                     expectKeyword("KEYS");
@@ -424,6 +471,19 @@ public class ExpressionParser {
                 }
                 return new IsJsonExpr(left, negated, jt, uniqueKeys);
             }
+            // IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED
+            String normForm = "NFC"; // default
+            if (checkIdentCI("NFC") || checkIdentCI("NFD") || checkIdentCI("NFKC") || checkIdentCI("NFKD")) {
+                normForm = advance().value().toUpperCase();
+            }
+            if (checkIdentCI("NORMALIZED")) {
+                advance(); // consume NORMALIZED
+                // Encode as function call: __is_normalized__(expr, form, negated)
+                return new FunctionCallExpr("__is_normalized__",
+                        java.util.Arrays.asList(left, Literal.ofString(normForm), Literal.ofBoolean(!negated)));
+            }
+            // If we consumed a normForm token but didn't find NORMALIZED, that's an error
+            // but in practice this won't happen with well-formed SQL
         }
 
         // [NOT] IN (...)
@@ -481,16 +541,29 @@ public class ExpressionParser {
         }
         if (matchKeywords("SIMILAR", "TO")) {
             Expression right = parseAddition();
+            if (matchKeyword("ESCAPE")) {
+                String esc = advance().value(); // string literal (may be empty)
+                // Wrap as a function call so the executor can handle ESCAPE for SIMILAR TO
+                Expression result = new FunctionCallExpr("__similar_to_escape__",
+                        java.util.Arrays.asList(left, right, Literal.ofString(esc)), false, false);
+                return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
+            }
             Expression result = new BinaryExpr(left, BinaryExpr.BinOp.SIMILAR_TO, right);
+            return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
+        }
+        // SQL:2008 LIKE_REGEX (equivalent to POSIX ~ operator)
+        if (matchIdentifier("LIKE_REGEX")) {
+            Expression right = parseAddition();
+            Expression result = new BinaryExpr(left, BinaryExpr.BinOp.REGEX_MATCH, right);
             return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
         }
 
         // Comparison operators
         if (match(TokenType.EQUALS)) {
-            // Check for = ANY(...) or = ALL(...)
-            if (checkKeyword("ANY") || checkKeyword("ALL")) {
+            // Check for = ANY/SOME(...) or = ALL(...)
+            if (checkKeyword("ANY") || checkKeyword("SOME") || checkKeyword("ALL")) {
                 boolean isAll = checkKeyword("ALL");
-                advance(); // consume ANY/ALL
+                advance(); // consume ANY/SOME/ALL
                 expect(TokenType.LEFT_PAREN);
                 if (checkKeyword("SELECT") || checkKeyword("WITH") || checkKeyword("VALUES")) {
                     Statement subquery = parseSubqueryWithSetOps();
@@ -551,6 +624,10 @@ public class ExpressionParser {
         if (match(TokenType.GEO_NOT_EXTEND_LEFT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_LEFT, parseAddition());
         if (match(TokenType.GEO_NOT_EXTEND_ABOVE)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_ABOVE, parseAddition());
         if (match(TokenType.GEO_NOT_EXTEND_BELOW)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_BELOW, parseAddition());
+        if (match(TokenType.GEO_INTERSECTS)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_INTERSECTS, parseAddition());
+        if (match(TokenType.GEO_CLOSEST_POINT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_CLOSEST_POINT, parseAddition());
+        if (match(TokenType.GEO_PARALLEL)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_PARALLEL, parseAddition());
+        if (match(TokenType.GEO_PERPENDICULAR)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_PERPENDICULAR, parseAddition());
 
         // Range adjacency operator: -|-
         if (match(TokenType.RANGE_ADJACENT)) return new BinaryExpr(left, BinaryExpr.BinOp.RANGE_ADJACENT, parseAddition());
@@ -575,9 +652,9 @@ public class ExpressionParser {
      * (for subquery comparisons), otherwise parse a regular binary expression.
      */
     private Expression parseComparisonRhs(Expression left, BinaryExpr.BinOp op) {
-        if (checkKeyword("ANY") || checkKeyword("ALL")) {
+        if (checkKeyword("ANY") || checkKeyword("SOME") || checkKeyword("ALL")) {
             boolean isAll = checkKeyword("ALL");
-            advance(); // consume ANY/ALL
+            advance(); // consume ANY/SOME/ALL
             expect(TokenType.LEFT_PAREN);
             if (checkKeyword("SELECT") || checkKeyword("WITH") || checkKeyword("VALUES")) {
                 Statement subquery = parseSubqueryWithSetOps();
@@ -705,6 +782,16 @@ public class ExpressionParser {
         if (check(TokenType.PIPE) && pos + 1 < tokens.size() && tokens.get(pos + 1).type() == TokenType.SLASH) {
             advance(); advance(); // consume | /
             return new UnaryExpr(UnaryExpr.UnaryOp.SQRT, parseUnary());
+        }
+        // ?- (geometric is-horizontal prefix operator)
+        if (match(TokenType.GEO_IS_HORIZONTAL)) {
+            return new UnaryExpr(UnaryExpr.UnaryOp.GEO_IS_HORIZONTAL, parseUnary());
+        }
+        // ?| (geometric is-vertical prefix operator) — shares token with JSONB_EXISTS_ANY
+        if (check(TokenType.JSONB_EXISTS_ANY)) {
+            // In prefix position (no left operand), treat as geometric is-vertical
+            advance();
+            return new UnaryExpr(UnaryExpr.UnaryOp.GEO_IS_VERTICAL, parseUnary());
         }
         // !~ as unary prefix operator (user-defined): !~ expr
         // EXCL_TILDE is normally a binary NOT-regex-match operator, but when used
@@ -859,12 +946,23 @@ public class ExpressionParser {
     }
 
     static void validateCollationStatic(String collation, Token errorToken) {
-        String lower = collation.toLowerCase();
-        String unquoted = lower.replace("\"", "");
-        if (!KNOWN_COLLATIONS.contains(unquoted) && !KNOWN_COLLATIONS.contains(lower)) {
-            throw new ParseException("collation \"" + collation + "\" for encoding \"UTF8\" does not exist",
-                    errorToken, "42704");
+        // Accept all collation names at parse time; unknown collations are validated
+        // at runtime by ExprEvaluator.validateCollationAtRuntime which has access
+        // to user-defined collations from the database catalog.
+        // However, reject OS-level locale collations (e.g., en_US.utf8) that
+        // memgres cannot support, to match PG behavior for CREATE INDEX COLLATE.
+        if (collation == null) return;
+        String lower = collation.toLowerCase().replace("\"", "");
+        if (KNOWN_COLLATIONS.contains(lower)) return;
+        if (lower.startsWith("pg_catalog.")) return;
+        // Locale-like names with dots (en_US.utf8) are OS collations not available in memgres
+        if (lower.contains(".") && !lower.startsWith("c.")) {
+            com.memgres.engine.MemgresException ex = new com.memgres.engine.MemgresException(
+                    "collation \"" + collation + "\" for encoding \"UTF8\" does not exist", "42704");
+            if (errorToken != null && errorToken.position() > 0) ex.setPosition(errorToken.position());
+            throw ex;
         }
+        // Everything else (could be user-defined) is accepted at parse time
     }
 
     protected Expression parsePrimary() {
@@ -1110,9 +1208,13 @@ public class ExpressionParser {
                 case "JSON_OBJECTAGG": return specialFormParser.parseJsonObjectagg();
                 case "NEW":
                 case "OLD": {
-                    // Trigger variable: NEW.column or OLD.column
+                    // Trigger variable: NEW.column or OLD.column or NEW.* / OLD.*
                     String prefix = advance().value().toLowerCase();
                     if (match(TokenType.DOT)) {
+                        if (check(TokenType.STAR)) {
+                            advance();
+                            return new WildcardExpr(prefix);
+                        }
                         String col = readIdentifier();
                         return new ColumnRef(null, prefix, col);
                     }
@@ -1221,9 +1323,12 @@ public class ExpressionParser {
             if (t.type() == TokenType.ERROR && "!".equals(t.value())) {
                 throw new ParseException("syntax error at or near \"!\"", t);
             }
-            // !! is the removed factorial operator; report as undefined operator (42883)
+            // !! is the tsquery NOT prefix operator
             if (t.type() == TokenType.ERROR && "!!".equals(t.value())) {
-                throw new ParseException("operator does not exist: !!", t, "42883");
+                advance(); // consume the !! token
+                // Parse the operand expression following !!
+                Expression operand = parseUnary();
+                return new FunctionCallExpr("__tsquery_not__", java.util.Collections.singletonList(operand));
             }
             // For TS_MATCH (@@) followed by another operator char (e.g. @@@), report the combined operator
             if (t.type() == TokenType.TS_MATCH && pos + 1 < tokens.size()) {
@@ -1248,6 +1353,7 @@ public class ExpressionParser {
 
         boolean isStar = false;
         boolean distinct = false;
+        boolean ignoreNulls = false;
         List<Expression> args;
 
         // COUNT(*) special case
@@ -1270,6 +1376,35 @@ public class ExpressionParser {
                 innerOrderBy = parseOrderByClause();
             }
             expect(TokenType.RIGHT_PAREN);
+        }
+
+        // Check for IGNORE NULLS / RESPECT NULLS modifier (window functions)
+        // Syntax: func(args) IGNORE NULLS OVER (...) or func(args) RESPECT NULLS OVER (...)
+        // IGNORE and RESPECT are non-reserved words (identifiers), NULLS is a keyword.
+        if (checkIdentifier("IGNORE") || checkIdentifier("RESPECT")) {
+            int saved = pos;
+            boolean isIgnore = matchIdentifier("IGNORE");
+            if (!isIgnore) matchIdentifier("RESPECT");
+            if (matchKeyword("NULLS")) {
+                ignoreNulls = isIgnore;
+            } else {
+                // Not followed by NULLS — restore position
+                pos = saved;
+            }
+        }
+
+        // Check for FROM LAST / FROM FIRST modifier (nth_value)
+        boolean fromLast = false;
+        if (checkKeyword("FROM")) {
+            int saved = pos;
+            advance();
+            if (matchKeyword("LAST")) {
+                fromLast = true;
+            } else if (matchKeyword("FIRST")) {
+                fromLast = false;
+            } else {
+                pos = saved;
+            }
         }
 
         // Check for FILTER (WHERE ...) clause on aggregates
@@ -1296,7 +1431,7 @@ public class ExpressionParser {
 
         // Check for OVER clause: window function
         if (checkKeyword("OVER")) {
-            return specialFormParser.parseWindowFunction(name, args, distinct, isStar);
+            return specialFormParser.parseWindowFunction(name, args, distinct, isStar, ignoreNulls, fromLast, filter);
         }
 
         if (innerOrderBy != null || filter != null) {

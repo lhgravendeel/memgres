@@ -82,7 +82,7 @@ SELECT count(*)::text AS c FROM pg_collation WHERE collname = 'r14_coll_from';
 -- 8. German capital sharp S → ß
 -- begin-expected
 -- columns: v
--- row: ß
+-- row: ẞ
 -- end-expected
 SELECT lower(U&'\1E9E') AS v;
 

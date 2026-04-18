@@ -87,9 +87,16 @@ class DmlExecutor {
         // Collect WITH CHECK OPTION constraints from views we're inserting through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         Table table = executor.resolveTable(schemaName, stmt.table());
+        // Check table-level locks (blocks if ACCESS EXCLUSIVE held by another session)
+        executor.database.checkTableLockForDml(schemaName + "." + stmt.table(), executor.session);
 
-        // Check for INSTEAD rules
+        // Check for INSTEAD / ALSO rules
         String ruleVal = executor.database.getRule(stmt.table(), "INSERT");
+        // Check for DO ALSO rule - will be applied after normal insert
+        String alsoRuleSql = null;
+        if (ruleVal != null && ruleVal.startsWith("ALSO:")) {
+            alsoRuleSql = ruleVal.substring("ALSO:".length());
+        }
         if ("INSTEAD_NOTHING".equals(ruleVal)) {
             return QueryResult.command(QueryResult.Type.INSERT, 0);
         }
@@ -260,6 +267,8 @@ class DmlExecutor {
                 Column col = table.getColumns().get(i);
                 if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
                     row[i] = table.nextSerial();
+                } else if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
+                    row[i] = resolveIdentityNextVal(table, col);
                 } else if (col.getDefaultValue() != null) {
                     Object defVal = executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr());
                     row[i] = TypeCoercion.coerceForStorage(defVal, col);
@@ -362,6 +371,20 @@ class DmlExecutor {
                         continue;
                     } else if (stmt.onConflict().doUpdate() != null) {
                         // DO UPDATE: update the conflicting row
+                        // First evaluate the DO UPDATE WHERE clause if present
+                        if (stmt.onConflict().doUpdateWhereClause() != null) {
+                            Object[] evalConflictForWhere = hasVirtualColumns(table) ? computeVirtualColumns(table, conflictRow) : conflictRow;
+                            RowContext whereCtx = new RowContext(table, null, evalConflictForWhere);
+                            Object whereResult = conflictHelper.evalExprWithExcluded(stmt.onConflict().doUpdateWhereClause(), whereCtx, table, row);
+                            if (!(whereResult instanceof Boolean && ((Boolean) whereResult))) {
+                                // WHERE clause evaluated to false/null: skip the update, keep existing row
+                                if (stmt.returning() != null && !stmt.returning().isEmpty()) {
+                                    returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), conflictRow, conflictRow, conflictRow));
+                                }
+                                inserted++;
+                                continue;
+                            }
+                        }
                         Object[] oldRow = Arrays.copyOf(conflictRow, conflictRow.length);
                         Object[] newRow = Arrays.copyOf(conflictRow, conflictRow.length);
                         try {
@@ -445,6 +468,9 @@ class DmlExecutor {
             targetTable.getWriteLock().lock();
             try {
                 executor.constraintValidator.validateConstraints(table, row, null);
+                if (targetTable != table) {
+                    executor.constraintValidator.validateConstraints(targetTable, row, null);
+                }
                 targetTable.insertRow(row);
             } finally {
                 targetTable.getWriteLock().unlock();
@@ -465,6 +491,27 @@ class DmlExecutor {
 
         // Fire statement-level AFTER triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, table, insertedRows, null);
+
+        // Execute DO ALSO rule if present
+        if (alsoRuleSql != null && stmt.values() != null) {
+            for (List<Expression> valueRow : stmt.values()) {
+                String sql = alsoRuleSql;
+                List<String> colNames = stmt.columns();
+                if (colNames == null) {
+                    colNames = new ArrayList<>();
+                    for (Column c : table.getColumns()) colNames.add(c.getName());
+                }
+                for (int ci = 0; ci < Math.min(colNames.size(), valueRow.size()); ci++) {
+                    Object val = executor.evalExpr(valueRow.get(ci), null);
+                    String colName = colNames.get(ci);
+                    String replacement = val == null ? "NULL"
+                            : val instanceof Number ? val.toString()
+                            : "'" + val.toString().replace("'", "''") + "'";
+                    sql = sql.replaceAll("(?i)NEW\\s*\\.\\s*" + colName, replacement);
+                }
+                executor.execute(sql, Cols.listOf());
+            }
+        }
 
         // Track DML statistics
         if (inserted > 0) table.incrementTupInserted(inserted);
@@ -588,6 +635,10 @@ class DmlExecutor {
 
         // If inline data is present (non-wire COPY FROM), handle it directly
         if (stmt.inlineData() != null) {
+            Expression inlineWhereExpr = null;
+            if (stmt.whereClause() != null && !stmt.whereClause().isEmpty()) {
+                inlineWhereExpr = com.memgres.engine.parser.Parser.parseExpression(stmt.whereClause());
+            }
             int inserted = 0;
             for (List<String> dataRow : stmt.inlineData()) {
                 Object[] row = new Object[table.getColumns().size()];
@@ -599,6 +650,13 @@ class DmlExecutor {
                         row[colIndices.get(i)] = null;
                     } else {
                         row[colIndices.get(i)] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIndices.get(i)));
+                    }
+                }
+                // Apply WHERE clause filtering (COPY FROM ... WHERE)
+                if (inlineWhereExpr != null) {
+                    RowContext ctx = new RowContext(table, null, row);
+                    if (!executor.isTruthy(executor.evalExpr(inlineWhereExpr, ctx))) {
+                        continue; // Row does not match WHERE clause; skip it
                     }
                 }
                 // Validate + insert atomically under write lock (same as regular INSERT)
@@ -659,6 +717,8 @@ class DmlExecutor {
 
         // FORCE_NOT_NULL: for specified columns, convert null to empty string
         List<String> forceNotNull = stmt.forceNotNull();
+        // FORCE_NULL: for specified columns, convert empty string to null
+        List<String> forceNull = stmt.forceNull();
 
         for (int i = 0; i < values.size() && i < colIndices.size(); i++) {
             String val = values.get(i);
@@ -679,6 +739,14 @@ class DmlExecutor {
                 }
             }
 
+            // FORCE_NULL: if this column is in the list and value is empty string, convert to null
+            if (val != null && val.isEmpty() && forceNull != null) {
+                String colName = col.getName();
+                if (forceNull.contains("*") || forceNull.stream().anyMatch(c -> c.equalsIgnoreCase(colName))) {
+                    val = null;
+                }
+            }
+
             if (val == null) {
                 row[colIdx] = null;
             } else {
@@ -688,6 +756,15 @@ class DmlExecutor {
 
         // Compute generated columns
         computeGeneratedColumns(table, row);
+
+        // Apply WHERE clause filtering (COPY FROM ... WHERE)
+        if (stmt.whereClause() != null && !stmt.whereClause().isEmpty()) {
+            Expression whereExpr = com.memgres.engine.parser.Parser.parseExpression(stmt.whereClause());
+            RowContext ctx = new RowContext(table, null, row);
+            if (!executor.isTruthy(executor.evalExpr(whereExpr, ctx))) {
+                return null; // Row does not match WHERE clause; skip it
+            }
+        }
 
         // Fire BEFORE INSERT triggers
         List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.table());
@@ -721,11 +798,25 @@ class DmlExecutor {
             Column col = table.getColumns().get(i);
             if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
                 row[i] = table.nextSerial();
+            } else if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
+                row[i] = resolveIdentityNextVal(table, col);
             } else if (col.getDefaultValue() != null) {
                 Object defVal = executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr());
                 row[i] = TypeCoercion.coerceForStorage(defVal, col);
             }
         }
+    }
+
+    private Object resolveIdentityNextVal(Table table, Column col) {
+        String def = col.getDefaultValue();
+        if (def != null && def.contains(":seq:")) {
+            String seqName = def.substring(def.indexOf(":seq:") + 5);
+            Sequence seq = executor.database.getSequence(seqName);
+            if (seq != null) {
+                return seq.nextVal();
+            }
+        }
+        return table.nextSerial();
     }
 
     List<Integer> resolveColumnIndices(CopyStmt stmt, Table table) {
@@ -880,7 +971,10 @@ class DmlExecutor {
         // Simple UPDATE (no FROM clause)
         String updateAlias = stmt.alias();
         boolean updateHasVirtual = hasVirtualColumns(table);
-        if (stmt.where() != null) {
+        if (stmt.where() instanceof com.memgres.engine.parser.ast.CurrentOfExpr) {
+            com.memgres.engine.parser.ast.CurrentOfExpr cof = (com.memgres.engine.parser.ast.CurrentOfExpr) stmt.where();
+            rows = filterByCurrentOf(cof, table, rows);
+        } else if (stmt.where() != null) {
             rows = rows.stream()
                     .filter(row -> {
                         Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
@@ -916,8 +1010,35 @@ class DmlExecutor {
             // Record undo before applying the update
             recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
 
-            table.updateRowInPlace(row, oldRow, newRow);
-            recordRowUpdateMeta(stmt.schema(), table, row);
+            // Check if partition key changed and row needs to move between partitions
+            if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
+                Table newTarget = partitionHelper.routeToPartition(table, newRow);
+                // Find which partition currently owns this row
+                Table currentPartition = null;
+                List<Table> allParts = new ArrayList<>();
+                DmlPartitionHelper.collectAllPartitionTables(table, allParts);
+                for (Table pt : allParts) {
+                    if (pt.getRows().contains(row)) {
+                        currentPartition = pt;
+                        break;
+                    }
+                }
+                if (currentPartition != null && currentPartition != newTarget) {
+                    // Move row: delete from old partition, insert into new
+                    currentPartition.deleteRow(row);
+                    Object[] movedRow = Arrays.copyOf(newRow, newRow.length);
+                    newTarget.insertRow(movedRow);
+                } else if (currentPartition != null) {
+                    currentPartition.updateRowInPlace(row, oldRow, newRow);
+                    recordRowUpdateMeta(stmt.schema(), table, row);
+                } else {
+                    table.updateRowInPlace(row, oldRow, newRow);
+                    recordRowUpdateMeta(stmt.schema(), table, row);
+                }
+            } else {
+                table.updateRowInPlace(row, oldRow, newRow);
+                recordRowUpdateMeta(stmt.schema(), table, row);
+            }
 
             // Handle FK ON UPDATE cascades
             executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
@@ -977,6 +1098,26 @@ class DmlExecutor {
                 continue;
             }
             Object val = executor.evalExpr(set.value(), ctx);
+            // Validate array element type for subscript assignments (e.g. vals[1] = 'not_an_int')
+            // The parser transforms array subscript SET into jsonb_set calls. For non-JSONB array
+            // columns (INT[], TEXT[], etc.), validate that the assigned value matches the element type.
+            if (set.value() instanceof FunctionCallExpr
+                    && "jsonb_set".equals(((FunctionCallExpr) set.value()).name())
+                    && genCol.getType() == DataType.INT4_ARRAY) {
+                // Extract the new element value from the jsonb_set call's 3rd arg (to_jsonb(val))
+                FunctionCallExpr jsonbSetCall = (FunctionCallExpr) set.value();
+                if (jsonbSetCall.args().size() >= 3) {
+                    Expression innerValExpr = jsonbSetCall.args().get(2);
+                    Object innerVal = executor.evalExpr(innerValExpr, ctx);
+                    if (innerVal instanceof String) {
+                        String sv = innerVal.toString().replace("\"", "").trim();
+                        try { Long.parseLong(sv); } catch (NumberFormatException e) {
+                            throw new MemgresException(
+                                    "invalid input syntax for type integer: \"" + sv + "\"", "22P02");
+                        }
+                    }
+                }
+            }
             // Handle composite field update: SET col.field = value
             if (set.subField() != null) {
                 String compositeTypeName = genCol.getCompositeTypeName();
@@ -1169,6 +1310,10 @@ class DmlExecutor {
                     }
                 }
             }
+        } else if (stmt.where() instanceof com.memgres.engine.parser.ast.CurrentOfExpr) {
+            com.memgres.engine.parser.ast.CurrentOfExpr cof = (com.memgres.engine.parser.ast.CurrentOfExpr) stmt.where();
+            List<Object[]> matched = filterByCurrentOf(cof, table, allRows);
+            toDelete.addAll(matched);
         } else {
             for (Object[] row : allRows) {
                 Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
@@ -1640,6 +1785,46 @@ class DmlExecutor {
             throw e; // Propagate errors like division by zero
         } catch (Exception e) { /* ignore non-Memgres exceptions */ }
         return null;
+    }
+
+    // ---- Helper: WHERE CURRENT OF ----
+
+    /**
+     * Filter table rows to the single row positioned by the named cursor.
+     * Matches by comparing column values from the cursor's current row against the table row values.
+     */
+    private List<Object[]> filterByCurrentOf(com.memgres.engine.parser.ast.CurrentOfExpr cof,
+                                              Table table, List<Object[]> candidateRows) {
+        Session.CursorState cursor = executor.session.getCursor(cof.cursorName());
+        if (cursor == null) throw new MemgresException("cursor \"" + cof.cursorName() + "\" does not exist", "34000");
+        int pos = cursor.getPosition();
+        if (pos < 0 || pos >= cursor.getRowCount()) return new ArrayList<>();
+        Object[] cursorRow = cursor.getRow(pos);
+        // Map cursor columns to table column indices
+        List<Column> cursorCols = cursor.getColumns();
+        int[] tableColIdx = new int[cursorCols.size()];
+        for (int i = 0; i < cursorCols.size(); i++) {
+            tableColIdx[i] = table.getColumnIndex(cursorCols.get(i).getName());
+        }
+        // Find the table row matching all cursor column values
+        List<Object[]> result = new ArrayList<>();
+        for (Object[] row : candidateRows) {
+            boolean match = true;
+            for (int i = 0; i < cursorCols.size(); i++) {
+                if (tableColIdx[i] < 0) continue; // cursor column not in table (e.g., computed)
+                Object tableVal = row[tableColIdx[i]];
+                Object cursorVal = cursorRow[i];
+                if (!java.util.Objects.equals(tableVal, cursorVal)) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                result.add(row);
+                break; // Only one row should match
+            }
+        }
+        return result;
     }
 
     // ---- Helper: compute virtual generated columns on read ----

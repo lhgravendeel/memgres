@@ -40,13 +40,15 @@ class SelectExecutor {
             "regr_slope", "regr_intercept", "regr_r2",
             "regr_count", "regr_avgx", "regr_avgy", "regr_sxx", "regr_syy", "regr_sxy",
             "json_arrayagg", "json_objectagg",
-            "range_agg", "range_intersect_agg"
+            "range_agg", "range_intersect_agg",
+            "any_value"
     );
 
     static final Set<String> SRF_FUNCTION_NAMES = Cols.setOf("generate_series", "unnest", "regexp_matches",
             "json_array_elements", "jsonb_array_elements", "json_object_keys", "jsonb_object_keys",
             "json_array_elements_text", "jsonb_array_elements_text", "generate_subscripts",
-            "jsonb_path_query", "aclexplode", "string_to_table", "regexp_split_to_table");
+            "jsonb_path_query", "jsonb_path_query_tz", "aclexplode", "string_to_table", "regexp_split_to_table",
+            "pg_listening_channels", "pg_snapshot_xip", "txid_snapshot_xip");
     private static final Set<String> SRF_FUNCTIONS = SRF_FUNCTION_NAMES;
 
     SelectExecutor(AstExecutor executor) {
@@ -131,7 +133,13 @@ class SelectExecutor {
                             throw new MemgresException("column reference \"" + cr.column() + "\" is ambiguous", "42702");
                         }
                         if (matchCount == 0) {
-                            throw new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
+                            MemgresException colEx = new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
+                            // Try to generate a hint by finding the closest matching column
+                            for (RowContext.TableBinding b : baseBindings) {
+                                String hint = RowContext.suggestClosestColumn(cr.column(), b.table());
+                                if (hint != null) { colEx.setHint(hint); break; }
+                            }
+                            throw colEx;
                         }
                     } else {
                         boolean tableFound = false;
@@ -145,7 +153,12 @@ class SelectExecutor {
                             throw new MemgresException("missing FROM-clause entry for table \"" + cr.table() + "\"", "42P01");
                         }
                         if (!colFound) {
-                            throw new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
+                            MemgresException colEx = new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
+                            for (RowContext.TableBinding b : baseBindings) {
+                                String hint = RowContext.suggestClosestColumn(cr.column(), b.table());
+                                if (hint != null) { colEx.setHint(hint); break; }
+                            }
+                            throw colEx;
                         }
                     }
                 }
@@ -202,6 +215,16 @@ class SelectExecutor {
             contexts = contexts.stream()
                     .filter(ctx -> executor.isTruthy(executor.evalExpr(stmt.where(), ctx)))
                     .collect(Collectors.toList());
+            // Track index scan: if WHERE clause is on a table that has indexes, count it
+            if (!baseBindings.isEmpty()) {
+                for (RowContext.TableBinding binding : baseBindings) {
+                    Table srcTable = binding.sourceTable != null ? binding.sourceTable : binding.table;
+                    if (srcTable != null && !srcTable.getIndexes().isEmpty()) {
+                        srcTable.incrementIdxScanCount();
+                        break;
+                    }
+                }
+            }
         }
 
         // Check if this query uses aggregation
@@ -211,6 +234,11 @@ class SelectExecutor {
                 (stmt.having() != null && containsAggregate(stmt.having()));
 
         if (hasGroupBy || hasGroupingSets || hasAggregates) {
+            // Validate: DISTINCT ON with GROUP BY and aggregates is rejected (PG compatibility)
+            if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty() && hasGroupBy && hasAggregates) {
+                throw new MemgresException(
+                        "SELECT DISTINCT ON is not allowed with GROUP BY and aggregate functions", "42803");
+            }
             // Validate: non-aggregate columns must be in GROUP BY
             if (!hasGroupBy && !hasGroupingSets && hasAggregates) {
                 for (SelectStmt.SelectTarget target : stmt.targets()) {

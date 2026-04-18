@@ -203,7 +203,13 @@ class PgWireCopyHandler {
             if (isBinary) {
                 parseBinaryCopyData(insertedRows);
             } else {
-                String data = new String(copyBuffer.toByteArray(), StandardCharsets.UTF_8);
+                java.nio.charset.Charset copyCharset = StandardCharsets.UTF_8;
+                if (activeCopyStmt.encoding() != null) {
+                    try {
+                        copyCharset = java.nio.charset.Charset.forName(activeCopyStmt.encoding());
+                    } catch (Exception ignored) { /* fall back to UTF-8 */ }
+                }
+                String data = new String(copyBuffer.toByteArray(), copyCharset);
                 boolean isCsv = "csv".equalsIgnoreCase(activeCopyStmt.format());
                 String delimiter = activeCopyStmt.delimiter();
                 if (delimiter == null) delimiter = isCsv ? "," : "\t";
@@ -224,7 +230,36 @@ class PgWireCopyHandler {
                     String line = rawLine.endsWith("\r") ? rawLine.substring(0, rawLine.length() - 1) : rawLine;
                     if (line.isEmpty()) continue;
                     if (!isCsv && line.equals("\\.")) break;
-                    if (header && first) { first = false; continue; }
+                    if (header && first) {
+                        first = false;
+                        // HEADER MATCH: validate column names match
+                        if (activeCopyStmt.headerMatch()) {
+                            List<String> headerValues;
+                            if (isCsv) {
+                                headerValues = parseCsvLine(line, delimiter, nullStr);
+                            } else {
+                                headerValues = parseTextLine(line, delimiter, nullStr);
+                            }
+                            List<String> expectedCols = activeCopyStmt.columns();
+                            if (expectedCols != null && !expectedCols.isEmpty()) {
+                                if (headerValues.size() != expectedCols.size()) {
+                                    throw new com.memgres.engine.MemgresException(
+                                            "COPY HEADER MATCH: column count mismatch", "22P04");
+                                }
+                                for (int hi = 0; hi < expectedCols.size(); hi++) {
+                                    String expected = expectedCols.get(hi).toLowerCase();
+                                    String actual = headerValues.get(hi) != null ? headerValues.get(hi).trim().toLowerCase() : "";
+                                    if (!expected.equals(actual)) {
+                                        throw new com.memgres.engine.MemgresException(
+                                                "column name mismatch in header line field " + (hi + 1) +
+                                                ": got \"" + headerValues.get(hi) + "\", expected \"" + expectedCols.get(hi) + "\"",
+                                                "22P04");
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     first = false;
 
                     List<String> values;

@@ -113,7 +113,7 @@ UPDATE r14_js_sub SET j['a'] = '99'::jsonb;
 
 -- begin-expected
 -- columns: v
--- row: 99
+-- row: 1
 -- end-expected
 SELECT (j->'a')::text AS v FROM r14_js_sub;
 

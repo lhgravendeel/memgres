@@ -65,7 +65,19 @@ class ExprEvaluator {
             }
             return null;
         }
-        if (expr instanceof WildcardExpr) return null;
+        if (expr instanceof WildcardExpr) {
+            WildcardExpr wc = (WildcardExpr) expr;
+            if (wc.table() != null && ctx != null) {
+                RowContext.TableBinding b = ctx.getBinding(wc.table());
+                if (b != null) {
+                    // Return the full row as a List so IS DISTINCT FROM can compare row tuples
+                    java.util.List<Object> rowList = new java.util.ArrayList<>(b.row().length);
+                    for (Object v : b.row()) rowList.add(v);
+                    return rowList;
+                }
+            }
+            return null;
+        }
         if (expr instanceof SubqueryExpr) return evalSubquery(((SubqueryExpr) expr), ctx);
         if (expr instanceof ExistsExpr) return evalExists(((ExistsExpr) expr), ctx);
         if (expr instanceof AnyAllExpr) return evalAnyAll(((AnyAllExpr) expr), ctx);
@@ -232,7 +244,11 @@ class ExprEvaluator {
             return null;
         }
         if (expr instanceof ArraySliceExpr) return executor.arrayOperationHandler.evalArraySlice(((ArraySliceExpr) expr), ctx);
-        if (expr instanceof CollateExpr) return evalExpr(((CollateExpr) expr).expr(), ctx);
+        if (expr instanceof CollateExpr) {
+            CollateExpr ce = (CollateExpr) expr;
+            validateCollationAtRuntime(ce.collation());
+            return evalExpr(ce.expr(), ctx);
+        }
         if (expr instanceof CompositeStarExpr) return evalExpr(((CompositeStarExpr) expr).expr(), ctx); // expansion handled by SelectExecutor
         if (expr instanceof QualifiedOperatorExpr) return evalQualifiedOperator(((QualifiedOperatorExpr) expr), ctx);
         if (expr instanceof CustomOperatorExpr) return evalCustomOperator(((CustomOperatorExpr) expr), ctx);
@@ -376,11 +392,13 @@ class ExprEvaluator {
             // Unqualified column reference; check current context first
             Object result = null;
             boolean foundInCurrent = false;
+            String savedHint = null; // preserve hint from RowContext for rethrow
             try {
                 result = ctx.resolveColumn(null, ref.column());
                 foundInCurrent = true;
             } catch (MemgresException e) {
                 if (!"42703".equals(e.getSqlState())) throw e;
+                if (e.getHint() != null) savedHint = e.getHint();
                 // column not in current context, will try outer contexts / special columns below
             }
             if (foundInCurrent) {
@@ -442,7 +460,9 @@ class ExprEvaluator {
                     // not in this outer context either, continue
                 }
             }
-            throw new MemgresException("column \"" + ref.column() + "\" does not exist", "42703");
+            MemgresException colEx = new MemgresException("column \"" + ref.column() + "\" does not exist", "42703");
+            if (savedHint != null) colEx.setHint(savedHint);
+            throw colEx;
         } else {
             // Schema-qualified reference (schema.table.column); CTEs are not schema-qualified,
             // so a schema prefix means we're looking for a real table, not a CTE binding.
@@ -851,6 +871,22 @@ class ExprEvaluator {
                 double r = Math.cbrt(toDouble(val));
                 return r == Math.floor(r) && !Double.isInfinite(r) ? (long) r : r;
             }
+            case GEO_IS_HORIZONTAL: {
+                if (val == null) return null;
+                Object geom = GeometricOperations.autoDetectPublic(val.toString());
+                if (geom instanceof GeometricOperations.PgLseg) {
+                    return GeometricOperations.isHorizontal((GeometricOperations.PgLseg) geom);
+                }
+                throw new MemgresException("operator ?- not supported for type " + val.getClass().getSimpleName(), "42883");
+            }
+            case GEO_IS_VERTICAL: {
+                if (val == null) return null;
+                Object geom = GeometricOperations.autoDetectPublic(val.toString());
+                if (geom instanceof GeometricOperations.PgLseg) {
+                    return GeometricOperations.isVertical((GeometricOperations.PgLseg) geom);
+                }
+                throw new MemgresException("operator ?| not supported for type " + val.getClass().getSimpleName(), "42883");
+            }
             default:
                 throw new IllegalStateException("Unknown unary op: " + op);
         }
@@ -883,6 +919,12 @@ class ExprEvaluator {
                 case ARRAY: valid = s.startsWith("["); break;
                 case SCALAR: valid = !s.startsWith("{") && !s.startsWith("["); break;
                 case VALUE: break; // any JSON
+                case BOOLEAN: valid = s.equals("true") || s.equals("false"); break;
+                case NULL: valid = s.equals("null"); break;
+                case STRING: valid = s.startsWith("\"") && s.endsWith("\""); break;
+                case NUMBER: valid = !s.startsWith("{") && !s.startsWith("[")
+                        && !s.startsWith("\"") && !s.equals("true") && !s.equals("false")
+                        && !s.equals("null"); break;
             }
         }
         if (valid && ij.uniqueKeys()) {
@@ -1292,6 +1334,31 @@ class ExprEvaluator {
     }
 
     /** PG validates CASE branch type compatibility at plan time. Reject obvious mismatches. */
+    /** Validate a collation name at runtime, raising 42704 if unknown. */
+    private void validateCollationAtRuntime(String collation) {
+        if (collation == null) return;
+        String lower = collation.toLowerCase().replace("\"", "");
+        // Built-in collations that are always available
+        if (lower.equals("c") || lower.equals("posix") || lower.equals("default")
+                || lower.equals("ucs_basic") || lower.equals("unicode") || lower.equals("icu_root")
+                || lower.equals("c.utf-8") || lower.equals("c.utf8")) {
+            return;
+        }
+        // Schema-qualified built-in collations
+        if (lower.startsWith("pg_catalog.")) {
+            String unqualified = lower.substring("pg_catalog.".length());
+            if (unqualified.equals("c") || unqualified.equals("posix") || unqualified.equals("default")
+                    || unqualified.equals("ucs_basic") || unqualified.equals("unicode") || unqualified.equals("icu_root")) {
+                return;
+            }
+        }
+        // User-defined collations in the database
+        if (executor.database.getCollation(lower) != null) {
+            return;
+        }
+        throw new MemgresException("collation \"" + collation + "\" for encoding \"UTF8\" does not exist", "42704");
+    }
+
     private void validateCaseBranchTypes(CaseExpr c) {
         // PG rejects CASE expressions where all branches return composite (user-defined) types
         if (!c.whenClauses().isEmpty()) {
@@ -1589,6 +1656,14 @@ class ExprEvaluator {
                 }
             }
         }
+        // PgMoney arithmetic: unwrap to BigDecimal and re-wrap result as PgMoney
+        boolean isMoney = left instanceof PgMoney || right instanceof PgMoney;
+        if (isMoney) {
+            java.math.BigDecimal l = TypeCoercion.toBigDecimal(left);
+            java.math.BigDecimal r = TypeCoercion.toBigDecimal(right);
+            java.math.BigDecimal result = bdOp != null ? bdOp.apply(l, r) : java.math.BigDecimal.valueOf(doubleOp.apply(l.doubleValue(), r.doubleValue()));
+            return new PgMoney(result);
+        }
         // BigDecimal arithmetic, preserve precision
         if (left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) {
             java.math.BigDecimal l = TypeCoercion.toBigDecimal(left);
@@ -1601,22 +1676,30 @@ class ExprEvaluator {
             try {
                 long result = longOp.apply((long)(short)(Short)left, (long)(short)(Short)right);
                 if (result >= Short.MIN_VALUE && result <= Short.MAX_VALUE) return (short) result;
-                throw new MemgresException("smallint out of range", "22003");
+                MemgresException sme = new MemgresException("smallint out of range", "22003");
+                sme.setDatatype("smallint");
+                throw sme;
             } catch (ArithmeticException e) {
                 if (e.getMessage() != null && e.getMessage().contains("/ by zero"))
                     throw new MemgresException("division by zero", "22012");
-                throw new MemgresException("smallint out of range", "22003");
+                MemgresException sme = new MemgresException("smallint out of range", "22003");
+                sme.setDatatype("smallint");
+                throw sme;
             }
         }
         if (left instanceof Integer && right instanceof Integer) {
             try {
                 long result = longOp.apply((long)(int)left, (long)(int)right);
                 if (result >= Integer.MIN_VALUE && result <= Integer.MAX_VALUE) return (int) result;
-                throw new MemgresException("integer out of range", "22003");
+                MemgresException ime = new MemgresException("integer out of range", "22003");
+                ime.setDatatype("integer");
+                throw ime;
             } catch (ArithmeticException e) {
                 if (e.getMessage() != null && e.getMessage().contains("/ by zero"))
                     throw new MemgresException("division by zero", "22012");
-                throw new MemgresException("integer out of range", "22003");
+                MemgresException ime = new MemgresException("integer out of range", "22003");
+                ime.setDatatype("integer");
+                throw ime;
             }
         }
         if ((left instanceof Integer || left instanceof Long) && (right instanceof Integer || right instanceof Long)) {
@@ -1625,7 +1708,9 @@ class ExprEvaluator {
             } catch (ArithmeticException e) {
                 if (e.getMessage() != null && e.getMessage().contains("/ by zero"))
                     throw new MemgresException("division by zero", "22012");
-                throw new MemgresException("bigint out of range", "22003");
+                MemgresException bme = new MemgresException("bigint out of range", "22003");
+                bme.setDatatype("bigint");
+                throw bme;
             }
         }
         double result = doubleOp.apply(toDouble(left), toDouble(right));
@@ -1637,6 +1722,7 @@ class ExprEvaluator {
     }
 
     double toDouble(Object val) {
+        if (val instanceof PgMoney) return ((PgMoney) val).getValue().doubleValue();
         if (val instanceof Number) return ((Number) val).doubleValue();
         if (val instanceof String) {
             String s = (String) val;
@@ -1647,6 +1733,7 @@ class ExprEvaluator {
     }
 
     int toInt(Object val) {
+        if (val instanceof PgMoney) return ((PgMoney) val).getValue().intValue();
         if (val instanceof Number) return ((Number) val).intValue();
         if (val instanceof String) {
             String s = (String) val;
@@ -1658,6 +1745,7 @@ class ExprEvaluator {
 
     long toLong(Object val) {
         if (val == null) return 0;
+        if (val instanceof PgMoney) return ((PgMoney) val).getValue().longValue();
         if (val instanceof Number) return ((Number) val).longValue();
         return Long.parseLong(val.toString());
     }
@@ -1850,7 +1938,10 @@ class ExprEvaluator {
             if (bin.op() == BinaryExpr.BinOp.AND || bin.op() == BinaryExpr.BinOp.OR
                     || bin.op() == BinaryExpr.BinOp.EQUAL || bin.op() == BinaryExpr.BinOp.NOT_EQUAL
                     || bin.op() == BinaryExpr.BinOp.LESS_THAN || bin.op() == BinaryExpr.BinOp.GREATER_THAN
-                    || bin.op() == BinaryExpr.BinOp.LESS_EQUAL || bin.op() == BinaryExpr.BinOp.GREATER_EQUAL) {
+                    || bin.op() == BinaryExpr.BinOp.LESS_EQUAL || bin.op() == BinaryExpr.BinOp.GREATER_EQUAL
+                    || bin.op() == BinaryExpr.BinOp.IS_DISTINCT_FROM || bin.op() == BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM
+                    || bin.op() == BinaryExpr.BinOp.SIMILAR_TO
+                    || bin.op() == BinaryExpr.BinOp.LIKE || bin.op() == BinaryExpr.BinOp.ILIKE) {
                 return DataType.BOOLEAN;
             }
             // Concatenation: bytea || bytea returns bytea, otherwise text
@@ -1870,6 +1961,7 @@ class ExprEvaluator {
                     || name.equals("position") || name.equals("strpos")
                     || name.equals("array_length") || name.equals("cardinality")
                     || name.equals("array_position")) return DataType.INTEGER;
+            if (name.equals("array_positions")) return DataType.INT4_ARRAY;
             if (name.equals("sum") || name.equals("avg")) return DataType.NUMERIC;
             if (name.equals("max") || name.equals("min")) {
                 if (!fn.args().isEmpty()) return inferTypeFromContext(fn.args().get(0), bindings);
@@ -1903,9 +1995,11 @@ class ExprEvaluator {
                     || name.equals("has_function_privilege") || name.equals("has_type_privilege")
                     || name.equals("has_sequence_privilege") || name.equals("has_any_column_privilege")
                     || name.equals("has_foreign_data_wrapper_privilege") || name.equals("has_server_privilege")
-                    || name.equals("has_tablespace_privilege")
+                    || name.equals("has_tablespace_privilege") || name.equals("has_parameter_privilege")
+                    || name.equals("has_language_privilege")
                     || name.equals("pg_is_in_recovery") || name.equals("pg_is_wal_replay_paused")
-                    || name.equals("pg_has_role")) return DataType.BOOLEAN;
+                    || name.equals("pg_has_role")
+                    || name.equals("overlaps")) return DataType.BOOLEAN;
             if (name.equals("abs") || name.equals("ceil") || name.equals("floor")
                     || name.equals("round") || name.equals("trunc") || name.equals("sign")
                     || name.equals("mod") || name.equals("power") || name.equals("sqrt")
@@ -1932,16 +2026,20 @@ class ExprEvaluator {
                 }
                 return DataType.TEXT;
             }
-            if (name.equals("array_agg")) return DataType.TEXT; // array type, but TEXT as fallback
+            if (name.equals("array_agg")) return DataType.INT4_ARRAY; // array type; INT4_ARRAY lets JDBC decode arrays
             if (name.equals("row_number") || name.equals("rank") || name.equals("dense_rank")
                     || name.equals("ntile") || name.equals("txid_current")
-                    || name.equals("pg_current_xact_id")) return DataType.BIGINT;
+                    || name.equals("pg_current_xact_id")
+                    || name.equals("pg_current_xact_id_if_assigned")
+                    || name.equals("txid_current_if_assigned")
+                    || name.equals("pg_size_bytes")
+                    || name.equals("pg_tablespace_size")) return DataType.BIGINT;
             if (name.equals("lag") || name.equals("lead") || name.equals("first_value")
                     || name.equals("last_value") || name.equals("nth_value")) {
                 if (!fn.args().isEmpty()) return inferTypeFromContext(fn.args().get(0), bindings);
                 return DataType.TEXT;
             }
-            if (name.equals("uuid_generate_v4") || name.equals("gen_random_uuid")) return DataType.UUID;
+            if (name.equals("uuid_generate_v4") || name.equals("gen_random_uuid") || name.equals("uuidv4")) return DataType.UUID;
             if (name.equals("json_serialize")) return DataType.TEXT;
             // Check user-defined functions and aggregates for return type
             if (executor != null && executor.database != null) {

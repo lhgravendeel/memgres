@@ -133,8 +133,19 @@ class FromJoinExecutor {
                 if (!matched && isLeft) {
                     String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
                     List<Column> cols;
+                    // For XMLTABLE, extract column definitions from encoded args
+                    if (funcFrom.functionName().equals("__xmltable__")) {
+                        cols = new ArrayList<>();
+                        for (int i = 2; i < funcFrom.args().size(); i++) {
+                            Expression arg = funcFrom.args().get(i);
+                            String def = arg instanceof Literal ? ((Literal) arg).value() : arg.toString();
+                            String[] parts = def.split(":", 3);
+                            DataType dt = parts.length > 1 ? DataType.fromPgName(parts[1]) : null;
+                            cols.add(new Column(parts[0], dt != null ? dt : DataType.TEXT, true, false, null));
+                        }
+                    }
                     // For JSON_TABLE, extract column definitions from the JsonTableExpr
-                    if (funcFrom.functionName().equals("__json_table__") && !funcFrom.args().isEmpty()
+                    else if (funcFrom.functionName().equals("__json_table__") && !funcFrom.args().isEmpty()
                             && funcFrom.args().get(0) instanceof JsonTableExpr) {
                         JsonTableExpr jt = (JsonTableExpr) funcFrom.args().get(0);
                         cols = new ArrayList<>();

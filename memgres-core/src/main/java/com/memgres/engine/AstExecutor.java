@@ -25,6 +25,7 @@ public class AstExecutor {
     final Database database;
     final Session session; // null when no session
     final SystemCatalog systemCatalog;
+    public SystemCatalog getSystemCatalog() { return systemCatalog; }
     final ArrayOperationHandler arrayOperationHandler = new ArrayOperationHandler(this);
     final BinaryOpEvaluator binaryOpEvaluator = new BinaryOpEvaluator(this);
     final CompositeTypeHandler compositeTypeHandler = new CompositeTypeHandler(this);
@@ -109,7 +110,13 @@ public class AstExecutor {
         if (stmt instanceof InsertStmt) return dmlExecutor.executeInsert(((InsertStmt) stmt));
         if (stmt instanceof UpdateStmt) return dmlExecutor.executeUpdate(((UpdateStmt) stmt));
         if (stmt instanceof DeleteStmt) return dmlExecutor.executeDelete(((DeleteStmt) stmt));
-        if (stmt instanceof CreateTableStmt) return ddlExecutor.executeCreateTable(((CreateTableStmt) stmt));
+        if (stmt instanceof CreateTableStmt) {
+            String tag = getDdlTag(stmt);
+            fireEventTriggers("ddl_command_start", tag);
+            QueryResult result = ddlExecutor.executeCreateTable(((CreateTableStmt) stmt));
+            fireEventTriggers("ddl_command_end", tag);
+            return result;
+        }
         if (stmt instanceof DropTableStmt) return ddlExecutor.executeDropTable(((DropTableStmt) stmt));
         if (stmt instanceof CreateTypeStmt) return ddlExecutor.executeCreateType(((CreateTypeStmt) stmt));
         if (stmt instanceof CreateFunctionStmt) return ddlExecutor.executeCreateFunction(((CreateFunctionStmt) stmt));
@@ -119,7 +126,20 @@ public class AstExecutor {
         if (stmt instanceof CreateOperatorClassStmt) return ddlExecutor.executeCreateOperatorClass(((CreateOperatorClassStmt) stmt));
         if (stmt instanceof AlterOperatorStmt) return ddlExecutor.executeAlterOperator(((AlterOperatorStmt) stmt));
         if (stmt instanceof CreateTriggerStmt) return ddlExecutor.executeCreateTrigger(((CreateTriggerStmt) stmt));
-        if (stmt instanceof CreateExtensionStmt) return QueryResult.message(QueryResult.Type.SET, "CREATE EXTENSION");
+        if (stmt instanceof CreateEventTriggerStmt) return ddlExecutor.executeCreateEventTrigger(((CreateEventTriggerStmt) stmt));
+        if (stmt instanceof AlterEventTriggerStmt) return ddlExecutor.executeAlterEventTrigger(((AlterEventTriggerStmt) stmt));
+        if (stmt instanceof DropEventTriggerStmt) return ddlExecutor.executeDropEventTrigger(((DropEventTriggerStmt) stmt));
+        if (stmt instanceof CreateExtensionStmt) {
+            CreateExtensionStmt extStmt = (CreateExtensionStmt) stmt;
+            if (!extStmt.ifNotExists() || !database.hasExtension(extStmt.name())) {
+                String version = extStmt.version() != null ? extStmt.version() : "1.0";
+                database.addExtension(extStmt.name(), version, extStmt.schema());
+                registerExtensionObjects(extStmt.name());
+            }
+            return QueryResult.message(QueryResult.Type.SET, "CREATE EXTENSION");
+        }
+        if (stmt instanceof CreateCollationStmt) return ddlExecutor.executeCreateCollation(((CreateCollationStmt) stmt));
+        if (stmt instanceof CreateCastStmt) return ddlExecutor.executeCreateCast(((CreateCastStmt) stmt));
         if (stmt instanceof CreateRuleStmt) return ddlExecutor.executeCreateRule(((CreateRuleStmt) stmt));
         if (stmt instanceof DropStmt) return ddlExecutor.executeDropStmt(((DropStmt) stmt));
         if (stmt instanceof AlterTableStmt) return ddlExecutor.executeAlterTable(((AlterTableStmt) stmt));
@@ -160,8 +180,9 @@ public class AstExecutor {
         if (stmt instanceof AlterDefaultPrivilegesStmt) {
             AlterDefaultPrivilegesStmt s = (AlterDefaultPrivilegesStmt) stmt;
             if (s.isGrant()) {
+                String grantor = s.forRole() != null ? s.forRole() : sessionUser();
                 database.addDefaultAcl(new Database.DefaultAclEntry(
-                        null, s.inSchema(), s.objectType(),
+                        grantor, s.inSchema(), s.objectType(),
                         s.privileges(), s.grantees(), true));
             } else {
                 database.removeDefaultAcl(s.inSchema(), s.objectType(), s.grantees());
@@ -341,7 +362,15 @@ public class AstExecutor {
 
         @Override
         public String toString() {
-            return "PgRow[values=" + values + "]";
+            // PG-compatible format: (val1,val2,...) where NULL is empty
+            StringBuilder sb = new StringBuilder("(");
+            for (int i = 0; i < values.size(); i++) {
+                if (i > 0) sb.append(",");
+                Object v = values.get(i);
+                if (v != null) sb.append(v);
+            }
+            sb.append(")");
+            return sb.toString();
         }
     }
 
@@ -435,6 +464,20 @@ public class AstExecutor {
             return session.getConnectingUser();
         }
         return "memgres";
+    }
+
+    /** Returns the current effective role (respects SET ROLE), falling back to session user. */
+    String currentRole() {
+        if (session != null) {
+            GucSettings guc = session.getGucSettings();
+            if (guc.hasSessionOverride("role")) {
+                String role = guc.get("role");
+                if (role != null && !role.equalsIgnoreCase("NONE") && !role.equalsIgnoreCase("DEFAULT")) {
+                    return role;
+                }
+            }
+        }
+        return sessionUser();
     }
 
     Table resolveTable(String schemaName, String tableName) {
@@ -533,6 +576,9 @@ public class AstExecutor {
     }
 
     Object evaluateDefault(String defaultExpr, DataType type, Expression parsedExpr) {
+        if (defaultExpr != null && defaultExpr.startsWith("__identity__")) {
+            return null; // identity columns handled by nextSerial() in DmlExecutor
+        }
         if (defaultExpr != null) {
             String lower = defaultExpr.toLowerCase().trim();
             if (lower.equals("uuid_generate_v4()") || lower.equals("gen_random_uuid()")) {
@@ -891,13 +937,127 @@ public class AstExecutor {
                 }
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
             }
+            case ATTACH_PARTITION: {
+                // Record child→parent index inheritance for pg_inherits
+                if (stmt.targetValue() != null) {
+                    database.setIndexParent(stmt.targetValue(), stmt.name());
+                }
+                return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+            }
             default:
-                // All other actions (SET TABLESPACE, ATTACH PARTITION, etc.) are accepted no-ops
+                // All other actions (SET TABLESPACE, etc.) are accepted no-ops
                 if (stmt.action() != AlterIndexStmt.Action.NO_OP
                         && !database.hasIndex(stmt.name()) && !stmt.ifExists()) {
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
+        }
+    }
+
+    // ---- Event Trigger Support ----
+
+    /**
+     * Determine the DDL command tag for a statement (e.g. "CREATE TABLE", "ALTER TABLE").
+     */
+    private String getDdlTag(Statement stmt) {
+        if (stmt instanceof CreateTableStmt) return "CREATE TABLE";
+        if (stmt instanceof DropTableStmt) return "DROP TABLE";
+        if (stmt instanceof AlterTableStmt) return "ALTER TABLE";
+        if (stmt instanceof CreateIndexStmt) return "CREATE INDEX";
+        if (stmt instanceof CreateViewStmt) return "CREATE VIEW";
+        if (stmt instanceof CreateFunctionStmt) return "CREATE FUNCTION";
+        if (stmt instanceof CreateTypeStmt) return "CREATE TYPE";
+        if (stmt instanceof CreateSequenceStmt) return "CREATE SEQUENCE";
+        if (stmt instanceof CreateTriggerStmt) return "CREATE TRIGGER";
+        if (stmt instanceof DropStmt) return "DROP";
+        return "DDL";
+    }
+
+    /**
+     * Fire all enabled event triggers that match the given event and optional tag.
+     */
+    void fireEventTriggers(String event, String tag) {
+        for (PgEventTrigger et : database.getAllEventTriggers().values()) {
+            if (et.getEnabled() == 'D') continue; // disabled
+            if (!et.getEvent().equals(event)) continue;
+            // Check tag filter
+            if (et.getTags() != null && !et.getTags().isEmpty()) {
+                boolean matchesTag = false;
+                for (String t : et.getTags()) {
+                    if (t.equalsIgnoreCase(tag)) { matchesTag = true; break; }
+                }
+                if (!matchesTag) continue;
+            }
+            // Find and execute the function
+            PgFunction func = database.getFunction(et.getFunctionName());
+            if (func != null && func.getBody() != null) {
+                try {
+                    PlpgsqlExecutor plpgsql = new PlpgsqlExecutor(this, database);
+                    plpgsql.executeEventTriggerFunction(func, tag, event);
+                } catch (Exception e) {
+                    LOG.debug("Event trigger {} function execution error: {}", et.getName(), e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * Register extension-specific objects (opfamilies, functions) when an extension is created.
+     */
+    private void registerExtensionObjects(String extName) {
+        switch (extName.toLowerCase()) {
+            case "btree_gin": {
+                // Register gin opfamilies for scalar types
+                for (String typeName : new String[]{"integer_ops", "text_ops", "bool_ops", "float_ops",
+                        "numeric_ops", "datetime_ops", "uuid_ops"}) {
+                    String key = typeName + ":gin";
+                    if (!database.hasOperatorFamily(key)) {
+                        PgOperatorFamily fam = new PgOperatorFamily(typeName, "gin");
+                        fam.setSchemaName("pg_catalog");
+                        database.addOperatorFamily(fam);
+                    }
+                }
+                break;
+            }
+            case "btree_gist": {
+                // Register gist opfamilies for scalar types
+                for (String typeName : new String[]{"integer_ops", "text_ops", "bool_ops", "float_ops",
+                        "numeric_ops", "datetime_ops", "uuid_ops"}) {
+                    String key = typeName + ":gist";
+                    if (!database.hasOperatorFamily(key)) {
+                        PgOperatorFamily fam = new PgOperatorFamily(typeName, "gist");
+                        fam.setSchemaName("pg_catalog");
+                        database.addOperatorFamily(fam);
+                    }
+                }
+                break;
+            }
+            case "tablefunc": {
+                // Register crosstab function
+                if (database.getFunction("crosstab") == null) {
+                    PgFunction fn = new PgFunction("crosstab", "record", "SELECT NULL", "sql");
+                    fn.setSchemaName("pg_catalog");
+                    database.addFunction(fn);
+                }
+                break;
+            }
+            case "pgrowlocks": {
+                // Register pgrowlocks function
+                if (database.getFunction("pgrowlocks") == null) {
+                    PgFunction fn = new PgFunction("pgrowlocks", "record", "", "c");
+                    fn.setSchemaName("pg_catalog");
+                    database.addFunction(fn);
+                }
+                break;
+            }
+            case "citext": {
+                // citext is a case-insensitive text type; casting is handled in CastEvaluator
+                // and equality comparison works through CitextValue.equals()
+                break;
+            }
+            default:
+                // no special registrations needed
+                break;
         }
     }
 }

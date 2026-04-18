@@ -55,7 +55,7 @@ class Round14RegexAdvancedTest {
     @Test
     void regex_extended_flag_x() throws SQLException {
         // (?x) allows whitespace / comments in pattern
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT ('hello' ~ '(?x) h e l l o ')::text"));
     }
 
@@ -63,20 +63,20 @@ class Round14RegexAdvancedTest {
     void regex_newline_sensitive_flag_n() throws SQLException {
         // (?n): . does NOT match newline; ^$ match line boundaries
         // Input 'foo\nbar' — pattern '.' in non-(?n) mode only matches first line
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT ('line1\nline2' ~ '(?n)^line2$')::text"));
     }
 
     @Test
     void regex_case_insensitive_flag_i() throws SQLException {
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT ('HELLO' ~ '(?i)hello')::text"));
     }
 
     @Test
     void regex_single_line_flag_s() throws SQLException {
         // (?s): . matches newline
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT ('a\nb' ~ '(?s)a.b')::text"));
     }
 
@@ -182,13 +182,13 @@ class Round14RegexAdvancedTest {
 
     @Test
     void regexp_like_basic() throws SQLException {
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT regexp_like('abc', 'b')::text"));
     }
 
     @Test
     void regexp_like_with_flags() throws SQLException {
-        assertEquals("t", scalarString(
+        assertEquals("true", scalarString(
                 "SELECT regexp_like('ABC', 'abc', 'i')::text"));
     }
 
@@ -199,7 +199,7 @@ class Round14RegexAdvancedTest {
     @Test
     void like_regex_predicate() throws SQLException {
         try {
-            assertEquals("t", scalarString(
+            assertEquals("true", scalarString(
                     "SELECT ('abc' LIKE_REGEX 'b.*')::text"));
         } catch (SQLException e) {
             // LIKE_REGEX is in SQL:2008 but Memgres may not parse — explicit fail.

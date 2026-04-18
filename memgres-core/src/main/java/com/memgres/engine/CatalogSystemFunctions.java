@@ -42,9 +42,16 @@ class CatalogSystemFunctions {
             case "pg_typeof": {
                 Expression rawExpr = fn.args().get(0);
 
-                // Check if this is a column reference and use declared column type metadata
+                // Check if this is a system column reference (ctid, xmin, xmax, cmin, cmax, tableoid)
                 if (rawExpr instanceof ColumnRef && ctx != null) {
                     ColumnRef colRef = (ColumnRef) rawExpr;
+                    String colName = colRef.column().toLowerCase();
+                    switch (colName) {
+                        case "ctid": return "tid";
+                        case "xmin": case "xmax": return "xid";
+                        case "cmin": case "cmax": return "cid";
+                        case "tableoid": return "oid";
+                    }
                     Column colDef = ctx.resolveColumnDef(colRef.table(), colRef.column());
                     if (colDef != null) {
                         if (colDef.getEnumTypeName() != null) return colDef.getEnumTypeName();
@@ -229,13 +236,20 @@ class CatalogSystemFunctions {
             case "pg_postmaster_start_time":
                 return OffsetDateTime.now();
             case "pg_is_in_recovery":
-                return false;
+                return false;  // Return Java boolean so CASE WHEN evaluates correctly
             case "pg_is_wal_replay_paused":
                 return false;
             case "pg_cancel_backend":
             case "pg_terminate_backend": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
                 return false;
+            }
+            case "pg_drop_replication_slot": {
+                if (!fn.args().isEmpty()) {
+                    String slotName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                    executor.database.removeReplicationSlot(slotName);
+                }
+                return null;  // void function
             }
             case "pg_reload_conf":
                 return true;
@@ -272,7 +286,7 @@ class CatalogSystemFunctions {
                 return Cols.listOf();
             }
             case "pg_export_snapshot":
-                return "00000001-00000001-1";
+                return executor.database.exportSnapshot();
             case "pg_stat_clear_snapshot": {
                 return null; 
             }
@@ -280,7 +294,16 @@ class CatalogSystemFunctions {
                 return null; 
             }
             case "pg_stat_reset_shared": {
-                return null; 
+                if (!fn.args().isEmpty()) {
+                    Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                    String target = arg != null ? arg.toString().toLowerCase() : "";
+                    java.util.Set<String> validTargets = new java.util.HashSet<>(java.util.Arrays.asList(
+                            "bgwriter", "archiver", "wal", "io", "recovery_prefetch"));
+                    if (!validTargets.contains(target)) {
+                        throw new MemgresException("unrecognized reset target: \"" + target + "\"", "22023");
+                    }
+                }
+                return null;
             }
             case "pg_stat_reset_single_table_counters":
             case "pg_stat_reset_single_function_counters": {
@@ -288,7 +311,7 @@ class CatalogSystemFunctions {
                 return null;
             }
             case "txid_current":
-                return (long) (System.nanoTime() / 1000);
+                return executor.session != null ? executor.session.getTransactionId() : (long) (System.nanoTime() / 1000);
             case "pg_indexam_has_property": {
                 Object amOid = fn.args().size() > 0 ? executor.evalExpr(fn.args().get(0), ctx) : 0;
                 Object propArg = fn.args().size() > 1 ? executor.evalExpr(fn.args().get(1), ctx) : "";
@@ -396,8 +419,21 @@ class CatalogSystemFunctions {
             case "has_type_privilege":
             case "has_foreign_data_wrapper_privilege":
             case "has_language_privilege":
-            case "has_parameter_privilege":
-                return true;
+            case "has_parameter_privilege": {
+                // has_parameter_privilege(role, param_name, privilege) -> boolean
+                // Returns PG boolean value (rendered as "t"/"f" by wire protocol)
+                String hppUser, hppParam, hppPriv;
+                if (fn.args().size() >= 3) {
+                    hppUser = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
+                    hppParam = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toLowerCase();
+                    hppPriv = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toUpperCase().trim();
+                } else {
+                    hppUser = currentUserName();
+                    hppParam = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
+                    hppPriv = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toUpperCase().trim();
+                }
+                return checkPrivilege(hppUser, hppPriv, "PARAMETER", hppParam);
+            }
             case "pg_has_role": {
                 String pgHasRoleUser;
                 String pgHasRoleRole;
@@ -452,7 +488,26 @@ class CatalogSystemFunctions {
                 if (!fn.args().isEmpty()) {
                     Object val = executor.evalExpr(fn.args().get(0), ctx);
                     if (val == null) return 0;
-                    return val.toString().length() + 4;
+                    // Compute payload size in bytes + varlena header (4 bytes)
+                    int payloadBytes;
+                    if (val instanceof byte[]) {
+                        payloadBytes = ((byte[]) val).length;
+                    } else if (val instanceof String) {
+                        try {
+                            payloadBytes = ((String) val).getBytes("UTF-8").length;
+                        } catch (java.io.UnsupportedEncodingException e) {
+                            payloadBytes = ((String) val).length();
+                        }
+                    } else if (val instanceof Number) {
+                        if (val instanceof Integer || val instanceof Short) payloadBytes = 4;
+                        else if (val instanceof Long) payloadBytes = 8;
+                        else if (val instanceof Float) payloadBytes = 4;
+                        else if (val instanceof Double) payloadBytes = 8;
+                        else payloadBytes = val.toString().length();
+                    } else {
+                        payloadBytes = val.toString().length();
+                    }
+                    return payloadBytes + 4;
                 }
                 return 0;
             }
@@ -615,8 +670,160 @@ class CatalogSystemFunctions {
                 return 0L;
             case "pg_event_trigger_table_rewrite_reason":
                 return 0;
+            case "pg_client_encoding":
+                return "UTF8";
+            case "pg_current_xact_id": {
+                // Returns a bigint transaction ID; stable within a transaction
+                return executor.session != null ? executor.session.getTransactionId() : (long) (System.nanoTime() / 1000);
+            }
+            case "pg_current_xact_id_if_assigned":
+            case "txid_current_if_assigned": {
+                // Returns null if no transaction is currently active
+                if (executor.session != null && executor.session.isInTransaction()) {
+                    return executor.session.getTransactionId();
+                }
+                return null;
+            }
+            case "pg_current_snapshot": {
+                // Returns a text snapshot string like '100:100:'
+                long xid = System.nanoTime() / 1000;
+                return xid + ":" + xid + ":";
+            }
+            case "txid_status":
+            case "pg_xact_status": {
+                // txid_status(bigint) / pg_xact_status(text) → returns 'committed' for known xids
+                requireArgs(fn, 1);
+                Object xidArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (xidArg == null) return null;
+                // In memgres, all completed transactions are considered committed
+                return "committed";
+            }
+            case "pg_visible_in_snapshot": {
+                // pg_visible_in_snapshot(xid, snapshot) → returns boolean
+                requireArgs(fn, 2);
+                Object xidArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object snapArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (xidArg == null || snapArg == null) return null;
+                // Parse snapshot string 'xmin:xmax:xip_list'
+                String snap = snapArg.toString();
+                String[] parts = snap.split(":");
+                long xid = ((Number) TypeCoercion.toLong(xidArg)).longValue();
+                long xmin = Long.parseLong(parts[0].trim());
+                long xmax = parts.length > 1 ? Long.parseLong(parts[1].trim()) : xmin;
+                // xid is visible if it is < xmin (committed before snapshot)
+                if (xid < xmin) return true;
+                // xid is not visible if >= xmax (started after snapshot)
+                if (xid >= xmax) return false;
+                // Check if xid is in the in-progress list
+                if (parts.length > 2 && !parts[2].isEmpty()) {
+                    for (String xipStr : parts[2].split(",")) {
+                        if (!xipStr.trim().isEmpty() && Long.parseLong(xipStr.trim()) == xid) {
+                            return false; // in-progress, not visible
+                        }
+                    }
+                }
+                return true;
+            }
+            case "pg_snapshot_xmin": {
+                // pg_snapshot_xmin(snapshot) → returns xmin from snapshot string
+                requireArgs(fn, 1);
+                Object snapArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (snapArg == null) return null;
+                String[] parts = snapArg.toString().split(":");
+                return Long.parseLong(parts[0].trim());
+            }
+            case "pg_snapshot_xmax": {
+                // pg_snapshot_xmax(snapshot) → returns xmax from snapshot string
+                requireArgs(fn, 1);
+                Object snapArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (snapArg == null) return null;
+                String[] parts = snapArg.toString().split(":");
+                return parts.length > 1 ? Long.parseLong(parts[1].trim()) : Long.parseLong(parts[0].trim());
+            }
+            case "pg_snapshot_xip": {
+                // pg_snapshot_xip(snapshot) → returns set of xids in progress
+                requireArgs(fn, 1);
+                Object snapArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (snapArg == null) return Cols.listOf();
+                String snap = snapArg.toString();
+                String[] parts = snap.split(":");
+                List<Long> xips = new ArrayList<>();
+                if (parts.length > 2 && !parts[2].isEmpty()) {
+                    for (String xipStr : parts[2].split(",")) {
+                        if (!xipStr.trim().isEmpty()) {
+                            xips.add(Long.parseLong(xipStr.trim()));
+                        }
+                    }
+                }
+                return xips;
+            }
+            case "pg_size_bytes": {
+                // pg_size_bytes(text) → parses size strings like '8 kB' to bytes
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String sizeStr = arg.toString().trim();
+                return parseSizeBytes(sizeStr);
+            }
+            case "pg_tablespace_size": {
+                // pg_tablespace_size(text|oid) → returns 0 (stub)
+                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                return 0L;
+            }
+            case "current_query": {
+                // current_query() → returns the text of the currently executing query
+                if (executor.session != null) {
+                    String q = executor.session.getCurrentQuery();
+                    if (q != null) return q;
+                }
+                return "";
+            }
+            case "pg_listening_channels": {
+                // pg_listening_channels() → returns set of channels this session is listening on
+                if (executor.session != null) {
+                    return executor.database.getNotificationManager()
+                            .getListeningChannels(executor.session);
+                }
+                return Cols.listOf();
+            }
+            case "pg_notification_queue_usage": {
+                // pg_notification_queue_usage() → returns 0.0 (stub)
+                return 0.0;
+            }
             default:
                 return NOT_HANDLED;
+        }
+    }
+
+    // ---- pg_size_bytes parser ----
+
+    private static long parseSizeBytes(String sizeStr) {
+        // Try plain numeric first
+        try {
+            return Long.parseLong(sizeStr);
+        } catch (NumberFormatException ignored) {}
+
+        String s = sizeStr.trim();
+        // Match number (possibly decimal) followed by optional unit
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "^([\\d.]+)\\s*(bytes?|kB|MB|GB|TB|PB)?$", java.util.regex.Pattern.CASE_INSENSITIVE
+        ).matcher(s);
+        if (!m.matches()) {
+            throw new MemgresException("invalid size: \"" + sizeStr + "\"", "22023");
+        }
+        double num = Double.parseDouble(m.group(1));
+        String unit = m.group(2);
+        if (unit == null || unit.isEmpty() || unit.equalsIgnoreCase("bytes") || unit.equalsIgnoreCase("byte")) {
+            return (long) num;
+        }
+        switch (unit.toLowerCase()) {
+            case "kb": return (long) (num * 1024);
+            case "mb": return (long) (num * 1024 * 1024);
+            case "gb": return (long) (num * 1024 * 1024 * 1024);
+            case "tb": return (long) (num * 1024L * 1024 * 1024 * 1024);
+            case "pb": return (long) (num * 1024L * 1024 * 1024 * 1024 * 1024);
+            default:
+                throw new MemgresException("invalid size: \"" + sizeStr + "\"", "22023");
         }
     }
 
