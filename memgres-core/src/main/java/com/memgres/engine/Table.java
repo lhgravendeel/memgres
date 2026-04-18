@@ -57,6 +57,10 @@ public class Table {
     // Unlogged table
     private boolean unlogged;
 
+    // Replica identity for logical replication (DEFAULT, FULL, NOTHING, or index name)
+    // 'd' = DEFAULT (PK), 'f' = FULL, 'n' = NOTHING, 'i' = USING INDEX
+    private volatile char replicaIdentity = 'd';
+
     // Row-level security
     private boolean rlsEnabled;
     private boolean rlsForced;
@@ -636,6 +640,31 @@ public class Table {
     public void setRlsForced(boolean forced) { this.rlsForced = forced; }
     public List<RlsPolicy> getRlsPolicies() { return rlsPolicies; }
     public void addRlsPolicy(RlsPolicy policy) { rlsPolicies.add(policy); }
+
+    // Replica identity
+    public char getReplicaIdentity() { return replicaIdentity; }
+    public void setReplicaIdentity(char identity) { this.replicaIdentity = identity; }
+
+    /**
+     * Whether this table has a usable replica identity for UPDATE/DELETE in
+     * logical replication.  PG considers DEFAULT ('d') usable only when the
+     * table actually has a primary key; FULL ('f') is always usable; NOTHING
+     * ('n') is never usable; INDEX ('i') is usable.
+     */
+    public boolean hasUsableReplicaIdentity() {
+        switch (replicaIdentity) {
+            case 'f': // FULL — always usable
+            case 'i': // USING INDEX — usable
+                return true;
+            case 'd': // DEFAULT — usable only if PK exists
+                for (StoredConstraint c : constraints) {
+                    if (c.getType() == StoredConstraint.Type.PRIMARY_KEY) return true;
+                }
+                return false;
+            default:  // 'n' (NOTHING) or unknown
+                return false;
+        }
+    }
 
     // DML statistics
     public long getTupInserted() { return tupInserted.get(); }

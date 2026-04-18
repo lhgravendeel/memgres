@@ -545,6 +545,12 @@ class PgDumpFromMemgresTest {
                 errors.forEach(e -> System.out.println("  " + e));
             }
 
+            // pg_dump preamble clears search_path via set_config; restore it so
+            // unqualified table names resolve to public schema.
+            try (Statement s = c2.createStatement()) {
+                s.execute("SET search_path TO public, pg_catalog");
+            }
+
             // Verify tables exist and have data
             try (Statement s = c2.createStatement()) {
                 try (ResultSet rs = s.executeQuery("SELECT count(*) FROM customers")) {
@@ -584,6 +590,11 @@ class PgDumpFromMemgresTest {
              Connection c2 = DriverManager.getConnection(m2.getJdbcUrl(), m2.getUser(), m2.getPassword())) {
             c2.setAutoCommit(true);
             restoreDump(c2, fullDump);
+
+            // pg_dump preamble clears search_path; restore it for unqualified queries
+            try (Statement s = c2.createStatement()) {
+                s.execute("SET search_path TO public, pg_catalog");
+            }
 
             try (Statement s = c2.createStatement()) {
                 // Verify specific data values

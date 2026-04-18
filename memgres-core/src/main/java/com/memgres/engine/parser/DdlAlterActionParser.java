@@ -206,19 +206,27 @@ class DdlAlterActionParser {
             String constraintName = parser.readIdentifier();
             return new AlterTableStmt.ValidateConstraint(constraintName);
         }
-        // REPLICA IDENTITY { DEFAULT | USING INDEX indexname | FULL | NOTHING }, no-op for in-memory db
+        // REPLICA IDENTITY { DEFAULT | USING INDEX indexname | FULL | NOTHING }
         if (parser.peek().value().equalsIgnoreCase("REPLICA")
                 && parser.pos + 1 < parser.tokens.size()
                 && parser.tokens.get(parser.pos + 1).value().equalsIgnoreCase("IDENTITY")) {
             parser.advance(); // consume REPLICA
             parser.advance(); // consume IDENTITY
+            char identity;
             if (parser.matchKeyword("USING")) {
                 parser.expectKeyword("INDEX");
                 parser.readIdentifier(); // index name
-            } else if (parser.matchKeyword("FULL") || parser.matchKeyword("NOTHING") || parser.matchKeyword("DEFAULT")) {
-                // consumed
+                identity = 'i';
+            } else if (parser.matchKeyword("FULL")) {
+                identity = 'f';
+            } else if (parser.matchKeyword("NOTHING")) {
+                identity = 'n';
+            } else if (parser.matchKeyword("DEFAULT")) {
+                identity = 'd';
+            } else {
+                identity = 'd';
             }
-            return new AlterTableStmt.RenameTable(null); // no-op
+            return new AlterTableStmt.SetReplicaIdentity(identity);
         }
         if (parser.matchKeywords("CLUSTER", "ON")) {
             parser.readIdentifier(); // index name, no-op for in-memory db

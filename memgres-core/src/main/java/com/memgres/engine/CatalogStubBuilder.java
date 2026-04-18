@@ -1745,28 +1745,44 @@ class CatalogStubBuilder {
     }
 
     Table buildPgSubscription() {
+        // PG18 pg_subscription: 18 columns (see system_views.sql GRANT on pg_subscription)
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.INTEGER),
                 col("subdbid", DataType.INTEGER),
+                col("subskiplsn", DataType.TEXT),
                 col("subname", DataType.TEXT),
                 col("subowner", DataType.INTEGER),
                 col("subenabled", DataType.BOOLEAN),
-                col("subconninfo", DataType.TEXT),
-                col("subslotname", DataType.TEXT),
-                col("subsynccommit", DataType.TEXT),
-                col("subpublications", DataType.TEXT),
+                col("subbinary", DataType.BOOLEAN),
+                col("substream", DataType.CHAR),
                 col("subtwophasestate", DataType.CHAR),
                 col("subdisableonerr", DataType.BOOLEAN),
                 col("subpasswordrequired", DataType.BOOLEAN),
                 col("subrunasowner", DataType.BOOLEAN),
-                col("subfailover", DataType.BOOLEAN)
+                col("subfailover", DataType.BOOLEAN),
+                col("subconninfo", DataType.TEXT),
+                col("subslotname", DataType.TEXT),
+                col("subsynccommit", DataType.TEXT),
+                col("subpublications", DataType.TEXT),
+                col("suborigin", DataType.TEXT)
         );
         Table table = new Table("pg_subscription", cols);
         for (Database.SubDef sub : database.getSubscriptions().values()) {
             table.insertRow(new Object[]{
-                    oids.oid("sub:" + sub.name), oids.oid("db:memgres"), sub.name, 10,
-                    false, sub.conninfo, sub.name, "off",
-                    "{" + sub.publication + "}", "d", false, true, false, false
+                    oids.oid("sub:" + sub.name), oids.oid("db:memgres"),
+                    null,                           // subskiplsn
+                    sub.name, 10,
+                    false,                          // subenabled
+                    false,                          // subbinary
+                    "f",                            // substream
+                    "d",                            // subtwophasestate
+                    false,                          // subdisableonerr
+                    true,                           // subpasswordrequired
+                    false,                          // subrunasowner
+                    false,                          // subfailover
+                    sub.conninfo, sub.name, "off",
+                    "{" + sub.publication + "}",
+                    "any"                           // suborigin
             });
         }
         return table;

@@ -544,10 +544,18 @@ class JsonFunctions {
         }
     }
 
+    private static String repeat(String s, int count) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
     private String rowMapToJson(java.util.Map<?, ?> map, boolean pretty, int indent) {
         StringBuilder sb = new StringBuilder("{");
-        String sep = pretty ? ",\n" + " ".repeat(indent) : ",";
-        if (pretty) sb.append("\n").append(" ".repeat(indent));
+        String sep = pretty ? ",\n" + repeat(" ",indent) : ",";
+        if (pretty) sb.append("\n").append(repeat(" ", indent));
         boolean first = true;
         for (Map.Entry<?, ?> entry : map.entrySet()) {
             if (!first) sb.append(sep);

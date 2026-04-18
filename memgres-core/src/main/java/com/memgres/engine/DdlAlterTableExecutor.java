@@ -50,6 +50,8 @@ class DdlAlterTableExecutor {
             table.renameColumn(rename.oldName(), rename.newName());
             rewriteDependentViews(stmt.table(), rename.oldName(), rename.newName());
             executor.recordUndo(new Session.RenameColumnUndo(schemaName, stmt.table(), rename.newName(), rename.oldName()));
+        } else if (action instanceof AlterTableStmt.SetReplicaIdentity) {
+            table.setReplicaIdentity(((AlterTableStmt.SetReplicaIdentity) action).identity());
         } else if (action instanceof AlterTableStmt.RenameTable) {
             AlterTableStmt.RenameTable rename = (AlterTableStmt.RenameTable) action;
             table = executeRenameTable(rename, table, stmt, schemaName);

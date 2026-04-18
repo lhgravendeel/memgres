@@ -277,6 +277,20 @@ public final class AlterTableStmt implements Statement {
             return "RenameTable[newName=" + newName + "]";
         }
     }
+    /** ALTER TABLE ... REPLICA IDENTITY { DEFAULT | FULL | NOTHING | USING INDEX idx } */
+    public static final class SetReplicaIdentity implements AlterAction {
+        private final char identity; // 'd', 'f', 'n', 'i'
+
+        public SetReplicaIdentity(char identity) { this.identity = identity; }
+        public char identity() { return identity; }
+
+        @Override public boolean equals(Object o) {
+            return this == o || (o instanceof SetReplicaIdentity && identity == ((SetReplicaIdentity) o).identity);
+        }
+        @Override public int hashCode() { return Character.hashCode(identity); }
+        @Override public String toString() { return "SetReplicaIdentity[" + identity + "]"; }
+    }
+
         public static final class EnableRls implements AlterAction {
         public EnableRls() {}
 

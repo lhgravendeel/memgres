@@ -165,7 +165,7 @@ class CatalogCoreBuilder {
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
                         false, hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
                         false,              // relhasoids
-                        true, "d", relispartition, // relispopulated, relreplident, relispartition
+                        true, String.valueOf(t.getReplicaIdentity()), relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid
                         buildRelacl(t.getName()), buildTableReloptions(t), relpartbound, 1 // relacl, reloptions, relpartbound, xmin
                 });

@@ -856,6 +856,7 @@ class DmlExecutor {
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         Table table = executor.resolveTable(schemaName, stmt.table());
+        checkReplicaIdentity(table, stmt.table(), "update");
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);
         List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.table());
@@ -1211,6 +1212,7 @@ class DmlExecutor {
         checkReadOnly("DELETE");
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         Table table = executor.resolveTable(schemaName, stmt.table());
+        checkReplicaIdentity(table, stmt.table(), "delete");
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);
         boolean hasReturning = stmt.returning() != null && !stmt.returning().isEmpty();
@@ -1907,6 +1909,33 @@ class DmlExecutor {
     private void checkReadOnly(String command) {
         if (executor.session != null && executor.session.isReadOnly()) {
             throw new MemgresException("cannot execute " + command + " in a read-only transaction", "25006");
+        }
+    }
+
+    /**
+     * PG enforces that tables covered by a publication must have a usable replica
+     * identity before UPDATE or DELETE is allowed (error 55000).  A table is
+     * "published" if any publication with FOR ALL TABLES exists, or if the table
+     * is explicitly listed in a publication.
+     */
+    private void checkReplicaIdentity(Table table, String tableName, String dmlVerb) {
+        if (executor.database.getPublications().isEmpty()) return;
+        boolean published = false;
+        for (Database.PubDef pub : executor.database.getPublications().values()) {
+            if (pub.allTables) { published = true; break; }
+            for (String t : pub.tables) {
+                if (t.equalsIgnoreCase(tableName)) { published = true; break; }
+            }
+            if (published) break;
+        }
+        if (published && !table.hasUsableReplicaIdentity()) {
+            String verb = "update".equals(dmlVerb) ? "updates" : "deletes";
+            MemgresException ex = new MemgresException(
+                    "cannot " + dmlVerb + " table \"" + tableName
+                            + "\" because it does not have a replica identity and publishes " + verb,
+                    "55000");
+            ex.setHint("To enable updating the table, set REPLICA IDENTITY using ALTER TABLE.");
+            throw ex;
         }
     }
 
