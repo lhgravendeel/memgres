@@ -61,6 +61,15 @@ class IndexComparisonTest {
     }
 
     static void cleanPg() throws SQLException {
+        // Drop leftover publications first — FOR ALL TABLES publications cause
+        // replica identity errors on tables without a primary key.
+        try (Statement s = pgConn.createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT pubname FROM pg_publication WHERE pubname NOT LIKE 'pg_%'")) {
+            while (rs.next()) {
+                try { execPg("DROP PUBLICATION IF EXISTS " + rs.getString(1)); } catch (SQLException ignored) {}
+            }
+        }
         String[] tables = {"t_basic", "users", "expr_test", "bad_idx", "num_test",
                 "docs", "bookings", "texts", "introspect", "mix_idx",
                 "idx_cap_btree", "idx_cap_hash", "idx_cap_gin", "idx_cap_gist",

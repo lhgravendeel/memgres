@@ -273,6 +273,8 @@ public class PgCatalogBuilder {
                 return stubs.buildPgStatWalSenders();
             case "pg_ident_file_mappings":
                 return stubs.buildPgIdentFileMappings();
+            case "pg_db_role_setting":
+                return stubs.buildPgDbRoleSetting();
             case "pg_catalog":
                 return emptyTable(tableName);
             default:

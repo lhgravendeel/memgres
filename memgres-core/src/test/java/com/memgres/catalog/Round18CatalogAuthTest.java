@@ -137,4 +137,34 @@ class Round18CatalogAuthTest {
         boolean b = bool1("SELECT rolbypassrls FROM pg_roles WHERE rolname='r18_rb'");
         assertTrue(b, "pg_roles.rolbypassrls must reflect BYPASSRLS flag");
     }
+
+    // =========================================================================
+    // S6. pg_db_role_setting exists and is queryable (pg_dump depends on it)
+    // =========================================================================
+
+    @Test
+    void pg_db_role_setting_exists_and_queryable() throws SQLException {
+        // pg_dump issues: SELECT unnest(setconfig) FROM pg_db_role_setting WHERE ...
+        // The table must exist even if empty.
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT setdatabase, setrole, setconfig FROM pg_catalog.pg_db_role_setting LIMIT 0")) {
+            // Table exists and has the expected columns — no rows needed
+            ResultSetMetaData md = rs.getMetaData();
+            assertEquals(3, md.getColumnCount(), "pg_db_role_setting must have 3 columns");
+            assertEquals("setdatabase", md.getColumnName(1));
+            assertEquals("setrole", md.getColumnName(2));
+            assertEquals("setconfig", md.getColumnName(3));
+        }
+    }
+
+    @Test
+    void pg_db_role_setting_unnest_query() throws SQLException {
+        // Exact query pg_dump uses — must not throw "relation does not exist"
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT unnest(setconfig) FROM pg_db_role_setting WHERE setrole = 0 AND setdatabase = 0::oid")) {
+            assertFalse(rs.next(), "empty pg_db_role_setting should return no rows");
+        }
+    }
 }

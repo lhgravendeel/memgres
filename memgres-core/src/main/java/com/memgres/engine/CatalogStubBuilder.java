@@ -2099,4 +2099,13 @@ class CatalogStubBuilder {
         );
         return new Table("pg_ident_file_mappings", cols); // empty, no ident mappings
     }
+
+    Table buildPgDbRoleSetting() {
+        List<Column> cols = Cols.listOf(
+                col("setdatabase", DataType.INTEGER),
+                col("setrole", DataType.INTEGER),
+                col("setconfig", DataType.TEXT)
+        );
+        return new Table("pg_db_role_setting", cols); // empty, no per-db role settings
+    }
 }
