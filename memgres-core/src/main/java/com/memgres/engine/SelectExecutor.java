@@ -234,11 +234,7 @@ class SelectExecutor {
                 (stmt.having() != null && containsAggregate(stmt.having()));
 
         if (hasGroupBy || hasGroupingSets || hasAggregates) {
-            // Validate: DISTINCT ON with GROUP BY and aggregates is rejected (PG compatibility)
-            if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty() && hasGroupBy && hasAggregates) {
-                throw new MemgresException(
-                        "SELECT DISTINCT ON is not allowed with GROUP BY and aggregate functions", "42803");
-            }
+            // PG allows DISTINCT ON with GROUP BY and aggregates — DISTINCT ON is applied after grouping
             // Validate: non-aggregate columns must be in GROUP BY
             if (!hasGroupBy && !hasGroupingSets && hasAggregates) {
                 for (SelectStmt.SelectTarget target : stmt.targets()) {
@@ -609,6 +605,7 @@ class SelectExecutor {
         if (expr instanceof CastExpr) return containsAggregate(((CastExpr) expr).expr());
         if (expr instanceof IsJsonExpr) return containsAggregate(((IsJsonExpr) expr).expr());
         if (expr instanceof IsNullExpr) return containsAggregate(((IsNullExpr) expr).expr());
+        if (expr instanceof InExpr) return containsAggregate(((InExpr) expr).expr());
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
             for (CaseExpr.WhenClause when : c.whenClauses()) {
@@ -672,6 +669,7 @@ class SelectExecutor {
         if (expr instanceof SubqueryExpr) return true;
         if (expr instanceof ExistsExpr) return true;
         if (expr instanceof WindowFuncExpr) return true;
+        if (expr instanceof InExpr) return isAggregateOrConstant(((InExpr) expr).expr());
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
             if (c.operand() != null && !isAggregateOrConstant(c.operand())) return false;

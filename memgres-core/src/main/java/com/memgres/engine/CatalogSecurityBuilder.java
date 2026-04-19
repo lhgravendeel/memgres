@@ -136,7 +136,6 @@ class CatalogSecurityBuilder {
                 col("datcollate", DataType.TEXT),
                 col("datctype", DataType.TEXT),
                 col("datlocale", DataType.TEXT),
-                col("daticulocale", DataType.TEXT),
                 col("daticurules", DataType.TEXT),
                 col("datcollversion", DataType.TEXT),
                 col("datacl", DataType.ACLITEM_ARRAY)
@@ -150,14 +149,14 @@ class CatalogSecurityBuilder {
                 "c", true, false, -1,
                 722, 1, tsOid,
                 "en_US.UTF-8", "en_US.UTF-8",
-                null, null, null, null, null
+                null, null, null, null
         });
         table.insertRow(new Object[]{
                 oids.oid("db:template1"), "template1", 10, 6,
                 "c", true, true, -1,
                 722, 1, tsOid,
                 "en_US.UTF-8", "en_US.UTF-8",
-                null, null, null, null, null
+                null, null, null, null
         });
 
         // Dynamically list all databases from the registry
@@ -169,7 +168,7 @@ class CatalogSecurityBuilder {
                         "c", false, true, -1,
                         722, 1, tsOid,
                         "en_US.UTF-8", "en_US.UTF-8",
-                        null, null, null, null, null
+                        null, null, null, null
                 });
             }
         } else {
@@ -179,7 +178,7 @@ class CatalogSecurityBuilder {
                     "c", false, true, -1,
                     722, 1, tsOid,
                     "en_US.UTF-8", "en_US.UTF-8",
-                    null, null, null, null, null
+                    null, null, null, null
             });
         }
 
@@ -223,8 +222,8 @@ class CatalogSecurityBuilder {
                     buildRolconfig(attrs.get("ROLCONFIG")), "********" // rolconfig, rolpassword (always masked in pg_roles)
             });
         }
-        // PG18 default system roles
-        int sysOid = 4200;
+        // PG18 default system roles (OIDs match PG 18 dynamic assignment, starting at 6168)
+        int sysOid = 6168;
         String[][] sysRoles = {
             {"pg_database_owner"},
             {"pg_read_all_data"},

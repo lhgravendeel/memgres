@@ -873,12 +873,40 @@ public final class TypeCoercion {
     }
 
     /**
-     * Compare two timetz strings by normalizing to UTC.
+     * Compare two timetz strings. PG compares by UTC-normalized time first,
+     * then by zone offset (smaller offset = greater for ordering).
+     * For equality, both UTC time AND zone must match.
      */
     static int compareTimeTz(String a, String b) {
         long utcA = timeTzToUtcNanos(a);
         long utcB = timeTzToUtcNanos(b);
-        return Long.compare(utcA, utcB);
+        int cmp = Long.compare(utcA, utcB);
+        if (cmp != 0) return cmp;
+        // Same UTC time: compare by zone offset (PG sorts smaller offset as greater)
+        int offA = timeTzOffsetSeconds(a);
+        int offB = timeTzOffsetSeconds(b);
+        return Integer.compare(offB, offA);
+    }
+
+    private static int timeTzOffsetSeconds(String s) {
+        int idx = -1;
+        for (int i = s.length() - 1; i >= 1; i--) {
+            char c = s.charAt(i);
+            if (c == '+' || c == '-') { idx = i; break; }
+        }
+        if (idx < 1) return 0;
+        String offsetPart = s.substring(idx);
+        int sign = offsetPart.charAt(0) == '-' ? -1 : 1;
+        String offVal = offsetPart.substring(1);
+        int offHours, offMinutes = 0;
+        if (offVal.contains(":")) {
+            String[] parts = offVal.split(":");
+            offHours = Integer.parseInt(parts[0]);
+            offMinutes = Integer.parseInt(parts[1]);
+        } else {
+            offHours = Integer.parseInt(offVal);
+        }
+        return sign * (offHours * 3600 + offMinutes * 60);
     }
 
     private static long timeTzToUtcNanos(String s) {

@@ -13,7 +13,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * Covers:
  *  - FILTER on window aggregates (also H4; duplicated here for area owner)
  *  - array_agg DISTINCT dedup on actual value, not toString()
- *  - percentile_disc/cont array with NaN raises SQLSTATE 22023 (not 22003)
+ *  - percentile_disc/cont array with NaN raises SQLSTATE 22003
  *  - nth_value(col, n) FROM FIRST / FROM LAST / IGNORE NULLS
  */
 class Round16AggregateWindowEdgeTest {
@@ -81,22 +81,22 @@ class Round16AggregateWindowEdgeTest {
     }
 
     // =========================================================================
-    // L3. percentile_disc / percentile_cont with NaN → SQLSTATE 22023
+    // L3. percentile_disc / percentile_cont with NaN → SQLSTATE 22003
     // =========================================================================
 
     @Test
-    void percentile_disc_with_nan_raises_22023() throws SQLException {
+    void percentile_disc_with_nan_raises_22003() throws SQLException {
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery(
                      "SELECT percentile_disc(ARRAY['nan'::float8, 0.5]) " +
                              "WITHIN GROUP (ORDER BY x) " +
                              "FROM (VALUES (1), (2), (3)) AS t(x)")) {
             if (rs.next()) {
-                fail("percentile_disc with NaN must raise SQLSTATE 22023");
+                fail("percentile_disc with NaN must raise SQLSTATE 22003");
             }
         } catch (SQLException e) {
-            assertEquals("22023", e.getSQLState(),
-                    "percentile with NaN must raise 22023 invalid_parameter_value; got " +
+            assertEquals("22003", e.getSQLState(),
+                    "percentile with NaN must raise 22003 numeric_value_out_of_range; got " +
                             e.getSQLState());
         }
     }

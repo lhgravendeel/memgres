@@ -140,8 +140,8 @@ class Round18RlsDepthTest {
     @Test
     void predefined_role_oid_in_reserved_range() throws SQLException {
         int oid = int1("SELECT oid::int FROM pg_roles WHERE rolname='pg_read_all_data'");
-        assertTrue(oid >= 4200 && oid <= 4402,
-                "pg_read_all_data OID must be in PG reserved range 4200-4402; got " + oid);
+        assertTrue(oid >= 6168,
+                "pg_read_all_data OID must be in PG reserved range 6168+; got " + oid);
     }
 
     // =========================================================================

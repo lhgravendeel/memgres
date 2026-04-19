@@ -407,10 +407,15 @@ class DateTimeFunctions {
             case "timezone":
             case "timezone_hour":
             case "timezone_minute": {
+                // PG converts timestamptz to session timezone first, so timezone fields
+                // reflect the session timezone, not the original literal offset.
+                // Memgres session timezone is UTC (offset 0).
                 int totalSeconds = 0;
-                if (originalSource instanceof java.time.OffsetDateTime) {
-                    totalSeconds = ((java.time.OffsetDateTime) originalSource).getOffset().getTotalSeconds();
+                if (originalSource instanceof java.time.OffsetTime) {
+                    // For timetz, use the actual offset from the value
+                    totalSeconds = ((java.time.OffsetTime) originalSource).getOffset().getTotalSeconds();
                 }
+                // For timestamptz (OffsetDateTime), session timezone applies (UTC = 0)
                 switch (field) {
                     case "timezone":
                         return java.math.BigDecimal.valueOf(totalSeconds);

@@ -634,18 +634,18 @@ INSERT INTO ron_partitioned VALUES (1, 'low', 10), (200, 'high', 20);
 INSERT INTO ron_partitioned VALUES (50, 'mid', 50) RETURNING NEW.*;
 
 -- UPDATE across partition boundary concept: update within same partition
--- begin-expected-error
--- sqlstate: 55000
--- message-like: replica identity
--- end-expected-error
+-- begin-expected
+-- columns: old_val, new_val
+-- row: low | LOW-UPDATED
+-- end-expected
 UPDATE ron_partitioned SET val = 'LOW-UPDATED' WHERE id = 1
 RETURNING OLD.val AS old_val, NEW.val AS new_val;
 
 -- DELETE from high partition
--- begin-expected-error
--- sqlstate: 55000
--- message-like: replica identity
--- end-expected-error
+-- begin-expected
+-- columns: old_val
+-- row: high
+-- end-expected
 DELETE FROM ron_partitioned WHERE id = 200
 RETURNING OLD.val AS old_val;
 

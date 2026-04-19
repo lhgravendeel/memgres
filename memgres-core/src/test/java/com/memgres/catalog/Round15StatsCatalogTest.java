@@ -96,11 +96,11 @@ class Round15StatsCatalogTest {
             s.executeQuery("SELECT r15_sf_fn()").close();
             s.executeQuery("SELECT r15_sf_fn()").close();
         }
-        int calls = scalarInt(
-                "SELECT COALESCE(calls,0)::int FROM pg_stat_user_functions "
+        int rows = scalarInt(
+                "SELECT count(*)::int FROM pg_stat_user_functions "
                         + "WHERE funcname='r15_sf_fn'");
-        assertTrue(calls >= 2,
-                "pg_stat_user_functions.calls should track function invocations; got " + calls);
+        assertEquals(0, rows,
+                "pg_stat_user_functions returns 0 rows without track_functions enabled; got " + rows);
     }
 
     // =========================================================================

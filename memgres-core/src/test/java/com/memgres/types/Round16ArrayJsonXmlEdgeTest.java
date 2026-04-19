@@ -83,14 +83,12 @@ class Round16ArrayJsonXmlEdgeTest {
     // =========================================================================
 
     @Test
-    void array_with_null_equality_is_null_not_true() throws SQLException {
-        // PG 18: ARRAY[1, NULL] = ARRAY[1, NULL] propagates NULL → (bool) NULL
+    void array_with_null_equality_is_true() throws SQLException {
+        // PG 18: ARRAY[1, NULL] = ARRAY[1, NULL] → true (array equality treats NULL=NULL as true)
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery("SELECT (ARRAY[1, NULL]::int[] = ARRAY[1, NULL]::int[])::text")) {
             assertTrue(rs.next());
-            Object o = rs.getObject(1);
-            assertNull(o,
-                    "ARRAY[1,NULL] = ARRAY[1,NULL] must propagate NULL element-wise → NULL; got: " + o);
+            assertEquals("true", rs.getString(1));
         }
     }
 

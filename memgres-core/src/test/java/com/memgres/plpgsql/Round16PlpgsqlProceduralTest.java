@@ -88,11 +88,11 @@ class Round16PlpgsqlProceduralTest {
 
     @Test
     void raise_extra_args_must_error_42601() throws SQLException {
-        exec("CREATE OR REPLACE FUNCTION r16_raise_extra() RETURNS void AS $$\n"
-                + "BEGIN RAISE NOTICE 'no-placeholder', 'leftover-arg'; END;\n"
-                + "$$ LANGUAGE plpgsql");
+        // PG validates RAISE format string vs argument count at CREATE FUNCTION time
         try (Statement s = conn.createStatement()) {
-            s.execute("SELECT r16_raise_extra()");
+            s.execute("CREATE OR REPLACE FUNCTION r16_raise_extra() RETURNS void AS $$\n"
+                    + "BEGIN RAISE NOTICE 'no-placeholder', 'leftover-arg'; END;\n"
+                    + "$$ LANGUAGE plpgsql");
             fail("RAISE with extra positional args must error 42601 'too many parameters specified for RAISE'");
         } catch (SQLException e) {
             assertEquals("42601", e.getSQLState(),

@@ -1986,9 +1986,16 @@ class FunctionEvaluator {
                         }
 
                         // STRICT: return NULL immediately if any argument is NULL
+                        // For set-returning functions, return empty set instead of NULL
                         if (userFunc.isStrict()) {
                             for (Object arg : args) {
-                                if (arg == null) return null;
+                                if (arg == null) {
+                                    String rt = userFunc.getReturnType();
+                                    if (rt != null && (rt.toUpperCase().startsWith("SETOF") || rt.toUpperCase().startsWith("TABLE"))) {
+                                        return new java.util.ArrayList<>();
+                                    }
+                                    return null;
+                                }
                             }
                         }
                         userFunc.incrementCallCount();
@@ -2023,9 +2030,16 @@ class FunctionEvaluator {
                         args.add(val);
                     }
                     // STRICT: return NULL immediately if any argument is NULL
+                    // For set-returning functions, return empty set instead of NULL
                     if (userFunc.isStrict()) {
                         for (Object arg : args) {
-                            if (arg == null) return null;
+                            if (arg == null) {
+                                String rt = userFunc.getReturnType();
+                                if (rt != null && (rt.toUpperCase().startsWith("SETOF") || rt.toUpperCase().startsWith("TABLE"))) {
+                                    return new java.util.ArrayList<>();
+                                }
+                                return null;
+                            }
                         }
                     }
                     userFunc.incrementCallCount();

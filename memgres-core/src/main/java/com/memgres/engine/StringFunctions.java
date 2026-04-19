@@ -133,7 +133,25 @@ class StringFunctions {
                     return r.isEmpty() ? null : r.lower();
                 }
                 if (arg instanceof Number) throw new MemgresException("function lower(integer) does not exist", "42883");
-                return arg.toString().toLowerCase();
+                {
+                    String original = arg.toString();
+                    String lowered = original.toLowerCase();
+                    // PG does not lowercase U+1E9E (capital sharp S) to U+00DF (ß)
+                    if (original.indexOf('\u1E9E') >= 0) {
+                        StringBuilder sb = new StringBuilder(lowered.length());
+                        int oi = 0;
+                        for (int li = 0; li < lowered.length(); li++) {
+                            if (lowered.charAt(li) == '\u00DF' && oi < original.length() && original.charAt(oi) == '\u1E9E') {
+                                sb.append('\u1E9E');
+                            } else {
+                                sb.append(lowered.charAt(li));
+                            }
+                            oi++;
+                        }
+                        return sb.toString();
+                    }
+                    return lowered;
+                }
             }
             case "trim":
             case "btrim": {

@@ -219,8 +219,8 @@ class Round24PgGapTest {
     @Test
     void hostmask_of_cidr_returns_inverse_of_netmask() throws SQLException {
         // hostmask('192.168.1.0/24'::cidr) -> 0.0.0.255
-        assertEquals("0.0.0.255", q("SELECT hostmask('192.168.1.0/24'::cidr)::text"));
-        assertEquals("0.0.0.0",   q("SELECT hostmask('10.0.0.0/32'::cidr)::text"));
+        assertEquals("0.0.0.255/32", q("SELECT hostmask('192.168.1.0/24'::cidr)::text"));
+        assertEquals("0.0.0.0/32",   q("SELECT hostmask('10.0.0.0/32'::cidr)::text"));
     }
 
     @Test
@@ -278,15 +278,12 @@ class Round24PgGapTest {
 
     @Test
     void plpgsql_raise_too_many_params_errors() throws SQLException {
-        exec("CREATE OR REPLACE FUNCTION r24_raise_extra() RETURNS void AS $$ "
-                + "BEGIN RAISE NOTICE 'no-placeholder', 'leftover-arg'; END; $$ LANGUAGE plpgsql");
-        try {
-            var ex = assertThrows(SQLException.class, () -> q("SELECT r24_raise_extra()"));
-            assertTrue(ex.getMessage().contains("too many parameters"),
-                    "Expected 'too many parameters' error, got: " + ex.getMessage());
-        } finally {
-            exec("DROP FUNCTION IF EXISTS r24_raise_extra()");
-        }
+        // PG validates RAISE format string vs argument count at CREATE FUNCTION time
+        var ex = assertThrows(SQLException.class, () ->
+                exec("CREATE OR REPLACE FUNCTION r24_raise_extra() RETURNS void AS $$ "
+                        + "BEGIN RAISE NOTICE 'no-placeholder', 'leftover-arg'; END; $$ LANGUAGE plpgsql"));
+        assertTrue(ex.getMessage().contains("too many parameters"),
+                "Expected 'too many parameters' error, got: " + ex.getMessage());
     }
 
     @Test

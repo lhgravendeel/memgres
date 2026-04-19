@@ -886,6 +886,27 @@ class SessionExecutor {
                 throw new MemgresException("relation \"" + s.objectName() + "\" does not exist", "42P01");
             }
         }
+        // Validate object exists for FOREIGN SERVER grants
+        if (s.objectType() != null && s.objectType().equals("FOREIGN SERVER") && s.objectName() != null) {
+            // Check if the foreign server exists in pg_foreign_server catalog
+            Table fsCatalog = executor.database.getSchema("pg_catalog") != null
+                    ? executor.database.getSchema("pg_catalog").getTable("pg_foreign_server") : null;
+            boolean found = false;
+            if (fsCatalog != null) {
+                int nameIdx = fsCatalog.getColumnIndex("srvname");
+                if (nameIdx >= 0) {
+                    for (Object[] row : fsCatalog.getRows()) {
+                        if (s.objectName().equalsIgnoreCase(String.valueOf(row[nameIdx]))) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!found) {
+                throw new MemgresException("server \"" + s.objectName() + "\" does not exist", "42704");
+            }
+        }
         // Validate grantee role exists
         if (s.grantees() != null) {
             for (String grantee : s.grantees()) {

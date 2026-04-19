@@ -137,24 +137,24 @@ class Round16TemporalEdgeTest {
     void extract_timezone_returns_offset_seconds() throws SQLException {
         BigDecimal v = dec("SELECT extract(timezone FROM '2025-06-15 12:00:00+05'::timestamptz)");
         assertNotNull(v);
-        assertEquals(0, new BigDecimal("18000").compareTo(v),
-                "extract(timezone FROM ts) must return offset in seconds (+05 → 18000)");
+        assertEquals(0, new BigDecimal("0").compareTo(v),
+                "extract(timezone FROM timestamptz) returns session timezone offset in seconds (UTC=0)");
     }
 
     @Test
     void extract_timezone_hour_returns_hours() throws SQLException {
         BigDecimal v = dec("SELECT extract(timezone_hour FROM '2025-06-15 12:00:00+05:30'::timestamptz)");
         assertNotNull(v);
-        assertEquals(0, new BigDecimal("5").compareTo(v),
-                "extract(timezone_hour) must return 5 for +05:30");
+        assertEquals(0, new BigDecimal("0").compareTo(v),
+                "extract(timezone_hour) returns session timezone hour (UTC=0)");
     }
 
     @Test
     void extract_timezone_minute_returns_minutes() throws SQLException {
         BigDecimal v = dec("SELECT extract(timezone_minute FROM '2025-06-15 12:00:00+05:30'::timestamptz)");
         assertNotNull(v);
-        assertEquals(0, new BigDecimal("30").compareTo(v),
-                "extract(timezone_minute) must return 30 for +05:30");
+        assertEquals(0, new BigDecimal("0").compareTo(v),
+                "extract(timezone_minute) returns session timezone minute (UTC=0)");
     }
 
     // =========================================================================
@@ -162,14 +162,15 @@ class Round16TemporalEdgeTest {
     // =========================================================================
 
     @Test
-    void timetz_comparison_respects_offset() throws SQLException {
-        // 12:00:00+05 == 07:00:00+00 (UTC wall-clock)
+    void timetz_comparison_is_not_utc_normalized() throws SQLException {
+        // PG compares timetz values without UTC normalization:
+        // '12:00:00+05' != '07:00:00+00' even though they represent the same instant
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery(
                      "SELECT '12:00:00+05'::timetz = '07:00:00+00'::timetz")) {
             assertTrue(rs.next());
-            assertTrue(rs.getBoolean(1),
-                    "TIMETZ equality must compare UTC-wall-clock: '12:00:00+05' = '07:00:00+00'");
+            assertFalse(rs.getBoolean(1),
+                    "TIMETZ equality: '12:00:00+05' != '07:00:00+00' in PG");
         }
     }
 

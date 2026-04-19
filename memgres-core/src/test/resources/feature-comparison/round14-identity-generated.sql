@@ -109,7 +109,7 @@ UPDATE r14_vg SET a = 10;
 
 -- begin-expected
 -- columns: b
--- row: 10
+-- row: 20
 -- end-expected
 SELECT b::text FROM r14_vg;
 
@@ -130,7 +130,7 @@ UPDATE r14_sgc SET a = 7;
 -- 11. STORED recomputed after UPDATE
 -- begin-expected
 -- columns: b
--- row: 10
+-- row: 14
 -- end-expected
 SELECT b::text FROM r14_sgc;
 
@@ -157,6 +157,6 @@ DELETE FROM r14_sdp WHERE id = 1;
 -- 13. pid reset to default 99
 -- begin-expected
 -- columns: pid
--- row: 1
+-- row: 99
 -- end-expected
 SELECT pid::text AS pid FROM r14_sdc;

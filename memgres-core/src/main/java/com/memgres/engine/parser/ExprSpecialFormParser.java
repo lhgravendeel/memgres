@@ -937,12 +937,14 @@ class ExprSpecialFormParser {
         List<Expression> args = new ArrayList<>();
         boolean nullOnNull = false;
         // PG 18 uses colon syntax: JSON_OBJECT('key' : value, ...)
-        // KEY...VALUE syntax is NOT supported in PG 18 (KEY is parsed as a type name).
+        // Also supports VALUE keyword: JSON_OBJECT('key' VALUE value, ...)
         do {
             Expression key;
             Expression val;
             key = ep.parseExpression();
-            ep.expect(TokenType.COLON);
+            if (!ep.match(TokenType.COLON)) {
+                ep.expectKeyword("VALUE");
+            }
             val = ep.parseExpression();
             args.add(key);
             args.add(val);

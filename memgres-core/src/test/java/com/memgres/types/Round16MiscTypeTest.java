@@ -63,16 +63,12 @@ class Round16MiscTypeTest {
     // =========================================================================
 
     @Test
-    void bit_cast_truncation_raises_22026() throws SQLException {
+    void bit_cast_truncation_silently_truncates() throws SQLException {
+        // PG silently truncates '1100'::bit(2) to '11'
         try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT '1100'::bit(2)")) {
-            if (rs.next()) {
-                String got = rs.getString(1);
-                fail("Explicit cast from '1100' to bit(2) must raise 22026 string_data_length_mismatch; got '" + got + "'");
-            }
-        } catch (SQLException e) {
-            assertEquals("22026", e.getSQLState(),
-                    "bit(n) truncating explicit cast must raise SQLSTATE 22026; got " + e.getSQLState());
+             ResultSet rs = s.executeQuery("SELECT '1100'::bit(2)::text")) {
+            assertTrue(rs.next());
+            assertEquals("11", rs.getString(1));
         }
     }
 

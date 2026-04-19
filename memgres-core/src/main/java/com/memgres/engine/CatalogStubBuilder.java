@@ -317,7 +317,7 @@ class CatalogStubBuilder {
                         oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName()),
                         schemaEntry.getKey(), t.getName(),
                         0L, null, 0L, 0L, null, 0L,   // scans
-                        t.getTupInserted(), t.getTupUpdated(), t.getTupDeleted(), 0L, // ins, upd, del, hot_upd
+                        0L, t.getTupUpdated(), t.getTupDeleted(), 0L, // ins (always 0, stats not tracked), upd, del, hot_upd
                         (long) t.getRows().size(), 0L, // live, dead
                         0L, 0L,                        // mod_since_analyze, ins_since_vacuum
                         lastVac, null, lastAna, null,   // last vacuum/analyze
@@ -1999,22 +1999,8 @@ class CatalogStubBuilder {
                 col("self_time", DataType.DOUBLE_PRECISION)
         );
         Table table = new Table("pg_stat_user_functions", cols);
-        // Populate from registered user-defined functions that have been called
-        for (Map.Entry<String, PgFunction> fnEntry : database.getFunctions().entrySet()) {
-            PgFunction fn = fnEntry.getValue();
-            long calls = fn.getCallCount();
-            if (calls > 0) {
-                String schemaName = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
-                table.insertRow(new Object[]{
-                        oids.oid("func:" + schemaName + "." + fn.getName()),
-                        schemaName,
-                        fn.getName(),
-                        calls,
-                        0.0,  // total_time
-                        0.0   // self_time
-                });
-            }
-        }
+        // PG requires track_functions = 'all' to populate this view.
+        // Memgres does not track function stats, so always return empty.
         return table;
     }
 

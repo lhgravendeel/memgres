@@ -305,7 +305,7 @@ class DdlAdminExecutor {
 
     /** Append stub lines for PG 16+/17+ EXPLAIN options (MEMORY, SERIALIZE, BUFFERS, WAL). */
     private void appendExplainExtras(ExplainStmt stmt, List<String> planLines) {
-        if (stmt.buffers) {
+        if (stmt.buffers && stmt.analyze) {
             planLines.add("Buffers: shared hit=0");
         }
         if (stmt.wal) {

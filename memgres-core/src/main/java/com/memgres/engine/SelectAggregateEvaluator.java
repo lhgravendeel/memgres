@@ -429,6 +429,20 @@ class SelectAggregateEvaluator {
         } else if (expr instanceof OrderedSetAggExpr) {
             OrderedSetAggExpr osa = (OrderedSetAggExpr) expr;
             return evalOrderedSetAggregate(osa, group);
+        } else if (expr instanceof InExpr) {
+            InExpr in = (InExpr) expr;
+            Object val = evalAggregateExpr(in.expr(), group, representative);
+            if (val == null) return null;
+            boolean found = false;
+            boolean hasNull = false;
+            for (Expression v : in.values()) {
+                Object elem = executor.evalExpr(v, representative);
+                if (elem == null) { hasNull = true; continue; }
+                if (TypeCoercion.areEqual(val, elem)) { found = true; break; }
+            }
+            if (found) return !in.negated();
+            if (hasNull) return null;
+            return in.negated();
         } else if (expr instanceof WindowFuncExpr) {
             return null;
         } else if (expr instanceof Literal) {
@@ -485,7 +499,7 @@ class SelectAggregateEvaluator {
                             throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                         }
                         if (Double.isNaN(fv))
-                            throw new MemgresException("percentile value NaN is not a valid number", "22023");
+                            throw new MemgresException("percentile value NaN is not between 0 and 1", "22003");
                         if (fv < 0.0 || fv > 1.0)
                             throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                         if (vals.isEmpty()) { results.add(null); continue; }
@@ -501,7 +515,7 @@ class SelectAggregateEvaluator {
                     throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                 }
                 if (Double.isNaN(fraction))
-                    throw new MemgresException("percentile value NaN is not a valid number", "22023");
+                    throw new MemgresException("percentile value NaN is not between 0 and 1", "22003");
                 if (fraction < 0.0 || fraction > 1.0)
                     throw new MemgresException("percentile fraction must be between 0 and 1", "22003");
                 if (vals.isEmpty()) return null;

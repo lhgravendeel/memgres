@@ -139,7 +139,7 @@ class ByteaFunctions {
                 int p = executor.toInt(pos);
                 if (data instanceof byte[]) {
                     byte[] bytes = (byte[]) data;
-                    // bytea get_bit: bit 0 is MSB of first byte (MSB-first numbering within each byte, matching PG).
+                    // bytea get_bit: bit 0 is MSB of first byte (MSB-first within each byte, matching PG).
                     int byteIdx = p / 8;
                     int bitIdx = 7 - (p % 8);
                     if (byteIdx < 0 || byteIdx >= bytes.length) {
@@ -160,7 +160,7 @@ class ByteaFunctions {
                 int nb = executor.toInt(newBit);
                 if (data instanceof byte[]) {
                     byte[] bytes = (byte[]) data;
-                    // bytea set_bit: bit 0 is MSB of first byte (MSB-first numbering within each byte, matching PG).
+                    // bytea set_bit: bit 0 is MSB of first byte (MSB-first within each byte, matching PG).
                     int byteIdx = p / 8;
                     int bitIdx = 7 - (p % 8);
                     if (byteIdx < 0 || byteIdx >= bytes.length) {

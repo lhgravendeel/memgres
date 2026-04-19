@@ -382,14 +382,8 @@ class CastEvaluator {
                         // Pad with zeros on the right (PG behavior)
                         bitStr = bitStr + Strs.repeat("0", n - bitStr.length());
                     } else if (bitStr.length() > n) {
-                        if (val instanceof AstExecutor.PgBitString) {
-                            // varbit → bit(n): truncate to first n bits (PG behavior)
-                            bitStr = bitStr.substring(0, n);
-                        } else {
-                            // string literal → bit(n): length mismatch is an error
-                            throw new MemgresException("bit string length " + bitStr.length()
-                                    + " does not match type bit(" + n + ")", "22026");
-                        }
+                        // PG silently truncates to first n bits for both literals and varbit
+                        bitStr = bitStr.substring(0, n);
                     }
                 }
                 return new AstExecutor.PgBitString(bitStr);

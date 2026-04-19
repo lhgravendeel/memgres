@@ -390,8 +390,8 @@ class CatalogConstraintBuilder {
                                 indkeyVec,
                                 (short) nKeyAtts, (short) totalAtts, true, true, true, indexprs, whereClause, isClustered,
                                 false, // indisreplident
-                                new java.util.ArrayList<>(optionElems),
-                                nullsNotDistinct, new java.util.ArrayList<>(classElems), new java.util.ArrayList<>(collElems)});
+                                new PgVector(optionElems),
+                                nullsNotDistinct, new PgVector(classElems), new PgVector(collElems)});
                         break;
                     }
                 }
@@ -442,8 +442,8 @@ class CatalogConstraintBuilder {
                                     (short) indkeyList.size(), (short) indkeyList.size(),
                                     true, true, true, null, null, constraintClustered,
                                     false, // indisreplident
-                                    new java.util.ArrayList<>(optElems),
-                                    false, new java.util.ArrayList<>(resolvedClsElems), new java.util.ArrayList<>(colElems)
+                                    new PgVector(optElems),
+                                    false, new PgVector(resolvedClsElems), new PgVector(colElems)
                             });
                         }
                     }

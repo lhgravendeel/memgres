@@ -344,7 +344,7 @@ class Round13TypeFunctionGapsTest {
     /** hostmask returns the hostmask for a CIDR. */
     @Test
     void hostmask_cidr24() throws SQLException {
-        assertEquals("0.0.0.255",
+        assertEquals("0.0.0.255/32",
                 scalarString("SELECT hostmask('192.168.1.0/24'::cidr)::text"));
     }
 

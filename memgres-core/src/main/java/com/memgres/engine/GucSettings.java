@@ -114,8 +114,8 @@ public class GucSettings {
         DEFAULTS.put("integer_datetimes", "on");
         DEFAULTS.put("synchronize_seqscans", "on");
 
-        // Float/numeric display (commonly set by JDBC drivers)
-        DEFAULTS.put("extra_float_digits", "3");
+        // Float/numeric display (PG default is 1; JDBC drivers typically SET it to 3)
+        DEFAULTS.put("extra_float_digits", "1");
 
         // Text search
         DEFAULTS.put("default_text_search_config", "pg_catalog.simple");

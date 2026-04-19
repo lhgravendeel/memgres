@@ -150,7 +150,7 @@ class Round18IndexAmsTest {
         exec("CREATE INDEX r18_idop_ix ON r18_idop(a DESC NULLS FIRST)");
         // indoption[0] must have DESC bit (1) set.
         int opt = int1(
-                "SELECT (indoption[1])::int FROM pg_index ix " +
+                "SELECT (indoption[0])::int FROM pg_index ix " +
                         "JOIN pg_class ci ON ci.oid=ix.indexrelid " +
                         "WHERE ci.relname='r18_idop_ix'");
         // DESC = 1, NULLS FIRST = 2  → combined = 3 (for DESC on desc, NULLS FIRST is the default so only DESC bit)
@@ -172,11 +172,11 @@ class Round18IndexAmsTest {
         exec("CREATE INDEX r18_icls_b ON r18_icls(b)");
         // indclass[1] for integer column != indclass[1] for text column.
         int aCls = int1(
-                "SELECT indclass[1]::int FROM pg_index ix " +
+                "SELECT indclass[0]::int FROM pg_index ix " +
                         "JOIN pg_class ci ON ci.oid=ix.indexrelid " +
                         "WHERE ci.relname='r18_icls_a'");
         int bCls = int1(
-                "SELECT indclass[1]::int FROM pg_index ix " +
+                "SELECT indclass[0]::int FROM pg_index ix " +
                         "JOIN pg_class ci ON ci.oid=ix.indexrelid " +
                         "WHERE ci.relname='r18_icls_b'");
         assertNotEquals(aCls, bCls,

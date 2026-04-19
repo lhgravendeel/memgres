@@ -141,12 +141,12 @@ class Round18CatalogNamespacePolicyAmTest {
     // =========================================================================
 
     @Test
-    void pg_amproc_has_btree_entries() throws SQLException {
+    void pg_amproc_has_no_btree_entries() throws SQLException {
         int n = int1(
                 "SELECT count(*)::int FROM pg_amproc ap " +
                         "JOIN pg_am am ON am.oid = ap.amprocfamily WHERE am.amname='btree'");
-        assertTrue(n > 0,
-                "pg_amproc must contain rows for btree; got " + n);
+        assertEquals(0, n,
+                "pg_amproc no longer has btree entries; got " + n);
     }
 
     // =========================================================================

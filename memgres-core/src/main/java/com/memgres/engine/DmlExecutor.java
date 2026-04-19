@@ -856,6 +856,14 @@ class DmlExecutor {
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         Table table = executor.resolveTable(schemaName, stmt.table());
+        // Check for attempts to assign to system columns (PG error 0A000, before replica identity check)
+        for (InsertStmt.SetClause set : stmt.setClauses()) {
+            String col = set.column().toLowerCase();
+            if (col.equals("ctid") || col.equals("xmin") || col.equals("xmax")
+                    || col.equals("cmin") || col.equals("cmax") || col.equals("tableoid")) {
+                throw new MemgresException("cannot assign to system column \"" + set.column() + "\"", "0A000");
+            }
+        }
         checkReplicaIdentity(table, stmt.table(), "update");
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);

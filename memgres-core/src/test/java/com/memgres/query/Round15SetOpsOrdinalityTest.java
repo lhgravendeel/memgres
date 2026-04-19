@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * Covers:
  *  - INTERSECT ALL / EXCEPT ALL semantics (bag vs set)
- *  - DISTINCT ON + GROUP BY combined (should error per PG)
+ *  - DISTINCT ON + GROUP BY combined (PG allows this)
  *  - ROWS FROM (…) WITH ORDINALITY — emits ordinal column
  *  - WITH ORDINALITY on a single SRF (LATERAL context)
  */
@@ -112,26 +112,26 @@ class Round15SetOpsOrdinalityTest {
     }
 
     // =========================================================================
-    // B. DISTINCT ON + GROUP BY — error per PG
+    // B. DISTINCT ON + GROUP BY — allowed in PG
     // =========================================================================
 
     @Test
-    void distinct_on_with_group_by_errors() throws SQLException {
+    void distinct_on_with_group_by_succeeds() throws SQLException {
         try (Statement s = conn.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS r15_doonly");
             s.execute("CREATE TABLE r15_doonly (a int, b int)");
             s.execute("INSERT INTO r15_doonly VALUES (1,1),(1,2),(2,3)");
         }
-        try {
-            try (Statement s = conn.createStatement();
-                 ResultSet rs = s.executeQuery(
-                         "SELECT DISTINCT ON (a) a, count(*) FROM r15_doonly GROUP BY a")) {
-                // consume
-                while (rs.next()) { /* drain */ }
-            }
-            fail("DISTINCT ON + GROUP BY combination must error per PG");
-        } catch (SQLException e) {
-            // expected: error about GROUP BY / aggregate with DISTINCT ON
-            assertNotNull(e.getMessage());
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(
+                     "SELECT DISTINCT ON (a) a, count(*) FROM r15_doonly GROUP BY a ORDER BY a")) {
+            assertTrue(rs.next());
+            assertEquals(1, rs.getInt(1));
+            assertEquals(2, rs.getLong(2)); // count(*) for a=1
+            assertTrue(rs.next());
+            assertEquals(2, rs.getInt(1));
+            assertEquals(1, rs.getLong(2)); // count(*) for a=2
+            assertFalse(rs.next(), "DISTINCT ON + GROUP BY should return 2 rows");
         }
     }
 

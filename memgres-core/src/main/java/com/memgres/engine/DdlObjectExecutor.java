@@ -475,6 +475,7 @@ class DdlObjectExecutor {
         }
         if (checkBodies && "plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
             validatePlpgsqlDeclarations(stmt.body());
+            validatePlpgsqlRaiseArgs(stmt.body());
         }
 
         // Validate SQL language function bodies (only when check_function_bodies=on)
@@ -993,6 +994,68 @@ class DdlObjectExecutor {
             throw e;
         } catch (Exception ignored) {
             // Parse errors in the body are not validation errors at CREATE time
+        }
+    }
+
+    /**
+     * Validate PL/pgSQL RAISE format string vs argument count at CREATE FUNCTION time.
+     * PG validates this eagerly during function creation, not at execution time.
+     */
+    private void validatePlpgsqlRaiseArgs(String body) {
+        try {
+            com.memgres.engine.plpgsql.PlpgsqlStatement.Block block =
+                    com.memgres.engine.plpgsql.PlpgsqlParser.parse(body);
+            validateRaiseInStatements(block.body());
+        } catch (MemgresException e) {
+            throw e;
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void validateRaiseInStatements(java.util.List<com.memgres.engine.plpgsql.PlpgsqlStatement> stmts) {
+        if (stmts == null) return;
+        for (com.memgres.engine.plpgsql.PlpgsqlStatement stmt : stmts) {
+            if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.RaiseStmt) {
+                com.memgres.engine.plpgsql.PlpgsqlStatement.RaiseStmt raise =
+                        (com.memgres.engine.plpgsql.PlpgsqlStatement.RaiseStmt) stmt;
+                if (raise.format != null && raise.argExprs != null) {
+                    int placeholderCount = 0;
+                    for (int i = 0; i < raise.format.length(); i++) {
+                        if (raise.format.charAt(i) == '%') {
+                            if (i + 1 < raise.format.length() && raise.format.charAt(i + 1) == '%') {
+                                i++;
+                            } else {
+                                placeholderCount++;
+                            }
+                        }
+                    }
+                    if (raise.argExprs.size() > placeholderCount) {
+                        throw new MemgresException("too many parameters specified for RAISE", "42601");
+                    }
+                }
+            }
+            // Recurse into nested blocks and control structures
+            if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.Block) {
+                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.Block) stmt).body());
+            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt) {
+                com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt ifStmt =
+                        (com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt) stmt;
+                validateRaiseInStatements(ifStmt.thenBody());
+                if (ifStmt.elsifClauses() != null) {
+                    for (com.memgres.engine.plpgsql.PlpgsqlStatement.ElsifClause elsif : ifStmt.elsifClauses()) {
+                        validateRaiseInStatements(elsif.body());
+                    }
+                }
+                validateRaiseInStatements(ifStmt.elseBody());
+            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.LoopStmt) {
+                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.LoopStmt) stmt).body());
+            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.WhileStmt) {
+                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.WhileStmt) stmt).body());
+            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.ForStmt) {
+                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.ForStmt) stmt).body());
+            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.ForeachStmt) {
+                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.ForeachStmt) stmt).body());
+            }
         }
     }
 

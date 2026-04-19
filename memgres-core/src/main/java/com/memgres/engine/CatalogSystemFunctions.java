@@ -691,11 +691,23 @@ class CatalogSystemFunctions {
             }
             case "txid_status":
             case "pg_xact_status": {
-                // txid_status(bigint) / pg_xact_status(text) → returns 'committed' for known xids
+                // txid_status(bigint) / pg_xact_status(text) → returns status of given xid
                 requireArgs(fn, 1);
                 Object xidArg = executor.evalExpr(fn.args().get(0), ctx);
                 if (xidArg == null) return null;
-                // In memgres, all completed transactions are considered committed
+                // If the xid matches the current transaction and we're in a transaction, it's in progress
+                if (executor.session != null && executor.session.isInTransaction()) {
+                    long currentXid = executor.session.getTransactionId();
+                    long queryXid;
+                    if (xidArg instanceof Number) {
+                        queryXid = ((Number) xidArg).longValue();
+                    } else {
+                        queryXid = Long.parseLong(xidArg.toString());
+                    }
+                    if (queryXid == currentXid) {
+                        return "in progress";
+                    }
+                }
                 return "committed";
             }
             case "pg_visible_in_snapshot": {

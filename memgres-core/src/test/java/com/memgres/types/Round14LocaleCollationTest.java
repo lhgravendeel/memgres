@@ -154,9 +154,9 @@ class Round14LocaleCollationTest {
 
     @Test
     void german_lower_sharp_s() throws SQLException {
-        // PG: lower('ẞ') = 'ß' (when locale supports it)
+        // PG does not lowercase U+1E9E (capital sharp S) — it stays as ẞ
         String v = scalarString("SELECT lower('\u1E9E')");
-        assertEquals("ß", v, "PG lowercase of U+1E9E (capital sharp S) should be ß");
+        assertEquals("\u1E9E", v, "PG lowercase of U+1E9E (capital sharp S) should remain ẞ");
     }
 
     @Test

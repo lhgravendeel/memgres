@@ -334,14 +334,26 @@ class BinaryOpEvaluator {
                             (rightIsRow ? "record" : TypeCoercion.inferType(right) != null ? TypeCoercion.inferType(right).getPgName() : "unknown"),
                             "42883");
                 }
-                // Handle ROW comparison
+                // Handle ROW comparison (NULL propagates) vs ARRAY comparison (NULL=NULL is true)
+                boolean leftIsArray = left instanceof List && !(left instanceof AstExecutor.PgRow);
+                boolean rightIsArray = right instanceof List && !(right instanceof AstExecutor.PgRow);
                 List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
                 List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
                 if (lList != null && rList != null) {
-                    if (lList.size() != rList.size()) throw new MemgresException("cannot compare row values of different sizes", "42601");
+                    if (lList.size() != rList.size()) {
+                        if (leftIsArray && rightIsArray) return false;
+                        throw new MemgresException("cannot compare row values of different sizes", "42601");
+                    }
                     for (int ri = 0; ri < lList.size(); ri++) {
                         Object lv = lList.get(ri), rv = rList.get(ri);
-                        if (lv == null || rv == null) return null;
+                        if (lv == null || rv == null) {
+                            if (leftIsArray && rightIsArray) {
+                                // ARRAY: NULL=NULL is true, NULL!=non-NULL is false
+                                if (lv == null && rv == null) continue;
+                                return false;
+                            }
+                            return null; // ROW: NULL propagates
+                        }
                         if (!TypeCoercion.areEqual(lv, rv)) return false;
                     }
                     return true;

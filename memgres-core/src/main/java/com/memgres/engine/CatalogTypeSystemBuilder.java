@@ -120,9 +120,10 @@ class CatalogTypeSystemBuilder {
         Table table = new Table("pg_extension", cols);
         int pgCatalogNs = oids.oid("ns:pg_catalog");
         table.insertRow(new Object[]{oids.oid("ext:plpgsql"), "plpgsql", 10, pgCatalogNs, false, "1.0", null, null, 1});
-        // Add user-installed extensions
+        // Add user-installed extensions (skip plpgsql, already added above)
         for (java.util.Map.Entry<String, String> entry : database.getInstalledExtensions().entrySet()) {
             String extName = entry.getKey();
+            if ("plpgsql".equalsIgnoreCase(extName)) continue;
             String extVersion = entry.getValue();
             String extSchema = database.getExtensionSchema(extName);
             int extNs = (extSchema != null) ? oids.oid("ns:" + extSchema) : pgCatalogNs;
@@ -750,16 +751,8 @@ class CatalogTypeSystemBuilder {
                 col("amprocnum", DataType.SMALLINT), col("amproc", DataType.INTEGER),
                 col("xmin", DataType.INTEGER));
         Table table = new Table("pg_amproc", cols);
-        int int4Type = 23;
-        int textType = 25;
-        // btree support functions: procnum 1 = compare function
-        // Use btree AM OID (403) as amprocfamily for stub compatibility with
-        // simple joins like JOIN pg_am ON am.oid = amprocfamily
-        int btreeAm = 403;
-        table.insertRow(new Object[]{oids.oid("amproc:int:1"), btreeAm,
-                int4Type, int4Type, (short) 1, 0, 1});
-        table.insertRow(new Object[]{oids.oid("amproc:text:1"), btreeAm,
-                textType, textType, (short) 1, 0, 1});
+        // PG 18 has no btree support procedures in pg_amproc (btree uses pg_amop instead).
+        // Table is intentionally empty for now.
         return table;
     }
 }

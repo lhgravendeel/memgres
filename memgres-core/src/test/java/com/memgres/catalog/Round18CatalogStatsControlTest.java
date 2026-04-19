@@ -191,9 +191,9 @@ class Round18CatalogStatsControlTest {
     }
 
     @Test
-    void pg_database_daticulocale_column() throws SQLException {
-        assertTrue(hasColumn("pg_catalog", "pg_database", "daticulocale"),
-                "pg_database.daticulocale must exist (PG 15+)");
+    void pg_database_datlocale_column() throws SQLException {
+        assertTrue(hasColumn("pg_catalog", "pg_database", "datlocale"),
+                "pg_database.datlocale must exist (renamed from daticulocale in PG 18)");
     }
 
     // =========================================================================

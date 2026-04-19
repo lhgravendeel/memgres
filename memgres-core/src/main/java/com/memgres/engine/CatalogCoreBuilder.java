@@ -92,6 +92,7 @@ class CatalogCoreBuilder {
             "pg_statio_all_tables", "pg_stat_replication",
             "pg_stat_wal_receiver", "pg_stat_xact_all_tables",
             "pg_stat_xact_user_tables",
+            "pg_replication_slots",
             // System indexes (PG includes indexes in pg_class)
             "pg_type_oid_index", "pg_attribute_relid_attnum_index",
             "pg_proc_oid_index", "pg_class_oid_index",
