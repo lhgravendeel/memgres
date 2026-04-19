@@ -829,26 +829,29 @@ class SessionExecutor {
         if (executor.session == null || !executor.session.isInTransaction()) {
             throw new MemgresException("LOCK TABLE can only be used in transaction blocks", "25P01");
         }
-        // Validate table exists (handle schema-qualified names)
-        String schema = executor.defaultSchema();
-        String table = stmt.tableName();
-        if (table.contains(".")) {
-            int dot = table.indexOf('.');
-            schema = table.substring(0, dot);
-            table = table.substring(dot + 1);
-        }
-        executor.resolveTable(schema, table);
-        // Track the lock so pg_locks can expose it
-        String mode = stmt.lockMode() != null ? stmt.lockMode().toUpperCase() : "ACCESS EXCLUSIVE";
         // Convert PG mode name to pg_locks mode column format (e.g. "ACCESS EXCLUSIVE" -> "AccessExclusiveLock")
+        String mode = stmt.lockMode() != null ? stmt.lockMode().toUpperCase() : "ACCESS EXCLUSIVE";
         StringBuilder modeName = new StringBuilder();
         for (String word : mode.split("\\s+")) {
             modeName.append(Character.toUpperCase(word.charAt(0))).append(word.substring(1).toLowerCase());
         }
         modeName.append("Lock");
-        String tableKey = schema + "." + table;
-        executor.session.addTableLock(tableKey, modeName.toString());
-        executor.database.acquireTableLock(tableKey, modeName.toString(), executor.session, stmt.nowait());
+        String modeStr = modeName.toString();
+
+        // Lock each table in the comma-separated list
+        for (String tblName : stmt.tableNames()) {
+            String schema = executor.defaultSchema();
+            String table = tblName;
+            if (table.contains(".")) {
+                int dot = table.indexOf('.');
+                schema = table.substring(0, dot);
+                table = table.substring(dot + 1);
+            }
+            executor.resolveTable(schema, table);
+            String tableKey = schema + "." + table;
+            executor.session.addTableLock(tableKey, modeStr);
+            executor.database.acquireTableLock(tableKey, modeStr, executor.session, stmt.nowait());
+        }
         return QueryResult.message(QueryResult.Type.SET, "LOCK TABLE");
     }
 

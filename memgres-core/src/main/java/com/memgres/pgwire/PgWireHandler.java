@@ -357,6 +357,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     }
                 } catch (MemgresException e) {
                     enrichErrorPosition(e, stmt);
+                    // Log errors that occur inside transactions — these cascade and cause
+                    // all subsequent commands to fail with 25P02, making root-cause hard to find.
+                    if (session != null && session.isInTransaction() && !"25P02".equals(e.getSqlState())) {
+                        LOG.warn("Error in transaction [{}]: {} (SQL: {})",
+                                e.getSqlState(), e.getMessage(), stmt);
+                    }
                     sendErrorWithDetails(ctx, e, false);
                     batchFailed = true;
                 } catch (ArithmeticException e) {
@@ -366,6 +372,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     } else {
                         sendErrorSimple(ctx, "22003", errMsg);
                     }
+                    batchFailed = true;
+                } catch (Exception e) {
+                    // Catch unexpected exceptions (NPE, ClassCast, etc.) during query
+                    // execution or result sending (e.g. COPY TO stdout value formatting).
+                    // Without this, the exception propagates to the outer catch which
+                    // doesn't set batchFailed, or worse, to exceptionCaught() which
+                    // previously killed the connection — causing pg_dump "worker died".
+                    LOG.error("Unexpected error executing statement: {}", stmt, e);
+                    String errDetail = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                    sendErrorSimple(ctx, "XX000", "Internal error: " + errDetail);
                     batchFailed = true;
                 }
             }
@@ -1451,7 +1467,27 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        if (cause instanceof java.io.IOException) {
+            // Network-level errors (broken pipe, connection reset) — just close
+            LOG.debug("Connection I/O error: {}", cause.getMessage());
+            ctx.close();
+            return;
+        }
         LOG.error("Connection error", cause);
-        ctx.close();
+        // Try to send an error response instead of killing the connection.
+        // pg_dump workers die with "worker process died unexpectedly" when the
+        // connection is closed abruptly; sending a proper ErrorResponse lets
+        // libpq report the real error and avoids the cascade.
+        try {
+            if (ctx.channel().isActive()) {
+                String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+                sendErrorSimple(ctx, "XX000", "Internal error: " + msg);
+                sendReadyForQuery(ctx, session);
+            }
+        } catch (Exception e) {
+            // If sending the error also fails, close the connection
+            LOG.debug("Failed to send error response, closing connection", e);
+            ctx.close();
+        }
     }
 }

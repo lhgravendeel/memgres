@@ -912,10 +912,17 @@ class UtilityParser {
         parser.expectKeyword("LOCK");
         parser.matchKeyword("TABLE");
         parser.matchKeyword("ONLY");
-        String tableName = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) {
-            tableName = tableName + "." + parser.readIdentifier(); // schema.table
-        }
+        // Read comma-separated list of table names:
+        // LOCK TABLE t1, schema.t2, t3 IN ACCESS SHARE MODE NOWAIT
+        java.util.List<String> tableNames = new java.util.ArrayList<>();
+        do {
+            parser.matchKeyword("ONLY"); // ONLY can appear before each table
+            String tableName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) {
+                tableName = tableName + "." + parser.readIdentifier(); // schema.table
+            }
+            tableNames.add(tableName);
+        } while (parser.match(TokenType.COMMA));
         String lockMode = "ACCESS EXCLUSIVE"; // default
         if (parser.matchKeyword("IN")) {
             StringBuilder mode = new StringBuilder();
@@ -928,7 +935,7 @@ class UtilityParser {
             lockMode = mode.toString();
         }
         boolean nowait = parser.matchKeyword("NOWAIT");
-        return new LockStmt(tableName, lockMode, nowait);
+        return new LockStmt(tableNames, lockMode, nowait);
     }
 
     // ---- GRANT ----

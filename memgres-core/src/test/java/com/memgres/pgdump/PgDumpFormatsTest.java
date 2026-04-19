@@ -355,20 +355,29 @@ class PgDumpFormatsTest {
         // Parallel dump requires directory format and pg_export_snapshot() support.
         // pg_dump -j opens multiple connections and uses snapshot export for consistency.
         Path dumpDir = tempDir.resolve("dump_parallel");
-        ProcessResult r = runPgDump("-Fd", "-j2", "-f", dumpDir.toString());
 
-        System.out.println("=== pg_dump -Fd -j2 ===");
-        System.out.println("Exit code: " + r.exitCode);
-        if (!r.stderr.isEmpty()) System.out.println("Stderr:\n" + r.stderr);
+        // Enable statement logging to capture exactly what pg_dump sends.
+        // This helps diagnose "could not obtain lock" / "worker died" errors.
+        boolean prevLog = Memgres.logAllStatements;
+        Memgres.logAllStatements = true;
+        try {
+            ProcessResult r = runPgDump("-Fd", "-j2", "-f", dumpDir.toString());
 
-        // Skip if Memgres does not yet support pg_export_snapshot (required for parallel dump)
-        assumeTrue(r.exitCode == 0,
-                "Skipping: parallel dump requires pg_export_snapshot() which Memgres may not yet support. " +
-                "Stderr: " + r.stderr);
+            System.out.println("=== pg_dump -Fd -j2 ===");
+            System.out.println("Exit code: " + r.exitCode);
+            if (!r.stderr.isEmpty()) System.out.println("Stderr:\n" + r.stderr);
 
-        assertTrue(Files.isDirectory(dumpDir), "Parallel dump should create a directory");
-        assertTrue(Files.exists(dumpDir.resolve("toc.dat")),
-                "Parallel dump directory should contain toc.dat");
+            // Skip if Memgres does not yet support pg_export_snapshot (required for parallel dump)
+            assumeTrue(r.exitCode == 0,
+                    "Skipping: parallel dump requires pg_export_snapshot() which Memgres may not yet support. " +
+                    "Stderr: " + r.stderr);
+
+            assertTrue(Files.isDirectory(dumpDir), "Parallel dump should create a directory");
+            assertTrue(Files.exists(dumpDir.resolve("toc.dat")),
+                    "Parallel dump directory should contain toc.dat");
+        } finally {
+            Memgres.logAllStatements = prevLog;
+        }
     }
 
     @Test @Order(8)
