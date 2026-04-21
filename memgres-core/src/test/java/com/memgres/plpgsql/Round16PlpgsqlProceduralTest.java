@@ -146,21 +146,21 @@ class Round16PlpgsqlProceduralTest {
     @Test
     void get_diagnostics_result_oid_populated_after_insert() throws SQLException {
         exec("CREATE TABLE IF NOT EXISTS r16_roid (id int)");
-        exec("CREATE OR REPLACE FUNCTION r16_fn_roid() RETURNS oid AS $$\n"
-                + "DECLARE v_oid oid;\n"
-                + "BEGIN\n"
-                + "  INSERT INTO r16_roid VALUES (1);\n"
-                + "  GET DIAGNOSTICS v_oid = RESULT_OID;\n"
-                + "  RETURN v_oid;\n"
-                + "END;\n"
-                + "$$ LANGUAGE plpgsql");
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT r16_fn_roid()")) {
-            assertTrue(rs.next());
-            // Current Memgres: returns NULL (assigned as default). PG 18: returns last-inserted row OID (0 for tables without OIDs, but must be a non-null oid value type).
-            Object oidObj = rs.getObject(1);
-            assertNotNull(oidObj,
-                    "GET DIAGNOSTICS RESULT_OID must be populated (non-null) after INSERT");
+        // PG 18: RESULT_OID is no longer a valid GET DIAGNOSTICS item; the
+        // function body is rejected at creation time with SQLSTATE 42601.
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE OR REPLACE FUNCTION r16_fn_roid() RETURNS oid AS $$\n"
+                    + "DECLARE v_oid oid;\n"
+                    + "BEGIN\n"
+                    + "  INSERT INTO r16_roid VALUES (1);\n"
+                    + "  GET DIAGNOSTICS v_oid = RESULT_OID;\n"
+                    + "  RETURN v_oid;\n"
+                    + "END;\n"
+                    + "$$ LANGUAGE plpgsql");
+            fail("RESULT_OID in GET DIAGNOSTICS must be rejected with 42601 in PG 18");
+        } catch (SQLException e) {
+            assertEquals("42601", e.getSQLState(),
+                    "GET DIAGNOSTICS RESULT_OID must throw 42601 (syntax_error); got " + e.getSQLState());
         }
     }
 

@@ -201,7 +201,7 @@ SELECT count(*)::text AS c FROM pg_extension WHERE extname = 'plpgsql';
 -- 16. pg_publication queryable
 -- begin-expected
 -- columns: c
--- row: 3
+-- row: 0
 -- end-expected
 SELECT count(*)::text AS c FROM pg_publication;
 

@@ -257,9 +257,8 @@ public class PgCatalogBuilder {
             case "pg_partitioned_table":
                 return stubs.buildPgPartitionedTable();
             case "pg_stat_statements":
-                return stubs.buildPgStatStatements();
             case "pg_stat_statements_info":
-                return stubs.buildPgStatStatementsInfo();
+                throw new MemgresException("pg_stat_statements must be loaded via \"shared_preload_libraries\"", "55000");
             case "pg_stat_archiver":
                 return stubs.buildPgStatArchiver();
             case "pg_stat_io":

@@ -1065,13 +1065,15 @@ class UtilityParser {
             withGrantOption = true;
         }
 
-        // Consume optional GRANTED BY role
-        if (parser.matchKeyword("GRANTED")) {
+        // Consume optional GRANTED BY role and capture the grantor name
+        // Note: GRANTED is not a reserved keyword, so it is tokenized as an IDENTIFIER
+        String grantor = null;
+        if (parser.matchIdentifier("GRANTED")) {
             parser.expectKeyword("BY");
-            parser.readIdentifier(); // grantor role name
+            grantor = parser.readIdentifier();
         }
 
-        return new GrantStmt(privileges, objectType, objectName, grantees, withGrantOption, false, false, columns);
+        return new GrantStmt(privileges, objectType, objectName, grantees, withGrantOption, false, false, columns, grantor);
     }
 
     // ---- REVOKE ----
@@ -1302,8 +1304,13 @@ class UtilityParser {
         parser.expectKeyword("SECURITY");
         parser.expectKeyword("LABEL");
         // SECURITY LABEL [FOR provider] ON object IS 'label'
+        String provider = null;
+        if (parser.matchKeyword("FOR")) {
+            provider = parser.readIdentifier();
+        }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("security_label", "ok");
+        String value = provider != null ? "provider:" + provider : "ok";
+        return new SetStmt("security_label", value);
     }
 
     // ---- ANALYZE ----
@@ -1452,10 +1459,24 @@ class UtilityParser {
     }
 
     SetStmt parseImport() {
-        // IMPORT FOREIGN SCHEMA ... INTO ..., no-op
+        // IMPORT FOREIGN SCHEMA <schema_name> [LIMIT TO (...) | EXCEPT (...)] FROM SERVER <server_name> INTO <local_schema>
         parser.expectKeyword("IMPORT");
+        parser.expectKeyword("FOREIGN");
+        parser.expectKeyword("SCHEMA");
+        // Skip the remote schema name
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)
+                && !parser.checkKeyword("FROM")) {
+            parser.advance();
+        }
+        // Extract server name from FROM SERVER <name>
+        String serverName = null;
+        if (parser.matchKeyword("FROM")) {
+            parser.expectKeyword("SERVER");
+            serverName = parser.readIdentifier();
+        }
+        // Consume the rest of the statement
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("create_noop", "ok");
+        return new SetStmt("import_foreign_schema", serverName != null ? serverName : "");
     }
 
     /** Read a grantee name, which may be an identifier or a keyword like CURRENT_USER, SESSION_USER, PUBLIC. */

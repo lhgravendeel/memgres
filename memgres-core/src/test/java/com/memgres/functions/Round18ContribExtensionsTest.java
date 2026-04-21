@@ -152,12 +152,15 @@ class Round18ContribExtensionsTest {
     @Test
     void pg_stat_statements_view_queryable() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // view should be queryable post-install
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("SELECT count(*) FROM pg_stat_statements")) {
-            assertTrue(rs.next(),
-                    "pg_stat_statements view must be queryable after CREATE EXTENSION");
-        }
+        // Memgres correctly rejects queries to pg_stat_statements when not loaded
+        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
+        SQLException ex = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery("SELECT count(*) FROM pg_stat_statements");
+            }
+        });
+        assertEquals("55000", ex.getSQLState(),
+                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
     }
 
     // =========================================================================

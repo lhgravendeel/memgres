@@ -139,6 +139,9 @@ class SessionExecutor {
                 }
                 return QueryResult.select(cols, rows);
             }
+            if (param.equalsIgnoreCase("pg_stat_statements.max")) {
+                throw new MemgresException("unrecognized configuration parameter \"pg_stat_statements.max\"", "42704");
+            }
             if (guc != null && !guc.isKnown(param) && !param.isEmpty() && !param.contains(".")) {
                 throw new MemgresException("unrecognized configuration parameter \"" + param + "\"", "42704");
             }
@@ -471,6 +474,20 @@ class SessionExecutor {
             executor.database.removeForeignTable(stmt.value());
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
+        if (name.equals("import_foreign_schema")) {
+            String serverName = stmt.value();
+            // Look up the server to get its FDW name for the error message
+            String fdwName = null;
+            if (serverName != null && !serverName.isEmpty()) {
+                Database.FdwServer srv = executor.database.getForeignServer(serverName);
+                if (srv != null) {
+                    fdwName = srv.fdwName;
+                }
+            }
+            String displayFdw = (fdwName != null && !fdwName.isEmpty()) ? fdwName
+                    : (serverName != null && !serverName.isEmpty() ? serverName : "unknown");
+            throw new MemgresException("foreign-data wrapper \"" + displayFdw + "\" has no handler", "55000");
+        }
 
         // ---- Publication / Subscription DDL handling ----
         if (name.equals("create_publication")) {
@@ -693,19 +710,29 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, "ALTER EXTENSION");
         }
 
+        if (name.equals("security_label")) {
+            String val = stmt.value();
+            if (val != null && val.startsWith("provider:")) {
+                String providerName = val.substring("provider:".length());
+                throw new MemgresException(
+                        "security label provider \"" + providerName + "\" is not loaded", "22023");
+            }
+            throw new MemgresException("no security label providers have been loaded", "22023");
+        }
+
         Set<String> internalNames = Cols.setOf("constraints", "transaction",
                 "create_noop", "alter_noop", "drop_noop",
                 "create_statistics", "alter_statistics_rename", "alter_statistics_target", "drop_statistics",
                 "create_fdw", "drop_fdw", "create_server", "drop_server", "alter_server_options",
                 "create_user_mapping", "drop_user_mapping",
-                "create_foreign_table", "drop_foreign_table",
+                "create_foreign_table", "drop_foreign_table", "import_foreign_schema",
                 "create_publication", "alter_publication_add_table", "alter_publication_set_table",
                 "alter_publication_drop_table", "drop_publication",
                 "create_subscription", "drop_subscription",
                 "create_ts_config", "create_ts_dict", "drop_ts_configuration", "drop_ts_dictionary",
                 "drop_ts_parser", "drop_ts_template", "alter_ts_config_mapping",
                 "drop_owned", "reassign_owned", "do_block", "comment",
-                "security_label", "analyze", "vacuum",
+                "analyze", "vacuum",
                 "cluster", "checkpoint", "load");
 
         // PG rejects unknown flat (non-dotted) parameter names with 42704.
@@ -872,6 +899,17 @@ class SessionExecutor {
             "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN", "ALL");
 
     QueryResult executeGrant(GrantStmt s) {
+        // Validate GRANTED BY grantor matches current user
+        if (s.grantor() != null) {
+            String currentUser = executor.sessionUser();
+            String grantorName = s.grantor();
+            if (!grantorName.equalsIgnoreCase("current_user") && !grantorName.equalsIgnoreCase("session_user")
+                    && !grantorName.equalsIgnoreCase("current_role")
+                    && !grantorName.equalsIgnoreCase(currentUser)) {
+                throw new MemgresException("grantor must be current user", "0A000");
+            }
+        }
+
         if (s.isRoleGrant()) {
             // Track role memberships
             if (s.privileges() != null && s.grantees() != null) {

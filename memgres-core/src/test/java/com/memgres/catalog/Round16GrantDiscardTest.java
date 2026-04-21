@@ -57,8 +57,13 @@ class Round16GrantDiscardTest {
         exec("CREATE ROLE r16_grantee");
         exec("DROP TABLE IF EXISTS r16_gt");
         exec("CREATE TABLE r16_gt (id int)");
-        // Must parse — current user must be superuser-equivalent for it to commit.
-        exec("GRANT SELECT ON r16_gt TO r16_grantee GRANTED BY r16_grantor");
+        // GRANTED BY with a role other than the current user must be rejected (0A000)
+        try {
+            exec("GRANT SELECT ON r16_gt TO r16_grantee GRANTED BY r16_grantor");
+            fail("Expected SQLSTATE 0A000: grantor must be current user");
+        } catch (java.sql.SQLException e) {
+            assertEquals("0A000", e.getSQLState(), "Wrong SQLSTATE: " + e.getMessage());
+        }
     }
 
     // =========================================================================

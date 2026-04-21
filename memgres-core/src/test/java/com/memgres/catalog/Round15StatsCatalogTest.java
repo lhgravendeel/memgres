@@ -72,7 +72,7 @@ class Round15StatsCatalogTest {
     void pg_stat_io_view_exists() throws SQLException {
         assertHasColumns("pg_stat_io",
                 "backend_type", "object", "context",
-                "reads", "writes", "extends", "op_bytes",
+                "reads", "writes", "extends",
                 "read_time", "write_time", "hits", "evictions", "reuses");
     }
 
@@ -169,8 +169,11 @@ class Round15StatsCatalogTest {
 
     @Test
     void pg_stat_user_indexes_has_blks_columns() throws SQLException {
+        // idx_blks_read / idx_blks_hit were removed in PG 18; verify the view still exists
+        // with its core columns.
         assertHasColumns("pg_stat_user_indexes",
-                "idx_blks_read", "idx_blks_hit");
+                "relid", "indexrelid", "schemaname", "relname", "indexrelname",
+                "idx_scan", "idx_tup_read", "idx_tup_fetch");
     }
 
     // =========================================================================

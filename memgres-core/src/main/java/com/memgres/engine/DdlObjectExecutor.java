@@ -2352,6 +2352,13 @@ class DdlObjectExecutor {
         int targetOid = resolveTypeOid(stmt.targetType);
         String castMethod = stmt.functionName != null ? "f" : "b";
         int castFunc = 0; // 0 for binary coercible / without function
+        // Binary-compatible casts involving domain types are not allowed
+        if (castMethod.equals("b")) {
+            if (executor.database.getDomain(stmt.sourceType.toLowerCase()) != null
+                    || executor.database.getDomain(stmt.targetType.toLowerCase()) != null) {
+                throw new MemgresException("domain data types must not be marked binary-compatible", "42P17");
+            }
+        }
         // Store in database for inclusion in pg_cast virtual table
         executor.database.addUserCast(sourceOid, targetOid, castFunc, stmt.castContext, castMethod);
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);

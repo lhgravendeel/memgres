@@ -16,6 +16,7 @@ public final class GrantStmt implements Statement {
     public final boolean withAdminOption;
     public final boolean isRoleGrant;
     public final List<String> columns;
+    public final String grantor;
 
     public GrantStmt(
             List<String> privileges,
@@ -27,6 +28,20 @@ public final class GrantStmt implements Statement {
             boolean isRoleGrant,
             List<String> columns
     ) {
+        this(privileges, objectType, objectName, grantees, withGrantOption, withAdminOption, isRoleGrant, columns, null);
+    }
+
+    public GrantStmt(
+            List<String> privileges,
+            String objectType,
+            String objectName,
+            List<String> grantees,
+            boolean withGrantOption,
+            boolean withAdminOption,
+            boolean isRoleGrant,
+            List<String> columns,
+            String grantor
+    ) {
         this.privileges = privileges;
         this.objectType = objectType;
         this.objectName = objectName;
@@ -35,6 +50,7 @@ public final class GrantStmt implements Statement {
         this.withAdminOption = withAdminOption;
         this.isRoleGrant = isRoleGrant;
         this.columns = columns;
+        this.grantor = grantor;
     }
 
     public List<String> privileges() { return privileges; }
@@ -45,6 +61,7 @@ public final class GrantStmt implements Statement {
     public boolean withAdminOption() { return withAdminOption; }
     public boolean isRoleGrant() { return isRoleGrant; }
     public List<String> columns() { return columns; }
+    public String grantor() { return grantor; }
 
     @Override
     public boolean equals(Object o) {
@@ -58,18 +75,19 @@ public final class GrantStmt implements Statement {
             && withGrantOption == that.withGrantOption
             && withAdminOption == that.withAdminOption
             && isRoleGrant == that.isRoleGrant
-            && Objects.equals(columns, that.columns);
+            && Objects.equals(columns, that.columns)
+            && Objects.equals(grantor, that.grantor);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(privileges, objectType, objectName, grantees, withGrantOption, withAdminOption, isRoleGrant, columns);
+        return Objects.hash(privileges, objectType, objectName, grantees, withGrantOption, withAdminOption, isRoleGrant, columns, grantor);
     }
 
     @Override
     public String toString() {
         return "GrantStmt[privileges=" + privileges + ", objectType=" + objectType + ", objectName=" + objectName
             + ", grantees=" + grantees + ", withGrantOption=" + withGrantOption + ", withAdminOption=" + withAdminOption
-            + ", isRoleGrant=" + isRoleGrant + ", columns=" + columns + "]";
+            + ", isRoleGrant=" + isRoleGrant + ", columns=" + columns + ", grantor=" + grantor + "]";
     }
 }

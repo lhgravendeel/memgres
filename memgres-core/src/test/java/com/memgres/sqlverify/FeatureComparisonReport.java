@@ -65,12 +65,14 @@ public class FeatureComparisonReport {
                 "jdbc:postgresql://localhost:" + memgres.getPort() + "/test", "test", "test");
         memgresConn.setAutoCommit(true);
 
-        Connection pgConn = null;
+        Connection[] pgConnHolder = new Connection[1];
         boolean hasPg = true;
         try {
-            pgConn = DriverManager.getConnection(PG_URL, PG_USER, PG_PASS);
-            pgConn.setAutoCommit(true);
-            System.out.println("PG connected: " + pgConn.getMetaData().getDatabaseProductVersion());
+            // Reset PG test database for repeatable results
+            resetPgDatabase();
+            pgConnHolder[0] = DriverManager.getConnection(PG_URL, PG_USER, PG_PASS);
+            pgConnHolder[0].setAutoCommit(true);
+            System.out.println("PG connected: " + pgConnHolder[0].getMetaData().getDatabaseProductVersion());
         } catch (SQLException e) {
             System.out.println("WARNING: Cannot connect to PostgreSQL (" + PG_URL + "): " + e.getMessage());
             System.out.println("Running Memgres-only mode (comparing against annotations).");
@@ -89,9 +91,15 @@ public class FeatureComparisonReport {
 
             FileDifferences fd = new FileDifferences(fileName);
 
-            // Reset connection state between files
+            // Reset connection state between files. If the PG connection has
+            // been terminated by a prior fatal error (pgjdbc marks it closed
+            // and every subsequent statement fails with 08003), reconnect so
+            // we see real PG 18 behavior for this file's statements.
             safeReset(memgresConn);
-            if (hasPg) safeReset(pgConn);
+            if (hasPg) {
+                pgConnHolder[0] = ensureLive(pgConnHolder[0], PG_URL, PG_USER, PG_PASS);
+                safeReset(pgConnHolder[0]);
+            }
 
             for (int bi = 0; bi < blocks.size(); bi++) {
                 Pg18SampleSql5Test.ParsedBlock block = blocks.get(bi);
@@ -100,9 +108,15 @@ public class FeatureComparisonReport {
                 int sectionNum = bi + 1;
                 totalSections++;
 
-                // Execute on both engines
+                // Execute on both engines — reconnect PG if the last statement
+                // closed the session (otherwise every subsequent statement in
+                // this file would cascade with SQLSTATE 08003).
                 SqlVerifyHarness.StatementResult memResult = SqlVerifyHarness.executeStatement(memgresConn, block.sql());
-                SqlVerifyHarness.StatementResult pgResult = hasPg ? SqlVerifyHarness.executeStatement(pgConn, block.sql()) : null;
+                SqlVerifyHarness.StatementResult pgResult = null;
+                if (hasPg) {
+                    pgConnHolder[0] = ensureLive(pgConnHolder[0], PG_URL, PG_USER, PG_PASS);
+                    pgResult = SqlVerifyHarness.executeStatement(pgConnHolder[0], block.sql());
+                }
 
                 // Skip PG comparisons for known PG bugs
                 if (block.pgBugSkip() != null && pgResult != null) {
@@ -180,7 +194,7 @@ public class FeatureComparisonReport {
         // --- Cleanup ---
         memgresConn.close();
         memgres.close();
-        if (pgConn != null) pgConn.close();
+        if (pgConnHolder[0] != null) pgConnHolder[0].close();
     }
 
     // =========================================================================
@@ -517,6 +531,45 @@ public class FeatureComparisonReport {
     // Helpers
     // =========================================================================
 
+    /**
+     * Drops and recreates the PG test database and removes non-system roles
+     * for a fully clean slate. Connects to the 'postgres' database to issue
+     * DROP/CREATE, then disconnects.
+     */
+    private static void resetPgDatabase() throws SQLException {
+        String dbName = "memgrestest";
+        // Extract host/port from PG_URL to connect to 'postgres' DB instead
+        String adminUrl = PG_URL.replaceFirst("/[^/]*$", "/postgres");
+        try (Connection admin = DriverManager.getConnection(adminUrl, PG_USER, PG_PASS)) {
+            admin.setAutoCommit(true);
+            // Terminate existing connections to the test database
+            admin.createStatement().execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '" + dbName + "' AND pid <> pg_backend_pid()");
+            admin.createStatement().execute("DROP DATABASE IF EXISTS " + dbName);
+
+            // Drop non-system roles (roles are cluster-wide, survive DROP DATABASE).
+            // Keep: postgres, the test user, and pg_ system roles.
+            try (ResultSet rs = admin.createStatement().executeQuery(
+                    "SELECT rolname FROM pg_roles WHERE rolname NOT LIKE 'pg_%' AND rolname <> 'postgres' AND rolname <> '" + PG_USER + "'")) {
+                while (rs.next()) {
+                    String role = rs.getString(1);
+                    try {
+                        admin.createStatement().execute("DROP ROLE IF EXISTS " + quoteIdent(role));
+                    } catch (SQLException e) {
+                        // Role may have dependencies in other databases; skip it
+                    }
+                }
+            }
+
+            admin.createStatement().execute("CREATE DATABASE " + dbName + " OWNER " + PG_USER);
+        }
+        System.out.println("PG database '" + dbName + "' reset (dropped and recreated, stale roles removed).");
+    }
+
+    private static String quoteIdent(String ident) {
+        return "\"" + ident.replace("\"", "\"\"") + "\"";
+    }
+
     private static void safeReset(Connection conn) {
         try {
             if (!conn.getAutoCommit()) {
@@ -525,8 +578,44 @@ public class FeatureComparisonReport {
             }
             try (Statement s = conn.createStatement()) {
                 s.execute("SET search_path = public");
+                // Force deterministic locale / TZ so PG and Memgres produce
+                // identical locale-dependent output (money formatting,
+                // extract(timezone ...), session-TZ-dependent to_char, etc.).
+                // The host running the report may have TZ=Europe/X or
+                // lc_monetary=de_DE — we don't want those to show up as
+                // PG-vs-Memgres diffs.
+                try { s.execute("SET TIME ZONE 'UTC'"); } catch (SQLException ignored) {}
+                try { s.execute("SET lc_monetary = 'C'"); } catch (SQLException ignored) {}
+                try { s.execute("SET lc_numeric = 'C'"); } catch (SQLException ignored) {}
+                try { s.execute("SET lc_time = 'C'"); } catch (SQLException ignored) {}
+                try { s.execute("SET DateStyle = 'ISO, MDY'"); } catch (SQLException ignored) {}
+                try { s.execute("SET IntervalStyle = 'postgres'"); } catch (SQLException ignored) {}
             }
         } catch (SQLException ignored) {}
+    }
+
+    /**
+     * Return a live connection. If the given connection is closed (pgjdbc
+     * marks a connection closed after a fatal / protocol-level error and every
+     * subsequent statement fails with 08003 "This connection has been closed"),
+     * open a fresh one using the supplied credentials.
+     */
+    private static Connection ensureLive(Connection conn, String url, String user, String pass) {
+        try {
+            if (conn != null && !conn.isClosed() && conn.isValid(2)) {
+                return conn;
+            }
+        } catch (SQLException ignored) {}
+        try {
+            if (conn != null) {
+                try { conn.close(); } catch (SQLException ignored) {}
+            }
+            Connection fresh = DriverManager.getConnection(url, user, pass);
+            fresh.setAutoCommit(true);
+            return fresh;
+        } catch (SQLException e) {
+            throw new RuntimeException("Could not reconnect to PostgreSQL at " + url + ": " + e.getMessage(), e);
+        }
     }
 
     private static Path findFeatureComparisonDir() {

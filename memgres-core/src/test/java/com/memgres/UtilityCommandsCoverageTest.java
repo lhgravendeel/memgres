@@ -234,14 +234,20 @@ class UtilityCommandsCoverageTest {
     @DisplayName("101.8 SECURITY LABEL ON TABLE")
     void securityLabelOnTable() throws Exception {
         exec("CREATE TABLE sl_t1 (id int)");
-        assertDoesNotThrow(() -> exec("SECURITY LABEL ON TABLE sl_t1 IS 'classified'"));
+        SQLException ex = assertThrows(SQLException.class,
+                () -> exec("SECURITY LABEL ON TABLE sl_t1 IS 'classified'"));
+        assertEquals("22023", ex.getSQLState(),
+                "SECURITY LABEL without a registered provider must throw 22023; got " + ex.getSQLState());
     }
 
     @Test
     @DisplayName("101.9 SECURITY LABEL FOR provider ON TABLE")
     void securityLabelForProviderOnTable() throws Exception {
         exec("CREATE TABLE sl_t2 (id int)");
-        assertDoesNotThrow(() -> exec("SECURITY LABEL FOR dummy_provider ON TABLE sl_t2 IS 'secret'"));
+        SQLException ex = assertThrows(SQLException.class,
+                () -> exec("SECURITY LABEL FOR dummy_provider ON TABLE sl_t2 IS 'secret'"));
+        assertEquals("22023", ex.getSQLState(),
+                "SECURITY LABEL FOR unregistered provider must throw 22023; got " + ex.getSQLState());
     }
 
     // =========================================================================

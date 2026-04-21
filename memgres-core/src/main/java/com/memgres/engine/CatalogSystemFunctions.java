@@ -603,6 +603,9 @@ class CatalogSystemFunctions {
                 if (dataArg instanceof byte[]) data = (byte[]) dataArg;
                 else if (dataArg instanceof String) data = ((String) dataArg).getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 else data = new byte[0];
+                if (!executor.database.getLargeObjectStore().exists(loid)) {
+                    executor.database.getLargeObjectStore().loFromBytea(loid, new byte[0]);
+                }
                 executor.database.getLargeObjectStore().loPut(loid, offset, data);
                 return null;
             }

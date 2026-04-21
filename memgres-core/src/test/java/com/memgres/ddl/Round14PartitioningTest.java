@@ -185,16 +185,17 @@ class Round14PartitioningTest {
 
     @Test
     void fk_referencing_partitioned_table() throws SQLException {
-        exec("CREATE TABLE r14_fk_p (id int PRIMARY KEY, region text) "
+        // PK must include the partition column (region); use composite PK (id, region)
+        exec("CREATE TABLE r14_fk_p (id int, region text, PRIMARY KEY (id, region)) "
                 + "PARTITION BY LIST (region)");
         exec("CREATE TABLE r14_fk_p_us PARTITION OF r14_fk_p FOR VALUES IN ('US')");
         exec("INSERT INTO r14_fk_p VALUES (1, 'US')");
-        exec("CREATE TABLE r14_fk_c (pid int REFERENCES r14_fk_p(id))");
+        exec("CREATE TABLE r14_fk_c (pid int, pregion text, FOREIGN KEY (pid, pregion) REFERENCES r14_fk_p(id, region))");
         // Valid FK insert
-        exec("INSERT INTO r14_fk_c VALUES (1)");
+        exec("INSERT INTO r14_fk_c VALUES (1, 'US')");
         // Invalid FK insert should error
         SQLException ex = assertThrows(SQLException.class,
-                () -> exec("INSERT INTO r14_fk_c VALUES (99)"));
+                () -> exec("INSERT INTO r14_fk_c VALUES (99, 'US')"));
         assertNotNull(ex.getMessage());
     }
 

@@ -1547,10 +1547,8 @@ public class PlpgsqlExecutor {
                         value = scope.get("found");
                         break;
                     case "RESULT_OID":
-                        // PG returns the OID of the last inserted row (0 for tables without OIDs).
-                        // Modern PG tables don't have OIDs, so this is always 0.
-                        value = 0;
-                        break;
+                        throw new com.memgres.engine.MemgresException(
+                                "unrecognized GET DIAGNOSTICS item at or near \"RESULT_OID\"", "42601");
                     case "PG_CONTEXT":
                     case "PG_EXCEPTION_CONTEXT": {
                         // Non-stacked PG_CONTEXT: return current call stack

@@ -126,7 +126,7 @@ CREATE PUBLICATION r14_pub_tt FOR TABLE r14_pub_t1, r14_pub_t2;
 
 -- begin-expected
 -- columns: n
--- row: 0
+-- row: 2
 -- end-expected
 SELECT count(*)::text AS n FROM pg_publication_rel
   WHERE prpubid = (SELECT oid FROM pg_publication WHERE pubname = 'r14_pub_tt');
@@ -134,7 +134,7 @@ SELECT count(*)::text AS n FROM pg_publication_rel
 -- 15. pg_publication_tables view
 -- begin-expected
 -- columns: c
--- row: 0
+-- row: 2
 -- end-expected
 SELECT count(*)::text AS c FROM pg_publication_tables WHERE pubname = 'r14_pub_tt';
 
@@ -144,7 +144,7 @@ ALTER PUBLICATION r14_pub_tt ADD TABLE r14_pub_t3;
 
 -- begin-expected
 -- columns: n
--- row: 1
+-- row: 3
 -- end-expected
 SELECT count(*)::text AS n FROM pg_publication_rel
   WHERE prpubid = (SELECT oid FROM pg_publication WHERE pubname = 'r14_pub_tt');

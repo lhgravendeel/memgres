@@ -1664,8 +1664,8 @@ class FunctionEvaluator {
                 return true;
             }
             case "pg_promote": {
-                // pg_promote(boolean, integer) → boolean — stub, only works on standby, returns false
-                return false;
+                // pg_promote(boolean, integer) → boolean — only valid on a standby server
+                throw new MemgresException("recovery is not in progress", "55000");
             }
             case "pg_safe_snapshot_blocking_pids": {
                 // pg_safe_snapshot_blocking_pids(int) → int[] — stub, returns empty int array
@@ -1696,8 +1696,7 @@ class FunctionEvaluator {
                 return result;
             }
             case "pg_stat_statements_reset": {
-                // pg_stat_statements_reset() → void — stub
-                return null;
+                throw new MemgresException("pg_stat_statements must be loaded via \"shared_preload_libraries\"", "55000");
             }
 
             // ---- sha224 standalone function ----

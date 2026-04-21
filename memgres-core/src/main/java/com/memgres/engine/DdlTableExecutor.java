@@ -299,6 +299,39 @@ class DdlTableExecutor {
             }
         }
 
+        // Validate that PK/UNIQUE constraints on partitioned tables include the partition column
+        if (table.getPartitionStrategy() != null && table.getPartitionColumn() != null) {
+            String rawPartCol = table.getPartitionColumn().toLowerCase().trim();
+            // Strip surrounding parens from expression-based partition keys
+            if (rawPartCol.startsWith("(")) rawPartCol = rawPartCol.substring(1);
+            if (rawPartCol.endsWith(")")) rawPartCol = rawPartCol.substring(0, rawPartCol.length() - 1);
+            rawPartCol = rawPartCol.trim();
+            // Only validate simple column-name partition keys (skip expressions)
+            if (!rawPartCol.contains("(")) {
+                for (String partKeyCol : rawPartCol.split(",")) {
+                    String partKey = partKeyCol.trim();
+                    for (StoredConstraint sc : table.getConstraints()) {
+                        if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                                || sc.getType() == StoredConstraint.Type.UNIQUE) {
+                            boolean found = false;
+                            for (String col : sc.getColumns()) {
+                                if (col.equalsIgnoreCase(partKey)) { found = true; break; }
+                            }
+                            if (!found) {
+                                String constraintKind = sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                                        ? "PRIMARY KEY" : "UNIQUE";
+                                throw new MemgresException(
+                                        "unique constraint on partitioned table must include all partitioning columns\n"
+                                        + "  Detail: " + constraintKind + " constraint missing column \""
+                                        + partKey + "\" which is part of the partition key.",
+                                        "0A000");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Add constraints from LIKE tables
         for (StoredConstraint likeSc : likeConstraints) {
             table.addConstraint(likeSc);

@@ -93,11 +93,12 @@ class Round18TemporalSemanticsTest {
 
     @Test
     void extract_julian_works() throws SQLException {
-        // 2000-01-01 00:00 UTC = Julian 2451544.5
+        // PG 18: extract(julian) is midnight-based.
+        // 2000-01-01 00:00 UTC → Julian day 2451545 (integer, no fractional part).
         String v = str("SELECT extract(julian from '2000-01-01 00:00:00+00'::timestamptz)::text");
         assertNotNull(v);
-        assertTrue(v.startsWith("2451544"),
-                "extract(julian ...) must yield Julian day number; got '" + v + "'");
+        assertTrue(v.startsWith("2451545"),
+                "extract(julian ...) must yield midnight-based Julian day number; got '" + v + "'");
     }
 
     // =========================================================================

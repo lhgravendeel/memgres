@@ -80,10 +80,16 @@ class Round16AdminFunctionsTest {
 
     @Test
     void pg_promote_function_exists() throws SQLException {
-        // In a non-standby cluster pg_promote returns false — accept any bool.
+        // PG 18: pg_promote throws 55000 (object_not_in_prerequisite_state)
+        // when not in standby mode. Verify the function exists and produces
+        // exactly that error.
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery("SELECT pg_promote(false, 0)")) {
+            // If it somehow returns a result row, the function at least exists.
             assertTrue(rs.next(), "pg_promote must exist");
+        } catch (SQLException e) {
+            assertEquals("55000", e.getSQLState(),
+                    "pg_promote on a non-standby must throw 55000; got " + e.getSQLState());
         }
     }
 

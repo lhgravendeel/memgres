@@ -52,10 +52,10 @@ CREATE POLICY r18_rlsm_rest ON r18_rlsm AS RESTRICTIVE FOR SELECT TO r18_rlsu US
 SET ROLE r18_rlsu;
 
 -- 3. Only a=2 row visible
--- begin-expected-error
--- sqlstate: 42P01
--- message-like: does not exist
--- end-expected-error
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
 SELECT count(*)::int AS n FROM r18_rlsm;
 
 RESET ROLE;
@@ -115,10 +115,10 @@ CREATE POLICY r18_rlsfor_p ON r18_rlsfor USING (a = 1);
 SET ROLE r18_rlsow;
 
 -- 7. Only a=1 visible even for owner
--- begin-expected-error
--- sqlstate: 42P01
--- message-like: does not exist
--- end-expected-error
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
 SELECT count(*)::int AS n FROM r18_rlsfor;
 
 RESET ROLE;

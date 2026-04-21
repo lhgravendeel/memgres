@@ -390,18 +390,14 @@ class DateTimeFunctions {
             case "milliseconds":
                 return java.math.BigDecimal.valueOf(dt.getSecond() * 1000L + dt.getNano() / 1_000_000);
             case "julian": {
-                // Julian Day Number: PostgreSQL returns a fractional Julian day where
-                // Julian days start at noon (12:00). Java's JulianFields.JULIAN_DAY
-                // gives the integer Julian day that starts at midnight, so we need to
-                // subtract 0.5 (to shift to the noon-based epoch) and then add
-                // the fractional time-of-day.
+                // Julian Day Number: PostgreSQL uses midnight-based Julian days.
+                // Java's JulianFields.JULIAN_DAY also starts at midnight, so no
+                // offset adjustment is needed — just add the fractional time-of-day.
                 long julianDay = dt.toLocalDate().getLong(java.time.temporal.JulianFields.JULIAN_DAY);
                 long dayMicros = (dt.getHour() * 3600L + dt.getMinute() * 60L + dt.getSecond()) * 1_000_000L + dt.getNano() / 1000;
                 java.math.BigDecimal frac = java.math.BigDecimal.valueOf(dayMicros).divide(
                         java.math.BigDecimal.valueOf(86400_000_000L), 6, java.math.RoundingMode.HALF_UP);
-                // Subtract 0.5 because Julian days begin at noon, not midnight
                 return java.math.BigDecimal.valueOf(julianDay)
-                        .subtract(new java.math.BigDecimal("0.5"))
                         .add(frac).stripTrailingZeros();
             }
             case "timezone":

@@ -338,9 +338,7 @@ class CatalogStubBuilder {
                 col("idx_scan", DataType.BIGINT),
                 col("last_idx_scan", DataType.TIMESTAMPTZ),
                 col("idx_tup_read", DataType.BIGINT),
-                col("idx_tup_fetch", DataType.BIGINT),
-                col("idx_blks_read", DataType.BIGINT),
-                col("idx_blks_hit", DataType.BIGINT)
+                col("idx_tup_fetch", DataType.BIGINT)
         );
         Table table = new Table("pg_stat_user_indexes", cols);
         // Track which indexes we've already added (to avoid duplicates)
@@ -1978,7 +1976,6 @@ class CatalogStubBuilder {
                 col("writeback_time", DataType.DOUBLE_PRECISION),
                 col("extends", DataType.BIGINT),
                 col("extend_time", DataType.DOUBLE_PRECISION),
-                col("op_bytes", DataType.BIGINT),
                 col("hits", DataType.BIGINT),
                 col("evictions", DataType.BIGINT),
                 col("reuses", DataType.BIGINT),
