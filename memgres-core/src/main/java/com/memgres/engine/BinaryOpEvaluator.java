@@ -123,6 +123,20 @@ class BinaryOpEvaluator {
             }
         }
 
+        // json type does not support LIKE operator
+        if (bin.op() == BinaryExpr.BinOp.LIKE || bin.op() == BinaryExpr.BinOp.ILIKE) {
+            if (isCastToType(bin.left(), "json")) {
+                throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
+            }
+            if (bin.left() instanceof FunctionCallExpr) {
+                String fnName = ((FunctionCallExpr) bin.left()).name().toLowerCase();
+                if (fnName.equals("row_to_json") || fnName.equals("to_json") || fnName.equals("json_build_object")
+                        || fnName.equals("json_build_array") || fnName.equals("json_agg") || fnName.equals("json_object")) {
+                    throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
+                }
+            }
+        }
+
         // When || has an operand explicitly cast to text, force text concatenation
         // to avoid heuristic array detection on strings like "{1,2}"
         if (bin.op() == BinaryExpr.BinOp.CONCAT && left != null && right != null
@@ -1687,6 +1701,26 @@ class BinaryOpEvaluator {
                     return RangeOperations.areAdjacent(RangeOperations.parse(ls), RangeOperations.parse(rs));
                 }
                 return false;
+            }
+            case LIKE: {
+                if (left == null || right == null) return null;
+                if (left instanceof Number || left instanceof Boolean) {
+                    String tn = left instanceof Integer ? "integer" : left instanceof Long ? "bigint" :
+                            left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase();
+                    throw new MemgresException("operator does not exist: " + tn + " ~~ unknown", "42883");
+                }
+                String likePattern = AstExecutor.likeToRegex(right.toString());
+                return left.toString().matches("(?s)" + likePattern);
+            }
+            case ILIKE: {
+                if (left == null || right == null) return null;
+                String ilikePattern = AstExecutor.likeToRegex(right.toString());
+                return left.toString().matches("(?si)" + ilikePattern);
+            }
+            case SIMILAR_TO: {
+                if (left == null || right == null) return null;
+                String simPattern = similarToRegexForBinaryOp(right.toString(), "\\");
+                return left.toString().matches("(?s)" + simPattern);
             }
             default:
                 return null;

@@ -443,6 +443,17 @@ class SelectAggregateEvaluator {
             if (found) return !in.negated();
             if (hasNull) return null;
             return in.negated();
+        } else if (expr instanceof LikeExpr) {
+            LikeExpr like = (LikeExpr) expr;
+            Object left = evalAggregateExpr(like.left(), group, representative);
+            Object pattern = evalAggregateExpr(like.pattern(), group, representative);
+            if (left == null || pattern == null) return null;
+            // Rebuild with resolved values and delegate to ExprEvaluator
+            LikeExpr resolved = new LikeExpr(
+                    Literal.ofString(left.toString()),
+                    Literal.ofString(pattern.toString()),
+                    like.escape(), like.caseInsensitive(), like.negated());
+            return executor.evalExpr(resolved, representative);
         } else if (expr instanceof WindowFuncExpr) {
             return null;
         } else if (expr instanceof Literal) {

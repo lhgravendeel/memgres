@@ -34,6 +34,9 @@ class Round15UuidAndXactFnsTest {
                 memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"");
+        }
     }
 
     @AfterAll

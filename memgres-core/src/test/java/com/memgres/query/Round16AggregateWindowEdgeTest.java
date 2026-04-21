@@ -2,6 +2,7 @@ package com.memgres.query;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
+import org.postgresql.util.PSQLException;
 
 import java.sql.*;
 
@@ -110,15 +111,17 @@ class Round16AggregateWindowEdgeTest {
         exec("DROP TABLE IF EXISTS r16_nv");
         exec("CREATE TABLE r16_nv (id int, v int)");
         exec("INSERT INTO r16_nv VALUES (1,10),(2,20),(3,30),(4,40)");
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(
-                     "SELECT id, nth_value(v, 2) FROM LAST OVER " +
-                             "(ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) " +
-                             "FROM r16_nv ORDER BY id")) {
-            assertTrue(rs.next());
-            assertEquals(30, rs.getInt(2),
-                    "nth_value(v, 2) FROM LAST over full frame must be v at second-to-last row = 30");
-        }
+        // PG 18: nth_value FROM LAST is rejected with a parse error
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery(
+                        "SELECT id, nth_value(v, 2) FROM LAST OVER " +
+                                "(ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) " +
+                                "FROM r16_nv ORDER BY id");
+            }
+        });
+        assertTrue(ex.getMessage().contains("syntax error"),
+                "Expected syntax error for nth_value FROM LAST, got: " + ex.getMessage());
     }
 
     @Test
@@ -126,14 +129,16 @@ class Round16AggregateWindowEdgeTest {
         exec("DROP TABLE IF EXISTS r16_nvn");
         exec("CREATE TABLE r16_nvn (id int, v int)");
         exec("INSERT INTO r16_nvn VALUES (1, NULL), (2, 10), (3, NULL), (4, 20)");
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(
-                     "SELECT nth_value(v, 2) IGNORE NULLS OVER " +
-                             "(ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) " +
-                             "FROM r16_nvn ORDER BY id LIMIT 1")) {
-            assertTrue(rs.next());
-            assertEquals(20, rs.getInt(1),
-                    "nth_value(v,2) IGNORE NULLS must skip null v's — 2nd non-null is 20");
-        }
+        // PG 18: IGNORE NULLS on nth_value is rejected with a parse error
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery(
+                        "SELECT nth_value(v, 2) IGNORE NULLS OVER " +
+                                "(ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) " +
+                                "FROM r16_nvn ORDER BY id LIMIT 1");
+            }
+        });
+        assertTrue(ex.getMessage().contains("syntax error"),
+                "Expected syntax error for nth_value IGNORE NULLS, got: " + ex.getMessage());
     }
 }

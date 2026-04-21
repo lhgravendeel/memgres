@@ -2,6 +2,7 @@ package com.memgres.query;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
+import org.postgresql.util.PSQLException;
 
 import java.sql.*;
 
@@ -75,13 +76,13 @@ class Round18ArrayAggregateSemanticsTest {
     // =========================================================================
 
     @Test
-    void array_sample_three_arg_form_deterministic() throws SQLException {
-        // With same seed, two calls must match.
-        String a = str("SELECT array_sample(ARRAY[1,2,3,4,5,6,7,8,9,10], 3, 42)::text");
-        String b = str("SELECT array_sample(ARRAY[1,2,3,4,5,6,7,8,9,10], 3, 42)::text");
-        assertNotNull(a);
-        assertEquals(a, b,
-                "array_sample(arr, n, seed) with same seed must be deterministic; got '" + a + "' vs '" + b + "'");
+    void array_sample_three_arg_form_deterministic() {
+        // PG 18 removed the 3-argument form of array_sample; expect a "does not exist" error.
+        PSQLException ex = assertThrows(PSQLException.class,
+                () -> str("SELECT array_sample(ARRAY[1,2,3,4,5,6,7,8,9,10], 3, 42)::text"),
+                "array_sample(arr, n, seed) 3-arg form should be rejected in PG 18");
+        assertTrue(ex.getMessage().contains("does not exist"),
+                "Expected 'does not exist' in error message; got: " + ex.getMessage());
     }
 
     // =========================================================================

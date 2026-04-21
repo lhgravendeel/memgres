@@ -38,7 +38,7 @@ class DmlExecutor {
     /** Record row metadata (xmin, cmin) for system column support. */
     void recordRowMeta(String schema, Table table, Object[] row) {
         if (executor.session != null && executor.database != null) {
-            String tableKey = (schema != null ? schema : "public") + "." + table.getName();
+            String tableKey = resolveTableSchemaKey(schema, table);
             long xmin = executor.session.getTransactionId();
             long cmin = executor.session.getCommandId();
             executor.database.setRowInsertMeta(tableKey, row, xmin, cmin);
@@ -48,11 +48,24 @@ class DmlExecutor {
     /** Record row metadata update (new ctid after UPDATE). */
     void recordRowUpdateMeta(String schema, Table table, Object[] row) {
         if (executor.session != null && executor.database != null) {
-            String tableKey = (schema != null ? schema : "public") + "." + table.getName();
+            String tableKey = resolveTableSchemaKey(schema, table);
             long xmin = executor.session.getTransactionId();
             long cmin = executor.session.getCommandId();
             executor.database.setRowUpdateMeta(tableKey, row, xmin, cmin);
         }
+    }
+
+    /** Resolve the schema-qualified key for a table's row metadata.
+     *  When schema is null, find the actual schema by scanning database schemas. */
+    private String resolveTableSchemaKey(String schema, Table table) {
+        if (schema != null) return schema + "." + table.getName();
+        // Find the actual schema containing this table instance
+        for (Map.Entry<String, Schema> e : executor.database.getSchemas().entrySet()) {
+            if (e.getValue().getTable(table.getName()) == table) {
+                return e.getKey() + "." + table.getName();
+            }
+        }
+        return "public." + table.getName();
     }
 
     /** Push CTE scope, execute action, pop CTE scope. DRYs INSERT/UPDATE/DELETE CTE handling. */

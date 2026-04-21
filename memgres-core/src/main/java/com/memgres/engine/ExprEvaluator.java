@@ -1271,11 +1271,25 @@ class ExprEvaluator {
         Object leftVal = evalExpr(like.left(), ctx);
         Object patternVal = evalExpr(like.pattern(), ctx);
         if (leftVal == null || patternVal == null) return null;
-        // PG only allows LIKE on text-like types; reject integers, booleans, etc.
+        // PG only allows LIKE on text-like types; reject integers, booleans, json, etc.
         if (leftVal instanceof Number || leftVal instanceof Boolean) {
             String typeName = leftVal instanceof Integer ? "integer" : leftVal instanceof Long ? "bigint" :
                     leftVal instanceof Boolean ? "boolean" : leftVal.getClass().getSimpleName().toLowerCase();
             throw new MemgresException("operator does not exist: " + typeName + " ~~ unknown", "42883");
+        }
+        // Check if left operand comes from a json-returning function
+        if (like.left() instanceof FunctionCallExpr) {
+            String fnName = ((FunctionCallExpr) like.left()).name().toLowerCase();
+            if (fnName.equals("row_to_json") || fnName.equals("to_json") || fnName.equals("json_build_object")
+                    || fnName.equals("json_build_array") || fnName.equals("json_agg") || fnName.equals("json_object")) {
+                throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
+            }
+        }
+        if (like.left() instanceof CastExpr) {
+            String castType = ((CastExpr) like.left()).typeName().toLowerCase();
+            if (castType.equals("json")) {
+                throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
+            }
         }
         String str = leftVal.toString();
         String pat = patternVal.toString();

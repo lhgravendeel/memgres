@@ -460,10 +460,10 @@ public class ExpressionParser {
                 else if (matchKeyword("ARRAY")) jt = IsJsonExpr.JsonType.ARRAY;
                 else if (matchKeyword("SCALAR")) jt = IsJsonExpr.JsonType.SCALAR;
                 else if (matchKeyword("VALUE")) jt = IsJsonExpr.JsonType.VALUE;
-                else if (matchKeyword("BOOLEAN")) jt = IsJsonExpr.JsonType.BOOLEAN;
-                else if (matchKeyword("NULL")) jt = IsJsonExpr.JsonType.NULL;
-                else if (checkIdentCI("STRING")) { advance(); jt = IsJsonExpr.JsonType.STRING; }
-                else if (checkIdentCI("NUMBER")) { advance(); jt = IsJsonExpr.JsonType.NUMBER; }
+                else if (checkKeyword("BOOLEAN")) throw new ParseException("syntax error at or near \"BOOLEAN\"", peek());
+                else if (checkKeyword("NULL")) throw new ParseException("syntax error at or near \"NULL\"", peek());
+                else if (checkIdentCI("STRING")) throw new ParseException("syntax error at or near \"STRING\"", peek());
+                else if (checkIdentCI("NUMBER")) throw new ParseException("syntax error at or near \"NUMBER\"", peek());
                 boolean uniqueKeys = false;
                 if (matchKeywords("WITH", "UNIQUE")) {
                     expectKeyword("KEYS");
@@ -1378,30 +1378,29 @@ public class ExpressionParser {
             expect(TokenType.RIGHT_PAREN);
         }
 
-        // Check for IGNORE NULLS / RESPECT NULLS modifier (window functions)
-        // Syntax: func(args) IGNORE NULLS OVER (...) or func(args) RESPECT NULLS OVER (...)
-        // IGNORE and RESPECT are non-reserved words (identifiers), NULLS is a keyword.
+        // IGNORE NULLS / RESPECT NULLS: PG 18 does not support this syntax.
+        // Reject with syntax error to match PG 18 behavior.
         if (checkIdentifier("IGNORE") || checkIdentifier("RESPECT")) {
             int saved = pos;
             boolean isIgnore = matchIdentifier("IGNORE");
             if (!isIgnore) matchIdentifier("RESPECT");
-            if (matchKeyword("NULLS")) {
-                ignoreNulls = isIgnore;
+            if (checkKeyword("NULLS")) {
+                throw new ParseException("syntax error at or near \"NULLS\"", peek());
             } else {
                 // Not followed by NULLS — restore position
                 pos = saved;
             }
         }
 
-        // Check for FROM LAST / FROM FIRST modifier (nth_value)
+        // FROM FIRST / FROM LAST: PG 18 does not support this syntax.
+        // Reject with syntax error to match PG 18 behavior.
         boolean fromLast = false;
         if (checkKeyword("FROM")) {
             int saved = pos;
             advance();
-            if (matchKeyword("LAST")) {
-                fromLast = true;
-            } else if (matchKeyword("FIRST")) {
-                fromLast = false;
+            if (checkKeyword("LAST") || checkKeyword("FIRST")) {
+                // PG 18: syntax error at or near "ORDER" (the OVER keyword that follows)
+                throw new ParseException("syntax error at or near \"ORDER\"", peek());
             } else {
                 pos = saved;
             }

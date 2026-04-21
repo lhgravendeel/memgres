@@ -110,13 +110,13 @@ class Round18ContribExtensionsTest {
     @Test
     void btree_gin_install() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS btree_gin");
-        // btree_gin should register integer_ops opfamily for gin.
+        // btree_gin should register int4_ops opfamily for gin (PG 18 uses int4_ops, not integer_ops).
         int n = int1(
                 "SELECT count(*)::int FROM pg_opfamily f " +
                         "JOIN pg_am a ON a.oid=f.opfmethod " +
-                        "WHERE a.amname='gin' AND f.opfname='integer_ops'");
+                        "WHERE a.amname='gin' AND f.opfname='int4_ops'");
         assertTrue(n >= 1,
-                "btree_gin must install gin integer_ops opfamily; got " + n);
+                "btree_gin must install gin int4_ops opfamily; got " + n);
     }
 
     // =========================================================================
@@ -129,9 +129,9 @@ class Round18ContribExtensionsTest {
         int n = int1(
                 "SELECT count(*)::int FROM pg_opfamily f " +
                         "JOIN pg_am a ON a.oid=f.opfmethod " +
-                        "WHERE a.amname='gist' AND f.opfname='integer_ops'");
+                        "WHERE a.amname='gist' AND f.opfname='int4_ops'");
         assertTrue(n >= 1,
-                "btree_gist must install gist integer_ops opfamily; got " + n);
+                "btree_gist must install gist int4_ops opfamily; got " + n);
     }
 
     // =========================================================================

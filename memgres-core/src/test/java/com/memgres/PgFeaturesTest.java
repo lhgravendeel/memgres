@@ -216,6 +216,7 @@ class PgFeaturesTest {
         try (Connection conn = connect();
              Statement stmt = conn.createStatement()) {
 
+            stmt.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"");
             try (ResultSet rs = stmt.executeQuery("SELECT uuid_generate_v4() AS id")) {
                 assertTrue(rs.next());
                 String uuid = rs.getString("id");
@@ -231,6 +232,7 @@ class PgFeaturesTest {
         try (Connection conn = connect();
              Statement stmt = conn.createStatement()) {
 
+            stmt.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"");
             String uuid1, uuid2;
             try (ResultSet rs = stmt.executeQuery("SELECT uuid_generate_v4() AS id")) {
                 rs.next();

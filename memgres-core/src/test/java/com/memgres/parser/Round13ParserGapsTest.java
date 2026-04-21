@@ -111,28 +111,39 @@ class Round13ParserGapsTest {
     }
 
     @Test
-    void is_json_number() throws SQLException {
-        // Only the literal (scalar number) matches
-        assertTrue(scalarBool("SELECT '42' IS JSON NUMBER"));
-        assertFalse(scalarBool("SELECT '\"hi\"' IS JSON NUMBER"));
+    void is_json_number() {
+        // IS JSON NUMBER is rejected to match PG 18 behavior
+        SQLException ex = assertThrows(SQLException.class,
+                () -> scalarBool("SELECT '42' IS JSON NUMBER"));
+        assertTrue(ex.getMessage().toLowerCase().contains("syntax error"),
+                "expected syntax error; got: " + ex.getMessage());
     }
 
     @Test
-    void is_json_string() throws SQLException {
-        assertTrue(scalarBool("SELECT '\"abc\"' IS JSON STRING"));
-        assertFalse(scalarBool("SELECT '42' IS JSON STRING"));
+    void is_json_string() {
+        // IS JSON STRING is rejected to match PG 18 behavior
+        SQLException ex = assertThrows(SQLException.class,
+                () -> scalarBool("SELECT '\"abc\"' IS JSON STRING"));
+        assertTrue(ex.getMessage().toLowerCase().contains("syntax error"),
+                "expected syntax error; got: " + ex.getMessage());
     }
 
     @Test
-    void is_json_boolean() throws SQLException {
-        assertTrue(scalarBool("SELECT 'true' IS JSON BOOLEAN"));
-        assertFalse(scalarBool("SELECT '42' IS JSON BOOLEAN"));
+    void is_json_boolean() {
+        // IS JSON BOOLEAN is rejected to match PG 18 behavior
+        SQLException ex = assertThrows(SQLException.class,
+                () -> scalarBool("SELECT 'true' IS JSON BOOLEAN"));
+        assertTrue(ex.getMessage().toLowerCase().contains("syntax error"),
+                "expected syntax error; got: " + ex.getMessage());
     }
 
     @Test
-    void is_json_null() throws SQLException {
-        assertTrue(scalarBool("SELECT 'null' IS JSON NULL"));
-        assertFalse(scalarBool("SELECT '42' IS JSON NULL"));
+    void is_json_null() {
+        // IS JSON NULL is rejected to match PG 18 behavior
+        SQLException ex = assertThrows(SQLException.class,
+                () -> scalarBool("SELECT 'null' IS JSON NULL"));
+        assertTrue(ex.getMessage().toLowerCase().contains("syntax error"),
+                "expected syntax error; got: " + ex.getMessage());
     }
 
     @Test

@@ -571,6 +571,14 @@ class ConstraintValidator {
                         parentVals[i] = deletedRow[parentColIndices[i]];
                     }
 
+                    // Check replica identity for child table when it will be modified by FK cascade
+                    if (sc.getOnDelete() == StoredConstraint.FkAction.SET_NULL
+                            || sc.getOnDelete() == StoredConstraint.FkAction.SET_DEFAULT
+                            || sc.getOnDelete() == StoredConstraint.FkAction.CASCADE) {
+                        checkChildTableReplicaIdentity(childTable,
+                                sc.getOnDelete() == StoredConstraint.FkAction.CASCADE ? "delete" : "update");
+                    }
+
                     switch (sc.getOnDelete()) {
                         case CASCADE: {
                             // Collect rows to delete, then use Table.deleteRows for proper index maintenance
@@ -1332,6 +1340,27 @@ class ConstraintValidator {
     /** Check if a string matches the pg_lsn format: hex/hex (e.g., "0/4000000"). */
     private static boolean isLsnString(String s) {
         return s.matches("[0-9a-fA-F]+/[0-9a-fA-F]+");
+    }
+
+    /** Check if a child table affected by FK cascade is published and needs replica identity. */
+    private void checkChildTableReplicaIdentity(Table childTable, String dmlVerb) {
+        if (executor.database.getPublications().isEmpty()) return;
+        String tableName = childTable.getName();
+        boolean published = false;
+        for (Database.PubDef pub : executor.database.getPublications().values()) {
+            if (pub.allTables) { published = true; break; }
+            for (String t : pub.tables) {
+                if (t.equalsIgnoreCase(tableName)) { published = true; break; }
+            }
+            if (published) break;
+        }
+        if (published && !childTable.hasUsableReplicaIdentity()) {
+            String verb = "update".equals(dmlVerb) ? "updates" : "deletes";
+            throw new MemgresException(
+                    "cannot " + dmlVerb + " table \"" + tableName
+                            + "\" because it does not have a replica identity and publishes " + verb,
+                    "55000");
+        }
     }
 
 }

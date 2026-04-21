@@ -57,13 +57,9 @@ class SelectParser {
 
             boolean all = parser.matchKeyword("ALL");
             parser.matchKeyword("DISTINCT");
-            // PG: CORRESPONDING [BY (col, ...)] - match columns by name
-            if (!parser.matchKeyword("CORRESPONDING")) parser.matchIdentifier("CORRESPONDING");
-            if (parser.matchKeyword("BY")) {
-                // consume column list
-                parser.expect(TokenType.LEFT_PAREN);
-                parser.parseIdentifierList();
-                parser.expect(TokenType.RIGHT_PAREN);
+            // PG 18 does not support CORRESPONDING — reject with syntax error.
+            if (parser.checkKeyword("CORRESPONDING") || parser.checkIdentifier("CORRESPONDING")) {
+                throw new ParseException("syntax error at or near \"CORRESPONDING\"", parser.peek());
             }
 
             Statement right;
@@ -114,11 +110,9 @@ class SelectParser {
             boolean all = parser.matchKeyword("ALL");
             parser.matchKeyword("DISTINCT");
             // PG: CORRESPONDING [BY (col, ...)]
-            if (!parser.matchKeyword("CORRESPONDING")) parser.matchIdentifier("CORRESPONDING");
-            if (parser.matchKeyword("BY")) {
-                parser.expect(TokenType.LEFT_PAREN);
-                parser.parseIdentifierList();
-                parser.expect(TokenType.RIGHT_PAREN);
+            // PG 18 does not support CORRESPONDING — reject with syntax error.
+            if (parser.checkKeyword("CORRESPONDING") || parser.checkIdentifier("CORRESPONDING")) {
+                throw new ParseException("syntax error at or near \"CORRESPONDING\"", parser.peek());
             }
 
             Statement right;

@@ -2,6 +2,7 @@ package com.memgres.query;
 
 import com.memgres.core.Memgres;
 import org.junit.jupiter.api.*;
+import org.postgresql.util.PSQLException;
 
 import java.sql.*;
 
@@ -71,43 +72,44 @@ class Round14WindowFramesTest {
     // =========================================================================
 
     @Test
-    void lag_ignore_nulls() throws SQLException {
-        // lag IGNORE NULLS should skip NULL values when looking back
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(
-                     "SELECT id, lag(v, 1) IGNORE NULLS OVER (ORDER BY id) AS prev "
-                             + "FROM r14_win ORDER BY id")) {
-            rs.next(); // id=1, prev=NULL (nothing before)
-            rs.next(); // id=2, prev=NULL (id=1 v is NULL, skipped → no value)
-            rs.next(); // id=3, prev=10 (skipped id=1 NULL, found id=2 v=10)
-            assertEquals(10, rs.getInt("prev"));
-            rs.next(); // id=4, prev=10
-            assertEquals(10, rs.getInt("prev"));
-            rs.next(); // id=5, prev=20
-            assertEquals(20, rs.getInt("prev"));
-        }
+    void lag_ignore_nulls() {
+        // PG 18: IGNORE NULLS on lag is rejected with a parse error
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery(
+                        "SELECT id, lag(v, 1) IGNORE NULLS OVER (ORDER BY id) AS prev "
+                                + "FROM r14_win ORDER BY id");
+            }
+        });
+        assertTrue(ex.getMessage().contains("syntax error"),
+                "Expected syntax error for IGNORE NULLS on lag, got: " + ex.getMessage());
     }
 
     @Test
-    void lead_ignore_nulls() throws SQLException {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(
-                     "SELECT id, lead(v, 1) IGNORE NULLS OVER (ORDER BY id) AS nxt "
-                             + "FROM r14_win ORDER BY id")) {
-            rs.next(); // id=1, nxt=10
-            assertEquals(10, rs.getInt("nxt"));
-            rs.next(); // id=2, nxt=20
-            assertEquals(20, rs.getInt("nxt"));
-        }
+    void lead_ignore_nulls() {
+        // PG 18: IGNORE NULLS on lead is rejected with a parse error
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery(
+                        "SELECT id, lead(v, 1) IGNORE NULLS OVER (ORDER BY id) AS nxt "
+                                + "FROM r14_win ORDER BY id");
+            }
+        });
+        assertTrue(ex.getMessage().contains("syntax error"),
+                "Expected syntax error for IGNORE NULLS on lead, got: " + ex.getMessage());
     }
 
     @Test
-    void first_value_ignore_nulls() throws SQLException {
-        String v = scalarString(
-                "SELECT first_value(v) IGNORE NULLS OVER (ORDER BY id "
-                        + "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)::text "
-                        + "FROM r14_win ORDER BY id LIMIT 1");
-        assertEquals("10", v, "first_value IGNORE NULLS must skip initial NULL");
+    void first_value_ignore_nulls() {
+        // PG 18: IGNORE NULLS on first_value is rejected with a parse error
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            scalarString(
+                    "SELECT first_value(v) IGNORE NULLS OVER (ORDER BY id "
+                            + "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)::text "
+                            + "FROM r14_win ORDER BY id LIMIT 1");
+        });
+        assertTrue(ex.getMessage().contains("syntax error"),
+                "Expected syntax error for IGNORE NULLS on first_value, got: " + ex.getMessage());
     }
 
     @Test
@@ -125,23 +127,29 @@ class Round14WindowFramesTest {
     // =========================================================================
 
     @Test
-    void nth_value_from_first() throws SQLException {
-        int v = scalarInt(
-                "SELECT nth_value(v, 2) FROM FIRST OVER (ORDER BY id "
-                        + "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) "
-                        + "FROM r14_win ORDER BY id LIMIT 1");
-        // 2nd value in the frame is NULL (id=2 v=10) — but PG returns v at rownum=2, which is 10
-        assertEquals(10, v);
+    void nth_value_from_first() {
+        // PG 18: nth_value FROM FIRST is rejected with a parse error
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            scalarInt(
+                    "SELECT nth_value(v, 2) FROM FIRST OVER (ORDER BY id "
+                            + "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) "
+                            + "FROM r14_win ORDER BY id LIMIT 1");
+        });
+        assertTrue(ex.getMessage().contains("syntax error"),
+                "Expected syntax error for nth_value FROM FIRST, got: " + ex.getMessage());
     }
 
     @Test
-    void nth_value_from_last() throws SQLException {
-        int v = scalarInt(
-                "SELECT nth_value(v, 2) FROM LAST OVER (ORDER BY id "
-                        + "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) "
-                        + "FROM r14_win ORDER BY id LIMIT 1");
-        // 2nd from last: id=5 v=NULL (with default RESPECT NULLS -> 0 from getInt)
-        assertEquals(0, v);
+    void nth_value_from_last() {
+        // PG 18: nth_value FROM LAST is rejected with a parse error
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            scalarInt(
+                    "SELECT nth_value(v, 2) FROM LAST OVER (ORDER BY id "
+                            + "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) "
+                            + "FROM r14_win ORDER BY id LIMIT 1");
+        });
+        assertTrue(ex.getMessage().contains("syntax error"),
+                "Expected syntax error for nth_value FROM LAST, got: " + ex.getMessage());
     }
 
     // =========================================================================
@@ -178,16 +186,17 @@ class Round14WindowFramesTest {
     // =========================================================================
 
     @Test
-    void union_corresponding_matches_by_name() throws SQLException {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(
-                     "SELECT 1 AS a, 2 AS b UNION CORRESPONDING SELECT 3 AS b, 4 AS a "
-                             + "ORDER BY a")) {
-            // CORRESPONDING matches by column name; both sides contribute a,b pairs
-            int rows = 0;
-            while (rs.next()) rows++;
-            assertEquals(2, rows);
-        }
+    void union_corresponding_matches_by_name() {
+        // PG 18: UNION CORRESPONDING is rejected with a parse error
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery(
+                        "SELECT 1 AS a, 2 AS b UNION CORRESPONDING SELECT 3 AS b, 4 AS a "
+                                + "ORDER BY a");
+            }
+        });
+        assertTrue(ex.getMessage().contains("syntax error"),
+                "Expected syntax error for UNION CORRESPONDING, got: " + ex.getMessage());
     }
 
     // =========================================================================
@@ -239,17 +248,19 @@ class Round14WindowFramesTest {
     // =========================================================================
 
     @Test
-    void mutual_recursion_two_ctes() throws SQLException {
-        // Two CTEs referencing each other — PG supports this.
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery(
-                     "WITH RECURSIVE "
-                             + "  a(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM b WHERE n < 3), "
-                             + "  b(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM a WHERE n < 3) "
-                             + "SELECT count(*)::int FROM a")) {
-            assertTrue(rs.next());
-            assertTrue(rs.getInt(1) > 0, "mutual recursion should produce rows");
-        }
+    void mutual_recursion_two_ctes() {
+        // PG 18: mutual recursion between WITH items is not implemented
+        PSQLException ex = assertThrows(PSQLException.class, () -> {
+            try (Statement s = conn.createStatement()) {
+                s.executeQuery(
+                        "WITH RECURSIVE "
+                                + "  a(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM b WHERE n < 3), "
+                                + "  b(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM a WHERE n < 3) "
+                                + "SELECT count(*)::int FROM a");
+            }
+        });
+        assertTrue(ex.getMessage().contains("mutual recursion between WITH items is not implemented"),
+                "Expected mutual recursion error, got: " + ex.getMessage());
     }
 
     // =========================================================================

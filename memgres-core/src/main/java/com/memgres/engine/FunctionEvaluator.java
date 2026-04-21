@@ -90,6 +90,21 @@ class FunctionEvaluator {
         }
     }
 
+    /**
+     * Checks that a required extension is installed. PG 18 requires CREATE EXTENSION
+     * before extension functions become available. Throws 42883 if not installed.
+     */
+    private void requireExtension(String extensionName, String functionName, int argCount) {
+        if (!executor.database.hasExtension(extensionName)) {
+            String sig = functionName + "(" + String.join(", ",
+                    java.util.Collections.nCopies(argCount, "unknown")) + ")";
+            throw new MemgresException(
+                    "function " + sig + " does not exist\n" +
+                    "  Hint: No function matches the given name and argument types. " +
+                    "You might need to add explicit type casts.", "42883");
+        }
+    }
+
     Object evalFunction(FunctionCallExpr fn, RowContext ctx) {
         String name = fn.name().toLowerCase();
         // Strip schema prefixes for built-in function resolution
@@ -194,11 +209,15 @@ class FunctionEvaluator {
                 return LocalDateTime.now();
             case "version":
                 return "PostgreSQL 18.0";
-            case "uuid_generate_v4":
             case "gen_random_uuid":
+                return java.util.UUID.randomUUID();
             case "uuidv4":
                 return java.util.UUID.randomUUID();
+            case "uuid_generate_v4":
+                requireExtension("uuid-ossp", name, fn.args().size());
+                return java.util.UUID.randomUUID();
             case "uuid_generate_v1": {
+                requireExtension("uuid-ossp", name, fn.args().size());
                 // UUID v1: timestamp + node (MAC) based
                 // Use current time since UUID epoch (Oct 15, 1582) in 100-ns intervals
                 long uuidEpochOffset = 122192928000000000L; // 100-ns intervals between UUID epoch and Unix epoch
@@ -217,6 +236,7 @@ class FunctionEvaluator {
                 return new java.util.UUID(msb, lsb);
             }
             case "uuid_generate_v3": {
+                requireExtension("uuid-ossp", name, fn.args().size());
                 // UUID v3: MD5-based namespace UUID
                 requireArgs(fn, 2);
                 Object nsArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -226,6 +246,7 @@ class FunctionEvaluator {
                 return uuid3(namespace, nameArg.toString());
             }
             case "uuid_generate_v5": {
+                requireExtension("uuid-ossp", name, fn.args().size());
                 // UUID v5: SHA-1-based namespace UUID
                 requireArgs(fn, 2);
                 Object nsArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -235,10 +256,13 @@ class FunctionEvaluator {
                 return uuid5(namespace, nameArg.toString());
             }
             case "uuid_nil":
+                requireExtension("uuid-ossp", name, fn.args().size());
                 return java.util.UUID.fromString("00000000-0000-0000-0000-000000000000");
             case "uuid_ns_dns":
+                requireExtension("uuid-ossp", name, fn.args().size());
                 return java.util.UUID.fromString("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
             case "uuid_ns_url":
+                requireExtension("uuid-ossp", name, fn.args().size());
                 return java.util.UUID.fromString("6ba7b811-9dad-11d1-80b4-00c04fd430c8");
             case "uuidv7": {
                 if (!fn.args().isEmpty()) {
@@ -276,6 +300,7 @@ class FunctionEvaluator {
                 return bytes;
             }
             case "digest": {
+                requireExtension("pgcrypto", name, fn.args().size());
                 // pgcrypto: digest(data, type) → bytea hash
                 requireArgs(fn, 2);
                 Object dataArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -306,6 +331,7 @@ class FunctionEvaluator {
                 }
             }
             case "hmac": {
+                requireExtension("pgcrypto", name, fn.args().size());
                 // pgcrypto: hmac(data, key, type) → bytea HMAC
                 requireArgs(fn, 3);
                 Object dataArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -344,6 +370,7 @@ class FunctionEvaluator {
                 }
             }
             case "gen_salt": {
+                requireExtension("pgcrypto", name, fn.args().size());
                 // pgcrypto: gen_salt(type [, iter_count]) → text salt string
                 requireArgs(fn, 1);
                 Object typeArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1298,7 +1325,12 @@ class FunctionEvaluator {
                 return compareTemporal(s1, e2) < 0 && compareTemporal(s2, e1) < 0;
             }
             case "array_sample": {
-                // array_sample(arr, n[, seed]) - returns n random elements from arr (PG 16+)
+                // array_sample(arr, n) - returns n random elements from arr (PG 16+)
+                // PG 18 only supports 2-arg form; 3-arg with seed does not exist
+                if (fn.args().size() >= 3) {
+                    throw new MemgresException(
+                            "function array_sample(integer[], integer, integer) does not exist", "42883");
+                }
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object nObj = executor.evalExpr(fn.args().get(1), ctx);
                 if (arr == null) return null;
@@ -1311,14 +1343,7 @@ class FunctionEvaluator {
                 }
                 if (n <= 0) return TypeCoercion.formatPgArray(new ArrayList<>());
                 if (n >= elements.size()) n = elements.size();
-                java.util.Random rng;
-                if (fn.args().size() >= 3) {
-                    Object seedObj = executor.evalExpr(fn.args().get(2), ctx);
-                    long seed = seedObj instanceof Number ? ((Number) seedObj).longValue() : Long.parseLong(seedObj.toString());
-                    rng = new java.util.Random(seed);
-                } else {
-                    rng = new java.util.Random();
-                }
+                java.util.Random rng = new java.util.Random();
                 java.util.Collections.shuffle(elements, rng);
                 return TypeCoercion.formatPgArray(new ArrayList<>(elements.subList(0, n)));
             }
@@ -1509,6 +1534,7 @@ class FunctionEvaluator {
             }
             // ---- pg_trgm extension ----
             case "show_trgm": {
+                requireExtension("pg_trgm", name, fn.args().size());
                 requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -1522,6 +1548,7 @@ class FunctionEvaluator {
                 return new ArrayList<>(trgmSet);
             }
             case "similarity": {
+                requireExtension("pg_trgm", name, fn.args().size());
                 requireArgs(fn, 2);
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
@@ -1571,6 +1598,7 @@ class FunctionEvaluator {
             }
             // ---- fuzzystrmatch extension ----
             case "levenshtein": {
+                requireExtension("fuzzystrmatch", name, fn.args().size());
                 requireArgs(fn, 2);
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
@@ -1578,6 +1606,7 @@ class FunctionEvaluator {
                 return levenshteinDistance(arg1.toString(), arg2.toString());
             }
             case "soundex": {
+                requireExtension("fuzzystrmatch", name, fn.args().size());
                 requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -1585,6 +1614,7 @@ class FunctionEvaluator {
             }
             // ---- unaccent extension ----
             case "unaccent": {
+                requireExtension("unaccent", name, fn.args().size());
                 requireArgs(fn, 1);
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;

@@ -508,6 +508,7 @@ class BoolEnumUuidJsonCoverageTest {
     @Test
     void uuid_generate_v4() throws SQLException {
         try (Statement s = conn.createStatement()) {
+            s.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"");
             ResultSet rs = s.executeQuery("SELECT uuid_generate_v4()");
             assertTrue(rs.next());
             String uuid = rs.getString(1);

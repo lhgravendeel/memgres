@@ -1,6 +1,7 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.*;
+import com.memgres.engine.util.Cols;
 
 import java.util.*;
 
@@ -592,13 +593,39 @@ class SelectCteExecutor {
     }
 
     /**
-     * Previously detected mutual recursion cycles among RECURSIVE CTEs and rejected them.
-     * However, PostgreSQL does support mutual recursion between WITH items in RECURSIVE CTEs,
-     * so we now allow it. The maxIterations limit (1000) guards against infinite loops.
+     * Detect mutual recursion between RECURSIVE CTEs and reject it.
+     * PG 18 does not support mutual recursion between WITH items (error 0A000).
      */
     private void detectMutualRecursionCycle(SelectStmt.CommonTableExpr cte, String cteLower) {
-        // No-op: mutual recursion is allowed in PostgreSQL recursive CTEs.
-        // The iteration limit in executeRecursiveCte guards against non-termination.
+        if (!cte.recursive()) return;
+        // Walk the recursive term of this CTE and find references to sibling recursive CTEs
+        Map<String, SelectStmt.CommonTableExpr> siblingMap = new HashMap<>();
+        for (Deque<Map<String, SelectStmt.CommonTableExpr>> stack = executor.cteStack;
+             !stack.isEmpty(); ) {
+            for (Map.Entry<String, SelectStmt.CommonTableExpr> entry : stack.peek().entrySet()) {
+                if (!entry.getKey().equals(cteLower) && entry.getValue().recursive()) {
+                    siblingMap.put(entry.getKey(), entry.getValue());
+                }
+            }
+            break; // only check current scope
+        }
+        if (siblingMap.isEmpty()) return;
+        // Check if this CTE references any sibling recursive CTE
+        Set<String> refs = new HashSet<>();
+        collectSiblingRefs(cte.query(), siblingMap.keySet(), refs);
+        if (refs.isEmpty()) return;
+        // True mutual recursion: the referenced sibling must also reference this CTE
+        for (String refName : refs) {
+            SelectStmt.CommonTableExpr sibling = siblingMap.get(refName);
+            if (sibling != null) {
+                Set<String> backRefs = new HashSet<>();
+                collectSiblingRefs(sibling.query(), Cols.setOf(cteLower), backRefs);
+                if (!backRefs.isEmpty()) {
+                    throw new MemgresException(
+                            "mutual recursion between WITH items is not implemented", "0A000");
+                }
+            }
+        }
     }
 
     /**

@@ -606,6 +606,7 @@ class SelectExecutor {
         if (expr instanceof IsJsonExpr) return containsAggregate(((IsJsonExpr) expr).expr());
         if (expr instanceof IsNullExpr) return containsAggregate(((IsNullExpr) expr).expr());
         if (expr instanceof InExpr) return containsAggregate(((InExpr) expr).expr());
+        if (expr instanceof LikeExpr) return containsAggregate(((LikeExpr) expr).left()) || containsAggregate(((LikeExpr) expr).pattern());
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
             for (CaseExpr.WhenClause when : c.whenClauses()) {

@@ -1007,9 +1007,9 @@ public class AstExecutor {
     private void registerExtensionObjects(String extName) {
         switch (extName.toLowerCase()) {
             case "btree_gin": {
-                // Register gin opfamilies for scalar types
-                for (String typeName : new String[]{"integer_ops", "text_ops", "bool_ops", "float_ops",
-                        "numeric_ops", "datetime_ops", "uuid_ops"}) {
+                // Register gin opfamilies for scalar types (PG uses int4_ops, not integer_ops)
+                for (String typeName : new String[]{"int4_ops", "text_ops", "bool_ops", "float8_ops",
+                        "numeric_ops", "timestamptz_ops", "uuid_ops"}) {
                     String key = typeName + ":gin";
                     if (!database.hasOperatorFamily(key)) {
                         PgOperatorFamily fam = new PgOperatorFamily(typeName, "gin");
@@ -1020,9 +1020,9 @@ public class AstExecutor {
                 break;
             }
             case "btree_gist": {
-                // Register gist opfamilies for scalar types
-                for (String typeName : new String[]{"integer_ops", "text_ops", "bool_ops", "float_ops",
-                        "numeric_ops", "datetime_ops", "uuid_ops"}) {
+                // Register gist opfamilies for scalar types (PG uses int4_ops, not integer_ops)
+                for (String typeName : new String[]{"int4_ops", "text_ops", "bool_ops", "float8_ops",
+                        "numeric_ops", "timestamptz_ops", "uuid_ops"}) {
                     String key = typeName + ":gist";
                     if (!database.hasOperatorFamily(key)) {
                         PgOperatorFamily fam = new PgOperatorFamily(typeName, "gist");
