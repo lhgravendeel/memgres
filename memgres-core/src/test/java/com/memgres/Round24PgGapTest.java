@@ -231,10 +231,16 @@ class Round24PgGapTest {
 
     @Test
     void bytea_set_bit_uses_msb_first_numbering_within_byte() throws SQLException {
-        // PG bit numbering: bit 0 is MSB of first byte, so set_bit('\x00',0,1) = '\x80'
-        assertEquals("\\x80", q("SELECT set_bit('\\x00'::bytea, 0, 1)::text"));
-        assertEquals("\\x01", q("SELECT set_bit('\\x00'::bytea, 7, 1)::text"));
-        assertEquals("\\x1234563890", q("SELECT set_bit('\\x1234567890'::bytea, 25, 0)::text"));
+        // PG18 bytea bit numbering: bit 0 is LSB of first byte, so set_bit('\x00',0,1) = '\x01'
+        assertEquals("\\x01", q("SELECT set_bit('\\x00'::bytea, 0, 1)::text"));
+        assertEquals("\\x80", q("SELECT set_bit('\\x00'::bytea, 7, 1)::text"));
+        // Byte 3 (0x78), bit 25 = byte 3 bit 1. 0x78=01111000, clear bit 1 → 01111000 (bit 1 is 0, no change)
+        // Actually: bit 25: byteIdx=25/8=3, bitIdx=25%8=1. byte 3 = 0x78 = 0111_1000.
+        // Clear bit 1: 0x78 & ~(1<<1) = 0x78 & 0xFD = 0x78. No change since bit 1 is already 0.
+        // Wait, 0x78 = 0111_1000, bit 1 = 0. So set_bit(..., 25, 0) is a no-op.
+        // Let's verify: 0x1234567890 with byte 3 = 0x78. bit 25 (byte 3, bit 1): (0x78 >> 1) & 1 = 0.
+        // Setting to 0 is no-op. Result: \x1234567890
+        assertEquals("\\x1234567890", q("SELECT set_bit('\\x1234567890'::bytea, 25, 0)::text"));
     }
 
     @Test

@@ -68,6 +68,11 @@ class DdlAdminExecutor {
                     executor.session.rollbackToSavepoint(stmt.savepointName());
                     break;
                 case PREPARE_TRANSACTION: {
+                    // PG default: max_prepared_transactions = 0, which disables PREPARE TRANSACTION
+                    int maxPrepared = executor.database.getMaxPreparedTransactions();
+                    if (maxPrepared <= 0) {
+                        throw new MemgresException("prepared transactions are disabled\n  Hint: Set max_prepared_transactions to a nonzero value.", "55000");
+                    }
                     String gid = stmt.savepointName();
                     Database.PreparedTransaction pt = executor.session.prepareTransaction(gid);
                     executor.database.addPreparedTransaction(pt);
@@ -145,6 +150,11 @@ class DdlAdminExecutor {
             throw new MemgresException(stmt.deferredOptionError(), sqlState);
         }
 
+        // PG: EXPLAIN (WAL) requires ANALYZE
+        if (stmt.wal && !stmt.analyze) {
+            throw new MemgresException("EXPLAIN option WAL requires ANALYZE", "22023");
+        }
+
         if (stmt.analyze()) {
             startTime = System.nanoTime();
             actualResult = executor.executeStatement(stmt.statement());
@@ -213,7 +223,11 @@ class DdlAdminExecutor {
         if (stmt instanceof SelectStmt) {
             SelectStmt sel = (SelectStmt) stmt;
             if (sel.from() == null || sel.from().isEmpty()) {
-                lines.add(prefix + arrow + "Result");
+                String resultLine = prefix + arrow + "Result";
+                if (costs || analyze) {
+                    resultLine += "  (cost=0.00..0.01 rows=1 width=4)";
+                }
+                lines.add(resultLine);
                 if (verbose) {
                     lines.add(prefix + "  Output: (...)");
                 }

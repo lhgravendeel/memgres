@@ -33,8 +33,8 @@ ORDER BY article_id;
 
 -- begin-expected
 -- columns: article_id,rank
--- row: 2|0.493096
--- row: 1|0.440747
+-- row: 2|0.970786
+-- row: 1|0.716825
 -- end-expected
 SELECT article_id,
        ts_rank(search_doc, plainto_tsquery('english', 'search ranking')) AS rank

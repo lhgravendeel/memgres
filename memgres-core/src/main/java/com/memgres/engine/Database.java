@@ -572,6 +572,10 @@ public class Database {
     // Connection tracking
     private final AtomicInteger activeConnections = new AtomicInteger(0);
     private volatile int maxConnections = 100;
+    private volatile int maxPreparedTransactions = 0; // PG default: disabled
+
+    public int getMaxPreparedTransactions() { return maxPreparedTransactions; }
+    public void setMaxPreparedTransactions(int max) { this.maxPreparedTransactions = max; }
 
     public Database() {
         schemas.put("public", new Schema("public"));

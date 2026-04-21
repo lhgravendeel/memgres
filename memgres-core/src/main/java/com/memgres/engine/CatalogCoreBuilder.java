@@ -1197,8 +1197,20 @@ class CatalogCoreBuilder {
         }
 
         int publicNs = oids.oid("ns:public");
+        // Iterate all function overloads (not just last-added per name)
+        List<PgFunction> allFuncs = new java.util.ArrayList<>();
+        Map<String, Integer> overloadIndex = new java.util.HashMap<>();
         for (Map.Entry<String, PgFunction> entry : database.getFunctions().entrySet()) {
-            PgFunction fn = entry.getValue();
+            List<PgFunction> overloads = database.getFunctionOverloads(entry.getKey());
+            if (overloads != null && !overloads.isEmpty()) {
+                for (PgFunction f : overloads) {
+                    if (!allFuncs.contains(f)) allFuncs.add(f);
+                }
+            } else {
+                if (!allFuncs.contains(entry.getValue())) allFuncs.add(entry.getValue());
+            }
+        }
+        for (PgFunction fn : allFuncs) {
             String funcSchema = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
             int funcNs = funcSchema.equals("pg_catalog") ? pgCatalogNs : oids.oid("ns:" + funcSchema);
             String lang = fn.getLanguage() != null ? fn.getLanguage().toLowerCase() : "plpgsql";
@@ -1293,8 +1305,11 @@ class CatalogCoreBuilder {
             }
             // prosqlbody: populated for BEGIN ATOMIC functions
             String prosqlbody = fn.isAtomicBody() ? fn.getBody() : null;
+            // Use unique OID key for overloaded functions (append param count)
+            int idx = overloadIndex.merge(fn.getName(), 0, (a, b) -> a + 1);
+            String oidKey = idx == 0 ? "proc:" + fn.getName() : "proc:" + fn.getName() + "#" + idx;
             table.insertRow(new Object[]{
-                    oids.oid("proc:" + fn.getName()), fn.getName(), funcNs, fnOwnerOid,
+                    oids.oid(oidKey), fn.getName(), funcNs, fnOwnerOid,
                     langOid, fn.getCost(), fn.getRows(), 0, "-", kind,
                     fn.isSecurityDefiner(), fn.isLeakproof(), fn.isStrict(), false,
                     fn.getVolatility() != null ? fn.getVolatility().substring(0, 1).toLowerCase() : "v",
@@ -1390,6 +1405,24 @@ class CatalogCoreBuilder {
                 "26 26 25", null, null, null, null, null,
                 "has_largeobject_privilege", null, null, null, null, 1
         });
+        // has_largeobject_privilege(user name, loid oid, privilege text) → boolean
+        table.insertRow(new Object[]{
+                oids.oid("proc:has_largeobject_privilege_name"), "has_largeobject_privilege", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "s", "u",
+                (short) 3, (short) 0, 16, // returns boolean (OID 16)
+                "19 26 25", null, null, null, null, null,
+                "has_largeobject_privilege", null, null, null, null, 1
+        });
+        // has_largeobject_privilege(loid oid, privilege text) → boolean (current user)
+        table.insertRow(new Object[]{
+                oids.oid("proc:has_largeobject_privilege_2"), "has_largeobject_privilege", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "s", "u",
+                (short) 2, (short) 0, 16, // returns boolean (OID 16)
+                "26 25", null, null, null, null, null,
+                "has_largeobject_privilege", null, null, null, null, 1
+        });
         // lo_export(loid oid, filename text) → int4
         table.insertRow(new Object[]{
                 oids.oid("proc:lo_export"), "lo_export", pgCatalogNs, 10,
@@ -1406,6 +1439,15 @@ class CatalogCoreBuilder {
                 false, false, false, false, "v", "u",
                 (short) 1, (short) 0, 26, // returns oid (OID 26)
                 "25", null, null, null, null, null,
+                "lo_import", null, null, null, null, 1
+        });
+        // lo_import(filename text, loid oid) → oid (2-arg overload)
+        table.insertRow(new Object[]{
+                oids.oid("proc:lo_import_2"), "lo_import", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "v", "u",
+                (short) 2, (short) 0, 26, // returns oid (OID 26)
+                "25 26", null, null, null, null, null,
                 "lo_import", null, null, null, null, 1
         });
         // lo_truncate64(fd int4, len int8) → int4

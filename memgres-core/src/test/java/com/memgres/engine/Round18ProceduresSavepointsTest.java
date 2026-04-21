@@ -29,6 +29,8 @@ class Round18ProceduresSavepointsTest {
                 memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
+        // Enable two-phase commit (disabled by default like PG)
+        try (var s = conn.createStatement()) { s.execute("SET max_prepared_transactions = 10"); }
     }
 
     @AfterAll

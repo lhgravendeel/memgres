@@ -27,7 +27,8 @@ public class InfoSchemaBuilder {
         "pg_stat_bgwriter", "pg_stat_wal",
         "pg_replication_slots",
         "pg_seclabel", "pg_shseclabel",
-        "pg_policies"
+        "pg_policies",
+        "pg_authid"
     );
 
     private final Database database;

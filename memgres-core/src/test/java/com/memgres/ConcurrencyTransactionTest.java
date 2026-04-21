@@ -23,6 +23,11 @@ class ConcurrencyTransactionTest {
     static void setup() throws Exception {
         memgres = Memgres.builder().port(0).maxConnections(20).build().start();
         url = "jdbc:postgresql://localhost:" + memgres.getPort() + "/test";
+        // Enable two-phase commit (disabled by default like PG)
+        try (Connection c = DriverManager.getConnection(url, "test", "test");
+             var s = c.createStatement()) {
+            s.execute("SET max_prepared_transactions = 10");
+        }
     }
 
     @AfterAll

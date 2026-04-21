@@ -62,8 +62,12 @@ public class PgCatalogBuilder {
             case "pg_trigger":
                 return constraints.buildPgTrigger();
             case "pg_roles":
-            case "pg_authid":
                 return security.buildPgRoles();
+            case "pg_authid": {
+                Table t = security.buildPgRoles();
+                // Return with correct name for info_schema column lookup
+                return new Table("pg_authid", t.getColumns());
+            }
             case "pg_user":
                 return security.buildPgUser();
             case "pg_auth_members":

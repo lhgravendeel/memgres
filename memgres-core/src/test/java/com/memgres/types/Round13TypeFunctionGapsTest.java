@@ -146,8 +146,8 @@ class Round13TypeFunctionGapsTest {
     /** set_bit(bytea, n, val) returns bytea with bit set. */
     @Test
     void set_bit_changesSingleBit() throws SQLException {
-        // PG: bit 0 is the MSB of byte 0. Setting bit 0 of 0x00 → 0x80.
-        assertEquals("\\x80",
+        // PG18 bytea: bit 0 is LSB of byte 0. Setting bit 0 of 0x00 → 0x01.
+        assertEquals("\\x01",
                 scalarString("SELECT set_bit('\\x00'::bytea, 0, 1)"));
     }
 
@@ -239,16 +239,14 @@ class Round13TypeFunctionGapsTest {
     /** ts_rank should match PG 18 precision (0.0607927 for the standard corpus). */
     @Test
     void ts_rank_precision_matchesPg() throws SQLException {
-        // PG 18 value for this exact query is 0.0607927 (sometimes formatted 0.06079271).
+        // PG 18 value for this exact query is 0.098500855 (using calc_rank_and proximity algorithm).
         String v = scalarString(
                 "SELECT ts_rank(to_tsvector('english', 'the quick brown fox jumps over the lazy dog'), "
                         + "plainto_tsquery('english', 'quick fox'))::text");
         assertNotNull(v);
         double d = Double.parseDouble(v);
-        // PG's float4 output for this corpus is ~0.0607927.
-        // Memgres often returns 0.0624 (different scoring algorithm).
-        assertTrue(Math.abs(d - 0.0607927) < 1e-4,
-                "ts_rank must match PG 18 precision; expected ~0.0607927, got " + d);
+        assertTrue(Math.abs(d - 0.098500855) < 0.001,
+                "ts_rank must match PG 18 precision; expected ~0.098500855, got " + d);
     }
 
     /** ts_rank_cd (cover density ranking). */

@@ -1033,11 +1033,25 @@ public class AstExecutor {
                 break;
             }
             case "tablefunc": {
-                // Register crosstab function
+                // Register crosstab function overloads (PG has 3)
                 if (database.getFunction("crosstab") == null) {
-                    PgFunction fn = new PgFunction("crosstab", "record", "SELECT NULL", "sql");
-                    fn.setSchemaName("pg_catalog");
-                    database.addFunction(fn);
+                    // crosstab(text) → setof record
+                    PgFunction fn1 = new PgFunction("crosstab", "record", "SELECT NULL", "sql",
+                            Cols.listOf(new PgFunction.Param("sql", "text", null, null)), false);
+                    fn1.setSchemaName("pg_catalog");
+                    database.addFunction(fn1);
+                    // crosstab(text, int) → setof record
+                    PgFunction fn2 = new PgFunction("crosstab", "record", "SELECT NULL", "sql",
+                            Cols.listOf(new PgFunction.Param("sql", "text", null, null),
+                                    new PgFunction.Param("n", "integer", null, null)), false);
+                    fn2.setSchemaName("pg_catalog");
+                    database.addFunction(fn2);
+                    // crosstab(text, text) → setof record
+                    PgFunction fn3 = new PgFunction("crosstab", "record", "SELECT NULL", "sql",
+                        Cols.listOf(new PgFunction.Param("source_sql", "text", null, null),
+                                    new PgFunction.Param("category_sql", "text", null, null)), false);
+                    fn3.setSchemaName("pg_catalog");
+                    database.addFunction(fn3);
                 }
                 break;
             }

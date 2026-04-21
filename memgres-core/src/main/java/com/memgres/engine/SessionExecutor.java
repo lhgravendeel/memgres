@@ -184,6 +184,17 @@ class SessionExecutor {
             throw new MemgresException("parameter \"max_connections\" cannot be changed without restarting the server");
         }
 
+        if (name.equals("max_prepared_transactions")) {
+            try {
+                int val = Integer.parseInt(stmt.value());
+                executor.database.setMaxPreparedTransactions(val);
+            } catch (NumberFormatException e) {
+                throw new MemgresException("invalid value for parameter \"max_prepared_transactions\": \"" + stmt.value() + "\"", "22023");
+            }
+            if (guc != null) guc.set(name, stmt.value());
+            return QueryResult.message(QueryResult.Type.SET, "SET");
+        }
+
         if (name.equals("role")) {
             String role = stmt.value();
             if (role != null && !role.equalsIgnoreCase("NONE") && !role.equalsIgnoreCase("DEFAULT")

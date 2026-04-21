@@ -695,8 +695,10 @@ class CatalogSystemFunctions {
                 requireArgs(fn, 1);
                 Object xidArg = executor.evalExpr(fn.args().get(0), ctx);
                 if (xidArg == null) return null;
-                // If the xid matches the current transaction and we're in a transaction, it's in progress
-                if (executor.session != null && executor.session.isInTransaction()) {
+                // If the xid matches the current transaction's xid, it's in progress.
+                // This works both in explicit transactions and autocommit (where txid_current()
+                // allocates a txid for the current statement).
+                if (executor.session != null) {
                     long currentXid = executor.session.getTransactionId();
                     long queryXid;
                     if (xidArg instanceof Number) {

@@ -72,6 +72,7 @@ class FromFunctionResolver {
         if (fname.equals("ts_debug")) return resolveTsDebug(alias, colAliases, evalArgs);
         if (fname.equals("ts_parse")) return resolveTsParse(alias, colAliases, evalArgs);
         if (fname.equals("ts_token_type")) return resolveTsTokenType(alias, colAliases, evalArgs);
+        if (fname.equals("pg_listening_channels")) return resolvePgListeningChannels(alias);
 
         // Try user-defined function
         PgFunction userFunc = executor.database.getFunction(fname);
@@ -900,6 +901,14 @@ class FromFunctionResolver {
     // ---- User-defined functions ----
 
     private List<RowContext> resolveUserFunction(PgFunction userFunc, String alias, List<String> colAliases, List<Object> evalArgs) {
+        // STRICT: return empty set if any argument is NULL (PG returns empty set for strict SRFs)
+        if (userFunc.isStrict()) {
+            for (Object arg : evalArgs) {
+                if (arg == null) {
+                    return Collections.emptyList();
+                }
+            }
+        }
         com.memgres.engine.plpgsql.PlpgsqlExecutor plExec = new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
         Object result = plExec.executeFunction(userFunc, evalArgs);
         if (result instanceof List<?>) {
@@ -1483,6 +1492,26 @@ class FromFunctionResolver {
             virtualTable.insertRow(row);
             contexts.add(new RowContext(virtualTable, alias, row));
             current = current.getPartitionParent();
+        }
+        return contexts;
+    }
+
+    // ---- pg_listening_channels ----
+
+    private List<RowContext> resolvePgListeningChannels(String alias) {
+        Column col = new Column(alias, DataType.TEXT, true, false, null);
+        Table virtualTable = new Table(alias, Cols.listOf(col));
+        List<RowContext> contexts = new ArrayList<>();
+        if (executor.session != null) {
+            List<?> channels = executor.database.getNotificationManager()
+                    .getListeningChannels(executor.session);
+            if (channels != null) {
+                for (Object ch : channels) {
+                    Object[] row = new Object[]{ch != null ? ch.toString() : null};
+                    virtualTable.insertRow(row);
+                    contexts.add(new RowContext(virtualTable, alias, row));
+                }
+            }
         }
         return contexts;
     }

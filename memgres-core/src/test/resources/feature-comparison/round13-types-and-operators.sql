@@ -74,7 +74,7 @@ SELECT get_bit('\xff'::bytea, 0) AS b;
 -- 8. set_bit on bytea
 -- begin-expected
 -- columns: r
--- row: \x80
+-- row: \x01
 -- end-expected
 SELECT set_bit('\x00'::bytea, 0, 1) AS r;
 

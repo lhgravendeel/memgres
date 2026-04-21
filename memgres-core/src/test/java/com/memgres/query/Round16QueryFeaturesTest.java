@@ -200,10 +200,12 @@ class Round16QueryFeaturesTest {
 
     @Test
     void explain_wal_option_parses() throws SQLException {
-        try (Statement s = conn.createStatement();
-             ResultSet rs = s.executeQuery("EXPLAIN (WAL) SELECT 1")) {
-            assertTrue(rs.next(), "EXPLAIN (WAL) must parse");
-        }
+        // PG: EXPLAIN (WAL) without ANALYZE throws an error
+        var ex = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) { s.execute("EXPLAIN (WAL) SELECT 1"); }
+        });
+        assertTrue(ex.getMessage().contains("WAL requires ANALYZE"),
+                "Expected WAL requires ANALYZE error, got: " + ex.getMessage());
     }
 
     @Test
