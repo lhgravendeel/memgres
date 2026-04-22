@@ -64,17 +64,8 @@ INSERT INTO r13_wire_child VALUES (999);
 SELECT (2147483647 + 1)::int;
 
 -- ============================================================================
--- SECTION C: COPY FROM/TO PROGRAM must be rejected
+-- SECTION C: (removed — COPY PROGRAM is intentionally unsupported)
 -- ============================================================================
-
--- 6. COPY TO PROGRAM
-COPY (SELECT 1) TO PROGRAM 'echo';
-
--- 7. COPY FROM PROGRAM
--- begin-expected-error
--- message-like: program
--- end-expected-error
-COPY r13_wire_pk FROM PROGRAM 'cat /tmp/nope.csv';
 
 -- ============================================================================
 -- SECTION D: In-txn visibility after failed statement (25P02)

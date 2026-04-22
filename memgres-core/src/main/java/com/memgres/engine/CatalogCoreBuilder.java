@@ -704,7 +704,8 @@ class CatalogCoreBuilder {
             if (dt == DataType.ENUM || dt == DataType.SERIAL || dt == DataType.BIGSERIAL
                     || dt == DataType.SMALLSERIAL
                     || dt == DataType.TEXT_ARRAY || dt == DataType.INT4_ARRAY
-                    || dt == DataType.ACLITEM_ARRAY) continue;
+                    || dt == DataType.ACLITEM_ARRAY
+                    || dt == DataType.RECORD) continue;
             String cat;
             switch (dt) {
                 case SMALLINT:

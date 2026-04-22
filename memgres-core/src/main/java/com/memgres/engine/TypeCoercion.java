@@ -1057,6 +1057,18 @@ public final class TypeCoercion {
         if (a == null) return -1;
         if (b == null) return 1;
 
+        // PgRow (record) comparison: element-by-element
+        if (a instanceof AstExecutor.PgRow && b instanceof AstExecutor.PgRow) {
+            List<Object> la = ((AstExecutor.PgRow) a).values;
+            List<Object> lb = ((AstExecutor.PgRow) b).values;
+            int minLen = Math.min(la.size(), lb.size());
+            for (int i = 0; i < minLen; i++) {
+                int cmp = compare(la.get(i), lb.get(i));
+                if (cmp != 0) return cmp;
+            }
+            return Integer.compare(la.size(), lb.size());
+        }
+
         // PgEnum: compare by ordinal when both are PgEnum, fall through to string otherwise
         if (a instanceof AstExecutor.PgEnum && b instanceof AstExecutor.PgEnum) return ((AstExecutor.PgEnum) a).compareTo(((AstExecutor.PgEnum) b));
 

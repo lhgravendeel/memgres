@@ -99,6 +99,9 @@ public enum DataType {
     // Transaction ID type
     XID(28, "xid"),
 
+    // Record (composite) type
+    RECORD(2249, "record"),
+
     // Custom enum placeholder; actual enum types are resolved by name
     ENUM(0, "enum");
 

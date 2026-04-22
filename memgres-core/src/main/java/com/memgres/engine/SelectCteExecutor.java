@@ -403,37 +403,56 @@ class SelectCteExecutor {
         }
 
         // Add SEARCH ordering column if declared
+        // PG stores the ord column as type record:
+        //   BFS: (depth bigint, search_key1, search_key2, ...)
+        //   DFS: (search_key1, search_key2, ...)
         if (hasSearch) {
             String scol = cte.searchColumn();
             List<Column> extCols = new ArrayList<>(columns);
+            extCols.add(new Column(scol, DataType.RECORD, true, false, null));
             if (depthFirstSearch && ordcolPaths != null) {
-                // For DFS: sort rows by their search path (element-wise) and assign integer ordcol
-                // Build index array sorted by path comparison
+                // For DFS: sort rows by their search path (element-wise) and assign ordcol
                 Integer[] indices = new Integer[allRows.size()];
                 for (int i = 0; i < indices.length; i++) indices[i] = i;
                 Arrays.sort(indices, (a, b) -> compareSearchPaths(ordcolPaths.get(a), ordcolPaths.get(b)));
-                // Assign ordcol based on sorted position
-                int[] ordcolValues = new int[allRows.size()];
-                for (int rank = 0; rank < indices.length; rank++) {
-                    ordcolValues[indices[rank]] = rank;
-                }
-                extCols.add(new Column(scol, DataType.INTEGER, true, false, null));
+                // Build record values from search paths, then reorder rows
                 List<Object[]> extRows = new ArrayList<>();
-                for (int i = 0; i < allRows.size(); i++) {
-                    Object[] orig = allRows.get(i);
+                Object[][] sortedExt = new Object[allRows.size()][];
+                for (int rank = 0; rank < indices.length; rank++) {
+                    int origIdx = indices[rank];
+                    Object[] orig = allRows.get(origIdx);
                     Object[] ext = Arrays.copyOf(orig, orig.length + 1);
-                    ext[orig.length] = ordcolValues[i];
-                    extRows.add(ext);
+                    // DFS record: (search_key_path_elements...)
+                    ext[orig.length] = new AstExecutor.PgRow(ordcolPaths.get(origIdx));
+                    sortedExt[origIdx] = ext;
                 }
+                for (Object[] ext : sortedExt) extRows.add(ext);
                 columns = extCols;
                 allRows = extRows;
             } else {
-                extCols.add(new Column(scol, DataType.INTEGER, true, false, null));
+                // BFS: record is (depth, search_key)
                 List<Object[]> extRows = new ArrayList<>();
+                // Track depth: base rows are depth 0, each iteration increments
+                // ordcolPaths length encodes depth (base=1 element, first recursion=2, etc.)
                 for (int i = 0; i < allRows.size(); i++) {
                     Object[] orig = allRows.get(i);
                     Object[] ext = Arrays.copyOf(orig, orig.length + 1);
-                    ext[orig.length] = i;
+                    List<Object> pathElements = ordcolPaths != null && i < ordcolPaths.size()
+                            ? ordcolPaths.get(i) : Collections.singletonList(i);
+                    // BFS record: (depth, search_key_values...)
+                    long depth = pathElements.size() - 1;
+                    List<Object> recordValues = new ArrayList<>();
+                    recordValues.add(depth);
+                    // Add the last search key (current row's search value)
+                    if (!pathElements.isEmpty()) {
+                        Object lastKey = pathElements.get(pathElements.size() - 1);
+                        if (lastKey instanceof Object[]) {
+                            for (Object k : (Object[]) lastKey) recordValues.add(k);
+                        } else {
+                            recordValues.add(lastKey);
+                        }
+                    }
+                    ext[orig.length] = new AstExecutor.PgRow(recordValues);
                     extRows.add(ext);
                 }
                 columns = extCols;

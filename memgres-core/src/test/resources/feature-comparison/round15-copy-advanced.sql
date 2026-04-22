@@ -68,13 +68,8 @@ CREATE TABLE r15_cd (id int, v text DEFAULT 'DFLT');
 -- 8. DEFAULT '\D'
 
 -- ============================================================================
--- SECTION G: PROGRAM (security-rejected)
+-- SECTION G: (removed — COPY PROGRAM is intentionally unsupported)
 -- ============================================================================
-
-CREATE TABLE r15_pg (id int);
-
--- 9. COPY FROM PROGRAM 'echo 1' — expected to error or require superuser
-COPY r15_pg (id) FROM PROGRAM 'echo 1';
 
 -- ============================================================================
 -- SECTION H: BINARY format

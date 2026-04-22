@@ -179,7 +179,7 @@ class Round16MiscTypeTest {
     @Test
     void pgcrypto_digest_sha256_hex() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-        String v = str("SELECT encode(digest('hello', 'sha256'), 'hex')");
+        String v = str("SELECT encode(digest('hello'::text, 'sha256'), 'hex')");
         assertEquals(
                 "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
                 v,
@@ -189,7 +189,7 @@ class Round16MiscTypeTest {
     @Test
     void pgcrypto_hmac_returns_bytea() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-        String v = str("SELECT encode(hmac('msg', 'key', 'sha256'), 'hex')");
+        String v = str("SELECT encode(hmac('msg'::text, 'key', 'sha256'), 'hex')");
         assertNotNull(v);
         assertEquals(64, v.length(),
                 "pgcrypto hmac-sha256 hex output must be 64 chars");
@@ -198,7 +198,7 @@ class Round16MiscTypeTest {
     @Test
     void pgcrypto_gen_salt_bf_returns_non_null() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-        String v = str("SELECT gen_salt('bf')");
+        String v = str("SELECT gen_salt('bf'::text)");
         assertNotNull(v);
         assertTrue(v.startsWith("$2"), "gen_salt('bf') must return a Blowfish salt starting with $2");
     }

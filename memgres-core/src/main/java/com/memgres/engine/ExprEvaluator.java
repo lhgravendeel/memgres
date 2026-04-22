@@ -1573,6 +1573,17 @@ class ExprEvaluator {
 
     @SuppressWarnings("unchecked")
     int compareValues(Object a, Object b) {
+        // PgRow (record) comparison: element-by-element, like PG record comparison
+        if (a instanceof AstExecutor.PgRow && b instanceof AstExecutor.PgRow) {
+            List<Object> la = ((AstExecutor.PgRow) a).values;
+            List<Object> lb = ((AstExecutor.PgRow) b).values;
+            int minLen = Math.min(la.size(), lb.size());
+            for (int i = 0; i < minLen; i++) {
+                int cmp = compareValues(la.get(i), lb.get(i));
+                if (cmp != 0) return cmp;
+            }
+            return Integer.compare(la.size(), lb.size());
+        }
         // List (array) comparison: element-by-element, shorter list is "less" if prefix matches
         if (a instanceof List<?> && b instanceof List<?>) {
             List<?> la = (List<?>) a;

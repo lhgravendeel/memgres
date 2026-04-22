@@ -128,6 +128,27 @@ SELECT length(encode(hmac('msg','key','sha256'),'hex')) AS n;
 -- end-expected-error
 SELECT (gen_salt('bf') LIKE '$2%') AS ok;
 
+-- 14. digest with explicit text cast succeeds (PG resolves text→bytea)
+-- begin-expected
+-- columns: v
+-- row: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+-- end-expected
+SELECT encode(digest('hello'::text, 'sha256'), 'hex') AS v;
+
+-- 15. hmac with explicit text cast succeeds
+-- begin-expected
+-- columns: n
+-- row: 64
+-- end-expected
+SELECT length(encode(hmac('msg'::text,'key','sha256'),'hex')) AS n;
+
+-- 16. gen_salt with explicit text cast succeeds
+-- begin-expected
+-- columns: ok
+-- row: t
+-- end-expected
+SELECT (gen_salt('bf'::text) LIKE '$2%') AS ok;
+
 -- ============================================================================
 -- SECTION G8: citext case-insensitive equality
 -- ============================================================================

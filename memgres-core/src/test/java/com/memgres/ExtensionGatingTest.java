@@ -84,7 +84,7 @@ class ExtensionGatingTest {
     @Test void digest_works_after_create_extension() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-            ResultSet rs = s.executeQuery("SELECT encode(digest('hello', 'sha256'), 'hex')");
+            ResultSet rs = s.executeQuery("SELECT encode(digest('hello'::text, 'sha256'), 'hex')");
             assertTrue(rs.next());
             assertEquals("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", rs.getString(1));
             rs.close();
