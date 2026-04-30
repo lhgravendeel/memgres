@@ -171,30 +171,52 @@ class Round15WireProtocolGucTest {
     }
 
     @Test
-    void datestyle_postgres_format() throws SQLException {
-        exec("SET DateStyle = 'Postgres, MDY'");
-        String v = scalarString("SELECT (DATE '2025-03-14')::text");
-        // Postgres format: '03-14-2025'
-        assertTrue(v.contains("03") && v.contains("2025"),
-                "Postgres DateStyle output incorrect; got " + v);
+    void datestyle_postgres_disconnects_jdbc() throws SQLException {
+        // PG 18 sends ParameterStatus for DateStyle; pgjdbc disconnects on non-ISO (08006).
+        Connection c = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple",
+                memgres.getUser(), memgres.getPassword());
+        c.setAutoCommit(true);
+        try {
+            try (Statement s = c.createStatement()) { s.execute("SET DateStyle = 'Postgres, MDY'"); }
+            fail("Expected JDBC driver to disconnect on non-ISO DateStyle");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("DateStyle"), "Expected DateStyle error; got: " + e.getMessage());
+        } finally {
+            try { c.close(); } catch (Exception ignored) {}
+        }
     }
 
     @Test
-    void datestyle_sql_format() throws SQLException {
-        exec("SET DateStyle = 'SQL, MDY'");
-        String v = scalarString("SELECT (DATE '2025-03-14')::text");
-        // SQL style: '03/14/2025'
-        assertTrue(v.contains("/"),
-                "SQL DateStyle should use '/'; got " + v);
+    void datestyle_sql_disconnects_jdbc() throws SQLException {
+        Connection c = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple",
+                memgres.getUser(), memgres.getPassword());
+        c.setAutoCommit(true);
+        try {
+            try (Statement s = c.createStatement()) { s.execute("SET DateStyle = 'SQL, MDY'"); }
+            fail("Expected JDBC driver to disconnect on non-ISO DateStyle");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("DateStyle"), "Expected DateStyle error; got: " + e.getMessage());
+        } finally {
+            try { c.close(); } catch (Exception ignored) {}
+        }
     }
 
     @Test
-    void datestyle_german_format() throws SQLException {
-        exec("SET DateStyle = 'German'");
-        String v = scalarString("SELECT (DATE '2025-03-14')::text");
-        // German: '14.03.2025'
-        assertTrue(v.contains("."),
-                "German DateStyle should use '.'; got " + v);
+    void datestyle_german_disconnects_jdbc() throws SQLException {
+        Connection c = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple",
+                memgres.getUser(), memgres.getPassword());
+        c.setAutoCommit(true);
+        try {
+            try (Statement s = c.createStatement()) { s.execute("SET DateStyle = 'German'"); }
+            fail("Expected JDBC driver to disconnect on non-ISO DateStyle");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("DateStyle"), "Expected DateStyle error; got: " + e.getMessage());
+        } finally {
+            try { c.close(); } catch (Exception ignored) {}
+        }
     }
 
     // =========================================================================

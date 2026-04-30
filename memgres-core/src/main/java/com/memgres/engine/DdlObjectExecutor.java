@@ -1464,7 +1464,16 @@ class DdlObjectExecutor {
                     String[] parts = castName.split("->");
                     int srcOid = resolveTypeOid(parts[0].trim());
                     int tgtOid = resolveTypeOid(parts[1].trim());
-                    executor.database.removeUserCast(srcOid, tgtOid);
+                    boolean exists = executor.database.getUserDefinedCasts().stream()
+                            .anyMatch(c -> (int) c[0] == srcOid && (int) c[1] == tgtOid);
+                    if (!exists && !stmt.ifExists()) {
+                        throw new MemgresException(
+                                "cast from type " + parts[0].trim() + " to type " + parts[1].trim() + " does not exist",
+                                "42704");
+                    }
+                    if (exists) {
+                        executor.database.removeUserCast(srcOid, tgtOid);
+                    }
                 }
                 break;
             }
@@ -2165,6 +2174,42 @@ class DdlObjectExecutor {
                         }
                     } catch (MemgresException ignored) {}
                 }
+            }
+            // Auto-propagate index to existing partitions (PG creates matching child indexes automatically)
+            if (s.table() != null) {
+                try {
+                    Table parentTable = executor.resolveTable(idxSchemaForMeta, s.table());
+                    if (parentTable.getPartitionStrategy() != null && !parentTable.getPartitions().isEmpty()) {
+                        for (Table partition : parentTable.getPartitions()) {
+                            String childIdxName = s.name() + "_" + partition.getName();
+                            if (!executor.database.hasIndex(childIdxName)) {
+                                executor.database.addIndex(childIdxName, s.columns());
+                                executor.database.addIndexMeta(childIdxName,
+                                        idxSchemaForMeta + "." + partition.getName(),
+                                        s.unique(), s.method(), s.whereClause());
+                                executor.database.registerSchemaObject(idxSchemaForMeta, "index", childIdxName);
+                                executor.database.setIndexParent(childIdxName, s.name());
+                                // Build TableIndex on partition for query optimization
+                                boolean hasExprColsP = s.columns().stream().anyMatch(c ->
+                                        c.contains("(") || c.contains(" ") || c.contains("+") || c.contains("-")
+                                        || c.contains("*") || c.contains("/") || c.contains("||"));
+                                if (!hasExprColsP && s.whereClause() == null) {
+                                    int[] pColIndices = new int[s.columns().size()];
+                                    boolean pAllFound = true;
+                                    for (int ci = 0; ci < s.columns().size(); ci++) {
+                                        int idx = partition.getColumnIndex(s.columns().get(ci));
+                                        if (idx < 0) { pAllFound = false; break; }
+                                        pColIndices[ci] = idx;
+                                    }
+                                    if (pAllFound && partition.getIndex(childIdxName) == null) {
+                                        TableIndex pIdx = new TableIndex(childIdxName, pColIndices, s.unique());
+                                        partition.buildIndex(pIdx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (MemgresException ignored) {}
             }
         }
         // For UNIQUE indexes, also add a UNIQUE constraint to enforce uniqueness

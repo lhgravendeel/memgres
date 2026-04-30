@@ -196,17 +196,24 @@ class Round15IndexVariantsTest {
         exec("CREATE TABLE r15_pp (id int, region int) PARTITION BY LIST (region)");
         exec("CREATE TABLE r15_pp_1 PARTITION OF r15_pp FOR VALUES IN (1)");
         exec("CREATE INDEX r15_pp_parent_idx ON r15_pp (id)");
-        // Child should already have a matching index; force-attach is the variant we want
-        exec("CREATE INDEX r15_pp_1_idx ON r15_pp_1 (id)");
-        exec("ALTER INDEX r15_pp_parent_idx ATTACH PARTITION r15_pp_1_idx");
 
+        // Auto-created child index should be wired in pg_inherits
         int n = scalarInt(
                 "SELECT count(*)::int FROM pg_index i "
                         + "JOIN pg_inherits h ON h.inhrelid = i.indexrelid "
                         + "JOIN pg_class pc ON h.inhparent = pc.oid "
                         + "WHERE pc.relname='r15_pp_parent_idx'");
-        assertTrue(n >= 1,
-                "ALTER INDEX ATTACH PARTITION should wire child→parent in pg_inherits");
+        assertEquals(1, n,
+                "CREATE INDEX on partitioned table should auto-create child in pg_inherits");
+
+        // Manual ATTACH should fail — parent already has auto-created child for this partition (PG: 55000)
+        exec("CREATE INDEX r15_pp_1_idx ON r15_pp_1 (id)");
+        try {
+            exec("ALTER INDEX r15_pp_parent_idx ATTACH PARTITION r15_pp_1_idx");
+            fail("ALTER INDEX ATTACH should reject when parent already has child for partition");
+        } catch (SQLException e) {
+            assertEquals("55000", e.getSQLState());
+        }
     }
 
     // =========================================================================

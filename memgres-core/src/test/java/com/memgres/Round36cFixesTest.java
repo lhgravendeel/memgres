@@ -28,42 +28,33 @@ class Round36cFixesTest {
     }
 
     // ========================================================================
-    // pgcrypto: untyped args rejected (matches PG 18 function resolution)
+    // pgcrypto: untyped args succeed (PG resolves unknown to text overloads)
     // ========================================================================
 
-    @Test void digest_untyped_args_rejected() {
+    @Test void digest_untyped_args_succeed() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> s.executeQuery("SELECT digest('hello', 'sha256')"));
-            assertTrue(ex.getMessage().contains("does not exist"), ex.getMessage());
-            assertEquals("42883", ex.getSQLState());
-        } catch (SQLException e) {
-            fail("Setup failed: " + e.getMessage());
+            ResultSet rs = s.executeQuery("SELECT encode(digest('hello', 'sha256'), 'hex') AS v");
+            assertTrue(rs.next());
+            assertEquals("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", rs.getString(1));
         }
     }
 
-    @Test void hmac_untyped_args_rejected() {
+    @Test void hmac_untyped_args_succeed() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> s.executeQuery("SELECT hmac('msg', 'key', 'sha256')"));
-            assertTrue(ex.getMessage().contains("does not exist"), ex.getMessage());
-            assertEquals("42883", ex.getSQLState());
-        } catch (SQLException e) {
-            fail("Setup failed: " + e.getMessage());
+            ResultSet rs = s.executeQuery("SELECT length(encode(hmac('msg', 'key', 'sha256'), 'hex')) AS n");
+            assertTrue(rs.next());
+            assertEquals(64, rs.getInt(1));
         }
     }
 
-    @Test void gen_salt_untyped_arg_rejected() {
+    @Test void gen_salt_untyped_arg_succeed() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto");
-            SQLException ex = assertThrows(SQLException.class,
-                    () -> s.executeQuery("SELECT gen_salt('bf')"));
-            assertTrue(ex.getMessage().contains("does not exist"), ex.getMessage());
-            assertEquals("42883", ex.getSQLState());
-        } catch (SQLException e) {
-            fail("Setup failed: " + e.getMessage());
+            ResultSet rs = s.executeQuery("SELECT (gen_salt('bf') LIKE '$2%') AS ok");
+            assertTrue(rs.next());
+            assertTrue(rs.getBoolean(1));
         }
     }
 

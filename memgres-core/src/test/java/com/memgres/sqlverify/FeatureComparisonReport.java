@@ -61,9 +61,11 @@ public class FeatureComparisonReport {
 
         // --- Start engines ---
         Memgres memgres = Memgres.builder().port(0).build().start();
-        Connection memgresConn = DriverManager.getConnection(
-                "jdbc:postgresql://localhost:" + memgres.getPort() + "/test", "test", "test");
-        memgresConn.setAutoCommit(true);
+        String memUrl = "jdbc:postgresql://localhost:" + memgres.getPort() + "/test";
+        String memUser = "test", memPass = "test";
+        Connection[] memConnHolder = new Connection[1];
+        memConnHolder[0] = DriverManager.getConnection(memUrl, memUser, memPass);
+        memConnHolder[0].setAutoCommit(true);
 
         Connection[] pgConnHolder = new Connection[1];
         boolean hasPg = true;
@@ -95,7 +97,8 @@ public class FeatureComparisonReport {
             // been terminated by a prior fatal error (pgjdbc marks it closed
             // and every subsequent statement fails with 08003), reconnect so
             // we see real PG 18 behavior for this file's statements.
-            safeReset(memgresConn);
+            memConnHolder[0] = ensureLive(memConnHolder[0], memUrl, memUser, memPass);
+            safeReset(memConnHolder[0]);
             if (hasPg) {
                 pgConnHolder[0] = ensureLive(pgConnHolder[0], PG_URL, PG_USER, PG_PASS);
                 safeReset(pgConnHolder[0]);
@@ -108,15 +111,17 @@ public class FeatureComparisonReport {
                 int sectionNum = bi + 1;
                 totalSections++;
 
-                // Execute on both engines — reconnect PG if the last statement
+                // Execute on both engines — reconnect if the last statement
                 // closed the session (otherwise every subsequent statement in
                 // this file would cascade with SQLSTATE 08003).
-                SqlVerifyHarness.StatementResult memResult = SqlVerifyHarness.executeStatement(memgresConn, block.sql());
+                memConnHolder[0] = ensureLive(memConnHolder[0], memUrl, memUser, memPass);
+                SqlVerifyHarness.StatementResult memResult = SqlVerifyHarness.executeStatement(memConnHolder[0], block.sql());
                 SqlVerifyHarness.StatementResult pgResult = null;
                 if (hasPg) {
                     pgConnHolder[0] = ensureLive(pgConnHolder[0], PG_URL, PG_USER, PG_PASS);
                     pgResult = SqlVerifyHarness.executeStatement(pgConnHolder[0], block.sql());
                 }
+
 
                 // Skip PG comparisons for known PG bugs
                 if (block.pgBugSkip() != null && pgResult != null) {
@@ -192,7 +197,7 @@ public class FeatureComparisonReport {
         System.out.println("\nReport written to: " + reportPath);
 
         // --- Cleanup ---
-        memgresConn.close();
+        memConnHolder[0].close();
         memgres.close();
         if (pgConnHolder[0] != null) pgConnHolder[0].close();
     }
@@ -554,6 +559,9 @@ public class FeatureComparisonReport {
                 while (rs.next()) {
                     String role = rs.getString(1);
                     try {
+                        // DROP OWNED BY revokes cluster-wide grants (e.g., GRANT SET ON PARAMETER)
+                        // that survive DROP DATABASE and would otherwise block DROP ROLE.
+                        admin.createStatement().execute("DROP OWNED BY " + quoteIdent(role) + " CASCADE");
                         admin.createStatement().execute("DROP ROLE IF EXISTS " + quoteIdent(role));
                     } catch (SQLException e) {
                         // Role may have dependencies in other databases; skip it
@@ -614,7 +622,7 @@ public class FeatureComparisonReport {
             fresh.setAutoCommit(true);
             return fresh;
         } catch (SQLException e) {
-            throw new RuntimeException("Could not reconnect to PostgreSQL at " + url + ": " + e.getMessage(), e);
+            throw new RuntimeException("Could not reconnect to " + url + ": " + e.getMessage(), e);
         }
     }
 

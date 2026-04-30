@@ -1358,22 +1358,28 @@ class CatalogStubBuilder {
                 }
             }
         }
-        // Index inheritance from ALTER INDEX ... ATTACH PARTITION
+        // Index inheritance from ALTER INDEX ... ATTACH PARTITION / auto-propagation
         for (Map.Entry<String, String> entry : database.getIndexParentMap().entrySet()) {
             String childIdx = entry.getKey();
             String parentIdx = entry.getValue();
-            // Resolve OIDs for child and parent indexes
-            int childOid = 0;
-            int parentOid = 0;
-            for (Map.Entry<String, Schema> se : database.getSchemas().entrySet()) {
-                if (childOid == 0) childOid = oids.oid("rel:" + se.getKey() + "." + childIdx);
-                if (parentOid == 0) parentOid = oids.oid("rel:" + se.getKey() + "." + parentIdx);
-            }
-            if (childOid != 0 && parentOid != 0) {
-                table.insertRow(new Object[]{ childOid, parentOid, 1, false });
-            }
+            // Resolve schema from stored index metadata (must match pg_class OID keys)
+            String childSchema = resolveIndexSchema(childIdx);
+            String parentSchema = resolveIndexSchema(parentIdx);
+            int childOid = oids.oid("rel:" + childSchema + "." + childIdx);
+            int parentOid = oids.oid("rel:" + parentSchema + "." + parentIdx);
+            table.insertRow(new Object[]{ childOid, parentOid, 1, false });
         }
         return table;
+    }
+
+    /** Resolve the schema for an index using stored metadata (matches pg_class OID resolution). */
+    private String resolveIndexSchema(String indexName) {
+        String storedTable = database.getIndexTable(indexName);
+        if (storedTable != null) {
+            String[] parts = storedTable.split("\\.", 2);
+            if (parts.length == 2) return parts[0];
+        }
+        return "public";
     }
 
     /** Find the schema name for a given Table object by scanning all schemas. */

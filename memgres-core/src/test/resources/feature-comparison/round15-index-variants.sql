@@ -104,7 +104,11 @@ CREATE INDEX r15_pp_parent_idx ON r15_pp (id);
 CREATE INDEX r15_pp_1_idx ON r15_pp_1 (id);
 ALTER INDEX r15_pp_parent_idx ATTACH PARTITION r15_pp_1_idx;
 
--- 9. child→parent inheritance wired
+-- 9. child→parent inheritance wired (auto-created child from CREATE INDEX on partitioned table)
+-- begin-expected
+-- columns: c
+-- row: 1
+-- end-expected
 SELECT count(*)::int AS c FROM pg_index i
   JOIN pg_inherits h ON h.inhrelid = i.indexrelid
   JOIN pg_class pc ON h.inhparent = pc.oid

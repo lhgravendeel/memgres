@@ -694,9 +694,19 @@ class CatalogSystemFunctions {
             }
             case "txid_status":
             case "pg_xact_status": {
-                // txid_status(bigint) / pg_xact_status(text) → returns status of given xid
+                // pg_xact_status(xid8) — PG requires xid8 type, rejects text
                 requireArgs(fn, 1);
-                Object xidArg = executor.evalExpr(fn.args().get(0), ctx);
+                Expression arg0 = fn.args().get(0);
+                if (arg0 instanceof CastExpr) {
+                    String castType = ((CastExpr) arg0).typeName().toLowerCase();
+                    if (castType.equals("text") || castType.equals("varchar") || castType.equals("character varying")) {
+                        throw new MemgresException(
+                                "function pg_xact_status(text) does not exist\n" +
+                                "  Hint: No function matches the given name and argument types. " +
+                                "You might need to add explicit type casts.", "42883");
+                    }
+                }
+                Object xidArg = executor.evalExpr(arg0, ctx);
                 if (xidArg == null) return null;
                 // If the xid matches the current transaction's xid, it's in progress.
                 // This works both in explicit transactions and autocommit (where txid_current()

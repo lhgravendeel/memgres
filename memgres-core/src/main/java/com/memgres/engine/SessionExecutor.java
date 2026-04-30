@@ -347,10 +347,6 @@ class SessionExecutor {
         }
 
         if (name.equals("cluster")) {
-            // CLUSTER cannot run inside a transaction block
-            if (executor.session != null && executor.session.isInTransaction()) {
-                throw new MemgresException("CLUSTER cannot run inside a transaction block", "25001");
-            }
             String val = stmt.value();
             // Parse table and index from value: "table:foo,index:bar"
             if (val != null && val.contains("table:")) {

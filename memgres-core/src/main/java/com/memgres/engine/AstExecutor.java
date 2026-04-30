@@ -938,9 +938,25 @@ public class AstExecutor {
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
             }
             case ATTACH_PARTITION: {
-                // Record child→parent index inheritance for pg_inherits
-                if (stmt.targetValue() != null) {
-                    database.setIndexParent(stmt.targetValue(), stmt.name());
+                String childIdx = stmt.targetValue();
+                String parentIdx = stmt.name();
+                if (childIdx != null) {
+                    // Validate: reject if parent already has a child index for the same partition table
+                    String childTable = database.getIndexTable(childIdx);
+                    if (childTable != null) {
+                        for (Map.Entry<String, String> entry : database.getIndexParentMap().entrySet()) {
+                            if (entry.getValue().equalsIgnoreCase(parentIdx)) {
+                                String existingChildTable = database.getIndexTable(entry.getKey());
+                                if (childTable.equalsIgnoreCase(existingChildTable != null ? existingChildTable : "")) {
+                                    throw new MemgresException(
+                                            "cannot attach index \"" + childIdx
+                                            + "\" as a partition of index \"" + parentIdx + "\"",
+                                            "55000");
+                                }
+                            }
+                        }
+                    }
+                    database.setIndexParent(childIdx, parentIdx);
                 }
                 return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
             }

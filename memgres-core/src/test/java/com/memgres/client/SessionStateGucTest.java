@@ -92,28 +92,48 @@ class SessionStateGucTest {
         assertEquals("2024-03-15", result); // ISO format is always YYYY-MM-DD
     }
 
-    @Test void datestyle_german() throws Exception {
-        exec("SET DateStyle = 'German'");
-        String result = scalar("SELECT DATE '2024-03-15'");
-        // German style: DD.MM.YYYY
-        assertEquals("15.03.2024", result);
-        exec("SET DateStyle = 'ISO'");
+    @Test void datestyle_german_disconnects_jdbc() throws Exception {
+        // PG 18 sends ParameterStatus for DateStyle; pgjdbc disconnects on non-ISO (08006).
+        // Memgres now matches this behavior.
+        Connection c = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple", memgres.getUser(), memgres.getPassword());
+        c.setAutoCommit(true);
+        try {
+            try (Statement s = c.createStatement()) { s.execute("SET DateStyle = 'German'"); }
+            fail("Expected JDBC driver to disconnect on non-ISO DateStyle");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("DateStyle"), "Expected DateStyle error; got: " + e.getMessage());
+        } finally {
+            try { c.close(); } catch (Exception ignored) {}
+        }
     }
 
-    @Test void datestyle_sql() throws Exception {
-        exec("SET DateStyle = 'SQL, MDY'");
-        String result = scalar("SELECT DATE '2024-03-15'");
-        // SQL MDY style: MM/DD/YYYY
-        assertEquals("03/15/2024", result);
-        exec("SET DateStyle = 'ISO'");
+    @Test void datestyle_sql_disconnects_jdbc() throws Exception {
+        Connection c = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple", memgres.getUser(), memgres.getPassword());
+        c.setAutoCommit(true);
+        try {
+            try (Statement s = c.createStatement()) { s.execute("SET DateStyle = 'SQL, MDY'"); }
+            fail("Expected JDBC driver to disconnect on non-ISO DateStyle");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("DateStyle"), "Expected DateStyle error; got: " + e.getMessage());
+        } finally {
+            try { c.close(); } catch (Exception ignored) {}
+        }
     }
 
-    @Test void datestyle_postgres_style() throws Exception {
-        exec("SET DateStyle = 'Postgres, MDY'");
-        String result = scalar("SELECT DATE '2024-03-15'");
-        // Postgres style: Fri 15 Mar 2024 or similar
-        assertNotNull(result);
-        exec("SET DateStyle = 'ISO'");
+    @Test void datestyle_postgres_disconnects_jdbc() throws Exception {
+        Connection c = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple", memgres.getUser(), memgres.getPassword());
+        c.setAutoCommit(true);
+        try {
+            try (Statement s = c.createStatement()) { s.execute("SET DateStyle = 'Postgres, MDY'"); }
+            fail("Expected JDBC driver to disconnect on non-ISO DateStyle");
+        } catch (SQLException e) {
+            assertTrue(e.getMessage().contains("DateStyle"), "Expected DateStyle error; got: " + e.getMessage());
+        } finally {
+            try { c.close(); } catch (Exception ignored) {}
+        }
     }
 
     @Test void show_datestyle() throws Exception {
@@ -234,11 +254,11 @@ class SessionStateGucTest {
     }
 
     @Test void reset_all() throws Exception {
-        exec("SET DateStyle = 'German'");
+        exec("SET TimeZone = 'US/Eastern'");
         exec("RESET ALL");
-        String ds = scalar("SHOW datestyle");
+        String tz = scalar("SHOW timezone");
         // After RESET ALL, should be back to default
-        assertNotNull(ds);
+        assertNotNull(tz);
     }
 
     // --- SET LOCAL (transaction-scoped) ---

@@ -563,6 +563,76 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         return types;
     }
 
+    /** Scan SQL for $N parameter placeholders, return the highest N (0 if none).
+     *  Only counts in DML/EXPLAIN statements. Skips PREPARE, CREATE, ALTER, DROP, etc.
+     *  Skips single-quoted strings, dollar-quoted strings, and SQL comments. */
+    private static int maxParamPlaceholder(String sql) {
+        // Only DML/EXPLAIN statements can have wire-level bind parameters.
+        // PREPARE, CREATE, ALTER, DROP, EXECUTE, DO, etc. embed $N in their body, not as bind params.
+        String trimmed = sql.replaceAll("^\\s+", "").toUpperCase();
+        if (!(trimmed.startsWith("SELECT") || trimmed.startsWith("INSERT") ||
+              trimmed.startsWith("UPDATE") || trimmed.startsWith("DELETE") ||
+              trimmed.startsWith("EXPLAIN") || trimmed.startsWith("WITH") ||
+              trimmed.startsWith("VALUES") || trimmed.startsWith("TABLE"))) {
+            return 0;
+        }
+
+        int max = 0;
+        int len = sql.length();
+        for (int i = 0; i < len; i++) {
+            char c = sql.charAt(i);
+            // Skip single-quoted strings
+            if (c == '\'') {
+                i++;
+                while (i < len) {
+                    if (sql.charAt(i) == '\'') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '\'') { i += 2; continue; }
+                        break;
+                    }
+                    i++;
+                }
+                continue;
+            }
+            // Skip -- line comments
+            if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
+                i = sql.indexOf('\n', i);
+                if (i < 0) break;
+                continue;
+            }
+            // Skip /* block comments */
+            if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
+                i = sql.indexOf("*/", i + 2);
+                if (i < 0) break;
+                i++;
+                continue;
+            }
+            // Skip dollar-quoted strings ($$ or $tag$)
+            if (c == '$') {
+                int tagEnd = i + 1;
+                while (tagEnd < len && (Character.isLetterOrDigit(sql.charAt(tagEnd)) || sql.charAt(tagEnd) == '_')) {
+                    tagEnd++;
+                }
+                if (tagEnd < len && sql.charAt(tagEnd) == '$') {
+                    String tag = sql.substring(i, tagEnd + 1);
+                    int closePos = sql.indexOf(tag, tagEnd + 1);
+                    if (closePos >= 0) {
+                        i = closePos + tag.length() - 1;
+                        continue;
+                    }
+                }
+                // $N parameter placeholder
+                if (i + 1 < len && Character.isDigit(sql.charAt(i + 1))) {
+                    int j = i + 1;
+                    while (j < len && Character.isDigit(sql.charAt(j))) j++;
+                    int n = Integer.parseInt(sql.substring(i + 1, j));
+                    if (n > max) max = n;
+                    i = j - 1;
+                }
+            }
+        }
+        return max;
+    }
+
     private void handleBind(ChannelHandlerContext ctx, PgWireMessage msg) {
         String portalName = msg.getPortalName() != null ? msg.getPortalName() : "";
         String stmtName = msg.getStatementName() != null ? msg.getStatementName() : "";
@@ -570,6 +640,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         PreparedStmt prepared = preparedStatements.get(stmtName);
         if (prepared == null) {
             sendExtendedError(ctx, "26000", "prepared statement \"" + stmtName + "\" does not exist");
+            return;
+        }
+
+        // Validate bind parameter count matches $N placeholders in the SQL
+        int suppliedParams = msg.getParameterValues() != null ? msg.getParameterValues().length : 0;
+        int requiredParams = maxParamPlaceholder(prepared.sql());
+        if (suppliedParams < requiredParams) {
+            sendExtendedError(ctx, "08P01",
+                    "bind message supplies " + suppliedParams + " parameters, but prepared statement \"" +
+                    stmtName + "\" requires " + requiredParams);
             return;
         }
 
@@ -1186,10 +1266,10 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         // Parse "SET <param> TO <value>" or "SET <param> = <value>"
         String upper = sql.trim().toUpperCase();
         if (!upper.startsWith("SET ")) return;
-        // Only emit ParameterStatus for parameters that won't break the JDBC driver.
-        // JDBC requires client_encoding=UTF8 and DateStyle starting with ISO;
-        // sending a changed value for those kills the connection.
-        String[] tracked = {"application_name", "IntervalStyle",
+        // Emit ParameterStatus for GUC parameters that PG 18 reports to clients.
+        // Note: pgjdbc will disconnect (08006) if DateStyle changes to non-ISO
+        // or client_encoding changes from UTF8 — this matches real PG behavior.
+        String[] tracked = {"application_name", "DateStyle", "IntervalStyle",
                 "is_superuser", "session_authorization",
                 "standard_conforming_strings", "TimeZone"};
         for (String param : tracked) {

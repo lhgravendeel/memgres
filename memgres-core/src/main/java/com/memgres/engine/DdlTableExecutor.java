@@ -251,6 +251,7 @@ class DdlTableExecutor {
         schema.addTable(table);
         executor.recordUndo(new Session.CreateTableUndo(schemaName, stmt.name()));
 
+        try {
         // ON COMMIT actions for temp tables
         if ("DROP".equals(stmt.onCommitAction()) && executor.session != null) {
             if (executor.session.isInTransaction()) {
@@ -330,6 +331,12 @@ class DdlTableExecutor {
                     }
                 }
             }
+        }
+        } catch (MemgresException e) {
+            // Roll back: remove the table from schema so it doesn't persist after a failed CREATE TABLE.
+            // This matches PG's atomic DDL behavior where a failed CREATE TABLE leaves no trace.
+            schema.removeTable(stmt.name());
+            throw e;
         }
 
         // Add constraints from LIKE tables

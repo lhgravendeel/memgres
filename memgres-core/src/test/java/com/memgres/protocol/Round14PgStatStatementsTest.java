@@ -10,16 +10,10 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Round 14 gaps: pg_stat_statements extension surface.
  *
- * Tools like pgAdmin, DataDog, and any query-latency dashboard lean on this
- * extension. At minimum, the following must be SELECT-able even if empty:
- *   - pg_stat_statements view
- *   - pg_stat_statements_info
- *   - pg_stat_statements_reset()
- * And CREATE EXTENSION pg_stat_statements must succeed or be idempotent.
- *
- * NOTE: Memgres (matching PG 18 behavior) correctly throws SQLSTATE 55000
- * when pg_stat_statements is not loaded via shared_preload_libraries.
- * Tests that query the view or call its functions now assert this behavior.
+ * pg_stat_statements requires shared_preload_libraries on both PG and Memgres.
+ * CREATE EXTENSION succeeds (registers in pg_extension) but querying the view
+ * or calling its functions still fails with SQLSTATE 55000 because the shared
+ * memory backend is not loaded.
  */
 class Round14PgStatStatementsTest {
 
@@ -55,7 +49,6 @@ class Round14PgStatStatementsTest {
     @Test
     void create_extension_pg_stat_statements_idempotent() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Running again should not error
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
         assertTrue(scalarInt(
                 "SELECT count(*)::int FROM pg_extension WHERE extname = 'pg_stat_statements'") >= 1);
@@ -64,50 +57,39 @@ class Round14PgStatStatementsTest {
     @Test
     void pg_stat_statements_view_queryable() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects queries to pg_stat_statements when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.executeQuery("SELECT count(*)::int FROM pg_stat_statements");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
     void pg_stat_statements_info_queryable() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects queries to pg_stat_statements_info when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.executeQuery("SELECT count(*)::int FROM pg_stat_statements_info");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
     void pg_stat_statements_reset_callable() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects calls to pg_stat_statements_reset() when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.execute("SELECT pg_stat_statements_reset()");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
     void pg_stat_statements_required_columns_present() throws SQLException {
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects queries to pg_stat_statements when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.executeQuery(
@@ -115,87 +97,65 @@ class Round14PgStatStatementsTest {
                                 + "FROM pg_stat_statements LIMIT 0");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
     void pg_stat_statements_total_plan_time_column() throws SQLException {
-        // PG 13+ split plan vs exec time
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects queries to pg_stat_statements when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.executeQuery(
                         "SELECT total_plan_time, total_exec_time FROM pg_stat_statements LIMIT 0");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
     void pg_stat_statements_toplevel_column() throws SQLException {
-        // PG 14+ toplevel column
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects queries to pg_stat_statements when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
-                s.executeQuery(
-                        "SELECT toplevel FROM pg_stat_statements LIMIT 0");
+                s.executeQuery("SELECT toplevel FROM pg_stat_statements LIMIT 0");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
     void pg_stat_statements_wal_counters_present() throws SQLException {
-        // PG 13+ WAL metrics
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects queries to pg_stat_statements when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.executeQuery(
                         "SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_statements LIMIT 0");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
     void pg_stat_statements_jit_columns_present() throws SQLException {
-        // PG 15+ JIT counters
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects queries to pg_stat_statements when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.executeQuery(
                         "SELECT jit_functions, jit_generation_time FROM pg_stat_statements LIMIT 0");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
     void pg_stat_statements_reset_with_args_pg17() throws SQLException {
-        // PG 17+ pg_stat_statements_reset(userid, dbid, queryid, minmax_only)
         exec("CREATE EXTENSION IF NOT EXISTS pg_stat_statements");
-        // Memgres correctly rejects calls to pg_stat_statements_reset() when not loaded
-        // via shared_preload_libraries, matching PG 18 behavior (SQLSTATE 55000).
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.execute("SELECT pg_stat_statements_reset(0, 0, 0)");
             }
         });
-        assertEquals("55000", ex.getSQLState(),
-                "Expected SQLSTATE 55000 but got: " + ex.getSQLState());
+        assertEquals("55000", ex.getSQLState());
     }
 
     @Test
@@ -209,7 +169,6 @@ class Round14PgStatStatementsTest {
 
     @Test
     void pg_stat_statements_max_setting() throws SQLException {
-        // PG 18: pg_stat_statements.max is unrecognized unless extension is preloaded
         SQLException ex = assertThrows(SQLException.class, () -> {
             try (Statement s = conn.createStatement()) {
                 s.executeQuery("SHOW pg_stat_statements.max");
@@ -220,7 +179,6 @@ class Round14PgStatStatementsTest {
 
     @Test
     void compute_query_id_setting() throws SQLException {
-        // PG 14+
         try (Statement s = conn.createStatement();
              ResultSet rs = s.executeQuery("SHOW compute_query_id")) {
             assertTrue(rs.next());

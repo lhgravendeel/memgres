@@ -108,41 +108,45 @@ SELECT cube_dim(cube(ARRAY[1.0, 2.0, 3.0])) AS d;
 -- SECTION G7: pgcrypto digest/hmac/gen_salt
 -- ============================================================================
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+DROP EXTENSION IF EXISTS pgcrypto CASCADE;
+CREATE EXTENSION pgcrypto;
 
--- 11. digest('hello','sha256') hex — known-answer
--- begin-expected-error
--- message-like: does not exist
--- end-expected-error
+-- 11. digest('hello','sha256') hex — known-answer (untyped args resolve via text overload)
+-- begin-expected
+-- columns: v
+-- row: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+-- end-expected
 SELECT encode(digest('hello', 'sha256'), 'hex') AS v;
 
--- 12. hmac-sha256 hex is 64 chars
--- begin-expected-error
--- message-like: does not exist
--- end-expected-error
+-- 12. hmac-sha256 hex is 64 chars (untyped args resolve via text overload)
+-- begin-expected
+-- columns: n
+-- row: 64
+-- end-expected
 SELECT length(encode(hmac('msg','key','sha256'),'hex')) AS n;
 
 -- 13. gen_salt('bf') returns Blowfish salt starting with $2
--- begin-expected-error
--- message-like: does not exist
--- end-expected-error
+-- begin-expected
+-- columns: ok
+-- row: t
+-- end-expected
 SELECT (gen_salt('bf') LIKE '$2%') AS ok;
 
--- 14. digest with explicit text cast succeeds (PG resolves text→bytea)
+-- 14. typed digest succeeds after CREATE EXTENSION
 -- begin-expected
 -- columns: v
 -- row: 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
 -- end-expected
 SELECT encode(digest('hello'::text, 'sha256'), 'hex') AS v;
 
--- 15. hmac with explicit text cast succeeds
+-- 15. typed hmac-sha256 hex is 64 chars
 -- begin-expected
--- columns: n
--- row: 64
+-- columns: ok
+-- row: t
 -- end-expected
-SELECT length(encode(hmac('msg'::text,'key','sha256'),'hex')) AS n;
+SELECT (length(encode(hmac('msg'::text,'key','sha256'),'hex')) = 64) AS ok;
 
--- 16. gen_salt with explicit text cast succeeds
+-- 16. typed gen_salt('bf') returns Blowfish salt
 -- begin-expected
 -- columns: ok
 -- row: t

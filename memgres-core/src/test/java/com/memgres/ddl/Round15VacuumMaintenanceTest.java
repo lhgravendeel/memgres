@@ -166,15 +166,12 @@ class Round15VacuumMaintenanceTest {
     }
 
     @Test
-    void cluster_inside_txn_block_errors_25001() throws SQLException {
+    void cluster_inside_txn_block_succeeds() throws SQLException {
+        // PG allows CLUSTER inside transaction blocks (unlike VACUUM)
         exec("CREATE TABLE r15_cl_txn (id int PRIMARY KEY)");
         conn.setAutoCommit(false);
         try {
             exec("CLUSTER r15_cl_txn USING r15_cl_txn_pkey");
-            fail("CLUSTER inside transaction block must error with SQLSTATE 25001");
-        } catch (SQLException e) {
-            assertEquals("25001", e.getSQLState(),
-                    "Expected 25001 for CLUSTER in txn; got " + e.getSQLState());
         } finally {
             conn.rollback();
             conn.setAutoCommit(true);

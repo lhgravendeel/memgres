@@ -105,41 +105,6 @@ class FunctionEvaluator {
         }
     }
 
-    /**
-     * PG 18 cannot resolve extension function calls when all arguments are untyped
-     * string literals ('unknown' type). At least one argument must have an explicit
-     * type (via cast, column reference, function return, etc.) for PG to match the
-     * function signature. Throws 42883 if all args are bare string/null literals.
-     */
-    private void requireTypedArgs(String functionName, FunctionCallExpr fn) {
-        boolean hasTypedArg = false;
-        for (Expression arg : fn.args()) {
-            if (!isUntypedLiteral(arg)) {
-                hasTypedArg = true;
-                break;
-            }
-        }
-        if (!hasTypedArg && !fn.args().isEmpty()) {
-            List<String> types = new ArrayList<>();
-            for (Expression arg : fn.args()) {
-                types.add("unknown");
-            }
-            throw new MemgresException(
-                    "function " + functionName + "(" + String.join(", ", types) + ") does not exist\n" +
-                    "  Hint: No function matches the given name and argument types. " +
-                    "You might need to add explicit type casts.", "42883");
-        }
-    }
-
-    private static boolean isUntypedLiteral(Expression expr) {
-        if (expr instanceof Literal) {
-            Literal lit = (Literal) expr;
-            return lit.literalType == Literal.LiteralType.STRING
-                || lit.literalType == Literal.LiteralType.NULL;
-        }
-        return false;
-    }
-
     Object evalFunction(FunctionCallExpr fn, RowContext ctx) {
         String name = fn.name().toLowerCase();
         // Strip schema prefixes for built-in function resolution
@@ -336,7 +301,6 @@ class FunctionEvaluator {
             }
             case "digest": {
                 requireExtension("pgcrypto", name, fn.args().size());
-                requireTypedArgs(name, fn);
                 // pgcrypto: digest(data, type) → bytea hash
                 requireArgs(fn, 2);
                 Object dataArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -368,7 +332,6 @@ class FunctionEvaluator {
             }
             case "hmac": {
                 requireExtension("pgcrypto", name, fn.args().size());
-                requireTypedArgs(name, fn);
                 // pgcrypto: hmac(data, key, type) → bytea HMAC
                 requireArgs(fn, 3);
                 Object dataArg = executor.evalExpr(fn.args().get(0), ctx);
@@ -408,7 +371,6 @@ class FunctionEvaluator {
             }
             case "gen_salt": {
                 requireExtension("pgcrypto", name, fn.args().size());
-                requireTypedArgs(name, fn);
                 // pgcrypto: gen_salt(type [, iter_count]) → text salt string
                 requireArgs(fn, 1);
                 Object typeArg = executor.evalExpr(fn.args().get(0), ctx);
