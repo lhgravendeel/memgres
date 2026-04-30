@@ -10,11 +10,17 @@ public final class CreateTypeStmt implements Statement {
     public final String name;
     public final List<String> enumLabels;
     public final List<CompositeField> compositeFields;
+    public final String rangeSubtype;  // For CREATE TYPE ... AS RANGE (SUBTYPE = ...)
 
     public CreateTypeStmt(String name, List<String> enumLabels, List<CompositeField> compositeFields) {
+        this(name, enumLabels, compositeFields, null);
+    }
+
+    public CreateTypeStmt(String name, List<String> enumLabels, List<CompositeField> compositeFields, String rangeSubtype) {
         this.name = name;
         this.enumLabels = enumLabels;
         this.compositeFields = compositeFields;
+        this.rangeSubtype = rangeSubtype;
     }
 
         public static final class CompositeField {
@@ -57,6 +63,7 @@ public final class CreateTypeStmt implements Statement {
     public String name() { return name; }
     public List<String> enumLabels() { return enumLabels; }
     public List<CompositeField> compositeFields() { return compositeFields; }
+    public String rangeSubtype() { return rangeSubtype; }
 
     @Override
     public boolean equals(Object o) {

@@ -127,8 +127,21 @@ class FromResolver {
         } else if (item instanceof SelectStmt.FunctionFrom) {
             SelectStmt.FunctionFrom funcFrom = (SelectStmt.FunctionFrom) item;
             String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
+            // XMLTABLE: extract column definitions from encoded args
+            if (funcFrom.functionName().equals("__xmltable__")) {
+                List<Column> cols = new ArrayList<>();
+                for (int i = 2; i < funcFrom.args().size(); i++) {
+                    Expression arg = funcFrom.args().get(i);
+                    String def = arg instanceof Literal ? ((Literal) arg).value() : arg.toString();
+                    String[] parts = def.split(":", 3);
+                    DataType dt = parts.length > 1 ? DataType.fromPgName(parts[1]) : null;
+                    cols.add(new Column(parts[0], dt != null ? dt : DataType.TEXT, true, false, null));
+                }
+                Table virtualTable = new Table(alias, cols);
+                bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
+            }
             // JSON_TABLE: extract column definitions from the JsonTableExpr
-            if (funcFrom.functionName().equals("__json_table__") && !funcFrom.args().isEmpty()
+            else if (funcFrom.functionName().equals("__json_table__") && !funcFrom.args().isEmpty()
                     && funcFrom.args().get(0) instanceof JsonTableExpr) {
                 JsonTableExpr jt = (JsonTableExpr) funcFrom.args().get(0);
                 List<Column> cols = new ArrayList<>();
@@ -140,7 +153,7 @@ class FromResolver {
                 if (ca != null && !ca.isEmpty()) {
                     List<Column> cols = new ArrayList<>();
                     for (String colName : ca) {
-                        cols.add(new Column(colName, DataType.TEXT, true, false, null));
+                        cols.add(new Column(FromFunctionResolver.stripColType(colName), DataType.TEXT, true, false, null));
                     }
                     Table virtualTable = new Table(alias, cols);
                     bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
@@ -272,7 +285,7 @@ class FromResolver {
                             String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
                             List<Column> emptyCols = funcFrom.columnAliases() != null
                                     ? funcFrom.columnAliases().stream()
-                                        .map(c -> new Column(c, DataType.TEXT, true, false, null))
+                                        .map(c -> new Column(FromFunctionResolver.stripColType(c), DataType.TEXT, true, false, null))
                                         .collect(java.util.stream.Collectors.toList())
                                     : Cols.listOf();
                             Table virtualTable = new Table(alias, emptyCols);
@@ -600,31 +613,58 @@ class FromResolver {
                 || "memgres".equalsIgnoreCase(currentRole);
         if (!isSuperuser || table.isRlsForced()) {
             String effectiveRole = currentRole != null ? currentRole : "test";
-            List<RlsPolicy> selectPolicies = new ArrayList<>();
+            List<RlsPolicy> permissivePolicies = new ArrayList<>();
+            List<RlsPolicy> restrictivePolicies = new ArrayList<>();
             for (RlsPolicy p : table.getRlsPolicies()) {
                 if (p.appliesTo("SELECT") && p.getUsingExpr() != null
                         && p.appliesToRole(effectiveRole)) {
-                    selectPolicies.add(p);
+                    if (p.isRestrictive()) {
+                        restrictivePolicies.add(p);
+                    } else {
+                        permissivePolicies.add(p);
+                    }
                 }
             }
-            if (selectPolicies.isEmpty()) {
+            if (permissivePolicies.isEmpty() && restrictivePolicies.isEmpty()) {
                 return new ArrayList<>();
             }
             List<RowContext> filtered = new ArrayList<>();
             for (RowContext ctx : contexts) {
-                boolean passes = false;
-                for (RlsPolicy policy : selectPolicies) {
+                // PG semantics: row must pass ALL restrictive policies
+                // AND at least ONE permissive policy (if any exist).
+                // If no permissive policies exist but restrictive ones do,
+                // default deny (no permissive policy to grant access).
+                boolean passesPermissive;
+                if (permissivePolicies.isEmpty()) {
+                    passesPermissive = false;
+                } else {
+                    passesPermissive = false;
+                    for (RlsPolicy policy : permissivePolicies) {
+                        try {
+                            Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
+                            if (Boolean.TRUE.equals(result)) {
+                                passesPermissive = true;
+                                break;
+                            }
+                        } catch (Exception e) {
+                            // Expression evaluation failed; row does not pass this policy
+                        }
+                    }
+                }
+                boolean passesRestrictive = true;
+                for (RlsPolicy policy : restrictivePolicies) {
                     try {
                         Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
-                        if (Boolean.TRUE.equals(result)) {
-                            passes = true;
+                        if (!Boolean.TRUE.equals(result)) {
+                            passesRestrictive = false;
                             break;
                         }
                     } catch (Exception e) {
-                        // Expression evaluation failed; row does not pass
+                        passesRestrictive = false;
+                        break;
                     }
                 }
-                if (passes) {
+                if (passesPermissive && passesRestrictive) {
                     filtered.add(ctx);
                 }
             }

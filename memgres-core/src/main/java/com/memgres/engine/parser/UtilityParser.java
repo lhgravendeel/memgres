@@ -127,6 +127,8 @@ class UtilityParser {
         String escape = null; // null = same as quote char
         List<String> forceQuote = null;
         List<String> forceNotNull = null;
+        List<String> forceNull = null;
+        boolean headerMatch = false;
         boolean freeze = false;
         String encoding = null;
         String onError = null;
@@ -152,7 +154,7 @@ class UtilityParser {
                         header = true;
                         if (parser.matchKeyword("TRUE")) { /* already set */ }
                         else if (parser.matchKeyword("FALSE")) { header = false; }
-                        else if (parser.matchKeyword("MATCH")) { /* HEADER MATCH for FROM */ }
+                        else if (parser.matchKeyword("MATCH")) { headerMatch = true; }
                         break;
                     }
                     case "QUOTE":
@@ -168,7 +170,7 @@ class UtilityParser {
                         forceNotNull = parseColumnListOption();
                         break;
                     case "FORCE_NULL":
-                        parseColumnListOption();
+                        forceNull = parseColumnListOption();
                         break;
                     case "FREEZE": {
                         freeze = true;
@@ -219,9 +221,9 @@ class UtilityParser {
         if (nullString == null) nullString = "csv".equals(format) ? "" : "\\N";
         if (escape == null) escape = quote;
 
-        // Handle WHERE clause for COPY TO
+        // Handle WHERE clause for COPY FROM/TO
         String whereClause = null;
-        if (!isFrom && parser.matchKeyword("WHERE")) {
+        if (parser.matchKeyword("WHERE")) {
             // Capture the rest as WHERE clause text
             StringBuilder wb = new StringBuilder();
             while (!parser.isAtEnd() && parser.peek().type() != TokenType.SEMICOLON) {
@@ -237,7 +239,7 @@ class UtilityParser {
         }
 
         return new CopyStmt(table, columns, isFrom, source, format, delimiter, nullString, header, null, null,
-                quote, escape, forceQuote, forceNotNull, freeze, encoding, whereClause, onError, defaultString);
+                quote, escape, forceQuote, forceNotNull, forceNull, headerMatch, freeze, encoding, whereClause, onError, defaultString);
     }
 
     /** Parse a column list option like FORCE_QUOTE (col1, col2) or FORCE_QUOTE *. */
@@ -324,6 +326,16 @@ class UtilityParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("default_transaction_isolation", "");
         }
+        // SET LOCAL SESSION AUTHORIZATION name | DEFAULT
+        if (isLocal && parser.checkKeyword("SESSION") && parser.pos + 1 < parser.tokens.size()
+                && parser.tokens.get(parser.pos + 1).type() == TokenType.KEYWORD
+                && parser.tokens.get(parser.pos + 1).value().equals("AUTHORIZATION")) {
+            parser.advance(); // SESSION
+            parser.advance(); // AUTHORIZATION
+            String authValue = parser.readIdentifier();
+            return new SetStmt("session_authorization", authValue, true);
+        }
+
         // SET XML OPTION { DOCUMENT | CONTENT }
         if (parser.checkKeyword("XML")) {
             parser.advance(); // XML
@@ -379,6 +391,16 @@ class UtilityParser {
                 } else if (parser.matchKeyword("SERIALIZABLE")) {
                     isolLevel = "serializable";
                 }
+            }
+            // Parse SNAPSHOT 'id'
+            if (parser.matchKeyword("SNAPSHOT") || parser.matchIdentifier("SNAPSHOT")) {
+                String snapshotId;
+                if (parser.check(TokenType.STRING_LITERAL)) {
+                    snapshotId = parser.advance().value();
+                } else {
+                    snapshotId = parser.readIdentifier();
+                }
+                return new SetStmt("transaction_snapshot", snapshotId);
             }
             // Parse READ ONLY/WRITE
             if (parser.matchKeyword("READ")) {
@@ -551,6 +573,12 @@ class UtilityParser {
         boolean verbose = parser.matchKeyword("VERBOSE");
         String format = "TEXT";
         boolean costs = true;
+        boolean memory = false;
+        boolean serialize = false;
+        boolean genericPlan = false;
+        boolean buffers = false;
+        boolean wal = false;
+        boolean settings = false;
         // Deferred option error: collected here so that table-existence checks
         // in the executor run first (matching PostgreSQL's error priority).
         String deferredOptionError = null;
@@ -599,9 +627,58 @@ class UtilityParser {
                     } catch (ParseException e) {
                         if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
                     }
-                } else if (optName.equals("BUFFERS")
-                        || optName.equals("TIMING") || optName.equals("SUMMARY")
-                        || optName.equals("WAL") || optName.equals("SETTINGS")) {
+                } else if (optName.equals("SERIALIZE")) {
+                    parser.advance();
+                    serialize = true;
+                    // SERIALIZE takes TEXT or BINARY (or a boolean ON/OFF/TRUE/FALSE)
+                    if (parser.checkKeyword("TEXT") || parser.checkKeyword("BINARY")) {
+                        parser.advance();
+                    } else {
+                        try {
+                            if (consumeExplainBooleanOption()) serialize = false;
+                        } catch (ParseException e) {
+                            if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
+                        }
+                    }
+                } else if (optName.equals("MEMORY")) {
+                    parser.advance();
+                    memory = true;
+                    try {
+                        if (consumeExplainBooleanOption()) memory = false;
+                    } catch (ParseException e) {
+                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
+                    }
+                } else if (optName.equals("GENERIC_PLAN")) {
+                    parser.advance();
+                    genericPlan = true;
+                    try {
+                        if (consumeExplainBooleanOption()) genericPlan = false;
+                    } catch (ParseException e) {
+                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
+                    }
+                } else if (optName.equals("BUFFERS")) {
+                    parser.advance();
+                    try {
+                        buffers = !consumeExplainBooleanOption();
+                    } catch (ParseException e) {
+                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
+                    }
+                } else if (optName.equals("WAL")) {
+                    parser.advance();
+                    try {
+                        wal = !consumeExplainBooleanOption();
+                    } catch (ParseException e) {
+                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
+                    }
+                } else if (optName.equals("SETTINGS")) {
+                    parser.advance();
+                    settings = true;
+                    try {
+                        if (consumeExplainBooleanOption()) settings = false;
+                    } catch (ParseException e) {
+                        if (deferredOptionError == null) { deferredOptionError = e.getMessage(); deferredOptionSqlState = "22023"; }
+                    }
+                } else if (optName.equals("TIMING") || optName.equals("SUMMARY")) {
                     parser.advance();
                     try {
                         consumeExplainBooleanOption();
@@ -621,7 +698,9 @@ class UtilityParser {
         }
 
         Statement stmt = parser.parseStatement();
-        return new ExplainStmt(stmt, analyze, verbose, format, costs, deferredOptionError, deferredOptionSqlState);
+        ExplainStmt explainStmt = new ExplainStmt(stmt, analyze, verbose, format, costs, deferredOptionError, deferredOptionSqlState, memory, serialize, genericPlan, buffers, wal);
+        explainStmt.settings = settings;
+        return explainStmt;
     }
 
     /** Consume an optional TRUE/FALSE/ON/OFF value after an EXPLAIN option. Returns true if value was FALSE/OFF.
@@ -833,10 +912,17 @@ class UtilityParser {
         parser.expectKeyword("LOCK");
         parser.matchKeyword("TABLE");
         parser.matchKeyword("ONLY");
-        String tableName = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) {
-            tableName = tableName + "." + parser.readIdentifier(); // schema.table
-        }
+        // Read comma-separated list of table names:
+        // LOCK TABLE t1, schema.t2, t3 IN ACCESS SHARE MODE NOWAIT
+        java.util.List<String> tableNames = new java.util.ArrayList<>();
+        do {
+            parser.matchKeyword("ONLY"); // ONLY can appear before each table
+            String tableName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) {
+                tableName = tableName + "." + parser.readIdentifier(); // schema.table
+            }
+            tableNames.add(tableName);
+        } while (parser.match(TokenType.COMMA));
         String lockMode = "ACCESS EXCLUSIVE"; // default
         if (parser.matchKeyword("IN")) {
             StringBuilder mode = new StringBuilder();
@@ -849,7 +935,7 @@ class UtilityParser {
             lockMode = mode.toString();
         }
         boolean nowait = parser.matchKeyword("NOWAIT");
-        return new LockStmt(tableName, lockMode, nowait);
+        return new LockStmt(tableNames, lockMode, nowait);
     }
 
     // ---- GRANT ----
@@ -863,12 +949,15 @@ class UtilityParser {
         List<String> privileges = new ArrayList<>();
         List<String> columns = null;
 
-        // Read privileges: ALL [PRIVILEGES], SELECT, INSERT, UPDATE, DELETE, etc.
+        // Read privileges: ALL [PRIVILEGES], SELECT, INSERT, UPDATE, DELETE, ALTER SYSTEM, etc.
         do {
             String priv = parser.readIdentifier().toUpperCase();
             if (priv.equals("ALL")) {
                 parser.matchKeyword("PRIVILEGES");
                 privileges.add("ALL");
+            } else if (priv.equals("ALTER") && parser.checkKeyword("SYSTEM")) {
+                parser.advance(); // consume SYSTEM
+                privileges.add("ALTER SYSTEM");
             } else {
                 privileges.add(priv);
             }
@@ -898,11 +987,20 @@ class UtilityParser {
         String objectType = "TABLE"; // default
         String objectName;
 
-        // GRANT SET ON PARAMETER param_name TO role (PG 15+), no-op
+        // GRANT SET/ALTER SYSTEM ON PARAMETER param_name[, ...] TO role (PG 15+)
         if (parser.matchIdentifier("PARAMETER")) {
-            // Consume remaining until semicolon
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new GrantStmt(privileges, "PARAMETER", "param", Cols.listOf(), false, false, false, null);
+            String paramName = parser.readIdentifier();
+            // Consume additional parameter names separated by commas
+            while (parser.match(TokenType.COMMA)) {
+                paramName = paramName + "," + parser.readIdentifier();
+            }
+            parser.expectKeyword("TO");
+            java.util.List<String> paramGrantees = new java.util.ArrayList<>();
+            paramGrantees.add(readGrantee());
+            while (parser.match(TokenType.COMMA)) {
+                paramGrantees.add(readGrantee());
+            }
+            return new GrantStmt(privileges, "PARAMETER", paramName, paramGrantees, false, false, false, null);
         }
 
         if (parser.matchKeyword("ALL")) {
@@ -937,6 +1035,21 @@ class UtilityParser {
         } else if (parser.matchKeyword("TYPE")) {
             objectType = "TYPE";
             objectName = parser.readIdentifier();
+        } else if (parser.matchKeyword("FOREIGN")) {
+            // FOREIGN DATA WRAPPER name or FOREIGN SERVER name
+            if (parser.matchKeyword("DATA")) {
+                parser.expectKeyword("WRAPPER");
+                objectType = "FOREIGN DATA WRAPPER";
+                objectName = parser.readIdentifier();
+            } else {
+                parser.expectKeyword("SERVER");
+                objectType = "FOREIGN SERVER";
+                objectName = parser.readIdentifier();
+            }
+        } else if (parser.matchKeyword("LARGE")) {
+            parser.expectKeyword("OBJECT");
+            objectType = "LARGE OBJECT";
+            objectName = parser.advance().value(); // OID is a number, not an identifier
         } else {
             objectName = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) objectName = parser.readIdentifier();
@@ -952,7 +1065,15 @@ class UtilityParser {
             withGrantOption = true;
         }
 
-        return new GrantStmt(privileges, objectType, objectName, grantees, withGrantOption, false, false, columns);
+        // Consume optional GRANTED BY role and capture the grantor name
+        // Note: GRANTED is not a reserved keyword, so it is tokenized as an IDENTIFIER
+        String grantor = null;
+        if (parser.matchIdentifier("GRANTED")) {
+            parser.expectKeyword("BY");
+            grantor = parser.readIdentifier();
+        }
+
+        return new GrantStmt(privileges, objectType, objectName, grantees, withGrantOption, false, false, columns, grantor);
     }
 
     // ---- REVOKE ----
@@ -972,6 +1093,7 @@ class UtilityParser {
         }
 
         List<String> privileges = new ArrayList<>();
+        List<String> revokeColumns = null;
         do {
             String priv = parser.readIdentifier().toUpperCase();
             if (priv.equals("ALL")) {
@@ -980,9 +1102,14 @@ class UtilityParser {
             } else {
                 privileges.add(priv);
             }
-            // Skip column-level parens
+            // Capture column-level parens
             if (parser.check(TokenType.LEFT_PAREN) && !parser.checkKeyword("ON") && !parser.checkKeyword("FROM")) {
-                parser.consumeUntilParen();
+                revokeColumns = new ArrayList<>();
+                parser.advance(); // consume '('
+                do {
+                    revokeColumns.add(parser.readIdentifier());
+                } while (parser.match(TokenType.COMMA));
+                parser.expect(TokenType.RIGHT_PAREN);
             }
         } while (parser.match(TokenType.COMMA));
 
@@ -1031,6 +1158,20 @@ class UtilityParser {
         } else if (parser.matchKeyword("TYPE")) {
             objectType = "TYPE";
             objectName = parser.readIdentifier();
+        } else if (parser.matchKeyword("FOREIGN")) {
+            if (parser.matchKeyword("DATA")) {
+                parser.expectKeyword("WRAPPER");
+                objectType = "FOREIGN DATA WRAPPER";
+                objectName = parser.readIdentifier();
+            } else {
+                parser.expectKeyword("SERVER");
+                objectType = "FOREIGN SERVER";
+                objectName = parser.readIdentifier();
+            }
+        } else if (parser.matchKeyword("LARGE")) {
+            parser.expectKeyword("OBJECT");
+            objectType = "LARGE OBJECT";
+            objectName = parser.advance().value(); // OID is a number, not an identifier
         } else {
             objectName = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) objectName = parser.readIdentifier();
@@ -1043,7 +1184,7 @@ class UtilityParser {
         boolean cascade = parser.matchKeyword("CASCADE");
         parser.matchKeyword("RESTRICT");
 
-        return new RevokeStmt(privileges, objectType, objectName, grantees, grantOptionFor, false, cascade);
+        return new RevokeStmt(privileges, objectType, objectName, grantees, grantOptionFor, false, cascade, revokeColumns);
     }
 
     // ---- REASSIGN OWNED ----
@@ -1084,6 +1225,11 @@ class UtilityParser {
             return new SetStmt("reset", "ALL");
         }
         String param = parser.readIdentifier();
+        // RESET SESSION AUTHORIZATION → combine into "session_authorization"
+        if (param.equalsIgnoreCase("session") && parser.checkKeyword("AUTHORIZATION")) {
+            parser.advance(); // consume AUTHORIZATION
+            param = "session_authorization";
+        }
         if (parser.match(TokenType.DOT)) {
             param = param + "." + parser.readIdentifier();
         }
@@ -1158,8 +1304,13 @@ class UtilityParser {
         parser.expectKeyword("SECURITY");
         parser.expectKeyword("LABEL");
         // SECURITY LABEL [FOR provider] ON object IS 'label'
+        String provider = null;
+        if (parser.matchKeyword("FOR")) {
+            provider = parser.readIdentifier();
+        }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("security_label", "ok");
+        String value = provider != null ? "provider:" + provider : "ok";
+        return new SetStmt("security_label", value);
     }
 
     // ---- ANALYZE ----
@@ -1169,13 +1320,25 @@ class UtilityParser {
         // ANALYZE [VERBOSE] [table [(column, ...)]]
         parser.matchKeyword("VERBOSE");
         String tableName = null;
+        String columnList = null;
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             tableName = parser.readIdentifier(); // table name
             if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier(); // schema.table
             // Optional column list
-            if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                parser.advance(); // (
+                StringBuilder cols = new StringBuilder();
+                while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                    if (cols.length() > 0) { parser.expect(TokenType.COMMA); cols.append(","); }
+                    cols.append(parser.readIdentifier());
+                }
+                parser.expect(TokenType.RIGHT_PAREN);
+                columnList = cols.toString();
+            }
         }
-        return new SetStmt("analyze", tableName != null ? "table:" + tableName : "ok");
+        String value = tableName != null ? "table:" + tableName : "ok";
+        if (columnList != null) value += ",columns:" + columnList;
+        return new SetStmt("analyze", value);
     }
 
     // ---- VACUUM ----
@@ -1188,6 +1351,8 @@ class UtilityParser {
     SetStmt parseVacuum() {
         parser.expectKeyword("VACUUM");
         // VACUUM [(options)] [table [(column, ...)]]
+        boolean hasAnalyze = false;
+        boolean hasVerbose = false;
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.advance(); // (
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
@@ -1198,6 +1363,8 @@ class UtilityParser {
                 if (!VALID_VACUUM_OPTIONS.contains(opt)) {
                     throw new ParseException("unrecognized VACUUM option \"" + optToken.value() + "\"", optToken);
                 }
+                if (opt.equals("ANALYZE") || opt.equals("ANALYSE")) hasAnalyze = true;
+                if (opt.equals("VERBOSE")) hasVerbose = true;
                 // Some options take a value (PARALLEL n, BUFFER_USAGE_LIMIT n, INDEX_CLEANUP bool)
                 if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
                     parser.advance(); // consume value
@@ -1208,9 +1375,8 @@ class UtilityParser {
             // Bare options before table name
             parser.matchKeyword("FULL");
             parser.matchKeyword("FREEZE");
-            parser.matchKeyword("VERBOSE");
-            parser.matchKeyword("ANALYZE");
-            parser.matchKeyword("ANALYSE");
+            if (parser.matchKeyword("VERBOSE")) hasVerbose = true;
+            if (parser.matchKeyword("ANALYZE") || parser.matchKeyword("ANALYSE")) hasAnalyze = true;
         }
         // Optional table name
         String vacuumTable = null;
@@ -1219,7 +1385,11 @@ class UtilityParser {
             if (parser.match(TokenType.DOT)) vacuumTable = parser.readIdentifier();
             if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
         }
-        return new SetStmt("vacuum", vacuumTable != null ? "table:" + vacuumTable : "ok");
+        // Encode flags + table into the value string
+        String value = vacuumTable != null ? "table:" + vacuumTable : "ok";
+        if (hasAnalyze) value = "analyze," + value;
+        if (hasVerbose) value = "verbose," + value;
+        return new SetStmt("vacuum", value);
     }
 
     // ---- REINDEX ----
@@ -1254,13 +1424,22 @@ class UtilityParser {
         parser.expectKeyword("CLUSTER");
         // CLUSTER [VERBOSE] table [USING index]
         parser.matchKeyword("VERBOSE");
+        String tableName = null;
+        String indexName = null;
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            parser.readIdentifier(); // table name
+            tableName = parser.readIdentifier(); // table name
+            if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier(); // schema.table
             if (parser.matchKeyword("USING")) {
-                parser.readIdentifier(); // index name
+                indexName = parser.readIdentifier(); // index name
             }
         }
-        return new SetStmt("cluster", "ok");
+        String value = "ok";
+        if (tableName != null && indexName != null) {
+            value = "table:" + tableName + ",index:" + indexName;
+        } else if (tableName != null) {
+            value = "table:" + tableName;
+        }
+        return new SetStmt("cluster", value);
     }
 
     // ---- CHECKPOINT ----
@@ -1280,9 +1459,32 @@ class UtilityParser {
     }
 
     SetStmt parseImport() {
-        // IMPORT FOREIGN SCHEMA ... INTO ..., no-op
+        // IMPORT FOREIGN SCHEMA <schema_name> [LIMIT TO (...) | EXCEPT (...)] FROM SERVER <server_name> INTO <local_schema>
         parser.expectKeyword("IMPORT");
+        parser.expectKeyword("FOREIGN");
+        parser.expectKeyword("SCHEMA");
+        // Skip the remote schema name
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)
+                && !parser.checkKeyword("FROM")) {
+            parser.advance();
+        }
+        // Extract server name from FROM SERVER <name>
+        String serverName = null;
+        if (parser.matchKeyword("FROM")) {
+            parser.expectKeyword("SERVER");
+            serverName = parser.readIdentifier();
+        }
+        // Consume the rest of the statement
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("create_noop", "ok");
+        return new SetStmt("import_foreign_schema", serverName != null ? serverName : "");
+    }
+
+    /** Read a grantee name, which may be an identifier or a keyword like CURRENT_USER, SESSION_USER, PUBLIC. */
+    private String readGrantee() {
+        if (parser.matchKeyword("CURRENT_USER")) return "current_user";
+        if (parser.matchKeyword("SESSION_USER")) return "session_user";
+        if (parser.matchKeyword("CURRENT_ROLE")) return "current_user";
+        if (parser.matchKeyword("PUBLIC")) return "public";
+        return parser.readIdentifier();
     }
 }

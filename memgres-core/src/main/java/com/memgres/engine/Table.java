@@ -29,6 +29,11 @@ public class Table {
     private final AtomicLong tupInserted = new AtomicLong(0);
     private final AtomicLong tupUpdated = new AtomicLong(0);
     private final AtomicLong tupDeleted = new AtomicLong(0);
+    private final AtomicLong idxScanCount = new AtomicLong(0);
+
+    // Maintenance timestamps for pg_stat_user_tables
+    private volatile java.time.OffsetDateTime lastVacuum;
+    private volatile java.time.OffsetDateTime lastAnalyze;
 
     // Inheritance
     private Table parentTable;
@@ -45,6 +50,16 @@ public class Table {
     private Integer partitionModulus;   // for HASH
     private Integer partitionRemainder; // for HASH
     private boolean defaultPartition;  // DEFAULT partition
+
+    // Storage parameters (WITH options, e.g. fillfactor=80)
+    private Map<String, String> reloptions;
+
+    // Unlogged table
+    private boolean unlogged;
+
+    // Replica identity for logical replication (DEFAULT, FULL, NOTHING, or index name)
+    // 'd' = DEFAULT (PK), 'f' = FULL, 'n' = NOTHING, 'i' = USING INDEX
+    private volatile char replicaIdentity = 'd';
 
     // Row-level security
     private boolean rlsEnabled;
@@ -273,6 +288,14 @@ public class Table {
         } finally {
             writeLock.unlock();
         }
+    }
+
+    /**
+     * Delete a single row from the table using identity comparison.
+     */
+    public void deleteRow(Object[] row) {
+        java.util.Set<Object[]> s = java.util.Collections.singleton(row);
+        deleteRows(s);
     }
 
     public void addColumn(Column column) {
@@ -576,6 +599,12 @@ public class Table {
         return null;
     }
 
+    // Unlogged
+    public boolean isUnlogged() { return unlogged; }
+    public void setUnlogged(boolean unlogged) { this.unlogged = unlogged; }
+    public Map<String, String> getReloptions() { return reloptions; }
+    public void setReloptions(Map<String, String> reloptions) { this.reloptions = reloptions; }
+
     // Inheritance
     public Table getParentTable() { return parentTable; }
     public void setParentTable(Table parent) { this.parentTable = parent; }
@@ -612,6 +641,31 @@ public class Table {
     public List<RlsPolicy> getRlsPolicies() { return rlsPolicies; }
     public void addRlsPolicy(RlsPolicy policy) { rlsPolicies.add(policy); }
 
+    // Replica identity
+    public char getReplicaIdentity() { return replicaIdentity; }
+    public void setReplicaIdentity(char identity) { this.replicaIdentity = identity; }
+
+    /**
+     * Whether this table has a usable replica identity for UPDATE/DELETE in
+     * logical replication.  PG considers DEFAULT ('d') usable only when the
+     * table actually has a primary key; FULL ('f') is always usable; NOTHING
+     * ('n') is never usable; INDEX ('i') is usable.
+     */
+    public boolean hasUsableReplicaIdentity() {
+        switch (replicaIdentity) {
+            case 'f': // FULL — always usable
+            case 'i': // USING INDEX — usable
+                return true;
+            case 'd': // DEFAULT — usable only if PK exists
+                for (StoredConstraint c : constraints) {
+                    if (c.getType() == StoredConstraint.Type.PRIMARY_KEY) return true;
+                }
+                return false;
+            default:  // 'n' (NOTHING) or unknown
+                return false;
+        }
+    }
+
     // DML statistics
     public long getTupInserted() { return tupInserted.get(); }
     public long getTupUpdated() { return tupUpdated.get(); }
@@ -619,4 +673,12 @@ public class Table {
     public void incrementTupInserted(long count) { tupInserted.addAndGet(count); }
     public void incrementTupUpdated(long count) { tupUpdated.addAndGet(count); }
     public void incrementTupDeleted(long count) { tupDeleted.addAndGet(count); }
+    public long getIdxScanCount() { return idxScanCount.get(); }
+    public void incrementIdxScanCount() { idxScanCount.incrementAndGet(); }
+
+    // Maintenance timestamps
+    public java.time.OffsetDateTime getLastVacuum() { return lastVacuum; }
+    public void setLastVacuum(java.time.OffsetDateTime ts) { this.lastVacuum = ts; }
+    public java.time.OffsetDateTime getLastAnalyze() { return lastAnalyze; }
+    public void setLastAnalyze(java.time.OffsetDateTime ts) { this.lastAnalyze = ts; }
 }

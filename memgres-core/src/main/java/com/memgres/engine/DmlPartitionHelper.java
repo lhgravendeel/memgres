@@ -35,9 +35,17 @@ class DmlPartitionHelper {
     Table routeToPartition(Table table, Object[] row) {
         if (table.getPartitionStrategy() == null || table.getPartitions().isEmpty()) return table;
 
-        int colIdx = table.getColumnIndex(table.getPartitionColumn());
-        if (colIdx < 0) return table;
-        Object value = row[colIdx];
+        String partCol = table.getPartitionColumn();
+        Object value;
+        if (partCol.contains("(")) {
+            // Expression-based partition key (e.g., "(lower(s))")
+            // Build a row context and evaluate the expression
+            value = evaluatePartitionExpression(table, partCol, row);
+        } else {
+            int colIdx = table.getColumnIndex(partCol);
+            if (colIdx < 0) return table;
+            value = row[colIdx];
+        }
 
         Table matched = null;
         for (Table partition : table.getPartitions()) {
@@ -86,6 +94,35 @@ class DmlPartitionHelper {
             return routeToPartition(matched, row);
         }
         return matched;
+    }
+
+    /**
+     * Evaluate an expression-based partition key against a row.
+     * E.g., for PARTITION BY RANGE ((lower(s))), evaluate lower(s) for the given row.
+     */
+    private Object evaluatePartitionExpression(Table table, String exprStr, Object[] row) {
+        // Strip outer parens: "(lower(s))" -> "lower(s)"
+        String inner = exprStr.trim();
+        if (inner.startsWith("(") && inner.endsWith(")")) {
+            inner = inner.substring(1, inner.length() - 1).trim();
+        }
+        try {
+            // Parse via "SELECT <expr>" and extract the expression from the projection
+            com.memgres.engine.parser.ast.Statement stmt =
+                    com.memgres.engine.parser.Parser.parse("SELECT " + inner);
+            if (stmt instanceof com.memgres.engine.parser.ast.SelectStmt) {
+                com.memgres.engine.parser.ast.SelectStmt sel =
+                        (com.memgres.engine.parser.ast.SelectStmt) stmt;
+                if (sel.targets != null && !sel.targets.isEmpty()) {
+                    com.memgres.engine.parser.ast.Expression expr = sel.targets.get(0).expr();
+                    RowContext ctx = new RowContext(table, table.getName(), row);
+                    return executor.evalExpr(expr, ctx);
+                }
+            }
+        } catch (Exception e) {
+            // fallback: return null
+        }
+        return null;
     }
 
     /**

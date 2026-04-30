@@ -122,15 +122,29 @@ class SelectSetOpExecutor {
                 break;
             }
             case INTERSECT: {
-                Set<String> rightKeys = new HashSet<>();
-                for (Object[] row : rightResult.getRows()) {
-                    rightKeys.add(Arrays.deepToString(row));
-                }
-                Set<String> seen = new HashSet<>();
-                for (Object[] row : leftResult.getRows()) {
-                    String key = Arrays.deepToString(row);
-                    if (rightKeys.contains(key)) {
-                        if (stmt.all() || seen.add(key)) {
+                if (stmt.all()) {
+                    // Multiset semantics: each left row matches at most once per right occurrence.
+                    Map<String, Integer> rightCounts = new HashMap<>();
+                    for (Object[] row : rightResult.getRows()) {
+                        rightCounts.merge(Arrays.deepToString(row), 1, Integer::sum);
+                    }
+                    for (Object[] row : leftResult.getRows()) {
+                        String key = Arrays.deepToString(row);
+                        int remaining = rightCounts.getOrDefault(key, 0);
+                        if (remaining > 0) {
+                            resultRows.add(row);
+                            rightCounts.put(key, remaining - 1);
+                        }
+                    }
+                } else {
+                    Set<String> rightKeys = new HashSet<>();
+                    for (Object[] row : rightResult.getRows()) {
+                        rightKeys.add(Arrays.deepToString(row));
+                    }
+                    Set<String> seen = new HashSet<>();
+                    for (Object[] row : leftResult.getRows()) {
+                        String key = Arrays.deepToString(row);
+                        if (rightKeys.contains(key) && seen.add(key)) {
                             resultRows.add(row);
                         }
                     }

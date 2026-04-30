@@ -34,6 +34,7 @@ public enum DataType {
     INET(869, "inet"),
     CIDR(650, "cidr"),
     MACADDR(829, "macaddr"),
+    MACADDR8(774, "macaddr8"),
 
     // Binary
     BYTEA(17, "bytea"),
@@ -92,7 +93,14 @@ public enum DataType {
     // Array types (used for system catalog columns and array expressions)
     TEXT_ARRAY(1009, "_text"),
     INT4_ARRAY(1007, "_int4"),
+    NAME_ARRAY(1003, "_name"),
     ACLITEM_ARRAY(1034, "_aclitem"),
+
+    // Transaction ID type
+    XID(28, "xid"),
+
+    // Record (composite) type
+    RECORD(2249, "record"),
 
     // Custom enum placeholder; actual enum types are resolved by name
     ENUM(0, "enum");
@@ -149,6 +157,11 @@ public enum DataType {
                 return TEXT;
             case "name":
                 return NAME;
+            case "oid":
+            case "regclass":
+            case "regtype":
+            case "regproc":
+                return INTEGER;
             case "bool":
             case "boolean":
                 return BOOLEAN;
@@ -190,6 +203,8 @@ public enum DataType {
                 return CIDR;
             case "macaddr":
                 return MACADDR;
+            case "macaddr8":
+                return MACADDR8;
             case "tsvector":
                 return TSVECTOR;
             case "tsquery":
@@ -247,6 +262,9 @@ public enum DataType {
             case "integer[]":
             case "_int4":
                 return INT4_ARRAY;
+            case "name[]":
+            case "_name":
+                return NAME_ARRAY;
             case "aclitem[]":
             case "_aclitem":
                 return ACLITEM_ARRAY;
@@ -293,6 +311,7 @@ public enum DataType {
             case INET: return "inet";
             case CIDR: return "cidr";
             case MACADDR: return "macaddr";
+            case MACADDR8: return "macaddr8";
             case TSVECTOR: return "tsvector";
             case TSQUERY: return "tsquery";
             case POINT: return "point";
@@ -319,6 +338,7 @@ public enum DataType {
             case TSTZMULTIRANGE: return "tstzmultirange";
             case TEXT_ARRAY: return "text[]";
             case INT4_ARRAY: return "integer[]";
+            case NAME_ARRAY: return "name[]";
             case ACLITEM_ARRAY: return "aclitem[]";
             default: return pgName;
         }

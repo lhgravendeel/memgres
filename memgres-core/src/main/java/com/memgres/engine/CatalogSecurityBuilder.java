@@ -21,7 +21,7 @@ class CatalogSecurityBuilder {
         this.oids = oids;
     }
 
-    Table buildPgSettings() {
+    Table buildPgSettings(GucSettings sessionGuc) {
         List<Column> cols = Cols.listOf(
                 colNN("name", DataType.TEXT),
                 colNN("setting", DataType.TEXT),
@@ -34,7 +34,7 @@ class CatalogSecurityBuilder {
                 col("source", DataType.TEXT),
                 col("min_val", DataType.TEXT),
                 col("max_val", DataType.TEXT),
-                col("enumvals", DataType.TEXT),
+                col("enumvals", DataType.TEXT_ARRAY),
                 col("boot_val", DataType.TEXT),
                 col("reset_val", DataType.TEXT),
                 col("pending_restart", DataType.BOOLEAN),
@@ -44,6 +44,14 @@ class CatalogSecurityBuilder {
         Table table = new Table("pg_settings", cols);
         GucSettings defaults = new GucSettings();
         Map<String, String> all = defaults.getAll();
+        // If session GUC is provided, merge session overrides so new keys appear too
+        if (sessionGuc != null) {
+            for (Map.Entry<String, String> e : sessionGuc.getAll().entrySet()) {
+                if (!all.containsKey(e.getKey())) {
+                    all.put(e.getKey(), e.getValue());
+                }
+            }
+        }
         // Category and description info for well-known settings
         Map<String, String[]> meta = new LinkedHashMap<>();
         meta.put("server_version", new String[]{"Preset Options", "Shows the server version.", "internal", "string"});
@@ -62,15 +70,52 @@ class CatalogSecurityBuilder {
         meta.put("transaction_isolation", new String[]{"Client Connection Defaults", "Sets the current transaction's isolation level.", "user", "enum"});
         meta.put("lc_collate", new String[]{"Preset Options", "Shows the collation order locale.", "internal", "string"});
         meta.put("lc_ctype", new String[]{"Preset Options", "Shows the character classification and case conversion locale.", "internal", "string"});
+        // Unit metadata for known parameters
+        Map<String, String> units = new LinkedHashMap<>();
+        units.put("shared_buffers", "8kB");
+        units.put("work_mem", "kB");
+        units.put("maintenance_work_mem", "kB");
+        units.put("effective_cache_size", "8kB");
+        units.put("statement_timeout", "ms");
+        units.put("lock_timeout", "ms");
+        units.put("idle_in_transaction_session_timeout", "ms");
+        units.put("transaction_timeout", "ms");
+        units.put("track_activity_query_size", "B");
+        // min_val / max_val for bounded numeric parameters
+        Map<String, String[]> bounds = new LinkedHashMap<>();
+        // bounds: [min_val, max_val]
+        bounds.put("work_mem", new String[]{"64", "2147483647"});
+        bounds.put("maintenance_work_mem", new String[]{"1024", "2147483647"});
+        bounds.put("shared_buffers", new String[]{"16", "1073741823"});
+        bounds.put("effective_cache_size", new String[]{"1", "2147483647"});
+        bounds.put("max_connections", new String[]{"1", "262143"});
+        bounds.put("statement_timeout", new String[]{"0", "2147483647"});
+        bounds.put("lock_timeout", new String[]{"0", "2147483647"});
+        bounds.put("idle_in_transaction_session_timeout", new String[]{"0", "2147483647"});
+        // enumvals for enum parameters
+        Map<String, String> enumvals = new LinkedHashMap<>();
+        enumvals.put("client_min_messages", "{debug5,debug4,debug3,debug2,debug1,log,notice,warning,error}");
+        enumvals.put("log_min_messages", "{debug5,debug4,debug3,debug2,debug1,info,notice,warning,error,log,fatal,panic}");
+        enumvals.put("default_transaction_isolation", "{serializable,repeatable read,read committed,read uncommitted}");
+        enumvals.put("transaction_isolation", "{serializable,repeatable read,read committed,read uncommitted}");
         for (Map.Entry<String, String> entry : all.entrySet()) {
             String name = entry.getKey();
-            String value = entry.getValue();
+            String bootValue = entry.getValue();
+            // If session GUC is available, use the session's current value for 'setting'
+            String settingValue = (sessionGuc != null) ? sessionGuc.get(name) : bootValue;
+            if (settingValue == null) settingValue = bootValue;
+            String source = (sessionGuc != null && sessionGuc.hasSessionOverride(name)) ? "session" : "default";
             String[] m = meta.get(name);
             String category = m != null ? m[0] : "Ungrouped";
             String desc = m != null ? m[1] : "";
             String ctx = m != null ? m[2] : "user";
             String vartype = m != null ? m[3] : "string";
-            table.insertRow(new Object[]{name, value, null, category, desc, null, ctx, vartype, "default", null, null, null, value, value, false, null, null});
+            String unit = units.get(name);
+            String[] bound = bounds.get(name);
+            String minVal = bound != null ? bound[0] : null;
+            String maxVal = bound != null ? bound[1] : null;
+            String enumval = enumvals.get(name);
+            table.insertRow(new Object[]{name, settingValue, unit, category, desc, null, ctx, vartype, source, minVal, maxVal, enumval, bootValue, bootValue, false, null, null});
         }
         return table;
     }
@@ -85,7 +130,7 @@ class CatalogSecurityBuilder {
                 col("datistemplate", DataType.BOOLEAN),
                 col("datallowconn", DataType.BOOLEAN),
                 col("datconnlimit", DataType.INTEGER),
-                col("datfrozenxid", DataType.INTEGER),
+                col("datfrozenxid", DataType.XID),
                 col("datminmxid", DataType.INTEGER),
                 col("dattablespace", DataType.INTEGER),
                 col("datcollate", DataType.TEXT),
@@ -159,6 +204,11 @@ class CatalogSecurityBuilder {
         Table table = new Table("pg_roles", cols);
         for (Map.Entry<String, Map<String, String>> entry : database.getRoles().entrySet()) {
             Map<String, String> attrs = entry.getValue();
+            int connLimit = -1;
+            String climRaw = attrs.get("CONNECTION_LIMIT");
+            if (climRaw != null) {
+                try { connLimit = Integer.parseInt(climRaw.trim()); } catch (NumberFormatException ignore) {}
+            }
             table.insertRow(new Object[]{
                     oids.oid("role:" + entry.getKey()), entry.getKey(),
                     "true".equalsIgnoreCase(attrs.getOrDefault("SUPERUSER", "false")),
@@ -167,13 +217,13 @@ class CatalogSecurityBuilder {
                     "true".equalsIgnoreCase(attrs.getOrDefault("CREATEDB", "false")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("LOGIN", "false")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("REPLICATION", "false")),
-                    -1, null,
+                    connLimit, parseValidUntil(attrs.get("VALID_UNTIL")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("BYPASSRLS", "false")),
-                    null, "********" // rolconfig, rolpassword (always masked in pg_roles)
+                    buildRolconfig(attrs.get("ROLCONFIG")), "********" // rolconfig, rolpassword (always masked in pg_roles)
             });
         }
-        // PG18 default system roles
-        int sysOid = 6100;
+        // PG18 default system roles (OIDs match PG 18 dynamic assignment, starting at 6168)
+        int sysOid = 6168;
         String[][] sysRoles = {
             {"pg_database_owner"},
             {"pg_read_all_data"},
@@ -204,6 +254,40 @@ class CatalogSecurityBuilder {
             });
         }
         return table;
+    }
+
+    private static Object parseValidUntil(String raw) {
+        if (raw == null || raw.isEmpty()) return null;
+        try {
+            // Try parsing as timestamptz (various formats)
+            return java.time.OffsetDateTime.parse(raw, java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+        } catch (Exception e1) {
+            try {
+                // Try date-only format
+                java.time.LocalDate ld = java.time.LocalDate.parse(raw);
+                return ld.atStartOfDay().atOffset(java.time.ZoneOffset.UTC);
+            } catch (Exception e2) {
+                try {
+                    // Try with space separator (e.g., "2099-01-01 00:00:00+00")
+                    String normalized = raw.replace(" ", "T");
+                    if (!normalized.contains("+") && !normalized.contains("Z") && !normalized.matches(".*-\\d{2}$")) {
+                        normalized += "Z";
+                    }
+                    return java.time.OffsetDateTime.parse(normalized, java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+                } catch (Exception e3) {
+                    return raw; // Return as string if parsing fails
+                }
+            }
+        }
+    }
+
+    /**
+     * Build a PG-style text array literal from the ROLCONFIG attribute.
+     * Format: "{work_mem=42MB,search_path=public}" stored as text.
+     */
+    private static String buildRolconfig(String raw) {
+        if (raw == null || raw.isEmpty()) return null;
+        return "{" + raw + "}";
     }
 
     Table buildPgUser() {
@@ -248,9 +332,10 @@ class CatalogSecurityBuilder {
             int roleOid = oids.oid("role:" + grantedRole);
             for (String memberRole : entry.getValue()) {
                 int memberOid = oids.oid("role:" + memberRole);
+                boolean admin = database.hasAdminOption(grantedRole, memberRole);
                 table.insertRow(new Object[]{
                         rowOid++, roleOid, memberOid, 10 /* bootstrap superuser */,
-                        false, true, true
+                        admin, true, true
                 });
             }
         }
@@ -269,7 +354,42 @@ class CatalogSecurityBuilder {
                 col("polwithcheck", DataType.TEXT),
                 col("xmin", DataType.INTEGER)
         );
-        return new Table("pg_policy", cols);
+        Table table = new Table("pg_policy", cols);
+        int rowOid = oids.oid("pg_policy:base");
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Map.Entry<String, com.memgres.engine.Table> tableEntry
+                    : schemaEntry.getValue().getTables().entrySet()) {
+                com.memgres.engine.Table t = tableEntry.getValue();
+                int relOid = oids.oid("rel:" + schemaName + "." + t.getName());
+                for (RlsPolicy policy : t.getRlsPolicies()) {
+                    String cmdChar = "*"; // default = ALL
+                    if (policy.getCommand() != null) {
+                        switch (policy.getCommand().toUpperCase()) {
+                            case "SELECT": cmdChar = "r"; break;
+                            case "INSERT": cmdChar = "a"; break;
+                            case "UPDATE": cmdChar = "w"; break;
+                            case "DELETE": cmdChar = "d"; break;
+                            default: cmdChar = "*"; break;
+                        }
+                    }
+                    boolean permissive = !"RESTRICTIVE".equalsIgnoreCase(policy.getPolicyType());
+                    String rolesText = null;
+                    if (policy.getRoles() != null && !policy.getRoles().isEmpty()) {
+                        rolesText = "{" + String.join(",", policy.getRoles()) + "}";
+                    }
+                    String qualText = policy.getUsingExpr() != null
+                            ? SqlUnparser.exprToSql(policy.getUsingExpr()) : null;
+                    String withCheckText = policy.getWithCheckExpr() != null
+                            ? SqlUnparser.exprToSql(policy.getWithCheckExpr()) : null;
+                    table.insertRow(new Object[]{
+                            rowOid++, policy.getName(), relOid, cmdChar,
+                            permissive, rolesText, qualText, withCheckText, 1
+                    });
+                }
+            }
+        }
+        return table;
     }
 
     /** pg_policies view: one row per RLS policy, keyed by schema + table + policy name. */
@@ -279,7 +399,7 @@ class CatalogSecurityBuilder {
                 colNN("tablename", DataType.TEXT),
                 colNN("policyname", DataType.TEXT),
                 col("permissive", DataType.TEXT),
-                col("roles", DataType.TEXT),
+                col("roles", DataType.NAME_ARRAY),
                 col("cmd", DataType.TEXT),
                 col("qual", DataType.TEXT),
                 col("with_check", DataType.TEXT)
@@ -306,7 +426,7 @@ class CatalogSecurityBuilder {
                             schemaName,
                             t.getName(),
                             policy.getName(),
-                            "PERMISSIVE",  // default; permissive info not stored on RlsPolicy
+                            policy.getPolicyType(),
                             rolesText,
                             policy.getCommand(),
                             qualText,
@@ -335,9 +455,10 @@ class CatalogSecurityBuilder {
             int nsOid = entry.schema != null ? oids.oid("ns:" + entry.schema) : 0;
             String aclText = entry.grantees.isEmpty() ? null
                     : String.join(",", entry.grantees) + "=" + String.join(",", entry.privileges);
+            int grantorOid = entry.grantor != null ? oids.oid("role:" + entry.grantor) : 10;
             table.insertRow(new Object[]{
                     rowOid++,
-                    10, // default grantor OID (system/postgres)
+                    grantorOid,
                     nsOid,
                     String.valueOf(objType),
                     aclText
@@ -390,12 +511,28 @@ class CatalogSecurityBuilder {
                     null, null,      // wait_event_type, wait_event
                     s.getState(),
                     null, null,      // backend_xid, backend_xmin
-                    null,            // query_id
+                    computeQueryId(s), // query_id
                     s.getCurrentQuery(),
                     "client backend"
             });
         }
         return table;
+    }
+
+    /**
+     * Compute a query_id for pg_stat_activity. Returns null if compute_query_id
+     * is off, or a hash of the current query text otherwise.
+     */
+    private Long computeQueryId(Session s) {
+        if (s.getCurrentQuery() == null || s.getCurrentQuery().isEmpty()) return null;
+        GucSettings guc = s.getGucSettings();
+        if (guc == null) return null;
+        String setting = guc.get("compute_query_id");
+        if (setting == null || "off".equalsIgnoreCase(setting)) return null;
+        // "on" or "auto": compute a hash of the query text
+        long hash = s.getCurrentQuery().hashCode();
+        // Ensure non-zero (PG query_id is always non-zero when computed)
+        return hash == 0 ? 1L : hash;
     }
 
     Table buildPgLocks() {
@@ -433,6 +570,21 @@ class CatalogSecurityBuilder {
                             "AccessShareLock", true, false, null
                     });
                 }
+            }
+        }
+
+        // Expose explicit table locks acquired via LOCK TABLE
+        for (Session s : database.getActiveSessions()) {
+            for (Map.Entry<String, String> lockEntry : s.getTableLocks().entrySet()) {
+                String tableKey = lockEntry.getKey();
+                String lockMode = lockEntry.getValue();
+                int relOid = oids.oid("rel:" + tableKey);
+                table.insertRow(new Object[]{
+                        "relation", dbOid, relOid, null, null, null, null,
+                        null, null, null,
+                        String.valueOf(s.getPid()) + "/1", s.getPid(),
+                        lockMode, true, false, null
+                });
             }
         }
 

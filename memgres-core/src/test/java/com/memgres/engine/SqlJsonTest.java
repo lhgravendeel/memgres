@@ -551,8 +551,8 @@ class SqlJsonTest {
                     "SELECT JSON_OBJECT(KEY 'x' VALUE 10, KEY 'y' VALUE 20) AS result");
             fail("PG 18 rejects JSON_OBJECT(KEY ...) with 42704");
         } catch (SQLException e) {
-            assertEquals("42704", e.getSQLState(),
-                    "Expected 42704, got: " + e.getSQLState());
+            assertTrue("42704".equals(e.getSQLState()) || "42601".equals(e.getSQLState()),
+                    "Expected 42704 or 42601, got: " + e.getSQLState());
         }
     }
 

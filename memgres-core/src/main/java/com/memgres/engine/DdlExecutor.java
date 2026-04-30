@@ -45,6 +45,9 @@ class DdlExecutor {
     QueryResult executeCreateFunction(CreateFunctionStmt stmt) { return objectExecutor.executeCreateFunction(stmt); }
     QueryResult executeCall(CallStmt stmt) { return objectExecutor.executeCall(stmt); }
     QueryResult executeCreateTrigger(CreateTriggerStmt stmt) { return objectExecutor.executeCreateTrigger(stmt); }
+    QueryResult executeCreateEventTrigger(CreateEventTriggerStmt stmt) { return objectExecutor.executeCreateEventTrigger(stmt); }
+    QueryResult executeAlterEventTrigger(AlterEventTriggerStmt stmt) { return objectExecutor.executeAlterEventTrigger(stmt); }
+    QueryResult executeDropEventTrigger(DropEventTriggerStmt stmt) { return objectExecutor.executeDropEventTrigger(stmt); }
     QueryResult executeDropStmt(DropStmt stmt) { return objectExecutor.executeDropStmt(stmt); }
     QueryResult executeCreateSequence(CreateSequenceStmt stmt) { return objectExecutor.executeCreateSequence(stmt); }
     QueryResult executeAlterSequence(AlterSequenceStmt stmt) { return objectExecutor.executeAlterSequence(stmt); }
@@ -56,6 +59,9 @@ class DdlExecutor {
     QueryResult executeCreateOperatorFamily(CreateOperatorFamilyStmt stmt) { return objectExecutor.executeCreateOperatorFamily(stmt); }
     QueryResult executeCreateOperatorClass(CreateOperatorClassStmt stmt) { return objectExecutor.executeCreateOperatorClass(stmt); }
     QueryResult executeAlterOperator(AlterOperatorStmt stmt) { return objectExecutor.executeAlterOperator(stmt); }
+
+    QueryResult executeCreateCollation(CreateCollationStmt stmt) { return objectExecutor.executeCreateCollation(stmt); }
+    QueryResult executeCreateCast(CreateCastStmt stmt) { return objectExecutor.executeCreateCast(stmt); }
 
     QueryResult executeCreateView(CreateViewStmt stmt) { return viewExecutor.executeCreateView(stmt); }
     QueryResult executeAlterView(AlterViewStmt stmt) { return viewExecutor.executeAlterView(stmt); }
@@ -152,6 +158,7 @@ class DdlExecutor {
                 }
                 StoredConstraint chk = StoredConstraint.check(name, tc.checkExpr());
                 if (tc.notEnforced()) chk.setNotEnforced(true);
+                if (tc.noInherit()) chk.setNoInherit(true);
                 if (tc.deferrable()) {
                     chk.setDeferrable(true);
                     chk.setInitiallyDeferred(tc.initiallyDeferred());
@@ -169,6 +176,9 @@ class DdlExecutor {
                     fk.setInitiallyDeferred(tc.initiallyDeferred());
                 }
                 if (tc.notEnforced()) fk.setNotEnforced(true);
+                if (tc.matchType() != null) fk.setMatchType(tc.matchType());
+                fk.setOnDeleteSetNullColumns(StoredConstraint.parseSetNullColumns(tc.onDelete()));
+                fk.setOnUpdateSetNullColumns(StoredConstraint.parseSetNullColumns(tc.onUpdate()));
                 return fk;
             }
             case EXCLUDE: {
@@ -442,7 +452,7 @@ class DdlExecutor {
 
     // Built-in volatile function names (these don't have PgFunction entries in the database)
     private static final Set<String> BUILTIN_VOLATILE_FUNCTIONS = Cols.setOf(
-            "random", "now", "clock_timestamp", "timeofday", "gen_random_uuid",
+            "random", "now", "clock_timestamp", "timeofday", "gen_random_uuid", "uuidv4",
             "nextval", "currval", "setval", "txid_current", "statement_timestamp"
     );
 

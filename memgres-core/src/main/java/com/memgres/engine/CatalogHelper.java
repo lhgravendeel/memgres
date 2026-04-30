@@ -78,6 +78,8 @@ public final class CatalogHelper {
                 return "cidr";
             case MACADDR:
                 return "macaddr";
+            case MACADDR8:
+                return "macaddr8";
             case TSVECTOR:
                 return "tsvector";
             case TSQUERY:
@@ -134,8 +136,12 @@ public final class CatalogHelper {
                 return "integer[]";
             case ACLITEM_ARRAY:
                 return "aclitem[]";
+            case NAME_ARRAY:
+                return "name[]";
             case ENUM:
                 return "USER-DEFINED";
+            case XID:
+                return "xid";
             default:
                 throw new IllegalStateException("Unknown data type: " + dt);
         }

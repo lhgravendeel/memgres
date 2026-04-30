@@ -22,6 +22,11 @@ public final class CreateFunctionStmt implements Statement {
     public final boolean leakproof;           // LEAKPROOF
     public final String volatility;           // "VOLATILE" (default), "STABLE", or "IMMUTABLE"
     public final Map<String, String> setClauses; // function-level GUC overrides (may be null)
+    public final String parallel;             // "SAFE", "RESTRICTED", or "UNSAFE" (default)
+    public final double cost;                 // COST value (-1 means use default)
+    public final double rows;                 // ROWS value (-1 means use default)
+    public boolean atomicBody;                // true if body was defined via BEGIN ATOMIC
+    public String supportFunction;            // SUPPORT function name (null if not specified)
 
     public CreateFunctionStmt(
             String name,
@@ -39,7 +44,7 @@ public final class CreateFunctionStmt implements Statement {
             Map<String, String> setClauses
     ) {
         this(name, schema, params, parsedParams, returnType, body, language, orReplace,
-                isProcedure, securityDefiner, strict, false, volatility, setClauses);
+                isProcedure, securityDefiner, strict, false, volatility, setClauses, null, -1, -1);
     }
 
     public CreateFunctionStmt(
@@ -58,6 +63,29 @@ public final class CreateFunctionStmt implements Statement {
             String volatility,
             Map<String, String> setClauses
     ) {
+        this(name, schema, params, parsedParams, returnType, body, language, orReplace,
+                isProcedure, securityDefiner, strict, leakproof, volatility, setClauses, null, -1, -1);
+    }
+
+    public CreateFunctionStmt(
+            String name,
+            String schema,
+            String params,
+            List<FuncParam> parsedParams,
+            String returnType,
+            String body,
+            String language,
+            boolean orReplace,
+            boolean isProcedure,
+            boolean securityDefiner,
+            boolean strict,
+            boolean leakproof,
+            String volatility,
+            Map<String, String> setClauses,
+            String parallel,
+            double cost,
+            double rows
+    ) {
         this.name = name;
         this.schema = schema;
         this.params = params;
@@ -72,6 +100,9 @@ public final class CreateFunctionStmt implements Statement {
         this.leakproof = leakproof;
         this.volatility = volatility;
         this.setClauses = setClauses;
+        this.parallel = parallel;
+        this.cost = cost;
+        this.rows = rows;
     }
 
     public static final class FuncParam {
@@ -132,6 +163,9 @@ public final class CreateFunctionStmt implements Statement {
     public boolean leakproof() { return leakproof; }
     public String volatility() { return volatility; }
     public Map<String, String> setClauses() { return setClauses; }
+    public String parallel() { return parallel; }
+    public double cost() { return cost; }
+    public double rows() { return rows; }
 
     @Override
     public boolean equals(Object o) {

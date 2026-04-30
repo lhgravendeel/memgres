@@ -247,6 +247,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             String connectingUser = params.get("user");
             if (connectingUser != null && !connectingUser.isEmpty()) {
                 session.getGucSettings().set("session_authorization", connectingUser);
+                session.getGucSettings().setBootDefault("session_authorization", connectingUser);
+                session.getGucSettings().setBootDefault("role", connectingUser);
                 session.setConnectingUser(connectingUser);
                 if (!database.hasRole(connectingUser)) {
                     database.createRole(connectingUser, new java.util.HashMap<>());
@@ -288,6 +290,11 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         sendParameterStatus(ctx, "integer_datetimes", "on");
         sendParameterStatus(ctx, "standard_conforming_strings", "on");
         sendParameterStatus(ctx, "TimeZone", "UTC");
+        sendParameterStatus(ctx, "application_name",
+                session.getGucSettings() != null && session.getGucSettings().get("application_name") != null
+                        ? session.getGucSettings().get("application_name") : "");
+        sendParameterStatus(ctx, "IntervalStyle", "postgres");
+        sendParameterStatus(ctx, "is_superuser", "on");
 
         backendPid = cancelRegistry.nextPid();
         backendSecretKey = (int) (Math.random() * Integer.MAX_VALUE);
@@ -344,13 +351,19 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                         database.incrementXactCommit();
                     }
                     sendQueryResult(ctx, result);
-                } catch (MemgresException e) {
-                    if (e.getDetail() != null || e.getSchema() != null || e.getTable() != null
-                            || e.getConstraint() != null || e.getColumn() != null) {
-                        sendErrorWithDetails(ctx, e, false);
-                    } else {
-                        sendErrorSimple(ctx, e.getSqlState(), e.getMessage());
+                    // Emit ParameterStatus updates for tracked GUC parameters after SET
+                    if (result.getType() == QueryResult.Type.SET) {
+                        emitParameterStatusUpdates(ctx, stmt);
                     }
+                } catch (MemgresException e) {
+                    enrichErrorPosition(e, stmt);
+                    // Log errors that occur inside transactions — these cascade and cause
+                    // all subsequent commands to fail with 25P02, making root-cause hard to find.
+                    if (session != null && session.isInTransaction() && !"25P02".equals(e.getSqlState())) {
+                        LOG.warn("Error in transaction [{}]: {} (SQL: {})",
+                                e.getSqlState(), e.getMessage(), stmt);
+                    }
+                    sendErrorWithDetails(ctx, e, false);
                     batchFailed = true;
                 } catch (ArithmeticException e) {
                     String errMsg = e.getMessage() != null ? e.getMessage() : "arithmetic error";
@@ -359,6 +372,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     } else {
                         sendErrorSimple(ctx, "22003", errMsg);
                     }
+                    batchFailed = true;
+                } catch (Exception e) {
+                    // Catch unexpected exceptions (NPE, ClassCast, etc.) during query
+                    // execution or result sending (e.g. COPY TO stdout value formatting).
+                    // Without this, the exception propagates to the outer catch which
+                    // doesn't set batchFailed, or worse, to exceptionCaught() which
+                    // previously killed the connection — causing pg_dump "worker died".
+                    LOG.error("Unexpected error executing statement: {}", stmt, e);
+                    String errDetail = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                    sendErrorSimple(ctx, "XX000", "Internal error: " + errDetail);
                     batchFailed = true;
                 }
             }
@@ -540,6 +563,76 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         return types;
     }
 
+    /** Scan SQL for $N parameter placeholders, return the highest N (0 if none).
+     *  Only counts in DML/EXPLAIN statements. Skips PREPARE, CREATE, ALTER, DROP, etc.
+     *  Skips single-quoted strings, dollar-quoted strings, and SQL comments. */
+    private static int maxParamPlaceholder(String sql) {
+        // Only DML/EXPLAIN statements can have wire-level bind parameters.
+        // PREPARE, CREATE, ALTER, DROP, EXECUTE, DO, etc. embed $N in their body, not as bind params.
+        String trimmed = sql.replaceAll("^\\s+", "").toUpperCase();
+        if (!(trimmed.startsWith("SELECT") || trimmed.startsWith("INSERT") ||
+              trimmed.startsWith("UPDATE") || trimmed.startsWith("DELETE") ||
+              trimmed.startsWith("EXPLAIN") || trimmed.startsWith("WITH") ||
+              trimmed.startsWith("VALUES") || trimmed.startsWith("TABLE"))) {
+            return 0;
+        }
+
+        int max = 0;
+        int len = sql.length();
+        for (int i = 0; i < len; i++) {
+            char c = sql.charAt(i);
+            // Skip single-quoted strings
+            if (c == '\'') {
+                i++;
+                while (i < len) {
+                    if (sql.charAt(i) == '\'') {
+                        if (i + 1 < len && sql.charAt(i + 1) == '\'') { i += 2; continue; }
+                        break;
+                    }
+                    i++;
+                }
+                continue;
+            }
+            // Skip -- line comments
+            if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
+                i = sql.indexOf('\n', i);
+                if (i < 0) break;
+                continue;
+            }
+            // Skip /* block comments */
+            if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
+                i = sql.indexOf("*/", i + 2);
+                if (i < 0) break;
+                i++;
+                continue;
+            }
+            // Skip dollar-quoted strings ($$ or $tag$)
+            if (c == '$') {
+                int tagEnd = i + 1;
+                while (tagEnd < len && (Character.isLetterOrDigit(sql.charAt(tagEnd)) || sql.charAt(tagEnd) == '_')) {
+                    tagEnd++;
+                }
+                if (tagEnd < len && sql.charAt(tagEnd) == '$') {
+                    String tag = sql.substring(i, tagEnd + 1);
+                    int closePos = sql.indexOf(tag, tagEnd + 1);
+                    if (closePos >= 0) {
+                        i = closePos + tag.length() - 1;
+                        continue;
+                    }
+                }
+                // $N parameter placeholder
+                if (i + 1 < len && Character.isDigit(sql.charAt(i + 1))) {
+                    int j = i + 1;
+                    while (j < len && Character.isDigit(sql.charAt(j))) j++;
+                    int n = Integer.parseInt(sql.substring(i + 1, j));
+                    if (n > max) max = n;
+                    i = j - 1;
+                }
+            }
+        }
+        return max;
+    }
+
     private void handleBind(ChannelHandlerContext ctx, PgWireMessage msg) {
         String portalName = msg.getPortalName() != null ? msg.getPortalName() : "";
         String stmtName = msg.getStatementName() != null ? msg.getStatementName() : "";
@@ -547,6 +640,16 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         PreparedStmt prepared = preparedStatements.get(stmtName);
         if (prepared == null) {
             sendExtendedError(ctx, "26000", "prepared statement \"" + stmtName + "\" does not exist");
+            return;
+        }
+
+        // Validate bind parameter count matches $N placeholders in the SQL
+        int suppliedParams = msg.getParameterValues() != null ? msg.getParameterValues().length : 0;
+        int requiredParams = maxParamPlaceholder(prepared.sql());
+        if (suppliedParams < requiredParams) {
+            sendExtendedError(ctx, "08P01",
+                    "bind message supplies " + suppliedParams + " parameters, but prepared statement \"" +
+                    stmtName + "\" requires " + requiredParams);
             return;
         }
 
@@ -688,12 +791,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                             try {
                                 executeWithCancel(s, portal.paramValues());
                             } catch (MemgresException e) {
-                                if (e.getDetail() != null || e.getConstraint() != null) {
-                                    sendErrorWithDetails(ctx, e, true);
-                                    errorPendingUntilSync = true;
-                                } else {
-                                    sendExtendedError(ctx, e.getSqlState(), e.getMessage());
-                                }
+                                enrichErrorPosition(e, s);
+                                sendErrorWithDetails(ctx, e, true);
+                                errorPendingUntilSync = true;
                                 return;
                             }
                         }
@@ -742,14 +842,15 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     sendResultDataOnly(ctx, result, portal.resultFormatCodes());
                 }
             }
+            // Emit ParameterStatus updates for tracked GUC parameters after SET
+            if (result.getType() == QueryResult.Type.SET) {
+                emitParameterStatusUpdates(ctx, portal.sql());
+            }
         } catch (MemgresException e) {
             LOG.warn("[PROTO] Execute ERROR {}: {} | {}", e.getSqlState(), e.getMessage(), sqlSnip);
-            if (e.getDetail() != null || e.getConstraint() != null) {
-                sendErrorWithDetails(ctx, e, true);
-                errorPendingUntilSync = true;
-            } else {
-                sendExtendedError(ctx, e.getSqlState(), e.getMessage());
-            }
+            enrichErrorPosition(e, portal.sql());
+            sendErrorWithDetails(ctx, e, true);
+            errorPendingUntilSync = true;
         } catch (ArithmeticException e) {
             String errMsg = e.getMessage() != null ? e.getMessage() : "arithmetic error";
             LOG.warn("[PROTO] Execute ARITH ERROR: {} | {}", errMsg, sqlSnip);
@@ -1035,6 +1136,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         buf.writeInt(0);
         buf.writeByte('S');
         PgWireValueFormatter.writeCString(buf, "ERROR");
+        buf.writeByte('V');
+        PgWireValueFormatter.writeCString(buf, "ERROR");
         buf.writeByte('C');
         PgWireValueFormatter.writeCString(buf, ex.getSqlState() != null ? ex.getSqlState() : "XX000");
         buf.writeByte('M');
@@ -1042,6 +1145,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         if (ex.getDetail() != null) {
             buf.writeByte('D');
             PgWireValueFormatter.writeCString(buf, ex.getDetail());
+        }
+        if (ex.getHint() != null) {
+            buf.writeByte('H');
+            PgWireValueFormatter.writeCString(buf, ex.getHint());
+        }
+        if (ex.getPosition() > 0) {
+            buf.writeByte('P');
+            PgWireValueFormatter.writeCString(buf, String.valueOf(ex.getPosition()));
         }
         if (ex.getSchema() != null) {
             buf.writeByte('s');
@@ -1059,6 +1170,17 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             buf.writeByte('n');
             PgWireValueFormatter.writeCString(buf, ex.getConstraint());
         }
+        if (ex.getDatatype() != null) {
+            buf.writeByte('d');
+            PgWireValueFormatter.writeCString(buf, ex.getDatatype());
+        }
+        // File, Line, Routine stub fields (always populated by real PG)
+        buf.writeByte('F');
+        PgWireValueFormatter.writeCString(buf, "postgres.c");
+        buf.writeByte('L');
+        PgWireValueFormatter.writeCString(buf, "1");
+        buf.writeByte('R');
+        PgWireValueFormatter.writeCString(buf, "exec_simple_query");
         buf.writeByte(0);
         buf.setInt(lengthIdx, buf.writerIndex() - lengthIdx);
         ctx.write(buf);
@@ -1078,13 +1200,86 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         buf.writeInt(0);
         buf.writeByte('S');
         PgWireValueFormatter.writeCString(buf, "ERROR");
+        buf.writeByte('V');
+        PgWireValueFormatter.writeCString(buf, "ERROR");
         buf.writeByte('C');
         PgWireValueFormatter.writeCString(buf, sqlState);
         buf.writeByte('M');
         PgWireValueFormatter.writeCString(buf, message);
+        // File, Line, Routine stub fields (always populated by real PG)
+        buf.writeByte('F');
+        PgWireValueFormatter.writeCString(buf, "postgres.c");
+        buf.writeByte('L');
+        PgWireValueFormatter.writeCString(buf, "1");
+        buf.writeByte('R');
+        PgWireValueFormatter.writeCString(buf, "exec_simple_query");
         buf.writeByte(0);
         buf.setInt(lengthIdx, buf.writerIndex() - lengthIdx);
         ctx.write(buf);
+    }
+
+    /**
+     * Enrich a MemgresException with position information by finding the
+     * referenced object name (table, column, etc.) in the SQL text.
+     */
+    private static void enrichErrorPosition(MemgresException e, String sql) {
+        if (e.getPosition() > 0 || sql == null) return;
+        String msg = e.getMessage();
+        if (msg == null) return;
+        // Extract quoted name from error message patterns like: relation "foo" does not exist
+        // or column "bar" does not exist, or at or near "token"
+        String name = null;
+        int qStart = msg.indexOf('"');
+        if (qStart >= 0) {
+            int qEnd = msg.indexOf('"', qStart + 1);
+            if (qEnd > qStart) {
+                name = msg.substring(qStart + 1, qEnd);
+            }
+        }
+        if (name != null && !name.isEmpty()) {
+            // Find the name in the SQL (case-insensitive)
+            String lowerSql = sql.toLowerCase();
+            String lowerName = name.toLowerCase();
+            int idx = lowerSql.indexOf(lowerName);
+            if (idx >= 0) {
+                e.setPosition(idx + 1); // 1-based
+                return;
+            }
+        }
+        // For syntax errors where no quoted name was found, try "at or near" pattern
+        // or just set position to 1 for general errors
+        String sqlState = e.getSqlState();
+        if ("42601".equals(sqlState) || (msg.toLowerCase().contains("syntax") && "42000".equals(sqlState))) {
+            // Set position to approximately where the error is — use SELECT FROM case
+            // Try to find the problematic token
+            e.setPosition(1);
+        }
+        // For relation/column does not exist, if we couldn't find the exact name, set position 1
+        if ("42P01".equals(sqlState) || "42703".equals(sqlState)) {
+            if (e.getPosition() == 0) e.setPosition(1);
+        }
+    }
+
+    /** After a SET command, emit ParameterStatus messages for tracked GUC parameters. */
+    private void emitParameterStatusUpdates(ChannelHandlerContext ctx, String sql) {
+        if (session == null || session.getGucSettings() == null) return;
+        // Parse "SET <param> TO <value>" or "SET <param> = <value>"
+        String upper = sql.trim().toUpperCase();
+        if (!upper.startsWith("SET ")) return;
+        // Emit ParameterStatus for GUC parameters that PG 18 reports to clients.
+        // Note: pgjdbc will disconnect (08006) if DateStyle changes to non-ISO
+        // or client_encoding changes from UTF8 — this matches real PG behavior.
+        String[] tracked = {"application_name", "DateStyle", "IntervalStyle",
+                "is_superuser", "session_authorization",
+                "standard_conforming_strings", "TimeZone"};
+        for (String param : tracked) {
+            if (upper.contains(param.toUpperCase())) {
+                String val = session.getGucSettings().get(param);
+                if (val != null) {
+                    sendParameterStatus(ctx, param, val);
+                }
+            }
+        }
     }
 
     private void sendParameterStatus(ChannelHandlerContext ctx, String name, String value) {
@@ -1100,12 +1295,44 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         ctx.write(buf);
     }
 
-    /** Flush pending notices as NoticeResponse messages. */
+    /** Flush pending notices as NoticeResponse messages, filtered by client_min_messages. */
     private void flushPendingNotices(ChannelHandlerContext ctx) {
         List<Session.PgNotice> notices = session.drainPendingNotices();
+        int minLevel = getClientMinMessagesLevel();
         for (Session.PgNotice notice : notices) {
-            sendNoticeResponse(ctx, notice);
+            if (noticeSeverityLevel(notice.severity()) >= minLevel) {
+                sendNoticeResponse(ctx, notice);
+            }
         }
+    }
+
+    /** Map severity string to numeric level (higher = more important). */
+    private static int noticeSeverityLevel(String severity) {
+        if (severity == null) return 5; // NOTICE default
+        switch (severity.toUpperCase()) {
+            case "DEBUG": case "DEBUG1": case "DEBUG2": case "DEBUG3": case "DEBUG4": case "DEBUG5":
+                return 1;
+            case "LOG":
+                return 2;
+            case "INFO":
+                return 3;
+            case "NOTICE":
+                return 5;
+            case "WARNING":
+                return 6;
+            case "ERROR":
+                return 7;
+            default:
+                return 5;
+        }
+    }
+
+    /** Get the numeric level for client_min_messages GUC setting. */
+    private int getClientMinMessagesLevel() {
+        if (session == null || session.getGucSettings() == null) return 5; // default NOTICE
+        String setting = session.getGucSettings().get("client_min_messages");
+        if (setting == null) return 5;
+        return noticeSeverityLevel(setting);
     }
 
     private void sendNoticeResponse(ChannelHandlerContext ctx, Session.PgNotice notice) {
@@ -1320,7 +1547,27 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+        if (cause instanceof java.io.IOException) {
+            // Network-level errors (broken pipe, connection reset) — just close
+            LOG.debug("Connection I/O error: {}", cause.getMessage());
+            ctx.close();
+            return;
+        }
         LOG.error("Connection error", cause);
-        ctx.close();
+        // Try to send an error response instead of killing the connection.
+        // pg_dump workers die with "worker process died unexpectedly" when the
+        // connection is closed abruptly; sending a proper ErrorResponse lets
+        // libpq report the real error and avoids the cascade.
+        try {
+            if (ctx.channel().isActive()) {
+                String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
+                sendErrorSimple(ctx, "XX000", "Internal error: " + msg);
+                sendReadyForQuery(ctx, session);
+            }
+        } catch (Exception e) {
+            // If sending the error also fails, close the connection
+            LOG.debug("Failed to send error response, closing connection", e);
+            ctx.close();
+        }
     }
 }

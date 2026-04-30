@@ -34,6 +34,17 @@ public class NotificationManager {
         }
     }
 
+    public List<String> getListeningChannels(Session session) {
+        List<String> channels = new ArrayList<>();
+        for (Map.Entry<String, List<Session>> entry : listeners.entrySet()) {
+            if (entry.getValue().contains(session)) {
+                channels.add(entry.getKey());
+            }
+        }
+        Collections.sort(channels);
+        return channels;
+    }
+
     public void notify(String channel, String payload, int senderPid) {
         List<Session> sessions = listeners.get(channel.toLowerCase());
         if (sessions != null) {

@@ -37,6 +37,12 @@ class CatalogConstraintBuilder {
                 col("conindid", DataType.INTEGER),
                 col("confupdtype", DataType.CHAR),
                 col("confdeltype", DataType.CHAR),
+                col("confmatchtype", DataType.CHAR),
+                col("conpfeqop", DataType.INT4_ARRAY),
+                col("conppeqop", DataType.INT4_ARRAY),
+                col("conffeqop", DataType.INT4_ARRAY),
+                col("confdelsetcols", DataType.INT4_ARRAY),
+                col("coninhcount", DataType.INTEGER),
                 col("connoinherit", DataType.BOOLEAN),
                 col("conenforced", DataType.BOOLEAN),
                 col("conbin", DataType.TEXT),
@@ -111,8 +117,34 @@ class CatalogConstraintBuilder {
                         confupdtype = fkActionCode(sc.getOnUpdate());
                         confdeltype = fkActionCode(sc.getOnDelete());
                     }
-                    // In PG, connoinherit is true for PK/UNIQUE/CHECK, false for FK
-                    boolean connoinherit = sc.getType() != StoredConstraint.Type.FOREIGN_KEY;
+                    // connoinherit: reflects the NO INHERIT flag from CHECK constraints
+                    boolean connoinherit = sc.isNoInherit();
+                    // FK-only fields: confmatchtype defaults to 's' (SIMPLE) for standard PG foreign keys
+                    String confmatchtype = " ";
+                    List<Object> conpfeqop = null;
+                    List<Object> conppeqop = null;
+                    List<Object> conffeqop = null;
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
+                        if ("FULL".equals(sc.getMatchType())) {
+                            confmatchtype = "f";
+                        } else if ("PARTIAL".equals(sc.getMatchType())) {
+                            confmatchtype = "p";
+                        } else {
+                            confmatchtype = "s"; // SIMPLE (MATCH SIMPLE is PG default)
+                        }
+                        // One OID per referenced column; we don't track the real operator OID,
+                        // but PG guarantees these arrays are non-empty for FKs.
+                        int n = conkey == null ? 0 : conkey.size();
+                        conpfeqop = new java.util.ArrayList<>();
+                        conppeqop = new java.util.ArrayList<>();
+                        conffeqop = new java.util.ArrayList<>();
+                        for (int i = 0; i < n; i++) {
+                            // 96 = OID for integer equality operator int4eq — acts as a sentinel non-zero OID
+                            conpfeqop.add(96);
+                            conppeqop.add(96);
+                            conffeqop.add(96);
+                        }
+                    }
                     table.insertRow(new Object[]{
                             oids.oid("con:" + t.getName() + "." + sc.getName()),
                             sc.getName(),
@@ -126,9 +158,12 @@ class CatalogConstraintBuilder {
                             true, conindid,
                             confupdtype,
                             confdeltype,
+                            confmatchtype, conpfeqop, conppeqop, conffeqop, null /*confdelsetcols*/, 0 /*coninhcount*/,
                             connoinherit,
                             !sc.isNotEnforced(), // conenforced: true = enforced (default), false = not enforced
-                            null, null, false, 0, 0, 1 // conbin, conexclop, conperiod, conparentid, contypid, xmin
+                            sc.getType() == StoredConstraint.Type.CHECK && sc.getCheckExpr() != null
+                                    ? "{OPEXPR " + sc.getCheckExpr().toString() + "}" : null, // conbin
+                            null, false, 0, 0, 1 // conexclop, conperiod, conparentid, contypid, xmin
                     });
                 }
                 // PG 18: NOT NULL constraints are tracked in pg_constraint with contype='n'
@@ -157,7 +192,9 @@ class CatalogConstraintBuilder {
                                 null,
                                 false, false, true,
                                 true, 0,
-                                " ", " ", false,
+                                " ", " ",
+                                " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                                false,
                                 true, // conenforced
                                 null, null, false, 0, 0, 1
                         });
@@ -183,7 +220,9 @@ class CatalogConstraintBuilder {
                         null, null, // conkey, confkey
                         false, false, true,
                         true, 0,
-                        " ", " ", true, // connoinherit = true for domain constraints
+                        " ", " ",
+                        " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                        true, // connoinherit = true for domain constraints
                         true, // conenforced
                         dom.getCheckExpression(), null, false, 0, domTypeOid, 1
                 });
@@ -197,9 +236,11 @@ class CatalogConstraintBuilder {
                         "c",
                         0, 0,
                         null, null,
-                        false, false, true,
+                        false, false, nc.isValidated(),
                         true, 0,
-                        " ", " ", true,
+                        " ", " ",
+                        " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                        true,
                         true, // conenforced
                         nc.rawCheckExpr(), null, false, 0, domTypeOid, 1
                 });
@@ -216,7 +257,9 @@ class CatalogConstraintBuilder {
                         null, null,
                         false, false, true,
                         true, 0,
-                        " ", " ", true,
+                        " ", " ",
+                        " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                        true,
                         true, // conenforced
                         null, null, false, 0, domTypeOid, 1
                 });
@@ -301,22 +344,54 @@ class CatalogConstraintBuilder {
                         // Get WHERE predicate for partial indexes
                         String whereClause = database.getIndexWhereClause(indexName);
                         String indexprs = hasExprCols ? exprParts.toString() : null;
-                        // Build indoption, indclass, indcollation as PgVectors (0-based oidvector)
+                        // Build indoption, indclass, indcollation as PgVectors
+                        List<String> columnOptions = database.getIndexColumnOptions(indexName);
                         List<Object> optionElems = new java.util.ArrayList<>();
                         List<Object> classElems = new java.util.ArrayList<>();
                         List<Object> collElems = new java.util.ArrayList<>();
                         for (int ic = 0; ic < indkeyElems.size(); ic++) {
-                            optionElems.add(0);   // default options (no DESC, no NULLS FIRST)
-                            classElems.add(1978);  // default btree opclass OID (int4_ops=1978 in PG)
+                            int optBits = 0;
+                            if (columnOptions != null && ic < columnOptions.size()) {
+                                String opts = columnOptions.get(ic);
+                                if (opts != null) {
+                                    if (opts.contains("DESC")) optBits |= 1;        // INDOPTION_DESC
+                                    if (opts.contains("NULLS FIRST")) optBits |= 2; // INDOPTION_NULLS_FIRST
+                                    if (opts.contains("NULLS LAST") && opts.contains("DESC")) {
+                                        // DESC NULLS LAST is non-default for DESC; no extra bit needed
+                                        // but NULLS FIRST bit should NOT be set
+                                    }
+                                }
+                            }
+                            optionElems.add(optBits);
+                            // Resolve opclass OID based on column type
+                            int opclassOid = resolveColumnOpclass(t, indexCols, ic, columnOptions, database);
+                            classElems.add(opclassOid);
                             collElems.add(0);      // default collation
                         }
+                        // INCLUDE columns: add to indkey but not to indoption/indclass
+                        List<String> includeColumns = database.getIndexIncludeColumns(indexName);
+                        int nKeyAtts = indkeyElems.size();
+                        if (includeColumns != null && !includeColumns.isEmpty()) {
+                            for (String incCol : includeColumns) {
+                                int colIdx = t.getColumnIndex(incCol);
+                                if (colIdx >= 0) {
+                                    indkeyElems.add(colIdx + 1);
+                                } else {
+                                    indkeyElems.add(0);
+                                }
+                            }
+                            indkeyVec = new PgVector(indkeyElems);
+                        }
+                        int totalAtts = indkeyElems.size();
+                        boolean nullsNotDistinct = database.isIndexNullsNotDistinct(indexName);
+                        boolean isClustered = database.isClusteredIndex(indexName);
                         table.insertRow(new Object[]{indexOid, tableOid, isUnique, isPrimary,
                                 true, // indimmediate
                                 indkeyVec,
-                                (short) indkeyElems.size(), (short) indkeyElems.size(), true, true, true, indexprs, whereClause, false,
+                                (short) nKeyAtts, (short) totalAtts, true, true, true, indexprs, whereClause, isClustered,
                                 false, // indisreplident
                                 new PgVector(optionElems),
-                                false, new PgVector(classElems), new PgVector(collElems)});
+                                nullsNotDistinct, new PgVector(classElems), new PgVector(collElems)});
                         break;
                     }
                 }
@@ -350,6 +425,14 @@ class CatalogConstraintBuilder {
                                 clsElems.add(1978);
                                 colElems.add(0);
                             }
+                            // Resolve opclass OIDs based on column types
+                            List<Object> resolvedClsElems = new java.util.ArrayList<>();
+                            List<String> scColumns = sc.getColumns();
+                            for (int ic = 0; ic < scColumns.size(); ic++) {
+                                int opclassOid = resolveColumnOpclass(t, scColumns, ic, null, database);
+                                resolvedClsElems.add(opclassOid);
+                            }
+                            boolean constraintClustered = database.isClusteredIndex(indexName);
                             table.insertRow(new Object[]{
                                     indexOid, tableOid,
                                     true, // isUnique
@@ -357,10 +440,10 @@ class CatalogConstraintBuilder {
                                     true, // indimmediate
                                     indkeyVec,
                                     (short) indkeyList.size(), (short) indkeyList.size(),
-                                    true, true, true, null, null, false,
+                                    true, true, true, null, null, constraintClustered,
                                     false, // indisreplident
                                     new PgVector(optElems),
-                                    false, new PgVector(clsElems), new PgVector(colElems)
+                                    false, new PgVector(resolvedClsElems), new PgVector(colElems)
                             });
                         }
                     }
@@ -690,9 +773,10 @@ class CatalogConstraintBuilder {
             // Resolve trigger function OID from pg_proc
             int tgfoid = oids.oid("proc:" + first.getFunctionName());
 
+            String tgenabled = first.isDisabled() ? "D" : "O";
             table.insertRow(new Object[]{
                     oids.oid("trig:" + first.getName()), relOid, first.getName(),
-                    tgfoid, (short) tgtype, "O", false, 0, false, false,
+                    tgfoid, (short) tgtype, tgenabled, false, 0, false, false,
                     "", null, 0, null, null, 0, 1
             });
         }
@@ -734,5 +818,71 @@ class CatalogConstraintBuilder {
                 }
             }
         }
+    }
+
+    /**
+     * Resolve the btree opclass OID for a given index column based on its data type.
+     * Maps common types to their default btree opclass OIDs (matching pg_opclass).
+     */
+    private int resolveColumnOpclass(Table t, List<String> indexCols, int colIndex,
+                                     List<String> columnOptions, Database db) {
+        // If an explicit opclass is specified in options, resolve it by name
+        if (columnOptions != null && colIndex < columnOptions.size()) {
+            String opts = columnOptions.get(colIndex);
+            if (opts != null && opts.contains("opclass:")) {
+                String opclassName = null;
+                for (String part : opts.split(" ")) {
+                    if (part.startsWith("opclass:")) {
+                        opclassName = part.substring(8);
+                        break;
+                    }
+                }
+                if (opclassName != null) {
+                    return oids.oid("opclass:" + opclassName);
+                }
+            }
+        }
+        // Resolve by column data type
+        String colName = colIndex < indexCols.size() ? indexCols.get(colIndex) : null;
+        if (colName != null) {
+            int ci = t.getColumnIndex(colName);
+            if (ci >= 0) {
+                DataType dt = t.getColumns().get(ci).getType();
+                switch (dt) {
+                    case INTEGER:
+                    case SERIAL:
+                        return 1978; // int4_ops
+                    case TEXT:
+                    case VARCHAR:
+                    case CHAR:
+                        return oids.oid("opclass:text_ops");
+                    case BIGINT:
+                    case BIGSERIAL:
+                        return oids.oid("opclass:int8_ops");
+                    case SMALLINT:
+                    case SMALLSERIAL:
+                        return oids.oid("opclass:int2_ops");
+                    case BOOLEAN:
+                        return oids.oid("opclass:bool_ops");
+                    case REAL:
+                        return oids.oid("opclass:float4_ops");
+                    case DOUBLE_PRECISION:
+                        return oids.oid("opclass:float8_ops");
+                    case NUMERIC:
+                        return oids.oid("opclass:numeric_ops");
+                    case DATE:
+                        return oids.oid("opclass:date_ops");
+                    case TIMESTAMP:
+                        return oids.oid("opclass:timestamp_ops");
+                    case TIMESTAMPTZ:
+                        return oids.oid("opclass:timestamptz_ops");
+                    case UUID:
+                        return oids.oid("opclass:uuid_ops");
+                    default:
+                        return 1978; // fallback to int4_ops
+                }
+            }
+        }
+        return 1978; // default fallback
     }
 }

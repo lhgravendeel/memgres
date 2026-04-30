@@ -13,6 +13,20 @@ import java.util.stream.Collectors;
  */
 public class TsVector {
 
+    static final Set<String> STOP_WORDS_SET = Cols.setOf(
+            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+            "on", "with", "at", "by", "from", "as", "into", "about", "between",
+            "through", "during", "before", "after", "above", "below",
+            "and", "but", "or", "nor", "not", "so", "yet",
+            "it", "its", "this", "that", "these", "those"
+    );
+
+    static boolean isStopWord(String word) {
+        return STOP_WORDS_SET.contains(word.toLowerCase());
+    }
+
     private static final Set<String> STOP_WORDS = Cols.setOf(
             "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
             "have", "has", "had", "do", "does", "did", "will", "would", "could",
@@ -274,58 +288,111 @@ public class TsVector {
 
     public double rank(TsQuery query) {
         if (lexemes.isEmpty()) return 0.0;
-        // PG-compatible ts_rank algorithm (calc_rank_or from tsrank.c).
         // Default weights: {0.1, 0.2, 0.4, 1.0} for categories D, C, B, A.
         double[] defaultWeights = {0.1, 0.2, 0.4, 1.0}; // D, C, B, A
-        // pi^2/6, the theoretical maximum of sum(1/i^2, i=1..inf), used as normalizer
-        final double PI_SQ_OVER_6 = 1.64493406685;
 
-        double res = 0.0;
-        int matchCount = 0;
+        // Collect matching terms with their positions
+        List<String> matchedTerms = new ArrayList<>();
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             if (query.containsTerm(entry.getKey())) {
-                matchCount++;
-                List<PosEntry> positions = entry.getValue();
-                int dimt = positions.size();
-                // Compute resj = sum of wpos(post[j]) / (j+1)^2
-                double resj = 0.0;
-                double wjm = -1.0;
-                int jm = 0;
-                for (int j = 0; j < dimt; j++) {
-                    PosEntry pe = positions.get(j);
-                    int widx;
-                    switch (pe.weight()) {
-                        case 'A':
-                            widx = 3;
-                            break;
-                        case 'B':
-                            widx = 2;
-                            break;
-                        case 'C':
-                            widx = 1;
-                            break;
-                        default:
-                            widx = 0;
-                            break;
-                    }
-                    double wt = defaultWeights[widx];
-                    resj += wt / ((double)(j + 1) * (j + 1));
-                    if (wt > wjm) {
-                        wjm = wt;
-                        jm = j;
-                    }
-                }
-                // Per-word score: (wjm + resj - wjm/(jm+1)^2) / (pi^2/6)
-                double wordScore = (wjm + resj - wjm / ((double)(jm + 1) * (jm + 1))) / PI_SQ_OVER_6;
-                res += wordScore;
+                matchedTerms.add(entry.getKey());
             }
         }
-        if (matchCount == 0) return 0.0;
-        // PG's calc_rank_or divides by size (total query terms), but for AND queries
-        // calc_rank_and produces higher scores for co-occurring terms.
-        // We approximate by not dividing, which ensures more matches = higher rank.
-        // For single-term queries this matches PG exactly.
-        return (float) res; // PG returns float4 precision
+        if (matchedTerms.isEmpty()) return 0.0;
+
+        // Use PG's calc_rank_and for AND/PHRASE queries (proximity-based),
+        // calc_rank_or for OR queries and single terms.
+        if (isAndQuery(query) && matchedTerms.size() >= 2) {
+            return (float) calcRankAnd(defaultWeights, matchedTerms);
+        } else {
+            return (float) calcRankOr(defaultWeights, matchedTerms, countQueryTerms(query));
+        }
+    }
+
+    /** PG's calc_rank_and: proximity-based ranking for AND queries. */
+    private double calcRankAnd(double[] w, List<String> matchedTerms) {
+        double res = 0.0;
+        // For each pair of matching terms, compute proximity-weighted score
+        for (int i = 0; i < matchedTerms.size(); i++) {
+            List<PosEntry> posI = lexemes.get(matchedTerms.get(i));
+            for (int j = i + 1; j < matchedTerms.size(); j++) {
+                List<PosEntry> posJ = lexemes.get(matchedTerms.get(j));
+                // Compare all position pairs between two terms
+                for (PosEntry pi : posI) {
+                    for (PosEntry pj : posJ) {
+                        int dist = Math.abs(pi.position() - pj.position());
+                        double wd = wordDistance(dist);
+                        double wI = w[weightIndex(pi.weight())];
+                        double wJ = w[weightIndex(pj.weight())];
+                        double curw = Math.sqrt(wI * wJ * wd);
+                        res = 1.0 - (1.0 - res) * (1.0 - curw);
+                    }
+                }
+            }
+        }
+        return res;
+    }
+
+    /** PG's word_distance: exponential decay for term proximity. */
+    private static double wordDistance(int dist) {
+        if (dist > 100) return 1e-30;
+        return 1.0 / (1.005 + 0.05 * Math.exp(((double) dist) / 1.5 - 2));
+    }
+
+    /** PG's calc_rank_or: sum-based ranking for OR queries and single terms. */
+    private double calcRankOr(double[] w, List<String> matchedTerms, int queryTermCount) {
+        final double PI_SQ_OVER_6 = 1.64493406685;
+        double res = 0.0;
+        for (String term : matchedTerms) {
+            List<PosEntry> positions = lexemes.get(term);
+            double resj = 0.0;
+            double wjm = -1.0;
+            int jm = 0;
+            for (int j = 0; j < positions.size(); j++) {
+                double wt = w[weightIndex(positions.get(j).weight())];
+                resj += wt / ((double)(j + 1) * (j + 1));
+                if (wt > wjm) { wjm = wt; jm = j; }
+            }
+            res += (wjm + resj - wjm / ((double)(jm + 1) * (jm + 1))) / PI_SQ_OVER_6;
+        }
+        if (queryTermCount > 1) res /= queryTermCount;
+        return res;
+    }
+
+    private static int weightIndex(char weight) {
+        switch (weight) {
+            case 'A': return 3;
+            case 'B': return 2;
+            case 'C': return 1;
+            default: return 0;
+        }
+    }
+
+    /** Check if query root is AND (or PHRASE). */
+    private static boolean isAndQuery(TsQuery query) {
+        if (query == null) return false;
+        TsQuery.Op op = query.getOp();
+        return op == TsQuery.Op.AND || op == TsQuery.Op.PHRASE;
+    }
+
+    /** Count the number of unique terms in a TsQuery (excluding NOT branches). */
+    private static int countQueryTerms(TsQuery query) {
+        Set<String> terms = new HashSet<>();
+        collectQueryTerms(query, terms);
+        return Math.max(terms.size(), 1);
+    }
+
+    private static void collectQueryTerms(TsQuery query, Set<String> terms) {
+        if (query == null) return;
+        if (query.getOp() == TsQuery.Op.TERM) {
+            String t = query.getTerm();
+            if (t != null && !t.isEmpty()) terms.add(t);
+        } else if (query.getOp() == TsQuery.Op.NOT) {
+            // Do not count terms inside NOT branches
+        } else {
+            collectQueryTerms(query.getLeft(), terms);
+            collectQueryTerms(query.getRight(), terms);
+        }
     }
 
     /** Cover density ranking that considers proximity of matched terms. */

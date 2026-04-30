@@ -1,6 +1,7 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.*;
+import com.memgres.engine.util.Cols;
 
 import java.util.*;
 
@@ -35,13 +36,15 @@ class SelectCteExecutor {
      * Execute a CTE query and return the result.
      */
     QueryResult executeCte(SelectStmt.CommonTableExpr cte) {
-        if (cte.recursive()) {
-            return executeRecursiveCte(cte);
-        }
-
         String cacheKey = cte.name().toLowerCase();
         QueryResult cached = executor.cteResultCache.get(cacheKey);
         if (cached != null) return cached;
+
+        if (cte.recursive()) {
+            QueryResult result = executeRecursiveCte(cte);
+            executor.cteResultCache.put(cacheKey, result);
+            return result;
+        }
 
         if (executor.executingCtes.contains(cacheKey)) {
             throw new MemgresException(
@@ -170,10 +173,13 @@ class SelectCteExecutor {
         List<List<Object>> workingSetCyclePaths = hasCycle ? new ArrayList<>(cyclePaths) : null;
 
         String cteLower = cte.name().toLowerCase();
+        detectMutualRecursionCycle(cte, cteLower);
         executor.executingCtes.add(cteLower);
         int maxIterations = 1000;
+        int maxRows = 10000; // safety cap to prevent OOM in mutual recursion scenarios
         try {
         for (int iter = 0; iter < maxIterations && !workingSet.isEmpty(); iter++) {
+            if (allRows.size() > maxRows) break; // prevent runaway growth
             String cteName = cte.name().toLowerCase();
             Schema targetSchema = executor.database.getOrCreateSchema(executor.defaultSchema());
             Table previousTable = targetSchema.getTable(cteName);
@@ -369,6 +375,22 @@ class SelectCteExecutor {
                     }
                 }
 
+                // Fixed-point detection for UNION ALL: if new rows match previous working set exactly,
+                // we've reached a stable state and should terminate (important for mutual recursion)
+                if (isUnionAll && newRows.size() == workingSet.size()) {
+                    boolean stable = true;
+                    for (int ri = 0; ri < newRows.size(); ri++) {
+                        if (!Arrays.deepEquals(newRows.get(ri), workingSet.get(ri))) {
+                            stable = false;
+                            break;
+                        }
+                    }
+                    if (stable) {
+                        workingSet = Collections.emptyList();
+                        continue;
+                    }
+                }
+
                 workingSet = newRows;
                 workingSetCyclePaths = newCyclePaths;
             }
@@ -381,37 +403,56 @@ class SelectCteExecutor {
         }
 
         // Add SEARCH ordering column if declared
+        // PG stores the ord column as type record:
+        //   BFS: (depth bigint, search_key1, search_key2, ...)
+        //   DFS: (search_key1, search_key2, ...)
         if (hasSearch) {
             String scol = cte.searchColumn();
             List<Column> extCols = new ArrayList<>(columns);
+            extCols.add(new Column(scol, DataType.RECORD, true, false, null));
             if (depthFirstSearch && ordcolPaths != null) {
-                // For DFS: sort rows by their search path (element-wise) and assign integer ordcol
-                // Build index array sorted by path comparison
+                // For DFS: sort rows by their search path (element-wise) and assign ordcol
                 Integer[] indices = new Integer[allRows.size()];
                 for (int i = 0; i < indices.length; i++) indices[i] = i;
                 Arrays.sort(indices, (a, b) -> compareSearchPaths(ordcolPaths.get(a), ordcolPaths.get(b)));
-                // Assign ordcol based on sorted position
-                int[] ordcolValues = new int[allRows.size()];
-                for (int rank = 0; rank < indices.length; rank++) {
-                    ordcolValues[indices[rank]] = rank;
-                }
-                extCols.add(new Column(scol, DataType.INTEGER, true, false, null));
+                // Build record values from search paths, then reorder rows
                 List<Object[]> extRows = new ArrayList<>();
-                for (int i = 0; i < allRows.size(); i++) {
-                    Object[] orig = allRows.get(i);
+                Object[][] sortedExt = new Object[allRows.size()][];
+                for (int rank = 0; rank < indices.length; rank++) {
+                    int origIdx = indices[rank];
+                    Object[] orig = allRows.get(origIdx);
                     Object[] ext = Arrays.copyOf(orig, orig.length + 1);
-                    ext[orig.length] = ordcolValues[i];
-                    extRows.add(ext);
+                    // DFS record: (search_key_path_elements...)
+                    ext[orig.length] = new AstExecutor.PgRow(ordcolPaths.get(origIdx));
+                    sortedExt[origIdx] = ext;
                 }
+                for (Object[] ext : sortedExt) extRows.add(ext);
                 columns = extCols;
                 allRows = extRows;
             } else {
-                extCols.add(new Column(scol, DataType.INTEGER, true, false, null));
+                // BFS: record is (depth, search_key)
                 List<Object[]> extRows = new ArrayList<>();
+                // Track depth: base rows are depth 0, each iteration increments
+                // ordcolPaths length encodes depth (base=1 element, first recursion=2, etc.)
                 for (int i = 0; i < allRows.size(); i++) {
                     Object[] orig = allRows.get(i);
                     Object[] ext = Arrays.copyOf(orig, orig.length + 1);
-                    ext[orig.length] = i;
+                    List<Object> pathElements = ordcolPaths != null && i < ordcolPaths.size()
+                            ? ordcolPaths.get(i) : Collections.singletonList(i);
+                    // BFS record: (depth, search_key_values...)
+                    long depth = pathElements.size() - 1;
+                    List<Object> recordValues = new ArrayList<>();
+                    recordValues.add(depth);
+                    // Add the last search key (current row's search value)
+                    if (!pathElements.isEmpty()) {
+                        Object lastKey = pathElements.get(pathElements.size() - 1);
+                        if (lastKey instanceof Object[]) {
+                            for (Object k : (Object[]) lastKey) recordValues.add(k);
+                        } else {
+                            recordValues.add(lastKey);
+                        }
+                    }
+                    ext[orig.length] = new AstExecutor.PgRow(recordValues);
                     extRows.add(ext);
                 }
                 columns = extCols;
@@ -568,5 +609,87 @@ class SelectCteExecutor {
             return lit.literalType() == Literal.LiteralType.INTEGER || lit.literalType() == Literal.LiteralType.FLOAT;
         }
         return false;
+    }
+
+    /**
+     * Detect mutual recursion between RECURSIVE CTEs and reject it.
+     * PG 18 does not support mutual recursion between WITH items (error 0A000).
+     */
+    private void detectMutualRecursionCycle(SelectStmt.CommonTableExpr cte, String cteLower) {
+        if (!cte.recursive()) return;
+        // Walk the recursive term of this CTE and find references to sibling recursive CTEs
+        Map<String, SelectStmt.CommonTableExpr> siblingMap = new HashMap<>();
+        for (Deque<Map<String, SelectStmt.CommonTableExpr>> stack = executor.cteStack;
+             !stack.isEmpty(); ) {
+            for (Map.Entry<String, SelectStmt.CommonTableExpr> entry : stack.peek().entrySet()) {
+                if (!entry.getKey().equals(cteLower) && entry.getValue().recursive()) {
+                    siblingMap.put(entry.getKey(), entry.getValue());
+                }
+            }
+            break; // only check current scope
+        }
+        if (siblingMap.isEmpty()) return;
+        // Check if this CTE references any sibling recursive CTE
+        Set<String> refs = new HashSet<>();
+        collectSiblingRefs(cte.query(), siblingMap.keySet(), refs);
+        if (refs.isEmpty()) return;
+        // True mutual recursion: the referenced sibling must also reference this CTE
+        for (String refName : refs) {
+            SelectStmt.CommonTableExpr sibling = siblingMap.get(refName);
+            if (sibling != null) {
+                Set<String> backRefs = new HashSet<>();
+                collectSiblingRefs(sibling.query(), Cols.setOf(cteLower), backRefs);
+                if (!backRefs.isEmpty()) {
+                    throw new MemgresException(
+                            "mutual recursion between WITH items is not implemented", "0A000");
+                }
+            }
+        }
+    }
+
+    /**
+     * Walk an AST fragment (statement/expression/list) via reflection and collect
+     * unqualified TableRef names that match any sibling CTE name in scope. Used
+     * only for mutual-recursion cycle detection — correctness of reflection walk
+     * is bounded by the recursive-term tree size.
+     */
+    private static void collectSiblingRefs(Object node, Set<String> scopeNames, Set<String> out) {
+        if (node == null) return;
+        Deque<Object> stack = new ArrayDeque<>();
+        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        stack.push(node);
+        while (!stack.isEmpty()) {
+            Object cur = stack.pop();
+            if (cur == null || !seen.add(cur)) continue;
+            if (cur instanceof SelectStmt.TableRef) {
+                SelectStmt.TableRef tr = (SelectStmt.TableRef) cur;
+                if (tr.schema() == null && tr.table() != null) {
+                    String lc = tr.table().toLowerCase();
+                    if (scopeNames.contains(lc)) out.add(lc);
+                }
+                continue;
+            }
+            if (cur instanceof String || cur instanceof Number || cur instanceof Boolean
+                    || cur instanceof Character || cur instanceof Enum) continue;
+            if (cur instanceof Collection) {
+                for (Object item : (Collection<?>) cur) stack.push(item);
+                continue;
+            }
+            if (cur instanceof Map) {
+                for (Object item : ((Map<?, ?>) cur).values()) stack.push(item);
+                continue;
+            }
+            Class<?> cls = cur.getClass();
+            Package pkg = cls.getPackage();
+            if (pkg == null || !pkg.getName().startsWith("com.memgres")) continue;
+            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(cur);
+                    if (v != null) stack.push(v);
+                } catch (IllegalAccessException | RuntimeException ignored) { }
+            }
+        }
     }
 }

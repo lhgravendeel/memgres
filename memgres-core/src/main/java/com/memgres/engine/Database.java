@@ -6,6 +6,7 @@ import com.memgres.engine.parser.ast.CreateTypeStmt;
 import com.memgres.engine.parser.ast.Statement;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
@@ -21,6 +22,8 @@ import java.util.stream.Collectors;
 public class Database {
 
     private final Map<String, Schema> schemas = new ConcurrentHashMap<>();
+    /** Schema-level ACLs: schema name -> list of ACL items (e.g. "role=U/grantor"). */
+    private final Map<String, List<String>> schemaAcls = new ConcurrentHashMap<>();
     private final Map<String, CustomEnum> customEnums = new ConcurrentHashMap<>();
     private final Map<String, PgFunction> functions = new ConcurrentHashMap<>();
     private final Map<String, List<PgFunction>> functionOverloads = new ConcurrentHashMap<>();
@@ -29,6 +32,7 @@ public class Database {
     private final Map<String, ViewDef> views = new ConcurrentHashMap<>();
     private final Map<String, DomainType> domains = new ConcurrentHashMap<>();
     private final Map<String, List<CreateTypeStmt.CompositeField>> compositeTypes = new ConcurrentHashMap<>();
+    private final Map<String, String> rangeTypes = new ConcurrentHashMap<>(); // range type name → subtype name
     private final Map<String, PgAggregate> userAggregates = new ConcurrentHashMap<>();
     private final Map<String, PgOperator> userOperators = new ConcurrentHashMap<>();
     private final Map<String, PgOperatorFamily> userOperatorFamilies = new ConcurrentHashMap<>();
@@ -39,6 +43,153 @@ public class Database {
     private final Map<String, String> indexWhereClauses = new ConcurrentHashMap<>(); // index name → WHERE predicate
     private final Map<String, String> indexMethods = new ConcurrentHashMap<>(); // index name → access method (btree, hash, etc.)
     private final Map<String, Map<String, String>> indexReloptions = new ConcurrentHashMap<>(); // index name → storage params
+    private final Map<String, List<String>> indexColumnOptions = new ConcurrentHashMap<>(); // index name → per-column options (DESC, opclass, NULLS FIRST/LAST)
+    private final Map<String, List<String>> indexIncludeColumns = new ConcurrentHashMap<>(); // index name → INCLUDE columns
+    private final Map<String, Boolean> indexNullsNotDistinct = new ConcurrentHashMap<>(); // index name → NULLS NOT DISTINCT
+    private final Map<String, String> indexParentIndex = new ConcurrentHashMap<>(); // child index name → parent index name (ALTER INDEX ATTACH PARTITION)
+    private final Map<String, PgEventTrigger> eventTriggers = new ConcurrentHashMap<>(); // event trigger name → definition
+    private final Map<String, ExtendedStatistic> extendedStatistics = new ConcurrentHashMap<>();
+
+    // User-defined casts: each entry is [sourceOid(int), targetOid(int), castFunc(int), castContext(String), castMethod(String)]
+    private final java.util.List<Object[]> userDefinedCasts = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+
+    // ---- FDW catalog objects ----
+    private final Map<String, FdwWrapper> foreignDataWrappers = new ConcurrentHashMap<>();
+    private final Map<String, FdwServer> foreignServers = new ConcurrentHashMap<>();
+    private final Map<String, FdwUserMapping> foreignUserMappings = new ConcurrentHashMap<>(); // key: serverName:userName
+    private final Map<String, FdwForeignTable> foreignTables = new ConcurrentHashMap<>();
+
+    // ---- Publication / Subscription catalog objects ----
+    private final Map<String, PubDef> publications = new ConcurrentHashMap<>();
+    private final Map<String, SubDef> subscriptions = new ConcurrentHashMap<>();
+
+    // ---- Replication slots ----
+    private final Map<String, ReplicationSlot> replicationSlots = new ConcurrentHashMap<>();
+
+    // ---- Collation catalog objects ----
+    private final Map<String, CollationDef> userCollations = new ConcurrentHashMap<>();
+
+    /** User-defined collation metadata (CREATE COLLATION). */
+    public static class CollationDef {
+        public final String name;
+        public final String provider;   // "c" (libc), "i" (icu), "d" (default)
+        public final String locale;     // locale string
+        public final String lcCollate;
+        public final String lcCtype;
+        public final boolean deterministic;
+        public final String fromCollation; // if created with FROM clause
+        public CollationDef(String name, String provider, String locale, String lcCollate, String lcCtype, boolean deterministic, String fromCollation) {
+            this.name = name; this.provider = provider; this.locale = locale;
+            this.lcCollate = lcCollate; this.lcCtype = lcCtype;
+            this.deterministic = deterministic; this.fromCollation = fromCollation;
+        }
+    }
+
+    public void addCollation(CollationDef coll) { userCollations.put(coll.name.toLowerCase(), coll); }
+    public CollationDef getCollation(String name) { return userCollations.get(name.toLowerCase()); }
+    public Map<String, CollationDef> getUserCollations() { return userCollations; }
+
+    // ---- Text Search catalog objects ----
+    private final Map<String, TsConfigDef> tsConfigs = new ConcurrentHashMap<>();
+    private final Map<String, TsDictDef> tsDicts = new ConcurrentHashMap<>();
+    // key: configName + "\0" + tokenType, value: dictName
+    private final Map<String, String> tsConfigMaps = new ConcurrentHashMap<>();
+
+    /** Text Search Configuration metadata. */
+    public static class TsConfigDef {
+        public final String name;
+        public final String parserName; // parser or null if COPY
+        public final String copyFrom;   // source config or null if PARSER
+        public TsConfigDef(String name, String parserName, String copyFrom) {
+            this.name = name; this.parserName = parserName; this.copyFrom = copyFrom;
+        }
+    }
+
+    /** Text Search Dictionary metadata. */
+    public static class TsDictDef {
+        public final String name;
+        public final String template;
+        public final String options; // e.g. "STOPWORDS = english"
+        public TsDictDef(String name, String template, String options) {
+            this.name = name; this.template = template; this.options = options;
+        }
+    }
+
+    public void addTsConfig(TsConfigDef cfg) { tsConfigs.put(cfg.name.toLowerCase(), cfg); }
+    public void removeTsConfig(String name) { tsConfigs.remove(name.toLowerCase()); }
+    public Map<String, TsConfigDef> getTsConfigs() { return tsConfigs; }
+
+    public void addTsDict(TsDictDef dict) { tsDicts.put(dict.name.toLowerCase(), dict); }
+    public void removeTsDict(String name) { tsDicts.remove(name.toLowerCase()); }
+    public Map<String, TsDictDef> getTsDicts() { return tsDicts; }
+
+    public void addTsConfigMap(String configName, String tokenType, String dictName) {
+        tsConfigMaps.put(configName.toLowerCase() + "\0" + tokenType.toLowerCase(), dictName);
+    }
+    public Map<String, String> getTsConfigMaps() { return tsConfigMaps; }
+
+    /** Foreign Data Wrapper metadata. */
+    public static class FdwWrapper {
+        public final String name;
+        public final String options; // PG array format or null
+        public FdwWrapper(String name, String options) { this.name = name; this.options = options; }
+    }
+
+    /** Foreign Server metadata. */
+    public static class FdwServer {
+        public final String name;
+        public final String fdwName;
+        public String options; // PG array format or null
+        public FdwServer(String name, String fdwName, String options) { this.name = name; this.fdwName = fdwName; this.options = options; }
+    }
+
+    /** User Mapping metadata. */
+    public static class FdwUserMapping {
+        public final String serverName;
+        public final String userName; // "PUBLIC" or actual user name
+        public final String options;
+        public FdwUserMapping(String serverName, String userName, String options) { this.serverName = serverName; this.userName = userName; this.options = options; }
+    }
+
+    /** Foreign Table metadata. */
+    public static class FdwForeignTable {
+        public final String tableName;
+        public final String serverName;
+        public final String options;
+        public final List<String[]> columns; // each: {name, type}
+        public FdwForeignTable(String tableName, String serverName, String options, List<String[]> columns) {
+            this.tableName = tableName; this.serverName = serverName; this.options = options; this.columns = columns;
+        }
+    }
+
+    /** Publication metadata. */
+    public static class PubDef {
+        public final String name;
+        public final boolean allTables;
+        public final List<String> tables; // mutable for ALTER ADD TABLE
+        public final String schemaName; // for TABLES IN SCHEMA, or null
+        public PubDef(String name, boolean allTables, List<String> tables, String schemaName) {
+            this.name = name; this.allTables = allTables; this.tables = tables != null ? new ArrayList<>(tables) : new ArrayList<>(); this.schemaName = schemaName;
+        }
+    }
+
+    /** Subscription metadata. */
+    public static class SubDef {
+        public final String name;
+        public final String conninfo;
+        public final String publication;
+        public SubDef(String name, String conninfo, String publication) { this.name = name; this.conninfo = conninfo; this.publication = publication; }
+    }
+
+    /** Replication slot metadata. */
+    public static class ReplicationSlot {
+        public final String slotName;
+        public final String plugin;
+        public final String slotType; // "logical" or "physical"
+        public ReplicationSlot(String slotName, String plugin, String slotType) { this.slotName = slotName; this.plugin = plugin; this.slotType = slotType; }
+    }
+
     private final NotificationManager notificationManager = new NotificationManager();
     private final LargeObjectStore largeObjectStore = new LargeObjectStore();
     private DatabaseRegistry databaseRegistry;
@@ -48,6 +199,9 @@ public class Database {
 
     // Set of analyzed table names (schema.table) for pg_statistic
     private final Set<String> analyzedTables = ConcurrentHashMap.newKeySet();
+
+    // Set of clustered index names (for pg_index.indisclustered)
+    private final Set<String> clusteredIndexes = ConcurrentHashMap.newKeySet();
 
     // Row locks: maps table name to (row identity -> list of lock entries)
     private final Map<String, Map<Object[], List<LockEntry>>> rowLocks = new ConcurrentHashMap<>();
@@ -90,14 +244,105 @@ public class Database {
         return true;
     }
 
+    // Table-level locks: table key -> list of (session, mode)
+    public static class TableLockEntry {
+        public final Session session;
+        public final String mode;
+        public TableLockEntry(Session session, String mode) { this.session = session; this.mode = mode; }
+    }
+    private final Map<String, List<TableLockEntry>> tableLevelLocks = new ConcurrentHashMap<>();
+    private final Object tableLockMonitor = new Object();
+
+    /**
+     * Acquire a table-level lock. If NOWAIT and conflicting lock exists, throws 55P03.
+     * Otherwise blocks until the lock can be acquired.
+     */
+    public void acquireTableLock(String tableKey, String mode, Session session, boolean nowait) {
+        synchronized (tableLockMonitor) {
+            while (true) {
+                List<TableLockEntry> entries = tableLevelLocks.computeIfAbsent(tableKey, k -> new java.util.concurrent.CopyOnWriteArrayList<>());
+                boolean conflict = false;
+                for (TableLockEntry e : entries) {
+                    if (e.session != session && !tableLockModesCompatible(e.mode, mode)) {
+                        conflict = true;
+                        break;
+                    }
+                }
+                if (!conflict) {
+                    entries.add(new TableLockEntry(session, mode));
+                    return;
+                }
+                if (nowait) {
+                    throw new MemgresException("could not obtain lock on relation", "55P03");
+                }
+                try { tableLockMonitor.wait(5000); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new MemgresException("lock wait interrupted", "57014");
+                }
+            }
+        }
+    }
+
+    /** Release all table-level locks for a session. */
+    public void releaseTableLocks(Session session) {
+        synchronized (tableLockMonitor) {
+            for (List<TableLockEntry> entries : tableLevelLocks.values()) {
+                entries.removeIf(e -> e.session == session);
+            }
+            tableLockMonitor.notifyAll();
+        }
+    }
+
+    /** Check if a session can write to a table (no conflicting exclusive locks from other sessions). */
+    public void checkTableLockForDml(String tableKey, Session session) {
+        List<TableLockEntry> entries = tableLevelLocks.get(tableKey);
+        if (entries == null) return;
+        synchronized (tableLockMonitor) {
+            while (true) {
+                boolean conflict = false;
+                entries = tableLevelLocks.get(tableKey);
+                if (entries == null) return;
+                for (TableLockEntry e : entries) {
+                    if (e.session != session && !tableLockModesCompatible(e.mode, "RowExclusiveLock")) {
+                        conflict = true;
+                        break;
+                    }
+                }
+                if (!conflict) return;
+                try { tableLockMonitor.wait(5000); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new MemgresException("lock wait interrupted", "57014");
+                }
+            }
+        }
+    }
+
+    /** Table-level lock compatibility. ACCESS EXCLUSIVE conflicts with everything. */
+    private static boolean tableLockModesCompatible(String modeA, String modeB) {
+        // ACCESS EXCLUSIVE conflicts with ALL modes
+        if ("AccessExclusiveLock".equals(modeA) || "AccessExclusiveLock".equals(modeB)) return false;
+        // EXCLUSIVE conflicts with ROW SHARE, ROW EXCLUSIVE, SHARE UPDATE EXCLUSIVE, SHARE, SHARE ROW EXCLUSIVE, EXCLUSIVE
+        if ("ExclusiveLock".equals(modeA) || "ExclusiveLock".equals(modeB)) {
+            // Only compatible with ACCESS SHARE (handled above as not AccessExclusive)
+            return "AccessShareLock".equals(modeA) || "AccessShareLock".equals(modeB);
+        }
+        // For now, simplified: all other combos are compatible for the tests we need
+        return true;
+    }
+
     // Advisory locks: key -> set of sessions holding the lock
     private final Map<Long, Set<Session>> advisoryLocks = new ConcurrentHashMap<>();
+    // Advisory shared locks: key -> set of sessions holding the shared lock
+    private final Set<Long> advisorySharedKeys = ConcurrentHashMap.newKeySet();
 
     // Roles: name -> attributes map
     private final Map<String, Map<String, String>> roles = new ConcurrentHashMap<>();
 
     // Role memberships: granted role (lowercase) -> set of member roles (lowercase)
     private final Map<String, Set<String>> roleMemberships = new ConcurrentHashMap<>();
+
+    // admin_option flag: "grantedRole|memberRole" (lowercase) -> true if GRANT ... WITH ADMIN OPTION was used
+    private final Map<String, Boolean> roleAdminOptions = new ConcurrentHashMap<>();
 
     // Granted privileges: role (lowercase) -> set of "privilege:objectType:objectName" entries
     private final Map<String, Set<String>> rolePrivileges = new ConcurrentHashMap<>();
@@ -114,6 +359,12 @@ public class Database {
 
     // Object ownership: "objectType:objectName" -> owner role name (lowercase)
     private final Map<String, String> objectOwners = new ConcurrentHashMap<>();
+
+    // Installed extensions: extension name -> version string
+    private final Map<String, String> installedExtensions = new ConcurrentHashMap<>();
+
+    // Extension schema: extension name -> schema name
+    private final Map<String, String> extensionSchemas = new ConcurrentHashMap<>();
 
     // Two-phase commit: prepared transactions keyed by GID
     private final Map<String, PreparedTransaction> preparedTransactions = new ConcurrentHashMap<>();
@@ -252,26 +503,62 @@ public class Database {
     private final List<CommittedSsiInfo> recentlyCommittedSsi =
             java.util.Collections.synchronizedList(new ArrayList<>());
 
+    // Exported snapshots: snapshot_id -> table snapshots
+    private final Map<String, Map<String, List<Object[]>>> exportedSnapshots = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong snapshotCounter = new java.util.concurrent.atomic.AtomicLong(1);
+
+    /** Export a snapshot: capture current state of all tables and return a snapshot ID. */
+    public String exportSnapshot() {
+        long id = snapshotCounter.getAndIncrement();
+        String snapshotId = String.format("%08X-%08X-%d", id, id, 1);
+        Map<String, List<Object[]>> snapshot = new LinkedHashMap<>();
+        for (Map.Entry<String, Schema> schemaEntry : schemas.entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                String key = schemaName + "." + tableEntry.getKey();
+                List<Object[]> rows = tableEntry.getValue().getRows();
+                List<Object[]> copy = new ArrayList<>(rows.size());
+                for (Object[] row : rows) copy.add(java.util.Arrays.copyOf(row, row.length));
+                snapshot.put(key, copy);
+            }
+        }
+        exportedSnapshots.put(snapshotId, snapshot);
+        return snapshotId;
+    }
+
+    /** Import a previously exported snapshot. Returns the snapshot data or null. */
+    public Map<String, List<Object[]>> importSnapshot(String snapshotId) {
+        return exportedSnapshots.get(snapshotId);
+    }
+
     /** Info about a recently committed serializable transaction's read/write sets. */
     public static class CommittedSsiInfo {
         private final Set<String> readTables;
         private final Set<String> writeTables;
         private final long commitTime;
+        private final long sequence;
 
-        public CommittedSsiInfo(Set<String> readTables, Set<String> writeTables) {
+        public CommittedSsiInfo(Set<String> readTables, Set<String> writeTables, long sequence) {
             this.readTables = readTables;
             this.writeTables = writeTables;
             this.commitTime = System.currentTimeMillis();
+            this.sequence = sequence;
         }
 
         public Set<String> readTables() { return readTables; }
         public Set<String> writeTables() { return writeTables; }
         public long commitTime() { return commitTime; }
+        public long sequence() { return sequence; }
     }
+
+    private final AtomicLong ssiSequence = new AtomicLong(0);
+
+    /** Allocate a monotonic SSI sequence number (used to track transaction ordering). */
+    public long allocateSsiSequence() { return ssiSequence.incrementAndGet(); }
 
     /** Record a committed serializable transaction's read/write sets. */
     public void recordCommittedSsiTransaction(Set<String> readTables, Set<String> writeTables) {
-        recentlyCommittedSsi.add(new CommittedSsiInfo(readTables, writeTables));
+        recentlyCommittedSsi.add(new CommittedSsiInfo(readTables, writeTables, ssiSequence.incrementAndGet()));
         // Prune old entries (keep last 60 seconds)
         long cutoff = System.currentTimeMillis() - 60_000;
         recentlyCommittedSsi.removeIf(info -> info.commitTime() < cutoff);
@@ -285,6 +572,10 @@ public class Database {
     // Connection tracking
     private final AtomicInteger activeConnections = new AtomicInteger(0);
     private volatile int maxConnections = 100;
+    private volatile int maxPreparedTransactions = 0; // PG default: disabled
+
+    public int getMaxPreparedTransactions() { return maxPreparedTransactions; }
+    public void setMaxPreparedTransactions(int max) { this.maxPreparedTransactions = max; }
 
     public Database() {
         schemas.put("public", new Schema("public"));
@@ -305,6 +596,40 @@ public class Database {
         pgSleepFunc.setVolatility("VOLATILE");
         pgSleepFunc.setStrict(true);
         addFunction(pgSleepFunc);
+        // Register pg_sleep_for so it appears in pg_proc
+        PgFunction pgSleepForFunc = new PgFunction("pg_sleep_for", "void",
+                "-- built-in: pg_sleep_for", "internal",
+                Cols.listOf(new PgFunction.Param("duration", "interval", "IN", null)), false);
+        pgSleepForFunc.setSchemaName("pg_catalog");
+        pgSleepForFunc.setVolatility("VOLATILE");
+        pgSleepForFunc.setStrict(true);
+        addFunction(pgSleepForFunc);
+        // Register pg_sleep_until so it appears in pg_proc
+        PgFunction pgSleepUntilFunc = new PgFunction("pg_sleep_until", "void",
+                "-- built-in: pg_sleep_until", "internal",
+                Cols.listOf(new PgFunction.Param("wakeup", "timestamp with time zone", "IN", null)), false);
+        pgSleepUntilFunc.setSchemaName("pg_catalog");
+        pgSleepUntilFunc.setVolatility("VOLATILE");
+        pgSleepUntilFunc.setStrict(true);
+        addFunction(pgSleepUntilFunc);
+        // Register built-in comparison functions so CREATE OPERATOR PROCEDURE = int4eq etc. works
+        String[][] builtinCompFuncs = {
+                {"int4eq", "boolean", "integer,integer"},
+                {"int4ne", "boolean", "integer,integer"},
+                {"int4lt", "boolean", "integer,integer"},
+                {"int4gt", "boolean", "integer,integer"},
+                {"int4le", "boolean", "integer,integer"},
+                {"int4ge", "boolean", "integer,integer"},
+        };
+        for (String[] f : builtinCompFuncs) {
+            java.util.List<PgFunction.Param> params = new java.util.ArrayList<>();
+            for (String pType : f[2].split(",")) {
+                params.add(new PgFunction.Param(null, pType.trim(), "IN", null));
+            }
+            PgFunction fn = new PgFunction(f[0], f[1], "-- built-in: " + f[0], "internal", params, true);
+            fn.setSchemaName("pg_catalog");
+            addFunction(fn);
+        }
     }
 
     // ---- Connection management ----
@@ -363,6 +688,10 @@ public class Database {
     public void recordAnalyzedTable(String schemaTable) { analyzedTables.add(schemaTable); }
     public Set<String> getAnalyzedTables() { return analyzedTables; }
 
+    // Clustered index tracking
+    public void setClusteredIndex(String indexName) { clusteredIndexes.add(indexName.toLowerCase()); }
+    public boolean isClusteredIndex(String indexName) { return clusteredIndexes.contains(indexName.toLowerCase()); }
+
     /** Get advisory locks map (for pg_locks). */
     public Map<Long, Set<Session>> getAdvisoryLocks() {
         return advisoryLocks;
@@ -378,6 +707,35 @@ public class Database {
 
     public Map<String, Schema> getSchemas() {
         return schemas;
+    }
+
+    /**
+     * Lookup a table by unqualified name, searching pg_catalog first, then public.
+     */
+    public Table getTable(String name) {
+        Schema pgCatalog = schemas.get("pg_catalog");
+        if (pgCatalog != null) {
+            Table t = pgCatalog.getTable(name);
+            if (t != null) return t;
+        }
+        Schema pub = schemas.get("public");
+        if (pub != null) {
+            Table t = pub.getTable(name);
+            if (t != null) return t;
+        }
+        for (Schema s : schemas.values()) {
+            Table t = s.getTable(name);
+            if (t != null) return t;
+        }
+        return null;
+    }
+
+    public void addSchemaAcl(String schemaName, String aclItem) {
+        schemaAcls.computeIfAbsent(schemaName.toLowerCase(), k -> new java.util.ArrayList<>()).add(aclItem);
+    }
+
+    public List<String> getSchemaAcl(String schemaName) {
+        return schemaAcls.get(schemaName.toLowerCase());
     }
 
     public void removeSchema(String name) {
@@ -440,6 +798,31 @@ public class Database {
 
     public void removeCompositeType(String name) {
         compositeTypes.remove(name.toLowerCase());
+    }
+
+    public Map<String, List<CreateTypeStmt.CompositeField>> getCompositeTypes() {
+        return compositeTypes;
+    }
+
+    // User-defined range types
+    public void addRangeType(String name, String subtype) {
+        rangeTypes.put(name.toLowerCase(), subtype);
+    }
+
+    public Map<String, String> getRangeTypes() {
+        return rangeTypes;
+    }
+
+    public void addUserCast(int sourceOid, int targetOid, int castFunc, String castContext, String castMethod) {
+        userDefinedCasts.add(new Object[]{sourceOid, targetOid, castFunc, castContext, castMethod});
+    }
+
+    public java.util.List<Object[]> getUserDefinedCasts() {
+        return userDefinedCasts;
+    }
+
+    public void removeUserCast(int sourceOid, int targetOid) {
+        userDefinedCasts.removeIf(c -> (int) c[0] == sourceOid && (int) c[1] == targetOid);
     }
 
     // User-defined aggregates
@@ -825,6 +1208,40 @@ public class Database {
         }
     }
 
+    // Event triggers
+    public void addEventTrigger(PgEventTrigger et) {
+        eventTriggers.put(et.getName().toLowerCase(), et);
+    }
+
+    public PgEventTrigger getEventTrigger(String name) {
+        return eventTriggers.get(name.toLowerCase());
+    }
+
+    public void removeEventTrigger(String name) {
+        eventTriggers.remove(name.toLowerCase());
+    }
+
+    public Map<String, PgEventTrigger> getAllEventTriggers() {
+        return eventTriggers;
+    }
+
+    // Extended statistics
+    public void addExtendedStatistic(ExtendedStatistic stat) {
+        extendedStatistics.put(stat.getName().toLowerCase(), stat);
+    }
+
+    public ExtendedStatistic getExtendedStatistic(String name) {
+        return extendedStatistics.get(name.toLowerCase());
+    }
+
+    public void removeExtendedStatistic(String name) {
+        extendedStatistics.remove(name.toLowerCase());
+    }
+
+    public Map<String, ExtendedStatistic> getAllExtendedStatistics() {
+        return extendedStatistics;
+    }
+
     // Sequences
     public void addSequence(Sequence sequence) {
         sequences.put(sequence.getName().toLowerCase(), sequence);
@@ -863,6 +1280,25 @@ public class Database {
 
     public void removeRule(String ruleName, String table) {
         rules.remove("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+        rules.remove("def:" + ruleName.toLowerCase());
+    }
+
+    public void addRuleDefinition(String ruleName, String table, String definition) {
+        rules.put("def:" + ruleName.toLowerCase(), table.toLowerCase() + "|" + definition);
+    }
+
+    public java.util.Map<String, String[]> getRuleDefinitions() {
+        java.util.Map<String, String[]> result = new java.util.LinkedHashMap<>();
+        for (java.util.Map.Entry<String, String> e : rules.entrySet()) {
+            if (e.getKey().startsWith("def:")) {
+                String ruleName = e.getKey().substring(4);
+                int pipe = e.getValue().indexOf('|');
+                if (pipe >= 0) {
+                    result.put(ruleName, new String[]{ e.getValue().substring(0, pipe), e.getValue().substring(pipe + 1) });
+                }
+            }
+        }
+        return result;
     }
 
     public String getRule(String table, String event) {
@@ -901,6 +1337,38 @@ public class Database {
         indexUniqueFlags.put(name.toLowerCase(), isUnique);
         if (method != null) indexMethods.put(name.toLowerCase(), method);
         if (whereClause != null) indexWhereClauses.put(name.toLowerCase(), whereClause);
+    }
+
+    public void setIndexColumnOptions(String name, List<String> options) {
+        if (options != null) indexColumnOptions.put(name.toLowerCase(), options);
+    }
+
+    public List<String> getIndexColumnOptions(String name) {
+        return indexColumnOptions.get(name.toLowerCase());
+    }
+
+    public void setIndexIncludeColumns(String name, List<String> cols) {
+        if (cols != null && !cols.isEmpty()) indexIncludeColumns.put(name.toLowerCase(), cols);
+    }
+
+    public List<String> getIndexIncludeColumns(String name) {
+        return indexIncludeColumns.get(name.toLowerCase());
+    }
+
+    public void setIndexNullsNotDistinct(String name, boolean value) {
+        if (value) indexNullsNotDistinct.put(name.toLowerCase(), true);
+    }
+
+    public boolean isIndexNullsNotDistinct(String name) {
+        return indexNullsNotDistinct.getOrDefault(name.toLowerCase(), false);
+    }
+
+    public void setIndexParent(String childIndex, String parentIndex) {
+        indexParentIndex.put(childIndex.toLowerCase(), parentIndex.toLowerCase());
+    }
+
+    public Map<String, String> getIndexParentMap() {
+        return indexParentIndex;
     }
 
     public String getIndexMethod(String name) {
@@ -946,6 +1414,9 @@ public class Database {
         indexWhereClauses.remove(name.toLowerCase());
         indexMethods.remove(name.toLowerCase());
         indexReloptions.remove(name.toLowerCase());
+        indexColumnOptions.remove(name.toLowerCase());
+        indexIncludeColumns.remove(name.toLowerCase());
+        indexNullsNotDistinct.remove(name.toLowerCase());
     }
 
     /** Rename an index: re-key across all index maps and update schema registry. */
@@ -964,6 +1435,12 @@ public class Database {
         if (method != null) indexMethods.put(newKey, method);
         Map<String, String> opts = indexReloptions.remove(oldKey);
         if (opts != null) indexReloptions.put(newKey, opts);
+        List<String> colOpts = indexColumnOptions.remove(oldKey);
+        if (colOpts != null) indexColumnOptions.put(newKey, colOpts);
+        List<String> inclCols = indexIncludeColumns.remove(oldKey);
+        if (inclCols != null) indexIncludeColumns.put(newKey, inclCols);
+        Boolean nnd = indexNullsNotDistinct.remove(oldKey);
+        if (nnd != null) indexNullsNotDistinct.put(newKey, nnd);
         // Update schema registry
         for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
             if (entry.getValue().remove("index:" + oldKey)) {
@@ -1032,11 +1509,34 @@ public class Database {
         // Without this, two sessions could both see an empty set, both pass
         // the check, and both add themselves — violating mutual exclusion.
         synchronized (holders) {
-            for (Session holder : holders) {
-                if (holder != session) {
-                    return false;
+            // Exclusive lock: fail if any other session holds it (exclusive or shared)
+            if (advisorySharedKeys.contains(key)) {
+                // Key is held in shared mode by someone; exclusive lock fails if other sessions hold it
+                for (Session holder : holders) {
+                    if (holder != session) return false;
+                }
+            } else {
+                for (Session holder : holders) {
+                    if (holder != session) return false;
                 }
             }
+            holders.add(session);
+            return true;
+        }
+    }
+
+    /** Try to acquire a shared advisory lock. Multiple sessions can hold shared locks concurrently. */
+    public boolean tryAdvisoryLockShared(long key, Session session) {
+        Set<Session> holders = advisoryLocks.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
+        synchronized (holders) {
+            // Shared lock: fail only if another session holds an exclusive lock
+            if (!advisorySharedKeys.contains(key) && !holders.isEmpty()) {
+                // Key held exclusively by someone; check if it's us
+                for (Session holder : holders) {
+                    if (holder != session) return false;
+                }
+            }
+            advisorySharedKeys.add(key);
             holders.add(session);
             return true;
         }
@@ -1046,16 +1546,23 @@ public class Database {
         Set<Session> holders = advisoryLocks.get(key);
         if (holders != null) {
             synchronized (holders) {
-                return holders.remove(session);
+                boolean removed = holders.remove(session);
+                if (holders.isEmpty()) {
+                    advisorySharedKeys.remove(key);
+                }
+                return removed;
             }
         }
         return false;
     }
 
     public void advisoryUnlockAll(Session session) {
-        for (Set<Session> holders : advisoryLocks.values()) {
-            synchronized (holders) {
-                holders.remove(session);
+        for (Map.Entry<Long, Set<Session>> entry : advisoryLocks.entrySet()) {
+            synchronized (entry.getValue()) {
+                entry.getValue().remove(session);
+                if (entry.getValue().isEmpty()) {
+                    advisorySharedKeys.remove(entry.getKey());
+                }
             }
         }
     }
@@ -1389,8 +1896,21 @@ public class Database {
     // ---- Role membership ----
 
     public void addRoleMembership(String grantedRole, String memberRole) {
+        addRoleMembership(grantedRole, memberRole, false);
+    }
+
+    public void addRoleMembership(String grantedRole, String memberRole, boolean withAdminOption) {
         roleMemberships.computeIfAbsent(grantedRole.toLowerCase(), k -> ConcurrentHashMap.newKeySet())
                 .add(memberRole.toLowerCase());
+        String key = grantedRole.toLowerCase() + "|" + memberRole.toLowerCase();
+        if (withAdminOption) {
+            roleAdminOptions.put(key, true);
+        }
+    }
+
+    public boolean hasAdminOption(String grantedRole, String memberRole) {
+        return Boolean.TRUE.equals(
+                roleAdminOptions.get(grantedRole.toLowerCase() + "|" + memberRole.toLowerCase()));
     }
 
     public void removeRoleMembership(String grantedRole, String memberRole) {
@@ -1525,6 +2045,44 @@ public class Database {
         }
     }
 
+    // ---- Extension management ----
+
+    public void addExtension(String name, String version) {
+        installedExtensions.put(name.toLowerCase(), version);
+    }
+
+    public void addExtension(String name, String version, String schema) {
+        installedExtensions.put(name.toLowerCase(), version);
+        if (schema != null) {
+            extensionSchemas.put(name.toLowerCase(), schema);
+        }
+    }
+
+    public void setExtensionSchema(String name, String schema) {
+        extensionSchemas.put(name.toLowerCase(), schema);
+    }
+
+    public String getExtensionSchema(String name) {
+        return extensionSchemas.get(name.toLowerCase());
+    }
+
+    public void removeExtension(String name) {
+        installedExtensions.remove(name.toLowerCase());
+        extensionSchemas.remove(name.toLowerCase());
+    }
+
+    public boolean hasExtension(String name) {
+        return installedExtensions.containsKey(name.toLowerCase());
+    }
+
+    public Map<String, String> getInstalledExtensions() {
+        return installedExtensions;
+    }
+
+    public Map<String, String> getExtensionSchemas() {
+        return extensionSchemas;
+    }
+
     // ---- Schema object registry ----
 
     /**
@@ -1552,4 +2110,39 @@ public class Database {
     public void removeSchemaObjects(String schemaName) {
         schemaObjectRegistry.remove(schemaName.toLowerCase());
     }
+
+    // ---- FDW accessors ----
+
+    public Map<String, FdwWrapper> getForeignDataWrappers() { return foreignDataWrappers; }
+    public void addForeignDataWrapper(FdwWrapper w) { foreignDataWrappers.put(w.name.toLowerCase(), w); }
+    public void removeForeignDataWrapper(String name) { foreignDataWrappers.remove(name.toLowerCase()); }
+
+    public Map<String, FdwServer> getForeignServers() { return foreignServers; }
+    public void addForeignServer(FdwServer s) { foreignServers.put(s.name.toLowerCase(), s); }
+    public FdwServer getForeignServer(String name) { return foreignServers.get(name.toLowerCase()); }
+    public void removeForeignServer(String name) { foreignServers.remove(name.toLowerCase()); }
+
+    public Map<String, FdwUserMapping> getForeignUserMappings() { return foreignUserMappings; }
+    public void addForeignUserMapping(FdwUserMapping m) { foreignUserMappings.put((m.serverName + ":" + m.userName).toLowerCase(), m); }
+
+    public Map<String, FdwForeignTable> getForeignTables() { return foreignTables; }
+    public void addForeignTable(FdwForeignTable ft) { foreignTables.put(ft.tableName.toLowerCase(), ft); }
+    public void removeForeignTable(String name) { foreignTables.remove(name.toLowerCase()); }
+
+    // ---- Publication / Subscription accessors ----
+
+    public Map<String, PubDef> getPublications() { return publications; }
+    public void addPublication(PubDef p) { publications.put(p.name.toLowerCase(), p); }
+    public PubDef getPublication(String name) { return publications.get(name.toLowerCase()); }
+    public void removePublication(String name) { publications.remove(name.toLowerCase()); }
+
+    public Map<String, SubDef> getSubscriptions() { return subscriptions; }
+    public void addSubscription(SubDef s) { subscriptions.put(s.name.toLowerCase(), s); }
+    public void removeSubscription(String name) { subscriptions.remove(name.toLowerCase()); }
+
+    // ---- Replication slot accessors ----
+
+    public Map<String, ReplicationSlot> getReplicationSlots() { return replicationSlots; }
+    public void addReplicationSlot(ReplicationSlot s) { replicationSlots.put(s.slotName.toLowerCase(), s); }
+    public void removeReplicationSlot(String name) { replicationSlots.remove(name.toLowerCase()); }
 }

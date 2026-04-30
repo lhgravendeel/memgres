@@ -44,6 +44,30 @@ public final class XmlOperations {
         return xml;
     }
 
+    /** XMLSERIALIZE with INDENT: pretty-print XML with indentation. */
+    public static String xmlserializeIndent(String xml) {
+        if (xml == null) return null;
+        try {
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            DocumentBuilder db = dbf.newDocumentBuilder();
+            Document doc = db.parse(new InputSource(new StringReader(xml)));
+
+            TransformerFactory tf = TransformerFactory.newInstance();
+            Transformer transformer = tf.newTransformer();
+            transformer.setOutputProperty(OutputKeys.INDENT, "yes");
+            transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
+            transformer.setOutputProperty("{http://xml.apache.org/xslt}indent-amount", "2");
+
+            StringWriter writer = new StringWriter();
+            transformer.transform(new DOMSource(doc), new StreamResult(writer));
+            return writer.toString().trim();
+        } catch (Exception e) {
+            // Fallback: return as-is
+            return xml;
+        }
+    }
+
     /** IS DOCUMENT: returns true if the xml value is a well-formed XML document (single root element). */
     public static boolean isDocument(String xml) {
         if (xml == null) return false;

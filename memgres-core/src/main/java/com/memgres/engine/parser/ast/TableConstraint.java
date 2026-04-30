@@ -18,6 +18,8 @@ public final class TableConstraint {
     public final boolean deferrable;
     public final boolean initiallyDeferred;
     public final boolean notEnforced;
+    public final boolean noInherit;
+    public final String matchType; // null, "FULL", "SIMPLE", "PARTIAL"
     public final List<ExcludeElement> excludeElements;
 
     public TableConstraint(
@@ -35,6 +37,47 @@ public final class TableConstraint {
             boolean notEnforced,
             List<ExcludeElement> excludeElements
     ) {
+        this(name, type, columns, checkExpr, referencesTable, referencesColumns,
+                onDelete, onUpdate, nullsNotDistinct, deferrable, initiallyDeferred, notEnforced, false, null, excludeElements);
+    }
+
+    public TableConstraint(
+            String name,
+            ConstraintType type,
+            List<String> columns,
+            Expression checkExpr,
+            String referencesTable,
+            List<String> referencesColumns,
+            String onDelete,
+            String onUpdate,
+            boolean nullsNotDistinct,
+            boolean deferrable,
+            boolean initiallyDeferred,
+            boolean notEnforced,
+            String matchType,
+            List<ExcludeElement> excludeElements
+    ) {
+        this(name, type, columns, checkExpr, referencesTable, referencesColumns,
+                onDelete, onUpdate, nullsNotDistinct, deferrable, initiallyDeferred, notEnforced, false, matchType, excludeElements);
+    }
+
+    public TableConstraint(
+            String name,
+            ConstraintType type,
+            List<String> columns,
+            Expression checkExpr,
+            String referencesTable,
+            List<String> referencesColumns,
+            String onDelete,
+            String onUpdate,
+            boolean nullsNotDistinct,
+            boolean deferrable,
+            boolean initiallyDeferred,
+            boolean notEnforced,
+            boolean noInherit,
+            String matchType,
+            List<ExcludeElement> excludeElements
+    ) {
         this.name = name;
         this.type = type;
         this.columns = columns;
@@ -47,6 +90,8 @@ public final class TableConstraint {
         this.deferrable = deferrable;
         this.initiallyDeferred = initiallyDeferred;
         this.notEnforced = notEnforced;
+        this.noInherit = noInherit;
+        this.matchType = matchType;
         this.excludeElements = excludeElements;
     }
 
@@ -88,7 +133,7 @@ public final class TableConstraint {
                            List<String> referencesColumns, String onDelete, String onUpdate,
                            boolean nullsNotDistinct, boolean deferrable, boolean initiallyDeferred) {
         this(name, type, columns, checkExpr, referencesTable, referencesColumns,
-                onDelete, onUpdate, nullsNotDistinct, deferrable, initiallyDeferred, false, null);
+                onDelete, onUpdate, nullsNotDistinct, deferrable, initiallyDeferred, false, false, null, null);
     }
 
     // Constructor without deferrable fields
@@ -97,7 +142,7 @@ public final class TableConstraint {
                            List<String> referencesColumns, String onDelete, String onUpdate,
                            boolean nullsNotDistinct) {
         this(name, type, columns, checkExpr, referencesTable, referencesColumns,
-                onDelete, onUpdate, nullsNotDistinct, false, false, false, null);
+                onDelete, onUpdate, nullsNotDistinct, false, false, false, false, null, null);
     }
 
     // Backwards-compatible constructor without nullsNotDistinct
@@ -105,7 +150,7 @@ public final class TableConstraint {
                            Expression checkExpr, String referencesTable,
                            List<String> referencesColumns, String onDelete, String onUpdate) {
         this(name, type, columns, checkExpr, referencesTable, referencesColumns,
-                onDelete, onUpdate, false, false, false, false, null);
+                onDelete, onUpdate, false, false, false, false, false, null, null);
     }
 
     public enum ConstraintType {
@@ -124,6 +169,8 @@ public final class TableConstraint {
     public boolean deferrable() { return deferrable; }
     public boolean initiallyDeferred() { return initiallyDeferred; }
     public boolean notEnforced() { return notEnforced; }
+    public boolean noInherit() { return noInherit; }
+    public String matchType() { return matchType; }
     public List<ExcludeElement> excludeElements() { return excludeElements; }
 
     @Override

@@ -28,6 +28,8 @@ public class PlpgsqlExecutor {
     // Procedure transaction control context (PG 11+)
     private boolean isProcedureExecution;
     private int exceptionBlockDepth;
+    // Track current function name for PG_EXCEPTION_CONTEXT
+    private String currentFunctionName;
 
     // Control flow signals
     private static class ReturnSignal extends RuntimeException {
@@ -139,6 +141,7 @@ public class PlpgsqlExecutor {
 
     public Object executeFunction(PgFunction function, List<Object> args) {
         this.isProcedureExecution = function.isProcedure();
+        this.currentFunctionName = function.getName();
         // Track function call depth: when inside a non-procedure function, transaction control is forbidden
         boolean enteredFunctionContext = false;
         if (!function.isProcedure() && session != null) {
@@ -206,6 +209,10 @@ public class PlpgsqlExecutor {
         if (lang.equals("sql")) {
             // SQL language function: execute body as SQL with param substitution
             return executeSqlFunction(function, args);
+        }
+
+        if (lang.equals("internal")) {
+            return executeInternalFunction(function.getName(), args);
         }
 
         block = PlpgsqlParser.parse(function.getBody());
@@ -305,6 +312,26 @@ public class PlpgsqlExecutor {
         }
 
         return null;
+    }
+
+    private Object executeInternalFunction(String name, List<Object> args) {
+        // Built-in comparison functions for integer types
+        switch (name) {
+            case "int4eq": return toInt(args.get(0)) == toInt(args.get(1));
+            case "int4ne": return toInt(args.get(0)) != toInt(args.get(1));
+            case "int4lt": return toInt(args.get(0)) < toInt(args.get(1));
+            case "int4gt": return toInt(args.get(0)) > toInt(args.get(1));
+            case "int4le": return toInt(args.get(0)) <= toInt(args.get(1));
+            case "int4ge": return toInt(args.get(0)) >= toInt(args.get(1));
+            default:
+                throw new MemgresException("internal function " + name + " is not implemented", "0A000");
+        }
+    }
+
+    private static int toInt(Object val) {
+        if (val instanceof Number) return ((Number) val).intValue();
+        if (val instanceof String) return Integer.parseInt((String) val);
+        throw new MemgresException("cannot convert " + val + " to integer", "22023");
     }
 
     private Object executeSqlFunction(PgFunction function, List<Object> args) {
@@ -419,16 +446,27 @@ public class PlpgsqlExecutor {
 
         if (trigger != null) {
             scope.declare("tg_op", trigger.getEvent().name());
+            scope.declare("tg_name", trigger.getName());
             scope.declare("tg_table_name", trigger.getTableName());
+            scope.declare("tg_table_schema", "public");
             scope.declare("tg_when", trigger.getTiming().name());
+            scope.declare("tg_level", trigger.isForEachStatement() ? "STATEMENT" : "ROW");
             scope.declare("tg_nargs", 0);
             scope.declare("tg_argv", new String[0]);
+            // TG_RELID: OID of the table that caused the trigger invocation
+            int relid = astExecutor.getSystemCatalog().getOid("rel:public." + trigger.getTableName());
+            scope.declare("tg_relid", relid);
         } else {
             scope.declare("tg_op", "INSERT");
+            scope.declare("tg_name", "");
             scope.declare("tg_table_name", table.getName());
+            scope.declare("tg_table_schema", "public");
             scope.declare("tg_when", "BEFORE");
+            scope.declare("tg_level", "ROW");
             scope.declare("tg_nargs", 0);
             scope.declare("tg_argv", new String[0]);
+            int relid = astExecutor.getSystemCatalog().getOid("rel:public." + table.getName());
+            scope.declare("tg_relid", relid);
         }
 
         try {
@@ -451,6 +489,22 @@ public class PlpgsqlExecutor {
             copyMapToRow(finalNew, newRow, table);
         }
         return newRow;
+    }
+
+    /**
+     * Execute an event trigger function with tg_tag and tg_event set.
+     */
+    public void executeEventTriggerFunction(PgFunction function, String tag, String event) {
+        PlpgsqlStatement.Block block = PlpgsqlParser.parse(function.getBody());
+        Scope scope = new Scope(null);
+        scope.declare("tg_tag", tag);
+        scope.declare("tg_event", event);
+        scope.declare("found", false);
+        try {
+            executeBlock(block, scope);
+        } catch (ReturnSignal rs) {
+            // event triggers return void
+        }
     }
 
     private void copyMapToRow(Map<String, Object> map, Object[] row, Table table) {
@@ -600,6 +654,9 @@ public class PlpgsqlExecutor {
         } else if (stmt instanceof PlpgsqlStatement.ForQueryStmt) {
             PlpgsqlStatement.ForQueryStmt fq = (PlpgsqlStatement.ForQueryStmt) stmt;
             executeForQuery(fq, scope);
+        } else if (stmt instanceof PlpgsqlStatement.ForExecuteStmt) {
+            PlpgsqlStatement.ForExecuteStmt fe = (PlpgsqlStatement.ForExecuteStmt) stmt;
+            executeForExecute(fe, scope);
         } else if (stmt instanceof PlpgsqlStatement.ForeachStmt) {
             PlpgsqlStatement.ForeachStmt fe = (PlpgsqlStatement.ForeachStmt) stmt;
             executeForeach(fe, scope);
@@ -886,6 +943,46 @@ public class PlpgsqlExecutor {
         scope.set("found", anyIteration);
     }
 
+    private void executeForExecute(PlpgsqlStatement.ForExecuteStmt stmt, Scope scope) {
+        // Evaluate the SQL expression (which may be a string literal or expression)
+        String sqlExpr = substituteVariables(stmt.sqlExpr(), scope);
+        Object sqlObj = evalExpr(sqlExpr, scope);
+        String sql = sqlObj != null ? sqlObj.toString() : sqlExpr;
+
+        // Handle USING parameters by substituting $1, $2, etc.
+        if (stmt.usingExprs() != null && !stmt.usingExprs().isEmpty()) {
+            for (int u = 0; u < stmt.usingExprs().size(); u++) {
+                Object paramVal = evalExpr(substituteVariables(stmt.usingExprs().get(u), scope), scope);
+                String replacement = paramVal == null ? "NULL" : paramVal.toString();
+                sql = sql.replace("$" + (u + 1), replacement);
+            }
+        }
+
+        QueryResult result = astExecutor.execute(sql);
+
+        scope.declare(stmt.varName(), null);
+        boolean anyIteration = false;
+
+        for (Object[] row : result.getRows()) {
+            anyIteration = true;
+            Map<String, Object> record = new LinkedHashMap<>();
+            for (int i = 0; i < result.getColumns().size(); i++) {
+                record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
+            }
+            scope.set(stmt.varName(), record);
+            try {
+                executeStatements(stmt.body(), scope);
+            } catch (ExitSignal e) {
+                if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
+                throw e;
+            } catch (ContinueSignal c) {
+                if (c.label == null || c.label.equalsIgnoreCase(stmt.label())) continue;
+                throw c;
+            }
+        }
+        scope.set("found", anyIteration);
+    }
+
     private void executeForeach(PlpgsqlStatement.ForeachStmt stmt, Scope scope) {
         Object arrayObj = evalExpr(stmt.arrayExpr(), scope);
         if (arrayObj == null) return;
@@ -1001,7 +1098,15 @@ public class PlpgsqlExecutor {
             value = evalExpr(expr, scope);
         }
         List<Object> results = (List<Object>) scope.get("__return_next_results__");
-        if (results != null) results.add(value);
+        if (results != null) {
+            // Deep-copy Maps (composite records) to avoid mutation by subsequent assignments
+            if (value instanceof Map) {
+                value = new java.util.LinkedHashMap<>((Map<?, ?>) value);
+            } else if (value instanceof Object[]) {
+                value = ((Object[]) value).clone();
+            }
+            results.add(value);
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -1087,6 +1192,11 @@ public class PlpgsqlExecutor {
             MemgresException ex = new MemgresException(msg, sqlState);
             if (scope.has("__pg_detail")) ex.setDetail(String.valueOf(scope.get("__pg_detail")));
             if (scope.has("__pg_hint")) ex.setHint(String.valueOf(scope.get("__pg_hint")));
+            if (scope.has("__pg_column")) ex.setColumn(String.valueOf(scope.get("__pg_column")));
+            if (scope.has("__pg_constraint")) ex.setConstraint(String.valueOf(scope.get("__pg_constraint")));
+            if (scope.has("__pg_datatype")) ex.setDatatype(String.valueOf(scope.get("__pg_datatype")));
+            if (scope.has("__pg_table")) ex.setTable(String.valueOf(scope.get("__pg_table")));
+            if (scope.has("__pg_schema")) ex.setSchema(String.valueOf(scope.get("__pg_schema")));
             throw ex;
         }
 
@@ -1105,6 +1215,10 @@ public class PlpgsqlExecutor {
                 break;
             case "DEBUG":
                 LOG.debug("PL/pgSQL {}: {}", stmt.level(), message);
+                if (session != null) {
+                    String sqlState = stmt.errcode() != null ? conditionToSqlState(stmt.errcode()) : "00000";
+                    session.addNotice(stmt.level(), sqlState, message, hint);
+                }
                 break;
             case "EXCEPTION": {
                 String sqlState = "P0001";
@@ -1117,6 +1231,10 @@ public class PlpgsqlExecutor {
                 if (stmt.datatype() != null) ex.setDatatype(stmt.datatype());
                 if (stmt.table() != null) ex.setTable(stmt.table());
                 if (stmt.schema() != null) ex.setSchema(stmt.schema());
+                // Record context at throw time for PG_EXCEPTION_CONTEXT
+                if (currentFunctionName != null) {
+                    ex.setPgContext("PL/pgSQL function " + currentFunctionName + "() line 1 at RAISE");
+                }
                 throw ex;
             }
             default: {
@@ -1137,14 +1255,35 @@ public class PlpgsqlExecutor {
 
     private String formatRaiseMessage(String format, List<String> argExprs, Scope scope) {
         if (format == null) return null;
+        // Count placeholders in the format string (% except %%)
+        int placeholderCount = 0;
+        for (int i = 0; i < format.length(); i++) {
+            if (format.charAt(i) == '%') {
+                if (i + 1 < format.length() && format.charAt(i + 1) == '%') {
+                    i++; // skip escaped %%
+                } else {
+                    placeholderCount++;
+                }
+            }
+        }
+        if (argExprs.size() > placeholderCount) {
+            throw new MemgresException("too many parameters specified for RAISE", "42601");
+        }
         StringBuilder sb = new StringBuilder();
         int argIdx = 0;
         for (int i = 0; i < format.length(); i++) {
             char c = format.charAt(i);
-            if (c == '%' && argIdx < argExprs.size()) {
-                Object val = evalExpr(argExprs.get(argIdx), scope);
-                sb.append(val != null ? val.toString() : "NULL");
-                argIdx++;
+            if (c == '%') {
+                if (i + 1 < format.length() && format.charAt(i + 1) == '%') {
+                    sb.append('%');
+                    i++; // skip second %
+                } else if (argIdx < argExprs.size()) {
+                    Object val = evalExpr(argExprs.get(argIdx), scope);
+                    sb.append(val != null ? val.toString() : "NULL");
+                    argIdx++;
+                } else {
+                    sb.append(c);
+                }
             } else {
                 sb.append(c);
             }
@@ -1393,7 +1532,7 @@ public class PlpgsqlExecutor {
                         break;
                     case "PG_EXCEPTION_CONTEXT":
                     case "PG_CONTEXT":
-                        value = "PL/pgSQL function";
+                        value = scope.has("__pg_context") ? scope.get("__pg_context") : "PL/pgSQL function";
                         break;
                     default:
                         value = null;
@@ -1407,6 +1546,21 @@ public class PlpgsqlExecutor {
                     case "FOUND":
                         value = scope.get("found");
                         break;
+                    case "RESULT_OID":
+                        throw new com.memgres.engine.MemgresException(
+                                "unrecognized GET DIAGNOSTICS item at or near \"RESULT_OID\"", "42601");
+                    case "PG_CONTEXT":
+                    case "PG_EXCEPTION_CONTEXT": {
+                        // Non-stacked PG_CONTEXT: return current call stack
+                        StringBuilder ctx = new StringBuilder();
+                        ctx.append("PL/pgSQL function");
+                        if (currentFunctionName != null) {
+                            ctx.append(" ").append(currentFunctionName).append("()");
+                        }
+                        ctx.append(" line 1 during statement block local variable initialization");
+                        value = ctx.toString();
+                        break;
+                    }
                     default:
                         value = null;
                         break;
@@ -1792,12 +1946,6 @@ public class PlpgsqlExecutor {
         return true;
     }
 
-    private int toInt(Object val) {
-        if (val instanceof Number) return ((Number) val).intValue();
-        if (val instanceof String) return Integer.parseInt(((String) val));
-        return 0;
-    }
-
     private Object coerceParamValue(Object val, String typeName) {
         if (val == null || typeName == null) return val;
         String type = typeName.toLowerCase().trim();
@@ -2013,6 +2161,24 @@ public class PlpgsqlExecutor {
         if (e.getDatatype() != null) scope.declare("__pg_datatype", e.getDatatype());
         if (table != null) scope.declare("__pg_table", table);
         if (e.getSchema() != null) scope.declare("__pg_schema", e.getSchema());
+        // Build PG_EXCEPTION_CONTEXT with function name and line number
+        String ctx = buildExceptionContext(e);
+        if (ctx != null) scope.declare("__pg_context", ctx);
+    }
+
+    private String buildExceptionContext(MemgresException e) {
+        // If the exception itself carries context from the throw site, use it
+        if (e.getPgContext() != null) {
+            return e.getPgContext();
+        }
+        StringBuilder sb = new StringBuilder();
+        if (currentFunctionName != null) {
+            sb.append("PL/pgSQL function ").append(currentFunctionName).append("()");
+            sb.append(" line 1 at RAISE");
+        } else {
+            sb.append("PL/pgSQL function line 1 at RAISE");
+        }
+        return sb.toString();
     }
 
     private String mapJavaExceptionToSqlState(RuntimeException e) {

@@ -135,9 +135,11 @@ class ClientDuplicateDetectionTest {
                 }
             }
             // Check for duplicate names with same kind (which a client might flag)
-            // Note: pg_opclass ('c') legitimately has same-named entries for different access methods
+            // Note: pg_opclass ('c') and pg_opfamily ('F') have same-named entries for different AMs;
+            // pg_proc ('R','a') legitimately has overloaded function names
             for (var entry : byName.entrySet()) {
-                if (entry.getValue().size() > 1 && !entry.getKey().endsWith(":c") && !entry.getKey().endsWith(":F")) {
+                if (entry.getValue().size() > 1 && !entry.getKey().endsWith(":c") && !entry.getKey().endsWith(":F")
+                        && !entry.getKey().endsWith(":R") && !entry.getKey().endsWith(":a")) {
                     fail("Duplicate name+kind in " + schemaName + ": " + entry.getKey() + " -> OIDs " + entry.getValue());
                 }
             }

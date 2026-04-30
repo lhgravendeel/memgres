@@ -31,11 +31,16 @@ public class TsQuery {
     }
 
     public static TsQuery term(String t) {
-        return new TsQuery(Op.TERM, TsVector.simpleStem(t.toLowerCase()), false, null, null, null, 0);
+        String stemmed = TsVector.simpleStem(t.toLowerCase());
+        // Treat stop words as empty terms (matches anything, like PG behavior)
+        if (TsVector.isStopWord(stemmed)) stemmed = "";
+        return new TsQuery(Op.TERM, stemmed, false, null, null, null, 0);
     }
 
     public static TsQuery term(String t, boolean prefix, Set<Character> weights) {
-        return new TsQuery(Op.TERM, TsVector.simpleStem(t.toLowerCase()), prefix, weights, null, null, 0);
+        String stemmed = TsVector.simpleStem(t.toLowerCase());
+        if (TsVector.isStopWord(stemmed)) stemmed = "";
+        return new TsQuery(Op.TERM, stemmed, prefix, weights, null, null, 0);
     }
 
     public static TsQuery and(TsQuery l, TsQuery r) {

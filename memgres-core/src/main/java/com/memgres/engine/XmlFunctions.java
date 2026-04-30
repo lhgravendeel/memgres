@@ -33,7 +33,18 @@ class XmlFunctions {
                         throw new MemgresException("cannot cast type xml to " + targetType, "42846");
                     }
                 }
+                String mode = fn.args().size() >= 1 ? String.valueOf(executor.evalExpr(fn.args().get(0), ctx)) : "content";
                 Object xmlVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (xmlVal != null && "document".equalsIgnoreCase(mode)) {
+                    // DOCUMENT mode requires a single root element
+                    if (!XmlOperations.isDocument(xmlVal.toString())) {
+                        throw new MemgresException("not an XML document", "2200L");
+                    }
+                }
+                boolean indent = fn.args().size() >= 4 && "indent".equals(String.valueOf(executor.evalExpr(fn.args().get(3), ctx)));
+                if (indent) {
+                    return xmlVal == null ? null : XmlOperations.xmlserializeIndent(xmlVal.toString());
+                }
                 return xmlVal == null ? null : XmlOperations.xmlserialize(xmlVal.toString());
             }
             case "xmlelement": {

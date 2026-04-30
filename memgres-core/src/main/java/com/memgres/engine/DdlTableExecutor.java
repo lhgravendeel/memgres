@@ -67,8 +67,22 @@ class DdlTableExecutor {
 
         // Handle LIKE tables
         List<StoredConstraint> likeConstraints = new ArrayList<>();
+        // Track indexes to clone from LIKE ... INCLUDING INDEXES
+        List<String[]> likeIndexesToClone = new ArrayList<>(); // each: {srcIndexName, newTableName}
         if (stmt.likeTables() != null) {
-            for (String likeTableName : stmt.likeTables()) {
+            for (String likeEntry : stmt.likeTables()) {
+                // Parse "tablename:OPT1,OPT2" format
+                String likeTableName;
+                Set<String> likeOptions = new HashSet<>();
+                int colonIdx = likeEntry.indexOf(':');
+                if (colonIdx >= 0) {
+                    likeTableName = likeEntry.substring(0, colonIdx);
+                    for (String opt : likeEntry.substring(colonIdx + 1).split(",")) {
+                        likeOptions.add(opt.trim().toUpperCase());
+                    }
+                } else {
+                    likeTableName = likeEntry;
+                }
                 Table likeTable = executor.resolveTable(schemaName, likeTableName);
                 for (Column col : likeTable.getColumns()) {
                     boolean exists = inheritedColumns.stream()
@@ -77,6 +91,17 @@ class DdlTableExecutor {
                 }
                 for (StoredConstraint sc : likeTable.getConstraints()) {
                     likeConstraints.add(sc);
+                }
+                // Collect indexes to clone if INCLUDING INDEXES or INCLUDING ALL
+                if (likeOptions.contains("INDEXES") || likeOptions.contains("ALL")) {
+                    for (Map.Entry<String, List<String>> idxEntry : executor.database.getIndexColumns().entrySet()) {
+                        String srcIdx = idxEntry.getKey();
+                        String idxTable = executor.database.getIndexTable(srcIdx);
+                        if (idxTable != null && (idxTable.equalsIgnoreCase(schemaName + "." + likeTableName)
+                                || idxTable.equalsIgnoreCase(likeTableName))) {
+                            likeIndexesToClone.add(new String[]{srcIdx, stmt.name()});
+                        }
+                    }
                 }
             }
         }
@@ -110,7 +135,11 @@ class DdlTableExecutor {
                     if (dataType != DataType.BIGINT && dataType != DataType.INTEGER && dataType != DataType.SMALLINT) {
                         dataType = DataType.INTEGER;
                     }
-                    defaultVal = "nextval('" + seqName + "')";
+                    if ("ALWAYS".equalsIgnoreCase(def.identity())) {
+                        defaultVal = "__identity__:always:seq:" + seqName;
+                    } else {
+                        defaultVal = "__identity__:bydefault:seq:" + seqName;
+                    }
                 } else {
                     if (dataType == DataType.INTEGER) dataType = DataType.SERIAL;
                     else if (dataType == DataType.BIGINT) dataType = DataType.BIGSERIAL;
@@ -118,6 +147,8 @@ class DdlTableExecutor {
                     else dataType = DataType.SERIAL;
                     if ("ALWAYS".equalsIgnoreCase(def.identity())) {
                         defaultVal = "__identity__:always";
+                    } else {
+                        defaultVal = "__identity__:bydefault";
                     }
                 }
             }
@@ -189,6 +220,10 @@ class DdlTableExecutor {
         validateGeneratedColumns(stmt.columns(), columns);
 
         Table table = new Table(stmt.name(), columns);
+        if (stmt.unlogged()) table.setUnlogged(true);
+        if (stmt.withOptions() != null && !stmt.withOptions().isEmpty()) {
+            table.setReloptions(stmt.withOptions());
+        }
 
         // Set up inheritance links
         for (Table parent : parentTables) {
@@ -203,6 +238,8 @@ class DdlTableExecutor {
             if (partCol != null) {
                 for (String col : partCol.split(",")) {
                     String trimmed = col.trim();
+                    // Skip validation for expression-based partition keys (e.g., "(lower(s))")
+                    if (trimmed.startsWith("(") || trimmed.contains("(")) continue;
                     if (table.getColumnIndex(trimmed) < 0) {
                         throw new MemgresException("column \"" + trimmed + "\" named in partition key does not exist", "42703");
                     }
@@ -214,6 +251,7 @@ class DdlTableExecutor {
         schema.addTable(table);
         executor.recordUndo(new Session.CreateTableUndo(schemaName, stmt.name()));
 
+        try {
         // ON COMMIT actions for temp tables
         if ("DROP".equals(stmt.onCommitAction()) && executor.session != null) {
             if (executor.session.isInTransaction()) {
@@ -262,12 +300,66 @@ class DdlTableExecutor {
             }
         }
 
+        // Validate that PK/UNIQUE constraints on partitioned tables include the partition column
+        if (table.getPartitionStrategy() != null && table.getPartitionColumn() != null) {
+            String rawPartCol = table.getPartitionColumn().toLowerCase().trim();
+            // Strip surrounding parens from expression-based partition keys
+            if (rawPartCol.startsWith("(")) rawPartCol = rawPartCol.substring(1);
+            if (rawPartCol.endsWith(")")) rawPartCol = rawPartCol.substring(0, rawPartCol.length() - 1);
+            rawPartCol = rawPartCol.trim();
+            // Only validate simple column-name partition keys (skip expressions)
+            if (!rawPartCol.contains("(")) {
+                for (String partKeyCol : rawPartCol.split(",")) {
+                    String partKey = partKeyCol.trim();
+                    for (StoredConstraint sc : table.getConstraints()) {
+                        if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                                || sc.getType() == StoredConstraint.Type.UNIQUE) {
+                            boolean found = false;
+                            for (String col : sc.getColumns()) {
+                                if (col.equalsIgnoreCase(partKey)) { found = true; break; }
+                            }
+                            if (!found) {
+                                String constraintKind = sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                                        ? "PRIMARY KEY" : "UNIQUE";
+                                throw new MemgresException(
+                                        "unique constraint on partitioned table must include all partitioning columns\n"
+                                        + "  Detail: " + constraintKind + " constraint missing column \""
+                                        + partKey + "\" which is part of the partition key.",
+                                        "0A000");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        } catch (MemgresException e) {
+            // Roll back: remove the table from schema so it doesn't persist after a failed CREATE TABLE.
+            // This matches PG's atomic DDL behavior where a failed CREATE TABLE leaves no trace.
+            schema.removeTable(stmt.name());
+            throw e;
+        }
+
         // Add constraints from LIKE tables
         for (StoredConstraint likeSc : likeConstraints) {
             table.addConstraint(likeSc);
         }
 
-        executor.database.setObjectOwner("table:" + schemaName + "." + stmt.name(), executor.sessionUser());
+        // Clone indexes from LIKE ... INCLUDING INDEXES
+        for (String[] idxInfo : likeIndexesToClone) {
+            String srcIdx = idxInfo[0];
+            String newTableName = idxInfo[1];
+            List<String> srcCols = executor.database.getIndexColumns().get(srcIdx);
+            if (srcCols != null) {
+                // Generate a new index name: replace source table name prefix with new table name
+                String newIdxName = newTableName + "_" + String.join("_", srcCols) + "_idx";
+                boolean isUnique = executor.database.isUniqueIndex(srcIdx);
+                String method = executor.database.getIndexMethod(srcIdx);
+                executor.database.addIndex(newIdxName, new ArrayList<>(srcCols));
+                executor.database.addIndexMeta(newIdxName, schemaName + "." + newTableName, isUnique, method, null);
+            }
+        }
+
+        executor.database.setObjectOwner("table:" + schemaName + "." + stmt.name(), executor.currentRole());
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
     }
 
@@ -429,6 +521,9 @@ class DdlTableExecutor {
             fk.setInitiallyDeferred(def.initiallyDeferred());
         }
         if (def.notEnforced()) fk.setNotEnforced(true);
+        if (def.refMatchType() != null) fk.setMatchType(def.refMatchType());
+        fk.setOnDeleteSetNullColumns(StoredConstraint.parseSetNullColumns(def.refOnDelete()));
+        fk.setOnUpdateSetNullColumns(StoredConstraint.parseSetNullColumns(def.refOnUpdate()));
         table.addConstraint(fk);
     }
 
@@ -619,9 +714,32 @@ class DdlTableExecutor {
                         found = true;
                         List<Object[]> oldRows = new ArrayList<>(table.getRows());
                         executor.recordUndo(new Session.TruncateUndo(schemaName, bareName, oldRows, table.getSerialCounter()));
+                        // Fire BEFORE TRUNCATE statement-level triggers
+                        List<PgTrigger> triggers = executor.database.getTriggersForTable(bareName);
+                        for (PgTrigger trig : triggers) {
+                            if (!trig.isDisabled() && trig.getEvent() == PgTrigger.Event.TRUNCATE
+                                    && trig.getTiming() == PgTrigger.Timing.BEFORE && trig.isForEachStatement()) {
+                                PgFunction fn = executor.database.getFunction(trig.getFunctionName());
+                                if (fn != null) {
+                                    new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session)
+                                            .executeTriggerFunction(fn, null, null, table, trig);
+                                }
+                            }
+                        }
                         totalCount += table.deleteAll();
                         if (stmt.restartIdentity()) {
                             table.resetSerialCounter(1);
+                        }
+                        // Fire AFTER TRUNCATE statement-level triggers
+                        for (PgTrigger trig : triggers) {
+                            if (!trig.isDisabled() && trig.getEvent() == PgTrigger.Event.TRUNCATE
+                                    && trig.getTiming() == PgTrigger.Timing.AFTER && trig.isForEachStatement()) {
+                                PgFunction fn = executor.database.getFunction(trig.getFunctionName());
+                                if (fn != null) {
+                                    new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session)
+                                            .executeTriggerFunction(fn, null, null, table, trig);
+                                }
+                            }
                         }
                         break;
                     }

@@ -70,11 +70,38 @@ class FunctionEvaluator {
         this.advisoryLockFunctions = new AdvisoryLockFunctions(executor);
     }
 
+    private static java.nio.charset.Charset pgEncodingToCharset(String enc) {
+        String upper = enc.toUpperCase().replace("-", "").replace("_", "");
+        switch (upper) {
+            case "UTF8": case "UTF88": return java.nio.charset.StandardCharsets.UTF_8;
+            case "LATIN1": case "ISO88591": return java.nio.charset.StandardCharsets.ISO_8859_1;
+            case "LATIN2": case "ISO88592": return java.nio.charset.Charset.forName("ISO-8859-2");
+            case "WIN1252": return java.nio.charset.Charset.forName("windows-1252");
+            case "SQLASCII": case "ASCII": return java.nio.charset.StandardCharsets.US_ASCII;
+            default: return java.nio.charset.Charset.forName(enc);
+        }
+    }
+
     private void requireArgs(FunctionCallExpr fn, int min) {
         if (fn.args().size() < min) {
             throw new MemgresException(
                 "function " + fn.name() + "() does not exist" +
                 (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types."), "42883");
+        }
+    }
+
+    /**
+     * Checks that a required extension is installed. PG 18 requires CREATE EXTENSION
+     * before extension functions become available. Throws 42883 if not installed.
+     */
+    private void requireExtension(String extensionName, String functionName, int argCount) {
+        if (!executor.database.hasExtension(extensionName)) {
+            String sig = functionName + "(" + String.join(", ",
+                    java.util.Collections.nCopies(argCount, "unknown")) + ")";
+            throw new MemgresException(
+                    "function " + sig + " does not exist\n" +
+                    "  Hint: No function matches the given name and argument types. " +
+                    "You might need to add explicit type casts.", "42883");
         }
     }
 
@@ -182,9 +209,61 @@ class FunctionEvaluator {
                 return LocalDateTime.now();
             case "version":
                 return "PostgreSQL 18.0";
-            case "uuid_generate_v4":
             case "gen_random_uuid":
                 return java.util.UUID.randomUUID();
+            case "uuidv4":
+                return java.util.UUID.randomUUID();
+            case "uuid_generate_v4":
+                requireExtension("uuid-ossp", name, fn.args().size());
+                return java.util.UUID.randomUUID();
+            case "uuid_generate_v1": {
+                requireExtension("uuid-ossp", name, fn.args().size());
+                // UUID v1: timestamp + node (MAC) based
+                // Use current time since UUID epoch (Oct 15, 1582) in 100-ns intervals
+                long uuidEpochOffset = 122192928000000000L; // 100-ns intervals between UUID epoch and Unix epoch
+                long timestamp = System.currentTimeMillis() * 10000L + uuidEpochOffset;
+                long timeLow = timestamp & 0xFFFFFFFFL;
+                long timeMid = (timestamp >>> 32) & 0xFFFFL;
+                long timeHi = (timestamp >>> 48) & 0x0FFFL;
+                long msb = (timeLow << 32) | (timeMid << 16) | 0x1000L | timeHi; // version 1
+                // Clock sequence (random) and node (random, multicast bit set)
+                java.security.SecureRandom sr = new java.security.SecureRandom();
+                int clockSeq = sr.nextInt(0x3FFF);
+                long node = sr.nextLong() & 0xFFFFFFFFFFL | 0x010000000000L; // set multicast bit
+                long lsb = ((long)(0x80 | ((clockSeq >>> 8) & 0x3F)) << 56)
+                         | ((long)(clockSeq & 0xFF) << 48)
+                         | node;
+                return new java.util.UUID(msb, lsb);
+            }
+            case "uuid_generate_v3": {
+                requireExtension("uuid-ossp", name, fn.args().size());
+                // UUID v3: MD5-based namespace UUID
+                requireArgs(fn, 2);
+                Object nsArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object nameArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (nsArg == null || nameArg == null) return null;
+                java.util.UUID namespace = nsArg instanceof java.util.UUID ? (java.util.UUID) nsArg : java.util.UUID.fromString(nsArg.toString());
+                return uuid3(namespace, nameArg.toString());
+            }
+            case "uuid_generate_v5": {
+                requireExtension("uuid-ossp", name, fn.args().size());
+                // UUID v5: SHA-1-based namespace UUID
+                requireArgs(fn, 2);
+                Object nsArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object nameArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (nsArg == null || nameArg == null) return null;
+                java.util.UUID namespace = nsArg instanceof java.util.UUID ? (java.util.UUID) nsArg : java.util.UUID.fromString(nsArg.toString());
+                return uuid5(namespace, nameArg.toString());
+            }
+            case "uuid_nil":
+                requireExtension("uuid-ossp", name, fn.args().size());
+                return java.util.UUID.fromString("00000000-0000-0000-0000-000000000000");
+            case "uuid_ns_dns":
+                requireExtension("uuid-ossp", name, fn.args().size());
+                return java.util.UUID.fromString("6ba7b810-9dad-11d1-80b4-00c04fd430c8");
+            case "uuid_ns_url":
+                requireExtension("uuid-ossp", name, fn.args().size());
+                return java.util.UUID.fromString("6ba7b811-9dad-11d1-80b4-00c04fd430c8");
             case "uuidv7": {
                 if (!fn.args().isEmpty()) {
                     throw new MemgresException("function uuidv7(" + fn.args().stream()
@@ -219,6 +298,115 @@ class FunctionEvaluator {
                 byte[] bytes = new byte[size];
                 new java.security.SecureRandom().nextBytes(bytes);
                 return bytes;
+            }
+            case "digest": {
+                requireExtension("pgcrypto", name, fn.args().size());
+                // pgcrypto: digest(data, type) → bytea hash
+                requireArgs(fn, 2);
+                Object dataArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object typeArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (dataArg == null || typeArg == null) return null;
+                byte[] data;
+                if (dataArg instanceof byte[]) {
+                    data = (byte[]) dataArg;
+                } else {
+                    data = dataArg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                }
+                String algo = typeArg.toString().toLowerCase().trim();
+                String javaAlgo;
+                switch (algo) {
+                    case "md5": javaAlgo = "MD5"; break;
+                    case "sha1": javaAlgo = "SHA-1"; break;
+                    case "sha224": javaAlgo = "SHA-224"; break;
+                    case "sha256": javaAlgo = "SHA-256"; break;
+                    case "sha384": javaAlgo = "SHA-384"; break;
+                    case "sha512": javaAlgo = "SHA-512"; break;
+                    default: throw new MemgresException("Cannot use \"" + algo + "\": No such hash algorithm", "22023");
+                }
+                try {
+                    java.security.MessageDigest md = java.security.MessageDigest.getInstance(javaAlgo);
+                    return md.digest(data);
+                } catch (java.security.NoSuchAlgorithmException e) {
+                    throw new MemgresException("Cannot use \"" + algo + "\": No such hash algorithm", "22023");
+                }
+            }
+            case "hmac": {
+                requireExtension("pgcrypto", name, fn.args().size());
+                // pgcrypto: hmac(data, key, type) → bytea HMAC
+                requireArgs(fn, 3);
+                Object dataArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object keyArg = executor.evalExpr(fn.args().get(1), ctx);
+                Object typeArg = executor.evalExpr(fn.args().get(2), ctx);
+                if (dataArg == null || keyArg == null || typeArg == null) return null;
+                byte[] data;
+                if (dataArg instanceof byte[]) {
+                    data = (byte[]) dataArg;
+                } else {
+                    data = dataArg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                }
+                byte[] key;
+                if (keyArg instanceof byte[]) {
+                    key = (byte[]) keyArg;
+                } else {
+                    key = keyArg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                }
+                String algo = typeArg.toString().toLowerCase().trim();
+                String hmacAlgo;
+                switch (algo) {
+                    case "md5": hmacAlgo = "HmacMD5"; break;
+                    case "sha1": hmacAlgo = "HmacSHA1"; break;
+                    case "sha224": hmacAlgo = "HmacSHA224"; break;
+                    case "sha256": hmacAlgo = "HmacSHA256"; break;
+                    case "sha384": hmacAlgo = "HmacSHA384"; break;
+                    case "sha512": hmacAlgo = "HmacSHA512"; break;
+                    default: throw new MemgresException("Cannot use \"" + algo + "\": No such hash algorithm", "22023");
+                }
+                try {
+                    javax.crypto.Mac mac = javax.crypto.Mac.getInstance(hmacAlgo);
+                    mac.init(new javax.crypto.spec.SecretKeySpec(key, hmacAlgo));
+                    return mac.doFinal(data);
+                } catch (java.security.NoSuchAlgorithmException | java.security.InvalidKeyException e) {
+                    throw new MemgresException("Cannot use \"" + algo + "\": " + e.getMessage(), "22023");
+                }
+            }
+            case "gen_salt": {
+                requireExtension("pgcrypto", name, fn.args().size());
+                // pgcrypto: gen_salt(type [, iter_count]) → text salt string
+                requireArgs(fn, 1);
+                Object typeArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (typeArg == null) return null;
+                String saltType = typeArg.toString().toLowerCase().trim();
+                java.security.SecureRandom sr = new java.security.SecureRandom();
+                switch (saltType) {
+                    case "bf": {
+                        int rounds = fn.args().size() > 1 ? TypeCoercion.toInteger(executor.evalExpr(fn.args().get(1), ctx)) : 8;
+                        byte[] saltBytes = new byte[16];
+                        sr.nextBytes(saltBytes);
+                        String encoded = java.util.Base64.getEncoder().encodeToString(saltBytes).substring(0, 22);
+                        return "$2a$" + String.format("%02d", rounds) + "$" + encoded;
+                    }
+                    case "md5": {
+                        byte[] saltBytes = new byte[6];
+                        sr.nextBytes(saltBytes);
+                        StringBuilder sb = new StringBuilder("$1$");
+                        for (byte b : saltBytes) sb.append(String.format("%02x", b & 0xFF));
+                        return sb.toString();
+                    }
+                    case "des": {
+                        byte[] saltBytes = new byte[2];
+                        sr.nextBytes(saltBytes);
+                        String chars = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+                        return "" + chars.charAt((saltBytes[0] & 0xFF) % 64) + chars.charAt((saltBytes[1] & 0xFF) % 64);
+                    }
+                    case "xdes": {
+                        byte[] saltBytes = new byte[3];
+                        sr.nextBytes(saltBytes);
+                        String chars = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+                        return "_" + chars.charAt((saltBytes[0] & 0xFF) % 64) + chars.charAt((saltBytes[1] & 0xFF) % 64) + chars.charAt((saltBytes[2] & 0xFF) % 64);
+                    }
+                    default:
+                        throw new MemgresException("Unknown salt type: " + saltType, "22023");
+                }
             }
             case "pg_notify": {
                 // pg_notify(channel, payload): sends notification, returns void
@@ -431,6 +619,29 @@ class FunctionEvaluator {
                 }
                 return executor.lastSequenceValue;
             }
+            case "pg_sequence_last_value": {
+                // Returns the last value allocated by the sequence, or NULL if never used.
+                Object seqArg = executor.evalExpr(fn.args().get(0), ctx);
+                String seqName;
+                if (seqArg instanceof RegclassValue) {
+                    seqName = ((RegclassValue) seqArg).name();
+                } else if (seqArg instanceof Number) {
+                    int targetOid = ((Number) seqArg).intValue();
+                    seqName = null;
+                    for (Map.Entry<String, Sequence> entry : executor.database.getSequences().entrySet()) {
+                        int seqOid = executor.systemCatalog.getOid("rel:public." + entry.getKey());
+                        if (seqOid == targetOid) { seqName = entry.getKey(); break; }
+                    }
+                    if (seqName == null) seqName = String.valueOf(seqArg);
+                } else {
+                    seqName = String.valueOf(seqArg);
+                }
+                if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
+                Sequence seq = resolveSequence(seqName);
+                if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
+                try { return seq.currVal(); }
+                catch (Exception e) { return null; } // never been used -> null
+            }
             case "setval": {
                 String seqName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
                 if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
@@ -574,6 +785,29 @@ class FunctionEvaluator {
             case "isfinite":
             case "date_bin":
                 return dateTimeFunctions.eval(name, fn, ctx);
+            case "timezone": {
+                // timezone(zone, timestamp) → applies timezone conversion
+                // Equivalent to: timestamp AT TIME ZONE zone
+                requireArgs(fn, 2);
+                Object zoneArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object tsArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (tsArg == null) return null;
+                String zoneName = zoneArg != null ? zoneArg.toString() : "UTC";
+                java.time.ZoneId zid;
+                try {
+                    zid = java.time.ZoneId.of(zoneName);
+                } catch (java.time.DateTimeException e) {
+                    throw new MemgresException("time zone \"" + zoneName + "\" not recognized", "22023");
+                }
+                if (tsArg instanceof OffsetDateTime) {
+                    return ((OffsetDateTime) tsArg).atZoneSameInstant(zid).toLocalDateTime();
+                } else if (tsArg instanceof LocalDateTime) {
+                    return ((LocalDateTime) tsArg).atZone(zid).toOffsetDateTime();
+                } else if (tsArg instanceof LocalTime) {
+                    return tsArg;
+                }
+                return tsArg;
+            }
             case "array_length": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
@@ -596,7 +830,7 @@ class FunctionEvaluator {
                     if (dim != 1) return null;
                     String inner = s.substring(1, s.length() - 1).trim();
                     if (inner.isEmpty()) return null; // PG returns NULL for empty arrays
-                    return inner.split(",").length;
+                    return countArrayElements(inner);
                 }
                 return null;
             }
@@ -1002,7 +1236,7 @@ class FunctionEvaluator {
                         if (TypeCoercion.areEqual(la.get(ai), elem)) positions.add(ai + 1);
                     }
                 }
-                return TypeCoercion.formatPgArray(positions);
+                return positions;
             }
             case "array_replace": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
@@ -1015,6 +1249,54 @@ class FunctionEvaluator {
                     }
                 }
                 return result;
+            }
+            case "__similar_to_escape__": {
+                // SIMILAR TO with ESCAPE: __similar_to_escape__(str, pattern, escape_char)
+                requireArgs(fn, 3);
+                Object strVal = executor.evalExpr(fn.args().get(0), ctx);
+                Object patVal = executor.evalExpr(fn.args().get(1), ctx);
+                Object escVal = executor.evalExpr(fn.args().get(2), ctx);
+                if (strVal == null || patVal == null) return null;
+                String str = strVal.toString();
+                String pat = patVal.toString();
+                String esc = escVal != null ? escVal.toString() : "";
+                // If escape is empty, disable escaping; convert SIMILAR TO pattern to regex
+                String regex;
+                if (esc.isEmpty()) {
+                    // No escape character: convert % and _ but quote everything else for regex
+                    StringBuilder sbNoEsc = new StringBuilder();
+                    for (int ci = 0; ci < pat.length(); ci++) {
+                        char ch = pat.charAt(ci);
+                        if (ch == '%') {
+                            sbNoEsc.append(".*");
+                        } else if (ch == '_') {
+                            sbNoEsc.append(".");
+                        } else {
+                            sbNoEsc.append(java.util.regex.Pattern.quote(String.valueOf(ch)));
+                        }
+                    }
+                    regex = sbNoEsc.toString();
+                } else {
+                    char escChar = esc.charAt(0);
+                    StringBuilder sb = new StringBuilder();
+                    for (int ci = 0; ci < pat.length(); ci++) {
+                        char ch = pat.charAt(ci);
+                        if (ch == escChar && ci + 1 < pat.length()) {
+                            char next = pat.charAt(ci + 1);
+                            // Escaped character: emit literal
+                            sb.append(java.util.regex.Pattern.quote(String.valueOf(next)));
+                            ci++; // skip next
+                        } else if (ch == '%') {
+                            sb.append(".*");
+                        } else if (ch == '_') {
+                            sb.append(".");
+                        } else {
+                            sb.append(ch);
+                        }
+                    }
+                    regex = sb.toString();
+                }
+                return str.matches("(?s)" + regex);
             }
             case "overlaps": {
                 // SQL OVERLAPS: (start1, end1_or_interval) OVERLAPS (start2, end2_or_interval) -> boolean
@@ -1044,6 +1326,11 @@ class FunctionEvaluator {
             }
             case "array_sample": {
                 // array_sample(arr, n) - returns n random elements from arr (PG 16+)
+                // PG 18 only supports 2-arg form; 3-arg with seed does not exist
+                if (fn.args().size() >= 3) {
+                    throw new MemgresException(
+                            "function array_sample(integer[], integer, integer) does not exist", "42883");
+                }
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object nObj = executor.evalExpr(fn.args().get(1), ctx);
                 if (arr == null) return null;
@@ -1056,7 +1343,8 @@ class FunctionEvaluator {
                 }
                 if (n <= 0) return TypeCoercion.formatPgArray(new ArrayList<>());
                 if (n >= elements.size()) n = elements.size();
-                java.util.Collections.shuffle(elements, new java.util.Random());
+                java.util.Random rng = new java.util.Random();
+                java.util.Collections.shuffle(elements, rng);
                 return TypeCoercion.formatPgArray(new ArrayList<>(elements.subList(0, n)));
             }
             case "array_shuffle": {
@@ -1085,6 +1373,26 @@ class FunctionEvaluator {
                 return ce == null ? null : ce.getLabels().get(ce.getLabels().size() - 1);
             }
             case "enum_range": {
+                if (fn.args().size() >= 2) {
+                    // Bounded form: enum_range(from, to)
+                    String enumType = resolveEnumTypeFromArg(fn.args().get(0), ctx);
+                    if (enumType == null) enumType = resolveEnumTypeFromArg(fn.args().get(1), ctx);
+                    if (enumType == null) return null;
+                    CustomEnum ce = executor.database.getCustomEnum(enumType);
+                    if (ce == null) return null;
+                    Object fromVal = executor.evalExpr(fn.args().get(0), ctx);
+                    Object toVal = executor.evalExpr(fn.args().get(1), ctx);
+                    String fromStr = fromVal == null ? null : fromVal.toString();
+                    String toStr = toVal == null ? null : toVal.toString();
+                    java.util.List<String> labels = ce.getLabels();
+                    int startIdx = fromStr == null ? 0 : labels.indexOf(fromStr);
+                    int endIdx = toStr == null ? labels.size() - 1 : labels.indexOf(toStr);
+                    if (startIdx < 0) startIdx = 0;
+                    if (endIdx < 0) endIdx = labels.size() - 1;
+                    java.util.List<String> range = labels.subList(startIdx, endIdx + 1);
+                    return "{" + String.join(",", range) + "}";
+                }
+                // Unbounded form: enum_range(NULL::type)
                 String enumType = resolveEnumTypeFromArg(fn.args().get(0), ctx);
                 if (enumType == null) return null;
                 CustomEnum ce = executor.database.getCustomEnum(enumType);
@@ -1224,6 +1532,282 @@ class FunctionEvaluator {
                 }
                 return val.toString();
             }
+            // ---- pg_trgm extension ----
+            case "show_trgm": {
+                requireExtension("pg_trgm", name, fn.args().size());
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String s = arg.toString().toLowerCase();
+                Set<String> trgmSet = new java.util.TreeSet<>();
+                // Pad with two spaces on each side (PG convention)
+                String padded = "  " + s + " ";
+                for (int i = 0; i <= padded.length() - 3; i++) {
+                    trgmSet.add(padded.substring(i, i + 3));
+                }
+                return new ArrayList<>(trgmSet);
+            }
+            case "similarity": {
+                requireExtension("pg_trgm", name, fn.args().size());
+                requireArgs(fn, 2);
+                Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
+                Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
+                if (arg1 == null || arg2 == null) return 0.0;
+                String s1 = arg1.toString().toLowerCase();
+                String s2 = arg2.toString().toLowerCase();
+                Set<String> trgm1 = trigramSet(s1);
+                Set<String> trgm2 = trigramSet(s2);
+                if (trgm1.isEmpty() && trgm2.isEmpty()) return 1.0;
+                Set<String> intersection = new HashSet<>(trgm1);
+                intersection.retainAll(trgm2);
+                Set<String> union = new HashSet<>(trgm1);
+                union.addAll(trgm2);
+                if (union.isEmpty()) return 0.0;
+                return (double) intersection.size() / (double) union.size();
+            }
+            // ---- cube extension ----
+            case "cube": {
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                if (arg instanceof java.util.List<?>) {
+                    java.util.List<?> list = (java.util.List<?>) arg;
+                    double[] coords = new double[list.size()];
+                    for (int ci = 0; ci < list.size(); ci++) {
+                        Object elem = list.get(ci);
+                        if (elem instanceof Number) {
+                            coords[ci] = ((Number) elem).doubleValue();
+                        } else {
+                            coords[ci] = Double.parseDouble(elem.toString());
+                        }
+                    }
+                    return new CubeValue(coords);
+                }
+                // Single scalar → 1D cube
+                double v = (arg instanceof Number) ? ((Number) arg).doubleValue() : Double.parseDouble(arg.toString());
+                return new CubeValue(new double[]{v});
+            }
+            case "cube_dim": {
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                if (arg instanceof CubeValue) {
+                    return ((CubeValue) arg).dim();
+                }
+                throw new MemgresException("function cube_dim(cube) does not exist", "42883");
+            }
+            // ---- fuzzystrmatch extension ----
+            case "levenshtein": {
+                requireExtension("fuzzystrmatch", name, fn.args().size());
+                requireArgs(fn, 2);
+                Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
+                Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
+                if (arg1 == null || arg2 == null) return null;
+                return levenshteinDistance(arg1.toString(), arg2.toString());
+            }
+            case "soundex": {
+                requireExtension("fuzzystrmatch", name, fn.args().size());
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                return computeSoundex(arg.toString());
+            }
+            // ---- unaccent extension ----
+            case "unaccent": {
+                requireExtension("unaccent", name, fn.args().size());
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String s = arg.toString();
+                // Use Java's Normalizer to decompose, then strip combining marks
+                String normalized = java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFD);
+                return normalized.replaceAll("\\p{InCombiningDiacriticalMarks}+", "");
+            }
+            // ---- unicode functions ----
+            case "unicode_version":
+                return Character.UnicodeScript.of('A').toString().isEmpty() ? "0.0" : System.getProperty("java.version").startsWith("1") ? "6.2" : "15.0";
+            case "unicode_assigned": {
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String text = arg.toString();
+                if (text.isEmpty()) return false;
+                int codepoint = text.codePointAt(0);
+                return Character.isDefined(codepoint);
+            }
+            case "__is_normalized__": {
+                // IS [NOT] [NFC|NFD|NFKC|NFKD] NORMALIZED
+                Object textVal = executor.evalExpr(fn.args().get(0), ctx);
+                if (textVal == null) return null;
+                String form = executor.evalExpr(fn.args().get(1), ctx).toString();
+                boolean expectTrue = executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
+                java.text.Normalizer.Form nf;
+                switch (form.toUpperCase()) {
+                    case "NFD": nf = java.text.Normalizer.Form.NFD; break;
+                    case "NFKC": nf = java.text.Normalizer.Form.NFKC; break;
+                    case "NFKD": nf = java.text.Normalizer.Form.NFKD; break;
+                    default: nf = java.text.Normalizer.Form.NFC; break;
+                }
+                boolean normalized = java.text.Normalizer.isNormalized(textVal.toString(), nf);
+                boolean result = expectTrue ? normalized : !normalized;
+                return result;
+            }
+
+            // ---- server file access stubs ----
+            case "pg_read_file": {
+                // pg_read_file(text) / pg_read_file(text, int, int) — stub, returns empty string
+                return "";
+            }
+            case "pg_read_binary_file": {
+                // pg_read_binary_file(text) / pg_read_binary_file(text, int, int) — stub, returns empty bytea
+                return new byte[0];
+            }
+            case "pg_stat_file": {
+                // pg_stat_file(text) → record (size, access, modification, change, creation, isdir)
+                // Stub: returns a record with zeroed/null fields
+                List<Object> record = new ArrayList<>();
+                record.add(0L);          // size
+                record.add(null);        // access
+                record.add(null);        // modification
+                record.add(null);        // change
+                record.add(null);        // creation
+                record.add(false);       // isdir
+                return record;
+            }
+            case "pg_ls_dir": {
+                // pg_ls_dir(text) → set of text — stub, returns empty set
+                return new ArrayList<>();
+            }
+            case "pg_ls_logdir":
+            case "pg_ls_waldir":
+            case "pg_ls_tmpdir":
+            case "pg_ls_archive_statusdir": {
+                // These all return set of record — stub, return empty set
+                return new ArrayList<>();
+            }
+            case "pg_current_logfile": {
+                // pg_current_logfile() → text — stub, returns empty string
+                return "";
+            }
+            case "pg_log_backend_memory_contexts": {
+                // pg_log_backend_memory_contexts(int) → boolean — stub, returns true
+                return true;
+            }
+            case "pg_promote": {
+                // pg_promote(boolean, integer) → boolean — only valid on a standby server
+                throw new MemgresException("recovery is not in progress", "55000");
+            }
+            case "pg_safe_snapshot_blocking_pids": {
+                // pg_safe_snapshot_blocking_pids(int) → int[] — stub, returns empty int array
+                return "{}";
+            }
+            case "pg_partition_ancestors": {
+                // pg_partition_ancestors(regclass) → set of regclass — returns the table itself
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return new ArrayList<>();
+                List<Object> result = new ArrayList<>();
+                result.add(arg);
+                return result;
+            }
+            case "pg_partition_tree": {
+                // pg_partition_tree(regclass) → set of (relid, parentrelid, isleaf, level)
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return new ArrayList<>();
+                // Return the table itself as a single-entry partition tree
+                List<Object> row = new ArrayList<>();
+                row.add(arg);   // relid
+                row.add(null);  // parentrelid (root has no parent)
+                row.add(true);  // isleaf
+                row.add(0);     // level
+                List<List<Object>> result = new ArrayList<>();
+                result.add(row);
+                return result;
+            }
+            case "pg_stat_statements_reset": {
+                throw new MemgresException("pg_stat_statements must be loaded via \"shared_preload_libraries\"", "55000");
+            }
+
+            // ---- sha224 standalone function ----
+            case "sha224": {
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                byte[] data;
+                if (arg instanceof byte[]) {
+                    data = (byte[]) arg;
+                } else {
+                    data = arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                }
+                try {
+                    java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-224");
+                    return md.digest(data);
+                } catch (java.security.NoSuchAlgorithmException e) {
+                    throw new MemgresException("SHA-224 not available", "XX000");
+                }
+            }
+
+            // ---- encoding conversion stub ----
+            case "convert": {
+                // convert(bytea, src_encoding, dest_encoding) → bytea — encoding conversion
+                requireArgs(fn, 3);
+                Object input = executor.evalExpr(fn.args().get(0), ctx);
+                if (input == null) return null;
+                Object srcEncObj = executor.evalExpr(fn.args().get(1), ctx);
+                Object dstEncObj = executor.evalExpr(fn.args().get(2), ctx);
+                String srcEnc = srcEncObj != null ? srcEncObj.toString() : "UTF8";
+                String dstEnc = dstEncObj != null ? dstEncObj.toString() : "UTF8";
+                byte[] data;
+                if (input instanceof byte[]) {
+                    data = (byte[]) input;
+                } else {
+                    data = input.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                }
+                try {
+                    java.nio.charset.Charset srcCharset = pgEncodingToCharset(srcEnc);
+                    java.nio.charset.Charset dstCharset = pgEncodingToCharset(dstEnc);
+                    String decoded = new String(data, srcCharset);
+                    return decoded.getBytes(dstCharset);
+                } catch (Exception e) {
+                    return data;
+                }
+            }
+
+            // ---- enum comparison ----
+            case "enum_cmp": {
+                requireArgs(fn, 2);
+                Object a = executor.evalExpr(fn.args().get(0), ctx);
+                Object b = executor.evalExpr(fn.args().get(1), ctx);
+                if (a == null || b == null) return null;
+                // Compare by position in the enum type
+                // Try to resolve the enum type from argument casts
+                String enumType = null;
+                for (Expression arg : fn.args()) {
+                    if (arg instanceof CastExpr) {
+                        enumType = ((CastExpr) arg).typeName();
+                        break;
+                    }
+                }
+                if (enumType != null) {
+                    CustomEnum ce = executor.database.getCustomEnum(enumType);
+                    if (ce != null) {
+                        List<String> labels = ce.getLabels();
+                        int posA = labels.indexOf(a.toString());
+                        int posB = labels.indexOf(b.toString());
+                        return Integer.compare(posA, posB);
+                    }
+                }
+                // Fallback: lexicographic comparison
+                return a.toString().compareTo(b.toString());
+            }
+
+            // ---- ICU unicode version ----
+            case "icu_unicode_version": {
+                // Returns the ICU unicode version string — stub
+                return "15.1";
+            }
+
             default: {
                 // Delegate to domain-specific function handlers
                 Object delegated2;
@@ -1431,11 +2015,19 @@ class FunctionEvaluator {
                         }
 
                         // STRICT: return NULL immediately if any argument is NULL
+                        // For set-returning functions, return empty set instead of NULL
                         if (userFunc.isStrict()) {
                             for (Object arg : args) {
-                                if (arg == null) return null;
+                                if (arg == null) {
+                                    String rt = userFunc.getReturnType();
+                                    if (rt != null && (rt.toUpperCase().startsWith("SETOF") || rt.toUpperCase().startsWith("TABLE"))) {
+                                        return new java.util.ArrayList<>();
+                                    }
+                                    return null;
+                                }
                             }
                         }
+                        userFunc.incrementCallCount();
                         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
                         Object result = plExec.executeFunction(userFunc, args);
                         if (result instanceof List<?>) return (List<?>) result;
@@ -1467,11 +2059,19 @@ class FunctionEvaluator {
                         args.add(val);
                     }
                     // STRICT: return NULL immediately if any argument is NULL
+                    // For set-returning functions, return empty set instead of NULL
                     if (userFunc.isStrict()) {
                         for (Object arg : args) {
-                            if (arg == null) return null;
+                            if (arg == null) {
+                                String rt = userFunc.getReturnType();
+                                if (rt != null && (rt.toUpperCase().startsWith("SETOF") || rt.toUpperCase().startsWith("TABLE"))) {
+                                    return new java.util.ArrayList<>();
+                                }
+                                return null;
+                            }
                         }
                     }
+                    userFunc.incrementCallCount();
                     PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
                     Object result = plExec.executeFunction(userFunc, args);
                     // Handle set-returning functions
@@ -1487,7 +2087,7 @@ class FunctionEvaluator {
                         "string_agg", "array_agg", "bool_and", "bool_or", "every",
                         "bit_and", "bit_or", "json_agg", "jsonb_agg",
                         "json_object_agg", "jsonb_object_agg", "xmlagg",
-                        "json_arrayagg", "json_objectagg");
+                        "json_arrayagg", "json_objectagg", "any_value");
                 if (AGGREGATES.contains(name)) {
                     return null; // Will be handled by aggregate executor
                 }
@@ -1689,6 +2289,27 @@ class FunctionEvaluator {
         return sb.toString();
     }
 
+    /** Count elements in a PG array inner string, respecting quoted strings and braces. */
+    static int countArrayElements(String inner) {
+        if (inner.isEmpty()) return 0;
+        int count = 1;
+        boolean inQuote = false;
+        int braceDepth = 0;
+        for (int i = 0; i < inner.length(); i++) {
+            char c = inner.charAt(i);
+            if (inQuote) {
+                if (c == '\\' && i + 1 < inner.length()) { i++; continue; }
+                if (c == '"') inQuote = false;
+            } else {
+                if (c == '"') inQuote = true;
+                else if (c == '{') braceDepth++;
+                else if (c == '}') braceDepth--;
+                else if (c == ',' && braceDepth == 0) count++;
+            }
+        }
+        return count;
+    }
+
     /** Parse a simple PG array string like {a,b,c} into a List. */
     static List<Object> parseSimplePgArray(String s) {
         if (s == null || !s.startsWith("{") || !s.endsWith("}")) return Cols.listOf();
@@ -1808,5 +2429,107 @@ class FunctionEvaluator {
             return name.substring("information_schema.".length());
         }
         return name;
+    }
+
+    // ---- UUID v3/v5 helpers ----
+
+    private static java.util.UUID uuid3(java.util.UUID namespace, String name) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            md.update(uuidToBytes(namespace));
+            md.update(name.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            byte[] hash = md.digest();
+            hash[6] = (byte) ((hash[6] & 0x0F) | 0x30); // version 3
+            hash[8] = (byte) ((hash[8] & 0x3F) | 0x80); // variant RFC4122
+            return bytesToUuid(hash);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new MemgresException("MD5 not available", "XX000");
+        }
+    }
+
+    private static java.util.UUID uuid5(java.util.UUID namespace, String name) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
+            md.update(uuidToBytes(namespace));
+            md.update(name.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            byte[] hash = md.digest();
+            hash[6] = (byte) ((hash[6] & 0x0F) | 0x50); // version 5
+            hash[8] = (byte) ((hash[8] & 0x3F) | 0x80); // variant RFC4122
+            return bytesToUuid(hash);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new MemgresException("SHA-1 not available", "XX000");
+        }
+    }
+
+    private static byte[] uuidToBytes(java.util.UUID uuid) {
+        long msb = uuid.getMostSignificantBits();
+        long lsb = uuid.getLeastSignificantBits();
+        byte[] out = new byte[16];
+        for (int i = 0; i < 8; i++) out[i] = (byte) (msb >>> (56 - i * 8));
+        for (int i = 0; i < 8; i++) out[8 + i] = (byte) (lsb >>> (56 - i * 8));
+        return out;
+    }
+
+    private static java.util.UUID bytesToUuid(byte[] bytes) {
+        long msb = 0, lsb = 0;
+        for (int i = 0; i < 8; i++) msb = (msb << 8) | (bytes[i] & 0xFF);
+        for (int i = 8; i < 16; i++) lsb = (lsb << 8) | (bytes[i] & 0xFF);
+        return new java.util.UUID(msb, lsb);
+    }
+
+    // ---- Trigram helper ----
+
+    private static Set<String> trigramSet(String s) {
+        Set<String> trgms = new HashSet<>();
+        String padded = "  " + s + " ";
+        for (int i = 0; i <= padded.length() - 3; i++) {
+            trgms.add(padded.substring(i, i + 3));
+        }
+        return trgms;
+    }
+
+    // ---- Levenshtein distance ----
+
+    private static int levenshteinDistance(String s, String t) {
+        int m = s.length(), n = t.length();
+        int[] prev = new int[n + 1], curr = new int[n + 1];
+        for (int j = 0; j <= n; j++) prev[j] = j;
+        for (int i = 1; i <= m; i++) {
+            curr[0] = i;
+            for (int j = 1; j <= n; j++) {
+                int cost = s.charAt(i - 1) == t.charAt(j - 1) ? 0 : 1;
+                curr[j] = Math.min(Math.min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+            }
+            int[] tmp = prev; prev = curr; curr = tmp;
+        }
+        return prev[n];
+    }
+
+    // ---- Soundex ----
+
+    private static String computeSoundex(String s) {
+        if (s == null || s.isEmpty()) return "0000";
+        s = s.toUpperCase();
+        // Strip non-alpha
+        StringBuilder alpha = new StringBuilder();
+        for (char c : s.toCharArray()) {
+            if (c >= 'A' && c <= 'Z') alpha.append(c);
+        }
+        if (alpha.length() == 0) return "0000";
+        char first = alpha.charAt(0);
+        String map = "01230120022455012623010202"; // A=0, B=1, C=2, ...
+        StringBuilder code = new StringBuilder();
+        code.append(first);
+        char lastCode = map.charAt(first - 'A');
+        for (int i = 1; i < alpha.length() && code.length() < 4; i++) {
+            char c = alpha.charAt(i);
+            char mc = map.charAt(c - 'A');
+            if (mc != '0' && mc != lastCode) {
+                code.append(mc);
+            }
+            lastCode = mc;
+        }
+        while (code.length() < 4) code.append('0');
+        return code.toString();
     }
 }

@@ -27,7 +27,8 @@ public final class AlterTypeStmt implements Statement {
         this.neighbor = neighbor;
     }
 
-    public enum Action { ADD_VALUE, RENAME_VALUE, RENAME_TO, SET_SCHEMA, OWNER_TO }
+    public enum Action { ADD_VALUE, RENAME_VALUE, RENAME_TO, SET_SCHEMA, OWNER_TO,
+        ADD_ATTRIBUTE, DROP_ATTRIBUTE, ALTER_ATTRIBUTE_TYPE, RENAME_ATTRIBUTE }
 
     public String typeName() { return typeName; }
     public Action action() { return action; }

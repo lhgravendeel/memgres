@@ -7,7 +7,7 @@ CREATE EXTENSION IF NOT EXISTS postgres_fdw;
 
 -- begin-expected
 -- columns: extension_present
--- row: f
+-- row: t
 -- end-expected
 SELECT EXISTS (
   SELECT 1

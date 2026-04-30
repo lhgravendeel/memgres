@@ -177,8 +177,10 @@ SQL: SELECT 1)
 ERROR [42601]: ERROR: syntax error: syntax error at or near ")" at position 8 near ')'
 --- STMT 30 ---
 SQL: SELECT FROM pg_class
-RESULT: 0 columns, 121 rows
+RESULT: 0 columns, 123 rows
 COLUMNS: 
+ROW: 
+ROW: 
 ROW: 
 ROW: 
 ROW: 
@@ -522,7 +524,7 @@ SQL: SELECT 'abc'::int
 ERROR [22P02]: ERROR: invalid input syntax for type integer: "abc"
 --- STMT 46 ---
 SQL: SELECT d COLLATE no_such_collation FROM exprs
-ERROR [42704]: ERROR: syntax error: collation "no_such_collation" for encoding "UTF8" does not exist at position 35 near 'FROM'
+ERROR [42704]: ERROR: collation "no_such_collation" for encoding "UTF8" does not exist
 --- STMT 47 ---
 SQL: SELECT OPERATOR(no_such_schema.+)(1,2)
 ERROR [3F000]: ERROR: schema "no_such_schema" does not exist
@@ -1427,13 +1429,13 @@ SQL: INSERT INTO parent(id, code, qty) VALUES (4, NULL, 1)
 ERROR [23502]: ERROR: null value in column "code" violates not-null constraint
 --- STMT 19 ---
 SQL: INSERT INTO parent(id, code, qty) VALUES (5, 'E', -1)
-ERROR [23514]: ERROR: new row violates check constraint "parent_check"
+ERROR [23514]: ERROR: new row violates check constraint "parent_qty_check"
 --- STMT 20 ---
 SQL: INSERT INTO child(id, parent_id, qty) VALUES (12, 99, 1)
 ERROR [23503]: ERROR: insert or update on table "child" violates foreign key constraint "child_parent_id_fkey"
 --- STMT 21 ---
 SQL: INSERT INTO child(id, parent_id, qty) VALUES (13, 1, 0)
-ERROR [23514]: ERROR: new row violates check constraint "child_check"
+ERROR [23514]: ERROR: new row violates check constraint "child_qty_check"
 --- STMT 22 ---
 SQL: INSERT INTO child(id, parent_id, qty, total) VALUES (14, 1, 2, 999)
 ERROR [428C9]: ERROR: cannot insert a non-DEFAULT value into column "total"
@@ -2667,7 +2669,7 @@ SQL: SELECT ((SELECT comp FROM gap)).x
 ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
 --- STMT 41 ---
 SQL: SELECT txt COLLATE no_such_collation FROM gap
-ERROR [42704]: ERROR: syntax error: collation "no_such_collation" for encoding "UTF8" does not exist at position 37 near 'FROM'
+ERROR [42704]: ERROR: collation "no_such_collation" for encoding "UTF8" does not exist
 --- STMT 42 ---
 SQL: SELECT fmix(b => 2)
 ERROR [42883]: ERROR: function fmix(b => integer) does not exist
@@ -3728,12 +3730,12 @@ ROW: Seq Scan on admin_t\n  Sort Key: (...)
 SQL: EXPLAIN ANALYZE SELECT * FROM admin_t WHERE id = 1
 RESULT: 1 columns, 6 rows
 COLUMNS: QUERY PLAN
-ROW: Seq Scan on admin_t  (cost=0.00..1.02 rows=2 width=0) (actual time=0.136..0.136 rows=1 loops=1)
+ROW: Seq Scan on admin_t  (cost=0.00..1.02 rows=2 width=0) (actual time=0.162..0.162 rows=1 loops=1)
 ROW:   Filter: (...)
 ROW:   Rows Removed by Filter: 0
 ROW:   Output: (...)
-ROW: Planning Time: 0.042 ms
-ROW: Execution Time: 0.421 ms
+ROW: Planning Time: 0.052 ms
+ROW: Execution Time: 0.523 ms
 --- STMT 24 ---
 SQL: ANALYZE admin_t
 OK: 0 rows affected
@@ -4094,13 +4096,13 @@ ROW: 5 | 3 | {1,3,4,5}
 SQL: -- SEARCH / CYCLE WITH RECURSIVE graph(src, dst) AS ( SELECT src, dst FROM edges ), search_graph(id, path) AS ( SELECT 1, ARRAY[1] UNION ALL SELECT e.dst, sg.path || e.dst FROM search_graph sg JOIN gr...
 RESULT: 5 columns, 7 rows
 COLUMNS: id, path, ordcol, is_cycle, cycle_path
-ROW: 1 | {1} | 0 | f | {(1)}
-ROW: 2 | {1,2} | 1 | f | {(1),(2)}
-ROW: 4 | {1,2,4} | 2 | f | {(1),(2),(4)}
-ROW: 5 | {1,2,4,5} | 3 | f | {(1),(2),(4),(5)}
-ROW: 3 | {1,3} | 4 | f | {(1),(3)}
-ROW: 4 | {1,3,4} | 5 | f | {(1),(3),(4)}
-ROW: 5 | {1,3,4,5} | 6 | f | {(1),(3),(4),(5)}
+ROW: 1 | {1} | (1) | f | {(1)}
+ROW: 2 | {1,2} | (1,2) | f | {(1),(2)}
+ROW: 4 | {1,2,4} | (1,2,4) | f | {(1),(2),(4)}
+ROW: 5 | {1,2,4,5} | (1,2,4,5) | f | {(1),(2),(4),(5)}
+ROW: 3 | {1,3} | (1,3) | f | {(1),(3)}
+ROW: 4 | {1,3,4} | (1,3,4) | f | {(1),(3),(4)}
+ROW: 5 | {1,3,4,5} | (1,3,4,5) | f | {(1),(3),(4),(5)}
 --- STMT 14 ---
 SQL: -- data-modifying CTEs CREATE TABLE cte_t(id int PRIMARY KEY, v text)
 OK: 0 rows affected
@@ -4859,7 +4861,7 @@ SQL: WITH RECURSIVE w AS (SELECT 1 UNION ALL) SELECT * FROM w
 ERROR [42601]: ERROR: syntax error: Expected keyword SELECT at position 39 near ')'
 --- STMT 43 ---
 SQL: WITH w AS MATERIALIZED SELECT 1
-ERROR [42601]: ERROR: syntax error: Expected LEFT_PAREN but found KEYWORD at position 10 near 'MATERIALIZED'
+ERROR [42601]: ERROR: syntax error: Expected LEFT_PAREN but found KEYWORD at position 23 near 'SELECT'
 --- STMT 44 ---
 SQL: WITH w AS (SELECT 1) SEARCH DEPTH FIRST BY a SET ord SELECT * FROM w
 ERROR [42601]: ERROR: WITH query "w" is not recursive
@@ -5151,7 +5153,7 @@ ROW: äbcabc
 ROW: NULL
 --- STMT 32 ---
 SQL: SELECT a COLLATE no_such_coll FROM t
-ERROR [42704]: ERROR: syntax error: collation "no_such_coll" for encoding "UTF8" does not exist at position 30 near 'FROM'
+ERROR [42704]: ERROR: collation "no_such_coll" for encoding "UTF8" does not exist
 --- STMT 33 ---
 SQL: SELECT greatest()
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -6178,18 +6180,18 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a1'), ('B', 'b1') RETURNING id, code, note, updated_at
 RESULT: 4 columns, 2 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a1 | 2026-04-14 22:56:14.293404+00
-ROW: 2 | B | b1 | 2026-04-14 22:56:14.293404+00
+ROW: 1 | A | a1 | 2026-04-22 04:36:26.285706+00
+ROW: 2 | B | b1 | 2026-04-22 04:36:26.285706+00
 --- STMT 12 ---
 SQL: -- returning / generated-key shaped cases INSERT INTO upsert_t(code) VALUES ('C') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 3 | C | d | 2026-04-14 22:56:14.294022+00
+ROW: 3 | C | d | 2026-04-22 04:36:26.286404+00
 --- STMT 13 ---
 SQL: INSERT INTO upsert_t(id, code, note) OVERRIDING SYSTEM VALUE VALUES (100, 'SYS', 'sys') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 100 | SYS | sys | 2026-04-14 22:56:14.294297+00
+ROW: 100 | SYS | sys | 2026-04-22 04:36:26.286873+00
 --- STMT 14 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED BY DEFAULT
 OK: 0 rows affected
@@ -6197,7 +6199,7 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(id, code, note) VALUES (200, 'MAN', 'manual') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 200 | MAN | manual | 2026-04-14 22:56:14.294625+00
+ROW: 200 | MAN | manual | 2026-04-22 04:36:26.287418+00
 --- STMT 16 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED ALWAYS
 OK: 0 rows affected
@@ -6209,12 +6211,12 @@ COLUMNS: id, code, note, updated_at
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a3') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note, updated_at = CURRENT_TIMESTAMP RETURNING id, code, note, updated_at
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-04-14 22:56:14.301658+00
+ROW: 1 | A | a3 | 2026-04-22 04:36:26.293468+00
 --- STMT 19 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('B', 'b2') ON CONFLICT ON CONSTRAINT upsert_t_code_key DO UPDATE SET note = EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 2 | B | b2 | 2026-04-14 22:56:14.293404+00
+ROW: 2 | B | b2 | 2026-04-22 04:36:26.285706+00
 --- STMT 20 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd1'), ('E', 'e1') RETURNING id, code, note
 RESULT: 3 columns, 2 rows
@@ -6225,7 +6227,7 @@ ROW: 8 | E | e1
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd2') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note WHERE upsert_t.note <> EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 7 | D | d2 | 2026-04-14 22:56:14.302848+00
+ROW: 7 | D | d2 | 2026-04-22 04:36:26.294478+00
 --- STMT 22 ---
 SQL: UPDATE upsert_t SET note = note WHERE code = 'A' RETURNING id, code, note
 RESULT: 3 columns, 1 rows
@@ -6243,13 +6245,13 @@ COLUMNS: id, code, note, updated_at
 SQL: SELECT * FROM upsert_t ORDER BY id
 RESULT: 4 columns, 7 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-04-14 22:56:14.301658+00
-ROW: 2 | B | b2 | 2026-04-14 22:56:14.293404+00
-ROW: 3 | C | d | 2026-04-14 22:56:14.294022+00
-ROW: 7 | D | d2 | 2026-04-14 22:56:14.302848+00
-ROW: 8 | E | e1 | 2026-04-14 22:56:14.302848+00
-ROW: 100 | SYS | sys | 2026-04-14 22:56:14.294297+00
-ROW: 200 | MAN | manual | 2026-04-14 22:56:14.294625+00
+ROW: 1 | A | a3 | 2026-04-22 04:36:26.293468+00
+ROW: 2 | B | b2 | 2026-04-22 04:36:26.285706+00
+ROW: 3 | C | d | 2026-04-22 04:36:26.286404+00
+ROW: 7 | D | d2 | 2026-04-22 04:36:26.294478+00
+ROW: 8 | E | e1 | 2026-04-22 04:36:26.294478+00
+ROW: 100 | SYS | sys | 2026-04-22 04:36:26.286873+00
+ROW: 200 | MAN | manual | 2026-04-22 04:36:26.287418+00
 --- STMT 26 ---
 SQL: -- bad upsert / returning cases INSERT INTO upsert_t(code, note) VALUES ('A', 'dup') ON CONFLICT (note) DO NOTHING
 ERROR [42P10]: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification
@@ -6389,12 +6391,12 @@ OK: 0 rows affected
 --- STMT 36 ---
 SQL: SELECT 'compat.meta_t'::regclass
 RESULT: 1 columns, 1 rows
-COLUMNS: regclass
+COLUMNS: int4
 ROW: compat.meta_t
 --- STMT 37 ---
 SQL: SELECT 'int4'::regtype
 RESULT: 1 columns, 1 rows
-COLUMNS: regtype
+COLUMNS: int4
 ROW: integer
 --- STMT 38 ---
 SQL: SELECT to_regclass('compat.meta_t')
@@ -6585,7 +6587,7 @@ OK: 3 rows affected
 SQL: -- common app-shaped datetime and filter expressions SELECT CURRENT_DATE, CURRENT_TIMESTAMP, LOCALTIMESTAMP
 RESULT: 3 columns, 1 rows
 COLUMNS: current_date, current_timestamp, localtimestamp
-ROW: 2026-04-14 | 2026-04-14 22:56:14.367062+00 | 2026-04-14 22:56:14.367147
+ROW: 2026-04-22 | 2026-04-22 04:36:26.395139+00 | 2026-04-22 04:36:26.395295
 --- STMT 13 ---
 SQL: SELECT date_trunc('day', created_at), date_trunc('hour', local_ts) FROM app_t ORDER BY id
 RESULT: 2 columns, 3 rows
@@ -7440,7 +7442,7 @@ RESULT: 4 columns, 3 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
 ROW: 2 | 20 | b | NULL
-ROW: 3 | 10 | c | 2026-04-14 22:56:14.491848+00
+ROW: 3 | 10 | c | 2026-04-22 04:36:26.536302+00
 --- STMT 17 ---
 SQL: ALTER TABLE tenant_data FORCE ROW LEVEL SECURITY
 OK: 0 rows affected
@@ -7449,7 +7451,7 @@ SQL: SELECT * FROM tenant_data ORDER BY id
 RESULT: 4 columns, 2 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
-ROW: 3 | 10 | c | 2026-04-14 22:56:14.491848+00
+ROW: 3 | 10 | c | 2026-04-22 04:36:26.536302+00
 --- STMT 19 ---
 SQL: ALTER POLICY tenant_select_pol ON tenant_data USING (tenant_id = current_setting('compat.tenant_id')::int AND deleted_at IS NULL)
 OK: 0 rows affected
@@ -7762,23 +7764,23 @@ OK: 4 rows affected
 SQL: -- common repository query shapes SELECT * FROM repo_account WHERE id = 1
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-14 22:56:14.54631+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-22 04:36:26.58123+00
 --- STMT 15 ---
 SQL: SELECT * FROM repo_account WHERE email = 'a@example.com'
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-14 22:56:14.54631+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-22 04:36:26.58123+00
 --- STMT 16 ---
 SQL: SELECT * FROM repo_account WHERE deleted_at IS NULL ORDER BY id
 RESULT: 6 columns, 2 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-14 22:56:14.54631+00
-ROW: 2 | b@example.com | f | NULL | 0 | 2026-04-14 22:56:14.54631+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-22 04:36:26.58123+00
+ROW: 2 | b@example.com | f | NULL | 0 | 2026-04-22 04:36:26.58123+00
 --- STMT 17 ---
 SQL: SELECT * FROM repo_account WHERE active IS TRUE ORDER BY id
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-14 22:56:14.54631+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-04-22 04:36:26.58123+00
 --- STMT 18 ---
 SQL: SELECT EXISTS (SELECT 1 FROM repo_account WHERE email = 'missing@example.com')
 RESULT: 1 columns, 1 rows
@@ -7799,21 +7801,21 @@ ROW: 2 | 1 | 40.00
 SQL: SELECT o.* FROM repo_order o WHERE o.account_id = 1 ORDER BY o.created_at DESC, o.id DESC LIMIT 2 OFFSET 0
 RESULT: 5 columns, 2 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 3 | 1 | done | 30.00 | 2026-04-14 22:56:14.546574+00
-ROW: 2 | 1 | open | 20.00 | 2026-04-14 22:56:14.546574+00
+ROW: 3 | 1 | done | 30.00 | 2026-04-22 04:36:26.581431+00
+ROW: 2 | 1 | open | 20.00 | 2026-04-22 04:36:26.581431+00
 --- STMT 22 ---
 SQL: SELECT o.* FROM repo_order o WHERE (o.created_at, o.id) < (CURRENT_TIMESTAMP, 999999) ORDER BY o.created_at DESC, o.id DESC LIMIT 10
 RESULT: 5 columns, 4 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 4 | 2 | open | 40.00 | 2026-04-14 22:56:14.546574+00
-ROW: 3 | 1 | done | 30.00 | 2026-04-14 22:56:14.546574+00
-ROW: 2 | 1 | open | 20.00 | 2026-04-14 22:56:14.546574+00
-ROW: 1 | 1 | open | 10.00 | 2026-04-14 22:56:14.546574+00
+ROW: 4 | 2 | open | 40.00 | 2026-04-22 04:36:26.581431+00
+ROW: 3 | 1 | done | 30.00 | 2026-04-22 04:36:26.581431+00
+ROW: 2 | 1 | open | 20.00 | 2026-04-22 04:36:26.581431+00
+ROW: 1 | 1 | open | 10.00 | 2026-04-22 04:36:26.581431+00
 --- STMT 23 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 1 | 2026-04-14 22:56:14.54631+00
+ROW: 1 | a@example.com | t | NULL | 1 | 2026-04-22 04:36:26.58123+00
 --- STMT 24 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 0 rows
@@ -7822,7 +7824,7 @@ COLUMNS: id, email, active, deleted_at, version, created_at
 SQL: INSERT INTO repo_account(email, active) VALUES ('d@example.com', true) ON CONFLICT (email) DO NOTHING RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 4 | d@example.com | t | NULL | 0 | 2026-04-14 22:56:14.551994+00
+ROW: 4 | d@example.com | t | NULL | 0 | 2026-04-22 04:36:26.585403+00
 --- STMT 26 ---
 SQL: SELECT ra.id, ra.email, ro.id AS order_id, ro.status, ro.total FROM repo_account ra LEFT JOIN repo_order ro ON ro.account_id = ra.id WHERE ra.deleted_at IS NULL ORDER BY ra.id, ro.id
 RESULT: 5 columns, 5 rows

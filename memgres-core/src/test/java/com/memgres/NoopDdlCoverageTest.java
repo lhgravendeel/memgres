@@ -207,17 +207,23 @@ class NoopDdlCoverageTest {
         exec("DROP FOREIGN TABLE IF EXISTS ft1 CASCADE");
     }
 
-    // IMPORT FOREIGN SCHEMA
-    @Test void testImportForeignSchema() throws SQLException {
-        exec("IMPORT FOREIGN SCHEMA remote_schema FROM SERVER myserver INTO public");
+    // IMPORT FOREIGN SCHEMA — must error because FDW has no handler
+    @Test void testImportForeignSchema() {
+        assertThrows(SQLException.class,
+                () -> exec("IMPORT FOREIGN SCHEMA remote_schema FROM SERVER myserver INTO public"),
+                "Expected 55000: foreign-data wrapper has no handler");
     }
 
-    @Test void testImportForeignSchemaLimitTo() throws SQLException {
-        exec("IMPORT FOREIGN SCHEMA remote_schema LIMIT TO (t1, t2) FROM SERVER myserver INTO public");
+    @Test void testImportForeignSchemaLimitTo() {
+        assertThrows(SQLException.class,
+                () -> exec("IMPORT FOREIGN SCHEMA remote_schema LIMIT TO (t1, t2) FROM SERVER myserver INTO public"),
+                "Expected 55000: foreign-data wrapper has no handler");
     }
 
-    @Test void testImportForeignSchemaExcept() throws SQLException {
-        exec("IMPORT FOREIGN SCHEMA remote_schema EXCEPT (t3) FROM SERVER myserver INTO public");
+    @Test void testImportForeignSchemaExcept() {
+        assertThrows(SQLException.class,
+                () -> exec("IMPORT FOREIGN SCHEMA remote_schema EXCEPT (t3) FROM SERVER myserver INTO public"),
+                "Expected 55000: foreign-data wrapper has no handler");
     }
 
     // ========================================================================

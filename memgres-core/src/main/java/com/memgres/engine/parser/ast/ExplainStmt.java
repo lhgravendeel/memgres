@@ -17,6 +17,12 @@ public final class ExplainStmt implements Statement {
     public final boolean costs;
     public final String deferredOptionError;
     public final String deferredOptionSqlState;
+    public final boolean memory;
+    public final boolean serialize;
+    public final boolean genericPlan;
+    public final boolean buffers;
+    public final boolean wal;
+    public boolean settings;
 
     public ExplainStmt(
             Statement statement,
@@ -27,6 +33,38 @@ public final class ExplainStmt implements Statement {
             String deferredOptionError,
             String deferredOptionSqlState
     ) {
+        this(statement, analyze, verbose, format, costs, deferredOptionError, deferredOptionSqlState, false, false, false, false, false);
+    }
+
+    public ExplainStmt(
+            Statement statement,
+            boolean analyze,
+            boolean verbose,
+            String format,
+            boolean costs,
+            String deferredOptionError,
+            String deferredOptionSqlState,
+            boolean memory,
+            boolean serialize,
+            boolean genericPlan
+    ) {
+        this(statement, analyze, verbose, format, costs, deferredOptionError, deferredOptionSqlState, memory, serialize, genericPlan, false, false);
+    }
+
+    public ExplainStmt(
+            Statement statement,
+            boolean analyze,
+            boolean verbose,
+            String format,
+            boolean costs,
+            String deferredOptionError,
+            String deferredOptionSqlState,
+            boolean memory,
+            boolean serialize,
+            boolean genericPlan,
+            boolean buffers,
+            boolean wal
+    ) {
         this.statement = statement;
         this.analyze = analyze;
         this.verbose = verbose;
@@ -34,6 +72,11 @@ public final class ExplainStmt implements Statement {
         this.costs = costs;
         this.deferredOptionError = deferredOptionError;
         this.deferredOptionSqlState = deferredOptionSqlState;
+        this.memory = memory;
+        this.serialize = serialize;
+        this.genericPlan = genericPlan;
+        this.buffers = buffers;
+        this.wal = wal;
     }
 
     /** Canonical constructor without deferred error. */
@@ -58,6 +101,9 @@ public final class ExplainStmt implements Statement {
     public boolean costs() { return costs; }
     public String deferredOptionError() { return deferredOptionError; }
     public String deferredOptionSqlState() { return deferredOptionSqlState; }
+    public boolean memory() { return memory; }
+    public boolean serialize() { return serialize; }
+    public boolean genericPlan() { return genericPlan; }
 
     @Override
     public boolean equals(Object o) {

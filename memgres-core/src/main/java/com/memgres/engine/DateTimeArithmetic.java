@@ -16,6 +16,10 @@ class DateTimeArithmetic {
     Object dateTimeAdd(Object left, Object right) {
         if (left == null || right == null) return null;
 
+        // infinity timestamp + interval = infinity (and vice versa)
+        if (left instanceof String && isTimestampInfinity((String) left) && right instanceof PgInterval) return left;
+        if (right instanceof String && isTimestampInfinity((String) right) && left instanceof PgInterval) return right;
+
         // interval + interval
         if (left instanceof PgInterval && right instanceof PgInterval) return ((PgInterval) left).plus(((PgInterval) right));
 
@@ -141,6 +145,9 @@ class DateTimeArithmetic {
     Object dateTimeSubtract(Object left, Object right) {
         if (left == null || right == null) return null;
 
+        // infinity timestamp - interval = infinity
+        if (left instanceof String && isTimestampInfinity((String) left) && right instanceof PgInterval) return left;
+
         // Multirange - Multirange → set difference
         if (left instanceof String && right instanceof String
                 && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
@@ -204,6 +211,17 @@ class DateTimeArithmetic {
         // date - integer (days)
         if (left instanceof LocalDate && right instanceof Number) return ((LocalDate) left).minusDays(((Number) right).longValue());
 
+        // pg_lsn - pg_lsn → bigint (byte count difference)
+        if (left instanceof String && right instanceof String) {
+            String ls = ((String) left).trim();
+            String rs = ((String) right).trim();
+            if (ls.matches("[0-9a-fA-F]+/[0-9a-fA-F]+") && rs.matches("[0-9a-fA-F]+/[0-9a-fA-F]+")) {
+                long lVal = parseLsn(ls);
+                long rVal = parseLsn(rs);
+                return lVal - rVal;
+            }
+        }
+
         // Geometric subtraction: geom - point = translation
         if (left instanceof String && right instanceof String
                 && GeometricOperations.isGeometricString(((String) left))) {
@@ -212,11 +230,20 @@ class DateTimeArithmetic {
             return GeometricOperations.subtract(ls, rs);
         }
 
-        // JSONB subtraction: jsonb - text (delete key) or jsonb - int (delete by index)
+        // JSONB subtraction: jsonb - text (delete key), jsonb - int (delete by index),
+        //                    or jsonb - text[] (delete multiple keys at top level).
         if (left instanceof String) {
             String ls = (String) left;
             String trimmed = ls.trim();
             if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                if (right instanceof java.util.List<?>) {
+                    String acc = ls;
+                    for (Object k : (java.util.List<?>) right) {
+                        if (k == null) continue;
+                        acc = JsonOperations.deleteKey(acc, k.toString());
+                    }
+                    return acc;
+                }
                 return JsonOperations.deleteKey(ls, right.toString());
             }
         }
@@ -259,5 +286,22 @@ class DateTimeArithmetic {
         if (left instanceof PgInterval && right instanceof Number) return ((PgInterval) left).multiply(((Number) right).doubleValue());
         if (left instanceof Number && right instanceof PgInterval) return ((PgInterval) right).multiply(((Number) left).doubleValue());
         return executor.numericOp(left, right, (a, b) -> a * b, Math::multiplyExact, java.math.BigDecimal::multiply);
+    }
+
+    /** Check if a string represents a PG infinity timestamp. */
+    private static boolean isTimestampInfinity(String s) {
+        String t = s.trim().toLowerCase();
+        return t.equals("infinity") || t.equals("-infinity");
+    }
+
+    /**
+     * Parse a PostgreSQL LSN string (e.g., "0/4000000") into a long byte offset.
+     * Format is "upper32hex/lower32hex".
+     */
+    private static long parseLsn(String lsn) {
+        int slashIdx = lsn.indexOf('/');
+        long upper = Long.parseLong(lsn.substring(0, slashIdx), 16);
+        long lower = Long.parseLong(lsn.substring(slashIdx + 1), 16);
+        return (upper << 32) | lower;
     }
 }

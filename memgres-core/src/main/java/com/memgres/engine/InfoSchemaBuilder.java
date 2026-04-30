@@ -19,11 +19,16 @@ public class InfoSchemaBuilder {
         "pg_am", "pg_prepared_statements", "pg_cursors",
         "pg_class", "pg_attribute", "pg_namespace", "pg_type",
         "pg_proc", "pg_index", "pg_description",
-        "pg_constraint", "pg_depend", "pg_roles",
+        "pg_constraint", "pg_depend", "pg_roles", "pg_collation",
         "pg_database", "pg_tablespace", "pg_settings",
         "pg_extension", "pg_enum", "pg_operator",
         "pg_aggregate", "pg_trigger", "pg_rewrite",
-        "pg_stat_bgwriter", "pg_stat_wal"
+        "pg_event_trigger",
+        "pg_stat_bgwriter", "pg_stat_wal",
+        "pg_replication_slots",
+        "pg_seclabel", "pg_shseclabel",
+        "pg_policies",
+        "pg_authid"
     );
 
     private final Database database;
@@ -76,6 +81,16 @@ public class InfoSchemaBuilder {
                 return buildIsConstraintTableUsage();
             case "parameters":
                 return buildIsParameters();
+            case "triggers":
+                return buildIsTriggers();
+            case "collations":
+                return buildIsCollations();
+            case "enabled_roles":
+                return buildIsEnabledRoles();
+            case "applicable_roles":
+                return buildIsApplicableRoles();
+            case "role_table_grants":
+                return buildIsRoleTableGrants();
             default:
                 return CatalogHelper.emptyTable(tableName);
         }
@@ -205,8 +220,20 @@ public class InfoSchemaBuilder {
             Integer charMaxLen = null;
             Integer charOctetLen = isCharType ? Integer.valueOf(1073741824) : null;
             Integer numPrec = CatalogHelper.numericPrecision(dt);
+            // For NUMERIC columns, use the column's declared precision/scale if available
+            if (dt == DataType.NUMERIC && col.getPrecision() != null) {
+                numPrec = col.getPrecision();
+            }
             Integer numPrecRadix = numPrec != null ? Integer.valueOf(dt == DataType.NUMERIC ? 10 : 2) : null;
-            Integer numScale = dt == DataType.NUMERIC ? Integer.valueOf(0) : (numPrec != null && dt != DataType.REAL && dt != DataType.DOUBLE_PRECISION ? Integer.valueOf(0) : null);
+            Integer numScale;
+            if (dt == DataType.NUMERIC) {
+                // Only report scale when precision is declared (plain numeric has no limit)
+                numScale = col.getPrecision() != null
+                        ? (col.getScale() != null ? col.getScale() : Integer.valueOf(0))
+                        : null;
+            } else {
+                numScale = numPrec != null && dt != DataType.REAL && dt != DataType.DOUBLE_PRECISION ? Integer.valueOf(0) : null;
+            }
             Integer datetimePrec = isDateTimeType ? Integer.valueOf(6) : null;
             if (dt == DataType.DATE) datetimePrec = Integer.valueOf(0);
             Integer intervalPrec = dt == DataType.INTERVAL ? Integer.valueOf(6) : null;
@@ -622,13 +649,16 @@ public class InfoSchemaBuilder {
         for (String seqName : CatalogHelper.getSequenceNames(database)) {
             Sequence seq = database.getSequence(seqName);
             if (seq != null) {
+                String dataType = seq.getDataType() != null ? seq.getDataType() : "bigint";
+                int precision = "smallint".equals(dataType) ? 16 : "integer".equals(dataType) ? 32 : 64;
+                String cycleOption = seq.isCycle() ? "YES" : "NO";
                 table.insertRow(new Object[]{
-                        catalogName(), "public", seqName, "bigint", 64,
+                        catalogName(), "public", seqName, dataType, precision,
                         String.valueOf(seq.getStartWith()),
                         String.valueOf(seq.getMinValue()),
                         String.valueOf(seq.getMaxValue()),
                         String.valueOf(seq.getIncrementBy()),
-                        "NO"
+                        cycleOption
                 });
             }
         }
@@ -655,11 +685,28 @@ public class InfoSchemaBuilder {
             if (vd.query() != null) {
                 viewDef = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
             }
+            String isUpdatable = isSimpleUpdatableView(vd) ? "YES" : "NO";
             table.insertRow(new Object[]{
-                    catalogName(), vSchema, vd.name(), viewDef, "NONE", "NO", "NO", "NO", "NO", "NO"
+                    catalogName(), vSchema, vd.name(), viewDef, "NONE", isUpdatable, isUpdatable, "NO", "NO", "NO"
             });
         }
         return table;
+    }
+
+    /**
+     * Determine if a view is a simple updatable view (single-table, no aggregates/grouping/distinct/unions).
+     */
+    private boolean isSimpleUpdatableView(Database.ViewDef vd) {
+        if (vd.materialized()) return false;
+        if (!(vd.query() instanceof com.memgres.engine.parser.ast.SelectStmt)) return false;
+        com.memgres.engine.parser.ast.SelectStmt sel = (com.memgres.engine.parser.ast.SelectStmt) vd.query();
+        if (sel.distinct) return false;
+        if (sel.groupBy != null && !sel.groupBy.isEmpty()) return false;
+        if (sel.having != null) return false;
+        if (sel.from == null || sel.from.size() != 1) return false;
+        // Must be a simple table reference (no subquery, no join)
+        com.memgres.engine.parser.ast.SelectStmt.FromItem from = sel.from.get(0);
+        return from instanceof com.memgres.engine.parser.ast.SelectStmt.TableRef;
     }
 
     private Table buildIsDomains() {
@@ -771,5 +818,164 @@ public class InfoSchemaBuilder {
                 new Column("parameter_default", DataType.TEXT, true, false, null)
         );
         return new Table("parameters", cols); // empty, function params not tracked in detail
+    }
+
+    private Table buildIsTriggers() {
+        List<Column> cols = Cols.listOf(
+                new Column("trigger_catalog", DataType.TEXT, true, false, null),
+                new Column("trigger_schema", DataType.TEXT, true, false, null),
+                new Column("trigger_name", DataType.TEXT, true, false, null),
+                new Column("event_manipulation", DataType.TEXT, true, false, null),
+                new Column("event_object_catalog", DataType.TEXT, true, false, null),
+                new Column("event_object_schema", DataType.TEXT, true, false, null),
+                new Column("event_object_table", DataType.TEXT, true, false, null),
+                new Column("action_order", DataType.INTEGER, true, false, null),
+                new Column("action_condition", DataType.TEXT, true, false, null),
+                new Column("action_statement", DataType.TEXT, true, false, null),
+                new Column("action_orientation", DataType.TEXT, true, false, null),
+                new Column("action_timing", DataType.TEXT, true, false, null),
+                new Column("action_reference_old_table", DataType.TEXT, true, false, null),
+                new Column("action_reference_new_table", DataType.TEXT, true, false, null),
+                new Column("created", DataType.TIMESTAMPTZ, true, false, null)
+        );
+        Table table = new Table("triggers", cols);
+        // Group triggers by name to combine multiple events
+        Map<String, List<PgTrigger>> byName = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, List<PgTrigger>> entry : database.getAllTriggers().entrySet()) {
+            for (PgTrigger trigger : entry.getValue()) {
+                byName.computeIfAbsent(trigger.getName(), k -> new java.util.ArrayList<>()).add(trigger);
+            }
+        }
+        for (Map.Entry<String, List<PgTrigger>> entry : byName.entrySet()) {
+            PgTrigger first = entry.getValue().get(0);
+            String trigSchema = first.getSchemaName() != null ? first.getSchemaName() : "public";
+            String timing;
+            switch (first.getTiming()) {
+                case BEFORE: timing = "BEFORE"; break;
+                case AFTER: timing = "AFTER"; break;
+                case INSTEAD_OF: timing = "INSTEAD OF"; break;
+                default: timing = "AFTER"; break;
+            }
+            String orientation = first.isForEachStatement() ? "STATEMENT" : "ROW";
+            String actionStmt = "EXECUTE FUNCTION " + first.getFunctionName() + "()";
+            // Emit one row per event manipulation (PG standard)
+            for (PgTrigger trig : entry.getValue()) {
+                String event = trig.getEvent().name(); // INSERT, UPDATE, DELETE, TRUNCATE
+                table.insertRow(new Object[]{
+                        catalogName(),          // trigger_catalog
+                        trigSchema,             // trigger_schema
+                        first.getName(),        // trigger_name
+                        event,                  // event_manipulation
+                        catalogName(),          // event_object_catalog
+                        trigSchema,             // event_object_schema
+                        first.getTableName(),   // event_object_table
+                        1,                      // action_order
+                        null,                   // action_condition
+                        actionStmt,             // action_statement
+                        orientation,            // action_orientation
+                        timing,                 // action_timing
+                        null,                   // action_reference_old_table
+                        null,                   // action_reference_new_table
+                        null                    // created
+                });
+            }
+        }
+        return table;
+    }
+
+    private Table buildIsCollations() {
+        List<Column> cols = Cols.listOf(
+                new Column("collation_catalog", DataType.TEXT, true, false, null),
+                new Column("collation_schema", DataType.TEXT, true, false, null),
+                new Column("collation_name", DataType.TEXT, true, false, null),
+                new Column("pad_attribute", DataType.TEXT, true, false, null)
+        );
+        Table table = new Table("collations", cols);
+        String cat = catalogName();
+        // Builtin collations that PG always provides
+        table.insertRow(new Object[]{cat, "pg_catalog", "default", "NO PAD"});
+        table.insertRow(new Object[]{cat, "pg_catalog", "C", "NO PAD"});
+        table.insertRow(new Object[]{cat, "pg_catalog", "POSIX", "NO PAD"});
+        table.insertRow(new Object[]{cat, "pg_catalog", "ucs_basic", "NO PAD"});
+        return table;
+    }
+
+    private Table buildIsEnabledRoles() {
+        List<Column> cols = Cols.listOf(
+                new Column("role_name", DataType.TEXT, true, false, null)
+        );
+        Table table = new Table("enabled_roles", cols);
+        // Current user is always an enabled role
+        String currentUser = currentSession != null && currentSession.getConnectingUser() != null
+                ? currentSession.getConnectingUser() : "memgres";
+        table.insertRow(new Object[]{currentUser});
+        // Also include all roles the current user is a member of
+        if (database.getRoleMemberships() != null) {
+            for (Map.Entry<String, java.util.Set<String>> entry : database.getRoleMemberships().entrySet()) {
+                if (entry.getValue().contains(currentUser)) {
+                    table.insertRow(new Object[]{entry.getKey()});
+                }
+            }
+        }
+        return table;
+    }
+
+    private Table buildIsApplicableRoles() {
+        List<Column> cols = Cols.listOf(
+                new Column("grantee", DataType.TEXT, true, false, null),
+                new Column("role_name", DataType.TEXT, true, false, null),
+                new Column("is_grantable", DataType.TEXT, true, false, null)
+        );
+        Table table = new Table("applicable_roles", cols);
+        String currentUser = currentSession != null && currentSession.getConnectingUser() != null
+                ? currentSession.getConnectingUser() : "memgres";
+        if (database.getRoleMemberships() != null) {
+            for (Map.Entry<String, java.util.Set<String>> entry : database.getRoleMemberships().entrySet()) {
+                if (entry.getValue().contains(currentUser)) {
+                    table.insertRow(new Object[]{currentUser, entry.getKey(), "NO"});
+                }
+            }
+        }
+        return table;
+    }
+
+    private Table buildIsRoleTableGrants() {
+        List<Column> cols = Cols.listOf(
+                new Column("grantor", DataType.TEXT, true, false, null),
+                new Column("grantee", DataType.TEXT, true, false, null),
+                new Column("table_catalog", DataType.TEXT, true, false, null),
+                new Column("table_schema", DataType.TEXT, true, false, null),
+                new Column("table_name", DataType.TEXT, true, false, null),
+                new Column("privilege_type", DataType.TEXT, true, false, null),
+                new Column("is_grantable", DataType.TEXT, true, false, null),
+                new Column("with_hierarchy", DataType.TEXT, true, false, null)
+        );
+        Table table = new Table("role_table_grants", cols);
+        String catalog = catalogName();
+        // Iterate all role privileges and extract TABLE grants
+        for (Map.Entry<String, java.util.Set<String>> entry : database.getAllRolePrivileges().entrySet()) {
+            String grantee = entry.getKey();
+            for (String privEntry : entry.getValue()) {
+                // Format: "privilege:objectType:objectName"
+                String[] parts = privEntry.split(":", 3);
+                if (parts.length == 3 && "TABLE".equalsIgnoreCase(parts[1])) {
+                    String privilege = parts[0];
+                    String objectName = parts[2];
+                    // Determine schema — objectName might be schema-qualified
+                    String schema = "public";
+                    String tableName = objectName;
+                    if (objectName.contains(".")) {
+                        int dot = objectName.indexOf('.');
+                        schema = objectName.substring(0, dot);
+                        tableName = objectName.substring(dot + 1);
+                    }
+                    String grantor = currentSession != null && currentSession.getConnectingUser() != null
+                            ? currentSession.getConnectingUser() : "memgres";
+                    table.insertRow(new Object[]{grantor, grantee, catalog, schema, tableName,
+                            privilege, "NO", "NO"});
+                }
+            }
+        }
+        return table;
     }
 }

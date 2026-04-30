@@ -62,8 +62,12 @@ public class PgCatalogBuilder {
             case "pg_trigger":
                 return constraints.buildPgTrigger();
             case "pg_roles":
-            case "pg_authid":
                 return security.buildPgRoles();
+            case "pg_authid": {
+                Table t = security.buildPgRoles();
+                // Return with correct name for info_schema column lookup
+                return new Table("pg_authid", t.getColumns());
+            }
             case "pg_user":
                 return security.buildPgUser();
             case "pg_auth_members":
@@ -81,7 +85,7 @@ public class PgCatalogBuilder {
             case "pg_database":
                 return security.buildPgDatabase();
             case "pg_settings":
-                return security.buildPgSettings();
+                return security.buildPgSettings(session != null ? session.getGucSettings() : null);
             case "pg_cast":
                 return typeSystem.buildPgCast();
             case "pg_operator":
@@ -123,13 +127,15 @@ public class PgCatalogBuilder {
             case "pg_inherits":
                 return stubs.buildPgInherits();
             case "pg_event_trigger":
-                return stubs.buildPgEventTrigger();
+                return stubs.buildPgEventTriggerPopulated();
             case "pg_foreign_data_wrapper":
                 return stubs.buildPgForeignDataWrapper();
             case "pg_foreign_server":
                 return stubs.buildPgForeignServer();
             case "pg_user_mapping":
                 return stubs.buildPgUserMapping();
+            case "pg_user_mappings":
+                return stubs.buildPgUserMappings();
             case "pg_foreign_table":
                 return stubs.buildPgForeignTable();
             case "pg_timezone_names":
@@ -144,6 +150,7 @@ public class PgCatalogBuilder {
             case "pg_stat_user_indexes":
             case "pg_stat_all_indexes":
             case "pg_statio_all_indexes":
+            case "pg_statio_user_indexes":
                 return stubs.buildPgStatUserIndexes();
             case "pg_stat_database":
                 return stubs.buildPgStatDatabase();
@@ -169,8 +176,6 @@ public class PgCatalogBuilder {
                 return stubs.buildPgStatGssapi();
             case "pg_statio_user_tables":
             case "pg_statio_all_tables":
-                return stubs.buildPgStatioUserTables();
-            case "pg_statio_user_indexes":
                 return stubs.buildPgStatioUserTables();
             case "pg_prepared_xacts":
                 return stubs.buildPgPreparedXacts();
@@ -227,18 +232,58 @@ public class PgCatalogBuilder {
                 return stubs.buildPgStatistic();
             case "pg_statistic_ext":
                 return stubs.buildPgStatisticExt();
+            case "pg_statistic_ext_data":
+                return stubs.buildPgStatisticExtData();
+            case "pg_stats":
+                return stubs.buildPgStats();
+            case "pg_stats_ext":
+                return stubs.buildPgStatsExt();
             case "pg_publication_rel":
                 return stubs.buildPgPublicationRel();
+            case "pg_publication_tables":
+                return stubs.buildPgPublicationTables();
             case "pg_publication_namespace":
                 return stubs.buildPgPublicationNamespace();
             case "pg_subscription_rel":
                 return stubs.buildPgSubscriptionRel();
+            case "pg_replication_slots":
+                return stubs.buildPgReplicationSlots();
+            case "pg_replication_origin":
+                return stubs.buildPgReplicationOrigin();
+            case "pg_replication_origin_status":
+                return stubs.buildPgReplicationOriginStatus();
+            case "pg_stat_subscription_stats":
+                return stubs.buildPgStatSubscriptionStats();
             case "pg_partitioned_table":
                 return stubs.buildPgPartitionedTable();
+            case "pg_stat_statements":
+            case "pg_stat_statements_info":
+                throw new MemgresException("pg_stat_statements must be loaded via \"shared_preload_libraries\"", "55000");
+            case "pg_stat_archiver":
+                return stubs.buildPgStatArchiver();
+            case "pg_stat_io":
+                return stubs.buildPgStatIo();
+            case "pg_stat_user_functions":
+            case "pg_stat_xact_user_functions":
+                return stubs.buildPgStatUserFunctions();
+            case "pg_largeobject":
+                return stubs.buildPgLargeobject();
+            case "pg_parameter_acl":
+                return stubs.buildPgParameterAcl();
+            case "pg_buffercache":
+                return stubs.buildPgBuffercache();
+            case "pg_stat_wal_senders":
+                return stubs.buildPgStatWalSenders();
+            case "pg_ident_file_mappings":
+                return stubs.buildPgIdentFileMappings();
+            case "pg_db_role_setting":
+                return stubs.buildPgDbRoleSetting();
             case "pg_catalog":
                 return emptyTable(tableName);
             default:
-                return emptyTable(tableName);
+                // Return null for unknown pg_ tables so they produce a proper
+                // "relation does not exist" error (matching PG behavior).
+                return null;
         }
     }
 }

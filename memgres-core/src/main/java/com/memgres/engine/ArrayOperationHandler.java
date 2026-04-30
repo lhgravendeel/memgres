@@ -21,6 +21,10 @@ class ArrayOperationHandler {
         if (arrVal == null) return null;
         List<?> elements;
         int lowerBound = 1;
+        // Multi-dim slicing: when the source is itself a slice result (chained [1:2][1:1])
+        // and elements are lists, apply slice to each sub-array (column-wise)
+        boolean isMultiDim = false;
+        boolean isChainedSlice = slice.array() instanceof ArraySliceExpr;
         if (arrVal instanceof String && ((String) arrVal).matches("\\[\\d+:\\d+\\]=\\{.*\\}")) {
             String s = (String) arrVal;
             // Custom lower-bound array: "[lb:ub]={...}"
@@ -32,6 +36,7 @@ class ArrayOperationHandler {
             elements = FunctionEvaluator.parseSimplePgArray(content);
         } else if (arrVal instanceof List<?>) {
             elements = (List<?>) arrVal;
+            isMultiDim = isChainedSlice && !elements.isEmpty() && elements.get(0) instanceof List<?>;
         } else if (arrVal instanceof String && ((String) arrVal).startsWith("{") && ((String) arrVal).endsWith("}")) {
             String s = (String) arrVal;
             String inner = s.substring(1, s.length() - 1);
@@ -48,6 +53,29 @@ class ArrayOperationHandler {
         int lo = slice.lower() != null ? executor.toInt(executor.evalExpr(slice.lower(), ctx)) : lowerBound;
         int hi = slice.upper() != null ? executor.toInt(executor.evalExpr(slice.upper(), ctx)) : lowerBound + size - 1;
 
+        // Multi-dimensional array: apply slice to each sub-array (column-wise slicing)
+        if (isMultiDim) {
+            List<Object> result = new ArrayList<>();
+            for (Object elem : elements) {
+                if (elem instanceof List<?>) {
+                    List<?> subList = (List<?>) elem;
+                    int subSize = subList.size();
+                    int loIdx = lo - lowerBound;
+                    int hiIdx = hi - lowerBound;
+                    if (loIdx > hiIdx || hiIdx < 0 || loIdx >= subSize) {
+                        result.add(new ArrayList<>());
+                    } else {
+                        int from = Math.max(0, loIdx);
+                        int to = Math.min(subSize - 1, hiIdx);
+                        result.add(new ArrayList<>(subList.subList(from, to + 1)));
+                    }
+                } else {
+                    result.add(elem);
+                }
+            }
+            return formatArrayForOutput(result);
+        }
+
         // Convert to 0-based index
         int loIdx = lo - lowerBound;
         int hiIdx = hi - lowerBound;
@@ -61,6 +89,12 @@ class ArrayOperationHandler {
         int from = Math.max(0, loIdx);
         int to = Math.min(size - 1, hiIdx);
         List<?> sub = new java.util.ArrayList<>(elements.subList(from, to + 1));
+
+        // Multi-dimensional array: if elements are lists, return as List (not string)
+        // so that chained slices can apply to each sub-array
+        if (!sub.isEmpty() && sub.get(0) instanceof List<?>) {
+            return sub;
+        }
         return formatArrayForOutput(sub);
     }
 
@@ -71,6 +105,7 @@ class ArrayOperationHandler {
             if (i > 0) sb.append(",");
             Object e = elements.get(i);
             if (e == null) sb.append("NULL");
+            else if (e instanceof List<?>) sb.append(formatArrayForOutput((List<?>) e));
             else sb.append(e);
         }
         sb.append("}");

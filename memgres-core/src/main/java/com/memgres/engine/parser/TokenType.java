@@ -69,6 +69,11 @@ public enum TokenType {
     GEO_NOT_EXTEND_ABOVE,  // &<|
     GEO_NOT_EXTEND_BELOW,  // |&>
     RANGE_ADJACENT,  // -|-
+    GEO_INTERSECTS,  // ?#
+    GEO_CLOSEST_POINT, // ##
+    GEO_PARALLEL,    // ?||
+    GEO_PERPENDICULAR, // ?-|
+    GEO_IS_HORIZONTAL, // ?- (prefix)
     PARAM,           // $1, $2, etc.
 
     // Punctuation

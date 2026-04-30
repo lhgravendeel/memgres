@@ -23,6 +23,11 @@ class ConcurrencyTransactionTest {
     static void setup() throws Exception {
         memgres = Memgres.builder().port(0).maxConnections(20).build().start();
         url = "jdbc:postgresql://localhost:" + memgres.getPort() + "/test";
+        // Enable two-phase commit (disabled by default like PG)
+        try (Connection c = DriverManager.getConnection(url, "test", "test");
+             var s = c.createStatement()) {
+            s.execute("SET max_prepared_transactions = 10");
+        }
     }
 
     @AfterAll
@@ -563,13 +568,17 @@ class ConcurrencyTransactionTest {
 
     @Test void testCommitPrepared() throws SQLException {
         try (Connection c = connect(); Statement st = c.createStatement()) {
-            st.execute("COMMIT PREPARED 'test_xact_1'");
+            st.execute("BEGIN");
+            st.execute("PREPARE TRANSACTION 'test_xact_commit'");
+            st.execute("COMMIT PREPARED 'test_xact_commit'");
         }
     }
 
     @Test void testRollbackPrepared() throws SQLException {
         try (Connection c = connect(); Statement st = c.createStatement()) {
-            st.execute("ROLLBACK PREPARED 'test_xact_2'");
+            st.execute("BEGIN");
+            st.execute("PREPARE TRANSACTION 'test_xact_rollback'");
+            st.execute("ROLLBACK PREPARED 'test_xact_rollback'");
         }
     }
 

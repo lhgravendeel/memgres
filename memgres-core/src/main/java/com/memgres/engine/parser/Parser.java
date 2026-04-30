@@ -66,10 +66,8 @@ public class Parser extends ExpressionParser {
                     if ("!".equals(t.value())) {
                         throw new ParseException("syntax error at or near \"!\"", t);
                     }
-                    // !! is the removed factorial operator; report as undefined operator (42883)
-                    if ("!!".equals(t.value())) {
-                        throw new ParseException("operator does not exist: !!", t, "42883");
-                    }
+                    // !! can be the tsquery NOT prefix operator; skip explicit error here
+                    // so the expression parser can handle it
                     throw new ParseException("operator does not exist: " + t.value(), t, "42883");
                 }
                 if (t.type() == TokenType.IDENTIFIER

@@ -277,6 +277,20 @@ public final class AlterTableStmt implements Statement {
             return "RenameTable[newName=" + newName + "]";
         }
     }
+    /** ALTER TABLE ... REPLICA IDENTITY { DEFAULT | FULL | NOTHING | USING INDEX idx } */
+    public static final class SetReplicaIdentity implements AlterAction {
+        private final char identity; // 'd', 'f', 'n', 'i'
+
+        public SetReplicaIdentity(char identity) { this.identity = identity; }
+        public char identity() { return identity; }
+
+        @Override public boolean equals(Object o) {
+            return this == o || (o instanceof SetReplicaIdentity && identity == ((SetReplicaIdentity) o).identity);
+        }
+        @Override public int hashCode() { return Character.hashCode(identity); }
+        @Override public String toString() { return "SetReplicaIdentity[" + identity + "]"; }
+    }
+
         public static final class EnableRls implements AlterAction {
         public EnableRls() {}
 
@@ -539,6 +553,47 @@ public final class AlterTableStmt implements Statement {
             return "NoInherit[parentTable=" + parentTable + "]";
         }
     }
+        public static final class DisableTrigger implements AlterAction {
+        public final String triggerName;
+        public DisableTrigger(String triggerName) { this.triggerName = triggerName; }
+        public String triggerName() { return triggerName; }
+    }
+
+        public static final class EnableTrigger implements AlterAction {
+        public final String triggerName;
+        public EnableTrigger(String triggerName) { this.triggerName = triggerName; }
+        public String triggerName() { return triggerName; }
+    }
+
+    /** SET LOGGED (logged=true) or SET UNLOGGED (logged=false). */
+        public static final class SetLogged implements AlterAction {
+        public final boolean logged;
+
+        public SetLogged(boolean logged) {
+            this.logged = logged;
+        }
+
+        public boolean logged() { return logged; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            SetLogged that = (SetLogged) o;
+            return logged == that.logged;
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(logged);
+        }
+
+        @Override
+        public String toString() {
+            return "SetLogged[logged=" + logged + "]";
+        }
+    }
+
         public static final class SetStorageParams implements AlterAction {
         public SetStorageParams() {}
 
@@ -741,6 +796,24 @@ public final class AlterTableStmt implements Statement {
             return "DropNotNull[]";
         }
     }
+        public static final class SetStatistics implements AlterColumnAction {
+        public final int target;
+        public SetStatistics(int target) { this.target = target; }
+        public int target() { return target; }
+    }
+
+        public static final class SetStorage implements AlterColumnAction {
+        public final String storageType;
+        public SetStorage(String storageType) { this.storageType = storageType; }
+        public String storageType() { return storageType; }
+    }
+
+        public static final class SetCompression implements AlterColumnAction {
+        public final String method;
+        public SetCompression(String method) { this.method = method; }
+        public String method() { return method; }
+    }
+
         public static final class ColumnNoOp implements AlterColumnAction {
         public ColumnNoOp() {}
 

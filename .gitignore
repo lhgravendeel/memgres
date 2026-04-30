@@ -16,3 +16,5 @@ progress/
 # Generated test output
 memgres-results-current.txt
 diff-report.txt
+pgdata
+pg18

@@ -305,7 +305,8 @@ Memgres is designed for testing, not production. The following PostgreSQL featur
 |----------|---------|
 | **Persistence** | Fully in-memory. All data is lost on shutdown (by design). |
 | **Index types** | Only btree indexes. No GiST, GIN, BRIN, SP-GiST, or hash indexes. |
-| **Extensions** | `CREATE EXTENSION` is parsed and accepted but does not load real extension code (no PostGIS, pg_trgm, pgcrypto, etc.). |
+| **Extensions** | `CREATE EXTENSION` enables built-in support for **uuid-ossp**, **pgcrypto**, **pg_trgm**, **fuzzystrmatch**, and **unaccent**. C-based extensions (PostGIS, etc.) are not available. |
+| **COPY PROGRAM** | `COPY TO/FROM PROGRAM` (external command execution) is not supported. Use `COPY TO/FROM` with files or stdin/stdout instead. |
 | **Replication** | No WAL, streaming replication, or logical replication. |
 | **Foreign data wrappers** | No FDW or foreign tables. |
 | **Tablespaces** | Not supported (all storage is in-memory). |

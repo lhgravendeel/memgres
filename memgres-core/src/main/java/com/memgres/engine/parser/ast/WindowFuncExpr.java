@@ -15,6 +15,9 @@ public final class WindowFuncExpr implements Expression {
     public final List<SelectStmt.OrderByItem> orderBy;
     public final FrameClause frame;
     public final String windowName;
+    public final boolean ignoreNulls;
+    public final boolean fromLast;
+    public final Expression filter;
 
     public WindowFuncExpr(
             String name,
@@ -26,6 +29,36 @@ public final class WindowFuncExpr implements Expression {
             FrameClause frame,
             String windowName
     ) {
+        this(name, args, distinct, star, partitionBy, orderBy, frame, windowName, false, false, null);
+    }
+
+    public WindowFuncExpr(
+            String name,
+            List<Expression> args,
+            boolean distinct,
+            boolean star,
+            List<Expression> partitionBy,
+            List<SelectStmt.OrderByItem> orderBy,
+            FrameClause frame,
+            String windowName,
+            boolean ignoreNulls
+    ) {
+        this(name, args, distinct, star, partitionBy, orderBy, frame, windowName, ignoreNulls, false, null);
+    }
+
+    public WindowFuncExpr(
+            String name,
+            List<Expression> args,
+            boolean distinct,
+            boolean star,
+            List<Expression> partitionBy,
+            List<SelectStmt.OrderByItem> orderBy,
+            FrameClause frame,
+            String windowName,
+            boolean ignoreNulls,
+            boolean fromLast,
+            Expression filter
+    ) {
         this.name = name;
         this.args = args;
         this.distinct = distinct;
@@ -34,6 +67,9 @@ public final class WindowFuncExpr implements Expression {
         this.orderBy = orderBy;
         this.frame = frame;
         this.windowName = windowName;
+        this.ignoreNulls = ignoreNulls;
+        this.fromLast = fromLast;
+        this.filter = filter;
     }
 
     /**
@@ -42,7 +78,7 @@ public final class WindowFuncExpr implements Expression {
     public WindowFuncExpr(String name, List<Expression> args, boolean distinct, boolean star,
                            List<Expression> partitionBy, List<SelectStmt.OrderByItem> orderBy,
                            FrameClause frame) {
-        this(name, args, distinct, star, partitionBy, orderBy, frame, null);
+        this(name, args, distinct, star, partitionBy, orderBy, frame, null, false, false, null);
     }
 
     /**
@@ -151,6 +187,9 @@ public final class WindowFuncExpr implements Expression {
     public List<SelectStmt.OrderByItem> orderBy() { return orderBy; }
     public FrameClause frame() { return frame; }
     public String windowName() { return windowName; }
+    public boolean ignoreNulls() { return ignoreNulls; }
+    public boolean fromLast() { return fromLast; }
+    public Expression filter() { return filter; }
 
     @Override
     public boolean equals(Object o) {

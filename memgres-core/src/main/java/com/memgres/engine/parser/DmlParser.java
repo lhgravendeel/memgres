@@ -166,10 +166,11 @@ class DmlParser {
         parser.expectKeyword("SET");
         List<InsertStmt.SetClause> sets = parseSetClauses();
         // Optional WHERE clause for ON CONFLICT DO UPDATE
+        Expression doUpdateWhere = null;
         if (parser.matchKeyword("WHERE")) {
-            parser.parseExpression(); // consume the WHERE condition (stored but not yet used for filtering)
+            doUpdateWhere = parser.parseExpression();
         }
-        return new InsertStmt.OnConflict(conflictColumns, constraintName, false, sets, conflictWhere, conflictExpressions);
+        return new InsertStmt.OnConflict(conflictColumns, constraintName, false, sets, conflictWhere, conflictExpressions, doUpdateWhere);
     }
 
     UpdateStmt parseUpdate() {
@@ -207,10 +208,16 @@ class DmlParser {
             from = parser.parseFromList();
         }
 
-        // WHERE
+        // WHERE [CURRENT OF cursor_name | expression]
         Expression where = null;
         if (parser.matchKeyword("WHERE")) {
-            where = parser.parseExpression();
+            if (parser.matchKeyword("CURRENT")) {
+                parser.expectKeyword("OF");
+                String cursorName = parser.readIdentifier();
+                where = new CurrentOfExpr(cursorName);
+            } else {
+                where = parser.parseExpression();
+            }
         }
 
         // RETURNING
@@ -232,9 +239,47 @@ class DmlParser {
             if (parser.match(TokenType.DOT)) {
                 subField = parser.readIdentifier();
             }
+            // Check for JSONB subscript update: col['key'] = value or col['k1']['k2'] = value
+            List<String> subscriptKeys = null;
+            while (parser.check(TokenType.LEFT_BRACKET)) {
+                parser.advance(); // consume [
+                Token keyToken = parser.advance(); // consume key (string literal or integer)
+                String key = keyToken.value();
+                if (subscriptKeys == null) subscriptKeys = new ArrayList<>();
+                subscriptKeys.add(key);
+                parser.expect(TokenType.RIGHT_BRACKET);
+            }
             parser.expect(TokenType.EQUALS);
             Expression val = parser.parseExpression();
-            clauses.add(new InsertStmt.SetClause(col, val, subField));
+            if (subscriptKeys != null) {
+                // Transform into jsonb_set call: jsonb_set(col, '{key}', value)
+                // Build the path array
+                StringBuilder pathArray = new StringBuilder("{");
+                for (int i = 0; i < subscriptKeys.size(); i++) {
+                    if (i > 0) pathArray.append(",");
+                    pathArray.append(subscriptKeys.get(i));
+                }
+                pathArray.append("}");
+                // Wrap the value expression in a jsonb_set function call
+                Expression colRef = new ColumnRef(null, col);
+                Expression pathExpr = Literal.ofString(pathArray.toString());
+                // Use to_jsonb(value) to ensure the value is jsonb
+                Expression jsonbVal;
+                if (val instanceof CastExpr) {
+                    CastExpr cast = (CastExpr) val;
+                    if (cast.typeName().equalsIgnoreCase("jsonb") || cast.typeName().equalsIgnoreCase("json")) {
+                        jsonbVal = val; // already cast to jsonb
+                    } else {
+                        jsonbVal = new FunctionCallExpr("to_jsonb", Cols.listOf(val));
+                    }
+                } else {
+                    jsonbVal = new FunctionCallExpr("to_jsonb", Cols.listOf(val));
+                }
+                Expression setExpr = new FunctionCallExpr("jsonb_set", Cols.listOf(colRef, pathExpr, jsonbVal));
+                clauses.add(new InsertStmt.SetClause(col, setExpr, subField));
+            } else {
+                clauses.add(new InsertStmt.SetClause(col, val, subField));
+            }
         } while (parser.match(TokenType.COMMA));
         return clauses;
     }
@@ -276,7 +321,13 @@ class DmlParser {
 
         Expression where = null;
         if (parser.matchKeyword("WHERE")) {
-            where = parser.parseExpression();
+            if (parser.matchKeyword("CURRENT")) {
+                parser.expectKeyword("OF");
+                String cursorName = parser.readIdentifier();
+                where = new CurrentOfExpr(cursorName);
+            } else {
+                where = parser.parseExpression();
+            }
         }
 
         List<SelectStmt.SelectTarget> returning = null;

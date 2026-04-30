@@ -131,7 +131,10 @@ public class RowContext {
             }
             int idx = b.table().getColumnIndex(columnName);
             if (idx < 0) {
-                throw new MemgresException("column " + tableQualifier + "." + columnName + " does not exist", "42703");
+                MemgresException ex = new MemgresException("column " + tableQualifier + "." + columnName + " does not exist", "42703");
+                String hint = suggestClosestColumn(columnName, b.table());
+                if (hint != null) ex.setHint(hint);
+                throw ex;
             }
             return b.row()[idx];
         }
@@ -153,7 +156,13 @@ public class RowContext {
             }
         }
         if (!found) {
-            throw new MemgresException("column \"" + columnName + "\" does not exist", "42703");
+            MemgresException ex = new MemgresException("column \"" + columnName + "\" does not exist", "42703");
+            // Try to suggest a close match from any binding
+            for (TableBinding b : bindings) {
+                String hint = suggestClosestColumn(columnName, b.table());
+                if (hint != null) { ex.setHint(hint); break; }
+            }
+            throw ex;
         }
         return result;
     }
@@ -298,5 +307,46 @@ public class RowContext {
         List<TableBinding> merged = new ArrayList<>(this.bindings);
         merged.addAll(other.bindings);
         return new RowContext(merged);
+    }
+
+    /**
+     * Suggest the closest matching column name from a table for a typo hint.
+     * Uses Levenshtein edit distance. Returns null if no close match found.
+     */
+    static String suggestClosestColumn(String typo, Table table) {
+        if (table == null || typo == null) return null;
+        String bestName = null;
+        int bestDist = Integer.MAX_VALUE;
+        String lowerTypo = typo.toLowerCase();
+        for (Column col : table.getColumns()) {
+            String colName = col.getName().toLowerCase();
+            int dist = editDistance(lowerTypo, colName);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestName = col.getName();
+            }
+        }
+        // Only suggest if the edit distance is small relative to the name length
+        if (bestName != null && bestDist <= Math.max(1, typo.length() / 2)) {
+            return "Perhaps you meant to reference the column \"" + bestName + "\".";
+        }
+        return null;
+    }
+
+    /** Compute Levenshtein edit distance between two strings. */
+    private static int editDistance(String a, String b) {
+        int m = a.length(), n = b.length();
+        int[] prev = new int[n + 1];
+        int[] curr = new int[n + 1];
+        for (int j = 0; j <= n; j++) prev[j] = j;
+        for (int i = 1; i <= m; i++) {
+            curr[0] = i;
+            for (int j = 1; j <= n; j++) {
+                int cost = a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1;
+                curr[j] = Math.min(Math.min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+            }
+            int[] tmp = prev; prev = curr; curr = tmp;
+        }
+        return prev[n];
     }
 }

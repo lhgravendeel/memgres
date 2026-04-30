@@ -62,47 +62,49 @@ class JsonFunctions {
                 return "\"" + arg.toString().replace("\"", "\\\"") + "\"";
             }
             case "row_to_json": {
-                Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                if (arg == null) return "null";
-                if (arg instanceof java.util.Map<?, ?>) {
-                    java.util.Map<?, ?> map = (java.util.Map<?, ?>) arg;
-                    // Convert row record (LinkedHashMap) to JSON object
-                    StringBuilder sb = new StringBuilder("{");
-                    boolean first = true;
-                    for (Map.Entry<?, ?> entry : map.entrySet()) {
-                        if (!first) sb.append(",");
-                        first = false;
-                        sb.append("\"").append(entry.getKey()).append("\":");
-                        Object v = entry.getValue();
-                        if (v == null) {
-                            sb.append("null");
-                        } else if (v instanceof Number || v instanceof Boolean) {
-                            sb.append(v);
-                        } else {
-                            String s = v.toString();
-                            // Check if it's already JSON
-                            if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
-                                sb.append(s);
-                            } else {
-                                sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                // Try whole-row resolution first for ColumnRef args (e.g., row_to_json(x) where x is a table alias)
+                Object arg = null;
+                Expression firstArg = fn.args().get(0);
+                if (firstArg instanceof ColumnRef && ctx != null) {
+                    ColumnRef cref = (ColumnRef) firstArg;
+                    if (cref.table() == null) {
+                        RowContext.TableBinding b = ctx.getBinding(cref.column());
+                        if (b != null && b.table().getColumns().size() >= 1) {
+                            java.util.Map<String, Object> record = new java.util.LinkedHashMap<>();
+                            for (int i = 0; i < b.table().getColumns().size(); i++) {
+                                record.put(b.table().getColumns().get(i).getName(), b.row()[i]);
                             }
+                            arg = record;
                         }
                     }
-                    sb.append("}");
-                    return sb.toString();
+                }
+                if (arg == null) arg = executor.evalExpr(firstArg, ctx);
+                if (arg == null) return "null";
+                boolean pretty = false;
+                if (fn.args().size() >= 2) {
+                    Object prettyArg = executor.evalExpr(fn.args().get(1), ctx);
+                    if (prettyArg instanceof Boolean) pretty = (Boolean) prettyArg;
+                    else if (prettyArg != null) pretty = executor.isTruthy(prettyArg);
+                }
+                if (arg instanceof java.util.Map<?, ?>) {
+                    java.util.Map<?, ?> map = (java.util.Map<?, ?>) arg;
+                    return rowMapToJson(map, pretty, pretty ? 1 : 0);
                 }
                 if (arg instanceof java.util.List<?>) {
                     java.util.List<?> list = (java.util.List<?>) arg;
                     // ROW(...) value, convert to JSON
+                    String sep = pretty ? ",\n " : ",";
                     StringBuilder sb = new StringBuilder("{");
+                    if (pretty) sb.append("\n ");
                     for (int i = 0; i < list.size(); i++) {
-                        if (i > 0) sb.append(",");
+                        if (i > 0) sb.append(sep);
                         sb.append("\"f").append(i + 1).append("\":");
                         Object v = list.get(i);
                         if (v == null) sb.append("null");
                         else if (v instanceof Number || v instanceof Boolean) sb.append(v);
                         else sb.append("\"").append(v.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
                     }
+                    if (pretty) sb.append("\n");
                     sb.append("}");
                     return sb.toString();
                 }
@@ -119,6 +121,25 @@ class JsonFunctions {
                 }
                 List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
                 return new ArrayList<>(results); // Return as List for SRF expansion
+            }
+            case "jsonb_path_query_array": {
+                // PG: collect all jsonpath matches into a jsonb array.
+                requireArgs(fn, 2);
+                Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
+                Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (jsonVal == null || pathVal == null) return null;
+                String path = pathVal.toString().trim();
+                if (!path.startsWith("$") && !path.startsWith("@")) {
+                    throw new MemgresException("syntax error at or near \"" + path.substring(0, Math.min(3, path.length())) + "\" of jsonpath input", "42601");
+                }
+                List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
+                StringBuilder sb = new StringBuilder("[");
+                for (int i = 0; i < results.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(results.get(i));
+                }
+                sb.append("]");
+                return sb.toString();
             }
             case "jsonb_path_query_first": {
                 requireArgs(fn, 2);
@@ -179,6 +200,17 @@ class JsonFunctions {
                 // jsonb_path_match result must be boolean; SQLSTATE 22038
                 throw new MemgresException("jsonpath item method .boolean() can only be applied to a boolean, numeric, or string JSON item", "22038");
             }
+            // _tz variants: delegate to non-tz equivalents (timezone-aware, but we treat them the same)
+            case "jsonb_path_exists_tz":
+                return eval("jsonb_path_exists", fn, ctx);
+            case "jsonb_path_match_tz":
+                return eval("jsonb_path_match", fn, ctx);
+            case "jsonb_path_query_tz":
+                return eval("jsonb_path_query", fn, ctx);
+            case "jsonb_path_query_first_tz":
+                return eval("jsonb_path_query_first", fn, ctx);
+            case "jsonb_path_query_array_tz":
+                return eval("jsonb_path_query_array", fn, ctx);
             case "jsonb_typeof":
             case "json_typeof": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -291,8 +323,60 @@ class JsonFunctions {
                     throw new MemgresException("malformed array literal: \"" + ps + "\"", "22P02");
                 }
                 Object newVal = executor.evalExpr(fn.args().get(2), ctx);
+                boolean createMissing = fn.args().size() < 4
+                        || executor.isTruthy(executor.evalExpr(fn.args().get(3), ctx));
                 List<String> path = parsePathArg(pathArg);
                 String newValStr = jsonValueStr(newVal);
+                if (!createMissing && JsonOperations.extractPath(json.toString(), path) == null) {
+                    return json.toString();
+                }
+                return JsonOperations.jsonbSet(json.toString(), path, newValStr);
+            }
+            case "jsonb_set_lax": {
+                // PG 13+: jsonb_set_lax(target, path, new_value [, create_if_missing [, null_value_treatment]])
+                //   null_value_treatment: 'raise_exception'|'use_json_null'|'delete_key'|'return_target'
+                //   Default behaviour on NULL new_value is 'use_json_null'.
+                requireArgs(fn, 3);
+                Object json = executor.evalExpr(fn.args().get(0), ctx);
+                if (json == null) return null;
+                Object pathArg = executor.evalExpr(fn.args().get(1), ctx);
+                Object newVal = executor.evalExpr(fn.args().get(2), ctx);
+                boolean createIfMissing = fn.args().size() < 4
+                        || executor.isTruthy(executor.evalExpr(fn.args().get(3), ctx));
+                String treatment = "use_json_null";
+                if (fn.args().size() > 4) {
+                    Object tv = executor.evalExpr(fn.args().get(4), ctx);
+                    if (tv != null) treatment = tv.toString().toLowerCase();
+                }
+                List<String> path = parsePathArg(pathArg);
+                if (newVal == null) {
+                    switch (treatment) {
+                        case "return_target":
+                            return json.toString();
+                        case "delete_key":
+                            // Remove the element at path; we approximate by walking the path
+                            // and deleting the final key from its parent object.
+                            if (path.isEmpty()) return json.toString();
+                            if (path.size() == 1) {
+                                return JsonOperations.deleteKey(json.toString(), path.get(0));
+                            }
+                            // For nested paths, build a parent navigation by jsonb_set-like walk
+                            // Fall back to use_json_null if nested delete isn't trivial.
+                            return JsonOperations.jsonbSet(json.toString(), path, "null");
+                        case "raise_exception":
+                            throw new MemgresException(
+                                "JSON value must not be null", "22004");
+                        case "use_json_null":
+                        default:
+                            return JsonOperations.jsonbSet(json.toString(), path, "null");
+                    }
+                }
+                String newValStr = jsonValueStr(newVal);
+                // create_if_missing is true by default (and our jsonbSet always creates),
+                // so when it's explicitly false we should check existence first.
+                if (!createIfMissing && JsonOperations.extractPath(json.toString(), path) == null) {
+                    return json.toString();
+                }
                 return JsonOperations.jsonbSet(json.toString(), path, newValStr);
             }
             case "jsonb_strip_nulls": {
@@ -340,6 +424,97 @@ class JsonFunctions {
                 // Aggregate function, handled in aggregate evaluation
                 return null;
             }
+            case "json_strip_nulls": {
+                // Same as jsonb_strip_nulls but for json type (compact output, no extra spaces)
+                Object json = executor.evalExpr(fn.args().get(0), ctx);
+                return json == null ? null : JsonOperations.stripNulls(json.toString(), true);
+            }
+            case "jsonb_object": {
+                // jsonb_object(text[]) → builds a JSON object from a flat array of key/value pairs
+                // jsonb_object(keys text[], values text[]) → builds a JSON object from two arrays
+                requireArgs(fn, 1);
+                Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg1 == null) return null;
+                if (fn.args().size() >= 2) {
+                    // Two-array form: jsonb_object(keys[], values[])
+                    Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
+                    if (arg2 == null) return null;
+                    List<Object> keys = toList(arg1);
+                    List<Object> values = toList(arg2);
+                    if (keys.size() != values.size()) {
+                        throw new MemgresException("mismatched array dimensions", "22023");
+                    }
+                    StringBuilder sb = new StringBuilder("{");
+                    for (int i = 0; i < keys.size(); i++) {
+                        if (i > 0) sb.append(", ");
+                        Object k = keys.get(i);
+                        if (k == null) throw new MemgresException("null value not allowed for object key", "22023");
+                        sb.append("\"").append(k.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+                        Object v = values.get(i);
+                        if (v == null) sb.append("null");
+                        else sb.append("\"").append(v.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                    }
+                    sb.append("}");
+                    return sb.toString();
+                } else {
+                    // Single flat array form: jsonb_object('{k1,v1,k2,v2,...}')
+                    List<Object> elems = toList(arg1);
+                    if (elems.size() % 2 != 0) {
+                        throw new MemgresException("array must have even number of elements", "22023");
+                    }
+                    StringBuilder sb = new StringBuilder("{");
+                    for (int i = 0; i < elems.size(); i += 2) {
+                        if (i > 0) sb.append(", ");
+                        Object k = elems.get(i);
+                        if (k == null) throw new MemgresException("null value not allowed for object key", "22023");
+                        sb.append("\"").append(k.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+                        Object v = elems.get(i + 1);
+                        if (v == null) sb.append("null");
+                        else sb.append("\"").append(v.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                    }
+                    sb.append("}");
+                    return sb.toString();
+                }
+            }
+            case "json_populate_record":
+            case "jsonb_populate_record": {
+                // json_populate_record(base record, json) → record with fields filled from JSON
+                // In our engine, we return the JSON object as a map
+                requireArgs(fn, 2);
+                Object baseArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object jsonArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (jsonArg == null) return baseArg;
+                String jsonStr = jsonArg.toString().trim();
+                if (!jsonStr.startsWith("{")) {
+                    throw new MemgresException("cannot call json_populate_record on a non-object", "22023");
+                }
+                return populateRecordFromJson(baseArg, jsonStr);
+            }
+            case "json_populate_recordset":
+            case "jsonb_populate_recordset": {
+                // json_populate_recordset(base record, json_array) → setof record
+                requireArgs(fn, 2);
+                Object baseArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object jsonArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (jsonArg == null) return new java.util.ArrayList<>();
+                String jsonStr = jsonArg.toString().trim();
+                if (!jsonStr.startsWith("[")) {
+                    throw new MemgresException("cannot call json_populate_recordset on a non-array", "22023");
+                }
+                // Parse JSON array and populate records
+                List<Object> results = new java.util.ArrayList<>();
+                String inner = jsonStr.substring(1, jsonStr.length() - 1).trim();
+                if (!inner.isEmpty()) {
+                    List<String> elements = splitJsonPairs(inner);
+                    for (String elem : elements) {
+                        String trimmed = elem.trim();
+                        if (trimmed.startsWith("{")) {
+                            results.add(populateRecordFromJson(baseArg, trimmed));
+                        }
+                    }
+                }
+                return results;
+            }
             default:
                 return NOT_HANDLED;
         }
@@ -367,6 +542,81 @@ class JsonFunctions {
                 sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
             }
         }
+    }
+
+    private static String repeat(String s, int count) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
+    private String rowMapToJson(java.util.Map<?, ?> map, boolean pretty, int indent) {
+        StringBuilder sb = new StringBuilder("{");
+        String sep = pretty ? ",\n" + repeat(" ",indent) : ",";
+        if (pretty) sb.append("\n").append(repeat(" ", indent));
+        boolean first = true;
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!first) sb.append(sep);
+            first = false;
+            sb.append("\"").append(entry.getKey()).append("\":");
+            Object v = entry.getValue();
+            if (v == null) {
+                sb.append("null");
+            } else if (v instanceof Number || v instanceof Boolean) {
+                sb.append(v);
+            } else {
+                String s = v.toString();
+                if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+                    sb.append(s);
+                } else {
+                    sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                }
+            }
+        }
+        if (pretty) sb.append("\n");
+        sb.append("}");
+        return sb.toString();
+    }
+
+    private Map<String, Object> populateRecordFromJson(Object baseArg, String jsonStr) {
+        Map<String, Object> result = new java.util.LinkedHashMap<>();
+        // If base is a map, start with its values
+        if (baseArg instanceof Map<?, ?>) {
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) baseArg).entrySet()) {
+                result.put(entry.getKey().toString(), entry.getValue());
+            }
+        }
+        // Parse JSON object and overlay values
+        String inner = jsonStr.substring(1, jsonStr.length() - 1).trim();
+        if (!inner.isEmpty()) {
+            List<String> pairs = splitJsonPairs(inner);
+            for (String pair : pairs) {
+                int colonIdx = pair.indexOf(':');
+                if (colonIdx < 0) continue;
+                String key = pair.substring(0, colonIdx).trim();
+                String val = pair.substring(colonIdx + 1).trim();
+                if (key.startsWith("\"") && key.endsWith("\"")) key = key.substring(1, key.length() - 1);
+                Object parsed;
+                if (val.equals("null")) parsed = null;
+                else if (val.startsWith("\"") && val.endsWith("\"")) parsed = val.substring(1, val.length() - 1).replace("\\\"", "\"").replace("\\\\", "\\");
+                else if (val.equals("true")) parsed = true;
+                else if (val.equals("false")) parsed = false;
+                else {
+                    try { parsed = Integer.parseInt(val); }
+                    catch (NumberFormatException e1) {
+                        try { parsed = Long.parseLong(val); }
+                        catch (NumberFormatException e2) {
+                            try { parsed = Double.parseDouble(val); }
+                            catch (NumberFormatException e3) { parsed = val; }
+                        }
+                    }
+                }
+                result.put(key, parsed);
+            }
+        }
+        return result;
     }
 
     String extractJsonKey(String json, String key) {
@@ -445,6 +695,28 @@ class JsonFunctions {
                                 // For arrays, .* expands all elements
                                 List<String> elems = JsonOperations.parseArrayElements(node);
                                 for (String e : elems) next.add(e.trim());
+                            }
+                        }
+                        current = next;
+                    } else if (key.equals("datetime()")) {
+                        // .datetime() method: convert date/datetime strings to ISO datetime with timezone
+                        List<String> next = new ArrayList<>();
+                        for (String node : current) {
+                            node = node.trim();
+                            String unquoted = node;
+                            if (unquoted.startsWith("\"") && unquoted.endsWith("\"")) {
+                                unquoted = unquoted.substring(1, unquoted.length() - 1);
+                            }
+                            // If it's a date-only string (yyyy-MM-dd), expand to full datetime with timezone
+                            if (unquoted.matches("\\d{4}-\\d{2}-\\d{2}") ) {
+                                next.add("\"" + unquoted + "T00:00:00+00:00\"");
+                            } else if (unquoted.endsWith("Z")) {
+                                // Convert trailing Z to +00:00
+                                String withoutZ = unquoted.substring(0, unquoted.length() - 1);
+                                next.add("\"" + withoutZ + "+00:00\"");
+                            } else {
+                                // Already has timezone or other format — pass through
+                                next.add(node);
                             }
                         }
                         current = next;
@@ -638,6 +910,20 @@ class JsonFunctions {
                     if (leftResults.isEmpty()) return null;
                     String leftVal = leftResults.get(0).trim();
                     String rightVal = rightExpr.trim();
+                    // Handle .datetime() method on the right-hand side literal
+                    if (rightVal.endsWith(".datetime()")) {
+                        String rawRight = rightVal.substring(0, rightVal.length() - ".datetime()".length()).trim();
+                        if (rawRight.startsWith("\"") && rawRight.endsWith("\"")) {
+                            String dateStr = rawRight.substring(1, rawRight.length() - 1);
+                            if (dateStr.matches("\\d{4}-\\d{2}-\\d{2}")) {
+                                rightVal = "\"" + dateStr + "T00:00:00+00:00\"";
+                            } else if (dateStr.endsWith("Z")) {
+                                rightVal = "\"" + dateStr.substring(0, dateStr.length() - 1) + "+00:00\"";
+                            } else {
+                                rightVal = rawRight;
+                            }
+                        }
+                    }
                     if (rightVal.startsWith("\"") && rightVal.endsWith("\"")) {
                         rightVal = rightVal.substring(1, rightVal.length() - 1);
                         if (leftVal.startsWith("\"") && leftVal.endsWith("\"")) {
@@ -699,6 +985,30 @@ class JsonFunctions {
 
     boolean evaluateJsonPathExists(String json, String path) {
         if (path.equals("$")) return true;
+        // Check if this is a predicate expression (contains comparison operators at top level)
+        String[] compOps = {"==", "!=", ">=", "<=", ">", "<"};
+        boolean isPredicate = false;
+        for (String op : compOps) {
+            // Check for comparison operators at depth 0
+            int depth = 0;
+            for (int i = 0; i < path.length() - op.length() + 1; i++) {
+                char c = path.charAt(i);
+                if (c == '(' || c == '[' || c == '{') depth++;
+                else if (c == ')' || c == ']' || c == '}') depth--;
+                else if (depth == 0 && path.startsWith(op, i)) {
+                    isPredicate = true;
+                    break;
+                }
+            }
+            if (isPredicate) break;
+        }
+        if (isPredicate) {
+            // Strip .datetime() method calls — they convert JSON strings to datetime for comparison.
+            // ISO datetime strings compare correctly as strings, so just strip the method call.
+            String cleanPath = path.replace(".datetime()", "");
+            Boolean result = evaluateJsonPathPredicate(json, cleanPath);
+            return result != null && result;
+        }
         List<String> results = evaluateJsonPathAll(json, path);
         return !results.isEmpty();
     }
@@ -731,5 +1041,53 @@ class JsonFunctions {
         if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) return s;
         try { Double.parseDouble(s); return s; } catch (Exception e) { /* not a number */ }
         return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    /** Convert an object to a List (handles List, PG array string format). */
+    @SuppressWarnings("unchecked")
+    private List<Object> toList(Object obj) {
+        if (obj instanceof List<?>) return (List<Object>) obj;
+        if (obj instanceof String) {
+            String s = ((String) obj).trim();
+            if (s.startsWith("{") && s.endsWith("}")) {
+                String inner = s.substring(1, s.length() - 1).trim();
+                if (inner.isEmpty()) return new ArrayList<>();
+                List<Object> result = new ArrayList<>();
+                for (String elem : inner.split(",", -1)) {
+                    String trimmed = elem.trim();
+                    if (trimmed.equalsIgnoreCase("NULL")) result.add(null);
+                    else if (trimmed.startsWith("\"") && trimmed.endsWith("\"")) result.add(trimmed.substring(1, trimmed.length() - 1));
+                    else result.add(trimmed);
+                }
+                return result;
+            }
+        }
+        List<Object> single = new ArrayList<>();
+        single.add(obj);
+        return single;
+    }
+
+    /** Split JSON object interior into key:value pairs, respecting nesting. */
+    private List<String> splitJsonPairs(String s) {
+        List<String> pairs = new ArrayList<>();
+        int depth = 0;
+        boolean inString = false;
+        int start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' && inString) { i++; continue; }
+            if (c == '"') inString = !inString;
+            else if (!inString) {
+                if (c == '{' || c == '[') depth++;
+                else if (c == '}' || c == ']') depth--;
+                else if (c == ',' && depth == 0) {
+                    pairs.add(s.substring(start, i).trim());
+                    start = i + 1;
+                }
+            }
+        }
+        String last = s.substring(start).trim();
+        if (!last.isEmpty()) pairs.add(last);
+        return pairs;
     }
 }

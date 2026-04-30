@@ -64,13 +64,21 @@ class StringFunctions {
             }
             case "upper": {
                 Expression argExpr = fn.args().get(0);
-                // Detect COLLATE "C" or "POSIX" wrapping: apply ASCII-only uppercase (PG behaviour)
+                // Detect COLLATE wrapping: apply locale-specific uppercase
                 boolean asciiOnly = false;
+                java.util.Locale collLocale = null;
                 if (argExpr instanceof CollateExpr) {
                     CollateExpr ce = (CollateExpr) argExpr;
                     String coll = ce.collation().toLowerCase().replace("\"", "");
                     asciiOnly = coll.equals("c") || coll.equals("posix")
                             || coll.equals("pg_catalog.c") || coll.equals("pg_catalog.posix");
+                    if (!asciiOnly) {
+                        // Look up user-defined collation for locale-aware upper()
+                        Database.CollationDef collDef = executor.database.getCollation(ce.collation());
+                        if (collDef != null && collDef.locale != null) {
+                            collLocale = parseLocale(collDef.locale);
+                        }
+                    }
                 }
                 Object arg = executor.evalExpr(argExpr, ctx);
                 if (arg == null) return null;
@@ -100,6 +108,9 @@ class StringFunctions {
                     }
                     return sb.toString();
                 }
+                if (collLocale != null) {
+                    return arg.toString().toUpperCase(collLocale);
+                }
                 return arg.toString().toUpperCase();
             }
             case "lower": {
@@ -122,7 +133,25 @@ class StringFunctions {
                     return r.isEmpty() ? null : r.lower();
                 }
                 if (arg instanceof Number) throw new MemgresException("function lower(integer) does not exist", "42883");
-                return arg.toString().toLowerCase();
+                {
+                    String original = arg.toString();
+                    String lowered = original.toLowerCase();
+                    // PG does not lowercase U+1E9E (capital sharp S) to U+00DF (ß)
+                    if (original.indexOf('\u1E9E') >= 0) {
+                        StringBuilder sb = new StringBuilder(lowered.length());
+                        int oi = 0;
+                        for (int li = 0; li < lowered.length(); li++) {
+                            if (lowered.charAt(li) == '\u00DF' && oi < original.length() && original.charAt(oi) == '\u1E9E') {
+                                sb.append('\u1E9E');
+                            } else {
+                                sb.append(lowered.charAt(li));
+                            }
+                            oi++;
+                        }
+                        return sb.toString();
+                    }
+                    return lowered;
+                }
             }
             case "trim":
             case "btrim": {
@@ -352,19 +381,68 @@ class StringFunctions {
                 return (field >= 1 && field <= parts.length) ? parts[field - 1] : "";
             }
             case "regexp_replace": {
+                // Two forms:
+                // Old: regexp_replace(string, pattern, replacement [, flags])
+                // PG15+: regexp_replace(string, pattern, replacement, start, N [, flags])
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 String replacement = String.valueOf(executor.evalExpr(fn.args().get(2), ctx));
                 // Convert PG-style backreferences (\1, \2) to Java-style ($1, $2)
                 replacement = replacement.replaceAll("\\\\(\\d)", "\\$$1");
-                String flags = fn.args().size() > 3 ? String.valueOf(executor.evalExpr(fn.args().get(3), ctx)) : "";
+                String flags = "";
+                int startPos = 1;
+                int nth = 0; // 0 means replace all when using PG15+ form; in old form, default is replaceFirst
+                boolean pg15Form = false;
+                if (fn.args().size() > 3) {
+                    Object arg3 = executor.evalExpr(fn.args().get(3), ctx);
+                    // Distinguish old form (flags string) from PG15+ form (start int)
+                    if (arg3 instanceof Number) {
+                        pg15Form = true;
+                        startPos = executor.toInt(arg3);
+                        if (fn.args().size() > 4) {
+                            nth = executor.toInt(executor.evalExpr(fn.args().get(4), ctx));
+                        }
+                        if (fn.args().size() > 5) {
+                            flags = String.valueOf(executor.evalExpr(fn.args().get(5), ctx));
+                        }
+                    } else {
+                        flags = String.valueOf(arg3);
+                    }
+                }
                 int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
                 try {
-                    if (flags.contains("g")) {
-                        return java.util.regex.Pattern.compile(pattern, jflags).matcher(str.toString()).replaceAll(replacement);
+                    String s = str.toString();
+                    java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern, jflags);
+                    if (pg15Form) {
+                        // PG15+ form: start position and nth match
+                        String prefix = s.substring(0, Math.min(startPos - 1, s.length()));
+                        String searchPart = s.substring(Math.min(startPos - 1, s.length()));
+                        java.util.regex.Matcher m = p.matcher(searchPart);
+                        if (nth == 0) {
+                            // Replace all matches in the search region
+                            return prefix + m.replaceAll(replacement);
+                        } else {
+                            // Replace only the Nth match in the search region
+                            StringBuffer sb = new StringBuffer();
+                            int found = 0;
+                            while (m.find()) {
+                                found++;
+                                if (found == nth) {
+                                    m.appendReplacement(sb, replacement);
+                                    break;
+                                }
+                            }
+                            m.appendTail(sb);
+                            return prefix + sb.toString();
+                        }
+                    } else {
+                        // Old form
+                        if (flags.contains("g")) {
+                            return p.matcher(s).replaceAll(replacement);
+                        }
+                        return p.matcher(s).replaceFirst(replacement);
                     }
-                    return java.util.regex.Pattern.compile(pattern, jflags).matcher(str.toString()).replaceFirst(replacement);
                 } catch (java.util.regex.PatternSyntaxException e) {
                     throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B");
                 }
@@ -417,12 +495,25 @@ class StringFunctions {
                 return null;
             }
             case "regexp_count": {
+                // regexp_count(string, pattern [, start [, flags]])
+                // start is 1-based position to begin searching from
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                String flags = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : "";
+                int start = 1;
+                String flags = "";
+                if (fn.args().size() > 2) {
+                    Object arg2 = executor.evalExpr(fn.args().get(2), ctx);
+                    // 3rd arg is start position (int), not flags
+                    start = executor.toInt(arg2);
+                }
+                if (fn.args().size() > 3) {
+                    flags = String.valueOf(executor.evalExpr(fn.args().get(3), ctx));
+                }
                 int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern, jflags).matcher(str.toString());
+                String s = str.toString();
+                String searchStr = start > 1 ? s.substring(Math.min(start - 1, s.length())) : s;
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern, jflags).matcher(searchStr);
                 int count = 0;
                 while (m.find()) count++;
                 return count;
@@ -436,20 +527,89 @@ class StringFunctions {
                 return java.util.regex.Pattern.compile(pattern, jflags).matcher(str.toString()).find();
             }
             case "regexp_substr": {
+                // regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                String flags = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : "";
+                int start = 1;
+                int nthMatch = 1;
+                String flags = "";
+                int subexpr = 0;
+                if (fn.args().size() > 2) {
+                    start = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                }
+                if (fn.args().size() > 3) {
+                    nthMatch = executor.toInt(executor.evalExpr(fn.args().get(3), ctx));
+                }
+                if (fn.args().size() > 4) {
+                    flags = String.valueOf(executor.evalExpr(fn.args().get(4), ctx));
+                }
+                if (fn.args().size() > 5) {
+                    subexpr = executor.toInt(executor.evalExpr(fn.args().get(5), ctx));
+                }
                 int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern, jflags).matcher(str.toString());
-                return m.find() ? m.group(0) : null;
+                String s = str.toString();
+                int offset = Math.min(start - 1, s.length());
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern, jflags).matcher(s);
+                int found = 0;
+                int regionStart = offset;
+                while (m.find(regionStart)) {
+                    found++;
+                    if (found == nthMatch) {
+                        return m.group(subexpr);
+                    }
+                    regionStart = m.end();
+                }
+                return null;
             }
             case "regexp_instr": {
+                // regexp_instr(string, pattern [, start [, N [, endoption [, flags [, subexpr]]]]])
+                // start: 1-based position to begin searching
+                // N: which match to return (1 = first)
+                // endoption: 0 = return start of match (default), 1 = return position after end of match
+                // flags: regex flags string
+                // subexpr: which capture group to return position of
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return 0;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern).matcher(str.toString());
-                return m.find() ? m.start() + 1 : 0;
+                int start = 1;
+                int nthMatch = 1;
+                int endOption = 0;
+                String flags = "";
+                int subexpr = 0;
+                if (fn.args().size() > 2) {
+                    start = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                }
+                if (fn.args().size() > 3) {
+                    nthMatch = executor.toInt(executor.evalExpr(fn.args().get(3), ctx));
+                }
+                if (fn.args().size() > 4) {
+                    endOption = executor.toInt(executor.evalExpr(fn.args().get(4), ctx));
+                }
+                if (fn.args().size() > 5) {
+                    flags = String.valueOf(executor.evalExpr(fn.args().get(5), ctx));
+                }
+                if (fn.args().size() > 6) {
+                    subexpr = executor.toInt(executor.evalExpr(fn.args().get(6), ctx));
+                }
+                int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
+                String s = str.toString();
+                int offset = Math.min(start - 1, s.length());
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern, jflags).matcher(s);
+                int found = 0;
+                int regionStart = offset;
+                while (m.find(regionStart)) {
+                    found++;
+                    if (found == nthMatch) {
+                        int grp = subexpr;
+                        if (endOption == 1) {
+                            return m.end(grp) + 1; // position after the match end, 1-based
+                        }
+                        return m.start(grp) + 1; // 1-based position in original string
+                    }
+                    regionStart = m.end();
+                }
+                return 0;
             }
             case "regexp_split_to_array": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
@@ -733,7 +893,29 @@ class StringFunctions {
                 // PG: overlay(s, r, p, n) = left(s, p-1) || r || substr(s, p+n)
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
-                String replacement = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                Object replacementObj = executor.evalExpr(fn.args().get(1), ctx);
+                if (str instanceof byte[] || replacementObj instanceof byte[]) {
+                    // bytea overlay
+                    byte[] bStr = (str instanceof byte[]) ? (byte[]) str : str.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    byte[] bReplacement = (replacementObj instanceof byte[]) ? (byte[]) replacementObj : replacementObj.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    int startPos = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                    int count = fn.args().size() > 3 ? executor.toInt(executor.evalExpr(fn.args().get(3), ctx)) : bReplacement.length;
+                    if (count < 0 || startPos <= 0) {
+                        throw new MemgresException("negative substring length not allowed", "22011");
+                    }
+                    int start = startPos - 1; // 1-based to 0-based
+                    int prefixLen = Math.min(start, bStr.length);
+                    int suffixStart = start + count;
+                    int suffixLen = suffixStart < bStr.length ? bStr.length - suffixStart : 0;
+                    byte[] result = new byte[prefixLen + bReplacement.length + suffixLen];
+                    System.arraycopy(bStr, 0, result, 0, prefixLen);
+                    System.arraycopy(bReplacement, 0, result, prefixLen, bReplacement.length);
+                    if (suffixLen > 0) {
+                        System.arraycopy(bStr, suffixStart, result, prefixLen + bReplacement.length, suffixLen);
+                    }
+                    return result;
+                }
+                String replacement = String.valueOf(replacementObj);
                 int startPos = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
                 int count = fn.args().size() > 3 ? executor.toInt(executor.evalExpr(fn.args().get(3), ctx)) : replacement.length();
                 if (count < 0 || startPos <= 0) {
@@ -835,19 +1017,77 @@ class StringFunctions {
         String esc = escapeChar != null && !escapeChar.isEmpty() ? escapeChar : "\\";
         int i = 0;
         while (i < pattern.length()) {
-            String ch = pattern.substring(i, i + 1);
-            if (ch.equals(esc) && i + 1 < pattern.length()) {
+            char ch = pattern.charAt(i);
+            String chStr = String.valueOf(ch);
+            if (chStr.equals(esc) && i + 1 < pattern.length()) {
                 // Escaped character, treat next char as literal
                 sb.append(java.util.regex.Pattern.quote(pattern.substring(i + 1, i + 2)));
                 i += 2;
-            } else if (ch.equals("%")) {
+            } else if (ch == '%') {
                 sb.append(".*");
                 i++;
-            } else if (ch.equals("_")) {
+            } else if (ch == '_') {
                 sb.append(".");
                 i++;
+            } else if (ch == '|') {
+                sb.append("|");
+                i++;
+            } else if (ch == '(') {
+                sb.append("(");
+                i++;
+            } else if (ch == ')') {
+                sb.append(")");
+                i++;
+            } else if (ch == '+') {
+                sb.append("+");
+                i++;
+            } else if (ch == '*') {
+                sb.append("*");
+                i++;
+            } else if (ch == '?') {
+                sb.append("?");
+                i++;
+            } else if (ch == '[') {
+                // Pass character class through to regex, converting POSIX classes to Java equivalents
+                // Find closing ']' that isn't part of a POSIX class like [:alpha:]
+                int end = -1;
+                {
+                    int depth = 0;
+                    for (int j = i + 1; j < pattern.length(); j++) {
+                        if (pattern.charAt(j) == '[' && j + 1 < pattern.length() && pattern.charAt(j + 1) == ':') {
+                            depth++;
+                        } else if (pattern.charAt(j) == ']') {
+                            if (depth > 0 && j > 0 && pattern.charAt(j - 1) == ':') {
+                                depth--;
+                            } else {
+                                end = j;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (end >= 0) {
+                    String cls = pattern.substring(i, end + 1);
+                    cls = cls.replace("[:alpha:]", "\\p{Alpha}");
+                    cls = cls.replace("[:digit:]", "\\p{Digit}");
+                    cls = cls.replace("[:alnum:]", "\\p{Alnum}");
+                    cls = cls.replace("[:upper:]", "\\p{Upper}");
+                    cls = cls.replace("[:lower:]", "\\p{Lower}");
+                    cls = cls.replace("[:space:]", "\\p{Space}");
+                    cls = cls.replace("[:print:]", "\\p{Print}");
+                    cls = cls.replace("[:punct:]", "\\p{Punct}");
+                    cls = cls.replace("[:cntrl:]", "\\p{Cntrl}");
+                    cls = cls.replace("[:xdigit:]", "\\p{XDigit}");
+                    cls = cls.replace("[:graph:]", "\\p{Graph}");
+                    cls = cls.replace("[:blank:]", "\\p{Blank}");
+                    sb.append(cls);
+                    i = end + 1;
+                } else {
+                    sb.append(java.util.regex.Pattern.quote(chStr));
+                    i++;
+                }
             } else {
-                sb.append(java.util.regex.Pattern.quote(ch));
+                sb.append(java.util.regex.Pattern.quote(chStr));
                 i++;
             }
         }
@@ -871,5 +1111,23 @@ class StringFunctions {
         if (!VALID_ENCODINGS.contains(upper) && !VALID_ENCODINGS.contains(upper.replace("-", ""))) {
             throw new MemgresException("encoding \"" + encoding + "\" does not exist", "22023");
         }
+    }
+
+    /**
+     * Parse an ICU/POSIX locale string into a Java Locale.
+     * Handles formats like "tr-TR", "tr_TR", "und-u-ks-level2", "en_US.UTF-8".
+     */
+    static java.util.Locale parseLocale(String locale) {
+        if (locale == null) return java.util.Locale.ROOT;
+        // Strip encoding suffix (e.g., ".UTF-8")
+        String loc = locale;
+        int dotIdx = loc.indexOf('.');
+        if (dotIdx >= 0) loc = loc.substring(0, dotIdx);
+        // Replace hyphens with underscores for splitting
+        String[] parts = loc.replace('-', '_').split("_", 3);
+        if (parts.length >= 2) {
+            return new java.util.Locale(parts[0], parts[1]);
+        }
+        return new java.util.Locale(parts[0]);
     }
 }

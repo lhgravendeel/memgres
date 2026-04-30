@@ -68,6 +68,11 @@ class DdlAdminExecutor {
                     executor.session.rollbackToSavepoint(stmt.savepointName());
                     break;
                 case PREPARE_TRANSACTION: {
+                    // PG default: max_prepared_transactions = 0, which disables PREPARE TRANSACTION
+                    int maxPrepared = executor.database.getMaxPreparedTransactions();
+                    if (maxPrepared <= 0) {
+                        throw new MemgresException("prepared transactions are disabled\n  Hint: Set max_prepared_transactions to a nonzero value.", "55000");
+                    }
                     String gid = stmt.savepointName();
                     Database.PreparedTransaction pt = executor.session.prepareTransaction(gid);
                     executor.database.addPreparedTransaction(pt);
@@ -76,19 +81,19 @@ class DdlAdminExecutor {
                 case COMMIT_PREPARED: {
                     String gid = stmt.savepointName();
                     Database.PreparedTransaction pt = executor.database.removePreparedTransaction(gid);
-                    if (pt != null) {
-                        Session.commitPreparedTransaction(pt);
+                    if (pt == null) {
+                        throw new MemgresException("prepared transaction with identifier \"" + gid + "\" does not exist", "42704");
                     }
-                    // If pt is null, treat as no-op (compatible with shim 2PC support)
+                    Session.commitPreparedTransaction(pt);
                     break;
                 }
                 case ROLLBACK_PREPARED: {
                     String gid = stmt.savepointName();
                     Database.PreparedTransaction pt = executor.database.removePreparedTransaction(gid);
-                    if (pt != null) {
-                        Session.rollbackPreparedTransaction(executor.database, pt);
+                    if (pt == null) {
+                        throw new MemgresException("prepared transaction with identifier \"" + gid + "\" does not exist", "42704");
                     }
-                    // If pt is null, treat as no-op (compatible with shim 2PC support)
+                    Session.rollbackPreparedTransaction(executor.database, pt);
                     break;
                 }
             }
@@ -145,12 +150,18 @@ class DdlAdminExecutor {
             throw new MemgresException(stmt.deferredOptionError(), sqlState);
         }
 
+        // PG: EXPLAIN (WAL) requires ANALYZE
+        if (stmt.wal && !stmt.analyze) {
+            throw new MemgresException("EXPLAIN option WAL requires ANALYZE", "22023");
+        }
+
         if (stmt.analyze()) {
             startTime = System.nanoTime();
             actualResult = executor.executeStatement(stmt.statement());
         }
 
-        buildPlanLines(stmt.statement(), planLines, 0, stmt.analyze(), startTime, actualResult, stmt.costs());
+        buildPlanLines(stmt.statement(), planLines, 0, stmt.analyze(), startTime, actualResult, stmt.costs(), stmt.verbose());
+        appendExplainExtras(stmt, planLines);
 
         if (planLines.isEmpty()) {
             planLines.add("Memgres in-memory scan");
@@ -205,14 +216,21 @@ class DdlAdminExecutor {
     }
 
     private void buildPlanLines(Statement stmt, List<String> lines, int indent, boolean analyze,
-                                 long startTime, QueryResult actualResult, boolean costs) {
+                                 long startTime, QueryResult actualResult, boolean costs, boolean verbose) {
         String prefix = Strs.repeat("  ", indent);
         String arrow = indent > 0 ? "->  " : "";
 
         if (stmt instanceof SelectStmt) {
             SelectStmt sel = (SelectStmt) stmt;
             if (sel.from() == null || sel.from().isEmpty()) {
-                lines.add(prefix + arrow + "Result");
+                String resultLine = prefix + arrow + "Result";
+                if (costs || analyze) {
+                    resultLine += "  (cost=0.00..0.01 rows=1 width=4)";
+                }
+                lines.add(resultLine);
+                if (verbose) {
+                    lines.add(prefix + "  Output: (...)");
+                }
             } else {
                 boolean hasJoin = sel.from().stream().anyMatch(f -> f instanceof SelectStmt.JoinFrom);
                 if (hasJoin) {
@@ -237,13 +255,31 @@ class DdlAdminExecutor {
                     }
                     lines.add(scanLine);
                 }
+                if (verbose) {
+                    // Output columns line for EXPLAIN VERBOSE
+                    if (sel.targets != null && !sel.targets.isEmpty()) {
+                        StringBuilder outputCols = new StringBuilder(prefix + "  Output: ");
+                        for (int i = 0; i < sel.targets.size(); i++) {
+                            if (i > 0) outputCols.append(", ");
+                            SelectStmt.SelectTarget st = sel.targets.get(i);
+                            if (st.alias() != null) {
+                                outputCols.append(st.alias());
+                            } else {
+                                outputCols.append(SqlUnparser.exprToSql(st.expr()));
+                            }
+                        }
+                        lines.add(outputCols.toString());
+                    } else {
+                        lines.add(prefix + "  Output: (...)");
+                    }
+                }
                 if (sel.where() != null) {
                     lines.add(prefix + "  Filter: (...)");
                     if (analyze && actualResult != null) {
                         lines.add(prefix + "  Rows Removed by Filter: 0");
                     }
                 }
-                if (analyze) {
+                if (analyze && !verbose) {
                     lines.add(prefix + "  Output: (...)");
                 }
             }
@@ -281,6 +317,25 @@ class DdlAdminExecutor {
         }
     }
 
+    /** Append stub lines for PG 16+/17+ EXPLAIN options (MEMORY, SERIALIZE, BUFFERS, WAL). */
+    private void appendExplainExtras(ExplainStmt stmt, List<String> planLines) {
+        if (stmt.buffers && stmt.analyze) {
+            planLines.add("Buffers: shared hit=0");
+        }
+        if (stmt.wal) {
+            planLines.add("WAL: records=0 fpi=0 bytes=0");
+        }
+        if (stmt.memory()) {
+            planLines.add("Memory: used=0kB  allocated=0kB");
+        }
+        if (stmt.serialize()) {
+            planLines.add("Serialization: output=0kB  format=text");
+        }
+        if (stmt.settings) {
+            planLines.add("Settings: (none)");
+        }
+    }
+
     // ---- LISTEN / NOTIFY / UNLISTEN ----
 
     QueryResult executeListen(ListenStmt stmt) {
@@ -315,7 +370,7 @@ class DdlAdminExecutor {
     QueryResult executeCreatePolicy(CreatePolicyStmt stmt) {
         Table table = executor.resolveTable("public", stmt.table());
         table.addRlsPolicy(new RlsPolicy(stmt.name(), stmt.command(),
-                stmt.usingExpr(), stmt.withCheckExpr(), stmt.roles()));
+                stmt.usingExpr(), stmt.withCheckExpr(), stmt.roles(), stmt.policyType()));
         return QueryResult.message(QueryResult.Type.SET, "CREATE POLICY");
     }
 
@@ -380,7 +435,22 @@ class DdlAdminExecutor {
         } else if (!stmt.options().isEmpty()) {
             Map<String, String> existing = executor.database.getRole(stmt.name());
             if (existing != null) {
-                existing.putAll(stmt.options());
+                // Handle SET_CONFIG specially: append to ROLCONFIG list
+                String setConfig = stmt.options().get("SET_CONFIG");
+                if (setConfig != null) {
+                    String prev = existing.get("ROLCONFIG");
+                    if (prev != null && !prev.isEmpty()) {
+                        existing.put("ROLCONFIG", prev + "," + setConfig);
+                    } else {
+                        existing.put("ROLCONFIG", setConfig);
+                    }
+                }
+                // Apply other options normally
+                for (Map.Entry<String, String> e : stmt.options().entrySet()) {
+                    if (!"SET_CONFIG".equals(e.getKey())) {
+                        existing.put(e.getKey(), e.getValue());
+                    }
+                }
             }
         }
         return QueryResult.message(QueryResult.Type.SET, "ALTER ROLE");
@@ -468,9 +538,15 @@ class DdlAdminExecutor {
             executor.database.addRule(s.table(), s.event(), "INSTEAD_NOTHING");
         } else if ("INSTEAD".equals(s.action()) && s.command() != null && !s.command().isEmpty()) {
             executor.database.addRule(s.table(), s.event(), "INSTEAD:" + s.command());
+        } else if ("ALSO".equals(s.action()) && s.command() != null && !s.command().isEmpty()) {
+            executor.database.addRule(s.table(), s.event(), "ALSO:" + s.command());
         }
-        // Track rule name for DROP RULE support
+        // Track rule name with full definition for pg_rules
         executor.database.addRuleByName(s.name(), s.table());
+        // Store rule definition for pg_rules view
+        String definition = "CREATE RULE " + s.name() + " AS ON " + s.event() + " TO " + s.table()
+                + " DO " + s.action() + " " + (s.command() != null ? s.command() : "NOTHING") + ";";
+        executor.database.addRuleDefinition(s.name(), s.table(), definition);
         return QueryResult.message(QueryResult.Type.SET, "CREATE RULE");
     }
 
@@ -482,7 +558,8 @@ class DdlAdminExecutor {
             throw new MemgresException("schema \"" + s.name() + "\" already exists", "42P06");
         }
         executor.database.getOrCreateSchema(s.name());
-        executor.database.setObjectOwner("schema:" + s.name(), executor.sessionUser());
+        String owner = s.authorization() != null ? s.authorization() : executor.sessionUser();
+        executor.database.setObjectOwner("schema:" + s.name(), owner);
         return QueryResult.message(QueryResult.Type.SET, "CREATE SCHEMA");
     }
 }

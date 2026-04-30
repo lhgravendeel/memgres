@@ -3,6 +3,7 @@ package com.memgres.engine;
 import com.memgres.engine.plpgsql.PlpgsqlExecutor;
 
 import java.util.*;
+import com.memgres.engine.parser.ast.Expression;
 
 /**
  * Trigger execution helpers for DML operations.
@@ -25,6 +26,7 @@ class DmlTriggerHelper {
                              PgTrigger.Event event, Object[] newRow, Object[] oldRow, Table table,
                              Set<String> updatedColumns) {
         for (PgTrigger trigger : triggers) {
+            if (trigger.isDisabled()) continue;
             if (trigger.getTiming() == timing && trigger.getEvent() == event && !trigger.isForEachStatement()) {
                 // For UPDATE OF triggers, check if any of the updated columns match
                 if (event == PgTrigger.Event.UPDATE && trigger.getUpdateColumns() != null
@@ -37,6 +39,41 @@ class DmlTriggerHelper {
                         }
                     }
                     if (!matches) continue;
+                }
+                // Evaluate WHEN clause if present
+                if (trigger.getWhenClause() != null && !trigger.getWhenClause().isEmpty()) {
+                    try {
+                        com.memgres.engine.parser.ast.Expression whenExpr =
+                                com.memgres.engine.parser.Parser.parseExpression(trigger.getWhenClause());
+                        // Build a row context with NEW/OLD references
+                        RowContext ctx = newRow != null ? new RowContext(table, "new", newRow) : null;
+                        if (oldRow != null && ctx != null) {
+                            ctx = ctx.merge(new RowContext(table, "old", oldRow));
+                        } else if (oldRow != null) {
+                            ctx = new RowContext(table, "old", oldRow);
+                        }
+                        if (ctx == null) ctx = new RowContext(table, table.getName(), new Object[table.getColumns().size()]);
+                        Object result = executor.evalExpr(whenExpr, ctx);
+                        if (!executor.isTruthy(result)) continue;
+                    } catch (Exception e) {
+                        // If WHEN evaluation fails, skip this trigger
+                        continue;
+                    }
+                }
+                // Deferred constraint triggers: defer to commit
+                if (trigger.isInitiallyDeferred() && timing == PgTrigger.Timing.AFTER
+                        && executor.session != null && executor.session.isInTransaction()) {
+                    final Object[] capturedNew = newRow != null ? Arrays.copyOf(newRow, newRow.length) : null;
+                    final Object[] capturedOld = oldRow != null ? Arrays.copyOf(oldRow, oldRow.length) : null;
+                    final PgTrigger capturedTrigger = trigger;
+                    executor.session.addDeferredTrigger(() -> {
+                        PgFunction function = executor.database.getFunction(capturedTrigger.getFunctionName());
+                        if (function != null) {
+                            PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
+                            plExec.executeTriggerFunction(function, capturedNew, capturedOld, table, capturedTrigger);
+                        }
+                    });
+                    continue;
                 }
                 PgFunction function = executor.database.getFunction(trigger.getFunctionName());
                 if (function != null) {
@@ -55,6 +92,7 @@ class DmlTriggerHelper {
                                PgTrigger.Event event, Table table,
                                List<Object[]> newRows, List<Object[]> oldRows) {
         for (PgTrigger trigger : triggers) {
+            if (trigger.isDisabled()) continue;
             if (trigger.getTiming() == timing && trigger.getEvent() == event && trigger.isForEachStatement()) {
                 PgFunction function = executor.database.getFunction(trigger.getFunctionName());
                 if (function == null) continue;

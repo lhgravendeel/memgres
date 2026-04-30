@@ -24,6 +24,7 @@ public class Session {
     private final List<UndoEntry> undoLog = new ArrayList<>();
     private final LinkedHashMap<String, Integer> savepoints = new LinkedHashMap<>();
     private final List<DeferredFkCheck> deferredFkChecks = new ArrayList<>();
+    private final List<Runnable> deferredTriggers = new ArrayList<>();
     private boolean allConstraintsDeferred = false; // SET CONSTRAINTS ALL DEFERRED
     private boolean allConstraintsImmediate = false; // SET CONSTRAINTS ALL IMMEDIATE
     private final Set<String> immediateConstraintNames = new java.util.HashSet<>();
@@ -95,6 +96,9 @@ public class Session {
 
     // Transaction-scoped advisory locks: released on commit/rollback
     private final Set<Long> xactAdvisoryLocks = new LinkedHashSet<>();
+
+    // Explicit table locks acquired via LOCK TABLE: table_key -> lock mode (e.g. "AccessExclusiveLock")
+    private final Map<String, String> tableLocks = new LinkedHashMap<>();
 
     // Tracks function call depth for procedure transaction control validation.
     // When > 0, we are inside a function (not procedure) and COMMIT/ROLLBACK is forbidden.
@@ -320,6 +324,7 @@ public class Session {
     // SSI: tables read and written by this serializable transaction (for write-skew detection)
     private final Set<String> ssiReadTables = ConcurrentHashMap.newKeySet();
     private final Set<String> ssiWriteTables = ConcurrentHashMap.newKeySet();
+    private long ssiTxnStartSeq = 0;
 
     // MVCC: uncommitted inserts per table (schema.table -> set of row references)
     // ConcurrentHashMap + ConcurrentHashMap.newKeySet inner sets for thread-safe cross-session reads.
@@ -485,6 +490,7 @@ public class Session {
             // If thread was interrupted but returned normally, clear and ignore
             // (the timeout fired after the statement completed)
             Thread.interrupted(); // clear interrupt flag
+            resetAutocommitTxId();
             return result;
         } catch (MemgresException e) {
             Thread.interrupted(); // clear interrupt flag
@@ -554,6 +560,7 @@ public class Session {
         }
         status = TransactionStatus.IN_TRANSACTION;
         transactionTimestamp = java.time.OffsetDateTime.now();
+        ssiTxnStartSeq = database.allocateSsiSequence();
         transactionId = database.allocateTransactionId();
         commandId = 0;
         undoLog.clear();
@@ -604,6 +611,16 @@ public class Session {
             rollback();
             throw e;
         }
+        // Fire deferred triggers (CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED)
+        try {
+            for (Runnable trigger : deferredTriggers) {
+                trigger.run();
+            }
+        } catch (MemgresException e) {
+            rollback();
+            throw e;
+        }
+        deferredTriggers.clear();
         // Clear SSI tracking
         clearSsiState();
         // Swap MVCC maps to new empty instances (atomic from cross-session readers' perspective)
@@ -612,6 +629,7 @@ public class Session {
         uncommittedDeletes = new ConcurrentHashMap<>();
         rrSnapshots.clear();
         rrSnapshotTaken = false;
+        snapshotImported = false;
         // Clear transaction-scoped GUC overrides (SET LOCAL)
         gucSettings.clearTransactionOverrides();
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
@@ -649,6 +667,7 @@ public class Session {
         // Note: don't clear onCommitDeleteRowsTables because the table persists across transactions
         // Release transaction-scoped advisory locks
         releaseXactAdvisoryLocks();
+        releaseTableLocks();
         // Release all row-level locks held by this session
         database.unlockAllRows(this);
         // Destroy non-holdable cursors (PG behavior: only WITH HOLD cursors survive COMMIT)
@@ -668,6 +687,7 @@ public class Session {
         uncommittedDeletes = new ConcurrentHashMap<>();
         rrSnapshots.clear();
         rrSnapshotTaken = false;
+        snapshotImported = false;
         // Clear transaction-scoped GUC overrides (SET LOCAL)
         gucSettings.clearTransactionOverrides();
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
@@ -678,6 +698,7 @@ public class Session {
         undoLog.clear();
         savepoints.clear();
         deferredFkChecks.clear();
+        deferredTriggers.clear();
         allConstraintsDeferred = false;
         allConstraintsImmediate = false;
         deferredConstraintNames.clear();
@@ -689,6 +710,7 @@ public class Session {
         onCommitDropTables.clear();
         // Release transaction-scoped advisory locks
         releaseXactAdvisoryLocks();
+        releaseTableLocks();
         // Release all row-level locks held by this session
         database.unlockAllRows(this);
         // Destroy cursors on rollback. Holdable cursors that were already committed
@@ -726,6 +748,7 @@ public class Session {
         uncommittedDeletes = new ConcurrentHashMap<>();
         rrSnapshots.clear();
         rrSnapshotTaken = false;
+        snapshotImported = false;
         gucSettings.clearTransactionOverrides();
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
@@ -1114,6 +1137,24 @@ public class Session {
         xactAdvisoryLocks.clear();
     }
 
+    /** Track explicit LOCK TABLE lock for pg_locks visibility. */
+    public void addTableLock(String tableKey, String mode) {
+        tableLocks.put(tableKey, mode);
+    }
+
+    /** Get explicit table locks. */
+    public Map<String, String> getTableLocks() {
+        return tableLocks;
+    }
+
+    /** Release all explicit table locks. Called on commit/rollback. */
+    public void releaseTableLocks() {
+        tableLocks.clear();
+        if (database != null) {
+            database.releaseTableLocks(this);
+        }
+    }
+
     public void registerOnCommitDrop(String schema, String tableName) {
         onCommitDropTables.add(new String[]{schema, tableName});
     }
@@ -1162,6 +1203,10 @@ public class Session {
 
     public void addDeferredCheck(Table table, Object[] row, StoredConstraint constraint) {
         deferredFkChecks.add(new DeferredFkCheck(table, row, constraint));
+    }
+
+    public void addDeferredTrigger(Runnable trigger) {
+        deferredTriggers.add(trigger);
     }
 
     public void setAllConstraintsDeferred(boolean deferred) {
@@ -1279,6 +1324,7 @@ public class Session {
     // Once set, all subsequent table reads that don't already have a snapshot use current visible rows
     // (which is correct because no committed changes from other transactions should be visible).
     private boolean rrSnapshotTaken = false;
+    private boolean snapshotImported = false;
 
     /** Get or create a REPEATABLE READ snapshot for a table. Returns null if not in RR mode. */
     public List<Object[]> getOrCreateRRSnapshot(String schemaTable, List<Object[]> currentVisibleRows) {
@@ -1295,6 +1341,11 @@ public class Session {
         if (!rrSnapshotTaken) {
             rrSnapshotTaken = true;
             snapshotAllTables();
+        }
+        // If an imported snapshot already exists for this table, use it as-is.
+        // This happens when SET TRANSACTION SNAPSHOT imported another session's snapshot.
+        if (snapshotImported && rrSnapshots.containsKey(schemaTable)) {
+            return rrSnapshots.get(schemaTable);
         }
         // Use putIfAbsent with the MVCC-visible rows from the caller.
         // snapshotAllTables() provides a fast pre-population, but its snapshots
@@ -1340,6 +1391,25 @@ public class Session {
     /** Get existing RR snapshot (returns null if none exists). */
     public List<Object[]> getRRSnapshot(String schemaTable) {
         return rrSnapshots.get(schemaTable);
+    }
+
+
+    /** Import an exported snapshot into this session's RR snapshots. */
+    public void importSnapshot(Database db, String snapshotId) {
+        Map<String, List<Object[]>> snap = db.importSnapshot(snapshotId);
+        if (snap == null) {
+            throw new MemgresException("invalid snapshot identifier: \"" + snapshotId + "\"", "22023");
+        }
+        rrSnapshots.clear();
+        for (Map.Entry<String, List<Object[]>> entry : snap.entrySet()) {
+            List<Object[]> copied = new ArrayList<>(entry.getValue().size());
+            for (Object[] row : entry.getValue()) {
+                copied.add(java.util.Arrays.copyOf(row, row.length));
+            }
+            rrSnapshots.put(entry.getKey(), copied);
+        }
+        rrSnapshotTaken = true;
+        snapshotImported = true;
     }
 
     /** Get the effective isolation level for this session's current transaction. */
@@ -1389,14 +1459,16 @@ public class Session {
      */
     private void checkSsiConflicts() {
         if (!isSerializable()) return;
-        if (ssiWriteTables.isEmpty()) return; // read-only txn, no conflict possible
+        if (ssiWriteTables.isEmpty() && ssiReadTables.isEmpty()) return;
 
-        // Check against recently committed serializable transactions for rw-conflict cycles
+        // Check against recently committed serializable transactions for conflicts.
+        // Only consider transactions that committed after this transaction began,
+        // as earlier commits are already reflected in our snapshot.
         for (Database.CommittedSsiInfo info : database.getRecentlyCommittedSsiTransactions()) {
-            // Check for rw-conflict cycle:
-            // this read X, other wrote X (rw-dependency: this -> other)
-            // AND other read Y, this wrote Y (rw-dependency: other -> this)
-            // This forms a cycle, meaning write-skew anomaly
+            if (info.sequence() <= ssiTxnStartSeq) continue;
+            // Check for rw-conflict: this read X, other wrote X (phantom prevention)
+            // If another serializable transaction committed writes to a table we read,
+            // and we also write (to any table), we have a potential serialization anomaly.
             boolean thisReadOtherWrote = false;
             for (String table : ssiReadTables) {
                 if (info.writeTables().contains(table)) {
@@ -1404,19 +1476,27 @@ public class Session {
                     break;
                 }
             }
-            if (!thisReadOtherWrote) continue;
-
-            boolean otherReadThisWrote = false;
-            for (String table : info.readTables()) {
-                if (ssiWriteTables.contains(table)) {
-                    otherReadThisWrote = true;
-                    break;
-                }
-            }
-            if (otherReadThisWrote) {
+            if (thisReadOtherWrote && !ssiWriteTables.isEmpty()) {
                 throw new MemgresException(
                     "could not serialize access due to read/write dependencies among transactions",
                     "40001");
+            }
+
+            // Check for rw-conflict cycle (write-skew):
+            // other read Y, this wrote Y (rw-dependency: other -> this)
+            if (thisReadOtherWrote) {
+                boolean otherReadThisWrote = false;
+                for (String table : info.readTables()) {
+                    if (ssiWriteTables.contains(table)) {
+                        otherReadThisWrote = true;
+                        break;
+                    }
+                }
+                if (otherReadThisWrote) {
+                    throw new MemgresException(
+                        "could not serialize access due to read/write dependencies among transactions",
+                        "40001");
+                }
             }
         }
     }
@@ -1425,6 +1505,7 @@ public class Session {
     private void clearSsiState() {
         ssiReadTables.clear();
         ssiWriteTables.clear();
+        ssiTxnStartSeq = 0;
     }
 
     // ---- Undo log ----

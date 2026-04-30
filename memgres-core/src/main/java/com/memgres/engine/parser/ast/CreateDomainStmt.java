@@ -1,7 +1,7 @@
 package com.memgres.engine.parser.ast;
 
 /**
- * CREATE DOMAIN name AS base_type [DEFAULT expr] [NOT NULL] [CHECK (expr)]
+ * CREATE DOMAIN name AS base_type [DEFAULT expr] [NOT NULL] [CONSTRAINT name] [CHECK (expr)]
  */
 public final class CreateDomainStmt implements Statement {
     public final String name;
@@ -9,6 +9,7 @@ public final class CreateDomainStmt implements Statement {
     public final Expression defaultExpr;
     public final boolean notNull;
     public final Expression checkExpr;
+    public final String constraintName; // explicit constraint name for CHECK, or null
 
     public CreateDomainStmt(
             String name,
@@ -17,11 +18,23 @@ public final class CreateDomainStmt implements Statement {
             boolean notNull,
             Expression checkExpr
     ) {
+        this(name, baseType, defaultExpr, notNull, checkExpr, null);
+    }
+
+    public CreateDomainStmt(
+            String name,
+            String baseType,
+            Expression defaultExpr,
+            boolean notNull,
+            Expression checkExpr,
+            String constraintName
+    ) {
         this.name = name;
         this.baseType = baseType;
         this.defaultExpr = defaultExpr;
         this.notNull = notNull;
         this.checkExpr = checkExpr;
+        this.constraintName = constraintName;
     }
 
     public String name() { return name; }
@@ -29,6 +42,7 @@ public final class CreateDomainStmt implements Statement {
     public Expression defaultExpr() { return defaultExpr; }
     public boolean notNull() { return notNull; }
     public Expression checkExpr() { return checkExpr; }
+    public String constraintName() { return constraintName; }
 
     @Override
     public boolean equals(Object o) {
@@ -39,16 +53,17 @@ public final class CreateDomainStmt implements Statement {
             && java.util.Objects.equals(baseType, that.baseType)
             && java.util.Objects.equals(defaultExpr, that.defaultExpr)
             && notNull == that.notNull
-            && java.util.Objects.equals(checkExpr, that.checkExpr);
+            && java.util.Objects.equals(checkExpr, that.checkExpr)
+            && java.util.Objects.equals(constraintName, that.constraintName);
     }
 
     @Override
     public int hashCode() {
-        return java.util.Objects.hash(name, baseType, defaultExpr, notNull, checkExpr);
+        return java.util.Objects.hash(name, baseType, defaultExpr, notNull, checkExpr, constraintName);
     }
 
     @Override
     public String toString() {
-        return "CreateDomainStmt[name=" + name + ", " + "baseType=" + baseType + ", " + "defaultExpr=" + defaultExpr + ", " + "notNull=" + notNull + ", " + "checkExpr=" + checkExpr + "]";
+        return "CreateDomainStmt[name=" + name + ", " + "baseType=" + baseType + ", " + "defaultExpr=" + defaultExpr + ", " + "notNull=" + notNull + ", " + "checkExpr=" + checkExpr + ", " + "constraintName=" + constraintName + "]";
     }
 }

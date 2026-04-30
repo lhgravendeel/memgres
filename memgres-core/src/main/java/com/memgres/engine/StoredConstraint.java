@@ -60,11 +60,15 @@ public class StoredConstraint {
     private boolean deferrable;
     private boolean initiallyDeferred;
     private boolean notEnforced; // PG 18: NOT ENFORCED constraints are stored but not validated
+    private boolean noInherit; // CHECK ... NO INHERIT: constraint not inherited by child tables
     private boolean convalidated = true; // pg_constraint.convalidated: false when added with NOT VALID
     private boolean fromIndex; // true if this constraint was created via CREATE UNIQUE INDEX (not ADD CONSTRAINT)
     private boolean promotedFromIndex; // true if created via ADD CONSTRAINT ... UNIQUE USING INDEX
+    private String matchType; // FK match type: null/"SIMPLE"/"FULL"/"PARTIAL"
     private Expression whereExpr; // partial index predicate
     private List<Expression> expressionColumns; // parsed expressions for expression-based index columns
+    private List<String> onDeleteSetNullColumns; // FK SET NULL column list (subset of FK columns to null)
+    private List<String> onUpdateSetNullColumns; // FK SET NULL column list for ON UPDATE
 
     public StoredConstraint(String name, Type type, List<String> columns,
                             Expression checkExpr,
@@ -121,12 +125,20 @@ public class StoredConstraint {
     public void setInitiallyDeferred(boolean initiallyDeferred) { this.initiallyDeferred = initiallyDeferred; }
     public boolean isNotEnforced() { return notEnforced; }
     public void setNotEnforced(boolean notEnforced) { this.notEnforced = notEnforced; }
+    public boolean isNoInherit() { return noInherit; }
+    public void setNoInherit(boolean noInherit) { this.noInherit = noInherit; }
     public boolean isFromIndex() { return fromIndex; }
     public void setFromIndex(boolean fromIndex) { this.fromIndex = fromIndex; }
     public boolean isPromotedFromIndex() { return promotedFromIndex; }
     public void setPromotedFromIndex(boolean promotedFromIndex) { this.promotedFromIndex = promotedFromIndex; }
     public boolean isConvalidated() { return convalidated; }
     public void setConvalidated(boolean convalidated) { this.convalidated = convalidated; }
+    public String getMatchType() { return matchType; }
+    public void setMatchType(String matchType) { this.matchType = matchType; }
+    public List<String> getOnDeleteSetNullColumns() { return onDeleteSetNullColumns; }
+    public void setOnDeleteSetNullColumns(List<String> cols) { this.onDeleteSetNullColumns = cols; }
+    public List<String> getOnUpdateSetNullColumns() { return onUpdateSetNullColumns; }
+    public void setOnUpdateSetNullColumns(List<String> cols) { this.onUpdateSetNullColumns = cols; }
 
     /** Returns true if this constraint should be deferred (checked at commit time). */
     public boolean isCurrentlyDeferred() {
@@ -135,7 +147,9 @@ public class StoredConstraint {
 
     public static FkAction parseFkAction(String action) {
         if (action == null) return FkAction.NO_ACTION;
-        switch (action.toUpperCase().replace(" ", "_")) {
+        // Strip column list suffix (e.g., "SET NULL:a,b" -> "SET NULL")
+        String base = action.contains(":") ? action.substring(0, action.indexOf(':')) : action;
+        switch (base.toUpperCase().replace(" ", "_")) {
             case "CASCADE":
                 return FkAction.CASCADE;
             case "SET_NULL":
@@ -147,5 +161,13 @@ public class StoredConstraint {
             default:
                 return FkAction.NO_ACTION;
         }
+    }
+
+    /** Extract SET NULL column list from action string like "SET NULL:a,b". Returns null if no list. */
+    public static List<String> parseSetNullColumns(String action) {
+        if (action == null || !action.contains(":")) return null;
+        String colPart = action.substring(action.indexOf(':') + 1);
+        if (colPart.isEmpty()) return null;
+        return java.util.Arrays.asList(colPart.split(","));
     }
 }

@@ -16,7 +16,7 @@ public final class IsJsonExpr implements Expression {
         this.uniqueKeys = uniqueKeys;
     }
 
-    public enum JsonType { VALUE, OBJECT, ARRAY, SCALAR }
+    public enum JsonType { VALUE, OBJECT, ARRAY, SCALAR, BOOLEAN, NULL, STRING, NUMBER }
 
     public Expression expr() { return expr; }
     public boolean negated() { return negated; }

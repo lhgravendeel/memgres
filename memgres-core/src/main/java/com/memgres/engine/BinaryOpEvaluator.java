@@ -99,11 +99,41 @@ class BinaryOpEvaluator {
         Object left = executor.evalExpr(bin.left(), ctx);
         Object right = executor.evalExpr(bin.right(), ctx);
 
+        // Collation-aware string comparison for EQUAL/NOT_EQUAL
+        if ((bin.op() == BinaryExpr.BinOp.EQUAL || bin.op() == BinaryExpr.BinOp.NOT_EQUAL)
+                && left instanceof String && right instanceof String) {
+            String collationName = null;
+            if (bin.left() instanceof CollateExpr) collationName = ((CollateExpr) bin.left()).collation();
+            else if (bin.right() instanceof CollateExpr) collationName = ((CollateExpr) bin.right()).collation();
+            if (collationName != null) {
+                Database.CollationDef collDef = executor.database.getCollation(collationName);
+                if (collDef != null && !collDef.deterministic) {
+                    // Non-deterministic collation: use case-insensitive comparison
+                    boolean eq = ((String) left).equalsIgnoreCase((String) right);
+                    return bin.op() == BinaryExpr.BinOp.EQUAL ? eq : !eq;
+                }
+            }
+        }
+
         // json type (not jsonb) does not support || or - operators
         if (bin.op() == BinaryExpr.BinOp.CONCAT || bin.op() == BinaryExpr.BinOp.SUBTRACT) {
             if (isCastToType(bin.left(), "json") || isCastToType(bin.right(), "json")) {
                 String opSym = bin.op() == BinaryExpr.BinOp.CONCAT ? "||" : "-";
                 throw new MemgresException("operator does not exist: json " + opSym + " json", "42883");
+            }
+        }
+
+        // json type does not support LIKE operator
+        if (bin.op() == BinaryExpr.BinOp.LIKE || bin.op() == BinaryExpr.BinOp.ILIKE) {
+            if (isCastToType(bin.left(), "json")) {
+                throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
+            }
+            if (bin.left() instanceof FunctionCallExpr) {
+                String fnName = ((FunctionCallExpr) bin.left()).name().toLowerCase();
+                if (fnName.equals("row_to_json") || fnName.equals("to_json") || fnName.equals("json_build_object")
+                        || fnName.equals("json_build_array") || fnName.equals("json_agg") || fnName.equals("json_object")) {
+                    throw new MemgresException("operator does not exist: json ~~ unknown", "42883");
+                }
             }
         }
 
@@ -206,6 +236,19 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return NetworkOperations.bitwiseAnd(ls, rs);
                 }
+                // intarray intersection: int[] & int[] -> intersection
+                if (left instanceof java.util.List && right instanceof java.util.List) {
+                    @SuppressWarnings("unchecked")
+                    java.util.List<Object> la = (java.util.List<Object>) left;
+                    @SuppressWarnings("unchecked")
+                    java.util.List<Object> ra = (java.util.List<Object>) right;
+                    java.util.Set<Object> rSet = new java.util.LinkedHashSet<>(ra);
+                    java.util.List<Object> result = new java.util.ArrayList<>();
+                    for (Object item : la) {
+                        if (rSet.contains(item)) result.add(item);
+                    }
+                    return result;
+                }
                 return (int)(executor.toLong(left) & executor.toLong(right));
             }
             case BIT_OR: {
@@ -305,14 +348,26 @@ class BinaryOpEvaluator {
                             (rightIsRow ? "record" : TypeCoercion.inferType(right) != null ? TypeCoercion.inferType(right).getPgName() : "unknown"),
                             "42883");
                 }
-                // Handle ROW comparison
+                // Handle ROW comparison (NULL propagates) vs ARRAY comparison (NULL=NULL is true)
+                boolean leftIsArray = left instanceof List && !(left instanceof AstExecutor.PgRow);
+                boolean rightIsArray = right instanceof List && !(right instanceof AstExecutor.PgRow);
                 List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
                 List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
                 if (lList != null && rList != null) {
-                    if (lList.size() != rList.size()) throw new MemgresException("cannot compare row values of different sizes", "42601");
+                    if (lList.size() != rList.size()) {
+                        if (leftIsArray && rightIsArray) return false;
+                        throw new MemgresException("cannot compare row values of different sizes", "42601");
+                    }
                     for (int ri = 0; ri < lList.size(); ri++) {
                         Object lv = lList.get(ri), rv = rList.get(ri);
-                        if (lv == null || rv == null) return null;
+                        if (lv == null || rv == null) {
+                            if (leftIsArray && rightIsArray) {
+                                // ARRAY: NULL=NULL is true, NULL!=non-NULL is false
+                                if (lv == null && rv == null) continue;
+                                return false;
+                            }
+                            return null; // ROW: NULL propagates
+                        }
                         if (!TypeCoercion.areEqual(lv, rv)) return false;
                     }
                     return true;
@@ -420,7 +475,21 @@ class BinaryOpEvaluator {
                 return TypeCoercion.areEqual(left, right);
             }
             case CONCAT: {
-                if (left == null || right == null) return null;
+                // Array concat with NULL: NULL || array = array, array || NULL = array
+                if (left == null && right instanceof List) return right;
+                if (right == null && left instanceof List) return left;
+                if (left == null || right == null) {
+                    // Check if the non-null side is an array-like string
+                    if (left == null && right != null) {
+                        String rs = right.toString().trim();
+                        if (rs.startsWith("{") && rs.endsWith("}")) return right;
+                    }
+                    if (right == null && left != null) {
+                        String ls = left.toString().trim();
+                        if (ls.startsWith("{") && ls.endsWith("}")) return left;
+                    }
+                    return null;
+                }
                 // Bytea (byte[]) concatenation
                 if (left instanceof byte[] && right instanceof byte[]) {
                     byte[] lb = (byte[]) left;
@@ -450,6 +519,10 @@ class BinaryOpEvaluator {
                         return result;
                     }
                 }
+                // TsQuery || TsQuery — OR of two queries
+                if (left instanceof TsQuery && right instanceof TsQuery) return TsQuery.or((TsQuery) left, (TsQuery) right);
+                if (left instanceof TsQuery) return TsQuery.or((TsQuery) left, TsQuery.parse(right.toString()));
+                if (right instanceof TsQuery) return TsQuery.or(TsQuery.parse(left.toString()), (TsQuery) right);
                 // TsVector || TsVector concatenation
                 if (left instanceof TsVector && right instanceof TsVector) return ((TsVector) left).concat(((TsVector) right));
                 if (left instanceof TsVector) return ((TsVector) left).concat(TsVector.fromText(right.toString()));
@@ -527,15 +600,17 @@ class BinaryOpEvaluator {
             }
             case SIMILAR_TO: {
                 if (left == null || right == null) return null;
-                // SIMILAR TO uses SQL regex: % -> .*, _ -> ., rest is standard regex
-                String pattern = right.toString()
-                        .replace("%", ".*")
-                        .replace("_", ".");
-                return left.toString().matches(pattern);
+                // SIMILAR TO uses SQL regex with default backslash escape
+                String pattern = similarToRegexForBinaryOp(right.toString(), "\\");
+                return left.toString().matches("(?s)" + pattern);
             }
             case JSON_ARROW: {
                 // json -> key or json -> index (returns JSON), also array subscript
                 if (left == null || right == null) return null;
+                // hstore -> text: extract value by key
+                if (left instanceof HstoreValue) {
+                    return ((HstoreValue) left).get(right.toString());
+                }
                 // Reject non-integer numeric types (e.g., jsonb -> 999999999999999999999)
                 if (right instanceof java.math.BigDecimal) {
                     java.math.BigDecimal bd = (java.math.BigDecimal) right;
@@ -702,6 +777,10 @@ class BinaryOpEvaluator {
             }
             case CONTAINS: {
                 if (left == null || right == null) return null;
+                // hstore @> hstore containment
+                if (left instanceof HstoreValue && right instanceof HstoreValue) {
+                    return ((HstoreValue) left).containsAll((HstoreValue) right);
+                }
                 String ls = left.toString().trim();
                 String rs = right.toString().trim();
                 // Multirange containment: multirange @> value/range/multirange
@@ -834,6 +913,12 @@ class BinaryOpEvaluator {
             }
             case OVERLAP: {
                 if (left == null || right == null) return null;
+                // TsQuery && TsQuery — AND of two queries
+                if (left instanceof TsQuery && right instanceof TsQuery) {
+                    return TsQuery.and((TsQuery) left, (TsQuery) right);
+                }
+                if (left instanceof TsQuery) return TsQuery.and((TsQuery) left, TsQuery.parse(right.toString()));
+                if (right instanceof TsQuery) return TsQuery.and(TsQuery.parse(left.toString()), (TsQuery) right);
                 // Convert Lists to PG format for uniform handling
                 String oLs = (left instanceof List) ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
                 String oRs = (right instanceof List) ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
@@ -863,6 +948,12 @@ class BinaryOpEvaluator {
             }
             case DISTANCE: {
                 if (left == null || right == null) return null;
+                // TsQuery <-> TsQuery — phrase operator (distance 1)
+                if (left instanceof TsQuery && right instanceof TsQuery) {
+                    return TsQuery.phrase((TsQuery) left, (TsQuery) right, 1);
+                }
+                if (left instanceof TsQuery) return TsQuery.phrase((TsQuery) left, TsQuery.parse(right.toString()), 1);
+                if (right instanceof TsQuery) return TsQuery.phrase(TsQuery.parse(left.toString()), (TsQuery) right, 1);
                 // Try user-defined operator first (e.g., text <-> text)
                 Object udResult = tryUserDefinedOperator("<->", left, right);
                 if (udResult != null) return udResult;
@@ -900,24 +991,50 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 return GeometricOperations.doesNotExtendBelow(left.toString(), right.toString());
             }
+            case GEO_INTERSECTS: {
+                if (left == null || right == null) return null;
+                return GeometricOperations.intersects(left.toString(), right.toString());
+            }
+            case GEO_CLOSEST_POINT: {
+                if (left == null || right == null) return null;
+                return GeometricOperations.formatPoint(GeometricOperations.closestPoint(left.toString(), right.toString()));
+            }
+            case GEO_PARALLEL: {
+                if (left == null || right == null) return null;
+                Object lObj = GeometricOperations.autoDetectPublic(left.toString());
+                Object rObj = GeometricOperations.autoDetectPublic(right.toString());
+                if (lObj instanceof GeometricOperations.PgLseg && rObj instanceof GeometricOperations.PgLseg) {
+                    return GeometricOperations.isParallel((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
+                }
+                throw new MemgresException("operator ?|| not supported for these types", "42883");
+            }
+            case GEO_PERPENDICULAR: {
+                if (left == null || right == null) return null;
+                Object lObj = GeometricOperations.autoDetectPublic(left.toString());
+                Object rObj = GeometricOperations.autoDetectPublic(right.toString());
+                if (lObj instanceof GeometricOperations.PgLseg && rObj instanceof GeometricOperations.PgLseg) {
+                    return GeometricOperations.isPerpendicular((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
+                }
+                throw new MemgresException("operator ?-| not supported for these types", "42883");
+            }
             case REGEX_MATCH: {
                 if (left == null || right == null) return null;
-                try { return java.util.regex.Pattern.compile(right.toString()).matcher(left.toString()).find(); }
+                try { return java.util.regex.Pattern.compile(pgRegexToJava(right.toString())).matcher(left.toString()).find(); }
                 catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
             }
             case REGEX_IMATCH: {
                 if (left == null || right == null) return null;
-                try { return java.util.regex.Pattern.compile(right.toString(), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
+                try { return java.util.regex.Pattern.compile(pgRegexToJava(right.toString()), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
                 catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
             }
             case NOT_REGEX_MATCH: {
                 if (left == null || right == null) return null;
-                try { return !java.util.regex.Pattern.compile(right.toString()).matcher(left.toString()).find(); }
+                try { return !java.util.regex.Pattern.compile(pgRegexToJava(right.toString())).matcher(left.toString()).find(); }
                 catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
             }
             case NOT_REGEX_IMATCH: {
                 if (left == null || right == null) return null;
-                try { return !java.util.regex.Pattern.compile(right.toString(), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
+                try { return !java.util.regex.Pattern.compile(pgRegexToJava(right.toString()), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
                 catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
             }
             case RANGE_ADJACENT: {
@@ -1207,7 +1324,20 @@ class BinaryOpEvaluator {
                 return executor.compareValues(left, right) >= 0;
             }
             case CONCAT: {
-                if (left == null || right == null) return null;
+                // Array concat with NULL: NULL || array = array, array || NULL = array
+                if (left == null && right instanceof List) return right;
+                if (right == null && left instanceof List) return left;
+                if (left == null || right == null) {
+                    if (left == null && right != null) {
+                        String rs = right.toString().trim();
+                        if (rs.startsWith("{") && rs.endsWith("}")) return right;
+                    }
+                    if (right == null && left != null) {
+                        String ls = left.toString().trim();
+                        if (ls.startsWith("{") && ls.endsWith("}")) return left;
+                    }
+                    return null;
+                }
                 // Bytea (byte[]) concatenation
                 if (left instanceof byte[] && right instanceof byte[]) {
                     byte[] lb = (byte[]) left;
@@ -1237,6 +1367,10 @@ class BinaryOpEvaluator {
                         return result;
                     }
                 }
+                // TsQuery || TsQuery — OR of two queries
+                if (left instanceof TsQuery && right instanceof TsQuery) return TsQuery.or((TsQuery) left, (TsQuery) right);
+                if (left instanceof TsQuery) return TsQuery.or((TsQuery) left, TsQuery.parse(right.toString()));
+                if (right instanceof TsQuery) return TsQuery.or(TsQuery.parse(left.toString()), (TsQuery) right);
                 if (left instanceof TsVector && right instanceof TsVector) return ((TsVector) left).concat(((TsVector) right));
                 if (left instanceof TsVector) return ((TsVector) left).concat(TsVector.fromText(right.toString()));
                 if (right instanceof TsVector) return TsVector.fromText(left.toString()).concat(((TsVector) right));
@@ -1324,6 +1458,10 @@ class BinaryOpEvaluator {
             }
             case CONTAINS: {
                 if (left == null || right == null) return null;
+                // hstore @> hstore containment
+                if (left instanceof HstoreValue && right instanceof HstoreValue) {
+                    return ((HstoreValue) left).containsAll((HstoreValue) right);
+                }
                 String lStr = left.toString().trim();
                 String rStr = right.toString().trim();
                 // Multirange containment
@@ -1422,6 +1560,12 @@ class BinaryOpEvaluator {
             }
             case OVERLAP: {
                 if (left == null || right == null) return null;
+                // TsQuery && TsQuery — AND of two queries
+                if (left instanceof TsQuery && right instanceof TsQuery) {
+                    return TsQuery.and((TsQuery) left, (TsQuery) right);
+                }
+                if (left instanceof TsQuery) return TsQuery.and((TsQuery) left, TsQuery.parse(right.toString()));
+                if (right instanceof TsQuery) return TsQuery.and(TsQuery.parse(left.toString()), (TsQuery) right);
                 // Convert Lists to PG format for uniform handling
                 String oLs = (left instanceof List) ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
                 String oRs = (right instanceof List) ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
@@ -1451,6 +1595,12 @@ class BinaryOpEvaluator {
             }
             case DISTANCE: {
                 if (left == null || right == null) return null;
+                // TsQuery <-> TsQuery — phrase operator (distance 1)
+                if (left instanceof TsQuery && right instanceof TsQuery) {
+                    return TsQuery.phrase((TsQuery) left, (TsQuery) right, 1);
+                }
+                if (left instanceof TsQuery) return TsQuery.phrase((TsQuery) left, TsQuery.parse(right.toString()), 1);
+                if (right instanceof TsQuery) return TsQuery.phrase(TsQuery.parse(left.toString()), (TsQuery) right, 1);
                 // Try user-defined operator first (e.g., text <-> text)
                 Object udResult = tryUserDefinedOperator("<->", left, right);
                 if (udResult != null) return udResult;
@@ -1488,24 +1638,50 @@ class BinaryOpEvaluator {
                 if (left == null || right == null) return null;
                 return GeometricOperations.doesNotExtendBelow(left.toString(), right.toString());
             }
+            case GEO_INTERSECTS: {
+                if (left == null || right == null) return null;
+                return GeometricOperations.intersects(left.toString(), right.toString());
+            }
+            case GEO_CLOSEST_POINT: {
+                if (left == null || right == null) return null;
+                return GeometricOperations.formatPoint(GeometricOperations.closestPoint(left.toString(), right.toString()));
+            }
+            case GEO_PARALLEL: {
+                if (left == null || right == null) return null;
+                Object lObj = GeometricOperations.autoDetectPublic(left.toString());
+                Object rObj = GeometricOperations.autoDetectPublic(right.toString());
+                if (lObj instanceof GeometricOperations.PgLseg && rObj instanceof GeometricOperations.PgLseg) {
+                    return GeometricOperations.isParallel((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
+                }
+                throw new MemgresException("operator ?|| not supported for these types", "42883");
+            }
+            case GEO_PERPENDICULAR: {
+                if (left == null || right == null) return null;
+                Object lObj = GeometricOperations.autoDetectPublic(left.toString());
+                Object rObj = GeometricOperations.autoDetectPublic(right.toString());
+                if (lObj instanceof GeometricOperations.PgLseg && rObj instanceof GeometricOperations.PgLseg) {
+                    return GeometricOperations.isPerpendicular((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
+                }
+                throw new MemgresException("operator ?-| not supported for these types", "42883");
+            }
             case REGEX_MATCH: {
                 if (left == null || right == null) return null;
-                try { return java.util.regex.Pattern.compile(right.toString()).matcher(left.toString()).find(); }
+                try { return java.util.regex.Pattern.compile(pgRegexToJava(right.toString())).matcher(left.toString()).find(); }
                 catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
             }
             case REGEX_IMATCH: {
                 if (left == null || right == null) return null;
-                try { return java.util.regex.Pattern.compile(right.toString(), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
+                try { return java.util.regex.Pattern.compile(pgRegexToJava(right.toString()), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
                 catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
             }
             case NOT_REGEX_MATCH: {
                 if (left == null || right == null) return null;
-                try { return !java.util.regex.Pattern.compile(right.toString()).matcher(left.toString()).find(); }
+                try { return !java.util.regex.Pattern.compile(pgRegexToJava(right.toString())).matcher(left.toString()).find(); }
                 catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
             }
             case NOT_REGEX_IMATCH: {
                 if (left == null || right == null) return null;
-                try { return !java.util.regex.Pattern.compile(right.toString(), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
+                try { return !java.util.regex.Pattern.compile(pgRegexToJava(right.toString()), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
                 catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
             }
             case RANGE_ADJACENT: {
@@ -1526,8 +1702,114 @@ class BinaryOpEvaluator {
                 }
                 return false;
             }
+            case LIKE: {
+                if (left == null || right == null) return null;
+                if (left instanceof Number || left instanceof Boolean) {
+                    String tn = left instanceof Integer ? "integer" : left instanceof Long ? "bigint" :
+                            left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase();
+                    throw new MemgresException("operator does not exist: " + tn + " ~~ unknown", "42883");
+                }
+                String likePattern = AstExecutor.likeToRegex(right.toString());
+                return left.toString().matches("(?s)" + likePattern);
+            }
+            case ILIKE: {
+                if (left == null || right == null) return null;
+                String ilikePattern = AstExecutor.likeToRegex(right.toString());
+                return left.toString().matches("(?si)" + ilikePattern);
+            }
+            case SIMILAR_TO: {
+                if (left == null || right == null) return null;
+                String simPattern = similarToRegexForBinaryOp(right.toString(), "\\");
+                return left.toString().matches("(?s)" + simPattern);
+            }
             default:
                 return null;
         }
+    }
+
+    /**
+     * Convert PG-specific regex flags to Java equivalents.
+     * PG (?n) = newline-sensitive (. excludes \n, ^ and $ match at line boundaries) → Java (?m)
+     * PG (?x) = extended (ignore whitespace and # comments) → Java (?x)
+     * PG (?s) = . matches everything including \n → Java (?s)
+     * PG (?i) = case insensitive → Java (?i)
+     */
+    static String pgRegexToJava(String pattern) {
+        // Replace (?n) with (?m) — PG newline-sensitive maps to Java MULTILINE
+        pattern = pattern.replace("(?n)", "(?m)");
+        return pattern;
+    }
+
+    /**
+     * Convert a SQL SIMILAR TO pattern to a Java regex.
+     * Handles: % -> .*, _ -> ., |, (), +, *, ?, [...] (including POSIX classes),
+     * and escape character processing.
+     */
+    private static String similarToRegexForBinaryOp(String pattern, String escapeChar) {
+        StringBuilder sb = new StringBuilder();
+        String esc = escapeChar != null && !escapeChar.isEmpty() ? escapeChar : "\\";
+        int i = 0;
+        while (i < pattern.length()) {
+            char ch = pattern.charAt(i);
+            String chStr = String.valueOf(ch);
+            if (chStr.equals(esc) && i + 1 < pattern.length()) {
+                // Escaped character, treat next char as literal
+                sb.append(java.util.regex.Pattern.quote(pattern.substring(i + 1, i + 2)));
+                i += 2;
+            } else if (ch == '%') {
+                sb.append(".*");
+                i++;
+            } else if (ch == '_') {
+                sb.append(".");
+                i++;
+            } else if (ch == '|' || ch == '(' || ch == ')' || ch == '+' || ch == '*' || ch == '?') {
+                sb.append(ch);
+                i++;
+            } else if (ch == '[') {
+                // Pass character class through, converting POSIX classes to Java equivalents
+                // Find closing ']' that isn't part of a POSIX class like [:alpha:]
+                int end = -1;
+                {
+                    int depth = 0;
+                    for (int j = i + 1; j < pattern.length(); j++) {
+                        if (pattern.charAt(j) == '[' && j + 1 < pattern.length() && pattern.charAt(j + 1) == ':') {
+                            depth++;
+                        } else if (pattern.charAt(j) == ']') {
+                            if (depth > 0 && j > 0 && pattern.charAt(j - 1) == ':') {
+                                depth--;
+                            } else {
+                                end = j;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (end >= 0) {
+                    String cls = pattern.substring(i, end + 1);
+                    // Convert POSIX classes to Java regex equivalents
+                    cls = cls.replace("[:alpha:]", "\\p{Alpha}");
+                    cls = cls.replace("[:digit:]", "\\p{Digit}");
+                    cls = cls.replace("[:alnum:]", "\\p{Alnum}");
+                    cls = cls.replace("[:upper:]", "\\p{Upper}");
+                    cls = cls.replace("[:lower:]", "\\p{Lower}");
+                    cls = cls.replace("[:space:]", "\\p{Space}");
+                    cls = cls.replace("[:print:]", "\\p{Print}");
+                    cls = cls.replace("[:punct:]", "\\p{Punct}");
+                    cls = cls.replace("[:cntrl:]", "\\p{Cntrl}");
+                    cls = cls.replace("[:xdigit:]", "\\p{XDigit}");
+                    cls = cls.replace("[:graph:]", "\\p{Graph}");
+                    cls = cls.replace("[:blank:]", "\\p{Blank}");
+                    sb.append(cls);
+                    i = end + 1;
+                } else {
+                    sb.append(java.util.regex.Pattern.quote(chStr));
+                    i++;
+                }
+            } else {
+                sb.append(java.util.regex.Pattern.quote(chStr));
+                i++;
+            }
+        }
+        return sb.toString();
     }
 }

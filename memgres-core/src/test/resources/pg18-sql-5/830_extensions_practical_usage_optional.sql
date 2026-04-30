@@ -22,7 +22,8 @@ SELECT user_id
 FROM users
 WHERE lower(email) = lower('alice@example.com');
 
--- begin-expected-error
--- message-like: function similarity
--- end-expected-error
+-- begin-expected
+-- columns: similarity_positive
+-- row: t
+-- end-expected
 SELECT similarity('postgres', 'postgress') > 0 AS similarity_positive;

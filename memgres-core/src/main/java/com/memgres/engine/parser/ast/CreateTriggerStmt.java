@@ -19,6 +19,8 @@ public final class CreateTriggerStmt implements Statement {
     public final String newTransitionTable;
     public final String oldTransitionTable;
     public final boolean forEachStatement;
+    public final boolean deferrable;
+    public final boolean initiallyDeferred;
 
     public CreateTriggerStmt(
             String name,
@@ -34,6 +36,26 @@ public final class CreateTriggerStmt implements Statement {
             String oldTransitionTable,
             boolean forEachStatement
     ) {
+        this(name, timing, events, table, schema, functionName, orReplace, whenClause,
+                updateOfColumns, newTransitionTable, oldTransitionTable, forEachStatement, false, false);
+    }
+
+    public CreateTriggerStmt(
+            String name,
+            String timing,
+            List<String> events,
+            String table,
+            String schema,
+            String functionName,
+            boolean orReplace,
+            String whenClause,
+            List<String> updateOfColumns,
+            String newTransitionTable,
+            String oldTransitionTable,
+            boolean forEachStatement,
+            boolean deferrable,
+            boolean initiallyDeferred
+    ) {
         this.name = name;
         this.timing = timing;
         this.events = events;
@@ -46,6 +68,8 @@ public final class CreateTriggerStmt implements Statement {
         this.newTransitionTable = newTransitionTable;
         this.oldTransitionTable = oldTransitionTable;
         this.forEachStatement = forEachStatement;
+        this.deferrable = deferrable;
+        this.initiallyDeferred = initiallyDeferred;
     }
 
     /** Backward-compatible constructor without whenClause. */

@@ -25,8 +25,11 @@ class FromFunctionResolver {
         String rawFname = funcFrom.functionName().toLowerCase();
         String fname = rawFname.contains(".") ? rawFname.substring(rawFname.lastIndexOf('.') + 1) : rawFname;
         String alias = funcFrom.alias() != null ? funcFrom.alias() : fname;
-        List<String> colAliases = funcFrom.columnAliases();
+        List<String> rawColAliases = funcFrom.columnAliases();
+        // Strip type info from column aliases for most functions (jsonb_to_record/json_to_record use raw aliases)
+        List<String> colAliases = stripColTypes(rawColAliases);
         if (fname.equals("__json_table__")) return resolveJsonTable(funcFrom, alias);
+        if (fname.equals("__xmltable__")) return resolveXmlTable(funcFrom, alias);
         List<Object> evalArgs = new ArrayList<>();
         for (Expression arg : funcFrom.args()) {
             evalArgs.add(executor.evalExpr(arg, null));
@@ -40,7 +43,10 @@ class FromFunctionResolver {
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
             return resolveJsonEach(fname, alias, colAliases, evalArgs);
         if (fname.equals("jsonb_to_recordset") || fname.equals("json_to_recordset") || fname.equals("jsonb_to_record") || fname.equals("json_to_record"))
-            return resolveJsonToRecordset(alias, colAliases, evalArgs);
+            return resolveJsonToRecordset(alias, rawColAliases, evalArgs);
+        if (fname.equals("json_populate_recordset") || fname.equals("jsonb_populate_recordset")
+                || fname.equals("json_populate_record") || fname.equals("jsonb_populate_record"))
+            return resolveJsonPopulateRecordset(funcFrom, alias, colAliases, evalArgs);
         if (fname.equals("regexp_matches")) return resolveRegexpMatches(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_path_query")) return resolveJsonbPathQuery(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_array_elements") || fname.equals("json_array_elements") ||
@@ -54,6 +60,19 @@ class FromFunctionResolver {
         if (fname.equals("regexp_split_to_table")) return resolveRegexpSplitToTable(alias, colAliases, evalArgs);
         if (fname.startsWith("__tablesample__:")) return resolveTablesample(fname, alias, evalArgs);
         if (fname.equals("__rows_from__")) return resolveRowsFrom(funcFrom, alias, colAliases);
+        if (fname.equals("pg_create_logical_replication_slot")) return resolveCreateLogicalReplicationSlot(alias, colAliases, evalArgs);
+        if (fname.equals("pg_create_physical_replication_slot")) return resolveCreatePhysicalReplicationSlot(alias, colAliases, evalArgs);
+        if (fname.equals("pg_ls_dir")) return resolvePgLsDir(alias, colAliases);
+        if (fname.equals("pg_ls_logdir") || fname.equals("pg_ls_waldir") ||
+            fname.equals("pg_ls_tmpdir") || fname.equals("pg_ls_archive_statusdir"))
+            return resolvePgLsDirRecord(alias, colAliases);
+        if (fname.equals("pg_partition_tree")) return resolvePgPartitionTree(alias, colAliases, evalArgs);
+        if (fname.equals("pg_partition_ancestors")) return resolvePgPartitionAncestors(alias, colAliases, evalArgs);
+        if (fname.equals("jsonb_path_query_tz")) return resolveJsonbPathQuery(alias, colAliases, evalArgs);
+        if (fname.equals("ts_debug")) return resolveTsDebug(alias, colAliases, evalArgs);
+        if (fname.equals("ts_parse")) return resolveTsParse(alias, colAliases, evalArgs);
+        if (fname.equals("ts_token_type")) return resolveTsTokenType(alias, colAliases, evalArgs);
+        if (fname.equals("pg_listening_channels")) return resolvePgListeningChannels(alias);
 
         // Try user-defined function
         PgFunction userFunc = executor.database.getFunction(fname);
@@ -95,20 +114,26 @@ class FromFunctionResolver {
         long step = evalArgs.size() > 2 ? executor.toLong(evalArgs.get(2)) : 1;
 
         String colName = firstColAlias(colAliases, alias);
-        Column col = new Column(colName, DataType.INTEGER, true, false, null);
-        Table virtualTable = new Table(alias, Cols.listOf(col));
+        List<Column> cols = new ArrayList<>();
+        cols.add(new Column(colName, DataType.INTEGER, true, false, null));
+        boolean hasOrdinality = colAliases != null && colAliases.size() >= 2;
+        if (hasOrdinality) {
+            cols.add(new Column(colAliases.get(1), DataType.BIGINT, true, false, null));
+        }
+        Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
+        long ord = 1;
         if (step > 0) {
             for (long v = start; v <= stop; v += step) {
                 Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
-                Object[] row = new Object[]{val};
+                Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
             }
         } else if (step < 0) {
             for (long v = start; v >= stop; v += step) {
                 Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
-                Object[] row = new Object[]{val};
+                Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
             }
@@ -284,7 +309,7 @@ class FromFunctionResolver {
                 new Column("source", DataType.TEXT, true, false, null),
                 new Column("min_val", DataType.TEXT, true, false, null),
                 new Column("max_val", DataType.TEXT, true, false, null),
-                new Column("enumvals", DataType.TEXT, true, false, null),
+                new Column("enumvals", DataType.TEXT_ARRAY, true, false, null),
                 new Column("boot_val", DataType.TEXT, true, false, null),
                 new Column("reset_val", DataType.TEXT, true, false, null),
                 new Column("sourcefile", DataType.TEXT, true, false, null),
@@ -457,7 +482,17 @@ class FromFunctionResolver {
         List<Column> cols = new ArrayList<>();
         if (colAliases != null) {
             for (String ca : colAliases) {
-                cols.add(new Column(ca, DataType.TEXT, true, false, null));
+                // Column alias may contain type info: "name type" e.g. "a int"
+                int spaceIdx = ca.indexOf(' ');
+                if (spaceIdx > 0) {
+                    String colName = ca.substring(0, spaceIdx);
+                    String typeName = ca.substring(spaceIdx + 1).trim();
+                    DataType dt = DataType.fromPgName(typeName);
+                    if (dt == null) dt = DataType.TEXT;
+                    cols.add(new Column(colName, dt, true, false, null));
+                } else {
+                    cols.add(new Column(ca, DataType.TEXT, true, false, null));
+                }
             }
         }
         if (cols.isEmpty()) cols.add(new Column("value", DataType.TEXT, true, false, null));
@@ -499,6 +534,103 @@ class FromFunctionResolver {
                         if (extracted.equals("true")) extracted = "t";
                         else if (extracted.equals("false")) extracted = "f";
                         else if (extracted.equals("null")) extracted = null;
+                    }
+                    if (extracted != null) {
+                        DataType colDt = cols.get(ci).getType();
+                        if (colDt == DataType.INTEGER || colDt == DataType.BIGINT || colDt == DataType.SMALLINT) {
+                            try { row[ci] = Long.parseLong(extracted); } catch (NumberFormatException e) { row[ci] = extracted; }
+                        } else if (colDt == DataType.NUMERIC || colDt == DataType.DOUBLE_PRECISION || colDt == DataType.REAL) {
+                            try { row[ci] = new java.math.BigDecimal(extracted); } catch (NumberFormatException e) { row[ci] = extracted; }
+                        } else if (colDt == DataType.BOOLEAN) {
+                            row[ci] = "t".equals(extracted) || "true".equalsIgnoreCase(extracted);
+                        } else {
+                            row[ci] = extracted;
+                        }
+                    } else {
+                        row[ci] = null;
+                    }
+                }
+                virtualTable.insertRow(row);
+                contexts.add(new RowContext(virtualTable, alias, row));
+            }
+        }
+        return contexts;
+    }
+
+    // ---- json_populate_recordset / jsonb_populate_recordset ----
+
+    private List<RowContext> resolveJsonPopulateRecordset(SelectStmt.FunctionFrom funcFrom,
+            String alias, List<String> colAliases, List<Object> evalArgs) {
+        // First arg defines the composite type (e.g. NULL::my_type)
+        // Extract composite type name from the CastExpr in the first argument
+        List<Column> cols = new ArrayList<>();
+        if (funcFrom.args().size() >= 1 && funcFrom.args().get(0) instanceof CastExpr) {
+            String typeName = ((CastExpr) funcFrom.args().get(0)).typeName().toLowerCase();
+            List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+            if (fields != null) {
+                for (CreateTypeStmt.CompositeField field : fields) {
+                    DataType dt = DataType.fromPgName(field.typeName());
+                    cols.add(new Column(field.name(), dt != null ? dt : DataType.TEXT, true, false, null));
+                }
+            } else {
+                // Fall back to table columns (PG treats table types as composite types)
+                Table tbl = executor.database.getTable(typeName);
+                if (tbl != null) {
+                    for (Column c : tbl.getColumns()) {
+                        cols.add(new Column(c.getName(), c.getType(), true, false, null));
+                    }
+                }
+            }
+        }
+        if (cols.isEmpty() && colAliases != null) {
+            for (String ca : colAliases) {
+                cols.add(new Column(ca, DataType.TEXT, true, false, null));
+            }
+        }
+        if (cols.isEmpty()) cols.add(new Column("value", DataType.TEXT, true, false, null));
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+        Object jsonVal = evalArgs.size() > 1 ? evalArgs.get(1) : null;
+        if (jsonVal != null) {
+            String json = jsonVal.toString().trim();
+            List<String> jsonObjects = new ArrayList<>();
+            if (json.startsWith("[")) {
+                // Array of objects
+                json = json.substring(1, json.length() - 1).trim();
+                int depth = 0;
+                StringBuilder current = new StringBuilder();
+                for (char c : json.toCharArray()) {
+                    if (c == '{') depth++;
+                    if (c == '}') depth--;
+                    current.append(c);
+                    if (depth == 0 && current.length() > 0) {
+                        String s = current.toString().trim();
+                        if (!s.isEmpty() && !s.equals(",")) jsonObjects.add(s);
+                        current = new StringBuilder();
+                    }
+                    if (c == ',' && depth == 0) current = new StringBuilder();
+                }
+                if (current.length() > 0) {
+                    String s = current.toString().trim();
+                    if (!s.isEmpty() && !s.equals(",")) jsonObjects.add(s);
+                }
+            } else if (json.startsWith("{")) {
+                jsonObjects.add(json);
+            }
+            for (String obj : jsonObjects) {
+                if (obj.isEmpty() || obj.equals(",")) continue;
+                Object[] row = new Object[cols.size()];
+                for (int ci = 0; ci < cols.size(); ci++) {
+                    String key = cols.get(ci).getName();
+                    String extracted = JsonOperations.extractKey(obj, key);
+                    if (extracted != null) {
+                        extracted = extracted.trim();
+                        if (extracted.startsWith("\"") && extracted.endsWith("\"")) {
+                            extracted = extracted.substring(1, extracted.length() - 1);
+                        }
+                        if (extracted.equals("null")) extracted = null;
+                        else if (extracted.equals("true")) extracted = "t";
+                        else if (extracted.equals("false")) extracted = "f";
                     }
                     row[ci] = extracted;
                 }
@@ -769,6 +901,14 @@ class FromFunctionResolver {
     // ---- User-defined functions ----
 
     private List<RowContext> resolveUserFunction(PgFunction userFunc, String alias, List<String> colAliases, List<Object> evalArgs) {
+        // STRICT: return empty set if any argument is NULL (PG returns empty set for strict SRFs)
+        if (userFunc.isStrict()) {
+            for (Object arg : evalArgs) {
+                if (arg == null) {
+                    return Collections.emptyList();
+                }
+            }
+        }
         com.memgres.engine.plpgsql.PlpgsqlExecutor plExec = new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
         Object result = plExec.executeFunction(userFunc, evalArgs);
         if (result instanceof List<?>) {
@@ -780,20 +920,52 @@ class FromFunctionResolver {
             if (returnType != null && returnType.toUpperCase().startsWith("SETOF ")) {
                 String refTable = returnType.substring(6).trim();
                 if (!"record".equalsIgnoreCase(refTable)) {
-                    try {
-                        Table sourceTable = executor.resolveTable("public", refTable);
-                        if (sourceTable != null) {
-                            cols.addAll(sourceTable.getColumns());
+                    // Try composite type first
+                    List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> ctFields =
+                            executor.database.getCompositeType(refTable);
+                    if (ctFields != null) {
+                        for (com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f : ctFields) {
+                            DataType dt = DataType.fromPgName(f.typeName());
+                            if (dt == null) dt = DataType.TEXT;
+                            cols.add(new Column(f.name(), dt, true, false, null));
                         }
-                    } catch (Exception e) {
-                        // Not a table, use single column
+                    } else {
+                        try {
+                            Table sourceTable = executor.resolveTable("public", refTable);
+                            if (sourceTable != null) {
+                                cols.addAll(sourceTable.getColumns());
+                            }
+                        } catch (Exception e) {
+                            // Not a table, use single column
+                        }
                     }
                 }
             }
 
             Table virtualTable;
             List<RowContext> contexts = new ArrayList<>();
-            if (!resultList.isEmpty() && resultList.get(0) instanceof Object[]) {
+            if (!resultList.isEmpty() && resultList.get(0) instanceof Map) {
+                // Composite record results (Map from PL/pgSQL composite type assignments)
+                if (cols.isEmpty()) {
+                    // Infer columns from the first Map's keys
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> firstMap = (Map<String, Object>) resultList.get(0);
+                    for (String key : firstMap.keySet()) {
+                        cols.add(new Column(key, DataType.TEXT, true, false, null));
+                    }
+                }
+                virtualTable = new Table(alias, cols);
+                for (Object item : resultList) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> map = (Map<String, Object>) item;
+                    Object[] rowArr = new Object[cols.size()];
+                    for (int i = 0; i < cols.size(); i++) {
+                        rowArr[i] = map.get(cols.get(i).getName().toLowerCase());
+                    }
+                    virtualTable.insertRow(rowArr);
+                    contexts.add(new RowContext(virtualTable, alias, rowArr));
+                }
+            } else if (!resultList.isEmpty() && resultList.get(0) instanceof Object[]) {
                 Object[] firstRow = (Object[]) resultList.get(0);
                 if (cols.isEmpty() && colAliases != null && !colAliases.isEmpty()) {
                     for (int i = 0; i < colAliases.size(); i++) {
@@ -902,7 +1074,24 @@ class FromFunctionResolver {
     // ---- Shared helpers ----
 
     private static String firstColAlias(List<String> colAliases, String fallback) {
-        return (colAliases != null && !colAliases.isEmpty()) ? colAliases.get(0) : fallback;
+        return (colAliases != null && !colAliases.isEmpty()) ? stripColType(colAliases.get(0)) : fallback;
+    }
+
+    /** Strip type information from a column alias like "id integer" -> "id". */
+    static String stripColType(String alias) {
+        if (alias == null) return null;
+        int sp = alias.indexOf(' ');
+        return sp > 0 ? alias.substring(0, sp) : alias;
+    }
+
+    /** Strip type info from all column aliases. */
+    static List<String> stripColTypes(List<String> colAliases) {
+        if (colAliases == null) return null;
+        List<String> result = new ArrayList<>();
+        for (String ca : colAliases) {
+            result.add(stripColType(ca));
+        }
+        return result;
     }
 
     /**
@@ -1172,5 +1361,299 @@ class FromFunctionResolver {
         }
         if ("null".equals(val)) return null;
         return val;
+    }
+
+    // ---- pg_create_logical_replication_slot ----
+
+    private List<RowContext> resolveCreateLogicalReplicationSlot(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.size() < 2) throw new MemgresException("function pg_create_logical_replication_slot requires at least 2 arguments", "42883");
+        String slotName = String.valueOf(evalArgs.get(0));
+        String plugin = String.valueOf(evalArgs.get(1));
+        // Create the slot in the database
+        executor.database.addReplicationSlot(new Database.ReplicationSlot(slotName, plugin, "logical"));
+        // Return a single row with (slot_name text, lsn pg_lsn)
+        String c1 = colAliases != null && colAliases.size() > 0 ? colAliases.get(0) : "slot_name";
+        String c2 = colAliases != null && colAliases.size() > 1 ? colAliases.get(1) : "lsn";
+        Column col1 = new Column(c1, DataType.TEXT, true, false, null);
+        Column col2 = new Column(c2, DataType.TEXT, true, false, null);
+        Table virtualTable = new Table(alias, Cols.listOf(col1, col2));
+        Object[] row = new Object[]{slotName, "0/0"};
+        virtualTable.insertRow(row);
+        List<RowContext> contexts = new ArrayList<>();
+        contexts.add(new RowContext(virtualTable, alias, row));
+        return contexts;
+    }
+
+    private List<RowContext> resolveCreatePhysicalReplicationSlot(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.isEmpty()) throw new MemgresException("function pg_create_physical_replication_slot requires at least 1 argument", "42883");
+        String slotName = String.valueOf(evalArgs.get(0));
+        executor.database.addReplicationSlot(new Database.ReplicationSlot(slotName, null, "physical"));
+        String c1 = colAliases != null && colAliases.size() > 0 ? colAliases.get(0) : "slot_name";
+        String c2 = colAliases != null && colAliases.size() > 1 ? colAliases.get(1) : "lsn";
+        Column col1 = new Column(c1, DataType.TEXT, true, false, null);
+        Column col2 = new Column(c2, DataType.TEXT, true, false, null);
+        Table virtualTable = new Table(alias, Cols.listOf(col1, col2));
+        Object[] row = new Object[]{slotName, null};
+        virtualTable.insertRow(row);
+        List<RowContext> contexts = new ArrayList<>();
+        contexts.add(new RowContext(virtualTable, alias, row));
+        return contexts;
+    }
+
+    // ---- pg_ls_dir (set of text, stub returns empty) ----
+
+    private List<RowContext> resolvePgLsDir(String alias, List<String> colAliases) {
+        String colName = colAliases != null && !colAliases.isEmpty() ? colAliases.get(0) : "pg_ls_dir";
+        Column col = new Column(colName, DataType.TEXT, true, false, null);
+        Table virtualTable = new Table(alias, Cols.listOf(col));
+        return new ArrayList<>();
+    }
+
+    // ---- pg_ls_logdir / pg_ls_waldir / pg_ls_tmpdir / pg_ls_archive_statusdir ----
+    // Returns set of (name text, size bigint, modification timestamptz) — empty stub
+
+    private List<RowContext> resolvePgLsDirRecord(String alias, List<String> colAliases) {
+        String c1 = colAliases != null && colAliases.size() > 0 ? colAliases.get(0) : "name";
+        String c2 = colAliases != null && colAliases.size() > 1 ? colAliases.get(1) : "size";
+        String c3 = colAliases != null && colAliases.size() > 2 ? colAliases.get(2) : "modification";
+        List<Column> cols = Cols.listOf(
+                new Column(c1, DataType.TEXT, true, false, null),
+                new Column(c2, DataType.BIGINT, true, false, null),
+                new Column(c3, DataType.TIMESTAMPTZ, true, false, null)
+        );
+        Table virtualTable = new Table(alias, cols);
+        return new ArrayList<>();
+    }
+
+    // ---- pg_partition_tree(regclass) ----
+    // Returns set of (relid regclass, parentrelid regclass, isleaf boolean, level int)
+
+    private List<RowContext> resolvePgPartitionTree(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.isEmpty() || evalArgs.get(0) == null) return new ArrayList<>();
+        String tableName = evalArgs.get(0).toString();
+        Table rootTable = executor.resolveTableAnySchema(tableName);
+        if (rootTable == null) {
+            throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+        }
+
+        String c1 = colAliases != null && colAliases.size() > 0 ? colAliases.get(0) : "relid";
+        String c2 = colAliases != null && colAliases.size() > 1 ? colAliases.get(1) : "parentrelid";
+        String c3 = colAliases != null && colAliases.size() > 2 ? colAliases.get(2) : "isleaf";
+        String c4 = colAliases != null && colAliases.size() > 3 ? colAliases.get(3) : "level";
+        List<Column> cols = Cols.listOf(
+                new Column(c1, DataType.TEXT, true, false, null),
+                new Column(c2, DataType.TEXT, true, false, null),
+                new Column(c3, DataType.BOOLEAN, true, false, null),
+                new Column(c4, DataType.INTEGER, true, false, null)
+        );
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+
+        // Recursively collect partition tree
+        collectPartitionTree(rootTable, null, 0, virtualTable, alias, contexts);
+        return contexts;
+    }
+
+    private void collectPartitionTree(Table table, String parentName, int level,
+                                       Table virtualTable, String alias, List<RowContext> contexts) {
+        String name = table.getName();
+        List<Table> partitions = table.getPartitions();
+        boolean isLeaf = partitions == null || partitions.isEmpty();
+        Object[] row = new Object[]{name, parentName, isLeaf, level};
+        virtualTable.insertRow(row);
+        contexts.add(new RowContext(virtualTable, alias, row));
+        if (!isLeaf) {
+            for (Table child : partitions) {
+                collectPartitionTree(child, name, level + 1, virtualTable, alias, contexts);
+            }
+        }
+    }
+
+    // ---- pg_partition_ancestors(regclass) ----
+    // Returns set of regclass (the table itself and all its ancestors up to the root)
+
+    private List<RowContext> resolvePgPartitionAncestors(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.isEmpty() || evalArgs.get(0) == null) return new ArrayList<>();
+        String tableName = evalArgs.get(0).toString();
+        Table table = executor.resolveTableAnySchema(tableName);
+        if (table == null) {
+            throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+        }
+
+        String colName = colAliases != null && !colAliases.isEmpty() ? colAliases.get(0) : "pg_partition_ancestors";
+        Column col = new Column(colName, DataType.TEXT, true, false, null);
+        Table virtualTable = new Table(alias, Cols.listOf(col));
+        List<RowContext> contexts = new ArrayList<>();
+
+        // Walk up the partition hierarchy
+        Table current = table;
+        while (current != null) {
+            Object[] row = new Object[]{current.getName()};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
+            current = current.getPartitionParent();
+        }
+        return contexts;
+    }
+
+    // ---- pg_listening_channels ----
+
+    private List<RowContext> resolvePgListeningChannels(String alias) {
+        Column col = new Column(alias, DataType.TEXT, true, false, null);
+        Table virtualTable = new Table(alias, Cols.listOf(col));
+        List<RowContext> contexts = new ArrayList<>();
+        if (executor.session != null) {
+            List<?> channels = executor.database.getNotificationManager()
+                    .getListeningChannels(executor.session);
+            if (channels != null) {
+                for (Object ch : channels) {
+                    Object[] row = new Object[]{ch != null ? ch.toString() : null};
+                    virtualTable.insertRow(row);
+                    contexts.add(new RowContext(virtualTable, alias, row));
+                }
+            }
+        }
+        return contexts;
+    }
+
+    // ---- ts_debug ----
+
+    private List<RowContext> resolveTsDebug(String alias, List<String> colAliases, List<Object> evalArgs) {
+        String config = "english";
+        String input;
+        if (evalArgs.size() >= 2) {
+            config = String.valueOf(evalArgs.get(0));
+            input = String.valueOf(evalArgs.get(1));
+        } else {
+            input = String.valueOf(evalArgs.get(0));
+        }
+        List<Object[]> debugRows = TextSearchOperations.tsDebug(input);
+        List<Column> cols = Cols.listOf(
+                new Column("alias", DataType.TEXT, true, false, null),
+                new Column("description", DataType.TEXT, true, false, null),
+                new Column("token", DataType.TEXT, true, false, null),
+                new Column("dictionaries", DataType.TEXT, true, false, null),
+                new Column("dictionary", DataType.TEXT, true, false, null),
+                new Column("lexemes", DataType.TEXT, true, false, null)
+        );
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+        for (Object[] dr : debugRows) {
+            Object[] row = new Object[]{dr[0], dr[1], dr[2], "{" + dr[3] + "}", dr[3], "{" + dr[5] + "}"};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
+        }
+        return contexts;
+    }
+
+    // ---- ts_parse ----
+
+    private List<RowContext> resolveTsParse(String alias, List<String> colAliases, List<Object> evalArgs) {
+        String parserName = String.valueOf(evalArgs.get(0));
+        String text = String.valueOf(evalArgs.get(1));
+        List<Object[]> tokens = TextSearchOperations.tsParse(parserName, text);
+        List<Column> cols = Cols.listOf(
+                new Column("tokid", DataType.INTEGER, true, false, null),
+                new Column("token", DataType.TEXT, true, false, null)
+        );
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+        for (Object[] t : tokens) {
+            Object[] row = new Object[]{t[0], t[1]};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
+        }
+        return contexts;
+    }
+
+    // ---- ts_token_type ----
+
+    private List<RowContext> resolveTsTokenType(String alias, List<String> colAliases, List<Object> evalArgs) {
+        String parserName = evalArgs.isEmpty() ? "default" : String.valueOf(evalArgs.get(0));
+        List<Object[]> types = TextSearchOperations.tsTokenType(parserName);
+        List<Column> cols = Cols.listOf(
+                new Column("tokid", DataType.INTEGER, true, false, null),
+                new Column("alias", DataType.TEXT, true, false, null),
+                new Column("description", DataType.TEXT, true, false, null)
+        );
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+        for (Object[] t : types) {
+            Object[] row = new Object[]{t[0], t[1], t[2]};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
+        }
+        return contexts;
+    }
+
+    // ---- XMLTABLE ----
+
+    private List<RowContext> resolveXmlTable(SelectStmt.FunctionFrom funcFrom, String alias) {
+        List<Expression> args = funcFrom.args();
+        if (args.size() < 2) return new ArrayList<>();
+
+        // args[0] = xpath expression, args[1] = xml document, args[2..] = column definitions
+        String xpath = executor.evalExpr(args.get(0), null).toString();
+        Object xmlObj = executor.evalExpr(args.get(1), null);
+        String xmlStr = xmlObj != null ? xmlObj.toString() : "";
+
+        // Parse column definitions from args[2..]
+        List<String> colNames = new ArrayList<>();
+        List<String> colTypes = new ArrayList<>();
+        List<String> colPaths = new ArrayList<>();
+        for (int i = 2; i < args.size(); i++) {
+            String def = args.get(i) instanceof com.memgres.engine.parser.ast.Literal
+                    ? ((com.memgres.engine.parser.ast.Literal) args.get(i)).value()
+                    : executor.evalExpr(args.get(i), null).toString();
+            String[] parts = def.split(":", 3);
+            colNames.add(parts[0]);
+            colTypes.add(parts.length > 1 ? parts[1] : "text");
+            colPaths.add(parts.length > 2 ? parts[2] : parts[0]);
+        }
+
+        // Use Java XPath to evaluate
+        List<RowContext> contexts = new ArrayList<>();
+        try {
+            javax.xml.parsers.DocumentBuilderFactory factory = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            javax.xml.parsers.DocumentBuilder builder = factory.newDocumentBuilder();
+            org.w3c.dom.Document doc = builder.parse(new org.xml.sax.InputSource(new java.io.StringReader(xmlStr)));
+            javax.xml.xpath.XPathFactory xpathFactory = javax.xml.xpath.XPathFactory.newInstance();
+            javax.xml.xpath.XPath xp = xpathFactory.newXPath();
+            org.w3c.dom.NodeList rows = (org.w3c.dom.NodeList) xp.evaluate(xpath, doc, javax.xml.xpath.XPathConstants.NODESET);
+
+            List<Column> cols = new ArrayList<>();
+            for (int i = 0; i < colNames.size(); i++) {
+                DataType dt = DataType.fromPgName(colTypes.get(i));
+                cols.add(new Column(colNames.get(i), dt != null ? dt : DataType.TEXT, true, false, null));
+            }
+            Table virtualTable = new Table("__xmltable__", cols);
+
+            for (int r = 0; r < rows.getLength(); r++) {
+                org.w3c.dom.Node rowNode = rows.item(r);
+                Object[] rowVals = new Object[colNames.size()];
+                for (int c = 0; c < colNames.size(); c++) {
+                    String colPath = colPaths.get(c);
+                    try {
+                        String val = xp.evaluate(colPath, rowNode);
+                        if (val != null && !val.isEmpty()) {
+                            DataType dt = DataType.fromPgName(colTypes.get(c));
+                            if (dt == DataType.INTEGER || dt == DataType.SMALLINT || dt == DataType.BIGINT) {
+                                rowVals[c] = Integer.parseInt(val.trim());
+                            } else {
+                                rowVals[c] = val;
+                            }
+                        }
+                    } catch (Exception e) {
+                        rowVals[c] = null;
+                    }
+                }
+                virtualTable.insertRow(rowVals);
+                contexts.add(new RowContext(virtualTable, alias, rowVals));
+            }
+        } catch (Exception e) {
+            throw new MemgresException("XMLTABLE evaluation error: " + e.getMessage(), "42000");
+        }
+        return contexts;
     }
 }

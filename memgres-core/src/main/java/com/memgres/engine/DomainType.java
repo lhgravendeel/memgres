@@ -49,7 +49,11 @@ public class DomainType {
     }
 
     public void addConstraint(String constraintName, String rawCheckExpr, Expression parsedCheckExpr) {
-        namedConstraints.add(new NamedConstraint(constraintName, rawCheckExpr, parsedCheckExpr));
+        namedConstraints.add(new NamedConstraint(constraintName, rawCheckExpr, parsedCheckExpr, true));
+    }
+
+    public void addConstraint(String constraintName, String rawCheckExpr, Expression parsedCheckExpr, boolean validated) {
+        namedConstraints.add(new NamedConstraint(constraintName, rawCheckExpr, parsedCheckExpr, validated));
     }
 
     public void removeConstraint(String constraintName) {
@@ -62,19 +66,28 @@ public class DomainType {
 
     /** A named CHECK constraint on a domain. */
         public static final class NamedConstraint {
-        public final String name;
+        private String name;
         public final String rawCheckExpr;
         public final Expression parsedCheck;
+        private boolean validated;
 
         public NamedConstraint(String name, String rawCheckExpr, Expression parsedCheck) {
+            this(name, rawCheckExpr, parsedCheck, true);
+        }
+
+        public NamedConstraint(String name, String rawCheckExpr, Expression parsedCheck, boolean validated) {
             this.name = name;
             this.rawCheckExpr = rawCheckExpr;
             this.parsedCheck = parsedCheck;
+            this.validated = validated;
         }
 
         public String name() { return name; }
+        public void setName(String name) { this.name = name; }
         public String rawCheckExpr() { return rawCheckExpr; }
         public Expression parsedCheck() { return parsedCheck; }
+        public boolean isValidated() { return validated; }
+        public void setValidated(boolean validated) { this.validated = validated; }
 
         @Override
         public boolean equals(Object o) {

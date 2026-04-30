@@ -24,6 +24,7 @@ public final class ColumnDef {
     public final boolean deferrable;             // DEFERRABLE on column-level FK
     public final boolean initiallyDeferred;      // INITIALLY DEFERRED on column-level FK
     public final boolean notEnforced;            // PG 18: NOT ENFORCED on column-level FK
+    public final String refMatchType;           // FK MATCH type: null, "FULL", "SIMPLE", "PARTIAL"
     public final Expression checkConstraintExpr; // or null
 
     public ColumnDef(
@@ -49,6 +50,35 @@ public final class ColumnDef {
             boolean notEnforced,
             Expression checkConstraintExpr
     ) {
+        this(name, typeName, precision, scale, notNull, primaryKey, unique,
+                defaultExpr, referencesTable, referencesColumn, generatedExpr, generatedVirtual, identity,
+                refOnDelete, refOnUpdate, identityStart, identityIncrement, deferrable, initiallyDeferred, notEnforced, null, checkConstraintExpr);
+    }
+
+    public ColumnDef(
+            String name,
+            String typeName,
+            Integer precision,
+            Integer scale,
+            boolean notNull,
+            boolean primaryKey,
+            boolean unique,
+            Expression defaultExpr,
+            String referencesTable,
+            String referencesColumn,
+            String generatedExpr,
+            boolean generatedVirtual,
+            String identity,
+            String refOnDelete,
+            String refOnUpdate,
+            Long identityStart,
+            Long identityIncrement,
+            boolean deferrable,
+            boolean initiallyDeferred,
+            boolean notEnforced,
+            String refMatchType,
+            Expression checkConstraintExpr
+    ) {
         this.name = name;
         this.typeName = typeName;
         this.precision = precision;
@@ -69,6 +99,7 @@ public final class ColumnDef {
         this.deferrable = deferrable;
         this.initiallyDeferred = initiallyDeferred;
         this.notEnforced = notEnforced;
+        this.refMatchType = refMatchType;
         this.checkConstraintExpr = checkConstraintExpr;
     }
 
@@ -154,6 +185,7 @@ public final class ColumnDef {
     public boolean deferrable() { return deferrable; }
     public boolean initiallyDeferred() { return initiallyDeferred; }
     public boolean notEnforced() { return notEnforced; }
+    public String refMatchType() { return refMatchType; }
     public Expression checkConstraintExpr() { return checkConstraintExpr; }
 
     @Override

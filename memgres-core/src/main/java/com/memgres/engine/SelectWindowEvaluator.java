@@ -435,7 +435,19 @@ class SelectWindowEvaluator {
                     if (wf.args().size() > 2) defaultVal = executor.evalExpr(wf.args().get(2), null);
                     Expression arg = wf.args().get(0);
                     for (int i = 0; i < sortedPartition.size(); i++) {
-                        if (i - offset >= 0) {
+                        if (wf.ignoreNulls()) {
+                            // IGNORE NULLS: search backwards from current position for nth non-null
+                            Object found = defaultVal;
+                            int remaining = offset;
+                            for (int j = i - 1; j >= 0; j--) {
+                                Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(j)));
+                                if (val != null) {
+                                    remaining--;
+                                    if (remaining == 0) { found = val; break; }
+                                }
+                            }
+                            results[sortedPartition.get(i)] = found;
+                        } else if (i - offset >= 0) {
                             results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(i - offset)));
                         } else {
                             results[sortedPartition.get(i)] = defaultVal;
@@ -453,7 +465,19 @@ class SelectWindowEvaluator {
                     if (wf.args().size() > 2) defaultVal = executor.evalExpr(wf.args().get(2), null);
                     Expression arg = wf.args().get(0);
                     for (int i = 0; i < sortedPartition.size(); i++) {
-                        if (i + offset < sortedPartition.size()) {
+                        if (wf.ignoreNulls()) {
+                            // IGNORE NULLS: search forwards from current position for nth non-null
+                            Object found = defaultVal;
+                            int remaining = offset;
+                            for (int j = i + 1; j < sortedPartition.size(); j++) {
+                                Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(j)));
+                                if (val != null) {
+                                    remaining--;
+                                    if (remaining == 0) { found = val; break; }
+                                }
+                            }
+                            results[sortedPartition.get(i)] = found;
+                        } else if (i + offset < sortedPartition.size()) {
                             results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(i + offset)));
                         } else {
                             results[sortedPartition.get(i)] = defaultVal;
@@ -463,10 +487,22 @@ class SelectWindowEvaluator {
                 }
                 case "first_value": {
                     Expression arg = wf.args().get(0);
-                    Object firstVal = sortedPartition.isEmpty() ? null :
-                            executor.evalExpr(arg, contexts.get(sortedPartition.get(0)));
-                    for (int idx : sortedPartition) {
-                        results[idx] = firstVal;
+                    if (wf.ignoreNulls()) {
+                        // IGNORE NULLS: find first non-null value in partition
+                        Object firstNonNull = null;
+                        for (int idx : sortedPartition) {
+                            Object val = executor.evalExpr(arg, contexts.get(idx));
+                            if (val != null) { firstNonNull = val; break; }
+                        }
+                        for (int idx : sortedPartition) {
+                            results[idx] = firstNonNull;
+                        }
+                    } else {
+                        Object firstVal = sortedPartition.isEmpty() ? null :
+                                executor.evalExpr(arg, contexts.get(sortedPartition.get(0)));
+                        for (int idx : sortedPartition) {
+                            results[idx] = firstVal;
+                        }
                     }
                     break;
                 }
@@ -507,11 +543,43 @@ class SelectWindowEvaluator {
                         }
                         frameStart = Math.max(0, frameStart);
                         frameEnd = Math.min(sortedPartition.size() - 1, frameEnd);
-                        int frameSize = frameEnd - frameStart + 1;
-                        if (nth >= 1 && nth <= frameSize) {
-                            results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameStart + nth - 1)));
+                        if (wf.ignoreNulls()) {
+                            // IGNORE NULLS: find the nth non-null value in frame
+                            int count = 0;
+                            Object found = null;
+                            if (wf.fromLast()) {
+                                for (int fi = frameEnd; fi >= frameStart; fi--) {
+                                    Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
+                                    if (val != null) {
+                                        count++;
+                                        if (count == nth) { found = val; break; }
+                                    }
+                                }
+                            } else {
+                                for (int fi = frameStart; fi <= frameEnd; fi++) {
+                                    Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
+                                    if (val != null) {
+                                        count++;
+                                        if (count == nth) { found = val; break; }
+                                    }
+                                }
+                            }
+                            results[sortedPartition.get(i)] = found;
+                        } else if (wf.fromLast()) {
+                            // FROM LAST: count from end of frame
+                            int frameSize = frameEnd - frameStart + 1;
+                            if (nth >= 1 && nth <= frameSize) {
+                                results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameEnd - nth + 1)));
+                            } else {
+                                results[sortedPartition.get(i)] = null;
+                            }
                         } else {
-                            results[sortedPartition.get(i)] = null;
+                            int frameSize = frameEnd - frameStart + 1;
+                            if (nth >= 1 && nth <= frameSize) {
+                                results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameStart + nth - 1)));
+                            } else {
+                                results[sortedPartition.get(i)] = null;
+                            }
                         }
                     }
                     break;
@@ -565,7 +633,9 @@ class SelectWindowEvaluator {
                 frameRows.add(contexts.get(sortedPartition.get(fi)));
             }
 
-            FunctionCallExpr fn = new FunctionCallExpr(funcName, wf.args(), wf.distinct(), wf.star());
+            FunctionCallExpr fn = wf.filter() != null
+                    ? new FunctionCallExpr(funcName, wf.args(), wf.distinct(), wf.star(), null, wf.filter())
+                    : new FunctionCallExpr(funcName, wf.args(), wf.distinct(), wf.star());
             Object val = select.aggregateEvaluator.evalAggregate(fn, frameRows);
             // If no rows in frame after exclusion, aggregate should be NULL (not 0)
             if (frameRows.isEmpty()) val = null;

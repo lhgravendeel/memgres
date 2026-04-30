@@ -538,18 +538,25 @@ public final class SelectStmt implements Statement {
      */
         public static final class WindowDef {
         public final String name;
+        public final String refName; // base window name for inheritance (e.g., w2 AS (w1 ORDER BY ...))
         public final List<Expression> partitionBy;
         public final List<OrderByItem> orderBy;
         public final WindowFuncExpr.FrameClause frame;
 
         public WindowDef(String name, List<Expression> partitionBy, List<OrderByItem> orderBy, WindowFuncExpr.FrameClause frame) {
+            this(name, null, partitionBy, orderBy, frame);
+        }
+
+        public WindowDef(String name, String refName, List<Expression> partitionBy, List<OrderByItem> orderBy, WindowFuncExpr.FrameClause frame) {
             this.name = name;
+            this.refName = refName;
             this.partitionBy = partitionBy;
             this.orderBy = orderBy;
             this.frame = frame;
         }
 
         public String name() { return name; }
+        public String refName() { return refName; }
         public List<Expression> partitionBy() { return partitionBy; }
         public List<OrderByItem> orderBy() { return orderBy; }
         public WindowFuncExpr.FrameClause frame() { return frame; }
@@ -560,6 +567,7 @@ public final class SelectStmt implements Statement {
             if (o == null || getClass() != o.getClass()) return false;
             WindowDef that = (WindowDef) o;
             return java.util.Objects.equals(name, that.name)
+                && java.util.Objects.equals(refName, that.refName)
                 && java.util.Objects.equals(partitionBy, that.partitionBy)
                 && java.util.Objects.equals(orderBy, that.orderBy)
                 && java.util.Objects.equals(frame, that.frame);
@@ -567,12 +575,12 @@ public final class SelectStmt implements Statement {
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(name, partitionBy, orderBy, frame);
+            return java.util.Objects.hash(name, refName, partitionBy, orderBy, frame);
         }
 
         @Override
         public String toString() {
-            return "WindowDef[name=" + name + ", " + "partitionBy=" + partitionBy + ", " + "orderBy=" + orderBy + ", " + "frame=" + frame + "]";
+            return "WindowDef[name=" + name + ", " + "refName=" + refName + ", " + "partitionBy=" + partitionBy + ", " + "orderBy=" + orderBy + ", " + "frame=" + frame + "]";
         }
     }
 

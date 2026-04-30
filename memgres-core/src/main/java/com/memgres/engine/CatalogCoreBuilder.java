@@ -85,12 +85,14 @@ class CatalogCoreBuilder {
             "pg_subscription_rel", "pg_tablespace", "pg_transform",
             "pg_ts_config", "pg_ts_config_map", "pg_ts_dict", "pg_ts_parser",
             "pg_ts_template", "pg_user_mapping",
+            "pg_parameter_acl",
             "pg_stat_all_indexes", "pg_stat_all_tables",
             "pg_stat_bgwriter", "pg_stat_database",
             "pg_statio_all_indexes", "pg_statio_all_sequences",
             "pg_statio_all_tables", "pg_stat_replication",
             "pg_stat_wal_receiver", "pg_stat_xact_all_tables",
             "pg_stat_xact_user_tables",
+            "pg_replication_slots",
             // System indexes (PG includes indexes in pg_class)
             "pg_type_oid_index", "pg_attribute_relid_attnum_index",
             "pg_proc_oid_index", "pg_class_oid_index",
@@ -160,13 +162,13 @@ class CatalogCoreBuilder {
                         tblOid,          // relfilenode
                         0,               // reltablespace
                         0, (double) t.getRows().size(), 0, 0, 0, // relpages, reltuples, relallvisible, relallfrozen, reltoastrelid
-                        hasIdx, false, "p", relkind,          // relhasindex, relisshared, relpersistence, relkind
+                        hasIdx, false, t.isUnlogged() ? "u" : "p", relkind,          // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
-                        false, hasTriggers, false, false, false, // relhasrules..relforcerowsecurity
+                        false, hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
                         false,              // relhasoids
-                        true, "d", relispartition, // relispopulated, relreplident, relispartition
+                        true, String.valueOf(t.getReplicaIdentity()), relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid
-                        null, null, relpartbound, 1 // relacl, reloptions, relpartbound, xmin
+                        buildRelacl(t.getName()), buildTableReloptions(t), relpartbound, 1 // relacl, reloptions, relpartbound, xmin
                 });
             }
         }
@@ -193,7 +195,7 @@ class CatalogCoreBuilder {
                     vOid, vd.name(), oids.oid("ns:" + vSchema),
                     0, 0, viewOwnerOid, 0, vOid, 0,
                     0, 0.0, 0, 0, 0,
-                    false, false, "p", "v",
+                    false, false, "p", vd.materialized() ? "m" : "v",
                     (short) 0, (short) 0,
                     true, false, false, false, false,
                     false, // relhasoids
@@ -288,11 +290,27 @@ class CatalogCoreBuilder {
                 }
                 reloptionsVal = optList;
             }
+            String idxMethod = database.getIndexMethod(indexName);
+            int relamOid = resolveAccessMethodOid(idxMethod);
+            // Determine if this is a partitioned index (index on a partitioned table)
+            String idxRelkind = "i";
+            if (storedTableQualified != null) {
+                String[] qParts = storedTableQualified.split("\\.", 2);
+                if (qParts.length == 2) {
+                    Schema idxSchema = database.getSchema(qParts[0]);
+                    if (idxSchema != null) {
+                        Table idxTable = idxSchema.getTable(qParts[1]);
+                        if (idxTable != null && idxTable.getPartitionStrategy() != null) {
+                            idxRelkind = "I";
+                        }
+                    }
+                }
+            }
             table.insertRow(new Object[]{
                     idxOid, indexName, oids.oid("ns:" + indexSchema),
-                    0, 0, 10, 403, idxOid, 0,  // relam=403 (btree)
+                    0, 0, 10, relamOid, idxOid, 0,  // relam from access method
                     1, 0.0, 0, 0, 0,
-                    false, false, "p", "i",
+                    false, false, "p", idxRelkind,
                     idxNatts, (short) 0,
                     false, false, false, false, false,
                     false, // relhasoids
@@ -309,11 +327,12 @@ class CatalogCoreBuilder {
                             && !addedIndexNames.contains(sc.getName().toLowerCase())) {
                         int ciOid = oids.oid("rel:" + schemaEntry.getKey() + "." + sc.getName());
                         short ciNatts = (short) (sc.getColumns() != null ? sc.getColumns().size() : 0);
+                        String ciRelkind = tableEntry.getValue().getPartitionStrategy() != null ? "I" : "i";
                         table.insertRow(new Object[]{
                                 ciOid, sc.getName(), oids.oid("ns:" + schemaEntry.getKey()),
                                 0, 0, 10, 403, ciOid, 0,
                                 1, 0.0, 0, 0, 0,
-                                false, false, "p", "i",
+                                false, false, "p", ciRelkind,
                                 ciNatts, (short) 0,
                                 false, false, false, false, false,
                                 false, // relhasoids
@@ -323,6 +342,24 @@ class CatalogCoreBuilder {
                     }
                 }
             }
+        }
+
+        // Foreign tables (relkind='f')
+        int publicNsOid = oids.oid("ns:public");
+        for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
+            int ftOid = oids.oid("rel:public." + ft.tableName);
+            short ftNatts = (short) (ft.columns != null ? ft.columns.size() : 0);
+            table.insertRow(new Object[]{
+                    ftOid, ft.tableName, publicNsOid,
+                    0, 0, 10, 0, ftOid, 0,
+                    0, 0.0, 0, 0, 0,
+                    false, false, "p", "f",
+                    ftNatts, (short) 0,
+                    false, false, false, false, false,
+                    false, true, "d", false,
+                    0, 0, 0,
+                    null, null, null, 1
+            });
         }
 
         return table;
@@ -402,6 +439,13 @@ class CatalogCoreBuilder {
                     // SERIAL/BIGSERIAL/SMALLSERIAL are NOT identity columns (attidentity stays empty)
                     // Only actual GENERATED AS IDENTITY columns get 'd' or 'a'
                     String identity = "";
+                    if (c.getDefaultValue() != null) {
+                        if (c.getDefaultValue().contains("__identity__:always")) {
+                            identity = "a";
+                        } else if (c.getDefaultValue().contains("__identity__")) {
+                            identity = "d";
+                        }
+                    }
                     DataType colType = c.getType();
                     boolean hasDefault = c.getDefaultValue() != null
                             || colType == DataType.SERIAL || colType == DataType.BIGSERIAL || colType == DataType.SMALLSERIAL
@@ -468,6 +512,8 @@ class CatalogCoreBuilder {
                     } else if (c.getDomainTypeName() != null) {
                         atttypid = oids.oid("type:" + c.getDomainTypeName());
                     }
+                    // Use column-level overrides if set
+                    String effectiveStorage = c.getAttStorageOverride() != null ? c.getAttStorageOverride() : storage;
                     table.insertRow(new Object[]{
                             relOid,
                             c.getName(),
@@ -483,10 +529,10 @@ class CatalogCoreBuilder {
                             0,         // attcollation
                             1, true, 0, null, 0, null,  // xmin, attislocal, attinhcount, attfdwoptions, attndims, attacl
                             null,      // attoptions
-                            (short) -1, // attstattarget
-                            storage,   // attstorage
-                            "",        // attcompression
-                            false,     // atthasmissing
+                            c.getAttStattarget(), // attstattarget
+                            effectiveStorage,   // attstorage
+                            c.getAttCompression(),        // attcompression
+                            c.isAttHasMissing(), // atthasmissing
                             null,      // attmissingval
                             "i"        // attalign
                     });
@@ -494,14 +540,96 @@ class CatalogCoreBuilder {
             }
         }
 
+        // Foreign table columns
+        for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
+            int ftRelOid = oids.oid("rel:public." + ft.tableName);
+            if (ft.columns != null) {
+                for (int i = 0; i < ft.columns.size(); i++) {
+                    String[] colParts = ft.columns.get(i);
+                    String colName = colParts[0];
+                    String colTypeName = colParts.length > 1 ? colParts[1] : "text";
+                    int typOid = resolveTypeOidByName(colTypeName);
+                    table.insertRow(new Object[]{
+                            ftRelOid, colName, typOid, (short) (i + 1),
+                            false, -1, (short) -1, false, false,
+                            "", "", 0, 1, true, 0, null, 0, null,
+                            null, (short) -1, "p", "", false, null, "i"
+                    });
+                }
+            }
+        }
+
+        // Composite type attributes
+        for (Map.Entry<String, java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>> ctEntry
+                : database.getCompositeTypes().entrySet()) {
+            String ctName = ctEntry.getKey();
+            int ctRelOid = oids.oid("rel:public." + ctName);
+            java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = ctEntry.getValue();
+            for (int i = 0; i < fields.size(); i++) {
+                com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f = fields.get(i);
+                int atttypid = resolveTypeOidByName(f.typeName());
+                table.insertRow(new Object[]{
+                        ctRelOid, f.name(), atttypid, (short) (i + 1),
+                        false, -1, (short) -1, false, false,
+                        "", "", 0, 1, true, 0, null, 0, null,
+                        null, (short) -1, "p", "", false, null, "i"
+                });
+            }
+        }
+
         // Add pg_attribute entries for key catalog tables so queries like
         // "SELECT ... FROM pg_attribute WHERE attrelid = 'pg_aggregate'::regclass" work.
+        // pg_index attributes (indkey must be int2vector = OID 22)
+        addCatalogTableAttributesTyped(table, "pg_index", new String[]{
+                "indexrelid", "indrelid", "indisunique", "indisprimary",
+                "indimmediate", "indkey", "indnkeyatts", "indnatts",
+                "indisvalid", "indisready", "indislive", "indexprs",
+                "indpred", "indisclustered", "indisreplident", "indoption",
+                "indnullsnotdistinct", "indclass", "indcollation"
+        }, new int[]{
+                26, 26, 16, 16,    // oid, oid, bool, bool
+                16, 22, 21, 21,    // bool, int2vector, int2, int2
+                16, 16, 16, 25,    // bool, bool, bool, text
+                25, 16, 16, 22,    // text, bool, bool, int2vector
+                16, 30, 30         // bool, oidvector, oidvector
+        });
+
+        // pg_proc attributes (proargmodes must be _char=OID 1002, proargnames must be _text=OID 1009)
+        addCatalogTableAttributesTyped(table, "pg_proc", new String[]{
+                "oid", "proname", "pronamespace", "proowner",
+                "prolang", "procost", "prorows", "provariadic",
+                "prosupport", "prokind", "prosecdef", "proleakproof",
+                "proisstrict", "proretset", "provolatile", "proparallel",
+                "pronargs", "pronargdefaults", "prorettype", "proargtypes",
+                "proallargtypes", "proargmodes", "proargnames", "proargdefaults",
+                "protrftypes", "prosrc", "probin", "prosqlbody",
+                "proconfig", "proacl", "xmin"
+        }, new int[]{
+                26, 25, 26, 26,       // oid, text, oid, oid
+                26, 701, 701, 26,     // oid, float8, float8, oid
+                25, 18, 16, 16,       // text, char, bool, bool
+                16, 16, 18, 18,       // bool, bool, char, char
+                21, 21, 26, 30,       // int2, int2, oid, oidvector
+                26, 1002, 1009, 25,   // oid, _char, _text, text
+                26, 25, 25, 25,       // oid, text, text, text
+                25, 1034, 26          // text, _aclitem, oid (xmin)
+        });
+
         addCatalogTableAttributes(table, "pg_aggregate", new String[]{
                 "aggfnoid", "aggtransfn", "aggtranstype", "aggfinalfn",
                 "agginitval", "aggsortop", "aggfinalextra", "aggtransspace",
                 "aggmtransfn", "aggminvtransfn", "aggmtranstype", "aggmtransspace",
                 "aggmfinalfn", "aggmfinalextra", "aggminitval", "aggkind",
                 "aggnumdirectargs", "aggcombinefn", "aggserialfn", "aggdeserialfn"
+        });
+        addCatalogTableAttributesTyped(table, "pg_authid", new String[]{
+                "oid", "rolname", "rolsuper", "rolinherit", "rolcreaterole",
+                "rolcreatedb", "rolcanlogin", "rolreplication", "rolconnlimit",
+                "rolvaliduntil", "rolbypassrls", "rolconfig", "rolpassword"
+        }, new int[]{
+                26, 25, 16, 16, 16,    // oid=oid, rolname=text, rolsuper=bool, rolinherit=bool, rolcreaterole=bool
+                16, 16, 16, 23,        // rolcreatedb=bool, rolcanlogin=bool, rolreplication=bool, rolconnlimit=int4
+                1184, 16, 25, 25       // rolvaliduntil=timestamptz, rolbypassrls=bool, rolconfig=text, rolpassword=text
         });
 
         return table;
@@ -513,6 +641,19 @@ class CatalogCoreBuilder {
         for (int i = 0; i < colNames.length; i++) {
             attrTable.insertRow(new Object[]{
                     relOid, colNames[i], 0, (short) (i + 1),
+                    false, -1, (short) -1, false, false,
+                    "", "", 0, 1, true, 0, null, 0, null,
+                    null, (short) -1, "p", "", false, null, "i"
+            });
+        }
+    }
+
+    /** Helper: add pg_attribute rows with specific type OIDs for a system catalog table. */
+    private void addCatalogTableAttributesTyped(Table attrTable, String catalogName, String[] colNames, int[] typeOids) {
+        int relOid = oids.oid("rel:pg_catalog." + catalogName);
+        for (int i = 0; i < colNames.length; i++) {
+            attrTable.insertRow(new Object[]{
+                    relOid, colNames[i], typeOids[i], (short) (i + 1),
                     false, -1, (short) -1, false, false,
                     "", "", 0, 1, true, 0, null, 0, null,
                     null, (short) -1, "p", "", false, null, "i"
@@ -563,7 +704,8 @@ class CatalogCoreBuilder {
             if (dt == DataType.ENUM || dt == DataType.SERIAL || dt == DataType.BIGSERIAL
                     || dt == DataType.SMALLSERIAL
                     || dt == DataType.TEXT_ARRAY || dt == DataType.INT4_ARRAY
-                    || dt == DataType.ACLITEM_ARRAY) continue;
+                    || dt == DataType.ACLITEM_ARRAY
+                    || dt == DataType.RECORD) continue;
             String cat;
             switch (dt) {
                 case SMALLINT:
@@ -765,6 +907,31 @@ class CatalogCoreBuilder {
                 false, 0, -1, 0, 0, null, null, null, 1
         });
 
+        // Pseudo-types: trigger, event_trigger, void, record, etc.
+        String[][] pseudoTypes = {
+                {"trigger", "2279"},
+                {"event_trigger", "3838"},
+                {"void", "2278"},
+                {"record", "2249"},
+                {"any", "2276"},
+                {"anyelement", "2283"},
+                {"anyarray", "2277"},
+                {"internal", "2281"},
+                {"cstring", "2275"},
+        };
+        for (String[] pt : pseudoTypes) {
+            String ptName = pt[0];
+            int ptOid = Integer.parseInt(pt[1]);
+            table.insertRow(new Object[]{
+                    ptOid, ptName, pgCatalogOid, 10,
+                    (short) 4, true, "p", "P", false, true, ",",
+                    0, null, 0, 0,
+                    ptName + "_in", ptName + "_out", "-", "-",
+                    "-", "-", "-", "i", "p",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+        }
+
         // Add custom enum types
         for (CustomEnum ce : database.getCustomEnums().values()) {
             // Determine the schema this enum belongs to via the schema object registry
@@ -782,6 +949,22 @@ class CatalogCoreBuilder {
                     0, null, 0, 0,
                     "enum_in", "enum_out", "enum_recv", "enum_send",
                     "-", "-", "-", "i", "p",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+        }
+
+        // Add composite types
+        for (Map.Entry<String, java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>> ctEntry
+                : database.getCompositeTypes().entrySet()) {
+            String ctName = ctEntry.getKey();
+            int ctNsOid = oids.oid("ns:public");
+            int ctRelOid = oids.oid("rel:public." + ctName);
+            table.insertRow(new Object[]{
+                    oids.oid("type:" + ctName), ctName, ctNsOid, 10,
+                    (short) -1, false, "c", "C", false, true, ",",
+                    ctRelOid, null, 0, 0,
+                    "record_in", "record_out", "record_recv", "record_send",
+                    "-", "-", "-", "d", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
@@ -840,6 +1023,20 @@ class CatalogCoreBuilder {
             });
         }
 
+        // Add user-defined range types
+        for (Map.Entry<String, String> rangeEntry : database.getRangeTypes().entrySet()) {
+            String rangeName = rangeEntry.getKey();
+            int rangeNsOid = oids.oid("ns:public");
+            table.insertRow(new Object[]{
+                    oids.oid("type:" + rangeName), rangeName, rangeNsOid, 10,
+                    (short) -1, false, "r", "R", false, true, ",",
+                    0, null, 0, 0,
+                    "range_in", "range_out", "range_recv", "range_send",
+                    "-", "-", "-", "d", "x",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+        }
+
         return table;
     }
 
@@ -859,7 +1056,10 @@ class CatalogCoreBuilder {
         table.insertRow(new Object[]{oids.oid("ns:pg_toast"), "pg_toast", 10, 1, null});
 
         for (String schemaName : database.getSchemas().keySet()) {
-            table.insertRow(new Object[]{oids.oid("ns:" + schemaName), schemaName, 10, 1, null});
+            int ownerOid = CatalogHelper.resolveOwnerOid(database, oids, "schema:" + schemaName);
+            java.util.List<String> acl = database.getSchemaAcl(schemaName);
+            String aclText = acl != null && !acl.isEmpty() ? "{" + String.join(",", acl) + "}" : null;
+            table.insertRow(new Object[]{oids.oid("ns:" + schemaName), schemaName, ownerOid, 1, aclText});
         }
         return table;
     }
@@ -980,9 +1180,38 @@ class CatalogCoreBuilder {
                 "plpgsql_validator", null, null, null, null, 1
         });
 
+        // Built-in aggregate functions (prokind='a')
+        String[] builtinAggs = {"count", "sum", "avg", "min", "max", "array_agg",
+                "string_agg", "bool_and", "bool_or", "every", "json_agg", "jsonb_agg",
+                "json_object_agg", "jsonb_object_agg", "xmlagg", "bit_and", "bit_or"};
+        int anyType = 2276; // anyelement pseudo-type OID
+        for (String aggName : builtinAggs) {
+            int aggProcOid = oids.oid("proc:" + aggName);
+            int retType = aggName.equals("count") ? 20 /* int8 */ : anyType;
+            table.insertRow(new Object[]{
+                    aggProcOid, aggName, pgCatalogNs, 10, internalLangOid, 1.0, 0.0,
+                    0, "-", "a", false, false, false, false, "i", "u",
+                    (short) 1, (short) 0, retType,
+                    String.valueOf(anyType), null, null, null, null, null,
+                    aggName, null, null, null, null, 1
+            });
+        }
+
         int publicNs = oids.oid("ns:public");
+        // Iterate all function overloads (not just last-added per name)
+        List<PgFunction> allFuncs = new java.util.ArrayList<>();
+        Map<String, Integer> overloadIndex = new java.util.HashMap<>();
         for (Map.Entry<String, PgFunction> entry : database.getFunctions().entrySet()) {
-            PgFunction fn = entry.getValue();
+            List<PgFunction> overloads = database.getFunctionOverloads(entry.getKey());
+            if (overloads != null && !overloads.isEmpty()) {
+                for (PgFunction f : overloads) {
+                    if (!allFuncs.contains(f)) allFuncs.add(f);
+                }
+            } else {
+                if (!allFuncs.contains(entry.getValue())) allFuncs.add(entry.getValue());
+            }
+        }
+        for (PgFunction fn : allFuncs) {
             String funcSchema = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
             int funcNs = funcSchema.equals("pg_catalog") ? pgCatalogNs : oids.oid("ns:" + funcSchema);
             String lang = fn.getLanguage() != null ? fn.getLanguage().toLowerCase() : "plpgsql";
@@ -1002,11 +1231,51 @@ class CatalogCoreBuilder {
                     break;
             }
             String kind = fn.isProcedure() ? "p" : "f";
-            // Count arguments
+            // Count arguments and build proargnames, proargmodes, proallargtypes
             short nargs = 0;
             String argTypes = null;
+            String proargnames = null;
+            String proargmodes = null;
+            String proallargtypes = null;
             if (fn.getParams() != null && !fn.getParams().isEmpty()) {
                 nargs = (short) fn.getParams().size();
+                // Build proargnames: {name1,name2,...} — populated when any param has a name
+                boolean hasNames = fn.getParams().stream().anyMatch(p -> p.name() != null && !p.name().isEmpty());
+                if (hasNames) {
+                    StringBuilder namesBuilder = new StringBuilder("{");
+                    for (int pi = 0; pi < fn.getParams().size(); pi++) {
+                        if (pi > 0) namesBuilder.append(",");
+                        PgFunction.Param p = fn.getParams().get(pi);
+                        namesBuilder.append(p.name() != null ? p.name() : "");
+                    }
+                    namesBuilder.append("}");
+                    proargnames = namesBuilder.toString();
+                }
+                // Build proargmodes: {i,o,...} — populated when any param is not IN
+                boolean hasNonIn = fn.getParams().stream().anyMatch(p -> p.mode() != null
+                        && !p.mode().equalsIgnoreCase("IN") && !p.mode().isEmpty());
+                if (hasNonIn) {
+                    StringBuilder modesBuilder = new StringBuilder("{");
+                    StringBuilder allTypesBuilder = new StringBuilder("{");
+                    for (int pi = 0; pi < fn.getParams().size(); pi++) {
+                        if (pi > 0) { modesBuilder.append(","); allTypesBuilder.append(","); }
+                        PgFunction.Param p = fn.getParams().get(pi);
+                        String mode = p.mode() != null ? p.mode().toLowerCase() : "i";
+                        switch (mode) {
+                            case "in": mode = "i"; break;
+                            case "out": mode = "o"; break;
+                            case "inout": mode = "b"; break;
+                            case "variadic": mode = "v"; break;
+                            default: break; // already single-char
+                        }
+                        modesBuilder.append(mode);
+                        allTypesBuilder.append(resolveTypeOidByName(p.typeName()));
+                    }
+                    modesBuilder.append("}");
+                    allTypesBuilder.append("}");
+                    proargmodes = modesBuilder.toString();
+                    proallargtypes = allTypesBuilder.toString();
+                }
             }
             String fnOwner = fn.getOwner();
             int fnOwnerOid = (fnOwner != null && !fnOwner.isEmpty()) ? oids.oid("role:" + fnOwner) : 10;
@@ -1023,15 +1292,208 @@ class CatalogCoreBuilder {
                 sb.append("}");
                 proconfig = sb.toString();
             }
+            // Build proargdefaults: populate when any param has a default expression
+            String proargdefaults = null;
+            if (fn.getParams() != null) {
+                StringBuilder defs = new StringBuilder();
+                for (PgFunction.Param p : fn.getParams()) {
+                    if (p.defaultExpr() != null && !p.defaultExpr().isEmpty()) {
+                        if (defs.length() > 0) defs.append(" ");
+                        defs.append("({CONST :constvalue ").append(p.defaultExpr()).append("})");
+                    }
+                }
+                if (defs.length() > 0) proargdefaults = defs.toString();
+            }
+            // prosqlbody: populated for BEGIN ATOMIC functions
+            String prosqlbody = fn.isAtomicBody() ? fn.getBody() : null;
+            // Use unique OID key for overloaded functions (append param count)
+            int idx = overloadIndex.merge(fn.getName(), 0, (a, b) -> a + 1);
+            String oidKey = idx == 0 ? "proc:" + fn.getName() : "proc:" + fn.getName() + "#" + idx;
             table.insertRow(new Object[]{
-                    oids.oid("proc:" + fn.getName()), fn.getName(), funcNs, fnOwnerOid,
+                    oids.oid(oidKey), fn.getName(), funcNs, fnOwnerOid,
                     langOid, fn.getCost(), fn.getRows(), 0, "-", kind,
                     fn.isSecurityDefiner(), fn.isLeakproof(), fn.isStrict(), false,
                     fn.getVolatility() != null ? fn.getVolatility().substring(0, 1).toLowerCase() : "v",
                     fn.getParallel() != null ? fn.getParallel().substring(0, 1).toLowerCase() : "u",
                     nargs, (short) 0, 0,
-                    argTypes, null, null, null, null, null,
-                    fn.getBody(), null, null, proconfig, null, 1
+                    argTypes, proallargtypes, proargmodes, proargnames, proargdefaults, null,
+                    fn.getBody(), null, prosqlbody, proconfig, null, 1
+            });
+        }
+
+        // Event trigger helper functions (built-in)
+        String[] eventTriggerHelpers = {
+                "pg_event_trigger_ddl_commands",
+                "pg_event_trigger_dropped_objects",
+                "pg_event_trigger_table_rewrite_oid",
+                "pg_event_trigger_table_rewrite_reason"
+        };
+        for (String etHelper : eventTriggerHelpers) {
+            table.insertRow(new Object[]{
+                    oids.oid("proc:" + etHelper), etHelper, pgCatalogNs, 10,
+                    internalLangOid, 1.0, 0.0, 0, "-", "f",
+                    false, false, false, false, "v", "u",
+                    (short) 0, (short) 0, voidType,
+                    null, null, null, null, null, null,
+                    etHelper, null, null, null, null, 1
+            });
+        }
+
+        // Built-in extension functions (uuid-ossp, pgcrypto, pg_trgm, fuzzystrmatch, unaccent, json)
+        String[] extensionFunctions = {
+                "uuid_generate_v1", "uuid_generate_v3", "uuid_generate_v4", "uuid_generate_v5",
+                "uuid_nil", "uuid_ns_dns", "uuid_ns_url",
+                "digest", "hmac", "gen_salt", "gen_random_uuid",
+                "show_trgm", "similarity",
+                "levenshtein", "soundex",
+                "unaccent",
+                "json_strip_nulls", "jsonb_strip_nulls",
+                "jsonb_object", "json_populate_record", "json_populate_recordset",
+                "jsonb_populate_record", "jsonb_populate_recordset",
+                "jsonb_path_match", "jsonb_path_match_tz",
+                "row_to_json", "to_json", "to_jsonb",
+                "uuidv4",
+                "unicode_version", "unicode_assigned"
+        };
+        for (String extFn : extensionFunctions) {
+            table.insertRow(new Object[]{
+                    oids.oid("proc:" + extFn), extFn, pgCatalogNs, 10,
+                    internalLangOid, 1.0, 0.0, 0, "-", "f",
+                    false, false, false, false, "i", "u",
+                    (short) 0, (short) 0, 0,
+                    null, null, null, null, null, null,
+                    extFn, null, null, null, null, 1
+            });
+        }
+
+        // Replication / WAL functions (stubs for pg_proc visibility)
+        String[] replicationFunctions = {
+                "pg_create_logical_replication_slot",
+                "pg_create_physical_replication_slot",
+                "pg_drop_replication_slot",
+                "pg_logical_slot_get_changes",
+                "pg_logical_slot_peek_changes",
+                "pg_replication_slot_advance",
+                "pg_switch_wal",
+                "pg_walfile_name",
+                "pg_last_wal_receive_lsn",
+                "pg_last_wal_replay_lsn",
+                "pg_backup_start",
+                "pg_backup_stop",
+                "pg_promote",
+                "pg_create_restore_point",
+                "pg_wal_replay_pause",
+                "pg_wal_replay_resume"
+        };
+        for (String replFn : replicationFunctions) {
+            table.insertRow(new Object[]{
+                    oids.oid("proc:" + replFn), replFn, pgCatalogNs, 10,
+                    internalLangOid, 1.0, 0.0, 0, "-", "f",
+                    false, false, false, false, "v", "u",
+                    (short) 0, (short) 0, 0,
+                    null, null, null, null, null, null,
+                    replFn, null, null, null, null, 1
+            });
+        }
+
+        // Large object functions
+        // has_largeobject_privilege(user oid, loid oid, privilege text) → boolean
+        table.insertRow(new Object[]{
+                oids.oid("proc:has_largeobject_privilege"), "has_largeobject_privilege", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "s", "u",
+                (short) 3, (short) 0, 16, // returns boolean (OID 16)
+                "26 26 25", null, null, null, null, null,
+                "has_largeobject_privilege", null, null, null, null, 1
+        });
+        // has_largeobject_privilege(user name, loid oid, privilege text) → boolean
+        table.insertRow(new Object[]{
+                oids.oid("proc:has_largeobject_privilege_name"), "has_largeobject_privilege", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "s", "u",
+                (short) 3, (short) 0, 16, // returns boolean (OID 16)
+                "19 26 25", null, null, null, null, null,
+                "has_largeobject_privilege", null, null, null, null, 1
+        });
+        // has_largeobject_privilege(loid oid, privilege text) → boolean (current user)
+        table.insertRow(new Object[]{
+                oids.oid("proc:has_largeobject_privilege_2"), "has_largeobject_privilege", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "s", "u",
+                (short) 2, (short) 0, 16, // returns boolean (OID 16)
+                "26 25", null, null, null, null, null,
+                "has_largeobject_privilege", null, null, null, null, 1
+        });
+        // lo_export(loid oid, filename text) → int4
+        table.insertRow(new Object[]{
+                oids.oid("proc:lo_export"), "lo_export", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "v", "u",
+                (short) 2, (short) 0, 23, // returns int4 (OID 23)
+                "26 25", null, null, null, null, null,
+                "lo_export", null, null, null, null, 1
+        });
+        // lo_import(filename text) → oid
+        table.insertRow(new Object[]{
+                oids.oid("proc:lo_import"), "lo_import", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "v", "u",
+                (short) 1, (short) 0, 26, // returns oid (OID 26)
+                "25", null, null, null, null, null,
+                "lo_import", null, null, null, null, 1
+        });
+        // lo_import(filename text, loid oid) → oid (2-arg overload)
+        table.insertRow(new Object[]{
+                oids.oid("proc:lo_import_2"), "lo_import", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "v", "u",
+                (short) 2, (short) 0, 26, // returns oid (OID 26)
+                "25 26", null, null, null, null, null,
+                "lo_import", null, null, null, null, 1
+        });
+        // lo_truncate64(fd int4, len int8) → int4
+        table.insertRow(new Object[]{
+                oids.oid("proc:lo_truncate64"), "lo_truncate64", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, false, false, "v", "u",
+                (short) 2, (short) 0, 23, // returns int4 (OID 23)
+                "23 20", null, null, null, null, null,
+                "lo_truncate64", null, null, null, null, 1
+        });
+
+        // UUID functions
+        // uuid_extract_timestamp(uuid) → timestamptz
+        table.insertRow(new Object[]{
+                oids.oid("proc:uuid_extract_timestamp"), "uuid_extract_timestamp", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, true, false, "i", "s",
+                (short) 1, (short) 0, 1184, // returns timestamptz (OID 1184)
+                "2950", null, null, null, null, null,
+                "uuid_extract_timestamp", null, null, null, null, 1
+        });
+        // uuid_extract_version(uuid) → int4
+        table.insertRow(new Object[]{
+                oids.oid("proc:uuid_extract_version"), "uuid_extract_version", pgCatalogNs, 10,
+                internalLangOid, 1.0, 0.0, 0, "-", "f",
+                false, false, true, false, "i", "s",
+                (short) 1, (short) 0, 23, // returns int4 (OID 23)
+                "2950", null, null, null, null, null,
+                "uuid_extract_version", null, null, null, null, 1
+        });
+
+        // pg_control_* functions (return record)
+        String[] pgControlFunctions = {
+                "pg_control_checkpoint", "pg_control_init",
+                "pg_control_recovery", "pg_control_system"
+        };
+        for (String ctlFn : pgControlFunctions) {
+            table.insertRow(new Object[]{
+                    oids.oid("proc:" + ctlFn), ctlFn, pgCatalogNs, 10,
+                    internalLangOid, 1.0, 0.0, 0, "-", "f",
+                    false, false, true, true, "s", "u",
+                    (short) 0, (short) 0, 2249, // returns record (OID 2249)
+                    null, null, null, null, null, null,
+                    ctlFn, null, null, null, null, 1
             });
         }
 
@@ -1054,5 +1516,125 @@ class CatalogCoreBuilder {
         }
 
         return table;
+    }
+
+    /**
+     * Build an aclitem[] string for a table based on granted privileges.
+     * Returns null if no privileges have been granted, or a PG-style aclitem array string.
+     */
+    private String buildRelacl(String tableName) {
+        Map<String, Set<String>> allPrivs = database.getAllRolePrivileges();
+        // Collect grants: grantee -> set of privilege abbreviations
+        Map<String, Set<String>> aclEntries = new java.util.LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> entry : allPrivs.entrySet()) {
+            String role = entry.getKey();
+            for (String priv : entry.getValue()) {
+                // Format: "PRIVILEGE:OBJECTTYPE:OBJECTNAME"
+                String[] parts = priv.split(":", 3);
+                if (parts.length == 3 && parts[1].equalsIgnoreCase("TABLE")
+                        && parts[2].equalsIgnoreCase(tableName)) {
+                    String abbrev = privAbbrev(parts[0]);
+                    if (abbrev != null) {
+                        aclEntries.computeIfAbsent(role, k -> new java.util.LinkedHashSet<>()).add(abbrev);
+                    }
+                }
+            }
+        }
+        if (aclEntries.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, Set<String>> entry : aclEntries.entrySet()) {
+            if (!first) sb.append(",");
+            first = false;
+            String grantee = entry.getKey().equalsIgnoreCase("public") ? "" : entry.getKey();
+            sb.append(grantee).append("=");
+            for (String a : entry.getValue()) sb.append(a);
+            sb.append("/").append("memgres"); // grantor
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /** Build a PG text-array string for table storage parameters (reloptions). */
+    private String buildTableReloptions(Table t) {
+        Map<String, String> opts = t.getReloptions();
+        if (opts == null || opts.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (Map.Entry<String, String> entry : opts.entrySet()) {
+            if (!first) sb.append(",");
+            sb.append(entry.getKey()).append("=").append(entry.getValue());
+            first = false;
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
+    /** Map a privilege name to its PG aclitem abbreviation. */
+    private static String privAbbrev(String priv) {
+        switch (priv.toUpperCase()) {
+            case "SELECT": return "r";
+            case "INSERT": return "a";
+            case "UPDATE": return "w";
+            case "DELETE": return "d";
+            case "TRUNCATE": return "D";
+            case "REFERENCES": return "x";
+            case "TRIGGER": return "t";
+            case "ALL": return "arwdDxt";
+            case "USAGE": return "U";
+            default: return null;
+        }
+    }
+
+    private int resolveAccessMethodOid(String method) {
+        if (method == null) return 403; // default btree
+        switch (method.toLowerCase()) {
+            case "btree": return 403;
+            case "hash": return 405;
+            case "gist": return 783;
+            case "gin": return 2742;
+            case "spgist": return 4000;
+            case "brin": return 3580;
+            default: return oids.oid("am:" + method.toLowerCase());
+        }
+    }
+
+    /** Resolve a type name (e.g., "int", "text", "integer") to its PG OID. */
+    private int resolveTypeOidByName(String typeName) {
+        if (typeName == null) return 0;
+        String lower = typeName.toLowerCase().trim();
+        // Handle common aliases
+        switch (lower) {
+            case "int": case "integer": case "int4": return 23;
+            case "bigint": case "int8": return 20;
+            case "smallint": case "int2": return 21;
+            case "text": return 25;
+            case "varchar": case "character varying": return 1043;
+            case "char": case "character": case "bpchar": return 1042;
+            case "boolean": case "bool": return 16;
+            case "float4": case "real": return 700;
+            case "float8": case "double precision": return 701;
+            case "numeric": case "decimal": return 1700;
+            case "date": return 1082;
+            case "timestamp": case "timestamp without time zone": return 1114;
+            case "timestamptz": case "timestamp with time zone": return 1184;
+            case "time": case "time without time zone": return 1083;
+            case "interval": return 1186;
+            case "uuid": return 2950;
+            case "json": return 114;
+            case "jsonb": return 3802;
+            case "bytea": return 17;
+            case "void": return 2278;
+            case "record": return 2249;
+            case "trigger": return 2279;
+            default: break;
+        }
+        // Try matching against DataType enum
+        for (DataType dt : DataType.values()) {
+            if (dt.getPgName().equalsIgnoreCase(lower) || dt.name().equalsIgnoreCase(lower)) {
+                return dt.getOid();
+            }
+        }
+        return 0;
     }
 }

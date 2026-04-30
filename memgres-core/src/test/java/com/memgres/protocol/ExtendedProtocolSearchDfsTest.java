@@ -29,7 +29,7 @@ class ExtendedProtocolSearchDfsTest {
             s.execute("INSERT INTO ext_edges VALUES (1,2),(1,3),(2,4),(3,4),(4,5),(5,1)");
         }
         try {
-            List<String> ids = new ArrayList<>();
+            List<Integer> ids = new ArrayList<>();
             try (PreparedStatement ps = conn.prepareStatement("""
                     WITH RECURSIVE graph(src, dst) AS (
                       SELECT src, dst FROM ext_edges
@@ -44,18 +44,12 @@ class ExtendedProtocolSearchDfsTest {
                     )
                     SEARCH DEPTH FIRST BY id SET ordcol
                     SELECT id, path FROM search_graph ORDER BY ordcol
-                    """)) {
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) ids.add(rs.getString(1));
-                }
+                    """);
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) ids.add(rs.getInt(1));
             }
-            // PG18 ordcol uses record format {(1)},{(1),(2)} etc.
-            // Verify the query returns expected rows (order may vary with ordcol format)
-            assertFalse(ids.isEmpty(), "SEARCH DEPTH FIRST should return rows");
-            assertEquals(7, ids.size(), "Should return 7 rows from DFS traversal");
-            assertTrue(ids.contains("1"), "Should contain root node 1");
-            assertTrue(ids.contains("2"), "Should contain node 2");
-            assertTrue(ids.contains("3"), "Should contain node 3");
+            assertEquals(7, ids.size(), "SEARCH DEPTH FIRST should return 7 rows");
+            assertEquals(1, ids.get(0), "First row should be id=1 (root)");
         } finally {
             try (Statement s = conn.createStatement()) { s.execute("DROP TABLE ext_edges"); }
         }

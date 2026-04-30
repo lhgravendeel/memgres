@@ -56,17 +56,17 @@ class AdvisoryLockFunctions {
             }
             case "pg_advisory_lock_shared": {
                 long key = advisoryKey(fn, ctx);
-                executor.database.tryAdvisoryLock(key, executor.session);
+                executor.database.tryAdvisoryLockShared(key, executor.session);
                 return null;
             }
             case "pg_advisory_xact_lock_shared": {
                 long key = advisoryKey(fn, ctx);
-                executor.database.tryAdvisoryLock(key, executor.session);
+                executor.database.tryAdvisoryLockShared(key, executor.session);
                 return null;
             }
             case "pg_try_advisory_lock_shared": {
                 long key = advisoryKey(fn, ctx);
-                return executor.database.tryAdvisoryLock(key, executor.session);
+                return executor.database.tryAdvisoryLockShared(key, executor.session);
             }
             case "pg_advisory_unlock_shared": {
                 long key = advisoryKey(fn, ctx);

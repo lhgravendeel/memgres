@@ -160,6 +160,47 @@ public class PgInterval implements Comparable<PgInterval> {
             return new PgInterval(totalMonths, days, totalMicros);
         }
 
+        // Try sql_standard year-month format: 'Y-M' (e.g. '1-2' = 1 year 2 months)
+        // Also handles optional sign and optional day/time parts: [+|-]Y-M [D] [H:M:S]
+        {
+            java.util.regex.Matcher sqm = java.util.regex.Pattern.compile(
+                    "^(-?)(\\d+)-(\\d+)(?:\\s+(-?\\d+))?(?:\\s+(-?)(\\d+):(\\d+)(?::(\\d+(?:\\.\\d+)?))?)?$"
+            ).matcher(s);
+            if (sqm.matches()) {
+                int sign = "-".equals(sqm.group(1)) ? -1 : 1;
+                int years = Integer.parseInt(sqm.group(2));
+                int mons = Integer.parseInt(sqm.group(3));
+                int totalMonths = sign * (years * 12 + mons);
+                int days = sqm.group(4) != null ? Integer.parseInt(sqm.group(4)) : 0;
+                long totalMicros = 0;
+                if (sqm.group(6) != null) {
+                    int tsign = "-".equals(sqm.group(5)) ? -1 : 1;
+                    int hours = Integer.parseInt(sqm.group(6));
+                    int minutes = Integer.parseInt(sqm.group(7));
+                    double secs = sqm.group(8) != null ? Double.parseDouble(sqm.group(8)) : 0;
+                    totalMicros = tsign * ((hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(secs * 1_000_000L));
+                }
+                return new PgInterval(totalMonths, days, totalMicros);
+            }
+        }
+
+        // Try sql_standard day-time format: 'D HH:MM:SS' (e.g. '2 04:05:06' = 2 days 04:05:06)
+        {
+            java.util.regex.Matcher dtm = java.util.regex.Pattern.compile(
+                    "^(-?)(\\d+)\\s+(-?)(\\d+):(\\d+)(?::(\\d+(?:\\.\\d+)?))?$"
+            ).matcher(s);
+            if (dtm.matches()) {
+                int dsign = "-".equals(dtm.group(1)) ? -1 : 1;
+                int days = dsign * Integer.parseInt(dtm.group(2));
+                int tsign = "-".equals(dtm.group(3)) ? -1 : 1;
+                int hours = Integer.parseInt(dtm.group(4));
+                int minutes = Integer.parseInt(dtm.group(5));
+                double secs = dtm.group(6) != null ? Double.parseDouble(dtm.group(6)) : 0;
+                long totalMicros = tsign * ((hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(secs * 1_000_000L));
+                return new PgInterval(0, days, totalMicros);
+            }
+        }
+
         // Try simple number (treated as seconds)
         try {
             double secs = Double.parseDouble(s);
@@ -185,8 +226,47 @@ public class PgInterval implements Comparable<PgInterval> {
             return toIso8601();
         } else if (intervalStyle != null && intervalStyle.equalsIgnoreCase("sql_standard")) {
             return toSqlStandard();
+        } else if (intervalStyle != null && intervalStyle.equalsIgnoreCase("postgres_verbose")) {
+            return toPostgresVerbose();
         }
         return toPostgres();
+    }
+
+    private String toPostgresVerbose() {
+        StringBuilder sb = new StringBuilder("@ ");
+        int years = months / 12;
+        int mons = months % 12;
+        if (years != 0) sb.append(years).append(years == 1 || years == -1 ? " year " : " years ");
+        if (mons != 0) sb.append(mons).append(mons == 1 || mons == -1 ? " mon " : " mons ");
+        if (days != 0) sb.append(days).append(days == 1 || days == -1 ? " day " : " days ");
+
+        long absMicros = Math.abs(microseconds);
+        long totalSecs = absMicros / 1_000_000;
+        long fracMicros = absMicros % 1_000_000;
+        long hours = totalSecs / 3600;
+        long mins = (totalSecs % 3600) / 60;
+        long secs = totalSecs % 60;
+        if (microseconds < 0) {
+            if (hours != 0) sb.append(-hours).append(hours == 1 ? " hour " : " hours ");
+            if (mins != 0) sb.append(-mins).append(mins == 1 ? " min " : " mins ");
+            if (secs != 0 || fracMicros != 0) {
+                sb.append(-secs);
+                if (fracMicros > 0) sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));
+                sb.append(secs == 1 && fracMicros == 0 ? " sec " : " secs ");
+            }
+        } else {
+            if (hours != 0) sb.append(hours).append(hours == 1 ? " hour " : " hours ");
+            if (mins != 0) sb.append(mins).append(mins == 1 ? " min " : " mins ");
+            if (secs != 0 || fracMicros != 0) {
+                sb.append(secs);
+                if (fracMicros > 0) sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));
+                sb.append(secs == 1 && fracMicros == 0 ? " sec " : " secs ");
+            }
+        }
+
+        String result = sb.toString().trim();
+        if (result.equals("@")) return "@ 0";
+        return result;
     }
 
     private String toPostgres() {

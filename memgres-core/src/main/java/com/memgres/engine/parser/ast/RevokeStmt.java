@@ -15,6 +15,7 @@ public final class RevokeStmt implements Statement {
     public final boolean grantOptionFor;
     public final boolean isRoleGrant;
     public final boolean cascade;
+    public final List<String> columns;
 
     public RevokeStmt(
             List<String> privileges,
@@ -25,6 +26,19 @@ public final class RevokeStmt implements Statement {
             boolean isRoleGrant,
             boolean cascade
     ) {
+        this(privileges, objectType, objectName, grantees, grantOptionFor, isRoleGrant, cascade, null);
+    }
+
+    public RevokeStmt(
+            List<String> privileges,
+            String objectType,
+            String objectName,
+            List<String> grantees,
+            boolean grantOptionFor,
+            boolean isRoleGrant,
+            boolean cascade,
+            List<String> columns
+    ) {
         this.privileges = privileges;
         this.objectType = objectType;
         this.objectName = objectName;
@@ -32,6 +46,7 @@ public final class RevokeStmt implements Statement {
         this.grantOptionFor = grantOptionFor;
         this.isRoleGrant = isRoleGrant;
         this.cascade = cascade;
+        this.columns = columns;
     }
 
     public List<String> privileges() { return privileges; }
@@ -41,6 +56,7 @@ public final class RevokeStmt implements Statement {
     public boolean grantOptionFor() { return grantOptionFor; }
     public boolean isRoleGrant() { return isRoleGrant; }
     public boolean cascade() { return cascade; }
+    public List<String> columns() { return columns; }
 
     @Override
     public boolean equals(Object o) {

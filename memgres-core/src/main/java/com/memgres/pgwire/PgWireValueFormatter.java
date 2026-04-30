@@ -19,6 +19,24 @@ class PgWireValueFormatter {
     static String formatValue(Object val, GucSettings guc) {
         if (val instanceof byte[]) {
             byte[] ba = (byte[]) val;
+            String byteaOutput = guc != null ? guc.get("bytea_output") : "hex";
+            if ("escape".equalsIgnoreCase(byteaOutput)) {
+                StringBuilder sb = new StringBuilder();
+                for (byte b : ba) {
+                    int v = b & 0xFF;
+                    if (v == 0x5C) { // backslash
+                        sb.append("\\\\");
+                    } else if (v >= 32 && v <= 126) {
+                        sb.append((char) v);
+                    } else {
+                        sb.append('\\');
+                        sb.append((char) ('0' + ((v >> 6) & 7)));
+                        sb.append((char) ('0' + ((v >> 3) & 7)));
+                        sb.append((char) ('0' + (v & 7)));
+                    }
+                }
+                return sb.toString();
+            }
             StringBuilder sb = new StringBuilder("\\x");
             for (byte b : ba) sb.append(String.format("%02x", b & 0xFF));
             return sb.toString();

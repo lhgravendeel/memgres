@@ -19,6 +19,13 @@ class TextSearchFunctions {
 
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
+            case "__tsquery_not__": {
+                // !! tsquery — NOT prefix operator
+                Object operand = executor.evalExpr(fn.args().get(0), ctx);
+                if (operand == null) return null;
+                TsQuery q = operand instanceof TsQuery ? (TsQuery) operand : TsQuery.parse(operand.toString());
+                return TsQuery.not(q);
+            }
             case "to_tsvector": {
                 if (fn.args().size() == 2) {
                     String configName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();

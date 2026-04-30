@@ -13,9 +13,12 @@ public final class CreateSequenceStmt implements Statement {
     public final Boolean cycle;
     public final boolean temporary;
     private Integer cache;
+    private String asType;
 
     public Integer getCache() { return cache; }
     public void setCache(Integer cache) { this.cache = cache; }
+    public String getAsType() { return asType; }
+    public void setAsType(String asType) { this.asType = asType; }
 
     public CreateSequenceStmt(
             String name,
