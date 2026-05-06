@@ -1,6 +1,6 @@
 # memgres-junit5
 
-JUnit 5 extension for [Memgres](https://github.com/memgres/memgres) — an in-memory PostgreSQL-compatible database. No Docker, no external processes. Tests start in milliseconds.
+JUnit 5 extension for [Memgres](https://github.com/lhgravendeel/memgres) — an in-memory PostgreSQL-compatible database. No Docker, no external processes. Tests start in milliseconds.
 
 ## Setup
 

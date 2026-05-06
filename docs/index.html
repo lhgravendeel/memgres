@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Memgres - In-Memory PostgreSQL for Java Testing</title>
-    <meta name="description" content="In-memory PostgreSQL-compatible database for Java testing. No Docker, no external processes. Millisecond startup, real PG wire protocol, 9,500+ tests.">
+    <meta name="description" content="In-memory PostgreSQL-compatible database for Java testing. No Docker, no external processes. Millisecond startup, real PG wire protocol, 13,000+ tests.">
     <meta property="og:title" content="Memgres - In-Memory PostgreSQL for Java Testing">
     <meta property="og:description" content="No Docker, no external processes. Just add the dependency and write tests against real PostgreSQL SQL.">
     <meta property="og:type" content="website">
@@ -489,7 +489,7 @@
 <div class="container">
     <div class="stats">
         <div class="stat">
-            <div class="stat-value">9,500<span class="unit">+</span></div>
+            <div class="stat-value">13,000<span class="unit">+</span></div>
             <div class="stat-label">Passing tests</div>
         </div>
         <div class="stat">
@@ -717,7 +717,7 @@
         <div class="limitations">
             <div class="limitation">No persistence — fully in-memory by design</div>
             <div class="limitation">Btree indexes only (no GiST, GIN, BRIN)</div>
-            <div class="limitation">Extensions parsed but not loaded (no PostGIS, pg_trgm)</div>
+            <div class="limitation">Built-in extensions only (uuid-ossp, pgcrypto, pg_trgm, fuzzystrmatch, unaccent). No C-based extensions (PostGIS, etc.)</div>
             <div class="limitation">No replication (WAL, streaming, or logical)</div>
             <div class="limitation">No foreign data wrappers or foreign tables</div>
             <div class="limitation">No tablespaces</div>

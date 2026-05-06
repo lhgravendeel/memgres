@@ -53,7 +53,7 @@ That's it. `@MemgresTest` starts an in-memory database, injects a `Connection`, 
 
 ### SQL Compatibility
 
-Memgres targets PostgreSQL 18 compatibility with 9,500+ passing tests. Supported features include:
+Memgres targets PostgreSQL 18 compatibility with 13,000+ passing tests. Supported features include:
 
 - **Queries**: SELECT, JOIN (all types), subqueries, CTEs (recursive), window functions, GROUPING SETS / ROLLUP / CUBE, DISTINCT ON, LATERAL, set operations (UNION / INTERSECT / EXCEPT)
 - **DML**: INSERT (ON CONFLICT / RETURNING), UPDATE (FROM), DELETE (USING), MERGE, COPY (text / CSV / binary, FROM STDIN, SELECT ... TO), TRUNCATE
