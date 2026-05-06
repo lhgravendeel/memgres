@@ -21,6 +21,17 @@ class CatalogCoreBuilder {
         this.oids = oids;
     }
 
+    /** Resolve the schema that owns a given sequence via the schemaObjectRegistry. */
+    private static String resolveSequenceSchema(Database database, String seqName) {
+        for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
+            java.util.Set<String> objects = database.getSchemaObjects(entry.getKey());
+            if (objects.contains("sequence:" + seqName.toLowerCase())) {
+                return entry.getKey();
+            }
+        }
+        return "public";
+    }
+
     Table buildPgClass() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.INTEGER),
@@ -205,12 +216,13 @@ class CatalogCoreBuilder {
             });
         }
 
-        // Sequences - explicit sequences (use public namespace)
+        // Sequences - explicit sequences (resolve actual schema)
         for (String seqName : database.getSequences().keySet()) {
+            String explSeqSchema = resolveSequenceSchema(database, seqName);
             int seqOwnerOid = resolveOwnerOid(database, oids, "sequence:" + seqName);
-            int sOid = oids.oid("rel:public." + seqName);
+            int sOid = oids.oid("rel:" + explSeqSchema + "." + seqName);
             table.insertRow(new Object[]{
-                    sOid, seqName, oids.oid("ns:public"),
+                    sOid, seqName, oids.oid("ns:" + explSeqSchema),
                     0, 0, seqOwnerOid, 0, sOid, 0,
                     1, 1.0, 0, 0, 0,
                     false, false, "p", "S",
@@ -234,7 +246,7 @@ class CatalogCoreBuilder {
                     } else if (seqCol.getDefaultValue() != null && seqCol.getDefaultValue().contains("__identity__")) {
                         implicitSeqName = seqT.getName() + "_" + seqCol.getName() + "_seq";
                     }
-                    if (implicitSeqName != null) {
+                    if (implicitSeqName != null && !database.getSequences().containsKey(implicitSeqName.toLowerCase())) {
                         int isOid = oids.oid("rel:" + seqSchemaName + "." + implicitSeqName);
                         table.insertRow(new Object[]{
                                 isOid, implicitSeqName, seqNsOid,

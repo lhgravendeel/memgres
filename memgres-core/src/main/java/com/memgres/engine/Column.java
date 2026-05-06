@@ -11,7 +11,7 @@ public class Column {
     private final DataType type;
     private final boolean nullable;
     private final boolean primaryKey;
-    private final String defaultValue;       // String representation (for display/catalog)
+    private String defaultValue;       // String representation (for display/catalog)
     private Expression parsedDefaultExpr;     // Parsed AST (for evaluation; avoids re-parsing)
     private final String enumTypeName;
     private final Integer precision;
@@ -91,6 +91,7 @@ public class Column {
     public boolean isNullable() { return nullable; }
     public boolean isPrimaryKey() { return primaryKey; }
     public String getDefaultValue() { return defaultValue; }
+    public void setDefaultValue(String defaultValue) { this.defaultValue = defaultValue; }
     public Expression getParsedDefaultExpr() { return parsedDefaultExpr; }
     public void setParsedDefaultExpr(Expression expr) { this.parsedDefaultExpr = expr; }
     public String getEnumTypeName() { return enumTypeName; }

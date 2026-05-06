@@ -208,7 +208,8 @@ class CatalogStubBuilder {
         Table table = new Table("pg_sequence", cols);
         for (String seqName : getSequenceNames(database)) {
             Sequence seq = database.getSequence(seqName);
-            int seqOid = oids.oid("rel:public." + seqName);
+            String seqSchemaName = resolveSequenceSchema(database, seqName);
+            int seqOid = oids.oid("rel:" + seqSchemaName + "." + seqName);
             // Determine sequence type from the source column type
             DataType seqDataType = getSequenceDataType(database, seqName);
             int typOid = seqDataType.getOid();
@@ -266,13 +267,25 @@ class CatalogStubBuilder {
             boolean cycle = seq != null && seq.isCycle();
             long cacheSize = seq != null ? (long) seq.getCache() : 1L;
             Long lastValue = (seq != null && seq.isCalled()) ? seq.currValRaw() : null;
+            String seqSchema = resolveSequenceSchema(database, seqName);
             table.insertRow(new Object[]{
-                    "public", seqName, "memgres", typeName,
+                    seqSchema, seqName, "memgres", typeName,
                     startWith, minValue, maxValue,
                     incrementBy, cacheSize, cycle, lastValue
             });
         }
         return table;
+    }
+
+    /** Resolve the schema that owns a given sequence by checking the schemaObjectRegistry. */
+    private static String resolveSequenceSchema(Database database, String seqName) {
+        for (java.util.Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
+            java.util.Set<String> objects = database.getSchemaObjects(entry.getKey());
+            if (objects.contains("sequence:" + seqName.toLowerCase())) {
+                return entry.getKey();
+            }
+        }
+        return "public";
     }
 
     // ---------------------------------------------------------------

@@ -278,10 +278,16 @@ class DmlExecutor {
             for (int i = 0; i < table.getColumns().size(); i++) {
                 if (filledCols.contains(i)) continue;
                 Column col = table.getColumns().get(i);
-                if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
-                    row[i] = table.nextSerial();
-                } else if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
+                if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
                     row[i] = resolveIdentityNextVal(table, col);
+                } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
+                        && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval(")) {
+                    row[i] = resolveSerialNextVal(col);
+                } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
+                        && col.getDefaultValue() == null) {
+                    // Default was removed (e.g. DROP SEQUENCE CASCADE) — no auto-value
+                } else if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
+                    row[i] = table.nextSerial();
                 } else if (col.getDefaultValue() != null) {
                     Object defVal = executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr());
                     row[i] = TypeCoercion.coerceForStorage(defVal, col);
@@ -831,15 +837,36 @@ class DmlExecutor {
     private void fillDefaults(Table table, Object[] row) {
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
-            if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
-                row[i] = table.nextSerial();
-            } else if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
+            if (col.getDefaultValue() != null && col.getDefaultValue().startsWith("__identity__")) {
                 row[i] = resolveIdentityNextVal(table, col);
+            } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
+                    && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval(")) {
+                row[i] = resolveSerialNextVal(col);
+            } else if ((col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL)
+                    && col.getDefaultValue() == null) {
+                // Default was removed (e.g. DROP SEQUENCE CASCADE) — no auto-value
+            } else if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
+                row[i] = table.nextSerial();
             } else if (col.getDefaultValue() != null) {
                 Object defVal = executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr());
                 row[i] = TypeCoercion.coerceForStorage(defVal, col);
             }
         }
+    }
+
+    private Object resolveSerialNextVal(Column col) {
+        String def = col.getDefaultValue();
+        // Extract sequence name from nextval('seqname'::regclass)
+        int q1 = def.indexOf('\'');
+        int q2 = def.indexOf('\'', q1 + 1);
+        if (q1 >= 0 && q2 > q1) {
+            String seqName = def.substring(q1 + 1, q2);
+            Sequence seq = executor.database.getSequence(seqName);
+            if (seq != null) {
+                return seq.nextVal();
+            }
+        }
+        return null;
     }
 
     private Object resolveIdentityNextVal(Table table, Column col) {

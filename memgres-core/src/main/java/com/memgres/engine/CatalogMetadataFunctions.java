@@ -568,10 +568,15 @@ class CatalogMetadataFunctions {
         if (fn.args().size() < 2) return null;
         String tblName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
         String colName = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+        String explicitSchema = null;
         if (tblName.contains(".")) {
+            explicitSchema = tblName.substring(0, tblName.lastIndexOf('.'));
             tblName = tblName.substring(tblName.lastIndexOf('.') + 1);
         }
-        for (Schema schema : executor.database.getSchemas().values()) {
+        for (java.util.Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
+            String schemaName = entry.getKey();
+            if (explicitSchema != null && !schemaName.equalsIgnoreCase(explicitSchema)) continue;
+            Schema schema = entry.getValue();
             Table tbl = schema.getTable(tblName);
             if (tbl != null) {
                 for (Column col : tbl.getColumns()) {
@@ -581,7 +586,7 @@ class CatalogMetadataFunctions {
                             int q1 = def.indexOf('\'');
                             int q2 = def.indexOf('\'', q1 + 1);
                             if (q1 >= 0 && q2 > q1) {
-                                return "public." + def.substring(q1 + 1, q2);
+                                return schemaName + "." + def.substring(q1 + 1, q2);
                             }
                         }
                         if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL
@@ -592,7 +597,7 @@ class CatalogMetadataFunctions {
                                 Sequence seq = new Sequence(seqName, tbl.getSerialCounter(), 1L, null, null);
                                 executor.database.addSequence(seq);
                             }
-                            return "public." + seqName;
+                            return schemaName + "." + seqName;
                         }
                     }
                 }

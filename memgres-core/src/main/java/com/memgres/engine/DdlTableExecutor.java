@@ -127,30 +127,35 @@ class DdlTableExecutor {
             // GENERATED AS IDENTITY
             if (def.identity() != null) {
                 notNull = true;
+                String seqName = stmt.name() + "_" + def.name() + "_seq";
+                Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
+                executor.database.addSequence(seq);
+                executor.database.registerSchemaObject(schemaName, "sequence", seqName);
                 if (def.identityStart() != null || def.identityIncrement() != null) {
-                    String seqName = stmt.name() + "_" + def.name() + "_seq";
-                    Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
-                    executor.database.addSequence(seq);
-                    executor.database.registerSchemaObject(schemaName, "sequence", seqName);
                     if (dataType != DataType.BIGINT && dataType != DataType.INTEGER && dataType != DataType.SMALLINT) {
                         dataType = DataType.INTEGER;
-                    }
-                    if ("ALWAYS".equalsIgnoreCase(def.identity())) {
-                        defaultVal = "__identity__:always:seq:" + seqName;
-                    } else {
-                        defaultVal = "__identity__:bydefault:seq:" + seqName;
                     }
                 } else {
                     if (dataType == DataType.INTEGER) dataType = DataType.SERIAL;
                     else if (dataType == DataType.BIGINT) dataType = DataType.BIGSERIAL;
                     else if (dataType == DataType.SMALLINT) dataType = DataType.SMALLSERIAL;
                     else dataType = DataType.SERIAL;
-                    if ("ALWAYS".equalsIgnoreCase(def.identity())) {
-                        defaultVal = "__identity__:always";
-                    } else {
-                        defaultVal = "__identity__:bydefault";
-                    }
                 }
+                if ("ALWAYS".equalsIgnoreCase(def.identity())) {
+                    defaultVal = "__identity__:always:seq:" + seqName;
+                } else {
+                    defaultVal = "__identity__:bydefault:seq:" + seqName;
+                }
+            }
+
+            // SERIAL/BIGSERIAL/SMALLSERIAL — create a real sequence (PG-compatible)
+            if (def.identity() == null && (dataType == DataType.SERIAL || dataType == DataType.BIGSERIAL || dataType == DataType.SMALLSERIAL)) {
+                String seqName = stmt.name() + "_" + def.name() + "_seq";
+                Sequence seq = new Sequence(seqName, null, null, null, null);
+                executor.database.addSequence(seq);
+                executor.database.registerSchemaObject(schemaName, "sequence", seqName);
+                defaultVal = "nextval('" + seqName + "'::regclass)";
+                notNull = true;
             }
             if (def.defaultExpr() != null) {
                 defaultVal = DdlExecutor.exprToDefaultString(def.defaultExpr());
@@ -646,6 +651,32 @@ class DdlTableExecutor {
                 executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable));
             }
             schema.removeTable(name);
+            // Drop implicit sequences owned by SERIAL/IDENTITY columns
+            // Only drop sequences that were auto-created (SERIAL types or __identity__ defaults),
+            // NOT independently-created sequences referenced via DEFAULT nextval(...)
+            if (droppedTable != null) {
+                for (Column col : droppedTable.getColumns()) {
+                    String seqName = null;
+                    if (col.getType() == DataType.SERIAL || col.getType() == DataType.BIGSERIAL || col.getType() == DataType.SMALLSERIAL) {
+                        // SERIAL columns: sequence name follows tablename_colname_seq pattern
+                        String candidateSeq = name + "_" + col.getName() + "_seq";
+                        String def = col.getDefaultValue();
+                        if (def != null && def.contains("nextval('" + candidateSeq + "'")) {
+                            seqName = candidateSeq;
+                        } else {
+                            seqName = candidateSeq; // still try even without default
+                        }
+                    }
+                    if (col.getDefaultValue() != null && col.getDefaultValue().contains(":seq:")) {
+                        // __identity__:...:seq:seqname — always owned
+                        seqName = col.getDefaultValue().substring(col.getDefaultValue().indexOf(":seq:") + 5);
+                    }
+                    if (seqName != null && executor.database.hasSequence(seqName)) {
+                        executor.database.removeSequence(seqName);
+                        executor.database.removeObjectOwner("sequence:" + seqName);
+                    }
+                }
+            }
             executor.database.removeObjectOwner("table:" + schemaName + "." + name);
             executor.database.removePrivilegesOnObject("TABLE", name);
         } else if (!ifExists) {
@@ -729,6 +760,22 @@ class DdlTableExecutor {
                         totalCount += table.deleteAll();
                         if (stmt.restartIdentity()) {
                             table.resetSerialCounter(1);
+                            // Also restart real sequences for SERIAL/IDENTITY columns
+                            for (Column col : table.getColumns()) {
+                                String seqName = null;
+                                String def = col.getDefaultValue();
+                                if (def != null && def.contains("nextval('")) {
+                                    int q1 = def.indexOf('\'');
+                                    int q2 = def.indexOf('\'', q1 + 1);
+                                    if (q1 >= 0 && q2 > q1) seqName = def.substring(q1 + 1, q2);
+                                } else if (def != null && def.contains(":seq:")) {
+                                    seqName = def.substring(def.indexOf(":seq:") + 5);
+                                }
+                                if (seqName != null) {
+                                    Sequence seq = executor.database.getSequence(seqName);
+                                    if (seq != null) seq.restart();
+                                }
+                            }
                         }
                         // Fire AFTER TRUNCATE statement-level triggers
                         for (PgTrigger trig : triggers) {

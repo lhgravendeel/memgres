@@ -11,7 +11,7 @@ INSERT INTO items(item_name) VALUES ('a'), ('b'), ('c');
 
 -- begin-expected
 -- columns: sequence_name
--- row: public.items_item_id_seq
+-- row: items_item_id_seq
 -- end-expected
 SELECT pg_get_serial_sequence('test_730.items', 'item_id')::regclass::text AS sequence_name;
 
