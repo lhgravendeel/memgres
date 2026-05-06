@@ -6,6 +6,7 @@ import org.postgresql.copy.CopyManager;
 import org.postgresql.core.BaseConnection;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.sql.*;
 import java.util.*;
@@ -96,7 +97,7 @@ class CopyOutputComparisonTest {
                 ". Run CopyOutputBaselineCollector to generate it.");
 
         Map<String, CopyEntry> entries = new LinkedHashMap<>();
-        try (BufferedReader br = new BufferedReader(new InputStreamReader(is))) {
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
             String line;
             String currentLabel = null;
             String currentCmd = null;

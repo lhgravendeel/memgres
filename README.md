@@ -14,7 +14,7 @@ Memgres implements the PostgreSQL wire protocol (v3) and speaks directly to stan
 <dependency>
     <groupId>com.memgres</groupId>
     <artifactId>memgres-junit5</artifactId>
-    <version>0.1.0</version>
+    <version>0.2.0</version>
     <scope>test</scope>
 </dependency>
 ```
@@ -22,7 +22,7 @@ Memgres implements the PostgreSQL wire protocol (v3) and speaks directly to stan
 ### Gradle
 
 ```groovy
-testImplementation 'com.memgres:memgres-junit5:0.1.0'
+testImplementation 'com.memgres:memgres-junit5:0.2.0'
 testImplementation 'org.postgresql:postgresql:42.7.5'
 ```
 
