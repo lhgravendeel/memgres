@@ -2223,7 +2223,36 @@ class FunctionEvaluator {
             Sequence seq = executor.database.getSequence(tempName);
             if (seq != null) return seq;
         }
-        return executor.database.getSequence(seqName);
+        Sequence seq = executor.database.getSequence(seqName);
+        if (seq != null) return seq;
+
+        // PG creates implicit sequences for SERIAL columns (tablename_colname_seq).
+        // Memgres uses an internal counter instead, so auto-create the sequence
+        // on first reference to maintain PG-compatible setval/nextval/currval behavior.
+        if (seqName.endsWith("_seq")) {
+            String prefix = seqName.substring(0, seqName.length() - 4);
+            int lastUnderscore = prefix.lastIndexOf('_');
+            if (lastUnderscore > 0) {
+                String tblName = prefix.substring(0, lastUnderscore);
+                String colName = prefix.substring(lastUnderscore + 1);
+                for (Schema schema : executor.database.getSchemas().values()) {
+                    Table tbl = schema.getTable(tblName);
+                    if (tbl != null) {
+                        int colIdx = tbl.getColumnIndex(colName);
+                        if (colIdx >= 0 && (tbl.getColumns().get(colIdx).getType() == DataType.SERIAL
+                                || tbl.getColumns().get(colIdx).getType() == DataType.BIGSERIAL
+                                || tbl.getColumns().get(colIdx).getType() == DataType.SMALLSERIAL)) {
+                            Sequence implicitSeq = new Sequence(seqName, null, null, null, null);
+                            long currentVal = tbl.getSerialCounter() - 1;
+                            if (currentVal >= 1) implicitSeq.setVal(currentVal);
+                            executor.database.addSequence(implicitSeq);
+                            return implicitSeq;
+                        }
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     /**

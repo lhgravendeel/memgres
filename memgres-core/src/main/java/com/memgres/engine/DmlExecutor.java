@@ -372,6 +372,28 @@ class DmlExecutor {
                                 break;
                             }
                         }
+                        // Also match bare column names in expression syntax against regular column constraints
+                        // e.g., ON CONFLICT ((id)) where (id) is parsed as expression "id" should match PRIMARY KEY (id)
+                        if (!hasMatchingExprIndex
+                                && (sc.getType() == StoredConstraint.Type.UNIQUE || sc.getType() == StoredConstraint.Type.PRIMARY_KEY)
+                                && sc.getColumns() != null
+                                && sc.getColumns().size() == targetExprs.size()) {
+                            boolean allMatch = true;
+                            for (int ei = 0; ei < targetExprs.size(); ei++) {
+                                String targetExpr = targetExprs.get(ei).toLowerCase().replaceAll("\\s+", "");
+                                String colName = sc.getColumns().get(ei).toLowerCase();
+                                if (!targetExpr.equals(colName)) {
+                                    allMatch = false;
+                                    break;
+                                }
+                            }
+                            if (allMatch) {
+                                if (sc.getWhereExpr() != null && stmt.onConflict().whereClause() == null) {
+                                    continue;
+                                }
+                                hasMatchingExprIndex = true;
+                            }
+                        }
                     }
                     if (!hasMatchingExprIndex) {
                         throw new MemgresException("there is no unique or exclusion constraint matching the ON CONFLICT specification", "42P10");

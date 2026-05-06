@@ -109,6 +109,52 @@ public class ExpressionParser {
                 || checkKeyword("WINDOW");
     }
 
+    private static final java.util.Set<String> QUERY_START_KEYWORDS = Cols.setOf(
+            "SELECT", "WITH", "VALUES", "INSERT", "UPDATE", "DELETE", "MERGE");
+
+    /**
+     * Scans ahead through consecutive LEFT_PAREN tokens to check if a query keyword
+     * (SELECT, WITH, VALUES, etc.) follows. Does NOT consume any tokens.
+     * Returns the number of extra LEFT_PAREN tokens before the keyword, or -1 if
+     * no query keyword is found. A return of 0 means the current token is already
+     * a query keyword (no extra parens).
+     */
+    protected int countLeadingParensBeforeQuery() {
+        int look = pos;
+        int count = 0;
+        while (look < tokens.size() && tokens.get(look).type() == TokenType.LEFT_PAREN) {
+            count++;
+            look++;
+        }
+        if (count == 0) return -1;
+        if (look < tokens.size()) {
+            Token t = tokens.get(look);
+            if (t.type() == TokenType.KEYWORD && QUERY_START_KEYWORDS.contains(t.value())) {
+                return count;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Consumes N LEFT_PAREN tokens. Used with countLeadingParensBeforeQuery().
+     */
+    protected int consumeLeadingParens(int count) {
+        for (int i = 0; i < count; i++) {
+            expect(TokenType.LEFT_PAREN);
+        }
+        return count;
+    }
+
+    /**
+     * Consumes N RIGHT_PAREN tokens (the closing parens matching consumeLeadingParens).
+     */
+    protected void consumeTrailingParens(int count) {
+        for (int i = 0; i < count; i++) {
+            expect(TokenType.RIGHT_PAREN);
+        }
+    }
+
     protected boolean checkIdentifier(String name) {
         Token t = peek();
         return t.type() == TokenType.IDENTIFIER && t.value().equalsIgnoreCase(name);
@@ -565,8 +611,11 @@ public class ExpressionParser {
                 boolean isAll = checkKeyword("ALL");
                 advance(); // consume ANY/SOME/ALL
                 expect(TokenType.LEFT_PAREN);
-                if (checkKeyword("SELECT") || checkKeyword("WITH") || checkKeyword("VALUES")) {
+                int extraParens = Math.max(0, countLeadingParensBeforeQuery());
+                if (extraParens > 0 || checkKeyword("SELECT") || checkKeyword("WITH") || checkKeyword("VALUES")) {
+                    consumeLeadingParens(extraParens);
                     Statement subquery = parseSubqueryWithSetOps();
+                    consumeTrailingParens(extraParens);
                     expect(TokenType.RIGHT_PAREN);
                     return new AnyAllExpr(left, BinaryExpr.BinOp.EQUAL, subquery, isAll);
                 }
@@ -656,8 +705,11 @@ public class ExpressionParser {
             boolean isAll = checkKeyword("ALL");
             advance(); // consume ANY/SOME/ALL
             expect(TokenType.LEFT_PAREN);
-            if (checkKeyword("SELECT") || checkKeyword("WITH") || checkKeyword("VALUES")) {
+            int extraParens = Math.max(0, countLeadingParensBeforeQuery());
+            if (extraParens > 0 || checkKeyword("SELECT") || checkKeyword("WITH") || checkKeyword("VALUES")) {
+                consumeLeadingParens(extraParens);
                 Statement subquery = parseSubqueryWithSetOps();
+                consumeTrailingParens(extraParens);
                 expect(TokenType.RIGHT_PAREN);
                 return new AnyAllExpr(left, op, subquery, isAll);
             }
@@ -1116,7 +1168,10 @@ public class ExpressionParser {
                 case "EXISTS": {
                     advance();
                     expect(TokenType.LEFT_PAREN);
+                    int extraParens = Math.max(0, countLeadingParensBeforeQuery());
+                    consumeLeadingParens(extraParens);
                     Statement subquery = parseSubqueryWithSetOps();
+                    consumeTrailingParens(extraParens);
                     expect(TokenType.RIGHT_PAREN);
                     return new ExistsExpr(subquery);
                 }

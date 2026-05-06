@@ -37,9 +37,9 @@ class DmlParser {
             insertAlias = parser.readIdentifier();
         }
 
-        // Column list
+        // Column list — disambiguate from parenthesized SELECT by scanning for query keywords
         List<String> columns = null;
-        if (parser.check(TokenType.LEFT_PAREN) && !isNextKeywordSelect()) {
+        if (parser.check(TokenType.LEFT_PAREN) && parser.countLeadingParensBeforeQuery() < 0) {
             parser.expect(TokenType.LEFT_PAREN);
             columns = new ArrayList<>();
             do {
@@ -77,6 +77,16 @@ class DmlParser {
         } else if (parser.checkKeyword("SELECT") || parser.checkKeyword("WITH")) {
             // Parse SELECT which may include UNION/INTERSECT/EXCEPT
             selectStmt = parser.tryParseSetOp(parser.parseSelect());
+        } else if (parser.check(TokenType.LEFT_PAREN)) {
+            // Parenthesized SELECT: INSERT INTO t (cols) (((SELECT ...)))
+            int extra = parser.countLeadingParensBeforeQuery();
+            if (extra > 0) {
+                parser.consumeLeadingParens(extra);
+                selectStmt = parser.tryParseSetOp(parser.parseSelect());
+                parser.consumeTrailingParens(extra);
+            } else {
+                throw new ParseException("Expected VALUES, DEFAULT VALUES, or SELECT", parser.peek());
+            }
         } else {
             throw new ParseException("Expected VALUES, DEFAULT VALUES, or SELECT", parser.peek());
         }

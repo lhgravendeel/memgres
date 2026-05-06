@@ -128,28 +128,57 @@ class DmlConflictHelper {
 
         // Find the matching stored constraint with expression columns
         StoredConstraint matchedConstraint = null;
+        boolean matchedAsPlainColumns = false;
         for (StoredConstraint sc : table.getConstraints()) {
             if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) continue;
-            if (sc.getExpressionColumns() == null || sc.getExpressionColumns().size() != targetExprs.size()) continue;
 
-            boolean allMatch = true;
-            for (int i = 0; i < targetExprs.size(); i++) {
-                String targetExpr = targetExprs.get(i).toLowerCase().replaceAll("\\s+", "");
-                String idxExpr = sc.getColumns().get(i).toLowerCase().replaceAll("\\s+", "");
-                if (!targetExpr.equals(idxExpr)) {
-                    allMatch = false;
+            if (sc.getExpressionColumns() != null && sc.getExpressionColumns().size() == targetExprs.size()) {
+                boolean allMatch = true;
+                for (int i = 0; i < targetExprs.size(); i++) {
+                    String targetExpr = targetExprs.get(i).toLowerCase().replaceAll("\\s+", "");
+                    String idxExpr = sc.getColumns().get(i).toLowerCase().replaceAll("\\s+", "");
+                    if (!targetExpr.equals(idxExpr)) {
+                        allMatch = false;
+                        break;
+                    }
+                }
+                if (allMatch && sc.getWhereExpr() != null && conflictWhere == null) continue;
+                if (allMatch) {
+                    matchedConstraint = sc;
                     break;
                 }
             }
-            // For partial indexes, ON CONFLICT must also have WHERE
-            if (allMatch && sc.getWhereExpr() != null && conflictWhere == null) continue;
-            if (allMatch) {
-                matchedConstraint = sc;
-                break;
+            // Also match bare column name expressions against regular column constraints
+            // e.g., ON CONFLICT ((id)) where expression is "id" matches PRIMARY KEY (id)
+            if (sc.getColumns() != null && sc.getColumns().size() == targetExprs.size()) {
+                boolean allMatch = true;
+                for (int i = 0; i < targetExprs.size(); i++) {
+                    String targetExpr = targetExprs.get(i).toLowerCase().replaceAll("\\s+", "");
+                    String colName = sc.getColumns().get(i).toLowerCase();
+                    if (!targetExpr.equals(colName)) {
+                        allMatch = false;
+                        break;
+                    }
+                }
+                if (allMatch && sc.getWhereExpr() != null && conflictWhere == null) continue;
+                if (allMatch) {
+                    matchedConstraint = sc;
+                    matchedAsPlainColumns = true;
+                    break;
+                }
             }
         }
 
         if (matchedConstraint == null) return null;
+
+        // If matched as plain columns, delegate to the regular column-based conflict finder
+        if (matchedAsPlainColumns) {
+            List<String> cols = matchedConstraint.getColumns();
+            InsertStmt.OnConflict colBased = new InsertStmt.OnConflict(
+                    cols, onConflict.constraint(), onConflict.doNothing(), onConflict.doUpdate(),
+                    onConflict.whereClause(), null, onConflict.doUpdateWhereClause());
+            return findConflictingRow(table, proposedRow, colBased);
+        }
 
         List<Expression> exprCols = matchedConstraint.getExpressionColumns();
         Expression whereExpr = matchedConstraint.getWhereExpr();
