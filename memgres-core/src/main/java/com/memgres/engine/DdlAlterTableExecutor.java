@@ -639,9 +639,9 @@ class DdlAlterTableExecutor {
 
         String newDefault;
         if (marker.contains(":always")) {
-            newDefault = "__identity__:always";
+            newDefault = "__identity__:always:seq:" + seqName;
         } else {
-            newDefault = "nextval('" + seqName + "')";
+            newDefault = "__identity__:bydefault:seq:" + seqName;
         }
         table.alterColumnDefault(column, newDefault);
 
