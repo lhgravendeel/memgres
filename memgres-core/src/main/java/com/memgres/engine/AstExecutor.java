@@ -525,7 +525,26 @@ public class AstExecutor {
             if (underlying != null) return underlying;
             throw new MemgresException("cannot insert into view \"" + tableName + "\"", "55000");
         }
+        // Sequences are queryable as relations in PG (columns: last_value, log_cnt, is_called)
+        Table seqTable = resolveSequenceAsRelation(schemaName, tableName);
+        if (seqTable != null) return seqTable;
         throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+    }
+
+    /**
+     * Resolve a sequence name to a virtual single-row table with columns
+     * last_value, log_cnt, is_called — matching PG's sequence relation layout.
+     */
+    private Table resolveSequenceAsRelation(String schemaName, String seqName) {
+        Sequence seq = database.getSequence(seqName);
+        if (seq == null) return null;
+        List<Column> cols = new java.util.ArrayList<>();
+        cols.add(new Column("last_value", DataType.BIGINT, false, false, null));
+        cols.add(new Column("log_cnt", DataType.BIGINT, false, false, null));
+        cols.add(new Column("is_called", DataType.BOOLEAN, false, false, null));
+        Table table = new Table(seqName, cols);
+        table.insertRow(new Object[]{seq.currValRaw(), 0L, seq.isCalled()});
+        return table;
     }
 
     Table resolveTableSafe(String tableName) {

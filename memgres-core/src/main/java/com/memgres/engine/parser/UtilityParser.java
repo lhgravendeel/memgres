@@ -586,8 +586,9 @@ class UtilityParser {
         // 22023 for invalid option values (bad FORMAT, non-boolean value, etc.)
         String deferredOptionSqlState = null;
 
-        // Handle EXPLAIN (options) format
-        if (parser.check(TokenType.LEFT_PAREN)) {
+        // Handle EXPLAIN (options) format — but not EXPLAIN (SELECT ...) which is a parenthesized query
+        int explainQueryParens = Math.max(0, parser.countLeadingParensBeforeQuery());
+        if (parser.check(TokenType.LEFT_PAREN) && explainQueryParens == 0) {
             parser.advance();
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
                 parser.match(TokenType.COMMA); // options separated by commas
@@ -832,7 +833,10 @@ class UtilityParser {
             parser.matchKeyword("HOLD");
         }
         parser.expectKeyword("FOR");
+        int cursorExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
+        parser.consumeLeadingParens(cursorExtraParens);
         Statement query = parser.tryParseSetOp(parser.parseSelect());
+        parser.consumeTrailingParens(cursorExtraParens);
         return new DeclareCursorStmt(name, query, scroll, withHold, binary, explicitNoScroll);
     }
 

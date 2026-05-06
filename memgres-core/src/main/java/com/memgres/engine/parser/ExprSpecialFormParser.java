@@ -59,7 +59,10 @@ class ExprSpecialFormParser {
         ep.expectKeyword("ARRAY");
         if (ep.check(TokenType.LEFT_PAREN)) {
             ep.advance();
+            int extraParens = Math.max(0, ep.countLeadingParensBeforeQuery());
+            ep.consumeLeadingParens(extraParens);
             Statement subquery = ep.parseSubqueryWithSetOps();
+            ep.consumeTrailingParens(extraParens);
             ep.expect(TokenType.RIGHT_PAREN);
             return new ArraySubqueryExpr(subquery);
         }

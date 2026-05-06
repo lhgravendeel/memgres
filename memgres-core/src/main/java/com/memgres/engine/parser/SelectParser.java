@@ -63,7 +63,13 @@ class SelectParser {
             }
 
             Statement right;
-            if (parser.check(TokenType.LEFT_PAREN)) {
+            int setOpExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
+            if (parser.check(TokenType.LEFT_PAREN) && setOpExtraParens > 0) {
+                parser.consumeLeadingParens(setOpExtraParens);
+                right = parser.parseSelect(); right = tryParseSetOp(right);
+                parser.consumeTrailingParens(setOpExtraParens);
+                lastRightWasParenthesized = true;
+            } else if (parser.check(TokenType.LEFT_PAREN)) {
                 parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
                 lastRightWasParenthesized = true;
             } else {
@@ -116,8 +122,13 @@ class SelectParser {
             }
 
             Statement right;
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance(); right = parser.parseSelect(); parser.expect(TokenType.RIGHT_PAREN);
+            int intersectExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
+            if (parser.check(TokenType.LEFT_PAREN) && intersectExtraParens > 0) {
+                parser.consumeLeadingParens(intersectExtraParens);
+                right = parser.parseSelect(); right = tryParseSetOp(right);
+                parser.consumeTrailingParens(intersectExtraParens);
+            } else if (parser.check(TokenType.LEFT_PAREN)) {
+                parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
             } else {
                 right = parser.parseSelect();
             }
@@ -655,7 +666,7 @@ class SelectParser {
 
             // Optional column name list
             List<String> columnNames = null;
-            if (parser.check(TokenType.LEFT_PAREN) && !isNextKeywordSelect()) {
+            if (parser.check(TokenType.LEFT_PAREN) && parser.countLeadingParensBeforeQuery() < 0) {
                 parser.expect(TokenType.LEFT_PAREN);
                 columnNames = new ArrayList<>();
                 do {
@@ -675,8 +686,14 @@ class SelectParser {
             parser.expect(TokenType.LEFT_PAREN);
 
             // Parse the CTE body: can be SELECT, set operation, or writable (INSERT/UPDATE/DELETE with RETURNING)
+            // The body may be wrapped in extra parens ((SELECT ...)) or have parenthesized set-op arms
+            // (SELECT 1) UNION ALL (SELECT 2). Use parseStatement() for parenthesized content to handle both.
             Statement cteBody;
-            if (parser.checkKeyword("INSERT")) {
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                // Parenthesized content — use parseStatement which handles recursive nesting and set ops
+                cteBody = parser.parseStatement();
+                cteBody = tryParseSetOp(cteBody);
+            } else if (parser.checkKeyword("INSERT")) {
                 cteBody = parser.parseInsert();
             } else if (parser.checkKeyword("UPDATE")) {
                 cteBody = parser.parseUpdate();
@@ -1198,11 +1215,22 @@ class SelectParser {
                     }
                 } else if (parser.check(TokenType.LEFT_PAREN)) {
                     // Parenthesized SELECT union: ((SELECT ...) UNION ALL (SELECT ...))
-                    parser.advance(); // consume inner (
-                    subStmt = parser.parseSelect();
-                    subStmt = tryParseSetOp(subStmt);
-                    parser.expect(TokenType.RIGHT_PAREN); // consume inner )
-                    subStmt = tryParseSetOp(subStmt);
+                    // or multi-wrapped arms: ((SELECT ...)) UNION ((SELECT ...))
+                    int innerExtra = Math.max(0, parser.countLeadingParensBeforeQuery());
+                    if (innerExtra > 1) {
+                        // Multi-paren wrapped: ((SELECT ...)) or (((SELECT ...)))
+                        // Use parseStatement to handle arbitrary nesting and set ops
+                        subStmt = parser.parseStatement();
+                        subStmt = tryParseSetOp(subStmt);
+                    } else {
+                        // Single paren wrapper with potential set ops inside:
+                        // (SELECT ...) UNION ALL (SELECT ...) or ((SELECT ...) UNION ALL ...)
+                        parser.advance(); // consume inner (
+                        subStmt = parser.parseSelect();
+                        subStmt = tryParseSetOp(subStmt);
+                        parser.expect(TokenType.RIGHT_PAREN); // consume inner )
+                        subStmt = tryParseSetOp(subStmt);
+                    }
                 } else {
                     subStmt = parser.parseSelect();
                     subStmt = tryParseSetOp(subStmt);
@@ -1236,9 +1264,14 @@ class SelectParser {
                     }
                 }
                 // Parenthesized FROM item (e.g., pg_dump style: ((a JOIN b ON ...) JOIN c ON ...))
+                // PG rejects bare table names in parens: FROM (tablename) is a syntax error
                 parser.advance(); // consume (
                 SelectStmt.FromItem inner = parseFromItem(); // recursively parse the join tree
                 parser.expect(TokenType.RIGHT_PAREN);
+                // Reject bare table references in parens — PG only allows parenthesized joins
+                if (inner instanceof SelectStmt.TableRef) {
+                    throw new ParseException("syntax error at or near \")\"", parser.tokens.get(parser.pos - 1));
+                }
                 // Check for an optional alias after the parenthesized FROM item
                 // Pattern: (SELECT ... JOIN ...) alias or (SELECT ... JOIN ...) alias(col1, col2, ...)
                 String parenAlias = null;

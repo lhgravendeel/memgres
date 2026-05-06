@@ -1541,20 +1541,65 @@ class DdlObjectExecutor {
     }
 
     private void dropSequence(DropStmt stmt) {
+        String seqName = stmt.name();
+        // Strip schema prefix for lookup
+        String bareSeqName = seqName.contains(".") ? seqName.substring(seqName.lastIndexOf('.') + 1) : seqName;
         if (!stmt.ifExists()) {
-            if (!executor.database.hasSequence(stmt.name())) {
-                if (ddl.resolveTableOrNull(stmt.name()) != null || executor.database.hasView(stmt.name())) {
-                    throw new MemgresException("\"" + stmt.name() + "\" is not a sequence", "42809");
+            if (!executor.database.hasSequence(bareSeqName)) {
+                if (ddl.resolveTableOrNull(bareSeqName) != null || executor.database.hasView(bareSeqName)) {
+                    throw new MemgresException("\"" + bareSeqName + "\" is not a sequence", "42809");
                 }
-                throw new MemgresException("sequence \"" + stmt.name() + "\" does not exist", "42P01");
+                throw new MemgresException("sequence \"" + bareSeqName + "\" does not exist", "42P01");
             }
         }
-        Sequence oldSeq = executor.database.getSequence(stmt.name());
-        if (oldSeq != null) {
-            executor.recordUndo(new Session.DropSequenceUndo(stmt.name(), oldSeq));
+        if (!executor.database.hasSequence(bareSeqName)) return;
+        // Check for dependent columns
+        List<String[]> dependents = findSequenceDependents(bareSeqName);
+        if (!dependents.isEmpty() && !stmt.cascade()) {
+            throw new MemgresException("cannot drop sequence " + bareSeqName
+                    + " because other objects depend on it", "2BP01");
         }
-        executor.database.removeSequence(stmt.name());
-        executor.database.removeObjectOwner("sequence:" + stmt.name());
+        // CASCADE: remove the default from dependent columns
+        if (stmt.cascade()) {
+            for (String[] dep : dependents) {
+                String tblName = dep[0];
+                String colName = dep[1];
+                for (Schema schema : executor.database.getSchemas().values()) {
+                    Table tbl = schema.getTable(tblName);
+                    if (tbl != null) {
+                        for (Column col : tbl.getColumns()) {
+                            if (col.getName().equalsIgnoreCase(colName)) {
+                                col.setDefaultValue(null);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Sequence oldSeq = executor.database.getSequence(bareSeqName);
+        if (oldSeq != null) {
+            executor.recordUndo(new Session.DropSequenceUndo(bareSeqName, oldSeq));
+        }
+        executor.database.removeSequence(bareSeqName);
+        executor.database.removeObjectOwner("sequence:" + bareSeqName);
+    }
+
+    /** Find all table columns whose default references the given sequence name. */
+    private List<String[]> findSequenceDependents(String seqName) {
+        List<String[]> result = new java.util.ArrayList<>();
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (java.util.Map.Entry<String, Table> entry : schema.getTables().entrySet()) {
+                Table tbl = entry.getValue();
+                for (Column col : tbl.getColumns()) {
+                    String def = col.getDefaultValue();
+                    if (def == null) continue;
+                    if (def.contains("nextval('" + seqName + "'") || def.contains(":seq:" + seqName)) {
+                        result.add(new String[]{tbl.getName(), col.getName()});
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     private void dropIndex(DropStmt stmt) {

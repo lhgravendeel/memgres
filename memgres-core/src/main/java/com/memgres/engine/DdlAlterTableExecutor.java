@@ -170,6 +170,32 @@ class DdlAlterTableExecutor {
         String defaultVal = def.defaultExpr() != null ? DdlExecutor.exprToDefaultString(def.defaultExpr()) : null;
         String genExpr = def.generatedExpr();
 
+        // SERIAL/BIGSERIAL/SMALLSERIAL: create a real sequence (same as CREATE TABLE)
+        if (dt == DataType.SERIAL || dt == DataType.BIGSERIAL || dt == DataType.SMALLSERIAL) {
+            if (defaultVal == null && def.identity() == null) {
+                String seqName = stmt.table() + "_" + def.name() + "_seq";
+                Sequence seq = new Sequence(seqName, null, null, null, null);
+                executor.database.addSequence(seq);
+                executor.database.registerSchemaObject(schemaName, "sequence", seqName);
+                defaultVal = "nextval('" + seqName + "'::regclass)";
+            }
+        }
+
+        // GENERATED AS IDENTITY on ADD COLUMN
+        if (def.identity() != null) {
+            String seqName = stmt.table() + "_" + def.name() + "_seq";
+            if (!executor.database.hasSequence(seqName)) {
+                Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
+                executor.database.addSequence(seq);
+                executor.database.registerSchemaObject(schemaName, "sequence", seqName);
+            }
+            if ("ALWAYS".equalsIgnoreCase(def.identity())) {
+                defaultVal = "__identity__:always:seq:" + seqName;
+            } else {
+                defaultVal = "__identity__:bydefault:seq:" + seqName;
+            }
+        }
+
         // Validate generated column expression references valid columns and is immutable
         if (genExpr != null) {
             // Reject volatile/stable functions and operators in generated column expressions
@@ -193,7 +219,13 @@ class DdlAlterTableExecutor {
 
         Column col = new Column(def.name(), dt, !def.notNull(), def.primaryKey(), defaultVal,
                 enumTypeName, def.precision(), def.scale(), genExpr, def.generatedVirtual(), domainTypeName, null, null);
-        Object evaluatedDefault = defaultVal != null ? executor.evaluateDefault(defaultVal, dt) : null;
+        // Don't pre-evaluate serial/nextval/identity defaults — they should be evaluated per-row
+        Object evaluatedDefault;
+        if (defaultVal != null && (defaultVal.contains("nextval(") || defaultVal.startsWith("__identity__"))) {
+            evaluatedDefault = null;
+        } else {
+            evaluatedDefault = defaultVal != null ? executor.evaluateDefault(defaultVal, dt) : null;
+        }
 
         // Validate default type compatibility
         if (defaultVal != null && evaluatedDefault != null) {
@@ -528,7 +560,8 @@ class DdlAlterTableExecutor {
         int colIdx = table.getColumnIndex(column);
         Column col = colIdx >= 0 ? table.getColumns().get(colIdx) : null;
         boolean restarted = false;
-        if (col != null && col.getDefaultValue() != null && col.getDefaultValue().contains("nextval")) {
+        if (col != null && col.getDefaultValue() != null
+                && (col.getDefaultValue().contains("nextval") || col.getDefaultValue().contains(":seq:"))) {
             Sequence seq = findBackingSequence(col);
             if (seq != null) {
                 if (marker.contains(":")) {
@@ -606,9 +639,9 @@ class DdlAlterTableExecutor {
 
         String newDefault;
         if (marker.contains(":always")) {
-            newDefault = "__identity__:always";
+            newDefault = "__identity__:always:seq:" + seqName;
         } else {
-            newDefault = "nextval('" + seqName + "')";
+            newDefault = "__identity__:bydefault:seq:" + seqName;
         }
         table.alterColumnDefault(column, newDefault);
 
@@ -639,10 +672,16 @@ class DdlAlterTableExecutor {
 
     private Sequence findBackingSequence(Column col) {
         String seqRef = col.getDefaultValue();
+        // Check for nextval('seqname'::regclass) pattern
         int qi = seqRef.indexOf("'");
         int qi2 = seqRef.indexOf("'", qi + 1);
         if (qi >= 0 && qi2 >= 0) {
             String seqName = seqRef.substring(qi + 1, qi2);
+            return executor.database.getSequence(seqName);
+        }
+        // Check for __identity__:...:seq:seqname pattern
+        if (seqRef.contains(":seq:")) {
+            String seqName = seqRef.substring(seqRef.indexOf(":seq:") + 5);
             return executor.database.getSequence(seqName);
         }
         return null;

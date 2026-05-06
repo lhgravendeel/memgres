@@ -694,9 +694,10 @@ class DdlParser {
 
         if (materialized) {
             parser.expectKeyword("AS");
-            boolean parenWrapped = parser.match(TokenType.LEFT_PAREN);
+            int viewParens = Math.max(0, parser.countLeadingParensBeforeQuery());
+            parser.consumeLeadingParens(viewParens);
             Statement query = parser.tryParseSetOp(parser.parseSelect());
-            if (parenWrapped) parser.expect(TokenType.RIGHT_PAREN);
+            parser.consumeTrailingParens(viewParens);
             boolean withData = true;
             if (parser.matchKeyword("WITH")) {
                 if (parser.matchKeyword("NO")) { parser.expectKeyword("DATA"); withData = false; }
@@ -722,9 +723,10 @@ class DdlParser {
         }
 
         parser.expectKeyword("AS");
-        boolean parenWrapped2 = parser.match(TokenType.LEFT_PAREN);
+        int viewParens2 = Math.max(0, parser.countLeadingParensBeforeQuery());
+        parser.consumeLeadingParens(viewParens2);
         Statement query = parser.tryParseSetOp(parser.parseSelect());
-        if (parenWrapped2) parser.expect(TokenType.RIGHT_PAREN);
+        parser.consumeTrailingParens(viewParens2);
 
         String checkOption = null;
         if (parser.matchKeyword("WITH")) {
