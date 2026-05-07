@@ -647,7 +647,9 @@ class FunctionEvaluator {
                 if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
                 Sequence seq = resolveSequence(seqName);
                 if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
-                long val = executor.toLong(executor.evalExpr(fn.args().get(1), ctx));
+                Object rawVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (rawVal == null) return null; // PG treats setval(seq, NULL) as a no-op returning NULL
+                long val = executor.toLong(rawVal);
                 long result;
                 if (fn.args().size() > 2) {
                     boolean isCalled = executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));

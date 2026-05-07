@@ -429,7 +429,75 @@ class SerialSequenceLifecycleTest {
     }
 
     // =========================================================================
-    // 20. Verify column default expression is nextval('seq'::regclass)
+    // 20. setval with NULL is a no-op (PG 18 behavior)
+    // =========================================================================
+
+    @Test void setval_null_is_noop() throws SQLException {
+        exec("CREATE TABLE slc_t21 (id serial PRIMARY KEY)");
+        try {
+            exec("INSERT INTO slc_t21 DEFAULT VALUES"); // id = 1
+            assertEquals(1, queryInt("SELECT id FROM slc_t21"));
+
+            // setval with NULL literal — PG returns NULL, sequence unchanged
+            String setvalResult = querySingle("SELECT setval('slc_t21_id_seq', NULL)");
+            assertNull(setvalResult, "setval(seq, NULL) should return NULL");
+
+            // Next insert should still get id = 2
+            exec("INSERT INTO slc_t21 DEFAULT VALUES");
+            assertEquals(2, queryInt("SELECT max(id) FROM slc_t21"));
+        } finally {
+            exec("DROP TABLE slc_t21");
+        }
+    }
+
+    // =========================================================================
+    // 21. setval with NULL from subquery (empty table MAX pattern)
+    // =========================================================================
+
+    @Test void setval_null_from_empty_max_subquery() throws SQLException {
+        exec("CREATE TABLE slc_t22 (id serial PRIMARY KEY)");
+        try {
+            // Empty table — max returns NULL
+            assertNull(querySingle("SELECT max(id) FROM slc_t22"));
+
+            // setval with NULL subquery — should be a no-op
+            String setvalResult = querySingle(
+                    "SELECT setval('slc_t22_id_seq', (SELECT max(id) FROM slc_t22))");
+            assertNull(setvalResult, "setval(seq, NULL subquery) should return NULL");
+
+            // First insert should get id = 1
+            exec("INSERT INTO slc_t22 DEFAULT VALUES");
+            assertEquals(1, queryInt("SELECT id FROM slc_t22"));
+        } finally {
+            exec("DROP TABLE slc_t22");
+        }
+    }
+
+    // =========================================================================
+    // 22. setval NULL after real inserts — sequence position preserved
+    // =========================================================================
+
+    @Test void setval_null_after_inserts_preserves_position() throws SQLException {
+        exec("CREATE TABLE slc_t23 (id serial PRIMARY KEY)");
+        try {
+            exec("INSERT INTO slc_t23 DEFAULT VALUES"); // 1
+            exec("INSERT INTO slc_t23 DEFAULT VALUES"); // 2
+            exec("INSERT INTO slc_t23 DEFAULT VALUES"); // 3
+
+            // setval NULL should not reset the sequence
+            String setvalResult = querySingle("SELECT setval('slc_t23_id_seq', NULL)");
+            assertNull(setvalResult, "setval(seq, NULL) should return NULL");
+
+            // Next insert should get id = 4
+            exec("INSERT INTO slc_t23 DEFAULT VALUES");
+            assertEquals(4, queryInt("SELECT max(id) FROM slc_t23"));
+        } finally {
+            exec("DROP TABLE slc_t23");
+        }
+    }
+
+    // =========================================================================
+    // 23. Verify column default expression is nextval('seq'::regclass)
     // =========================================================================
 
     @Test void column_default_expression_references_sequence() throws SQLException {
