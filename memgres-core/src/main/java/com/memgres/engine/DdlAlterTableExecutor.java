@@ -67,7 +67,7 @@ class DdlAlterTableExecutor {
             executeAlterColumn(alterCol, table, stmt, schemaName);
         } else if (action instanceof AlterTableStmt.AddConstraint) {
             AlterTableStmt.AddConstraint addConstraint = (AlterTableStmt.AddConstraint) action;
-            executeAddConstraint(addConstraint, table, stmt);
+            executeAddConstraint(addConstraint, table, stmt, schemaName);
         } else if (action instanceof AlterTableStmt.ValidateConstraint) {
             AlterTableStmt.ValidateConstraint vc = (AlterTableStmt.ValidateConstraint) action;
             executeValidateConstraint(vc, table, stmt);
@@ -688,7 +688,7 @@ class DdlAlterTableExecutor {
     }
 
     private void executeAddConstraint(AlterTableStmt.AddConstraint addConstraint, Table table,
-                                       AlterTableStmt stmt) {
+                                       AlterTableStmt stmt, String schemaName) {
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.NOT_NULL) {
             for (String colName : addConstraint.constraint().columns()) {
                 table.alterColumnNullable(colName, false);
@@ -713,6 +713,11 @@ class DdlAlterTableExecutor {
             if (addConstraint.notValid()) {
                 sc.setConvalidated(false);
             }
+            // For FK constraints without explicit schema, default to the table's schema
+            if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
+                    && sc.getReferencesSchema() == null && sc.getReferencesTable() != null) {
+                sc.setReferencesSchema(schemaName);
+            }
             if (!sc.isNotEnforced() && !addConstraint.notValid()) {
                 if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
                     validateForeignKeyData(sc, table, stmt.table());
@@ -726,7 +731,12 @@ class DdlAlterTableExecutor {
     }
 
     private void validateForeignKeyData(StoredConstraint sc, Table table, String tableName) {
-        Table refTable = executor.resolveTable("public", sc.getReferencesTable());
+        Table refTable;
+        if (sc.getReferencesSchema() != null) {
+            refTable = executor.resolveTable(sc.getReferencesSchema(), sc.getReferencesTable());
+        } else {
+            refTable = executor.resolveTableAnySchema(sc.getReferencesTable());
+        }
         for (String refCol : sc.getReferencesColumns()) {
             if (refTable.getColumnIndex(refCol) < 0) {
                 throw new MemgresException("column \"" + refCol + "\" referenced in foreign key constraint does not exist", "42703");

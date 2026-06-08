@@ -960,7 +960,10 @@ class CatalogMetadataFunctions {
                 StringBuilder sb = new StringBuilder("FOREIGN KEY (");
                 sb.append(String.join(", ", sc.getColumns()));
                 sb.append(") REFERENCES ");
-                if (sc.getReferencesTable() != null) sb.append(sc.getReferencesTable());
+                if (sc.getReferencesTable() != null) {
+                    if (sc.getReferencesSchema() != null) sb.append(sc.getReferencesSchema()).append(".");
+                    sb.append(sc.getReferencesTable());
+                }
                 if (sc.getReferencesColumns() != null && !sc.getReferencesColumns().isEmpty()) {
                     sb.append("(").append(String.join(", ", sc.getReferencesColumns())).append(")");
                 }

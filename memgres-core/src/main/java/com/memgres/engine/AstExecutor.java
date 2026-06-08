@@ -570,6 +570,18 @@ public class AstExecutor {
     }
 
     Table resolveTableAnySchema(String tableName) {
+        // Handle schema-qualified names (e.g., "ks1.parent")
+        if (tableName.contains(".")) {
+            int dot = tableName.indexOf('.');
+            String schema = tableName.substring(0, dot);
+            String bare = tableName.substring(dot + 1);
+            Schema s = database.getSchema(schema);
+            if (s != null) {
+                Table t = s.getTable(bare);
+                if (t != null) return t;
+            }
+            throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+        }
         String defSchema = defaultSchema();
         if (defSchema != null) {
             Schema ds = database.getSchema(defSchema);

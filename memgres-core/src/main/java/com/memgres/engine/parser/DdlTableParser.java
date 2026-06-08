@@ -283,7 +283,7 @@ class DdlTableParser {
             if (parser.matchKeyword("REFERENCES")) {
                 refTable = parser.readIdentifier();
                 if (parser.match(TokenType.DOT)) {
-                    refTable = parser.readIdentifier();
+                    refTable = refTable + "." + parser.readIdentifier();
                 }
                 if (parser.check(TokenType.LEFT_PAREN)) {
                     parser.expect(TokenType.LEFT_PAREN);
@@ -539,7 +539,7 @@ class DdlTableParser {
             parser.expect(TokenType.RIGHT_PAREN);
             parser.expectKeyword("REFERENCES");
             String refTable = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) refTable = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) refTable = refTable + "." + parser.readIdentifier();
             List<String> refCols = null;
             if (parser.check(TokenType.LEFT_PAREN)) {
                 parser.expect(TokenType.LEFT_PAREN);

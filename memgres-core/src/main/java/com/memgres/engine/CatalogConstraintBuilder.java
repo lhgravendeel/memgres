@@ -84,7 +84,8 @@ class CatalogConstraintBuilder {
                     }
                     int confrelid = 0;
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
-                        confrelid = oids.oid("rel:" + schemaEntry.getKey() + "." + sc.getReferencesTable());
+                        String refSchema = sc.getReferencesSchema() != null ? sc.getReferencesSchema() : schemaEntry.getKey();
+                        confrelid = oids.oid("rel:" + refSchema + "." + sc.getReferencesTable());
                     }
                     // Convert column names to attnum array string
                     List<Object> conkey = columnNamesToAttnums(t, sc.getColumns());

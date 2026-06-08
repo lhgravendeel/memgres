@@ -1087,12 +1087,12 @@ class DdlParser {
         parser.matchKeyword("ONLY");
         List<String> tables = new ArrayList<>();
         String tbl = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) tbl = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) tbl = tbl + "." + parser.readIdentifier();
         tables.add(tbl);
         while (parser.match(TokenType.COMMA)) {
             parser.matchKeyword("ONLY");
             String next = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) next = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) next = next + "." + parser.readIdentifier();
             tables.add(next);
         }
         boolean restartIdentity = false;

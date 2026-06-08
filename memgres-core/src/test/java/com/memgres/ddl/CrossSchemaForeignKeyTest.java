@@ -84,8 +84,6 @@ class CrossSchemaForeignKeyTest {
     // 2. ALTER TABLE ADD FK referencing another schema
     // =========================================================================
 
-    @Disabled("Bug: ALTER TABLE ADD FK does not resolve schema-qualified REFERENCES — " +
-              "'relation \"parent\" does not exist' when referencing ks1.parent")
     @Test void alter_table_add_fk_references_other_schema() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.child (id int PRIMARY KEY, parent_id int)");
@@ -260,8 +258,6 @@ class CrossSchemaForeignKeyTest {
     // 13. Bidirectional FKs between schemas
     // =========================================================================
 
-    @Disabled("Bug: ALTER TABLE ADD FK does not resolve schema-qualified REFERENCES — " +
-              "'relation \"b\" does not exist' when referencing ks2.b from ks1.a")
     @Test void bidirectional_fks_between_schemas() throws SQLException {
         exec("CREATE TABLE ks1.a (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.b (id int PRIMARY KEY, a_id int REFERENCES ks1.a(id))");
@@ -311,8 +307,6 @@ class CrossSchemaForeignKeyTest {
     // 15. Schema-qualified REFERENCES resolves correctly despite search_path
     // =========================================================================
 
-    @Disabled("Bug: Schema-qualified REFERENCES ks1.parent resolves to wrong table — " +
-              "FK validates against search_path table instead of the explicitly named schema")
     @Test void schema_qualified_fk_ignores_search_path() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.parent (id int PRIMARY KEY)");
@@ -339,8 +333,6 @@ class CrossSchemaForeignKeyTest {
     // 16. ALTER TABLE ADD FK — ambiguous table, schema-qualified
     // =========================================================================
 
-    @Disabled("Bug: ALTER TABLE ADD FK does not resolve schema-qualified REFERENCES — " +
-              "'relation \"parent\" does not exist' when referencing ks1.parent")
     @Test void alter_table_add_fk_schema_qualified_with_ambiguity() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.parent (id int PRIMARY KEY)");
@@ -363,8 +355,6 @@ class CrossSchemaForeignKeyTest {
     // 17. DROP SCHEMA CASCADE drops dependent FKs
     // =========================================================================
 
-    @Disabled("Bug: DROP SCHEMA CASCADE does not clean up cross-schema FK constraints — " +
-              "'relation \"parent\" does not exist' when trying to insert after parent schema dropped")
     @Test void drop_schema_cascade_removes_cross_schema_fk() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.child (id int PRIMARY KEY, parent_id int REFERENCES ks1.parent(id))");
@@ -385,8 +375,6 @@ class CrossSchemaForeignKeyTest {
     // 18. DROP referenced table — blocked without CASCADE
     // =========================================================================
 
-    @Disabled("Bug: DROP TABLE does not check for cross-schema FK dependencies — " +
-              "silently drops the referenced table without error")
     @Test void drop_referenced_table_blocked_without_cascade() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.child (id int PRIMARY KEY, parent_id int REFERENCES ks1.parent(id))");
@@ -402,8 +390,6 @@ class CrossSchemaForeignKeyTest {
     // 19. DROP referenced table CASCADE — FK removed, child survives
     // =========================================================================
 
-    @Disabled("Bug: DROP TABLE CASCADE does not handle cross-schema FK cleanup — " +
-              "'relation \"parent\" does not exist' during cascade")
     @Test void drop_referenced_table_cascade_removes_fk() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.child (id int PRIMARY KEY, parent_id int REFERENCES ks1.parent(id))");
@@ -456,8 +442,6 @@ class CrossSchemaForeignKeyTest {
     // 22. ALTER TABLE ADD FK fails validation on existing data
     // =========================================================================
 
-    @Disabled("Bug: ALTER TABLE ADD FK does not resolve schema-qualified REFERENCES — " +
-              "gets 42P01 instead of 23503 because it can't find the referenced table")
     @Test void alter_table_add_fk_rejects_existing_invalid_data() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.child (id int PRIMARY KEY, parent_id int)");
@@ -517,8 +501,6 @@ class CrossSchemaForeignKeyTest {
     // 25. TRUNCATE child table — should work even with cross-schema FK
     // =========================================================================
 
-    @Disabled("Bug: TRUNCATE does not resolve schema-qualified table names — " +
-              "'Table not found: child' when using TRUNCATE ks2.child")
     @Test void truncate_child_with_cross_schema_fk() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.child (id int PRIMARY KEY, parent_id int REFERENCES ks1.parent(id))");
@@ -534,8 +516,6 @@ class CrossSchemaForeignKeyTest {
     // 26. TRUNCATE parent — should fail if child has rows referencing it
     // =========================================================================
 
-    @Disabled("Bug: TRUNCATE does not detect cross-schema FK dependencies — " +
-              "'Table not found: parent' instead of FK violation error")
     @Test void truncate_parent_blocked_by_cross_schema_child() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.child (id int PRIMARY KEY, parent_id int REFERENCES ks1.parent(id))");
@@ -554,8 +534,6 @@ class CrossSchemaForeignKeyTest {
     // 27. TRUNCATE CASCADE across schemas
     // =========================================================================
 
-    @Disabled("Bug: TRUNCATE CASCADE does not cascade across schemas — " +
-              "'Table not found: parent'")
     @Test void truncate_cascade_across_schemas() throws SQLException {
         exec("CREATE TABLE ks1.parent (id int PRIMARY KEY)");
         exec("CREATE TABLE ks2.child (id int PRIMARY KEY, parent_id int REFERENCES ks1.parent(id))");

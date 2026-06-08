@@ -1676,6 +1676,31 @@ class DdlObjectExecutor {
                     executor.database.removeObjectOwner("table:" + stmt.name() + "." + tName);
                 }
                 executor.database.removePrivilegesOnObject("SCHEMA", stmt.name());
+                // CASCADE: remove FK constraints from tables in other schemas referencing dropped tables
+                String droppedSchemaName = stmt.name();
+                for (Schema otherSchema : executor.database.getSchemas().values()) {
+                    if (otherSchema == schema) continue;
+                    for (Table otherTable : otherSchema.getTables().values()) {
+                        List<String> fksToRemove = new java.util.ArrayList<>();
+                        for (StoredConstraint sc : otherTable.getConstraints()) {
+                            if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                            String refTable = sc.getReferencesTable();
+                            boolean matchesDroppedTable = false;
+                            for (String tName : tableNames) {
+                                if (tName.equalsIgnoreCase(refTable)) {
+                                    // Check if FK explicitly references the dropped schema, or if it's unqualified
+                                    if (sc.getReferencesSchema() == null
+                                            || sc.getReferencesSchema().equalsIgnoreCase(droppedSchemaName)) {
+                                        matchesDroppedTable = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (matchesDroppedTable) fksToRemove.add(sc.getName());
+                        }
+                        for (String fkName : fksToRemove) otherTable.removeConstraint(fkName);
+                    }
+                }
                 tableNames.forEach(schema::removeTable);
 
                 String schemaName = stmt.name().toLowerCase();

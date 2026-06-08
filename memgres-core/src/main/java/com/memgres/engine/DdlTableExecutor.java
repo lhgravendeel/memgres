@@ -295,6 +295,11 @@ class DdlTableExecutor {
                 }
                 StoredConstraint sc = ddl.convertTableConstraint(stmt.name(), tc);
                 if (sc != null) {
+                    // For FK constraints without explicit schema, set the schema from the table's schema
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
+                            && sc.getReferencesSchema() == null && sc.getReferencesTable() != null) {
+                        sc.setReferencesSchema(schemaName);
+                    }
                     table.addConstraint(sc);
                     if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
                         for (String colName : sc.getColumns()) {
@@ -477,13 +482,17 @@ class DdlTableExecutor {
 
     private void addColumnForeignKey(Table table, ColumnDef def, String schemaName, String tableName) {
         String refTableName = def.referencesTable();
+        String refSchemaName = null;
         Table refTable = null;
         if (refTableName.contains(".")) {
             String[] parts = refTableName.split("\\.", 2);
-            try { refTable = executor.resolveTable(parts[0], parts[1]); } catch (MemgresException ignored) {}
+            refSchemaName = parts[0];
+            refTableName = parts[1]; // bare table name
+            try { refTable = executor.resolveTable(refSchemaName, refTableName); } catch (MemgresException ignored) {}
         }
         if (refTable == null) {
             try { refTable = executor.resolveTable(schemaName, refTableName); } catch (MemgresException ignored) {}
+            if (refTable != null && refSchemaName == null) refSchemaName = schemaName;
         }
         if (refTable == null) refTable = ddl.resolveTableOrNull(refTableName);
         if (refTable == null) {
@@ -518,9 +527,10 @@ class DdlTableExecutor {
                 ? Cols.listOf(def.referencesColumn()) : Cols.listOf();
         StoredConstraint fk = StoredConstraint.foreignKey(
                 tableName + "_" + def.name() + "_fkey",
-                Cols.listOf(def.name()), def.referencesTable(), refCols,
+                Cols.listOf(def.name()), refTableName, refCols,
                 StoredConstraint.parseFkAction(def.refOnDelete()),
                 StoredConstraint.parseFkAction(def.refOnUpdate()));
+        if (refSchemaName != null) fk.setReferencesSchema(refSchemaName);
         if (def.deferrable()) {
             fk.setDeferrable(true);
             fk.setInitiallyDeferred(def.initiallyDeferred());
@@ -597,6 +607,22 @@ class DdlTableExecutor {
             }
             if (droppedTable != null) {
                 if (!cascade) {
+                    // Check FK dependencies: any table in any schema referencing this table
+                    for (Schema s : executor.database.getSchemas().values()) {
+                        for (Table otherTable : s.getTables().values()) {
+                            if (otherTable == droppedTable) continue;
+                            for (StoredConstraint sc : otherTable.getConstraints()) {
+                                if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                                if (!sc.getReferencesTable().equalsIgnoreCase(name)) continue;
+                                if (sc.getReferencesSchema() != null
+                                        && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
+                                throw new MemgresException(
+                                        "cannot drop table " + name + " because other objects depend on it\n"
+                                        + "  Detail: constraint " + sc.getName() + " on table " + otherTable.getName() + " depends on table " + name,
+                                        "2BP01");
+                            }
+                        }
+                    }
                     for (Database.ViewDef view : executor.database.getViews().values()) {
                         String viewSql = view.query() != null ? view.query().toString().toLowerCase() : "";
                         if (viewSql.contains(name.toLowerCase())) {
@@ -631,6 +657,21 @@ class DdlTableExecutor {
                         }
                     }
                 } else {
+                    // CASCADE: remove FK constraints from tables referencing this table
+                    for (Schema s : executor.database.getSchemas().values()) {
+                        for (Table otherTable : s.getTables().values()) {
+                            if (otherTable == droppedTable) continue;
+                            List<String> fksToRemove = new ArrayList<>();
+                            for (StoredConstraint sc : otherTable.getConstraints()) {
+                                if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                                if (!sc.getReferencesTable().equalsIgnoreCase(name)) continue;
+                                if (sc.getReferencesSchema() != null
+                                        && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
+                                fksToRemove.add(sc.getName());
+                            }
+                            for (String fkName : fksToRemove) otherTable.removeConstraint(fkName);
+                        }
+                    }
                     List<String> viewsToDrop = new ArrayList<>();
                     for (Map.Entry<String, Database.ViewDef> entry : executor.database.getViews().entrySet()) {
                         String viewSql = entry.getValue().query() != null ? entry.getValue().query().toString().toLowerCase() : "";
@@ -744,6 +785,29 @@ class DdlTableExecutor {
                     if (table != null) {
                         found = true;
                         List<Object[]> oldRows = new ArrayList<>(table.getRows());
+                        // Check FK dependencies: tables referencing this one
+                        if (!stmt.cascade()) {
+                            for (Schema s : executor.database.getSchemas().values()) {
+                                for (Table otherTable : s.getTables().values()) {
+                                    if (otherTable == table) continue;
+                                    for (StoredConstraint sc : otherTable.getConstraints()) {
+                                        if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                                        if (sc.isNotEnforced()) continue;
+                                        if (!sc.getReferencesTable().equalsIgnoreCase(bareName)) continue;
+                                        if (sc.getReferencesSchema() != null
+                                                && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
+                                        // PG only blocks if child table has actual rows referencing parent
+                                        if (!otherTable.getRows().isEmpty()) {
+                                            throw new MemgresException(
+                                                    "cannot truncate a table referenced in a foreign key constraint\n"
+                                                    + "  Detail: Table \"" + otherTable.getName() + "\" references \"" + bareName + "\".\n"
+                                                    + "  Hint: Truncate table \"" + otherTable.getName() + "\" at the same time, or use TRUNCATE ... CASCADE.",
+                                                    "0A000");
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         executor.recordUndo(new Session.TruncateUndo(schemaName, bareName, oldRows, table.getSerialCounter()));
                         // Fire BEFORE TRUNCATE statement-level triggers
                         List<PgTrigger> triggers = executor.database.getTriggersForTable(bareName);
@@ -758,6 +822,22 @@ class DdlTableExecutor {
                             }
                         }
                         totalCount += table.deleteAll();
+                        // CASCADE: truncate dependent tables
+                        if (stmt.cascade()) {
+                            for (Schema s : executor.database.getSchemas().values()) {
+                                for (Table otherTable : s.getTables().values()) {
+                                    if (otherTable == table) continue;
+                                    for (StoredConstraint sc : otherTable.getConstraints()) {
+                                        if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                                        if (!sc.getReferencesTable().equalsIgnoreCase(bareName)) continue;
+                                        if (sc.getReferencesSchema() != null
+                                                && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
+                                        otherTable.deleteAll();
+                                        break; // one match is enough to truncate this table
+                                    }
+                                }
+                            }
+                        }
                         if (stmt.restartIdentity()) {
                             table.resetSerialCounter(1);
                             // Also restart real sequences for SERIAL/IDENTITY columns

@@ -167,10 +167,18 @@ class DdlExecutor {
             }
             case FOREIGN_KEY: {
                 if (name == null) name = tableName + "_" + String.join("_", tc.columns()) + "_fkey";
+                String fkRefTable = tc.referencesTable();
+                String fkRefSchema = null;
+                if (fkRefTable != null && fkRefTable.contains(".")) {
+                    int dot = fkRefTable.indexOf('.');
+                    fkRefSchema = fkRefTable.substring(0, dot);
+                    fkRefTable = fkRefTable.substring(dot + 1);
+                }
                 StoredConstraint fk = StoredConstraint.foreignKey(name, tc.columns(),
-                        tc.referencesTable(), tc.referencesColumns(),
+                        fkRefTable, tc.referencesColumns(),
                         StoredConstraint.parseFkAction(tc.onDelete()),
                         StoredConstraint.parseFkAction(tc.onUpdate()));
+                if (fkRefSchema != null) fk.setReferencesSchema(fkRefSchema);
                 if (tc.deferrable()) {
                     fk.setDeferrable(true);
                     fk.setInitiallyDeferred(tc.initiallyDeferred());

@@ -53,6 +53,7 @@ public class StoredConstraint {
     private final List<String> columns;
     private final Expression checkExpr;
     private final String referencesTable;
+    private String referencesSchema; // schema of the referenced table (null = resolve via search_path)
     private final List<String> referencesColumns;
     private final FkAction onDelete;
     private final FkAction onUpdate;
@@ -108,6 +109,8 @@ public class StoredConstraint {
     public List<String> getColumns() { return columns; }
     public Expression getCheckExpr() { return checkExpr; }
     public String getReferencesTable() { return referencesTable; }
+    public String getReferencesSchema() { return referencesSchema; }
+    public void setReferencesSchema(String schema) { this.referencesSchema = schema; }
     public List<String> getReferencesColumns() { return referencesColumns; }
     public FkAction getOnDelete() { return onDelete; }
     public FkAction getOnUpdate() { return onUpdate; }

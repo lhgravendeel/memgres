@@ -28,6 +28,16 @@ class ConstraintValidator {
         return null;
     }
 
+    /** Check if a FK constraint's referenced table matches the given parent table (name + schema). */
+    private boolean fkReferencesTable(StoredConstraint sc, Table parentTable, String parentSchemaName) {
+        if (!sc.getReferencesTable().equalsIgnoreCase(parentTable.getName())) return false;
+        if (sc.getReferencesSchema() != null) {
+            // Schema-qualified FK — must match the specific schema
+            return sc.getReferencesSchema().equalsIgnoreCase(parentSchemaName);
+        }
+        return true; // unqualified FK — name match is sufficient
+    }
+
     void validateConstraints(Table table, Object[] row, Object[] excludeRow) {
         // 1. NOT NULL enforcement
         for (int i = 0; i < table.getColumns().size(); i++) {
@@ -343,8 +353,13 @@ class ConstraintValidator {
     }
 
     private void validateForeignKey(Table table, Object[] row, StoredConstraint sc) {
-        // Resolve the referenced table
-        Table refTable = executor.resolveTableAnySchema(sc.getReferencesTable());
+        // Resolve the referenced table (schema-qualified when available)
+        Table refTable;
+        if (sc.getReferencesSchema() != null) {
+            refTable = executor.resolveTable(sc.getReferencesSchema(), sc.getReferencesTable());
+        } else {
+            refTable = executor.resolveTableAnySchema(sc.getReferencesTable());
+        }
 
         int[] fkColIndices = new int[sc.getColumns().size()];
         for (int i = 0; i < sc.getColumns().size(); i++) {
@@ -537,13 +552,14 @@ class ConstraintValidator {
      * Handle FK ON DELETE actions for all tables that reference the given table.
      */
     void handleFkOnDelete(Table parentTable, Object[] deletedRow) {
+        String parentSchemaName = findSchemaName(parentTable);
         // Find all tables with FK constraints referencing this table
         for (Schema schema : executor.database.getSchemas().values()) {
             for (Table childTable : schema.getTables().values()) {
                 for (StoredConstraint sc : childTable.getConstraints()) {
                     if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
                     if (sc.isNotEnforced()) continue;
-                    if (!sc.getReferencesTable().equalsIgnoreCase(parentTable.getName())) continue;
+                    if (!fkReferencesTable(sc, parentTable, parentSchemaName)) continue;
 
                     List<String> refColNames = sc.getReferencesColumns();
                     if (refColNames.isEmpty()) {
@@ -700,12 +716,13 @@ class ConstraintValidator {
      * Handle FK ON UPDATE actions for all tables that reference the given table.
      */
     void handleFkOnUpdate(Table parentTable, Object[] oldRow, Object[] newRow) {
+        String parentSchemaName = findSchemaName(parentTable);
         for (Schema schema : executor.database.getSchemas().values()) {
             for (Table childTable : schema.getTables().values()) {
                 for (StoredConstraint sc : childTable.getConstraints()) {
                     if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
                     if (sc.isNotEnforced()) continue;
-                    if (!sc.getReferencesTable().equalsIgnoreCase(parentTable.getName())) continue;
+                    if (!fkReferencesTable(sc, parentTable, parentSchemaName)) continue;
 
                     List<String> refColNames = sc.getReferencesColumns();
                     if (refColNames.isEmpty()) {
