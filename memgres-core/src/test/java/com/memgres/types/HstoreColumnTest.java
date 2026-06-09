@@ -1,0 +1,470 @@
+package com.memgres.types;
+
+import com.memgres.core.Memgres;
+import org.junit.jupiter.api.*;
+
+import java.sql.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Comprehensive tests for hstore as a column type, covering:
+ *  - Column creation (CREATE TABLE, ALTER TABLE ADD COLUMN)
+ *  - INSERT / UPDATE / DELETE with hstore data
+ *  - SELECT with hstore operators (->  @>  ?  ||  etc.)
+ *  - Casting to/from hstore (text, json, jsonb, record)
+ *  - hstore functions (akeys, avals, each, hstore_to_json, etc.)
+ *  - NULL handling, empty hstore, defaults
+ *  - WHERE clause filtering on hstore columns
+ *  - hstore with other column types in same table
+ */
+class HstoreColumnTest {
+
+    static Memgres memgres;
+    static Connection conn;
+
+    @BeforeAll
+    static void setUp() throws Exception {
+        memgres = Memgres.builder().port(0).build().start();
+        conn = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple",
+                memgres.getUser(), memgres.getPassword());
+        conn.setAutoCommit(true);
+        exec("CREATE EXTENSION IF NOT EXISTS hstore");
+    }
+
+    @AfterAll
+    static void tearDown() throws Exception {
+        if (conn != null) conn.close();
+        if (memgres != null) memgres.close();
+    }
+
+    private static void exec(String sql) throws SQLException {
+        try (Statement s = conn.createStatement()) { s.execute(sql); }
+    }
+
+    private static String str(String sql) throws SQLException {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            assertTrue(rs.next());
+            String v = rs.getString(1);
+            assertFalse(rs.next(), "expected single row");
+            return v;
+        }
+    }
+
+    private static boolean bool(String sql) throws SQLException {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            assertTrue(rs.next());
+            return rs.getBoolean(1);
+        }
+    }
+
+    private static int count(String sql) throws SQLException {
+        try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
+            assertTrue(rs.next());
+            return rs.getInt(1);
+        }
+    }
+
+    // =========================================================================
+    // A. Column creation
+    // =========================================================================
+
+    @Test
+    void create_table_with_hstore_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_create");
+        exec("CREATE TABLE hs_create (id serial PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_create (data) VALUES ('color=>blue,size=>large')");
+        assertEquals("blue", str("SELECT data->'color' FROM hs_create WHERE id = 1"));
+    }
+
+    @Test
+    void alter_table_add_hstore_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_alter");
+        exec("CREATE TABLE hs_alter (id serial PRIMARY KEY, name text)");
+        exec("ALTER TABLE hs_alter ADD COLUMN settings hstore");
+        exec("INSERT INTO hs_alter (name, settings) VALUES ('acme', 'theme=>dark,lang=>en')");
+        assertEquals("dark", str("SELECT settings->'theme' FROM hs_alter WHERE name = 'acme'"));
+    }
+
+    @Test
+    void hstore_column_with_default() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_default");
+        exec("CREATE TABLE hs_default (id int PRIMARY KEY, opts hstore DEFAULT 'debug=>false')");
+        exec("INSERT INTO hs_default (id) VALUES (1)");
+        assertEquals("false", str("SELECT opts->'debug' FROM hs_default WHERE id = 1"));
+    }
+
+    @Test
+    void hstore_column_not_null_constraint() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_notnull");
+        exec("CREATE TABLE hs_notnull (id int PRIMARY KEY, tags hstore NOT NULL)");
+        exec("INSERT INTO hs_notnull VALUES (1, 'a=>1')");
+        assertThrows(SQLException.class, () -> exec("INSERT INTO hs_notnull VALUES (2, NULL)"));
+    }
+
+    // =========================================================================
+    // B. INSERT / UPDATE / DELETE
+    // =========================================================================
+
+    @Test
+    void insert_hstore_literal() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_ins");
+        exec("CREATE TABLE hs_ins (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_ins VALUES (1, 'a=>1, b=>2, c=>3')");
+        assertEquals("1", str("SELECT data->'a' FROM hs_ins WHERE id = 1"));
+        assertEquals("3", str("SELECT data->'c' FROM hs_ins WHERE id = 1"));
+    }
+
+    @Test
+    void insert_hstore_null_value() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_null");
+        exec("CREATE TABLE hs_null (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_null VALUES (1, 'a=>1, b=>NULL')");
+        assertNull(str("SELECT data->'b' FROM hs_null WHERE id = 1"));
+    }
+
+    @Test
+    void insert_hstore_null_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_cnull");
+        exec("CREATE TABLE hs_cnull (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_cnull VALUES (1, NULL)");
+        assertNull(str("SELECT data FROM hs_cnull WHERE id = 1"));
+    }
+
+    @Test
+    void insert_empty_hstore() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_empty");
+        exec("CREATE TABLE hs_empty (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_empty VALUES (1, '')");
+        assertNull(str("SELECT data->'anything' FROM hs_empty WHERE id = 1"));
+    }
+
+    @Test
+    void update_hstore_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_upd");
+        exec("CREATE TABLE hs_upd (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_upd VALUES (1, 'x=>old')");
+        exec("UPDATE hs_upd SET data = 'x=>new,y=>added' WHERE id = 1");
+        assertEquals("new", str("SELECT data->'x' FROM hs_upd WHERE id = 1"));
+        assertEquals("added", str("SELECT data->'y' FROM hs_upd WHERE id = 1"));
+    }
+
+    @Test
+    void update_hstore_to_null() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_upd2");
+        exec("CREATE TABLE hs_upd2 (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_upd2 VALUES (1, 'a=>1')");
+        exec("UPDATE hs_upd2 SET data = NULL WHERE id = 1");
+        assertNull(str("SELECT data FROM hs_upd2 WHERE id = 1"));
+    }
+
+    @Test
+    void delete_with_hstore_condition() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_del");
+        exec("CREATE TABLE hs_del (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_del VALUES (1, 'keep=>yes'), (2, 'keep=>no')");
+        exec("DELETE FROM hs_del WHERE data->'keep' = 'no'");
+        assertEquals(1, count("SELECT count(*) FROM hs_del"));
+        assertEquals("yes", str("SELECT data->'keep' FROM hs_del"));
+    }
+
+    // =========================================================================
+    // C. Operators on hstore columns
+    // =========================================================================
+
+    @Test
+    void arrow_operator_on_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_op");
+        exec("CREATE TABLE hs_op (id int PRIMARY KEY, meta hstore)");
+        exec("INSERT INTO hs_op VALUES (1, 'name=>Alice, role=>admin')");
+        assertEquals("Alice", str("SELECT meta->'name' FROM hs_op WHERE id = 1"));
+    }
+
+    @Test
+    void contains_operator_on_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_cont");
+        exec("CREATE TABLE hs_cont (id int PRIMARY KEY, tags hstore)");
+        exec("INSERT INTO hs_cont VALUES (1, 'a=>1, b=>2'), (2, 'c=>3')");
+        assertTrue(bool("SELECT tags @> 'a=>1' FROM hs_cont WHERE id = 1"));
+        assertFalse(bool("SELECT tags @> 'a=>1' FROM hs_cont WHERE id = 2"));
+    }
+
+    @Test
+    void contained_by_operator_on_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_contby");
+        exec("CREATE TABLE hs_contby (id int PRIMARY KEY, tags hstore)");
+        exec("INSERT INTO hs_contby VALUES (1, 'a=>1')");
+        assertTrue(bool("SELECT tags <@ 'a=>1, b=>2' FROM hs_contby WHERE id = 1"));
+    }
+
+    @Test
+    void hstore_concat_operator_on_columns() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_concat");
+        exec("CREATE TABLE hs_concat (id int PRIMARY KEY, base hstore, extra hstore)");
+        exec("INSERT INTO hs_concat VALUES (1, 'a=>1', 'b=>2')");
+        String merged = str("SELECT (base || extra)->'b' FROM hs_concat WHERE id = 1");
+        assertEquals("2", merged);
+    }
+
+    @Test
+    void hstore_key_exists_operator() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_exists");
+        exec("CREATE TABLE hs_exists (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_exists VALUES (1, 'x=>1, y=>2')");
+        assertTrue(bool("SELECT data ? 'x' FROM hs_exists WHERE id = 1"));
+        assertFalse(bool("SELECT data ? 'z' FROM hs_exists WHERE id = 1"));
+    }
+
+    @Test
+    void hstore_delete_key_operator() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_delkey");
+        exec("CREATE TABLE hs_delkey (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_delkey VALUES (1, 'a=>1, b=>2, c=>3')");
+        assertFalse(bool("SELECT (data - 'b') ? 'b' FROM hs_delkey WHERE id = 1"));
+        assertTrue(bool("SELECT (data - 'b') ? 'a' FROM hs_delkey WHERE id = 1"));
+    }
+
+    // =========================================================================
+    // D. Casting
+    // =========================================================================
+
+    @Test
+    void cast_text_to_hstore_in_insert() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_cast_ins");
+        exec("CREATE TABLE hs_cast_ins (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_cast_ins VALUES (1, 'key=>val'::hstore)");
+        assertEquals("val", str("SELECT data->'key' FROM hs_cast_ins WHERE id = 1"));
+    }
+
+    @Test
+    void cast_hstore_column_to_text() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_to_text");
+        exec("CREATE TABLE hs_to_text (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_to_text VALUES (1, 'a=>1')");
+        String text = str("SELECT data::text FROM hs_to_text WHERE id = 1");
+        assertNotNull(text);
+        assertTrue(text.contains("a") && text.contains("1"), "text rep should contain key and value");
+    }
+
+    @Test
+    void cast_hstore_to_json() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_to_json");
+        exec("CREATE TABLE hs_to_json (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_to_json VALUES (1, 'x=>10, y=>20')");
+        String json = str("SELECT hstore_to_json(data)::text FROM hs_to_json WHERE id = 1");
+        assertNotNull(json);
+        assertTrue(json.contains("\"x\"") && json.contains("\"10\""), "json should contain hstore keys/values");
+    }
+
+    @Test
+    void cast_hstore_to_jsonb() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_to_jsonb");
+        exec("CREATE TABLE hs_to_jsonb (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_to_jsonb VALUES (1, 'a=>1')");
+        String jsonb = str("SELECT hstore_to_jsonb(data)::text FROM hs_to_jsonb WHERE id = 1");
+        assertNotNull(jsonb);
+        assertTrue(jsonb.contains("\"a\""), "jsonb should contain hstore key");
+    }
+
+    @Test
+    void cast_arrow_result_to_int() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_arrow_int");
+        exec("CREATE TABLE hs_arrow_int (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_arrow_int VALUES (1, 'count=>42')");
+        int val = count("SELECT (data->'count')::int FROM hs_arrow_int WHERE id = 1");
+        assertEquals(42, val);
+    }
+
+    @Test
+    void cast_arrow_result_to_numeric() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_arrow_num");
+        exec("CREATE TABLE hs_arrow_num (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_arrow_num VALUES (1, 'price=>19.99')");
+        String val = str("SELECT (data->'price')::numeric FROM hs_arrow_num WHERE id = 1");
+        assertEquals("19.99", val);
+    }
+
+    @Test
+    void cast_arrow_result_to_boolean() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_arrow_bool");
+        exec("CREATE TABLE hs_arrow_bool (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_arrow_bool VALUES (1, 'active=>true')");
+        assertTrue(bool("SELECT (data->'active')::boolean FROM hs_arrow_bool WHERE id = 1"));
+    }
+
+    // =========================================================================
+    // E. hstore functions
+    // =========================================================================
+
+    @Test
+    void akeys_on_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_akeys");
+        exec("CREATE TABLE hs_akeys (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_akeys VALUES (1, 'b=>2, a=>1')");
+        String keys = str("SELECT array_to_string(akeys(data), ',') FROM hs_akeys WHERE id = 1");
+        assertNotNull(keys);
+        assertTrue(keys.contains("a") && keys.contains("b"));
+    }
+
+    @Test
+    void avals_on_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_avals");
+        exec("CREATE TABLE hs_avals (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_avals VALUES (1, 'x=>10, y=>20')");
+        String vals = str("SELECT array_to_string(avals(data), ',') FROM hs_avals WHERE id = 1");
+        assertNotNull(vals);
+        assertTrue(vals.contains("10") && vals.contains("20"));
+    }
+
+    @Test
+    void skeys_on_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_skeys");
+        exec("CREATE TABLE hs_skeys (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_skeys VALUES (1, 'p=>1, q=>2')");
+        int cnt = count("SELECT count(*) FROM hs_skeys, skeys(data)");
+        assertEquals(2, cnt);
+    }
+
+    @Test
+    void svals_on_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_svals");
+        exec("CREATE TABLE hs_svals (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_svals VALUES (1, 'p=>1, q=>2')");
+        int cnt = count("SELECT count(*) FROM hs_svals, svals(data)");
+        assertEquals(2, cnt);
+    }
+
+    @Test
+    void each_on_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_each");
+        exec("CREATE TABLE hs_each (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_each VALUES (1, 'a=>1, b=>2')");
+        int cnt = count("SELECT count(*) FROM hs_each, each(data)");
+        assertEquals(2, cnt);
+    }
+
+    @Test
+    void hstore_from_arrays() throws SQLException {
+        String val = str("SELECT (hstore(ARRAY['a','b'], ARRAY['1','2']))->'b'");
+        assertEquals("2", val);
+    }
+
+    @Test
+    void hstore_from_record() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_rec");
+        exec("CREATE TABLE hs_rec (name text, age int)");
+        exec("INSERT INTO hs_rec VALUES ('alice', 30)");
+        String val = str("SELECT (hstore(hs_rec))->'name' FROM hs_rec");
+        assertEquals("alice", val);
+    }
+
+    @Test
+    void exist_function() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_exist");
+        exec("CREATE TABLE hs_exist (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_exist VALUES (1, 'a=>1, b=>2')");
+        assertTrue(bool("SELECT exist(data, 'a') FROM hs_exist WHERE id = 1"));
+        assertFalse(bool("SELECT exist(data, 'z') FROM hs_exist WHERE id = 1"));
+    }
+
+    @Test
+    void defined_function() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_defined");
+        exec("CREATE TABLE hs_defined (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_defined VALUES (1, 'a=>1, b=>NULL')");
+        assertTrue(bool("SELECT defined(data, 'a') FROM hs_defined WHERE id = 1"));
+        assertFalse(bool("SELECT defined(data, 'b') FROM hs_defined WHERE id = 1"));
+    }
+
+    @Test
+    void delete_function() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_delete_fn");
+        exec("CREATE TABLE hs_delete_fn (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_delete_fn VALUES (1, 'a=>1, b=>2, c=>3')");
+        assertFalse(bool("SELECT delete(data, 'b') ? 'b' FROM hs_delete_fn WHERE id = 1"));
+    }
+
+    @Test
+    void slice_function() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_slice");
+        exec("CREATE TABLE hs_slice (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_slice VALUES (1, 'a=>1, b=>2, c=>3')");
+        String val = str("SELECT (slice(data, ARRAY['a','c']))->'a' FROM hs_slice WHERE id = 1");
+        assertEquals("1", val);
+    }
+
+    // =========================================================================
+    // F. WHERE clause filtering
+    // =========================================================================
+
+    @Test
+    void where_arrow_equals() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_where");
+        exec("CREATE TABLE hs_where (id int PRIMARY KEY, props hstore)");
+        exec("INSERT INTO hs_where VALUES (1, 'status=>active'), (2, 'status=>inactive'), (3, 'status=>active')");
+        assertEquals(2, count("SELECT count(*) FROM hs_where WHERE props->'status' = 'active'"));
+    }
+
+    @Test
+    void where_contains() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_where2");
+        exec("CREATE TABLE hs_where2 (id int PRIMARY KEY, tags hstore)");
+        exec("INSERT INTO hs_where2 VALUES (1, 'env=>prod, region=>us'), (2, 'env=>staging, region=>eu')");
+        assertEquals(1, count("SELECT count(*) FROM hs_where2 WHERE tags @> 'env=>prod'"));
+    }
+
+    // =========================================================================
+    // G. hstore with other column types
+    // =========================================================================
+
+    @Test
+    void hstore_alongside_json_and_text_columns() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_multi");
+        exec("CREATE TABLE hs_multi (id int PRIMARY KEY, name text, meta hstore, extra jsonb)");
+        exec("INSERT INTO hs_multi VALUES (1, 'test', 'k=>v', '{\"j\":1}')");
+        assertEquals("v", str("SELECT meta->'k' FROM hs_multi WHERE id = 1"));
+    }
+
+    @Test
+    void multiple_hstore_columns() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_multi2");
+        exec("CREATE TABLE hs_multi2 (id int PRIMARY KEY, config hstore, overrides hstore)");
+        exec("INSERT INTO hs_multi2 VALUES (1, 'a=>1', 'a=>2')");
+        assertEquals("1", str("SELECT config->'a' FROM hs_multi2 WHERE id = 1"));
+        assertEquals("2", str("SELECT overrides->'a' FROM hs_multi2 WHERE id = 1"));
+    }
+
+    // =========================================================================
+    // H. Edge cases
+    // =========================================================================
+
+    @Test
+    void hstore_with_special_characters_in_keys_and_values() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_special");
+        exec("CREATE TABLE hs_special (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_special VALUES (1, '\"with space\"=>\"has => arrow\", \"quo\\\"te\"=>val')");
+        assertEquals("has => arrow", str("SELECT data->'with space' FROM hs_special WHERE id = 1"));
+    }
+
+    @Test
+    void hstore_large_number_of_keys() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_large");
+        exec("CREATE TABLE hs_large (id int PRIMARY KEY, data hstore)");
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 100; i++) {
+            if (i > 0) sb.append(",");
+            sb.append("k").append(i).append("=>v").append(i);
+        }
+        exec("INSERT INTO hs_large VALUES (1, '" + sb + "')");
+        assertEquals("v50", str("SELECT data->'k50' FROM hs_large WHERE id = 1"));
+    }
+
+    @Test
+    void hstore_in_subquery() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_sub");
+        exec("CREATE TABLE hs_sub (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_sub VALUES (1, 'x=>10'), (2, 'x=>20')");
+        assertEquals("20", str("SELECT data->'x' FROM hs_sub WHERE id = (SELECT id FROM hs_sub WHERE data->'x' = '20')"));
+    }
+}
