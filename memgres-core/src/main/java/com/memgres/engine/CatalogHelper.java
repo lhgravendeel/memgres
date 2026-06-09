@@ -142,6 +142,8 @@ public final class CatalogHelper {
                 return "USER-DEFINED";
             case XID:
                 return "xid";
+            case HSTORE:
+                return "hstore";
             default:
                 throw new IllegalStateException("Unknown data type: " + dt);
         }

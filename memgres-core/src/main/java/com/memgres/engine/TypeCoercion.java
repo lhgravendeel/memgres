@@ -102,6 +102,7 @@ public final class TypeCoercion {
             case ACLITEM_ARRAY:
                 return TypeCategory.UNKNOWN;
             case ENUM:
+            case HSTORE:
                 return TypeCategory.UNKNOWN;
             default:
                 throw new IllegalStateException("Unknown data type: " + type);
@@ -252,6 +253,9 @@ public final class TypeCoercion {
             case INET:
             case CIDR:
                 return NetworkOperations.normalizeAddress(value.toString());
+            case HSTORE:
+                if (value instanceof HstoreValue) return value;
+                return HstoreValue.parse(value.toString());
             default:
                 return value;
         }
@@ -363,6 +367,8 @@ public final class TypeCoercion {
             case INET:
             case CIDR:
                 return false;
+            case HSTORE:
+                return value instanceof HstoreValue;
             default:
                 return value instanceof String;
         }

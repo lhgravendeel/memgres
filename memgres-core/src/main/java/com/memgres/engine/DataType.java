@@ -54,6 +54,9 @@ public enum DataType {
     BIGSERIAL(20, "bigserial"),
     SMALLSERIAL(21, "smallserial"),
 
+    // Extension types
+    HSTORE(90001, "hstore"),
+
     // Full-text search
     TSVECTOR(3614, "tsvector"),
     TSQUERY(3615, "tsquery"),
@@ -189,6 +192,8 @@ public enum DataType {
                 return JSON;
             case "jsonb":
                 return JSONB;
+            case "hstore":
+                return HSTORE;
             case "serial":
                 return SERIAL;
             case "bigserial":
@@ -312,6 +317,7 @@ public enum DataType {
             case CIDR: return "cidr";
             case MACADDR: return "macaddr";
             case MACADDR8: return "macaddr8";
+            case HSTORE: return "hstore";
             case TSVECTOR: return "tsvector";
             case TSQUERY: return "tsquery";
             case POINT: return "point";

@@ -73,6 +73,9 @@ class FromFunctionResolver {
         if (fname.equals("ts_parse")) return resolveTsParse(alias, colAliases, evalArgs);
         if (fname.equals("ts_token_type")) return resolveTsTokenType(alias, colAliases, evalArgs);
         if (fname.equals("pg_listening_channels")) return resolvePgListeningChannels(alias);
+        if (fname.equals("skeys")) return resolveHstoreSkeys(alias, evalArgs);
+        if (fname.equals("svals")) return resolveHstoreSvals(alias, evalArgs);
+        if (fname.equals("each")) return resolveHstoreEach(alias, colAliases, evalArgs);
 
         // Try user-defined function
         PgFunction userFunc = executor.database.getFunction(fname);
@@ -1655,5 +1658,53 @@ class FromFunctionResolver {
             throw new MemgresException("XMLTABLE evaluation error: " + e.getMessage(), "42000");
         }
         return contexts;
+    }
+
+    // ---- hstore SRFs: skeys, svals, each ----
+
+    private List<RowContext> resolveHstoreSkeys(String alias, List<Object> evalArgs) {
+        if (evalArgs.isEmpty() || evalArgs.get(0) == null) return java.util.Collections.emptyList();
+        HstoreValue h = evalArgs.get(0) instanceof HstoreValue
+                ? (HstoreValue) evalArgs.get(0) : HstoreValue.parse(evalArgs.get(0).toString());
+        String effectiveAlias = alias != null ? alias : "skeys";
+        Column col = new Column("skeys", DataType.TEXT, true, false, null);
+        Table vt = new Table(effectiveAlias, Cols.listOf(col));
+        List<RowContext> rows = new ArrayList<>();
+        for (String k : h.keys()) {
+            rows.add(new RowContext(vt, effectiveAlias, new Object[]{k}));
+        }
+        return rows;
+    }
+
+    private List<RowContext> resolveHstoreSvals(String alias, List<Object> evalArgs) {
+        if (evalArgs.isEmpty() || evalArgs.get(0) == null) return java.util.Collections.emptyList();
+        HstoreValue h = evalArgs.get(0) instanceof HstoreValue
+                ? (HstoreValue) evalArgs.get(0) : HstoreValue.parse(evalArgs.get(0).toString());
+        String effectiveAlias = alias != null ? alias : "svals";
+        Column col = new Column("svals", DataType.TEXT, true, false, null);
+        Table vt = new Table(effectiveAlias, Cols.listOf(col));
+        List<RowContext> rows = new ArrayList<>();
+        for (String v : h.values()) {
+            rows.add(new RowContext(vt, effectiveAlias, new Object[]{v}));
+        }
+        return rows;
+    }
+
+    private List<RowContext> resolveHstoreEach(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.isEmpty() || evalArgs.get(0) == null) return java.util.Collections.emptyList();
+        HstoreValue h = evalArgs.get(0) instanceof HstoreValue
+                ? (HstoreValue) evalArgs.get(0) : HstoreValue.parse(evalArgs.get(0).toString());
+        String col1 = colAliases != null && colAliases.size() > 0 ? colAliases.get(0) : "key";
+        String col2 = colAliases != null && colAliases.size() > 1 ? colAliases.get(1) : "value";
+        String effectiveAlias = alias != null ? alias : "each";
+        List<Column> cols = Cols.listOf(
+                new Column(col1, DataType.TEXT, true, false, null),
+                new Column(col2, DataType.TEXT, true, false, null));
+        Table vt = new Table(effectiveAlias, cols);
+        List<RowContext> rows = new ArrayList<>();
+        for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+            rows.add(new RowContext(vt, effectiveAlias, new Object[]{e.getKey(), e.getValue()}));
+        }
+        return rows;
     }
 }

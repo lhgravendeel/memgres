@@ -145,6 +145,40 @@ class DateTimeArithmetic {
     Object dateTimeSubtract(Object left, Object right) {
         if (left == null || right == null) return null;
 
+        // hstore - text[]: delete multiple keys (checked first — List is unambiguous)
+        if (left instanceof HstoreValue && right instanceof java.util.List) {
+            java.util.List<?> keys = (java.util.List<?>) right;
+            java.util.List<String> strKeys = new java.util.ArrayList<>();
+            for (Object k : keys) strKeys.add(k != null ? k.toString() : null);
+            return ((HstoreValue) left).deleteKeys(strKeys);
+        }
+        // hstore - hstore: delete matching pairs
+        if (left instanceof HstoreValue && right instanceof HstoreValue) {
+            HstoreValue lh = (HstoreValue) left;
+            HstoreValue rh = (HstoreValue) right;
+            java.util.Map<String, String> result = new java.util.LinkedHashMap<>(lh.getData());
+            for (java.util.Map.Entry<String, String> e : rh.getData().entrySet()) {
+                String val = result.get(e.getKey());
+                if (val != null && val.equals(e.getValue())) result.remove(e.getKey());
+                else if (val == null && e.getValue() == null && result.containsKey(e.getKey())) result.remove(e.getKey());
+            }
+            return new HstoreValue(result);
+        }
+        // hstore - text (untyped literal): PG resolves untyped literals as hstore (same-type
+        // preference), so we try hstore parse first. If it parses, use hstore-hstore subtraction.
+        // If it fails to parse, that's an error — matching PG behavior.
+        if (left instanceof HstoreValue && right instanceof String) {
+            HstoreValue rh = HstoreValue.parse((String) right);
+            HstoreValue lh = (HstoreValue) left;
+            java.util.Map<String, String> result = new java.util.LinkedHashMap<>(lh.getData());
+            for (java.util.Map.Entry<String, String> e : rh.getData().entrySet()) {
+                String val = result.get(e.getKey());
+                if (val != null && val.equals(e.getValue())) result.remove(e.getKey());
+                else if (val == null && e.getValue() == null && result.containsKey(e.getKey())) result.remove(e.getKey());
+            }
+            return new HstoreValue(result);
+        }
+
         // infinity timestamp - interval = infinity
         if (left instanceof String && isTimestampInfinity((String) left) && right instanceof PgInterval) return left;
 

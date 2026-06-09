@@ -123,6 +123,13 @@ class BinaryOpEvaluator {
             }
         }
 
+        // hstore - ::text → key deletion (explicit text cast means "delete key", not "subtract hstore")
+        // Without explicit cast, PG resolves untyped literal as hstore (same-type preference)
+        if (bin.op() == BinaryExpr.BinOp.SUBTRACT && left instanceof HstoreValue
+                && right instanceof String && isCastToTextType(bin.right())) {
+            return ((HstoreValue) left).deleteKey((String) right);
+        }
+
         // json type does not support LIKE operator
         if (bin.op() == BinaryExpr.BinOp.LIKE || bin.op() == BinaryExpr.BinOp.ILIKE) {
             if (isCastToType(bin.left(), "json")) {
@@ -475,6 +482,13 @@ class BinaryOpEvaluator {
                 return TypeCoercion.areEqual(left, right);
             }
             case CONCAT: {
+                // hstore || hstore: merge
+                if (left instanceof HstoreValue || right instanceof HstoreValue) {
+                    if (left == null || right == null) return left != null ? left : right;
+                    HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
+                    HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
+                    return lh.merge(rh);
+                }
                 // Array concat with NULL: NULL || array = array, array || NULL = array
                 if (left == null && right instanceof List) return right;
                 if (right == null && left instanceof List) return left;
@@ -778,8 +792,10 @@ class BinaryOpEvaluator {
             case CONTAINS: {
                 if (left == null || right == null) return null;
                 // hstore @> hstore containment
-                if (left instanceof HstoreValue && right instanceof HstoreValue) {
-                    return ((HstoreValue) left).containsAll((HstoreValue) right);
+                if (left instanceof HstoreValue || right instanceof HstoreValue) {
+                    HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
+                    HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
+                    return lh.containsAll(rh);
                 }
                 String ls = left.toString().trim();
                 String rs = right.toString().trim();
@@ -851,6 +867,12 @@ class BinaryOpEvaluator {
             }
             case CONTAINED_BY: {
                 if (left == null || right == null) return null;
+                // hstore <@ hstore: contained-by
+                if (left instanceof HstoreValue || right instanceof HstoreValue) {
+                    HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
+                    HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
+                    return lh.containedBy(rh);
+                }
                 String ls = left.toString().trim();
                 String rs = right.toString().trim();
                 // Multirange/range containment: a <@ b means b @> a
@@ -1324,6 +1346,13 @@ class BinaryOpEvaluator {
                 return executor.compareValues(left, right) >= 0;
             }
             case CONCAT: {
+                // hstore || hstore: merge
+                if (left instanceof HstoreValue || right instanceof HstoreValue) {
+                    if (left == null || right == null) return left != null ? left : right;
+                    HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
+                    HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
+                    return lh.merge(rh);
+                }
                 // Array concat with NULL: NULL || array = array, array || NULL = array
                 if (left == null && right instanceof List) return right;
                 if (right == null && left instanceof List) return left;
@@ -1459,8 +1488,10 @@ class BinaryOpEvaluator {
             case CONTAINS: {
                 if (left == null || right == null) return null;
                 // hstore @> hstore containment
-                if (left instanceof HstoreValue && right instanceof HstoreValue) {
-                    return ((HstoreValue) left).containsAll((HstoreValue) right);
+                if (left instanceof HstoreValue || right instanceof HstoreValue) {
+                    HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
+                    HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
+                    return lh.containsAll(rh);
                 }
                 String lStr = left.toString().trim();
                 String rStr = right.toString().trim();
@@ -1498,6 +1529,12 @@ class BinaryOpEvaluator {
             }
             case CONTAINED_BY: {
                 if (left == null || right == null) return null;
+                // hstore <@ hstore: contained-by
+                if (left instanceof HstoreValue || right instanceof HstoreValue) {
+                    HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
+                    HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
+                    return lh.containedBy(rh);
+                }
                 String lStr = left.toString().trim();
                 String rStr = right.toString().trim();
                 // Multirange/range containment: a <@ b means b @> a

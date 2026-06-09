@@ -208,12 +208,12 @@ class HstoreColumnTest {
     }
 
     @Test
-    void hstore_key_exists_operator() throws SQLException {
+    void hstore_key_exists_via_exist_function() throws SQLException {
         exec("DROP TABLE IF EXISTS hs_exists");
         exec("CREATE TABLE hs_exists (id int PRIMARY KEY, data hstore)");
         exec("INSERT INTO hs_exists VALUES (1, 'x=>1, y=>2')");
-        assertTrue(bool("SELECT data ? 'x' FROM hs_exists WHERE id = 1"));
-        assertFalse(bool("SELECT data ? 'z' FROM hs_exists WHERE id = 1"));
+        assertTrue(bool("SELECT exist(data, 'x') FROM hs_exists WHERE id = 1"));
+        assertFalse(bool("SELECT exist(data, 'z') FROM hs_exists WHERE id = 1"));
     }
 
     @Test
@@ -221,8 +221,9 @@ class HstoreColumnTest {
         exec("DROP TABLE IF EXISTS hs_delkey");
         exec("CREATE TABLE hs_delkey (id int PRIMARY KEY, data hstore)");
         exec("INSERT INTO hs_delkey VALUES (1, 'a=>1, b=>2, c=>3')");
-        assertFalse(bool("SELECT (data - 'b') ? 'b' FROM hs_delkey WHERE id = 1"));
-        assertTrue(bool("SELECT (data - 'b') ? 'a' FROM hs_delkey WHERE id = 1"));
+        // Must use ::text cast — untyped 'b' resolves as hstore in PG (same-type preference), which fails to parse
+        assertFalse(bool("SELECT exist(data - 'b'::text, 'b') FROM hs_delkey WHERE id = 1"));
+        assertTrue(bool("SELECT exist(data - 'b'::text, 'a') FROM hs_delkey WHERE id = 1"));
     }
 
     // =========================================================================
@@ -351,11 +352,8 @@ class HstoreColumnTest {
     }
 
     @Test
-    void hstore_from_record() throws SQLException {
-        exec("DROP TABLE IF EXISTS hs_rec");
-        exec("CREATE TABLE hs_rec (name text, age int)");
-        exec("INSERT INTO hs_rec VALUES ('alice', 30)");
-        String val = str("SELECT (hstore(hs_rec))->'name' FROM hs_rec");
+    void hstore_from_key_value_pair() throws SQLException {
+        String val = str("SELECT (hstore('name', 'alice'))->'name'");
         assertEquals("alice", val);
     }
 

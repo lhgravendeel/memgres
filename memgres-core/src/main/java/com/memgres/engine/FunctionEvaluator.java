@@ -82,6 +82,28 @@ class FunctionEvaluator {
         }
     }
 
+    private static HstoreValue toHstore(Object val) {
+        if (val instanceof HstoreValue) return (HstoreValue) val;
+        return HstoreValue.parse(val.toString());
+    }
+
+    private static String hstoreToJsonString(HstoreValue h) {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+            if (!first) sb.append(", ");
+            first = false;
+            sb.append("\"").append(e.getKey().replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+            if (e.getValue() == null) {
+                sb.append("null");
+            } else {
+                sb.append("\"").append(e.getValue().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+            }
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
     private void requireArgs(FunctionCallExpr fn, int min) {
         if (fn.args().size() < min) {
             throw new MemgresException(
@@ -1808,6 +1830,136 @@ class FunctionEvaluator {
             case "icu_unicode_version": {
                 // Returns the ICU unicode version string — stub
                 return "15.1";
+            }
+
+            // =================================================================
+            // hstore extension functions
+            // =================================================================
+            case "akeys": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                return h.keys();
+            }
+            case "avals": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                return h.values();
+            }
+            case "skeys":
+            case "svals":
+            case "each": {
+                // These are set-returning functions — they work in FROM clauses via FromFunctionResolver.
+                // When called as scalar (not in FROM), return null for empty or first value.
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                if (name.equals("skeys")) {
+                    List<String> keys = h.keys();
+                    return keys.isEmpty() ? null : keys.get(0);
+                } else if (name.equals("svals")) {
+                    List<String> vals = h.values();
+                    return vals.isEmpty() ? null : vals.get(0);
+                } else {
+                    // each: first key-value pair
+                    if (h.size() == 0) return null;
+                    java.util.Map.Entry<String, String> first = h.getData().entrySet().iterator().next();
+                    return "(" + first.getKey() + "," + (first.getValue() != null ? first.getValue() : "") + ")";
+                }
+            }
+            case "exist": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                Object key = executor.evalExpr(fn.args().get(1), ctx);
+                if (val == null || key == null) return null;
+                HstoreValue h = toHstore(val);
+                return h.containsKey(key.toString());
+            }
+            case "defined": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                Object key = executor.evalExpr(fn.args().get(1), ctx);
+                if (val == null || key == null) return null;
+                HstoreValue h = toHstore(val);
+                return h.defined(key.toString());
+            }
+            case "delete": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                Object key = executor.evalExpr(fn.args().get(1), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                if (key == null) return h;
+                return h.deleteKey(key.toString());
+            }
+            case "slice": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                Object keysObj = executor.evalExpr(fn.args().get(1), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                List<String> keys = new ArrayList<>();
+                if (keysObj instanceof List) {
+                    for (Object k : (List<?>) keysObj) keys.add(k != null ? k.toString() : null);
+                }
+                return h.slice(keys);
+            }
+            case "hstore": {
+                requireExtension("hstore", name, fn.args().size());
+                if (fn.args().size() == 2) {
+                    // hstore(keys text[], vals text[]) or hstore(key text, val text)
+                    Object keysObj = executor.evalExpr(fn.args().get(0), ctx);
+                    Object valsObj = executor.evalExpr(fn.args().get(1), ctx);
+                    if (keysObj instanceof List && valsObj instanceof List) {
+                        List<?> keysList = (List<?>) keysObj;
+                        List<?> valsList = (List<?>) valsObj;
+                        java.util.Map<String, String> map = new java.util.LinkedHashMap<>();
+                        for (int i = 0; i < keysList.size(); i++) {
+                            String k = keysList.get(i) != null ? keysList.get(i).toString() : null;
+                            String v = i < valsList.size() && valsList.get(i) != null ? valsList.get(i).toString() : null;
+                            if (k != null) map.put(k, v);
+                        }
+                        return new HstoreValue(map);
+                    }
+                    // hstore(key text, val text) — single pair
+                    java.util.Map<String, String> map = new java.util.LinkedHashMap<>();
+                    if (keysObj != null) map.put(keysObj.toString(), valsObj != null ? valsObj.toString() : null);
+                    return new HstoreValue(map);
+                }
+                if (fn.args().size() == 1) {
+                    // hstore(text) or hstore(hstore) — parse or pass through
+                    Object rec = executor.evalExpr(fn.args().get(0), ctx);
+                    if (rec == null) return null;
+                    if (rec instanceof HstoreValue) return rec;
+                    return HstoreValue.parse(rec.toString());
+                }
+                throw new MemgresException("function hstore() requires 1 or 2 arguments", "42883");
+            }
+            case "hstore_to_json": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                return hstoreToJsonString(h);
+            }
+            case "hstore_to_jsonb": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                return hstoreToJsonString(h);
+            }
+            case "hstore_to_json_loose":
+            case "hstore_to_jsonb_loose": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                return hstoreToJsonString(h);
             }
 
             default: {
