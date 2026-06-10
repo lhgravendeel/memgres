@@ -418,6 +418,314 @@ SELECT (data->'nonexistent') IS NULL AS is_null FROM hs_test.t_sub WHERE id = 1;
 SELECT id, data->'x' AS val FROM hs_test.t_sub ORDER BY (data->'x')::int;
 
 -- ============================================================================
+-- I. Equality and comparison semantics
+-- ============================================================================
+
+-- I1. hstore equality is content-based, key-order-independent
+-- begin-expected
+-- columns: eq
+-- row: true
+-- end-expected
+SELECT 'a=>1, b=>2'::hstore = 'b=>2, a=>1'::hstore AS eq;
+
+-- I2. hstore inequality
+-- begin-expected
+-- columns: neq
+-- row: true
+-- end-expected
+SELECT 'a=>1'::hstore <> 'a=>2'::hstore AS neq;
+
+-- I3. Equal hstore with different whitespace
+-- begin-expected
+-- columns: eq
+-- row: true
+-- end-expected
+SELECT 'a => 1 , b => 2'::hstore = 'a=>1,b=>2'::hstore AS eq;
+
+-- ============================================================================
+-- J. Duplicate keys in input
+-- ============================================================================
+
+-- J1. Duplicate keys — first value wins in PG
+-- begin-expected
+-- columns: val
+-- row: 1
+-- end-expected
+SELECT ('a=>1, a=>2'::hstore)->'a' AS val;
+
+-- J2. Duplicate keys — key count is 1 (deduplicated)
+-- begin-expected
+-- columns: key_count
+-- row: 1
+-- end-expected
+SELECT array_length(akeys('a=>1, a=>2'::hstore), 1) AS key_count;
+
+-- ============================================================================
+-- K. hstore text output format
+-- ============================================================================
+
+-- K1. Simple hstore text representation contains key and value with =>
+CREATE TABLE hs_test.t_textout (id int PRIMARY KEY, data hstore);
+INSERT INTO hs_test.t_textout VALUES (1, 'a=>1');
+
+-- begin-expected
+-- columns: txt
+-- row: "a"=>"1"
+-- end-expected
+SELECT data::text AS txt FROM hs_test.t_textout WHERE id = 1;
+
+-- K2. Multi-key hstore text representation (keys are sorted by PG in output)
+INSERT INTO hs_test.t_textout VALUES (2, 'b=>2, a=>1');
+
+-- begin-expected-regex
+-- columns: txt
+-- row-regex: "a"=>"1".*"b"=>"2"|"b"=>"2".*"a"=>"1"
+-- end-expected-regex
+SELECT data::text AS txt FROM hs_test.t_textout WHERE id = 2;
+
+-- ============================================================================
+-- L. Concat operator with untyped literal
+-- ============================================================================
+
+CREATE TABLE hs_test.t_concat2 (id int PRIMARY KEY, data hstore);
+INSERT INTO hs_test.t_concat2 VALUES (1, 'a=>1, b=>2');
+
+-- L1. || with ::hstore cast (known working)
+-- begin-expected
+-- columns: val
+-- row: 99
+-- end-expected
+SELECT (data || 'b=>99'::hstore)->'b' AS val FROM hs_test.t_concat2 WHERE id = 1;
+
+-- L2. || with untyped literal — may have operator resolution issue like - operator
+-- begin-expected
+-- columns: val
+-- row: 99
+-- end-expected
+SELECT (data || 'b=>99')->'b' AS val FROM hs_test.t_concat2 WHERE id = 1;
+
+-- ============================================================================
+-- M. hstore_to_json/jsonb with NULL values
+-- ============================================================================
+
+-- M1. hstore_to_json preserves NULL values as JSON null
+-- begin-expected
+-- columns: b_is_null
+-- row: true
+-- end-expected
+SELECT (hstore_to_json('a=>1, b=>NULL'::hstore)->>'b') IS NULL AS b_is_null;
+
+-- M2. hstore_to_jsonb preserves NULL values as JSON null
+-- begin-expected
+-- columns: b_is_null
+-- row: true
+-- end-expected
+SELECT (hstore_to_jsonb('a=>1, b=>NULL'::hstore)->>'b') IS NULL AS b_is_null;
+
+-- M3. hstore_to_json non-NULL value is present
+-- begin-expected
+-- columns: val
+-- row: 1
+-- end-expected
+SELECT hstore_to_json('a=>1, b=>NULL'::hstore)->>'a' AS val;
+
+-- ============================================================================
+-- N. RETURNING clause with hstore
+-- ============================================================================
+
+CREATE TABLE hs_test.t_ret (id int PRIMARY KEY, data hstore);
+
+-- N1. INSERT RETURNING with arrow extraction
+-- begin-expected
+-- columns: val
+-- row: hello
+-- end-expected
+INSERT INTO hs_test.t_ret VALUES (1, 'key=>hello') RETURNING data->'key' AS val;
+
+-- N2. UPDATE RETURNING with arrow extraction
+-- begin-expected
+-- columns: val
+-- row: world
+-- end-expected
+UPDATE hs_test.t_ret SET data = 'key=>world' WHERE id = 1 RETURNING data->'key' AS val;
+
+-- ============================================================================
+-- O. DISTINCT and GROUP BY on hstore
+-- ============================================================================
+
+CREATE TABLE hs_test.t_distinct (id int PRIMARY KEY, data hstore);
+INSERT INTO hs_test.t_distinct VALUES (1, 'a=>1'), (2, 'a=>1'), (3, 'b=>2');
+
+-- O1. DISTINCT on hstore column
+-- begin-expected
+-- columns: cnt
+-- row: 2
+-- end-expected
+SELECT count(*) AS cnt FROM (SELECT DISTINCT data FROM hs_test.t_distinct) sub;
+
+-- O2. GROUP BY on hstore column
+-- begin-expected
+-- columns: cnt
+-- row: 2
+-- end-expected
+SELECT count(*) AS cnt FROM (SELECT data, count(*) FROM hs_test.t_distinct GROUP BY data) sub;
+
+-- ============================================================================
+-- P. COALESCE and CASE with hstore
+-- ============================================================================
+
+CREATE TABLE hs_test.t_coalesce (id int PRIMARY KEY, data hstore);
+INSERT INTO hs_test.t_coalesce VALUES (1, NULL), (2, 'x=>1');
+
+-- P1. COALESCE with hstore — fallback to default
+-- begin-expected
+-- columns: val
+-- row: fallback
+-- end-expected
+SELECT COALESCE(data, 'default=>fallback'::hstore)->'default' AS val FROM hs_test.t_coalesce WHERE id = 1;
+
+-- P2. COALESCE with hstore — non-null passes through
+-- begin-expected
+-- columns: val
+-- row: 1
+-- end-expected
+SELECT COALESCE(data, 'default=>fallback'::hstore)->'x' AS val FROM hs_test.t_coalesce WHERE id = 2;
+
+-- P3. CASE expression returning hstore
+-- begin-expected
+-- columns: val
+-- row: yes
+-- end-expected
+SELECT (CASE WHEN id = 2 THEN 'found=>yes'::hstore ELSE 'found=>no'::hstore END)->'found' AS val FROM hs_test.t_coalesce WHERE id = 2;
+
+-- ============================================================================
+-- Q. hstore constructor edge cases
+-- ============================================================================
+
+-- Q1. hstore('key', NULL) — creates hstore with NULL value
+-- begin-expected
+-- columns: is_null
+-- row: true
+-- end-expected
+SELECT (hstore('key', NULL))->'key' IS NULL AS is_null;
+
+-- Q2. hstore('key', NULL) — key exists but is not defined
+-- begin-expected
+-- columns: key_exists|key_defined
+-- row: true|false
+-- end-expected
+SELECT exist(hstore('key', NULL), 'key') AS key_exists, defined(hstore('key', NULL), 'key') AS key_defined;
+
+-- ============================================================================
+-- R. delete function with array argument
+-- ============================================================================
+
+-- R1. delete(hstore, text[]) — remove multiple keys
+-- begin-expected
+-- columns: has_a|has_b|has_c
+-- row: false|false|true
+-- end-expected
+SELECT exist(delete('a=>1, b=>2, c=>3'::hstore, ARRAY['a','b']), 'a') AS has_a,
+       exist(delete('a=>1, b=>2, c=>3'::hstore, ARRAY['a','b']), 'b') AS has_b,
+       exist(delete('a=>1, b=>2, c=>3'::hstore, ARRAY['a','b']), 'c') AS has_c;
+
+-- ============================================================================
+-- S. slice with non-existent keys
+-- ============================================================================
+
+-- S1. slice with all missing keys — returns empty hstore; array_length of empty array is NULL
+-- begin-expected
+-- columns: key_count
+-- row: NULL
+-- end-expected
+SELECT array_length(akeys(slice('a=>1, b=>2'::hstore, ARRAY['x','y'])), 1) AS key_count;
+
+-- S2. slice with mix of existing and missing keys
+-- begin-expected
+-- columns: val_a|val_x_null
+-- row: 1|true
+-- end-expected
+SELECT (slice('a=>1, b=>2'::hstore, ARRAY['a','x']))->'a' AS val_a,
+       (slice('a=>1, b=>2'::hstore, ARRAY['a','x']))->'x' IS NULL AS val_x_null;
+
+-- ============================================================================
+-- T. pg_typeof on hstore
+-- ============================================================================
+
+CREATE TABLE hs_test.t_typeof (id int PRIMARY KEY, data hstore);
+INSERT INTO hs_test.t_typeof VALUES (1, 'a=>1');
+
+-- T1. pg_typeof returns 'hstore' for hstore column
+-- begin-expected
+-- columns: tp
+-- row: hstore
+-- end-expected
+SELECT pg_typeof(data)::text AS tp FROM hs_test.t_typeof WHERE id = 1;
+
+-- ============================================================================
+-- U. hstore - hstore (delete matching pairs)
+-- ============================================================================
+
+-- U1. Delete matching key+value pair
+-- begin-expected
+-- columns: has_a|has_b
+-- row: false|true
+-- end-expected
+SELECT exist('a=>1, b=>2'::hstore - 'a=>1'::hstore, 'a') AS has_a,
+       exist('a=>1, b=>2'::hstore - 'a=>1'::hstore, 'b') AS has_b;
+
+-- U2. Non-matching value — key is NOT removed
+-- begin-expected
+-- columns: has_a
+-- row: true
+-- end-expected
+SELECT exist('a=>1, b=>2'::hstore - 'a=>999'::hstore, 'a') AS has_a;
+
+-- ============================================================================
+-- V. Empty string keys and values
+-- ============================================================================
+
+-- V1. Empty string as value — PG rejects 'a=>' as invalid hstore syntax
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error in hstore
+-- end-expected-error
+SELECT ('a=>'::hstore)->'a' AS val;
+
+-- V2. Empty string as value using quoted syntax (valid PG way)
+-- begin-expected
+-- columns: val
+-- row:
+-- end-expected
+SELECT ('a=>""'::hstore)->'a' AS val;
+
+-- V3. Empty string as key
+-- begin-expected
+-- columns: val
+-- row: 1
+-- end-expected
+SELECT ('""=>1'::hstore)->'' AS val;
+
+-- ============================================================================
+-- W. Concat merge order — right side wins for duplicate keys
+-- ============================================================================
+
+-- W1. Right side value wins on key conflict
+-- begin-expected
+-- columns: val
+-- row: new
+-- end-expected
+SELECT ('a=>old'::hstore || 'a=>new'::hstore)->'a' AS val;
+
+-- W2. Left-only and right-only keys both preserved
+-- begin-expected
+-- columns: val_a|val_b
+-- row: 1|2
+-- end-expected
+SELECT ('a=>1'::hstore || 'b=>2'::hstore)->'a' AS val_a,
+       ('a=>1'::hstore || 'b=>2'::hstore)->'b' AS val_b;
+
+-- ============================================================================
 -- Cleanup
 -- ============================================================================
 

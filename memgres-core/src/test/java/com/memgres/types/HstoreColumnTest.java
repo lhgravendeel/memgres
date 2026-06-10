@@ -465,4 +465,257 @@ class HstoreColumnTest {
         exec("INSERT INTO hs_sub VALUES (1, 'x=>10'), (2, 'x=>20')");
         assertEquals("20", str("SELECT data->'x' FROM hs_sub WHERE id = (SELECT id FROM hs_sub WHERE data->'x' = '20')"));
     }
+
+    // =========================================================================
+    // I. Equality and comparison semantics
+    // =========================================================================
+
+    @Test
+    void hstore_equality_is_key_order_independent() throws SQLException {
+        assertTrue(bool("SELECT 'a=>1, b=>2'::hstore = 'b=>2, a=>1'::hstore"));
+    }
+
+    @Test
+    void hstore_inequality() throws SQLException {
+        assertTrue(bool("SELECT 'a=>1'::hstore <> 'a=>2'::hstore"));
+    }
+
+    @Test
+    void hstore_equality_ignores_whitespace() throws SQLException {
+        assertTrue(bool("SELECT 'a => 1 , b => 2'::hstore = 'a=>1,b=>2'::hstore"));
+    }
+
+    // =========================================================================
+    // J. Duplicate keys in input
+    // =========================================================================
+
+    @Test
+    void duplicate_keys_first_value_wins() throws SQLException {
+        // PG keeps the first occurrence, not the last
+        assertEquals("1", str("SELECT ('a=>1, a=>2'::hstore)->'a'"));
+    }
+
+    @Test
+    void duplicate_keys_deduplicated_count() throws SQLException {
+        assertEquals(1, count("SELECT array_length(akeys('a=>1, a=>2'::hstore), 1)"));
+    }
+
+    // =========================================================================
+    // K. hstore text output format
+    // =========================================================================
+
+    @Test
+    void hstore_text_output_single_key() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_txtout");
+        exec("CREATE TABLE hs_txtout (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_txtout VALUES (1, 'a=>1')");
+        String txt = str("SELECT data::text FROM hs_txtout WHERE id = 1");
+        // PG outputs: "a"=>"1"
+        assertEquals("\"a\"=>\"1\"", txt);
+    }
+
+    // =========================================================================
+    // L. Concat operator with untyped literal
+    // =========================================================================
+
+    @Test
+    void concat_with_untyped_literal() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_cat");
+        exec("CREATE TABLE hs_cat (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_cat VALUES (1, 'a=>1, b=>2')");
+        // Without ::hstore cast — may trigger operator resolution issues like - operator
+        assertEquals("99", str("SELECT (data || 'b=>99')->'b' FROM hs_cat WHERE id = 1"));
+    }
+
+    // =========================================================================
+    // M. hstore_to_json/jsonb with NULL values
+    // =========================================================================
+
+    @Test
+    void hstore_to_json_null_value_is_json_null() throws SQLException {
+        assertNull(str("SELECT hstore_to_json('a=>1, b=>NULL'::hstore)->>'b'"));
+    }
+
+    @Test
+    void hstore_to_jsonb_null_value_is_json_null() throws SQLException {
+        assertNull(str("SELECT hstore_to_jsonb('a=>1, b=>NULL'::hstore)->>'b'"));
+    }
+
+    @Test
+    void hstore_to_json_non_null_value_present() throws SQLException {
+        assertEquals("1", str("SELECT hstore_to_json('a=>1, b=>NULL'::hstore)->>'a'"));
+    }
+
+    // =========================================================================
+    // N. RETURNING clause with hstore
+    // =========================================================================
+
+    @Test
+    void insert_returning_hstore_arrow() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_ret");
+        exec("CREATE TABLE hs_ret (id int PRIMARY KEY, data hstore)");
+        assertEquals("hello", str("INSERT INTO hs_ret VALUES (1, 'key=>hello') RETURNING data->'key'"));
+    }
+
+    @Test
+    void update_returning_hstore_arrow() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_ret2");
+        exec("CREATE TABLE hs_ret2 (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_ret2 VALUES (1, 'key=>hello')");
+        assertEquals("world", str("UPDATE hs_ret2 SET data = 'key=>world' WHERE id = 1 RETURNING data->'key'"));
+    }
+
+    // =========================================================================
+    // O. DISTINCT and GROUP BY on hstore
+    // =========================================================================
+
+    @Test
+    void distinct_on_hstore_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_dist");
+        exec("CREATE TABLE hs_dist (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_dist VALUES (1, 'a=>1'), (2, 'a=>1'), (3, 'b=>2')");
+        assertEquals(2, count("SELECT count(*) FROM (SELECT DISTINCT data FROM hs_dist) sub"));
+    }
+
+    @Test
+    void group_by_on_hstore_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_grp");
+        exec("CREATE TABLE hs_grp (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_grp VALUES (1, 'a=>1'), (2, 'a=>1'), (3, 'b=>2')");
+        assertEquals(2, count("SELECT count(*) FROM (SELECT data, count(*) FROM hs_grp GROUP BY data) sub"));
+    }
+
+    // =========================================================================
+    // P. COALESCE and CASE with hstore
+    // =========================================================================
+
+    @Test
+    void coalesce_hstore_null_fallback() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_coal");
+        exec("CREATE TABLE hs_coal (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_coal VALUES (1, NULL)");
+        assertEquals("fallback", str("SELECT COALESCE(data, 'default=>fallback'::hstore)->'default' FROM hs_coal WHERE id = 1"));
+    }
+
+    @Test
+    void coalesce_hstore_non_null_passthrough() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_coal2");
+        exec("CREATE TABLE hs_coal2 (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_coal2 VALUES (1, 'x=>1')");
+        assertEquals("1", str("SELECT COALESCE(data, 'default=>fallback'::hstore)->'x' FROM hs_coal2 WHERE id = 1"));
+    }
+
+    @Test
+    void case_expression_returning_hstore() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_case");
+        exec("CREATE TABLE hs_case (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_case VALUES (1, 'a=>1')");
+        assertEquals("yes", str("SELECT (CASE WHEN id = 1 THEN 'found=>yes'::hstore ELSE 'found=>no'::hstore END)->'found' FROM hs_case WHERE id = 1"));
+    }
+
+    // =========================================================================
+    // Q. hstore constructor edge cases
+    // =========================================================================
+
+    @Test
+    void hstore_constructor_with_null_value() throws SQLException {
+        assertNull(str("SELECT (hstore('key', NULL))->'key'"));
+    }
+
+    @Test
+    void hstore_constructor_null_value_exists_but_not_defined() throws SQLException {
+        assertTrue(bool("SELECT exist(hstore('key', NULL), 'key')"));
+        assertFalse(bool("SELECT defined(hstore('key', NULL), 'key')"));
+    }
+
+    // =========================================================================
+    // R. delete function with array argument
+    // =========================================================================
+
+    @Test
+    void delete_function_with_array() throws SQLException {
+        assertFalse(bool("SELECT exist(delete('a=>1, b=>2, c=>3'::hstore, ARRAY['a','b']), 'a')"));
+        assertFalse(bool("SELECT exist(delete('a=>1, b=>2, c=>3'::hstore, ARRAY['a','b']), 'b')"));
+        assertTrue(bool("SELECT exist(delete('a=>1, b=>2, c=>3'::hstore, ARRAY['a','b']), 'c')"));
+    }
+
+    // =========================================================================
+    // S. slice with non-existent keys
+    // =========================================================================
+
+    @Test
+    void slice_all_missing_keys() throws SQLException {
+        // slice with non-existent keys returns empty hstore; array_length of empty array is NULL in PG
+        assertNull(str("SELECT array_length(akeys(slice('a=>1, b=>2'::hstore, ARRAY['x','y'])), 1)"));
+    }
+
+    @Test
+    void slice_mix_existing_and_missing_keys() throws SQLException {
+        assertEquals("1", str("SELECT (slice('a=>1, b=>2'::hstore, ARRAY['a','x']))->'a'"));
+        assertNull(str("SELECT (slice('a=>1, b=>2'::hstore, ARRAY['a','x']))->'x'"));
+    }
+
+    // =========================================================================
+    // T. pg_typeof on hstore
+    // =========================================================================
+
+    @Test
+    void pg_typeof_hstore_column() throws SQLException {
+        exec("DROP TABLE IF EXISTS hs_typeof");
+        exec("CREATE TABLE hs_typeof (id int PRIMARY KEY, data hstore)");
+        exec("INSERT INTO hs_typeof VALUES (1, 'a=>1')");
+        assertEquals("hstore", str("SELECT pg_typeof(data)::text FROM hs_typeof WHERE id = 1"));
+    }
+
+    // =========================================================================
+    // U. hstore - hstore (delete matching pairs)
+    // =========================================================================
+
+    @Test
+    void subtract_hstore_matching_pair_removed() throws SQLException {
+        assertFalse(bool("SELECT exist('a=>1, b=>2'::hstore - 'a=>1'::hstore, 'a')"));
+        assertTrue(bool("SELECT exist('a=>1, b=>2'::hstore - 'a=>1'::hstore, 'b')"));
+    }
+
+    @Test
+    void subtract_hstore_non_matching_value_kept() throws SQLException {
+        // Key 'a' has value '1', subtracting 'a=>999' should NOT remove it (value doesn't match)
+        assertTrue(bool("SELECT exist('a=>1, b=>2'::hstore - 'a=>999'::hstore, 'a')"));
+    }
+
+    // =========================================================================
+    // V. Empty string keys and values
+    // =========================================================================
+
+    @Test
+    void empty_string_as_value_unquoted_is_invalid() throws SQLException {
+        // PG rejects 'a=>' as invalid hstore syntax — "syntax error in hstore: unexpected end of string"
+        assertThrows(SQLException.class, () -> str("SELECT ('a=>'::hstore)->'a'"));
+    }
+
+    @Test
+    void empty_string_as_value_quoted_is_valid() throws SQLException {
+        // Valid PG syntax for empty string value: 'a=>""'
+        assertEquals("", str("SELECT ('a=>\"\"'::hstore)->'a'"));
+    }
+
+    @Test
+    void empty_string_as_key() throws SQLException {
+        assertEquals("1", str("SELECT ('\"\"=>1'::hstore)->''"));
+    }
+
+    // =========================================================================
+    // W. Concat merge order — right side wins
+    // =========================================================================
+
+    @Test
+    void concat_right_side_wins_on_duplicate_key() throws SQLException {
+        assertEquals("new", str("SELECT ('a=>old'::hstore || 'a=>new'::hstore)->'a'"));
+    }
+
+    @Test
+    void concat_preserves_both_sides_unique_keys() throws SQLException {
+        assertEquals("1", str("SELECT ('a=>1'::hstore || 'b=>2'::hstore)->'a'"));
+        assertEquals("2", str("SELECT ('a=>1'::hstore || 'b=>2'::hstore)->'b'"));
+    }
 }

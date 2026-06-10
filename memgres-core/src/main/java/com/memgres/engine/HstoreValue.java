@@ -47,10 +47,9 @@ public final class HstoreValue {
             // skip whitespace
             while (i < len && s.charAt(i) == ' ') i++;
 
-            // parse value
+            // parse value — PG requires a value after =>
             if (i >= len) {
-                map.put(key, null);
-                break;
+                throw new MemgresException("syntax error in hstore: unexpected end of string", "42601");
             }
             String val;
             // check for NULL (unquoted)
@@ -62,7 +61,7 @@ public final class HstoreValue {
                 val = parseToken(s, i);
                 i += rawTokenLength(s, i);
             }
-            map.put(key, val);
+            map.putIfAbsent(key, val);
         }
         return new HstoreValue(map);
     }
@@ -207,6 +206,18 @@ public final class HstoreValue {
 
     public int size() {
         return data.size();
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof HstoreValue)) return false;
+        return data.equals(((HstoreValue) o).data);
+    }
+
+    @Override
+    public int hashCode() {
+        return data.hashCode();
     }
 
     @Override

@@ -1894,6 +1894,11 @@ class FunctionEvaluator {
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
                 if (key == null) return h;
+                if (key instanceof java.util.List) {
+                    java.util.List<String> keys = new java.util.ArrayList<>();
+                    for (Object k : (java.util.List<?>) key) keys.add(k != null ? k.toString() : null);
+                    return h.deleteKeys(keys);
+                }
                 return h.deleteKey(key.toString());
             }
             case "slice": {
