@@ -718,4 +718,101 @@ class HstoreColumnTest {
         assertEquals("1", str("SELECT ('a=>1'::hstore || 'b=>2'::hstore)->'a'"));
         assertEquals("2", str("SELECT ('a=>1'::hstore || 'b=>2'::hstore)->'b'"));
     }
+
+    // =========================================================================
+    // X. Multi-key arrow extraction (hstore -> text[])
+    // =========================================================================
+
+    @Test
+    void arrow_text_array_extraction() throws SQLException {
+        String result = str("SELECT ('a=>1, b=>2, c=>3'::hstore -> ARRAY['a','c'])::text");
+        assertNotNull(result);
+        assertTrue(result.contains("1") && result.contains("3"));
+    }
+
+    @Test
+    void arrow_text_array_missing_key_returns_null_element() throws SQLException {
+        // Missing key 'z' should produce NULL in the array
+        assertTrue(bool("SELECT ('a=>1'::hstore -> ARRAY['a','z'])[2] IS NULL"));
+    }
+
+    // =========================================================================
+    // Y. hstore_to_array and hstore_to_matrix
+    // =========================================================================
+
+    @Test
+    void hstore_to_array_returns_flat_array() throws SQLException {
+        String result = str("SELECT hstore_to_array('a=>1, b=>2'::hstore)::text");
+        assertNotNull(result);
+        // Flat array: alternating keys and values
+        assertTrue(result.contains("a") && result.contains("1") && result.contains("b") && result.contains("2"));
+    }
+
+    @Test
+    void hstore_to_matrix_returns_2d_array() throws SQLException {
+        String result = str("SELECT hstore_to_matrix('a=>1'::hstore)::text");
+        assertNotNull(result);
+        assertTrue(result.contains("a") && result.contains("1"));
+    }
+
+    // =========================================================================
+    // Z. delete(hstore, hstore) function
+    // =========================================================================
+
+    @Test
+    void delete_function_with_hstore_arg() throws SQLException {
+        // delete(h, hstore) removes matching key+value pairs
+        assertFalse(bool("SELECT exist(delete('a=>1, b=>2'::hstore, 'a=>1'::hstore), 'a')"));
+        assertTrue(bool("SELECT exist(delete('a=>1, b=>2'::hstore, 'a=>1'::hstore), 'b')"));
+    }
+
+    @Test
+    void delete_function_with_hstore_non_matching_value() throws SQLException {
+        // Non-matching value — key NOT removed
+        assertTrue(bool("SELECT exist(delete('a=>1, b=>2'::hstore, 'a=>999'::hstore), 'a')"));
+    }
+
+    // =========================================================================
+    // AA. isexists / isdefined aliases
+    // =========================================================================
+
+    @Test
+    void isexists_alias() throws SQLException {
+        assertTrue(bool("SELECT isexists('a=>1, b=>2'::hstore, 'a')"));
+        assertFalse(bool("SELECT isexists('a=>1, b=>2'::hstore, 'z')"));
+    }
+
+    @Test
+    void isdefined_alias() throws SQLException {
+        assertTrue(bool("SELECT isdefined('a=>1, b=>NULL'::hstore, 'a')"));
+        assertFalse(bool("SELECT isdefined('a=>1, b=>NULL'::hstore, 'b')"));
+    }
+
+    // =========================================================================
+    // AB. hstore_to_json_loose type inference
+    // =========================================================================
+
+    @Test
+    void hstore_to_json_loose_unquotes_numbers() throws SQLException {
+        // Use single-key to avoid ordering issues
+        String json = str("SELECT hstore_to_json_loose('count=>42'::hstore)::text");
+        assertNotNull(json);
+        // PG unquotes numeric values in loose mode
+        assertTrue(json.contains(": 42") || json.contains(":42"), "number should be unquoted");
+    }
+
+    @Test
+    void hstore_to_json_loose_keeps_booleans_quoted() throws SQLException {
+        // PG does NOT unquote booleans in hstore_to_json_loose — only numbers
+        String json = str("SELECT hstore_to_json_loose('active=>true'::hstore)::text");
+        assertNotNull(json);
+        assertTrue(json.contains("\"true\""), "boolean should stay quoted in PG-compatible loose mode");
+    }
+
+    @Test
+    void hstore_to_jsonb_loose_unquotes_numbers() throws SQLException {
+        String json = str("SELECT hstore_to_jsonb_loose('x=>3.14'::hstore)::text");
+        assertNotNull(json);
+        assertTrue(json.contains(": 3.14") || json.contains(":3.14"), "number should be unquoted");
+    }
 }

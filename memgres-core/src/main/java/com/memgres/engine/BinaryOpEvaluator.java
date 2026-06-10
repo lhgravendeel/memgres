@@ -621,6 +621,15 @@ class BinaryOpEvaluator {
             case JSON_ARROW: {
                 // json -> key or json -> index (returns JSON), also array subscript
                 if (left == null || right == null) return null;
+                // hstore -> text[]: extract multiple values by key array
+                if (left instanceof HstoreValue && right instanceof List) {
+                    HstoreValue h = (HstoreValue) left;
+                    List<String> result = new java.util.ArrayList<>();
+                    for (Object k : (List<?>) right) {
+                        result.add(k != null ? h.get(k.toString()) : null);
+                    }
+                    return result;
+                }
                 // hstore -> text: extract value by key
                 if (left instanceof HstoreValue) {
                     return ((HstoreValue) left).get(right.toString());

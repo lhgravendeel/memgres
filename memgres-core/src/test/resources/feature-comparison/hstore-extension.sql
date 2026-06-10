@@ -726,6 +726,97 @@ SELECT ('a=>1'::hstore || 'b=>2'::hstore)->'a' AS val_a,
        ('a=>1'::hstore || 'b=>2'::hstore)->'b' AS val_b;
 
 -- ============================================================================
+-- X. Multi-key arrow extraction (hstore -> text[])
+-- ============================================================================
+
+-- X1. Extract multiple keys as text array
+-- begin-expected
+-- columns: vals
+-- row: {1,3}
+-- end-expected
+SELECT ('a=>1, b=>2, c=>3'::hstore -> ARRAY['a','c'])::text AS vals;
+
+-- X2. Missing key produces NULL element
+-- begin-expected
+-- columns: is_null
+-- row: true
+-- end-expected
+SELECT ('a=>1'::hstore -> ARRAY['a','z'])[2] IS NULL AS is_null;
+
+-- ============================================================================
+-- Y. hstore_to_array and hstore_to_matrix
+-- ============================================================================
+
+-- Y1. hstore_to_array returns flat alternating key/value array
+-- begin-expected
+-- columns: len
+-- row: 4
+-- end-expected
+SELECT array_length(hstore_to_array('a=>1, b=>2'::hstore), 1) AS len;
+
+-- Y2. hstore_to_matrix returns 2D array
+-- begin-expected
+-- columns: len
+-- row: 1
+-- end-expected
+SELECT array_length(hstore_to_matrix('a=>1'::hstore), 1) AS len;
+
+-- ============================================================================
+-- Z. delete(hstore, hstore) function
+-- ============================================================================
+
+-- Z1. delete matching key+value pair
+-- begin-expected
+-- columns: has_a|has_b
+-- row: false|true
+-- end-expected
+SELECT exist(delete('a=>1, b=>2'::hstore, 'a=>1'::hstore), 'a') AS has_a,
+       exist(delete('a=>1, b=>2'::hstore, 'a=>1'::hstore), 'b') AS has_b;
+
+-- Z2. Non-matching value — key NOT removed
+-- begin-expected
+-- columns: has_a
+-- row: true
+-- end-expected
+SELECT exist(delete('a=>1, b=>2'::hstore, 'a=>999'::hstore), 'a') AS has_a;
+
+-- ============================================================================
+-- AA. isexists / isdefined aliases
+-- ============================================================================
+
+-- AA1. isexists — alias for exist
+-- begin-expected
+-- columns: has_a|has_z
+-- row: true|false
+-- end-expected
+SELECT isexists('a=>1, b=>2'::hstore, 'a') AS has_a, isexists('a=>1, b=>2'::hstore, 'z') AS has_z;
+
+-- AA2. isdefined — alias for defined
+-- begin-expected
+-- columns: a_def|b_def
+-- row: true|false
+-- end-expected
+SELECT isdefined('a=>1, b=>NULL'::hstore, 'a') AS a_def, isdefined('a=>1, b=>NULL'::hstore, 'b') AS b_def;
+
+-- ============================================================================
+-- AB. hstore_to_json_loose — type inference
+-- ============================================================================
+
+-- AB1. Numbers unquoted in loose mode — use single key to avoid ordering issues
+-- begin-expected
+-- columns: val
+-- row: {"count": 42}
+-- end-expected
+SELECT hstore_to_json_loose('count=>42'::hstore)::text AS val;
+
+-- AB2. Booleans stay quoted in PG's hstore_to_json_loose
+-- begin-expected
+-- columns: val
+-- row: {"active": "true"}
+-- end-expected
+SELECT hstore_to_json_loose('active=>true'::hstore)::text AS val;
+
+-- ============================================================================
 -- Cleanup
 -- ============================================================================
 

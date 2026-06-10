@@ -87,6 +87,30 @@ class FunctionEvaluator {
         return HstoreValue.parse(val.toString());
     }
 
+    /** Loose JSON: numeric values are unquoted, NULLs are JSON null. PG does NOT unquote booleans. */
+    private static String hstoreToJsonLooseString(HstoreValue h) {
+        StringBuilder sb = new StringBuilder("{");
+        boolean first = true;
+        for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+            if (!first) sb.append(", ");
+            first = false;
+            sb.append("\"").append(e.getKey().replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+            String v = e.getValue();
+            if (v == null) {
+                sb.append("null");
+            } else {
+                try {
+                    new java.math.BigDecimal(v);
+                    sb.append(v); // valid number — unquoted
+                } catch (NumberFormatException ex) {
+                    sb.append("\"").append(v.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                }
+            }
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
     private static String hstoreToJsonString(HstoreValue h) {
         StringBuilder sb = new StringBuilder("{");
         boolean first = true;
@@ -1871,7 +1895,8 @@ class FunctionEvaluator {
                     return "(" + first.getKey() + "," + (first.getValue() != null ? first.getValue() : "") + ")";
                 }
             }
-            case "exist": {
+            case "exist":
+            case "isexists": {
                 requireExtension("hstore", name, fn.args().size());
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 Object key = executor.evalExpr(fn.args().get(1), ctx);
@@ -1879,7 +1904,8 @@ class FunctionEvaluator {
                 HstoreValue h = toHstore(val);
                 return h.containsKey(key.toString());
             }
-            case "defined": {
+            case "defined":
+            case "isdefined": {
                 requireExtension("hstore", name, fn.args().size());
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 Object key = executor.evalExpr(fn.args().get(1), ctx);
@@ -1898,6 +1924,17 @@ class FunctionEvaluator {
                     java.util.List<String> keys = new java.util.ArrayList<>();
                     for (Object k : (java.util.List<?>) key) keys.add(k != null ? k.toString() : null);
                     return h.deleteKeys(keys);
+                }
+                if (key instanceof HstoreValue) {
+                    // delete(hstore, hstore) — remove matching key/value pairs
+                    HstoreValue rh = (HstoreValue) key;
+                    java.util.Map<String, String> result = new java.util.LinkedHashMap<>(h.getData());
+                    for (java.util.Map.Entry<String, String> e : rh.getData().entrySet()) {
+                        String v = result.get(e.getKey());
+                        if (v != null && v.equals(e.getValue())) result.remove(e.getKey());
+                        else if (v == null && e.getValue() == null && result.containsKey(e.getKey())) result.remove(e.getKey());
+                    }
+                    return new HstoreValue(result);
                 }
                 return h.deleteKey(key.toString());
             }
@@ -1964,7 +2001,35 @@ class FunctionEvaluator {
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
-                return hstoreToJsonString(h);
+                return hstoreToJsonLooseString(h);
+            }
+            case "hstore_to_array": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                // Returns flat array: {k1, v1, k2, v2, ...}
+                List<String> result = new ArrayList<>();
+                for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+                    result.add(e.getKey());
+                    result.add(e.getValue());
+                }
+                return result;
+            }
+            case "hstore_to_matrix": {
+                requireExtension("hstore", name, fn.args().size());
+                Object val = executor.evalExpr(fn.args().get(0), ctx);
+                if (val == null) return null;
+                HstoreValue h = toHstore(val);
+                // Returns 2D array: {{k1,v1},{k2,v2},...}
+                List<List<String>> result = new ArrayList<>();
+                for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+                    List<String> pair = new ArrayList<>();
+                    pair.add(e.getKey());
+                    pair.add(e.getValue());
+                    result.add(pair);
+                }
+                return result;
             }
 
             default: {
