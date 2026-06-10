@@ -887,6 +887,28 @@ class ExprEvaluator {
                 }
                 throw new MemgresException("operator ?| not supported for type " + val.getClass().getSimpleName(), "42883");
             }
+            case HSTORE_TO_ARRAY: {
+                if (val == null) return null;
+                HstoreValue h = (val instanceof HstoreValue) ? (HstoreValue) val : HstoreValue.parse(val.toString());
+                java.util.List<Object> result = new java.util.ArrayList<>();
+                for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+                    result.add(e.getKey());
+                    result.add(e.getValue());
+                }
+                return result;
+            }
+            case HSTORE_TO_MATRIX: {
+                if (val == null) return null;
+                HstoreValue h = (val instanceof HstoreValue) ? (HstoreValue) val : HstoreValue.parse(val.toString());
+                java.util.List<Object> result = new java.util.ArrayList<>();
+                for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+                    java.util.List<Object> pair = new java.util.ArrayList<>();
+                    pair.add(e.getKey());
+                    pair.add(e.getValue());
+                    result.add(pair);
+                }
+                return result;
+            }
             default:
                 throw new IllegalStateException("Unknown unary op: " + op);
         }

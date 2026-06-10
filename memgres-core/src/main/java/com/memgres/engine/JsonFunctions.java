@@ -316,6 +316,25 @@ class JsonFunctions {
             case "jsonb_set": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
                 if (json == null) return null;
+                // hstore subscript update: jsonb_set(hstore, '{key}', value) → merge key into hstore
+                if (json instanceof HstoreValue) {
+                    Object pathArg = executor.evalExpr(fn.args().get(1), ctx);
+                    Object newVal = executor.evalExpr(fn.args().get(2), ctx);
+                    List<String> hpath = parsePathArg(pathArg);
+                    if (!hpath.isEmpty()) {
+                        String key = hpath.get(0);
+                        String val = newVal != null ? newVal.toString() : null;
+                        // Strip surrounding quotes from JSON string value (to_jsonb wraps in quotes)
+                        if (val != null && val.startsWith("\"") && val.endsWith("\"")) {
+                            val = val.substring(1, val.length() - 1);
+                        }
+                        HstoreValue h = (HstoreValue) json;
+                        java.util.Map<String, String> merged = new java.util.LinkedHashMap<>(h.getData());
+                        merged.put(key, val);
+                        return new HstoreValue(merged);
+                    }
+                    return json;
+                }
                 Object pathArg = executor.evalExpr(fn.args().get(1), ctx);
                 // Validate path is text[] format
                 if (pathArg instanceof String && !(pathArg instanceof java.util.List) && !((String) pathArg).trim().startsWith("{")) {

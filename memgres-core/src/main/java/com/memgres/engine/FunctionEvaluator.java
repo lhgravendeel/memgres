@@ -1973,10 +1973,33 @@ class FunctionEvaluator {
                     return new HstoreValue(map);
                 }
                 if (fn.args().size() == 1) {
-                    // hstore(text) or hstore(hstore) — parse or pass through
+                    // hstore(text) or hstore(hstore) or hstore(text[]) — parse, pass through, or build from array
                     Object rec = executor.evalExpr(fn.args().get(0), ctx);
                     if (rec == null) return null;
                     if (rec instanceof HstoreValue) return rec;
+                    if (rec instanceof List) {
+                        List<?> arr = (List<?>) rec;
+                        java.util.Map<String, String> map = new java.util.LinkedHashMap<>();
+                        if (!arr.isEmpty() && arr.get(0) instanceof List) {
+                            // 2D array: [[k1,v1],[k2,v2],...]
+                            for (Object row : arr) {
+                                List<?> pair = (List<?>) row;
+                                if (pair.size() >= 2) {
+                                    String k = pair.get(0) != null ? pair.get(0).toString() : null;
+                                    String v = pair.get(1) != null ? pair.get(1).toString() : null;
+                                    if (k != null) map.put(k, v);
+                                }
+                            }
+                        } else {
+                            // Flat alternating array: [k1,v1,k2,v2,...]
+                            for (int i = 0; i + 1 < arr.size(); i += 2) {
+                                String k = arr.get(i) != null ? arr.get(i).toString() : null;
+                                String v = arr.get(i + 1) != null ? arr.get(i + 1).toString() : null;
+                                if (k != null) map.put(k, v);
+                            }
+                        }
+                        return new HstoreValue(map);
+                    }
                     return HstoreValue.parse(rec.toString());
                 }
                 throw new MemgresException("function hstore() requires 1 or 2 arguments", "42883");

@@ -477,6 +477,21 @@ class CastEvaluator {
             }
             case "json":
             case "jsonb": {
+                // hstore → json/jsonb: convert via hstore_to_json semantics (all values as strings)
+                if (val instanceof HstoreValue) {
+                    HstoreValue h = (HstoreValue) val;
+                    StringBuilder sb = new StringBuilder("{");
+                    boolean first = true;
+                    for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+                        if (!first) sb.append(", ");
+                        first = false;
+                        sb.append("\"").append(e.getKey().replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+                        if (e.getValue() == null) sb.append("null");
+                        else sb.append("\"").append(e.getValue().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                    }
+                    sb.append("}");
+                    return sb.toString();
+                }
                 String jsonStr = val.toString();
                 // Validate JSON syntax
                 String trimmed = jsonStr.trim();

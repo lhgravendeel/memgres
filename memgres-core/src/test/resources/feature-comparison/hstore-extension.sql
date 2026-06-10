@@ -817,6 +817,161 @@ SELECT hstore_to_json_loose('count=>42'::hstore)::text AS val;
 SELECT hstore_to_json_loose('active=>true'::hstore)::text AS val;
 
 -- ============================================================================
+-- AC. hstore_to_jsonb_loose — type inference (jsonb variant)
+-- ============================================================================
+
+-- AC1. Numbers unquoted in jsonb_loose mode — single key to avoid ordering
+-- begin-expected
+-- columns: val
+-- row: {"count": 42}
+-- end-expected
+SELECT hstore_to_jsonb_loose('count=>42'::hstore)::text AS val;
+
+-- AC2. Booleans stay quoted in hstore_to_jsonb_loose (same as json variant)
+-- begin-expected
+-- columns: val
+-- row: {"active": "true"}
+-- end-expected
+SELECT hstore_to_jsonb_loose('active=>true'::hstore)::text AS val;
+
+-- ============================================================================
+-- AD. hstore(text[]) — single array constructor
+-- ============================================================================
+
+-- AD1. hstore from flat alternating key/value array
+-- begin-expected
+-- columns: val
+-- row: 2
+-- end-expected
+SELECT (hstore(ARRAY['a','1','b','2']))->'b' AS val;
+
+-- AD2. hstore from 2D key/value array
+-- begin-expected
+-- columns: val
+-- row: 4
+-- end-expected
+SELECT (hstore(ARRAY[['c','3'],['d','4']]))->'d' AS val;
+
+-- ============================================================================
+-- AE. ?& operator (all keys exist) and ?| operator (any key exists)
+-- ============================================================================
+
+-- AE1. ?& — all keys exist — true case
+-- begin-expected
+-- columns: val
+-- row: true
+-- end-expected
+SELECT 'a=>1, b=>2, c=>3'::hstore ?& ARRAY['a','b'] AS val;
+
+-- AE2. ?& — all keys exist — false case (missing key)
+-- begin-expected
+-- columns: val
+-- row: false
+-- end-expected
+SELECT 'a=>1, b=>2'::hstore ?& ARRAY['a','z'] AS val;
+
+-- AE3. ?| — any key exists — true case
+-- begin-expected
+-- columns: val
+-- row: true
+-- end-expected
+SELECT 'a=>1, b=>2'::hstore ?| ARRAY['z','b'] AS val;
+
+-- AE4. ?| — any key exists — false case (no matching keys)
+-- begin-expected
+-- columns: val
+-- row: false
+-- end-expected
+SELECT 'a=>1, b=>2'::hstore ?| ARRAY['x','y'] AS val;
+
+-- ============================================================================
+-- AF. Implicit cast hstore → json and hstore → jsonb
+-- ============================================================================
+
+-- AF1. hstore::json implicit cast
+-- begin-expected
+-- columns: val
+-- row: 1
+-- end-expected
+SELECT ('a=>1'::hstore::json)->>'a' AS val;
+
+-- AF2. hstore::jsonb implicit cast
+-- begin-expected
+-- columns: val
+-- row: 1
+-- end-expected
+SELECT ('a=>1'::hstore::jsonb)->>'a' AS val;
+
+-- ============================================================================
+-- AG. Subscript access h['key']
+-- ============================================================================
+
+CREATE TABLE hs_test.t_subscript (id int PRIMARY KEY, data hstore);
+INSERT INTO hs_test.t_subscript VALUES (1, 'x=>10, y=>20');
+
+-- AG1. Subscript fetch — read value by key
+-- begin-expected
+-- columns: val
+-- row: 10
+-- end-expected
+SELECT data['x'] AS val FROM hs_test.t_subscript WHERE id = 1;
+
+-- AG2. Subscript fetch — missing key returns NULL
+-- begin-expected
+-- columns: is_null
+-- row: true
+-- end-expected
+SELECT data['z'] IS NULL AS is_null FROM hs_test.t_subscript WHERE id = 1;
+
+-- AG3. Subscript update — set existing key
+UPDATE hs_test.t_subscript SET data['x'] = '99' WHERE id = 1;
+
+-- begin-expected
+-- columns: val
+-- row: 99
+-- end-expected
+SELECT data['x'] AS val FROM hs_test.t_subscript WHERE id = 1;
+
+-- AG4. Subscript update — add new key
+UPDATE hs_test.t_subscript SET data['z'] = 'new' WHERE id = 1;
+
+-- begin-expected
+-- columns: val
+-- row: new
+-- end-expected
+SELECT data['z'] AS val FROM hs_test.t_subscript WHERE id = 1;
+
+-- ============================================================================
+-- AH. Prefix operators %% and %#
+-- ============================================================================
+
+-- AH1. %% — convert hstore to alternating key/value array
+-- begin-expected
+-- columns: len
+-- row: 2
+-- end-expected
+SELECT array_length(%% 'a=>1'::hstore, 1) AS len;
+
+-- AH2. %# — convert hstore to 2D key/value matrix
+-- begin-expected
+-- columns: len
+-- row: 1
+-- end-expected
+SELECT array_length(%# 'a=>1'::hstore, 1) AS len;
+
+-- ============================================================================
+-- AI. hstore - text with explicit ::text cast (key deletion)
+-- ============================================================================
+
+-- AI1. Delete single key using explicit ::text cast
+-- begin-expected
+-- columns: has_b|has_a
+-- row: false|true
+-- end-expected
+SELECT exist('a=>1, b=>2'::hstore - 'b'::text, 'b') AS has_b,
+       exist('a=>1, b=>2'::hstore - 'b'::text, 'a') AS has_a;
+
+-- ============================================================================
 -- Cleanup
 -- ============================================================================
 

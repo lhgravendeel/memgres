@@ -815,4 +815,110 @@ class HstoreColumnTest {
         assertNotNull(json);
         assertTrue(json.contains(": 3.14") || json.contains(":3.14"), "number should be unquoted");
     }
+
+    @Test
+    void hstore_to_jsonb_loose_keeps_booleans_quoted() throws SQLException {
+        // PG does NOT unquote booleans in hstore_to_jsonb_loose — only numbers
+        String json = str("SELECT hstore_to_jsonb_loose('active=>true'::hstore)::text");
+        assertNotNull(json);
+        assertTrue(json.contains("\"true\""), "boolean should stay quoted in PG-compatible loose mode");
+    }
+
+    // =========================================================================
+    // AC. hstore(text[]) single-array constructors
+    // =========================================================================
+
+    @Test
+    void hstore_from_flat_array() throws SQLException {
+        // hstore(ARRAY['a','1','b','2']) — alternating key/value flat array
+        String val = str("SELECT (hstore(ARRAY['a','1','b','2']))->'b'");
+        assertEquals("2", val);
+    }
+
+    @Test
+    void hstore_from_2d_array() throws SQLException {
+        // hstore(ARRAY[['c','3'],['d','4']]) — 2D key/value array
+        String val = str("SELECT (hstore(ARRAY[['c','3'],['d','4']]))->'d'");
+        assertEquals("4", val);
+    }
+
+    // =========================================================================
+    // AD. Implicit cast hstore → json / jsonb
+    // =========================================================================
+
+    @Test
+    void implicit_cast_hstore_to_json() throws SQLException {
+        String val = str("SELECT ('a=>1'::hstore::json)->>'a'");
+        assertEquals("1", val);
+    }
+
+    @Test
+    void implicit_cast_hstore_to_jsonb() throws SQLException {
+        String val = str("SELECT ('a=>1'::hstore::jsonb)->>'a'");
+        assertEquals("1", val);
+    }
+
+    // =========================================================================
+    // AE. Subscript access h['key']
+    // =========================================================================
+
+    @Test
+    void subscript_fetch_existing_key() throws SQLException {
+        exec("CREATE TABLE hs_sub_test (id int PRIMARY KEY, data hstore)");
+        try {
+            exec("INSERT INTO hs_sub_test VALUES (1, 'x=>10, y=>20')");
+            String val = str("SELECT data['x'] FROM hs_sub_test WHERE id = 1");
+            assertEquals("10", val);
+        } finally {
+            exec("DROP TABLE IF EXISTS hs_sub_test");
+        }
+    }
+
+    @Test
+    void subscript_fetch_missing_key_returns_null() throws SQLException {
+        exec("CREATE TABLE hs_sub_test2 (id int PRIMARY KEY, data hstore)");
+        try {
+            exec("INSERT INTO hs_sub_test2 VALUES (1, 'x=>10')");
+            assertTrue(bool("SELECT data['z'] IS NULL FROM hs_sub_test2 WHERE id = 1"));
+        } finally {
+            exec("DROP TABLE IF EXISTS hs_sub_test2");
+        }
+    }
+
+    @Test
+    void subscript_update_existing_key() throws SQLException {
+        exec("CREATE TABLE hs_sub_test3 (id int PRIMARY KEY, data hstore)");
+        try {
+            exec("INSERT INTO hs_sub_test3 VALUES (1, 'x=>10, y=>20')");
+            exec("UPDATE hs_sub_test3 SET data['x'] = '99' WHERE id = 1");
+            String val = str("SELECT data['x'] FROM hs_sub_test3 WHERE id = 1");
+            assertEquals("99", val);
+        } finally {
+            exec("DROP TABLE IF EXISTS hs_sub_test3");
+        }
+    }
+
+    @Test
+    void subscript_update_new_key() throws SQLException {
+        exec("CREATE TABLE hs_sub_test4 (id int PRIMARY KEY, data hstore)");
+        try {
+            exec("INSERT INTO hs_sub_test4 VALUES (1, 'x=>10')");
+            exec("UPDATE hs_sub_test4 SET data['z'] = 'new' WHERE id = 1");
+            String val = str("SELECT data['z'] FROM hs_sub_test4 WHERE id = 1");
+            assertEquals("new", val);
+        } finally {
+            exec("DROP TABLE IF EXISTS hs_sub_test4");
+        }
+    }
+
+    // =========================================================================
+    // AF. hstore - text with explicit ::text cast
+    // =========================================================================
+
+    @Test
+    void delete_key_with_explicit_text_cast() throws SQLException {
+        // PG requires ::text cast for key deletion to disambiguate from hstore-hstore subtraction
+        assertFalse(bool("SELECT exist('a=>1, b=>2'::hstore - 'b'::text, 'b')"));
+        assertTrue(bool("SELECT exist('a=>1, b=>2'::hstore - 'b'::text, 'a')"));
+    }
 }

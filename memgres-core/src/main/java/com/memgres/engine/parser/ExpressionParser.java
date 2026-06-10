@@ -865,6 +865,15 @@ public class ExpressionParser {
                 advance();
                 return new UnaryExpr(UnaryExpr.UnaryOp.SQRT, parseUnary());
             }
+            // %% (hstore to array) and %# (hstore to matrix) prefix operators
+            if (opSymbol.equals("%%")) {
+                advance();
+                return new UnaryExpr(UnaryExpr.UnaryOp.HSTORE_TO_ARRAY, parseUnary());
+            }
+            if (opSymbol.equals("%#")) {
+                advance();
+                return new UnaryExpr(UnaryExpr.UnaryOp.HSTORE_TO_MATRIX, parseUnary());
+            }
             advance();
             Expression right = parseUnary();
             return new CustomOperatorExpr(null, opSymbol, null, right);

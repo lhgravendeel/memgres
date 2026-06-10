@@ -915,10 +915,17 @@ class BinaryOpEvaluator {
             }
             case JSONB_EXISTS: {
                 if (left == null || right == null) return null;
+                if (left instanceof HstoreValue) return ((HstoreValue) left).getData().containsKey(right.toString());
                 return JsonOperations.keyExists(left.toString(), right.toString());
             }
             case JSONB_EXISTS_ANY: {
                 if (left == null || right == null) return null;
+                if (left instanceof HstoreValue) {
+                    List<String> hkeys = right instanceof List ? ((List<?>) right).stream().map(Object::toString).collect(Collectors.toList()) : Cols.listOf(right.toString());
+                    HstoreValue h = (HstoreValue) left;
+                    for (String k : hkeys) { if (h.getData().containsKey(k)) return true; }
+                    return false;
+                }
                 // ?| requires text[] on right side
                 if (right instanceof String && !((String) right).trim().startsWith("{") && !(right instanceof List<?>)) {
                     String rs = (String) right;
@@ -929,6 +936,12 @@ class BinaryOpEvaluator {
             }
             case JSONB_EXISTS_ALL: {
                 if (left == null || right == null) return null;
+                if (left instanceof HstoreValue) {
+                    List<String> hkeys = right instanceof List ? ((List<?>) right).stream().map(Object::toString).collect(Collectors.toList()) : Cols.listOf(right.toString());
+                    HstoreValue h = (HstoreValue) left;
+                    for (String k : hkeys) { if (!h.getData().containsKey(k)) return false; }
+                    return true;
+                }
                 List<String> keys = right instanceof List ? ((List<?>) right).stream().map(Object::toString).collect(Collectors.toList()) : Cols.listOf(right.toString());
                 return JsonOperations.allKeysExist(left.toString(), keys);
             }
@@ -1577,10 +1590,17 @@ class BinaryOpEvaluator {
             }
             case JSONB_EXISTS: {
                 if (left == null || right == null) return null;
+                if (left instanceof HstoreValue) return ((HstoreValue) left).getData().containsKey(right.toString());
                 return JsonOperations.keyExists(left.toString(), right.toString());
             }
             case JSONB_EXISTS_ANY: {
                 if (left == null || right == null) return null;
+                if (left instanceof HstoreValue) {
+                    List<String> hkeys = right instanceof List ? ((List<?>) right).stream().map(Object::toString).collect(Collectors.toList()) : Cols.listOf(right.toString());
+                    HstoreValue h = (HstoreValue) left;
+                    for (String k : hkeys) { if (h.getData().containsKey(k)) return true; }
+                    return false;
+                }
                 // ?| requires text[] on right side
                 if (right instanceof String && !((String) right).trim().startsWith("{") && !(right instanceof List<?>)) {
                     String rs = (String) right;
@@ -1591,6 +1611,12 @@ class BinaryOpEvaluator {
             }
             case JSONB_EXISTS_ALL: {
                 if (left == null || right == null) return null;
+                if (left instanceof HstoreValue) {
+                    List<String> hkeys = right instanceof List ? ((List<?>) right).stream().map(Object::toString).collect(Collectors.toList()) : Cols.listOf(right.toString());
+                    HstoreValue h = (HstoreValue) left;
+                    for (String k : hkeys) { if (!h.getData().containsKey(k)) return false; }
+                    return true;
+                }
                 List<String> keys = right instanceof List ? ((List<?>) right).stream().map(Object::toString).collect(Collectors.toList()) : Cols.listOf(right.toString());
                 return JsonOperations.allKeysExist(left.toString(), keys);
             }
