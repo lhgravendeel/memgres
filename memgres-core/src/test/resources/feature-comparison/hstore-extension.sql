@@ -972,6 +972,90 @@ SELECT exist('a=>1, b=>2'::hstore - 'b'::text, 'b') AS has_b,
        exist('a=>1, b=>2'::hstore - 'b'::text, 'a') AS has_a;
 
 -- ============================================================================
+-- AJ. populate_record(anyelement, hstore)
+-- ============================================================================
+
+CREATE TYPE hs_test.pop_type AS (a int, b text, c boolean);
+
+-- AJ1. Basic populate_record with NULL base
+-- begin-expected
+-- columns: a|b|c
+-- row: 42|hello|t
+-- end-expected
+SELECT (populate_record(NULL::hs_test.pop_type, 'a=>42, b=>hello, c=>true'::hstore)).*;
+
+-- AJ2. Preserves base values for unmentioned fields
+-- begin-expected
+-- columns: a|b
+-- row: 99|new
+-- end-expected
+SELECT (populate_record(ROW(99, 'old', true)::hs_test.pop_type, 'b=>new'::hstore)).a,
+       (populate_record(ROW(99, 'old', true)::hs_test.pop_type, 'b=>new'::hstore)).b;
+
+-- AJ3. Extra hstore keys are ignored
+-- begin-expected
+-- columns: a
+-- row: 42
+-- end-expected
+SELECT (populate_record(NULL::hs_test.pop_type, 'a=>42, z=>extra'::hstore)).a;
+
+-- AJ4. populate_record in FROM clause
+-- begin-expected
+-- columns: a|b
+-- row: 10|world
+-- end-expected
+SELECT a, b FROM populate_record(NULL::hs_test.pop_type, 'a=>10, b=>world'::hstore);
+
+-- ============================================================================
+-- AK. hstore(record) — convert composite type to hstore
+-- ============================================================================
+
+-- AK1. Convert composite type to hstore and extract a key
+-- begin-expected
+-- columns: val
+-- row: hello
+-- end-expected
+SELECT hstore(ROW(1, 'hello', true)::hs_test.pop_type)->'b' AS val;
+
+-- AK2. NULL field in record becomes NULL in hstore
+-- begin-expected
+-- columns: val
+-- row: NULL
+-- end-expected
+SELECT hstore(ROW(1, NULL, false)::hs_test.pop_type)->'b' AS val;
+
+-- ============================================================================
+-- AL. #= operator (populate_record shorthand)
+-- ============================================================================
+
+-- AL1. Basic #= usage
+-- begin-expected
+-- columns: a|b
+-- row: 5|hi
+-- end-expected
+SELECT (NULL::hs_test.pop_type #= 'a=>5, b=>hi'::hstore).a,
+       (NULL::hs_test.pop_type #= 'a=>5, b=>hi'::hstore).b;
+
+-- AL2. #= preserves base record values
+-- begin-expected
+-- columns: a|b
+-- row: 99|new
+-- end-expected
+SELECT (ROW(99, 'old', true)::hs_test.pop_type #= 'b=>new'::hstore).a,
+       (ROW(99, 'old', true)::hs_test.pop_type #= 'b=>new'::hstore).b;
+
+-- ============================================================================
+-- AM. populate_record with array of hstores (no PG equivalent — expected error)
+-- ============================================================================
+
+-- AM1. There is no populate_recordset for hstore in PG — this should error
+-- begin-expected-error
+-- end-expected
+SELECT * FROM populate_recordset(NULL::hs_test.pop_type, ARRAY['a=>1, b=>x'::hstore, 'a=>2, b=>y'::hstore]);
+
+DROP TYPE hs_test.pop_type CASCADE;
+
+-- ============================================================================
 -- Cleanup
 -- ============================================================================
 

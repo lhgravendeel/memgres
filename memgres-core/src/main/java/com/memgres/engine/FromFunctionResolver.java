@@ -47,6 +47,8 @@ class FromFunctionResolver {
         if (fname.equals("json_populate_recordset") || fname.equals("jsonb_populate_recordset")
                 || fname.equals("json_populate_record") || fname.equals("jsonb_populate_record"))
             return resolveJsonPopulateRecordset(funcFrom, alias, colAliases, evalArgs);
+        if (fname.equals("populate_record"))
+            return resolveHstorePopulateRecord(funcFrom, alias, evalArgs);
         if (fname.equals("regexp_matches")) return resolveRegexpMatches(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_path_query")) return resolveJsonbPathQuery(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_array_elements") || fname.equals("json_array_elements") ||
@@ -636,6 +638,51 @@ class FromFunctionResolver {
                         else if (extracted.equals("false")) extracted = "f";
                     }
                     row[ci] = extracted;
+                }
+                virtualTable.insertRow(row);
+                contexts.add(new RowContext(virtualTable, alias, row));
+            }
+        }
+        return contexts;
+    }
+
+    // ---- hstore populate_record ----
+
+    private List<RowContext> resolveHstorePopulateRecord(SelectStmt.FunctionFrom funcFrom,
+            String alias, List<Object> evalArgs) {
+        // Extract composite type from CastExpr first argument
+        List<Column> cols = new ArrayList<>();
+        String typeName = null;
+        if (funcFrom.args().size() >= 1 && funcFrom.args().get(0) instanceof CastExpr) {
+            typeName = ((CastExpr) funcFrom.args().get(0)).typeName().toLowerCase();
+            java.util.List<CreateTypeStmt.CompositeField> fields =
+                    executor.compositeTypeHandler.resolveFieldsForType(typeName);
+            if (fields != null) {
+                for (CreateTypeStmt.CompositeField field : fields) {
+                    DataType dt = DataType.fromPgName(field.typeName());
+                    cols.add(new Column(field.name(), dt != null ? dt : DataType.TEXT, true, false, null));
+                }
+            }
+        }
+        if (cols.isEmpty()) cols.add(new Column("value", DataType.TEXT, true, false, null));
+
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+
+        // Evaluate: populate_record(base, hstore)
+        Object hstoreVal = evalArgs.size() > 1 ? evalArgs.get(1) : null;
+        if (hstoreVal != null) {
+            HstoreValue hs = (hstoreVal instanceof HstoreValue)
+                    ? (HstoreValue) hstoreVal : HstoreValue.parse(hstoreVal.toString());
+            java.util.List<CreateTypeStmt.CompositeField> fields =
+                    executor.compositeTypeHandler.resolveFieldsForType(typeName);
+            if (fields != null) {
+                Object baseVal = evalArgs.get(0);
+                java.util.Map<String, Object> populated =
+                        executor.compositeTypeHandler.populateFromHstore(baseVal, hs, fields);
+                Object[] row = new Object[cols.size()];
+                for (int ci = 0; ci < cols.size(); ci++) {
+                    row[ci] = populated.get(cols.get(ci).getName());
                 }
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));

@@ -1950,6 +1950,21 @@ class FunctionEvaluator {
                 }
                 return h.slice(keys);
             }
+            case "populate_record": {
+                requireExtension("hstore", name, fn.args().size());
+                if (fn.args().size() != 2)
+                    throw new MemgresException("function populate_record requires 2 arguments", "42883");
+                String typeName = executor.resolveCompositeTypeName(fn.args().get(0), ctx);
+                Object baseArg = executor.evalExpr(fn.args().get(0), ctx);
+                Object hstoreArg = executor.evalExpr(fn.args().get(1), ctx);
+                HstoreValue hs = (hstoreArg == null)
+                        ? new HstoreValue(new java.util.LinkedHashMap<>()) : toHstore(hstoreArg);
+                java.util.List<CreateTypeStmt.CompositeField> fields =
+                        executor.compositeTypeHandler.resolveFieldsForType(typeName);
+                if (fields == null)
+                    throw new MemgresException("first argument of populate_record must be a row type", "42846");
+                return executor.compositeTypeHandler.populateFromHstore(baseArg, hs, fields);
+            }
             case "hstore": {
                 requireExtension("hstore", name, fn.args().size());
                 if (fn.args().size() == 2) {
@@ -1977,6 +1992,29 @@ class FunctionEvaluator {
                     Object rec = executor.evalExpr(fn.args().get(0), ctx);
                     if (rec == null) return null;
                     if (rec instanceof HstoreValue) return rec;
+                    // hstore(record) — convert composite type to hstore
+                    if (rec instanceof java.util.Map) {
+                        java.util.Map<String, String> hmap = new java.util.LinkedHashMap<>();
+                        for (java.util.Map.Entry<?, ?> e : ((java.util.Map<?, ?>) rec).entrySet()) {
+                            hmap.put(e.getKey().toString(), e.getValue() != null ? e.getValue().toString() : null);
+                        }
+                        return new HstoreValue(hmap);
+                    }
+                    if (rec instanceof AstExecutor.PgRow) {
+                        String typeName = executor.resolveCompositeTypeName(fn.args().get(0), ctx);
+                        java.util.List<CreateTypeStmt.CompositeField> fields =
+                                typeName != null ? executor.compositeTypeHandler.resolveFieldsForType(typeName) : null;
+                        if (fields != null) {
+                            AstExecutor.PgRow row = (AstExecutor.PgRow) rec;
+                            java.util.Map<String, String> hmap = new java.util.LinkedHashMap<>();
+                            for (int i = 0; i < fields.size() && i < row.values().size(); i++) {
+                                Object v = row.values().get(i);
+                                hmap.put(fields.get(i).name(), v != null ? v.toString() : null);
+                            }
+                            return new HstoreValue(hmap);
+                        }
+                        throw new MemgresException("could not determine composite type for hstore(record)", "42804");
+                    }
                     if (rec instanceof List) {
                         List<?> arr = (List<?>) rec;
                         java.util.Map<String, String> map = new java.util.LinkedHashMap<>();

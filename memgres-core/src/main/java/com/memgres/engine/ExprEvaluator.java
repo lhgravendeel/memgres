@@ -644,6 +644,22 @@ class ExprEvaluator {
         Object leftVal = cop.left() != null ? evalExpr(cop.left(), ctx) : null;
         Object rightVal = evalExpr(cop.right(), ctx);
 
+        // #= is hstore populate_record: record #= hstore → record
+        if ("#=".equals(cop.opSymbol()) && cop.left() != null) {
+            if (!executor.database.hasExtension("hstore"))
+                throw new MemgresException("operator does not exist: record #= hstore", "42883");
+            String typeName = executor.resolveCompositeTypeName(cop.left(), ctx);
+            HstoreValue hs = (rightVal == null)
+                    ? new HstoreValue(new java.util.LinkedHashMap<>())
+                    : (rightVal instanceof HstoreValue)
+                        ? (HstoreValue) rightVal : HstoreValue.parse(rightVal.toString());
+            java.util.List<CreateTypeStmt.CompositeField> fields =
+                    executor.compositeTypeHandler.resolveFieldsForType(typeName);
+            if (fields == null)
+                throw new MemgresException("operator does not exist: record #= hstore", "42883");
+            return executor.compositeTypeHandler.populateFromHstore(leftVal, hs, fields);
+        }
+
         // Built-in text operators that aren't registered as user PgOperator.
         // ^@ is PG 11+ starts-with on text (treated as STRICT).
         if ("^@".equals(cop.opSymbol()) && cop.left() != null) {

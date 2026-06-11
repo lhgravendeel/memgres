@@ -19,6 +19,8 @@ class CompositeTypeHandler {
             CastExpr cast = (CastExpr) expr;
             String tn = cast.typeName().toLowerCase().trim();
             if (executor.database.isCompositeType(tn)) return tn;
+            // Tables also serve as composite types in PG
+            if (executor.database.getTable(tn) != null) return tn;
             return null;
         }
         if (expr instanceof FieldAccessExpr) {
@@ -49,6 +51,12 @@ class CompositeTypeHandler {
         }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
+            // populate_record / json_populate_record return the type of their first argument
+            String fname = fn.name().toLowerCase();
+            if ((fname.equals("populate_record") || fname.equals("json_populate_record"))
+                    && fn.args() != null && !fn.args().isEmpty()) {
+                return resolveCompositeTypeName(fn.args().get(0), ctx);
+            }
             PgFunction pgFunc = executor.database.getFunction(fn.name());
             if (pgFunc != null) {
                 String rt = pgFunc.getReturnType().toLowerCase().trim();
@@ -185,6 +193,57 @@ class CompositeTypeHandler {
             }
         }
         return new AstExecutor.PgRow(values);
+    }
+
+    /**
+     * Resolve composite type fields by name, with table-type fallback.
+     */
+    java.util.List<CreateTypeStmt.CompositeField> resolveFieldsForType(String typeName) {
+        if (typeName == null) return null;
+        java.util.List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+        if (fields != null) return fields;
+        // Fallback: PG treats tables as composite types
+        Table tbl = executor.database.getTable(typeName);
+        if (tbl != null) {
+            fields = new ArrayList<>();
+            for (Column c : tbl.getColumns()) {
+                fields.add(new CreateTypeStmt.CompositeField(c.getName(), c.getType().getPgName()));
+            }
+            return fields;
+        }
+        return null;
+    }
+
+    /**
+     * Populate a record from hstore: start with base values, overlay matching hstore keys with type coercion.
+     */
+    java.util.Map<String, Object> populateFromHstore(Object baseVal, HstoreValue hs,
+            java.util.List<CreateTypeStmt.CompositeField> fields) {
+        java.util.Map<String, Object> result = new java.util.LinkedHashMap<>();
+        // Initialize from base argument
+        if (baseVal instanceof java.util.Map) {
+            for (java.util.Map.Entry<?, ?> e : ((java.util.Map<?, ?>) baseVal).entrySet()) {
+                result.put(e.getKey().toString(), e.getValue());
+            }
+        } else if (baseVal instanceof AstExecutor.PgRow) {
+            AstExecutor.PgRow row = (AstExecutor.PgRow) baseVal;
+            for (int i = 0; i < fields.size() && i < row.values().size(); i++) {
+                result.put(fields.get(i).name(), row.values().get(i));
+            }
+        } else {
+            // Base is NULL — initialize all fields to null
+            for (CreateTypeStmt.CompositeField f : fields) {
+                result.put(f.name(), null);
+            }
+        }
+        // Overlay hstore values with type coercion
+        for (CreateTypeStmt.CompositeField f : fields) {
+            if (hs.getData().containsKey(f.name())) {
+                String val = hs.get(f.name());
+                result.put(f.name(), val == null ? null : coerceFieldValue(val, f.typeName()));
+            }
+        }
+        return result;
     }
 
     Object coerceFieldValue(String val, String typeName) {
