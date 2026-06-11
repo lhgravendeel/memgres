@@ -1,15 +1,27 @@
 package com.memgres.engine.parser;
 
 import com.memgres.engine.parser.ast.*;
+import com.memgres.engine.util.Cols;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Function/procedure creation and CALL parsing, extracted from DdlParser.
  */
 class DdlFunctionParser {
     private final Parser parser;
+
+    // Keywords that PG treats as reserved in function parameter name positions.
+    // These are "type_func_name" keywords that PG's parser interprets as expression starts
+    // (e.g., OVERLAY(...), POSITION(...), TRIM(...)) rather than bare identifiers.
+    private static final Set<String> RESERVED_PARAM_KEYWORDS = Cols.setOf(
+        "OVERLAY", "POSITION", "SUBSTRING", "TREAT", "TRIM",
+        "XMLELEMENT", "XMLFOREST", "XMLPARSE", "XMLPI", "XMLROOT", "XMLSERIALIZE",
+        "XMLEXISTS", "XMLTABLE", "NORMALIZE", "JSON_ARRAY", "JSON_OBJECT",
+        "JSON_ARRAYAGG", "JSON_OBJECTAGG"
+    );
 
     DdlFunctionParser(Parser parser) {
         this.parser = parser;
@@ -39,6 +51,11 @@ class DdlFunctionParser {
 
                 String paramName = null;
                 int saved = parser.pos;
+                // Check if the next token is a reserved keyword that can't be used as a parameter name
+                Token nextTok = parser.peek();
+                if (nextTok.type() == TokenType.KEYWORD && RESERVED_PARAM_KEYWORDS.contains(nextTok.value())) {
+                    throw new ParseException("syntax error at or near \"" + nextTok.value().toLowerCase() + "\"", nextTok, "42601");
+                }
                 String firstIdent = parser.readIdentifier();
 
                 boolean isTypeOnly = parser.check(TokenType.COMMA) || parser.check(TokenType.RIGHT_PAREN) ||

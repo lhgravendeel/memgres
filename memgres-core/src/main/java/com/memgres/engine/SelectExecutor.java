@@ -48,7 +48,8 @@ class SelectExecutor {
             "json_array_elements", "jsonb_array_elements", "json_object_keys", "jsonb_object_keys",
             "json_array_elements_text", "jsonb_array_elements_text", "generate_subscripts",
             "jsonb_path_query", "jsonb_path_query_tz", "aclexplode", "string_to_table", "regexp_split_to_table",
-            "pg_listening_channels", "pg_snapshot_xip", "txid_snapshot_xip");
+            "pg_listening_channels", "pg_snapshot_xip", "txid_snapshot_xip",
+            "skeys", "svals", "each", "akeys", "avals");
     private static final Set<String> SRF_FUNCTIONS = SRF_FUNCTION_NAMES;
 
     SelectExecutor(AstExecutor executor) {

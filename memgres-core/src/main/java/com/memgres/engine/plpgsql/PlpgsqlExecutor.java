@@ -1896,6 +1896,8 @@ public class PlpgsqlExecutor {
             sb.append("'").append(val.toString().replace("'", "''")).append("'::date");
         } else if (val instanceof java.time.LocalTime) {
             sb.append("'").append(val.toString().replace("'", "''")).append("'::time");
+        } else if (val instanceof com.memgres.engine.HstoreValue) {
+            sb.append("'").append(val.toString().replace("'", "''")).append("'::hstore");
         } else {
             sb.append("'").append(val.toString().replace("'", "''")).append("'");
         }

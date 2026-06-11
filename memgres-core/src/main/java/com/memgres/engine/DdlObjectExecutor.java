@@ -938,7 +938,12 @@ class DdlObjectExecutor {
                 "date_part", "date_trunc", "extract", "age", "make_interval",
                 "row_to_json", "json_build_object", "json_build_array",
                 "jsonb_build_object", "jsonb_build_array",
-                "generate_series", "pg_typeof", "pg_sleep", "pg_sleep_for", "pg_sleep_until").contains(name);
+                "generate_series", "pg_typeof", "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+                "hstore", "exist", "defined", "isexists", "isdefined",
+                "akeys", "avals", "skeys", "svals", "each",
+                "delete", "slice", "hstore_to_json", "hstore_to_jsonb",
+                "hstore_to_json_loose", "hstore_to_jsonb_loose",
+                "hstore_to_array", "hstore_to_matrix", "populate_record").contains(name);
     }
 
     /**

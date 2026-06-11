@@ -1876,23 +1876,23 @@ class FunctionEvaluator {
             case "skeys":
             case "svals":
             case "each": {
-                // These are set-returning functions — they work in FROM clauses via FromFunctionResolver.
-                // When called as scalar (not in FROM), return null for empty or first value.
+                // These are set-returning functions — they work in FROM clauses via FromFunctionResolver,
+                // and in SELECT target list via SRF expansion (returning a List).
                 requireExtension("hstore", name, fn.args().size());
                 Object val = executor.evalExpr(fn.args().get(0), ctx);
                 if (val == null) return null;
                 HstoreValue h = toHstore(val);
                 if (name.equals("skeys")) {
-                    List<String> keys = h.keys();
-                    return keys.isEmpty() ? null : keys.get(0);
+                    return new ArrayList<>(h.keys());
                 } else if (name.equals("svals")) {
-                    List<String> vals = h.values();
-                    return vals.isEmpty() ? null : vals.get(0);
+                    return new ArrayList<>(h.values());
                 } else {
-                    // each: first key-value pair
-                    if (h.size() == 0) return null;
-                    java.util.Map.Entry<String, String> first = h.getData().entrySet().iterator().next();
-                    return "(" + first.getKey() + "," + (first.getValue() != null ? first.getValue() : "") + ")";
+                    // each: list of key-value pairs
+                    List<String> pairs = new ArrayList<>();
+                    for (java.util.Map.Entry<String, String> e : h.getData().entrySet()) {
+                        pairs.add("(" + e.getKey() + "," + (e.getValue() != null ? e.getValue() : "") + ")");
+                    }
+                    return pairs;
                 }
             }
             case "exist":

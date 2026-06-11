@@ -543,6 +543,10 @@ class CastEvaluator {
                 return inetStr;
             }
             case "hstore":
+                if (!executor.database.hasExtension("hstore")) {
+                    throw new MemgresException("type \"hstore\" does not exist\n"
+                            + "  Hint: You need to install the hstore extension: CREATE EXTENSION hstore;", "42704");
+                }
                 if (val instanceof HstoreValue) return val;
                 return HstoreValue.parse(val.toString());
             case "macaddr":

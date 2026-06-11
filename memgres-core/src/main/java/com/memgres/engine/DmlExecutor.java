@@ -1843,9 +1843,16 @@ class DmlExecutor {
             Column c = table.getColumns().get(j);
             if (c.isGenerated()) continue;
             Object val = row[j];
-            String replacement = val == null ? "NULL"
-                    : (val instanceof Number || val instanceof Boolean) ? val.toString()
-                    : "'" + val.toString().replace("'", "''") + "'";
+            String replacement;
+            if (val == null) {
+                replacement = "NULL";
+            } else if (val instanceof Number || val instanceof Boolean) {
+                replacement = val.toString();
+            } else if (val instanceof HstoreValue) {
+                replacement = "'" + val.toString().replace("'", "''") + "'::hstore";
+            } else {
+                replacement = "'" + val.toString().replace("'", "''") + "'";
+            }
             sql = sql.replaceAll("(?i)\\b" + java.util.regex.Pattern.quote(c.getName()) + "\\b", replacement);
         }
         try {

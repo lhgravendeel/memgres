@@ -320,6 +320,12 @@ class DdlExecutor {
         } else {
             dataType = DataType.fromPgName(baseType);
         }
+
+        // Extension-gated types: hstore requires CREATE EXTENSION hstore
+        if (dataType == DataType.HSTORE && !executor.database.hasExtension("hstore")) {
+            throw new MemgresException("type \"hstore\" does not exist\n"
+                    + "  Hint: You need to install the hstore extension: CREATE EXTENSION hstore;", "42704");
+        }
         // FLOAT(p): p <= 24 -> REAL, p >= 25 -> DOUBLE PRECISION
         if (baseType.equalsIgnoreCase("float") && precision != null && precision <= 24) {
             dataType = DataType.REAL;

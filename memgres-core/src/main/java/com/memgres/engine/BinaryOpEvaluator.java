@@ -1794,6 +1794,40 @@ class BinaryOpEvaluator {
                 String simPattern = similarToRegexForBinaryOp(right.toString(), "\\");
                 return left.toString().matches("(?s)" + simPattern);
             }
+            case JSON_ARROW: {
+                if (left == null || right == null) return null;
+                if (left instanceof HstoreValue && right instanceof List) {
+                    HstoreValue h = (HstoreValue) left;
+                    java.util.List<String> result = new java.util.ArrayList<>();
+                    for (Object k : (java.util.List<?>) right) {
+                        result.add(k != null ? h.get(k.toString()) : null);
+                    }
+                    return result;
+                }
+                if (left instanceof HstoreValue) {
+                    return ((HstoreValue) left).get(right.toString());
+                }
+                // Object key access on JSON string
+                String json = left.toString().trim();
+                String key = right.toString();
+                return executor.functionEvaluator.extractJsonKey(json, key);
+            }
+            case JSON_ARROW_TEXT: {
+                if (left == null || right == null) return null;
+                if (left instanceof HstoreValue) {
+                    return ((HstoreValue) left).get(right.toString());
+                }
+                // json ->> key (returns text)
+                String jsonStr = left.toString().trim();
+                Object extracted = executor.functionEvaluator.extractJsonKey(jsonStr, right.toString());
+                if (extracted == null) return null;
+                String s = extracted.toString();
+                // Strip surrounding quotes for string values
+                if (s.startsWith("\"") && s.endsWith("\"")) {
+                    s = s.substring(1, s.length() - 1);
+                }
+                return s;
+            }
             default:
                 return null;
         }
