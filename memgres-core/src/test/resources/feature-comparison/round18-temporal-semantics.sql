@@ -140,3 +140,40 @@ SELECT left('abcdef', -2) AS v;
 -- row: cdef
 -- end-expected
 SELECT right('abcdef', -2) AS v;
+
+-- ============================================================================
+-- SECTION Y5: Timestamptz literal with space before timezone offset
+-- ============================================================================
+
+-- 15. Space before positive offset
+-- begin-expected
+-- columns: ok
+-- row: t
+-- end-expected
+SELECT '2025-04-04 12:51:20.785753 +00:00'::timestamptz = '2025-04-04 12:51:20.785753+00:00'::timestamptz AS ok;
+
+-- 16. Space before negative offset
+-- begin-expected
+-- columns: ok
+-- row: t
+-- end-expected
+SELECT '2025-04-04 12:51:20.785753 -05:00'::timestamptz = '2025-04-04 12:51:20.785753-05:00'::timestamptz AS ok;
+
+-- 17. Multiple spaces before offset
+-- begin-expected
+-- columns: ok
+-- row: t
+-- end-expected
+SELECT '2025-04-04 12:51:20.785753   +00:00'::timestamptz = '2025-04-04 12:51:20.785753+00:00'::timestamptz AS ok;
+
+-- 18. Insert with space-before-offset into timestamptz column
+CREATE TABLE ren_ts_space_test (id int, ts timestamptz NOT NULL DEFAULT now());
+INSERT INTO ren_ts_space_test(id, ts) VALUES (1, '2025-04-04 12:51:20.785753 +00:00');
+
+-- begin-expected
+-- columns: ok
+-- row: t
+-- end-expected
+SELECT ts = '2025-04-04 12:51:20.785753+00'::timestamptz AS ok FROM ren_ts_space_test WHERE id = 1;
+
+DROP TABLE ren_ts_space_test;

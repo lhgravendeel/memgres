@@ -699,10 +699,107 @@ public final class TypeCoercion {
             DateTimeFormatter.ofPattern("dd-MM-yyyy"),
     };
 
+    // Additional date formats with named months
+    private static final DateTimeFormatter[] NAMED_MONTH_FORMATS = {
+            DateTimeFormatter.ofPattern("MMMM d, yyyy", java.util.Locale.ENGLISH),  // January 8, 1999
+            DateTimeFormatter.ofPattern("MMM d, yyyy", java.util.Locale.ENGLISH),    // Jan 8, 1999
+            DateTimeFormatter.ofPattern("yyyy-MMM-dd", java.util.Locale.ENGLISH),    // 1999-Jan-08
+            DateTimeFormatter.ofPattern("dd-MMM-yyyy", java.util.Locale.ENGLISH),    // 08-Jan-1999
+            DateTimeFormatter.ofPattern("MMM dd yyyy", java.util.Locale.ENGLISH),    // Jan 08 1999
+    };
+
+    // Julian Day Number epoch: November 24, 4714 BC in proleptic Gregorian = JD 0
+    private static final long JULIAN_EPOCH_JD = 1721426L; // JD of 0001-01-01
+
+    private static LocalDate julianDayToDate(long jd) {
+        // Convert Julian Day Number to LocalDate
+        // JD 2451545 = 2000-01-01
+        // Use the known reference: JD 2451545 = 2000-01-01
+        long daysDiff = jd - 2451545L;
+        return LocalDate.of(2000, 1, 1).plusDays(daysDiff);
+    }
+
+    /**
+     * Replace only the first space (date-time separator) with 'T', preserving
+     * spaces before timezone offsets. Handles: "YYYY-MM-DD HH:MM:SS +05:00"
+     */
+    private static String replaceDateTimeSeparator(String s) {
+        // Find the space between date and time parts (after YYYY-MM-DD)
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "^(\\d{4}-\\d{2}-\\d{2}) (\\d)"
+        ).matcher(s);
+        if (m.find()) {
+            return s.substring(0, m.start(1) + 10) + "T" + s.substring(m.start(2));
+        }
+        return s;
+    }
+
+    /**
+     * Normalize a timezone offset string that may use compact +HHMM format
+     * or have a space before the offset. Converts to standard +HH:MM format.
+     */
+    private static String normalizeTimezoneOffset(String s) {
+        // Handle space before offset: "2024-01-08T04:05:06 +00:00" -> "2024-01-08T04:05:06+00:00"
+        s = s.replaceAll("\\s+([+-]\\d)", "$1");
+        // Handle +HHMM (4-digit offset without colon): "...+0530" -> "...+05:30"
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "([+-])(\\d{2})(\\d{2})$"
+        ).matcher(s);
+        if (m.find()) {
+            s = s.substring(0, m.start()) + m.group(1) + m.group(2) + ":" + m.group(3);
+        }
+        return s;
+    }
+
+    /**
+     * Map of common timezone abbreviations to their UTC offsets.
+     * PG has a much larger list; we cover the most common ones.
+     */
+    private static final java.util.Map<String, String> TZ_ABBREVIATIONS = new java.util.HashMap<>();
+    static {
+        TZ_ABBREVIATIONS.put("UTC", "+00:00");
+        TZ_ABBREVIATIONS.put("GMT", "+00:00");
+        TZ_ABBREVIATIONS.put("Z", "+00:00");
+        TZ_ABBREVIATIONS.put("EST", "-05:00");
+        TZ_ABBREVIATIONS.put("EDT", "-04:00");
+        TZ_ABBREVIATIONS.put("CST", "-06:00");
+        TZ_ABBREVIATIONS.put("CDT", "-05:00");
+        TZ_ABBREVIATIONS.put("MST", "-07:00");
+        TZ_ABBREVIATIONS.put("MDT", "-06:00");
+        TZ_ABBREVIATIONS.put("PST", "-08:00");
+        TZ_ABBREVIATIONS.put("PDT", "-07:00");
+        TZ_ABBREVIATIONS.put("HST", "-10:00");
+        TZ_ABBREVIATIONS.put("AKST", "-09:00");
+        TZ_ABBREVIATIONS.put("AKDT", "-08:00");
+        TZ_ABBREVIATIONS.put("AST", "-04:00");
+        TZ_ABBREVIATIONS.put("NST", "-03:30");
+        TZ_ABBREVIATIONS.put("NDT", "-02:30");
+        TZ_ABBREVIATIONS.put("CET", "+01:00");
+        TZ_ABBREVIATIONS.put("CEST", "+02:00");
+        TZ_ABBREVIATIONS.put("EET", "+02:00");
+        TZ_ABBREVIATIONS.put("EEST", "+03:00");
+        TZ_ABBREVIATIONS.put("WET", "+00:00");
+        TZ_ABBREVIATIONS.put("WEST", "+01:00");
+        TZ_ABBREVIATIONS.put("IST", "+05:30");
+        TZ_ABBREVIATIONS.put("JST", "+09:00");
+        TZ_ABBREVIATIONS.put("KST", "+09:00");
+        TZ_ABBREVIATIONS.put("CST6CDT", "-06:00");
+        TZ_ABBREVIATIONS.put("AEST", "+10:00");
+        TZ_ABBREVIATIONS.put("AEDT", "+11:00");
+        TZ_ABBREVIATIONS.put("ACST", "+09:30");
+        TZ_ABBREVIATIONS.put("ACDT", "+10:30");
+        TZ_ABBREVIATIONS.put("AWST", "+08:00");
+        TZ_ABBREVIATIONS.put("NZST", "+12:00");
+        TZ_ABBREVIATIONS.put("NZDT", "+13:00");
+    }
+
     public static Object toLocalDateOrBc(Object val) {
         if (val instanceof String) {
             String s = (String) val;
             String trimmed = s.trim();
+            // Handle date infinity/negative infinity
+            if (trimmed.equalsIgnoreCase("infinity")) return "infinity";
+            if (trimmed.equalsIgnoreCase("-infinity")) return "-infinity";
             if (trimmed.toUpperCase().endsWith(" BC")) {
                 // Parse the date part and return with BC suffix
                 String datePart = trimmed.substring(0, trimmed.length() - 3).trim();
@@ -722,14 +819,41 @@ public final class TypeCoercion {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalDate();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toLocalDate();
         String s = val.toString().trim();
+        // Handle special keywords
+        switch (s.toLowerCase()) {
+            case "epoch": return LocalDate.of(1970, 1, 1);
+            case "today": return LocalDate.now();
+            case "yesterday": return LocalDate.now().minusDays(1);
+            case "tomorrow": return LocalDate.now().plusDays(1);
+            case "infinity": case "-infinity":
+                throw new MemgresException("date out of range", "22008");
+        }
         // Reject year 0000 - PostgreSQL has no year zero
         if (s.startsWith("0000-")) {
             throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
+        }
+        // Julian day format: J2451545
+        if (s.length() > 1 && (s.charAt(0) == 'J' || s.charAt(0) == 'j') && s.substring(1).matches("\\d+")) {
+            long jd = Long.parseLong(s.substring(1));
+            return julianDayToDate(jd);
+        }
+        // Compact YYYYMMDD format (exactly 8 digits)
+        if (s.matches("\\d{8}")) {
+            try {
+                return LocalDate.parse(s, DateTimeFormatter.BASIC_ISO_DATE);
+            } catch (DateTimeParseException e) { /* fall through */ }
         }
         for (DateTimeFormatter fmt : DATE_FORMATS) {
             try {
                 LocalDate d = LocalDate.parse(s, fmt);
                 if (d.getYear() == 0) throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
+                return d;
+            } catch (DateTimeParseException e) { /* try next */ }
+        }
+        // Try named month formats
+        for (DateTimeFormatter fmt : NAMED_MONTH_FORMATS) {
+            try {
+                LocalDate d = LocalDate.parse(s, fmt);
                 return d;
             } catch (DateTimeParseException e) { /* try next */ }
         }
@@ -753,6 +877,9 @@ public final class TypeCoercion {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalTime();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toLocalTime();
         String s = val.toString().trim();
+        // Handle special keywords
+        if (s.equalsIgnoreCase("allballs")) return LocalTime.MIDNIGHT;
+        if (s.equalsIgnoreCase("now")) return LocalTime.now();
         try { return LocalTime.parse(s); } catch (DateTimeParseException e) {
             // Try parsing as time with timezone offset (e.g., "10:30:00+02")
             try {
@@ -974,8 +1101,16 @@ public final class TypeCoercion {
         // Handle PG 'infinity' / '-infinity' special values
         if (s.equalsIgnoreCase("infinity")) return TIMESTAMP_INFINITY;
         if (s.equalsIgnoreCase("-infinity")) return TIMESTAMP_NEG_INFINITY;
-        // Handle "YYYY-MM-DD HH:MM:SS" (space instead of T)
-        s = s.replace(' ', 'T');
+        // Handle special keywords
+        if (s.equalsIgnoreCase("epoch")) return LocalDateTime.of(1970, 1, 1, 0, 0, 0);
+        if (s.equalsIgnoreCase("now")) return LocalDateTime.now();
+        if (s.equalsIgnoreCase("today")) return LocalDate.now().atStartOfDay();
+        if (s.equalsIgnoreCase("yesterday")) return LocalDate.now().minusDays(1).atStartOfDay();
+        if (s.equalsIgnoreCase("tomorrow")) return LocalDate.now().plusDays(1).atStartOfDay();
+        // Handle "YYYY-MM-DD HH:MM:SS" (space instead of T) — only replace the date-time separator
+        s = replaceDateTimeSeparator(s);
+        // Normalize timezone offset in case there's a space before it or compact +HHMM
+        s = normalizeTimezoneOffset(s);
         try { return LocalDateTime.parse(s); } catch (DateTimeParseException e) { /* try more */ }
         // Try date-only
         try { return LocalDate.parse(s).atStartOfDay(); } catch (DateTimeParseException e) { /* try more */ }
@@ -990,19 +1125,37 @@ public final class TypeCoercion {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).atZone(ZoneId.systemDefault()).toOffsetDateTime();
         if (val instanceof LocalDate) return ((LocalDate) val).atStartOfDay(ZoneId.systemDefault()).toOffsetDateTime();
         String s = val.toString().trim();
-        // Try named timezone: "2024-01-01 13:00:00 Europe/Amsterdam"
+        // Handle special keywords
+        if (s.equalsIgnoreCase("epoch")) return OffsetDateTime.of(1970, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
+        if (s.equalsIgnoreCase("now")) return OffsetDateTime.now();
+        if (s.equalsIgnoreCase("today")) return LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toOffsetDateTime();
+        if (s.equalsIgnoreCase("yesterday")) return LocalDate.now().minusDays(1).atStartOfDay(ZoneId.systemDefault()).toOffsetDateTime();
+        if (s.equalsIgnoreCase("tomorrow")) return LocalDate.now().plusDays(1).atStartOfDay(ZoneId.systemDefault()).toOffsetDateTime();
+        if (s.equalsIgnoreCase("infinity")) return OffsetDateTime.of(TIMESTAMP_INFINITY, ZoneOffset.UTC);
+        if (s.equalsIgnoreCase("-infinity")) return OffsetDateTime.of(TIMESTAMP_NEG_INFINITY, ZoneOffset.UTC);
+        // Try named timezone region or abbreviation: "2024-01-01 13:00:00 Europe/Amsterdam" or "... PST"
         java.util.regex.Matcher tzMatcher = java.util.regex.Pattern
-                .compile("^(\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2})\\s+([A-Za-z][A-Za-z0-9_/+-]+)$")
+                .compile("^(\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?)\\s+([A-Za-z][A-Za-z0-9_/+-]*)$")
                 .matcher(s);
         if (tzMatcher.matches()) {
+            String dtPart = replaceDateTimeSeparator(tzMatcher.group(1));
+            String tzName = tzMatcher.group(2);
+            // Try timezone abbreviation first
+            String abbrevOffset = TZ_ABBREVIATIONS.get(tzName.toUpperCase());
+            if (abbrevOffset != null) {
+                try {
+                    return OffsetDateTime.parse(dtPart + abbrevOffset);
+                } catch (Exception ignore) { /* fall through */ }
+            }
+            // Try as ZoneId region
             try {
-                String dtPart = tzMatcher.group(1).replace(' ', 'T');
-                String tzName = tzMatcher.group(2);
                 java.time.ZoneId zone = java.time.ZoneId.of(tzName);
                 return LocalDateTime.parse(dtPart).atZone(zone).toOffsetDateTime();
             } catch (Exception ignore) { /* fall through */ }
         }
-        s = s.replace(' ', 'T');
+        // Replace only the date-time separator space, normalize offset format
+        s = replaceDateTimeSeparator(s);
+        s = normalizeTimezoneOffset(s);
         try { return OffsetDateTime.parse(s); } catch (DateTimeParseException e) { /* try more */ }
         try { return LocalDateTime.parse(s).atZone(ZoneId.systemDefault()).toOffsetDateTime(); } catch (DateTimeParseException e) { /* try more */ }
         try { return LocalDate.parse(s).atStartOfDay(ZoneId.systemDefault()).toOffsetDateTime(); } catch (DateTimeParseException e) { /* ignore */ }

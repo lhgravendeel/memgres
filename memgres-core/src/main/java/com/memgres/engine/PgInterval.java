@@ -112,6 +112,27 @@ public class PgInterval implements Comparable<PgInterval> {
         }
         String s = input.trim();
 
+        // Try ISO 8601 duration format: P[nY][nM][nD][T[nH][nM][nS]]
+        if (s.startsWith("P") || s.startsWith("p")) {
+            Matcher iso = java.util.regex.Pattern.compile(
+                    "^[Pp](?:(\\d+)[Yy])?(?:(\\d+)[Mm])?(?:(\\d+)[Ww])?(?:(\\d+)[Dd])?" +
+                    "(?:[Tt](?:(\\d+)[Hh])?(?:(\\d+)[Mm])?(?:(\\d+(?:\\.\\d+)?)[Ss])?)?$"
+            ).matcher(s);
+            if (iso.matches()) {
+                int years = iso.group(1) != null ? Integer.parseInt(iso.group(1)) : 0;
+                int mons = iso.group(2) != null ? Integer.parseInt(iso.group(2)) : 0;
+                int weeks = iso.group(3) != null ? Integer.parseInt(iso.group(3)) : 0;
+                int days = iso.group(4) != null ? Integer.parseInt(iso.group(4)) : 0;
+                int hours = iso.group(5) != null ? Integer.parseInt(iso.group(5)) : 0;
+                int minutes = iso.group(6) != null ? Integer.parseInt(iso.group(6)) : 0;
+                double seconds = iso.group(7) != null ? Double.parseDouble(iso.group(7)) : 0;
+                days += weeks * 7;
+                int totalMonths = years * 12 + mons;
+                long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(seconds * 1_000_000L);
+                return new PgInterval(totalMonths, days, totalMicros);
+            }
+        }
+
         // Try verbose format first: '1 year 2 months 3 weeks 3 days 4 hours 5 minutes 6 seconds'
         Matcher vm = VERBOSE_INTERVAL.matcher(s);
         if (vm.matches() && !s.isEmpty()) {

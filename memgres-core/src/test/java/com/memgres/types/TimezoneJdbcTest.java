@@ -410,4 +410,38 @@ class TimezoneJdbcTest {
         String clockType = scalar("SELECT pg_typeof(clock_timestamp())::text");
         assertEquals("timestamp with time zone", clockType);
     }
+
+    // --- 15. Timestamptz literal with space before offset ---
+
+    @Test void timestamptz_space_before_offset() throws Exception {
+        exec("SET TimeZone = 'UTC'");
+        // PG accepts a space between the time and the timezone offset
+        assertEquals("2025-04-04 12:51:20.785753+00",
+                scalar("SELECT '2025-04-04 12:51:20.785753 +00:00'::timestamptz::text"));
+    }
+
+    @Test void timestamptz_space_before_negative_offset() throws Exception {
+        exec("SET TimeZone = 'UTC'");
+        assertEquals("2025-04-04 17:51:20.785753+00",
+                scalar("SELECT '2025-04-04 12:51:20.785753 -05:00'::timestamptz::text"));
+    }
+
+    @Test void timestamptz_no_space_before_offset() throws Exception {
+        exec("SET TimeZone = 'UTC'");
+        // Without space — this already works
+        assertEquals("2025-04-04 12:51:20.785753+00",
+                scalar("SELECT '2025-04-04 12:51:20.785753+00:00'::timestamptz::text"));
+    }
+
+    @Test void timestamptz_insert_with_space_before_offset() throws Exception {
+        exec("SET TimeZone = 'UTC'");
+        exec("CREATE TABLE tz_space_offset(id int, ts timestamptz NOT NULL DEFAULT now())");
+        try {
+            exec("INSERT INTO tz_space_offset(id, ts) VALUES (1, '2025-04-04 12:51:20.785753 +00:00')");
+            assertEquals("2025-04-04 12:51:20.785753+00",
+                    scalar("SELECT ts::text FROM tz_space_offset WHERE id = 1"));
+        } finally {
+            exec("DROP TABLE tz_space_offset");
+        }
+    }
 }
