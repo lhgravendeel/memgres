@@ -642,4 +642,35 @@ class HstoreEdgeCaseTest {
             exec("DROP TABLE IF EXISTS hs_ec_e2");
         }
     }
+
+    // =========================================================================
+    // P. Coverage probes — previously untested corner cases
+    // =========================================================================
+
+    @Test
+    void akeys_empty_hstore_returns_empty_array() throws SQLException {
+        assertEquals("{}", str("SELECT akeys(''::hstore)::text"));
+    }
+
+    @Test
+    void avals_empty_hstore_returns_empty_array() throws SQLException {
+        assertEquals("{}", str("SELECT avals(''::hstore)::text"));
+    }
+
+    @Test
+    void window_function_cumulative_sum_over_hstore_arrow() throws SQLException {
+        exec("CREATE TABLE hs_probe_win (id serial primary key, data hstore)");
+        exec("INSERT INTO hs_probe_win (data) VALUES ('score=>10, team=>a'), ('score=>20, team=>a'), ('score=>30, team=>b')");
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery(
+                 "SELECT id, sum((data->'score')::int) OVER (PARTITION BY data->'team' ORDER BY id) as cum_sum "
+               + "FROM hs_probe_win ORDER BY id")) {
+            assertTrue(rs.next()); assertEquals(1, rs.getInt(1)); assertEquals(10, rs.getInt(2));
+            assertTrue(rs.next()); assertEquals(2, rs.getInt(1)); assertEquals(30, rs.getInt(2));
+            assertTrue(rs.next()); assertEquals(3, rs.getInt(1)); assertEquals(30, rs.getInt(2));
+            assertFalse(rs.next());
+        } finally {
+            exec("DROP TABLE hs_probe_win");
+        }
+    }
 }
