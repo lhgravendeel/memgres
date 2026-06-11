@@ -405,19 +405,20 @@ public interface PlpgsqlStatement {
 
         public static final class ForQueryStmt implements PlpgsqlStatement {
         public final String label;
-        public final String varName;
+        public final List<String> varNames;
         public final String sql;
         public final List<PlpgsqlStatement> body;
 
-        public ForQueryStmt(String label, String varName, String sql, List<PlpgsqlStatement> body) {
+        public ForQueryStmt(String label, List<String> varNames, String sql, List<PlpgsqlStatement> body) {
             this.label = label;
-            this.varName = varName;
+            this.varNames = varNames;
             this.sql = sql;
             this.body = body;
         }
 
         public String label() { return label; }
-        public String varName() { return varName; }
+        public String varName() { return varNames.get(0); }
+        public List<String> varNames() { return varNames; }
         public String sql() { return sql; }
         public List<PlpgsqlStatement> body() { return body; }
 
@@ -427,19 +428,19 @@ public interface PlpgsqlStatement {
             if (o == null || getClass() != o.getClass()) return false;
             ForQueryStmt that = (ForQueryStmt) o;
             return java.util.Objects.equals(label, that.label)
-                && java.util.Objects.equals(varName, that.varName)
+                && java.util.Objects.equals(varNames, that.varNames)
                 && java.util.Objects.equals(sql, that.sql)
                 && java.util.Objects.equals(body, that.body);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(label, varName, sql, body);
+            return java.util.Objects.hash(label, varNames, sql, body);
         }
 
         @Override
         public String toString() {
-            return "ForQueryStmt[label=" + label + ", " + "varName=" + varName + ", " + "sql=" + sql + ", " + "body=" + body + "]";
+            return "ForQueryStmt[label=" + label + ", " + "varNames=" + varNames + ", " + "sql=" + sql + ", " + "body=" + body + "]";
         }
     }
 
@@ -1148,28 +1149,29 @@ public interface PlpgsqlStatement {
     /** FOR rec IN EXECUTE 'sql' [USING expr, ...] LOOP ... END LOOP */
     public static final class ForExecuteStmt implements PlpgsqlStatement {
         public final String label;
-        public final String varName;
+        public final List<String> varNames;
         public final String sqlExpr;
         public final List<String> usingExprs;
         public final List<PlpgsqlStatement> body;
 
-        public ForExecuteStmt(String label, String varName, String sqlExpr, List<String> usingExprs, List<PlpgsqlStatement> body) {
+        public ForExecuteStmt(String label, List<String> varNames, String sqlExpr, List<String> usingExprs, List<PlpgsqlStatement> body) {
             this.label = label;
-            this.varName = varName;
+            this.varNames = varNames;
             this.sqlExpr = sqlExpr;
             this.usingExprs = usingExprs;
             this.body = body;
         }
 
         public String label() { return label; }
-        public String varName() { return varName; }
+        public String varName() { return varNames.get(0); }
+        public List<String> varNames() { return varNames; }
         public String sqlExpr() { return sqlExpr; }
         public List<String> usingExprs() { return usingExprs; }
         public List<PlpgsqlStatement> body() { return body; }
 
         @Override
         public String toString() {
-            return "ForExecuteStmt[label=" + label + ", varName=" + varName + ", sqlExpr=" + sqlExpr + ", usingExprs=" + usingExprs + "]";
+            return "ForExecuteStmt[label=" + label + ", varNames=" + varNames + ", sqlExpr=" + sqlExpr + ", usingExprs=" + usingExprs + "]";
         }
     }
 

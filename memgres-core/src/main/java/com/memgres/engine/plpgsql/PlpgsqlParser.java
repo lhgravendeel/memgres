@@ -394,7 +394,12 @@ public class PlpgsqlParser {
 
     private PlpgsqlStatement parseFor(String label) {
         matchKw("FOR");
-        String varName = readIdent();
+        // Read comma-separated loop variable names (PG supports FOR k, v IN ...)
+        List<String> varNames = new ArrayList<>();
+        varNames.add(readIdent());
+        while (match(TokenType.COMMA)) {
+            varNames.add(readIdent());
+        }
         matchKw("IN");
 
         boolean reverse = matchKw("REVERSE");
@@ -413,7 +418,7 @@ public class PlpgsqlParser {
             matchKw("END");
             matchKw("LOOP");
             match(TokenType.SEMICOLON);
-            return new PlpgsqlStatement.ForStmt(label, varName, lower, upper, step, reverse, body);
+            return new PlpgsqlStatement.ForStmt(label, varNames.get(0), lower, upper, step, reverse, body);
         } else if (checkKw("EXECUTE")) {
             // FOR rec IN EXECUTE 'sql' [USING expr, ...] LOOP ... END LOOP
             matchKw("EXECUTE");
@@ -429,7 +434,7 @@ public class PlpgsqlParser {
             matchKw("END");
             matchKw("LOOP");
             match(TokenType.SEMICOLON);
-            return new PlpgsqlStatement.ForExecuteStmt(label, varName, sqlExpr, usingExprs, body);
+            return new PlpgsqlStatement.ForExecuteStmt(label, varNames, sqlExpr, usingExprs, body);
         } else {
             String sql = collectUntilKeyword("LOOP");
             matchKw("LOOP");
@@ -437,7 +442,7 @@ public class PlpgsqlParser {
             matchKw("END");
             matchKw("LOOP");
             match(TokenType.SEMICOLON);
-            return new PlpgsqlStatement.ForQueryStmt(label, varName, sql, body);
+            return new PlpgsqlStatement.ForQueryStmt(label, varNames, sql, body);
         }
     }
 

@@ -174,20 +174,21 @@ BEGIN
 END;
 $$;
 
--- C2b. Same function with renamed parameter (additions instead of overlay)
+-- C2b. Multi-variable FOR loop with each() — FOR k, v IN SELECT * FROM each(h)
 CREATE OR REPLACE FUNCTION hs_noext.hstore_merge_with_prefix(base hstore, additions hstore, prefix text)
 RETURNS hstore LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE
     result hstore;
     k text;
+    v text;
 BEGIN
     result := base;
-    FOR k IN SELECT skeys(additions)
+    FOR k, v IN SELECT * FROM each(additions)
     LOOP
         IF exist(base, k) THEN
-            result := result || hstore(prefix || k, additions->k);
+            result := result || hstore(prefix || k, v);
         ELSE
-            result := result || hstore(k, additions->k);
+            result := result || hstore(k, v);
         END IF;
     END LOOP;
     RETURN result;

@@ -919,17 +919,28 @@ public class PlpgsqlExecutor {
         String sql = substituteVariables(stmt.sql(), scope);
         QueryResult result = astExecutor.execute(sql);
 
-        scope.declare(stmt.varName(), null);
+        List<String> varNames = stmt.varNames();
+        boolean multiVar = varNames.size() > 1;
+        for (String vn : varNames) {
+            scope.declare(vn, null);
+        }
         boolean anyIteration = false;
 
         for (Object[] row : result.getRows()) {
             anyIteration = true;
-            // Always create a record (Map) so that field access (r.col) works, matching PG behavior
-            Map<String, Object> record = new LinkedHashMap<>();
-            for (int i = 0; i < result.getColumns().size(); i++) {
-                record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
+            if (multiVar) {
+                // Destructure columns into individual scalar variables
+                for (int i = 0; i < varNames.size(); i++) {
+                    scope.set(varNames.get(i), i < row.length ? row[i] : null);
+                }
+            } else {
+                // Single variable — always create a record (Map) so that field access (r.col) works
+                Map<String, Object> record = new LinkedHashMap<>();
+                for (int i = 0; i < result.getColumns().size(); i++) {
+                    record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
+                }
+                scope.set(varNames.get(0), record);
             }
-            scope.set(stmt.varName(), record);
             try {
                 executeStatements(stmt.body(), scope);
             } catch (ExitSignal e) {
@@ -960,16 +971,26 @@ public class PlpgsqlExecutor {
 
         QueryResult result = astExecutor.execute(sql);
 
-        scope.declare(stmt.varName(), null);
+        List<String> varNames = stmt.varNames();
+        boolean multiVar = varNames.size() > 1;
+        for (String vn : varNames) {
+            scope.declare(vn, null);
+        }
         boolean anyIteration = false;
 
         for (Object[] row : result.getRows()) {
             anyIteration = true;
-            Map<String, Object> record = new LinkedHashMap<>();
-            for (int i = 0; i < result.getColumns().size(); i++) {
-                record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
+            if (multiVar) {
+                for (int i = 0; i < varNames.size(); i++) {
+                    scope.set(varNames.get(i), i < row.length ? row[i] : null);
+                }
+            } else {
+                Map<String, Object> record = new LinkedHashMap<>();
+                for (int i = 0; i < result.getColumns().size(); i++) {
+                    record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
+                }
+                scope.set(varNames.get(0), record);
             }
-            scope.set(stmt.varName(), record);
             try {
                 executeStatements(stmt.body(), scope);
             } catch (ExitSignal e) {

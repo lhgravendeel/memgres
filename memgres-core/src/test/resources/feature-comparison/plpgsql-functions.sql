@@ -532,6 +532,33 @@ $$;
 SELECT fn_for_query() AS result;
 
 -- ============================================================================
+-- 23b. PL/pgSQL control flow: FOR with multiple loop variables
+-- ============================================================================
+
+CREATE TABLE fn_kv_data (k text, v int);
+INSERT INTO fn_kv_data VALUES ('x', 10), ('y', 20), ('z', 30);
+
+CREATE FUNCTION fn_for_multi_var() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  result text := '';
+  k text;
+  v int;
+BEGIN
+  FOR k, v IN SELECT fn_kv_data.k, fn_kv_data.v FROM fn_kv_data ORDER BY fn_kv_data.k LOOP
+    IF result <> '' THEN result := result || ','; END IF;
+    result := result || k || '=' || v;
+  END LOOP;
+  RETURN result;
+END;
+$$;
+
+-- begin-expected
+-- columns: result
+-- row: x=10,y=20,z=30
+-- end-expected
+SELECT fn_for_multi_var() AS result;
+
+-- ============================================================================
 -- 24. PL/pgSQL control flow: FOREACH over array
 -- ============================================================================
 
