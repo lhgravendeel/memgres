@@ -7,7 +7,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class Sequence {
 
-    private final String name;
+    private String name;
     private long startWith;
     private long incrementBy;
     private long minValue;
@@ -30,6 +30,10 @@ public class Sequence {
 
     public String getName() {
         return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
     }
 
     public synchronized long nextVal() {

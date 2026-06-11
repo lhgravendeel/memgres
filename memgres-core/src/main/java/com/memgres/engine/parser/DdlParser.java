@@ -454,6 +454,39 @@ class DdlParser {
         }
         if (parser.matchKeyword("GROUP")) return roleParser.parseAlterRole();
 
+        if (parser.matchKeyword("MATERIALIZED")) {
+            parser.expectKeyword("VIEW");
+            boolean viewIfExists = parser.matchKeywords("IF", "EXISTS");
+            String viewName = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) viewName = parser.readIdentifier();
+            if (parser.matchKeywords("RENAME", "COLUMN")) {
+                String oldCol = parser.readIdentifier();
+                parser.expectKeyword("TO");
+                String newCol = parser.readIdentifier();
+                // Materialized view column rename — delegate to view rename logic
+                // For now, treat as no-op since matview columns come from the query
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.NO_OP);
+            }
+            if (parser.matchKeywords("RENAME", "TO")) {
+                return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.RENAME_TO);
+            }
+            if (parser.matchKeywords("OWNER", "TO")) {
+                return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.OWNER_TO);
+            }
+            if (parser.matchKeywords("SET", "SCHEMA")) {
+                String newSchema = parser.readIdentifier();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.NO_OP);
+            }
+            if (parser.matchKeyword("SET") && parser.check(TokenType.LEFT_PAREN)) {
+                Map<String, String> opts = parseViewWithOptions();
+                return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.SET_OPTIONS, opts);
+            }
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.NO_OP);
+        }
+
         if (parser.matchKeyword("VIEW")) {
             boolean viewIfExists = parser.matchKeywords("IF", "EXISTS");
             String viewName = parser.readIdentifier();
@@ -1057,6 +1090,9 @@ class DdlParser {
     AlterSequenceStmt parseAlterSequence() {
         String name = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        if (parser.matchKeywords("RENAME", "TO")) {
+            return AlterSequenceStmt.renameTo(name, parser.readIdentifier());
+        }
         boolean restart = false;
         Long restartWith = null;
         Long[] startWith = {null}, incrementBy = {null}, minValue = {null}, maxValue = {null};

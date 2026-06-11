@@ -13,6 +13,31 @@ public final class AlterSequenceStmt implements Statement {
     public final Long startWith;
     public final Boolean cycle;
     public final String ownerTo;
+    public final String renameTo;
+
+    public AlterSequenceStmt(
+            String name,
+            boolean restart,
+            Long restartWith,
+            Long incrementBy,
+            Long minValue,
+            Long maxValue,
+            Long startWith,
+            Boolean cycle,
+            String ownerTo,
+            String renameTo
+    ) {
+        this.name = name;
+        this.restart = restart;
+        this.restartWith = restartWith;
+        this.incrementBy = incrementBy;
+        this.minValue = minValue;
+        this.maxValue = maxValue;
+        this.startWith = startWith;
+        this.cycle = cycle;
+        this.ownerTo = ownerTo;
+        this.renameTo = renameTo;
+    }
 
     public AlterSequenceStmt(
             String name,
@@ -25,25 +50,21 @@ public final class AlterSequenceStmt implements Statement {
             Boolean cycle,
             String ownerTo
     ) {
-        this.name = name;
-        this.restart = restart;
-        this.restartWith = restartWith;
-        this.incrementBy = incrementBy;
-        this.minValue = minValue;
-        this.maxValue = maxValue;
-        this.startWith = startWith;
-        this.cycle = cycle;
-        this.ownerTo = ownerTo;
+        this(name, restart, restartWith, incrementBy, minValue, maxValue, startWith, cycle, ownerTo, null);
     }
 
     /** Backward-compatible constructor without ownerTo. */
     public AlterSequenceStmt(String name, boolean restart, Long restartWith, Long incrementBy,
                              Long minValue, Long maxValue, Long startWith, Boolean cycle) {
-        this(name, restart, restartWith, incrementBy, minValue, maxValue, startWith, cycle, null);
+        this(name, restart, restartWith, incrementBy, minValue, maxValue, startWith, cycle, null, null);
     }
     /** OWNER TO only constructor. */
     public AlterSequenceStmt(String name, String ownerTo) {
-        this(name, false, null, null, null, null, null, null, ownerTo);
+        this(name, false, null, null, null, null, null, null, ownerTo, null);
+    }
+    /** RENAME TO constructor. */
+    public static AlterSequenceStmt renameTo(String name, String newName) {
+        return new AlterSequenceStmt(name, false, null, null, null, null, null, null, null, newName);
     }
 
     public String name() { return name; }
@@ -55,6 +76,7 @@ public final class AlterSequenceStmt implements Statement {
     public Long startWith() { return startWith; }
     public Boolean cycle() { return cycle; }
     public String ownerTo() { return ownerTo; }
+    public String renameTo() { return renameTo; }
 
     @Override
     public boolean equals(Object o) {

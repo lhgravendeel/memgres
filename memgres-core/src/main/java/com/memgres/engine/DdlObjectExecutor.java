@@ -1812,6 +1812,15 @@ class DdlObjectExecutor {
     QueryResult executeAlterSequence(AlterSequenceStmt stmt) {
         Sequence seq = executor.database.getSequence(stmt.name());
         if (seq == null) throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
+        if (stmt.renameTo() != null) {
+            if (executor.database.hasSequence(stmt.renameTo())) {
+                throw new MemgresException("relation \"" + stmt.renameTo() + "\" already exists", "42P07");
+            }
+            executor.database.removeSequence(stmt.name());
+            seq.setName(stmt.renameTo());
+            executor.database.addSequence(seq);
+            return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
+        }
         if (stmt.incrementBy() != null) seq.setIncrementBy(stmt.incrementBy());
         if (stmt.minValue() != null) seq.setMinValue(stmt.minValue());
         if (stmt.maxValue() != null) seq.setMaxValue(stmt.maxValue());
