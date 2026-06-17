@@ -1,7 +1,6 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.*;
-import com.memgres.engine.plpgsql.PlpgsqlExecutor;
 
 import java.util.*;
 
@@ -221,60 +220,4 @@ class DmlConflictHelper {
         return null;
     }
 
-    /**
-     * Evaluate expression in ON CONFLICT DO UPDATE SET context.
-     * Supports "excluded.column" references to the proposed (conflicting) row.
-     */
-    Object evalExprWithExcluded(Expression expr, RowContext ctx, Table table, Object[] excludedRow) {
-        if (expr instanceof ColumnRef && "excluded".equalsIgnoreCase(((ColumnRef) expr).table())) {
-            ColumnRef cr = (ColumnRef) expr;
-            int idx = table.getColumnIndex(cr.column());
-            if (idx >= 0) return excludedRow[idx];
-        }
-        if (expr instanceof BinaryExpr) {
-            BinaryExpr bin = (BinaryExpr) expr;
-            Object left = evalExprWithExcluded(bin.left(), ctx, table, excludedRow);
-            Object right = evalExprWithExcluded(bin.right(), ctx, table, excludedRow);
-            // Re-evaluate using resolved values
-            return executor.evalBinaryValues(bin.op(), left, right);
-        }
-        if (expr instanceof CustomOperatorExpr) {
-            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
-            Object leftVal = cop.left() != null ? evalExprWithExcluded(cop.left(), ctx, table, excludedRow) : null;
-            Object rightVal = evalExprWithExcluded(cop.right(), ctx, table, excludedRow);
-            // Resolve operator and call backing function directly with evaluated values
-            String leftType = cop.left() != null ? AstExecutor.pgTypeNameOf(leftVal) : "NONE";
-            String rightType = AstExecutor.pgTypeNameOf(rightVal);
-            PgOperator pgOp = executor.exprEvaluator.resolveOperator(cop.schema(), cop.opSymbol(), leftType, rightType);
-            if (pgOp == null) {
-                throw new MemgresException(
-                    "operator does not exist: " + leftType + " " + cop.opSymbol() + " " + rightType, "42883");
-            }
-            PgFunction func = executor.database.getFunction(pgOp.getFunction());
-            if (func == null) {
-                throw new MemgresException(
-                    "function " + pgOp.getFunction() + " referenced by operator " + cop.opSymbol() + " does not exist", "42883");
-            }
-            if (func.isStrict()) {
-                if (leftVal == null && cop.left() != null) return null;
-                if (rightVal == null) return null;
-            }
-            List<Object> args = new ArrayList<>();
-            if (cop.left() != null) args.add(leftVal);
-            args.add(rightVal);
-            PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
-            return plExec.executeFunction(func, args);
-        }
-        if (expr instanceof FunctionCallExpr) {
-            FunctionCallExpr fn = (FunctionCallExpr) expr;
-            // Evaluate args with excluded context
-            List<Object> args = new ArrayList<>();
-            for (Expression arg : fn.args()) {
-                args.add(evalExprWithExcluded(arg, ctx, table, excludedRow));
-            }
-            // Delegate to evalFunction with resolved args, but we need to wrap back as literals
-            // Simpler: just eval as normal since function args are typically simple
-        }
-        return executor.evalExpr(expr, ctx);
-    }
 }

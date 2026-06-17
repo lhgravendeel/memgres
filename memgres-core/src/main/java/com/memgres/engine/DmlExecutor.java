@@ -412,11 +412,20 @@ class DmlExecutor {
                         continue;
                     } else if (stmt.onConflict().doUpdate() != null) {
                         // DO UPDATE: update the conflicting row
+                        // Build RowContext with "excluded" binding so the standard expression
+                        // evaluator resolves EXCLUDED.col references for all expression types
+                        Object[] evalConflict = hasVirtualColumns(table) ? computeVirtualColumns(table, conflictRow) : conflictRow;
+                        List<RowContext.TableBinding> conflictBindings = new ArrayList<>();
+                        conflictBindings.add(new RowContext.TableBinding(table, stmt.alias(), evalConflict));
+                        conflictBindings.add(new RowContext.TableBinding(table, "excluded", row));
+                        RowContext conflictCtx = new RowContext(conflictBindings);
+                        Set<String> allCols = new HashSet<>();
+                        for (Column c : table.getColumns()) allCols.add(c.getName().toLowerCase());
+                        conflictCtx.setUsingColumns(allCols);
+
                         // First evaluate the DO UPDATE WHERE clause if present
                         if (stmt.onConflict().doUpdateWhereClause() != null) {
-                            Object[] evalConflictForWhere = hasVirtualColumns(table) ? computeVirtualColumns(table, conflictRow) : conflictRow;
-                            RowContext whereCtx = new RowContext(table, null, evalConflictForWhere);
-                            Object whereResult = conflictHelper.evalExprWithExcluded(stmt.onConflict().doUpdateWhereClause(), whereCtx, table, row);
+                            Object whereResult = executor.evalExpr(stmt.onConflict().doUpdateWhereClause(), conflictCtx);
                             if (!(whereResult instanceof Boolean && ((Boolean) whereResult))) {
                                 // WHERE clause evaluated to false/null: skip the update, keep existing row
                                 if (stmt.returning() != null && !stmt.returning().isEmpty()) {
@@ -429,16 +438,12 @@ class DmlExecutor {
                         Object[] oldRow = Arrays.copyOf(conflictRow, conflictRow.length);
                         Object[] newRow = Arrays.copyOf(conflictRow, conflictRow.length);
                         try {
-                            Object[] evalConflict = hasVirtualColumns(table) ? computeVirtualColumns(table, conflictRow) : conflictRow;
-                            RowContext conflictCtx = new RowContext(table, null, evalConflict);
                             for (InsertStmt.SetClause set : stmt.onConflict().doUpdate()) {
                                 int colIdx = table.getColumnIndex(set.column());
                                 if (colIdx < 0) {
                                     throw new MemgresException("Column not found: " + set.column());
                                 }
-                                // In DO UPDATE SET, "excluded" refers to the proposed row
-                                // We handle this by making the proposed values available
-                                Object val = conflictHelper.evalExprWithExcluded(set.value(), conflictCtx, table, row);
+                                Object val = executor.evalExpr(set.value(), conflictCtx);
                                 newRow[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
                             }
                             computeGeneratedColumns(table, newRow);
