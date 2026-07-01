@@ -1267,7 +1267,47 @@ class DdlParser {
     static String readValueOrMinMax(Parser parser) {
         if (parser.checkKeyword("MINVALUE")) { parser.advance(); return "MINVALUE"; }
         if (parser.checkKeyword("MAXVALUE")) { parser.advance(); return "MAXVALUE"; }
-        return parser.advance().value();
+
+        // Signed numeric literal: -100, +5, -1.5
+        if ((parser.check(TokenType.MINUS) || parser.check(TokenType.PLUS))
+                && parser.pos + 1 < parser.tokens.size()
+                && (parser.tokens.get(parser.pos + 1).type() == TokenType.INTEGER_LITERAL
+                    || parser.tokens.get(parser.pos + 1).type() == TokenType.FLOAT_LITERAL)) {
+            String sign = parser.advance().value();
+            String num = parser.advance().value();
+            skipBoundCast(parser);
+            return sign + num;
+        }
+
+        // Typed literal: DATE '2026-04-01', TIMESTAMP '...'
+        Token cur = parser.peek();
+        Token next = parser.pos + 1 < parser.tokens.size() ? parser.tokens.get(parser.pos + 1) : null;
+        if ((cur.type() == TokenType.KEYWORD || cur.type() == TokenType.IDENTIFIER)
+                && next != null && next.type() == TokenType.STRING_LITERAL) {
+            parser.advance(); // skip the type keyword
+            String value = parser.advance().value();
+            skipBoundCast(parser);
+            return value;
+        }
+
+        // Plain literal with optional cast
+        String value = parser.advance().value();
+        skipBoundCast(parser);
+        return value;
+    }
+
+    private static void skipBoundCast(Parser parser) {
+        if (!parser.match(TokenType.CAST)) return;
+        parser.advance(); // type name
+        while (parser.match(TokenType.DOT)) parser.advance(); // schema.type
+        if (parser.match(TokenType.LEFT_PAREN)) { // varchar(100)
+            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) parser.advance();
+            parser.match(TokenType.RIGHT_PAREN);
+        }
+        while (parser.match(TokenType.LEFT_BRACKET)) { // int[]
+            while (!parser.check(TokenType.RIGHT_BRACKET) && !parser.isAtEnd()) parser.advance();
+            parser.match(TokenType.RIGHT_BRACKET);
+        }
     }
 
     // ---- CREATE OPERATOR ----

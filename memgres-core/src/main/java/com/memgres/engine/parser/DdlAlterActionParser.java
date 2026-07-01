@@ -362,18 +362,26 @@ class DdlAlterActionParser {
                 parser.expect(TokenType.LEFT_PAREN);
                 bounds.add("IN");
                 do {
-                    bounds.add(parser.advance().value());
+                    bounds.add(DdlParser.readValueOrMinMax(parser));
                 } while (parser.match(TokenType.COMMA));
                 parser.expect(TokenType.RIGHT_PAREN);
             } else if (parser.matchKeyword("FROM")) {
                 parser.expect(TokenType.LEFT_PAREN);
                 bounds.add("FROM");
-                bounds.add(DdlParser.readValueOrMinMax(parser));
+                StringBuilder fromVals = new StringBuilder(DdlParser.readValueOrMinMax(parser));
+                while (parser.match(TokenType.COMMA)) {
+                    fromVals.append(", ").append(DdlParser.readValueOrMinMax(parser));
+                }
+                bounds.add(fromVals.toString());
                 parser.expect(TokenType.RIGHT_PAREN);
                 parser.expectKeyword("TO");
                 parser.expect(TokenType.LEFT_PAREN);
                 bounds.add("TO");
-                bounds.add(DdlParser.readValueOrMinMax(parser));
+                StringBuilder toVals = new StringBuilder(DdlParser.readValueOrMinMax(parser));
+                while (parser.match(TokenType.COMMA)) {
+                    toVals.append(", ").append(DdlParser.readValueOrMinMax(parser));
+                }
+                bounds.add(toVals.toString());
                 parser.expect(TokenType.RIGHT_PAREN);
             } else if (parser.matchKeyword("WITH")) {
                 // HASH partition: WITH (MODULUS m, REMAINDER r)

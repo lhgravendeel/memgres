@@ -76,7 +76,7 @@ class DdlTableParser {
                     parser.expect(TokenType.LEFT_PAREN);
                     bounds.add("IN");
                     do {
-                        bounds.add(parser.advance().value());
+                        bounds.add(DdlParser.readValueOrMinMax(parser));
                     } while (parser.match(TokenType.COMMA));
                     parser.expect(TokenType.RIGHT_PAREN);
                 } else if (parser.matchKeyword("WITH")) {
