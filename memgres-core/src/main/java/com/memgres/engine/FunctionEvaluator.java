@@ -478,16 +478,40 @@ class FunctionEvaluator {
                 Object startObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object stopObj = executor.evalExpr(fn.args().get(1), ctx);
                 Object stepObj = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx) : null;
+                // OffsetDateTime (timestamptz) overload
+                if (startObj instanceof java.time.OffsetDateTime) {
+                    java.time.OffsetDateTime tzStart = (java.time.OffsetDateTime) startObj;
+                    java.time.OffsetDateTime tzStop = stopObj instanceof java.time.OffsetDateTime ? (java.time.OffsetDateTime) stopObj
+                            : TypeCoercion.toOffsetDateTime(stopObj);
+                    PgInterval step = stepObj != null ? TypeCoercion.toInterval(stepObj) : new PgInterval(0, 1, 0);
+                    boolean ascending = !tzStart.isAfter(tzStop);
+                    List<Object> result = new ArrayList<>();
+                    java.time.OffsetDateTime cur = tzStart;
+                    for (int i = 0; i < 10000; i++) {
+                        if (ascending ? cur.isAfter(tzStop) : cur.isBefore(tzStop)) break;
+                        result.add(cur);
+                        java.time.OffsetDateTime next = step.addTo(cur);
+                        if (next.isEqual(cur)) break;
+                        cur = next;
+                    }
+                    return result;
+                }
                 // Date/timestamp overload: generate_series(start_date, end_date, interval)
-                if (startObj instanceof LocalDate || startObj instanceof LocalDateTime) {
-                    LocalDateTime start = startObj instanceof LocalDate ? ((LocalDate) startObj).atStartOfDay() : (LocalDateTime) startObj;
+                if (startObj instanceof LocalDate || startObj instanceof LocalDateTime
+                        || (stepObj instanceof PgInterval)) {
+                    boolean dateInput = startObj instanceof LocalDate;
+                    LocalDateTime start = startObj instanceof LocalDate ? ((LocalDate) startObj).atStartOfDay() : TypeCoercion.toLocalDateTime(startObj);
                     LocalDateTime stop = stopObj instanceof LocalDate ? ((LocalDate) stopObj).atStartOfDay() : TypeCoercion.toLocalDateTime(stopObj);
                     PgInterval step = stepObj != null ? TypeCoercion.toInterval(stepObj) : new PgInterval(0, 1, 0);
+                    boolean ascending = !start.isAfter(stop);
                     List<Object> result = new ArrayList<>();
                     LocalDateTime cur = start;
-                    for (int i = 0; i < 10000 && !cur.isAfter(stop); i++) {
-                        result.add(startObj instanceof LocalDate ? cur.toLocalDate() : cur);
-                        cur = step.addTo(cur);
+                    for (int i = 0; i < 10000; i++) {
+                        if (ascending ? cur.isAfter(stop) : cur.isBefore(stop)) break;
+                        result.add(dateInput ? cur.toLocalDate() : cur);
+                        LocalDateTime next = step.addTo(cur);
+                        if (next.isEqual(cur)) break;
+                        cur = next;
                     }
                     return result;
                 }
