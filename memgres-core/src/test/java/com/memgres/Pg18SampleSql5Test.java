@@ -237,20 +237,27 @@ public class Pg18SampleSql5Test {
         public final String sql;
         public final Object expectation;
         public final String pgBugSkip;
+        public final String expectedDivergence;
 
         public ParsedBlock(String sql, Object expectation) {
-            this(sql, expectation, null);
+            this(sql, expectation, null, null);
         }
 
         public ParsedBlock(String sql, Object expectation, String pgBugSkip) {
+            this(sql, expectation, pgBugSkip, null);
+        }
+
+        public ParsedBlock(String sql, Object expectation, String pgBugSkip, String expectedDivergence) {
             this.sql = sql;
             this.expectation = expectation;
             this.pgBugSkip = pgBugSkip;
+            this.expectedDivergence = expectedDivergence;
         }
 
         public String sql() { return sql; }
         public Object expectation() { return expectation; }
         public String pgBugSkip() { return pgBugSkip; }
+        public String expectedDivergence() { return expectedDivergence; }
 
         @Override
         public boolean equals(Object o) {
@@ -342,6 +349,7 @@ public class Pg18SampleSql5Test {
         int i = 0;
         Object pendingExpectation = null;
         String pendingPgBugSkip = null;
+        String pendingExpectedDivergence = null;
 
         while (i < lines.size()) {
             String line = lines.get(i).trim();
@@ -349,6 +357,13 @@ public class Pg18SampleSql5Test {
             // Parse pg-bug skip annotation
             if (line.startsWith("-- pg-bug:")) {
                 pendingPgBugSkip = line.substring("-- pg-bug:".length()).trim();
+                i++;
+                continue;
+            }
+
+            // Parse expected-divergence annotation
+            if (line.startsWith("-- expected-divergence:")) {
+                pendingExpectedDivergence = line.substring("-- expected-divergence:".length()).trim();
                 i++;
                 continue;
             }
@@ -504,9 +519,10 @@ public class Pg18SampleSql5Test {
 
             String sql = sqlBuf.toString().trim();
             if (!sql.isEmpty()) {
-                blocks.add(new ParsedBlock(sql, pendingExpectation, pendingPgBugSkip));
+                blocks.add(new ParsedBlock(sql, pendingExpectation, pendingPgBugSkip, pendingExpectedDivergence));
                 pendingExpectation = null;
                 pendingPgBugSkip = null;
+                pendingExpectedDivergence = null;
             }
         }
 

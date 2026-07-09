@@ -40,19 +40,24 @@ SELECT (count(*) >= 0)::text AS ok FROM pg_stat_statements_info;
 -- ============================================================================
 
 -- 4. Core columns — queryid, query, calls, total_exec_time, rows
+-- expected-divergence: pg_stat_statements requires shared_preload_libraries which Memgres does not support
 SELECT queryid, query, calls, total_exec_time, rows
   FROM pg_stat_statements LIMIT 0;
 
 -- 5. Plan vs exec time split (PG 13+)
+-- expected-divergence: pg_stat_statements requires shared_preload_libraries which Memgres does not support
 SELECT total_plan_time, total_exec_time FROM pg_stat_statements LIMIT 0;
 
 -- 6. toplevel column (PG 14+)
+-- expected-divergence: pg_stat_statements requires shared_preload_libraries which Memgres does not support
 SELECT toplevel FROM pg_stat_statements LIMIT 0;
 
 -- 7. WAL counters (PG 13+)
+-- expected-divergence: pg_stat_statements requires shared_preload_libraries which Memgres does not support
 SELECT wal_records, wal_fpi, wal_bytes FROM pg_stat_statements LIMIT 0;
 
 -- 8. JIT counters (PG 15+)
+-- expected-divergence: pg_stat_statements requires shared_preload_libraries which Memgres does not support
 SELECT jit_functions, jit_generation_time FROM pg_stat_statements LIMIT 0;
 
 -- ============================================================================

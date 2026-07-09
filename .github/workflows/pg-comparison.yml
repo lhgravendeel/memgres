@@ -1,0 +1,53 @@
+name: PG 18 Comparison
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  pg-comparison:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: memgres
+          POSTGRES_PASSWORD: memgres
+          POSTGRES_DB: memgrestest
+        options: >-
+          --health-cmd "pg_isready -U memgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+          cache: maven
+
+      - name: Build (skip tests)
+        run: mvn -B compile test-compile -pl memgres-core
+
+      - name: Run PG 18 comparison
+        run: |
+          mvn -pl memgres-core exec:java \
+            -Dexec.mainClass="com.memgres.sqlverify.FeatureComparisonReport" \
+            -Dexec.classpathScope=test \
+            -Dpg.url=jdbc:postgresql://localhost:5432/memgrestest \
+            -Dpg.user=memgres \
+            -Dpg.pass=memgres
+
+      - name: Upload differences report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: differences-report
+          path: memgres-core/src/test/resources/feature-comparison/differences.md
