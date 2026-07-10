@@ -955,12 +955,28 @@ class CatalogCoreBuilder {
                     break;
                 }
             }
+            int enumOid = oids.oid("type:" + ce.getName());
+            // Every PG enum type also gets an array-type pg_type row (typname "_<name>"); mint
+            // its OID eagerly and link both rows (element.typarray -> array oid,
+            // array.typelem -> element oid) so pgjdbc's TypeInfoCache queries for an
+            // enum-ARRAY column (getArrayDelimiter, getPGArrayElement, ...) resolve instead of
+            // finding zero rows. See PgWireValueFormatter.columnTypeOid, which advertises this
+            // same "type:<name>[]" OID for "<name>[]"-typed columns.
+            int enumArrayOid = oids.oid("type:" + ce.getName() + "[]");
             table.insertRow(new Object[]{
-                    oids.oid("type:" + ce.getName()), ce.getName(), enumNsOid, 10,
+                    enumOid, ce.getName(), enumNsOid, 10,
                     (short) 4, true, "e", "E", false, true, ",",
-                    0, null, 0, 0,
+                    0, null, 0, enumArrayOid,
                     "enum_in", "enum_out", "enum_recv", "enum_send",
                     "-", "-", "-", "i", "p",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+            table.insertRow(new Object[]{
+                    enumArrayOid, "_" + ce.getName(), enumNsOid, 10,
+                    (short) -1, false, "b", "A", false, true, ",",
+                    0, "array_subscript_handler", enumOid, 0,
+                    "array_in", "array_out", "array_recv", "array_send",
+                    "-", "-", "-", "i", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }

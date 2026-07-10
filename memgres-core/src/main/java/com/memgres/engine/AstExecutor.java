@@ -662,6 +662,10 @@ public class AstExecutor {
         return exprEvaluator.resolveEnumTypeName(expr, bindings);
     }
 
+    Column buildResultColumn(String alias, Expression expr, List<RowContext.TableBinding> bindings) {
+        return exprEvaluator.buildResultColumn(alias, expr, bindings);
+    }
+
     @SuppressWarnings("unchecked")
     int compareValues(Object a, Object b) {
         return exprEvaluator.compareValues(a, b);

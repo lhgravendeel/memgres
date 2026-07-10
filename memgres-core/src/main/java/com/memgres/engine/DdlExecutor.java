@@ -361,6 +361,16 @@ class DdlExecutor {
             if (executor.database.isCustomEnum(baseType)) {
                 dataType = DataType.ENUM;
                 enumTypeName = baseType;
+                // A custom enum's base name never matches DataType.fromPgName, so the isArray
+                // branch above left arrayElementType null for "enum_type[]" columns -- making
+                // them indistinguishable from a scalar enum column of the same type. Mark them
+                // as arrays too (mirrors the built-in-array convention used elsewhere: dataType
+                // == arrayElementType, non-null arrayElementType means "this column is an
+                // array"), so the wire layer can advertise a distinct array-type OID instead of
+                // reusing the element's OID for both.
+                if (isArray) {
+                    arrayElementType = DataType.ENUM;
+                }
             } else if (executor.database.isDomain(baseType)) {
                 DomainType domain = executor.database.getDomain(baseType);
                 dataType = domain.getBaseType();

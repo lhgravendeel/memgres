@@ -409,6 +409,20 @@ class PgWireBinaryCodec {
                     }
                     break;
                 }
+                case TEXT_ARRAY: {
+                    // Mirror the COPY-path array encoder (encodeBinaryArray) so DataRow
+                    // and COPY produce byte-identical array wire formats.
+                    byte[] arr = encodeBinaryArray(val, 25);
+                    buf.writeInt(arr.length);
+                    buf.writeBytes(arr);
+                    break;
+                }
+                case INT4_ARRAY: {
+                    byte[] arr = encodeBinaryArray(val, 23);
+                    buf.writeInt(arr.length);
+                    buf.writeBytes(arr);
+                    break;
+                }
                 default: {
                     String text = PgWireValueFormatter.formatValue(val, null);
                     byte[] bytes = text.getBytes(StandardCharsets.UTF_8);

@@ -36,7 +36,7 @@ class SelectAggregateEvaluator {
         for (SelectStmt.SelectTarget target : stmt.targets()) {
             String alias = target.alias();
             if (alias == null) alias = executor.exprToAlias(target.expr());
-            resultColumns.add(new Column(alias, executor.inferTypeFromContext(target.expr(), baseBindings), true, false, null));
+            resultColumns.add(executor.buildResultColumn(alias, target.expr(), baseBindings));
         }
 
         List<Object[]> allResultRows = new ArrayList<>();
@@ -189,7 +189,7 @@ class SelectAggregateEvaluator {
         for (SelectStmt.SelectTarget target : stmt.targets()) {
             String alias = target.alias();
             if (alias == null) alias = executor.exprToAlias(target.expr());
-            resultColumns.add(new Column(alias, executor.inferTypeFromContext(target.expr(), baseBindings), true, false, null));
+            resultColumns.add(executor.buildResultColumn(alias, target.expr(), baseBindings));
         }
         List<Object[]> resultRows = new ArrayList<>();
 

@@ -303,10 +303,22 @@ class PgWireValueFormatter {
      * real, dynamically-allocated OID for their named type (the same OID the session's own
      * {@code pg_type}/{@code pg_attribute} catalog rows use, via {@code oid("type:" + name)}) —
      * not {@link DataType#ENUM}'s generic placeholder OID of 0, which pgjdbc cannot resolve.
+     *
+     * <p>An <em>array</em> of a custom enum ({@code col.getArrayElementType() == DataType.ENUM})
+     * must advertise the array type's own distinct OID ({@code oid("type:" + name + "[]")}), not
+     * the element's — reusing the element's OID for the array column made pgjdbc's
+     * {@code TypeInfoCache.getArrayDelimiter}/{@code getPGArrayElement} pg_type lookups (which
+     * join the advertised oid's row against its {@code typelem} row) find no rows, since the
+     * element row's own {@code typelem} is 0 (it isn't an array). See
+     * {@code CatalogCoreBuilder.buildPgType} for the matching synthesized pg_type array row.
      */
     private static int columnTypeOid(DataType colType, Column col, Session session) {
         if (colType == DataType.ENUM && session != null && col.getEnumTypeName() != null) {
-            return session.resolveOid("type:" + col.getEnumTypeName());
+            String key = "type:" + col.getEnumTypeName();
+            if (col.getArrayElementType() == DataType.ENUM) {
+                key = key + "[]";
+            }
+            return session.resolveOid(key);
         }
         return colType.getOid();
     }

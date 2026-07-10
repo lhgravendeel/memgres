@@ -947,8 +947,15 @@ class SelectExecutor {
                     }
                 }
                 if (sourceCol != null) {
+                    // Carry over domainTypeName/compositeTypeName/arrayElementType too, not just
+                    // enumTypeName+precision+scale -- dropping arrayElementType here made a
+                    // projected "region_t[]" column indistinguishable from a scalar "region_t"
+                    // column (both have type=ENUM, enumTypeName="region_t"), which caused
+                    // PgWireValueFormatter.columnTypeOid to advertise the enum element's OID
+                    // instead of the array's for e.g. "SELECT regions FROM sellers".
                     Column rc = new Column(alias, sourceCol.getType(), sourceCol.isNullable(), sourceCol.isPrimaryKey(), null,
-                            sourceCol.getEnumTypeName(), sourceCol.getPrecision(), sourceCol.getScale());
+                            sourceCol.getEnumTypeName(), sourceCol.getPrecision(), sourceCol.getScale(), null,
+                            sourceCol.getDomainTypeName(), sourceCol.getCompositeTypeName(), sourceCol.getArrayElementType());
                     if (sourceTableName != null) {
                         String schemaKey = sourceSchemaName != null ? sourceSchemaName : "public";
                         int tblOid = executor.systemCatalog.getOid("rel:" + schemaKey + "." + sourceTableName);
@@ -1377,14 +1384,10 @@ class SelectExecutor {
      * an unnamed ENUM when it can't be determined.
      */
     private Column buildProjectedColumn(String alias, Expression expr, List<RowContext.TableBinding> bindings) {
-        DataType targetType = executor.inferTypeFromContext(expr, bindings);
-        if (targetType == DataType.ENUM) {
-            String enumTypeName = executor.resolveEnumTypeName(expr, bindings);
-            return enumTypeName != null
-                    ? new Column(alias, DataType.ENUM, true, false, null, enumTypeName)
-                    : new Column(alias, DataType.TEXT, true, false, null);
-        }
-        return new Column(alias, targetType, true, false, null);
+        // Delegates to ExprEvaluator.buildResultColumn, which also recognizes array_agg over a
+        // custom-enum element and advertises the enum's ARRAY type (wave-5, group 9) on top of
+        // the scalar-ENUM name recovery described above.
+        return executor.buildResultColumn(alias, expr, bindings);
     }
 
     // ---- CTE delegation ----

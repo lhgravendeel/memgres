@@ -44,7 +44,7 @@ class SelectWindowEvaluator {
                     }
                 }
             } else {
-                resultColumns.add(new Column(alias, executor.inferTypeFromContext(target.expr(), baseBindings), true, false, null));
+                resultColumns.add(executor.buildResultColumn(alias, target.expr(), baseBindings));
             }
         }
 

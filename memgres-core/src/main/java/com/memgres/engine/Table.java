@@ -422,11 +422,39 @@ public class Table {
     }
 
     public void alterColumnType(String columnName, DataType newType) {
+        alterColumnType(columnName, newType, null, null);
+    }
+
+    /**
+     * Changes a column's type, replacing the full type spec including its typmod: the new
+     * precision/scale come from the new type declaration (null when it has none), never carried
+     * over from the old column. Mirrors PostgreSQL, where {@code ALTER COLUMN x TYPE numeric(10,2)}
+     * sets scale 2 and {@code ALTER COLUMN x TYPE numeric} (no typmod) removes any previous
+     * precision/scale constraint.
+     */
+    public void alterColumnType(String columnName, DataType newType, Integer precision, Integer scale) {
+        int idx = getColumnIndex(columnName);
+        if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+        // Historical behavior for callers that don't resolve type metadata themselves
+        // (e.g. serial->int conversion): carry over the old column's enum type name.
+        alterColumnType(columnName, newType, precision, scale, columns.get(idx).getEnumTypeName(), null);
+    }
+
+    /**
+     * Full-replacement variant: the new type's enum identity and array element type come from the
+     * new type declaration (both null when it has none), never carried over from the old column —
+     * PG semantics, where ALTER COLUMN TYPE replaces the type spec entirely. Needed so
+     * {@code ALTER COLUMN x TYPE some_enum[]} yields a column distinguishable from a scalar
+     * {@code some_enum} column (see PgWireValueFormatter.columnTypeOid).
+     */
+    public void alterColumnType(String columnName, DataType newType, Integer precision, Integer scale,
+                                String enumTypeName, DataType arrayElementType) {
         int idx = getColumnIndex(columnName);
         if (idx < 0) throw new MemgresException("Column not found: " + columnName);
         Column old = columns.get(idx);
         columns.set(idx, new Column(old.getName(), newType, old.isNullable(), old.isPrimaryKey(),
-                old.getDefaultValue(), old.getEnumTypeName(), old.getPrecision(), old.getScale(), old.getGeneratedExpr()));
+                old.getDefaultValue(), enumTypeName, precision, scale, old.getGeneratedExpr(), false,
+                null, null, arrayElementType));
     }
 
     public void alterColumnDefault(String columnName, String defaultValue) {

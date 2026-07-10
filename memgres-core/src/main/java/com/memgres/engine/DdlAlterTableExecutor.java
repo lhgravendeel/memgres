@@ -166,6 +166,8 @@ class DdlAlterTableExecutor {
         DataType dt = resolved.dataType();
         String enumTypeName = resolved.enumTypeName();
         String domainTypeName = resolved.domainTypeName();
+        String compositeTypeName = resolved.compositeTypeName();
+        DataType arrayElementType = resolved.arrayElementType();
 
         String defaultVal = def.defaultExpr() != null ? DdlExecutor.exprToDefaultString(def.defaultExpr()) : null;
         String genExpr = def.generatedExpr();
@@ -217,8 +219,13 @@ class DdlAlterTableExecutor {
                     + "\" of relation \"" + stmt.table() + "\" contains null values", "23502");
         }
 
+        // Carry the resolved compositeTypeName/arrayElementType through, same as CREATE TABLE
+        // (DdlTableExecutor) — hardcoding them to null made an ALTER-added "enum_type[]" column
+        // indistinguishable from a scalar enum column, so PgWireValueFormatter.columnTypeOid
+        // advertised the enum element's OID instead of the array type's.
         Column col = new Column(def.name(), dt, !def.notNull(), def.primaryKey(), defaultVal,
-                enumTypeName, def.precision(), def.scale(), genExpr, def.generatedVirtual(), domainTypeName, null, null);
+                enumTypeName, def.precision(), def.scale(), genExpr, def.generatedVirtual(), domainTypeName,
+                compositeTypeName, arrayElementType);
         // Don't pre-evaluate serial/nextval/identity defaults — they should be evaluated per-row
         Object evaluatedDefault;
         if (defaultVal != null && (defaultVal.contains("nextval(") || defaultVal.startsWith("__identity__"))) {
@@ -438,10 +445,39 @@ class DdlAlterTableExecutor {
     private void executeSetType(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetType setType,
                                  Table table, AlterTableStmt stmt, String schemaName) {
         String baseType = setType.typeName().replaceAll("\\(.*\\)", "").replace("[]", "").trim();
+        // Extract the new type's typmod (precision/scale) so it replaces the old column's —
+        // e.g. ALTER COLUMN capacity TYPE numeric(10, 2) must set precision 10 / scale 2, or
+        // NUMERIC storage coercion (TypeCoercion.applyPrecision) never enforces the declared
+        // scale and values round-trip at whatever incidental scale they arrived with.
+        Integer newPrecision = null;
+        Integer newScale = null;
+        java.util.regex.Matcher typmod = java.util.regex.Pattern
+                .compile("\\(\\s*(\\d+)\\s*(?:,\\s*(-?\\d+)\\s*)?\\)")
+                .matcher(setType.typeName());
+        if (typmod.find()) {
+            try {
+                newPrecision = Integer.valueOf(typmod.group(1));
+                if (typmod.group(2) != null) newScale = Integer.valueOf(typmod.group(2));
+            } catch (NumberFormatException ignored) {
+                newPrecision = null;
+                newScale = null;
+            }
+        }
+        boolean isArrayType = setType.typeName().replaceAll("\\(.*\\)", "").trim().endsWith("[]");
         DataType dt = DataType.fromPgName(baseType);
+        String newEnumTypeName = null;
+        DataType newArrayElementType = null;
         if (dt == null) {
             if (executor.database.isCustomEnum(baseType)) {
                 dt = DataType.ENUM;
+                // Carry the enum identity (and array-ness) into the retyped column, same as
+                // CREATE TABLE / ADD COLUMN via resolveColumnType — without these the retyped
+                // column advertised the unresolvable ENUM placeholder OID 0 (enumTypeName null),
+                // and "enum_type[]" was indistinguishable from a scalar enum column.
+                newEnumTypeName = baseType;
+                if (isArrayType) {
+                    newArrayElementType = DataType.ENUM;
+                }
             } else {
                 throw new MemgresException("type \"" + baseType + "\" does not exist", "42704");
             }
@@ -508,7 +544,7 @@ class DdlAlterTableExecutor {
                 RowContext ctx = new RowContext(table, null, row);
                 convertedValues[ri] = executor.evalExpr(setType.usingExpr(), ctx);
             }
-            table.alterColumnType(alterCol.column(), dt);
+            table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
             Column newCol = table.getColumns().get(convIdx);
             for (int ri = 0; ri < table.getRows().size(); ri++) {
                 Object[] row = table.getRows().get(ri);
@@ -517,7 +553,7 @@ class DdlAlterTableExecutor {
                         : null;
             }
         } else {
-            table.alterColumnType(alterCol.column(), dt);
+            table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
             Column newCol = table.getColumns().get(convIdx);
             for (Object[] row : table.getRows()) {
                 if (row[convIdx] != null) {

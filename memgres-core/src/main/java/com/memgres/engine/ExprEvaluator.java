@@ -2229,7 +2229,31 @@ class ExprEvaluator {
                 }
                 return DataType.TEXT;
             }
-            if (name.equals("array_agg")) return DataType.INT4_ARRAY; // array type; INT4_ARRAY lets JDBC decode arrays
+            if (name.equals("array_agg")) {
+                // Derive the array type from the argument's element type. Advertising a fixed
+                // _int4 (the old hardcoding) made pgjdbc parse text elements as int in text mode
+                // ("Bad value for type int : tennet") and, worse, decode the payload as a binary
+                // int4 array in binary mode — a garbage dimension count then triggers a giant
+                // allocation (OutOfMemoryError at PgArray.readBinaryResultSet). Anything that
+                // isn't int4-family is advertised as _text: elements travel as text, which pgjdbc
+                // can always decode (enum-element arrays get their own array OID one level up,
+                // in buildResultColumn, since a bare DataType can't carry the enum's identity).
+                if (!fn.args().isEmpty()) {
+                    DataType elem = inferTypeFromContext(fn.args().get(0), bindings);
+                    if (elem != null) {
+                        switch (elem) {
+                            case INTEGER:
+                            case SMALLINT:
+                            case SERIAL:
+                            case SMALLSERIAL:
+                                return DataType.INT4_ARRAY;
+                            default:
+                                return DataType.TEXT_ARRAY;
+                        }
+                    }
+                }
+                return DataType.TEXT_ARRAY;
+            }
             if (name.equals("row_number") || name.equals("rank") || name.equals("dense_rank")
                     || name.equals("ntile") || name.equals("txid_current")
                     || name.equals("pg_current_xact_id")
@@ -2316,12 +2340,44 @@ class ExprEvaluator {
             SubqueryExpr sq = (SubqueryExpr) expr;
             if (sq.subquery() instanceof SelectStmt && ((SelectStmt) sq.subquery()).targets() != null && !((SelectStmt) sq.subquery()).targets().isEmpty()) {
                 SelectStmt stmt = (SelectStmt) sq.subquery();
-                return inferTypeFromContext(stmt.targets().get(0).expr(), bindings);
+                // The subquery's own FROM tables must be visible when inferring its first
+                // target's type — with only the outer bindings, a scalar subquery like
+                // (SELECT array_agg(p.provider_id) FROM prov p ...) can't resolve p.provider_id
+                // and falls back to TEXT regardless of the actual column type.
+                return inferTypeFromContext(stmt.targets().get(0).expr(), subqueryScopedBindings(stmt, bindings));
             }
             return DataType.TEXT;
         }
         if (expr instanceof ArrayExpr) return DataType.TEXT;
         return DataType.TEXT;
+    }
+
+    /**
+     * Bindings for inferring types inside a scalar subquery: the subquery's own plain-table FROM
+     * items first (inner scope wins), then the caller's outer bindings (for correlated
+     * references). Only simple {@code TableRef}s are resolved — join trees/nested subqueries in
+     * FROM keep the previous behavior (fall through to the outer bindings / TEXT default).
+     */
+    private List<RowContext.TableBinding> subqueryScopedBindings(SelectStmt stmt, List<RowContext.TableBinding> outer) {
+        if (stmt.from() == null || stmt.from().isEmpty() || executor == null) return outer;
+        List<RowContext.TableBinding> result = new ArrayList<>();
+        for (SelectStmt.FromItem fi : stmt.from()) {
+            if (!(fi instanceof SelectStmt.TableRef)) continue;
+            SelectStmt.TableRef tr = (SelectStmt.TableRef) fi;
+            Table t;
+            try {
+                t = tr.schema() != null ? executor.resolveTable(tr.schema(), tr.table())
+                        : executor.resolveTableSafe(tr.table());
+            } catch (MemgresException e) {
+                t = null;
+            }
+            if (t != null) {
+                result.add(new RowContext.TableBinding(t, tr.alias() != null ? tr.alias() : tr.table(), null, null));
+            }
+        }
+        if (result.isEmpty()) return outer;
+        result.addAll(outer);
+        return result;
     }
 
     DataType inferExprType(Expression expr) {
@@ -2383,11 +2439,72 @@ class ExprEvaluator {
             SubqueryExpr sq = (SubqueryExpr) expr;
             if (sq.subquery() instanceof SelectStmt && ((SelectStmt) sq.subquery()).targets() != null
                     && !((SelectStmt) sq.subquery()).targets().isEmpty()) {
-                return resolveEnumTypeName(((SelectStmt) sq.subquery()).targets().get(0).expr(), bindings);
+                SelectStmt stmt = (SelectStmt) sq.subquery();
+                return resolveEnumTypeName(stmt.targets().get(0).expr(), subqueryScopedBindings(stmt, bindings));
             }
             return null;
         }
         return null;
+    }
+
+    /**
+     * Unwraps a projected expression to the {@code array_agg(...)} call it produces, if any:
+     * either the expression is the call itself, or it is a scalar subquery whose single/first
+     * target is the call. Returns {@code null} otherwise.
+     */
+    private static FunctionCallExpr findArrayAggCall(Expression expr) {
+        if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            return FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase()).equals("array_agg") ? fn : null;
+        }
+        if (expr instanceof SubqueryExpr) {
+            SubqueryExpr sq = (SubqueryExpr) expr;
+            if (sq.subquery() instanceof SelectStmt && ((SelectStmt) sq.subquery()).targets() != null
+                    && !((SelectStmt) sq.subquery()).targets().isEmpty()) {
+                return findArrayAggCall(((SelectStmt) sq.subquery()).targets().get(0).expr());
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Builds the result {@link Column} for a projected expression that isn't a plain resolved
+     * column reference. Extends the plain type inference with the two cases a bare
+     * {@link DataType} can't express:
+     * <ul>
+     *   <li>{@code array_agg} over a custom-enum element: the column must advertise the enum's
+     *       own ARRAY type OID (the wave-4 pg_type machinery: {@code type=ENUM},
+     *       {@code enumTypeName}, {@code arrayElementType=ENUM}), not {@code _int4}/{@code _text}
+     *       — see {@code PgWireValueFormatter.columnTypeOid};</li>
+     *   <li>a scalar-ENUM-typed expression (COALESCE/CASE/cast/...): the concrete enum type name
+     *       is recovered via {@link #resolveEnumTypeName} (mtask-8 C1) or the column safely
+     *       downgrades to TEXT — never an unnamed ENUM, whose placeholder OID 0 crashes
+     *       pgjdbc.</li>
+     * </ul>
+     */
+    Column buildResultColumn(String alias, Expression expr, List<RowContext.TableBinding> bindings) {
+        FunctionCallExpr arrayAgg = findArrayAggCall(expr);
+        if (arrayAgg != null && !arrayAgg.args().isEmpty()) {
+            List<RowContext.TableBinding> scope = expr instanceof SubqueryExpr
+                    && ((SubqueryExpr) expr).subquery() instanceof SelectStmt
+                    ? subqueryScopedBindings((SelectStmt) ((SubqueryExpr) expr).subquery(), bindings)
+                    : bindings;
+            if (inferTypeFromContext(arrayAgg.args().get(0), scope) == DataType.ENUM) {
+                String enumTypeName = resolveEnumTypeName(arrayAgg.args().get(0), scope);
+                if (enumTypeName != null) {
+                    return new Column(alias, DataType.ENUM, true, false, null, enumTypeName,
+                            null, null, null, false, null, null, DataType.ENUM);
+                }
+            }
+        }
+        DataType targetType = inferTypeFromContext(expr, bindings);
+        if (targetType == DataType.ENUM) {
+            String enumTypeName = resolveEnumTypeName(expr, bindings);
+            return enumTypeName != null
+                    ? new Column(alias, DataType.ENUM, true, false, null, enumTypeName)
+                    : new Column(alias, DataType.TEXT, true, false, null);
+        }
+        return new Column(alias, targetType, true, false, null);
     }
 
     // ---- JSON path parsing ----
