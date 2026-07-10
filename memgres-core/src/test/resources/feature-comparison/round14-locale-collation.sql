@@ -80,6 +80,7 @@ SELECT count(*)::text AS c FROM pg_collation WHERE collname = 'r14_coll_from';
 -- ============================================================================
 
 -- 8. German capital sharp S → ß
+-- expected-divergence: lower(U+1E9E) result depends on glibc/ICU version — PG may return ß or ẞ
 -- begin-expected
 -- columns: v
 -- row: ẞ

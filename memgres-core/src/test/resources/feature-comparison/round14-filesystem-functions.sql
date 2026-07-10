@@ -24,6 +24,7 @@ SELECT pg_read_binary_file('postgresql.conf', 0, 0);
 -- ============================================================================
 
 -- 5. pg_ls_logdir
+-- expected-divergence: pg_ls_logdir() depends on PG server log directory existing — Docker containers may lack it
 SELECT count(*)::int AS c FROM pg_ls_logdir();
 
 -- 6. pg_ls_waldir

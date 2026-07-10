@@ -330,6 +330,7 @@ SELECT date_trunc('quarter', timestamp '2024-05-15 12:00:00') AS to_quarter;
 -- 24. AT TIME ZONE: timestamp to timestamptz
 -- ============================================================================
 
+-- expected-divergence: US/Eastern timezone not available on all PG servers (minimal Docker images lack full tzdata)
 -- begin-expected
 -- columns: result
 -- row: 2024-02-11 20:00:00+00
@@ -340,6 +341,7 @@ SELECT timestamp '2024-02-11 15:00:00' AT TIME ZONE 'US/Eastern' AS result;
 -- 25. AT TIME ZONE: timestamptz to timestamp
 -- ============================================================================
 
+-- expected-divergence: US/Eastern timezone not available on all PG servers (minimal Docker images lack full tzdata)
 -- begin-expected
 -- columns: result
 -- row: 2024-02-11 10:00:00

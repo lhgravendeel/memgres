@@ -127,6 +127,10 @@ public class FeatureComparisonReport {
                 if (block.pgBugSkip() != null && pgResult != null) {
                     fd.pgBugSkips.add(new Difference(sectionNum, block.sql(), block.pgBugSkip(), pgResult, memResult));
                     totalPgBugSkips++;
+                } else if (block.expectedDivergence() != null && pgResult != null) {
+                    // Skip PG comparisons for environment-dependent statements
+                    fd.expectedDivergences.add(new Difference(sectionNum, block.sql(), block.expectedDivergence(), pgResult, memResult));
+                    totalExpectedDivergences++;
                 } else {
                     // Compare PG vs Memgres for annotated statements
                     if (pgResult != null && block.expectation() != null) {
@@ -141,19 +145,14 @@ public class FeatureComparisonReport {
                     // where one engine errors and the other succeeds)
                     if (pgResult != null && block.expectation() == null) {
                         if (pgResult.success() != memResult.success()) {
-                            if (block.expectedDivergence() != null) {
-                                fd.expectedDivergences.add(new Difference(sectionNum, block.sql(), block.expectedDivergence(), pgResult, memResult));
-                                totalExpectedDivergences++;
+                            String desc;
+                            if (pgResult.success()) {
+                                desc = "Setup divergence: PG succeeded, Memgres errored: " + memResult.errorMessage();
                             } else {
-                                String desc;
-                                if (pgResult.success()) {
-                                    desc = "Setup divergence: PG succeeded, Memgres errored: " + memResult.errorMessage();
-                                } else {
-                                    desc = "Setup divergence: PG errored (" + pgResult.errorState() + ": " + pgResult.errorMessage() + "), Memgres succeeded";
-                                }
-                                fd.setupDivergences.add(new Difference(sectionNum, block.sql(), desc, pgResult, memResult));
-                                totalSetupDivergences++;
+                                desc = "Setup divergence: PG errored (" + pgResult.errorState() + ": " + pgResult.errorMessage() + "), Memgres succeeded";
                             }
+                            fd.setupDivergences.add(new Difference(sectionNum, block.sql(), desc, pgResult, memResult));
+                            totalSetupDivergences++;
                         }
                     }
 
