@@ -350,7 +350,14 @@ class SelectAggregateEvaluator {
                     if (val == null) {
                         resolvedArgs.add(Literal.ofNull());
                     } else {
-                        resolvedArgs.add(Literal.ofString(val.toString()));
+                        // Preserve the resolved aggregate's runtime type (a typed value, not a
+                        // re-parsed string literal) so a scalar function/expression wrapped
+                        // around aggregate args -- e.g. LEAST(sum(a), sum(b)) -- compares its
+                        // arguments numerically instead of lexicographically. Literal.ofString
+                        // here previously stringified every value (mtask-8 Group 5): LEAST('7.0',
+                        // '10.0') compares as strings ("10.0" < "7.0" because '1' < '7'),
+                        // silently returning the wrong (larger) value.
+                        resolvedArgs.add(new ExprEvaluator.PrecomputedValueExpr(val));
                     }
                 }
                 return executor.functionEvaluator.evalFunction(new FunctionCallExpr(fn.name(), resolvedArgs, fn.distinct(), fn.star()), representative);

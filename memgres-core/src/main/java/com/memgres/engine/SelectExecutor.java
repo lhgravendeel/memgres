@@ -800,7 +800,12 @@ class SelectExecutor {
     }
 
     List<Object[]> applyDistinct(SelectStmt stmt, List<Object[]> resultRows) {
-        if (stmt.distinct()) {
+        // DISTINCT ON already deduped on its key expressions above (~line 407); it must never
+        // also run this plain full-projection DISTINCT pass. The parser sets stmt.distinct() =
+        // true for DISTINCT ON too (SelectParser.parseSelectBody), so without this guard two rows
+        // with distinct DISTINCT ON keys but an incidentally-equal projection collapse into one
+        // (mtask-8 Group 4) -- PostgreSQL keeps both.
+        if (stmt.distinct() && (stmt.distinctOn() == null || stmt.distinctOn().isEmpty())) {
             Set<String> seen = new LinkedHashSet<>();
             List<Object[]> deduped = new ArrayList<>();
             for (Object[] row : resultRows) {
