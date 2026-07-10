@@ -3,6 +3,7 @@ name: PG 18 Comparison
 on:
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   pg-comparison:
