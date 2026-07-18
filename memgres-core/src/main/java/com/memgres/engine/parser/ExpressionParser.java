@@ -523,7 +523,7 @@ public class ExpressionParser {
     }
 
     private Expression parseComparison() {
-        Expression left = parseAddition();
+        Expression left = parseOtherOps();
 
         // IS [NOT] NULL
         if (checkKeyword("IS")) {
@@ -534,7 +534,7 @@ public class ExpressionParser {
             }
             // IS [NOT] DISTINCT FROM: NULL-safe comparison
             if (matchKeywords("DISTINCT", "FROM")) {
-                Expression right = parseAddition();
+                Expression right = parseOtherOps();
                 return negated
                         ? new BinaryExpr(left, BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM, right)
                         : new BinaryExpr(left, BinaryExpr.BinOp.IS_DISTINCT_FROM, right);
@@ -604,58 +604,60 @@ public class ExpressionParser {
             if (checkKeyword("SELECT") || checkKeyword("WITH") || checkKeyword("VALUES")) {
                 Statement subquery = parseSubqueryWithSetOps();
                 expect(TokenType.RIGHT_PAREN);
-                return new InExpr(left, Cols.listOf(new SubqueryExpr(subquery)), negated);
+                left = new InExpr(left, Cols.listOf(new SubqueryExpr(subquery)), negated);
+            } else {
+                List<Expression> values = parseExpressionList();
+                expect(TokenType.RIGHT_PAREN);
+                left = new InExpr(left, values, negated);
             }
-            List<Expression> values = parseExpressionList();
-            expect(TokenType.RIGHT_PAREN);
-            return new InExpr(left, values, negated);
-        }
-
-        // [NOT] BETWEEN [SYMMETRIC] low AND high
-        if (matchKeyword("BETWEEN")) {
+            // Fall through to check for trailing comparison operator (e.g. "IN (1,2) = false")
+        } else if (matchKeyword("BETWEEN")) {
+            // [NOT] BETWEEN [SYMMETRIC] low AND high
             boolean symmetric = matchKeyword("SYMMETRIC");
-            Expression low = parseAddition();
+            Expression low = parseOtherOps();
             expectKeyword("AND");
-            Expression high = parseAddition();
-            return new BetweenExpr(left, low, high, negated, symmetric);
-        }
-
-        // [NOT] LIKE / ILIKE
-        if (matchKeyword("LIKE")) {
-            Expression right = parseAddition();
+            Expression high = parseOtherOps();
+            left = new BetweenExpr(left, low, high, negated, symmetric);
+            // Fall through
+        } else if (matchKeyword("LIKE")) {
+            // [NOT] LIKE / ILIKE
+            Expression right = parseOtherOps();
             if (matchKeyword("ESCAPE")) {
                 String esc = advance().value(); // string literal
-                return new LikeExpr(left, right, esc, false, negated);
+                left = new LikeExpr(left, right, esc, false, negated);
+            } else {
+                Expression result = new BinaryExpr(left, BinaryExpr.BinOp.LIKE, right);
+                left = negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
             }
-            Expression result = new BinaryExpr(left, BinaryExpr.BinOp.LIKE, right);
-            return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
-        }
-        if (matchKeyword("ILIKE")) {
-            Expression right = parseAddition();
+            // Fall through
+        } else if (matchKeyword("ILIKE")) {
+            Expression right = parseOtherOps();
             if (matchKeyword("ESCAPE")) {
                 String esc = advance().value(); // string literal
-                return new LikeExpr(left, right, esc, true, negated);
+                left = new LikeExpr(left, right, esc, true, negated);
+            } else {
+                Expression result = new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, right);
+                left = negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
             }
-            Expression result = new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, right);
-            return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
-        }
-        if (matchKeywords("SIMILAR", "TO")) {
-            Expression right = parseAddition();
+            // Fall through
+        } else if (matchKeywords("SIMILAR", "TO")) {
+            Expression right = parseOtherOps();
             if (matchKeyword("ESCAPE")) {
                 String esc = advance().value(); // string literal (may be empty)
-                // Wrap as a function call so the executor can handle ESCAPE for SIMILAR TO
                 Expression result = new FunctionCallExpr("__similar_to_escape__",
                         java.util.Arrays.asList(left, right, Literal.ofString(esc)), false, false);
-                return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
+                left = negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
+            } else {
+                Expression result = new BinaryExpr(left, BinaryExpr.BinOp.SIMILAR_TO, right);
+                left = negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
             }
-            Expression result = new BinaryExpr(left, BinaryExpr.BinOp.SIMILAR_TO, right);
-            return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
-        }
-        // SQL:2008 LIKE_REGEX (equivalent to POSIX ~ operator)
-        if (matchIdentifier("LIKE_REGEX")) {
-            Expression right = parseAddition();
+            // Fall through
+        } else if (matchIdentifier("LIKE_REGEX")) {
+            // SQL:2008 LIKE_REGEX (equivalent to POSIX ~ operator)
+            Expression right = parseOtherOps();
             Expression result = new BinaryExpr(left, BinaryExpr.BinOp.REGEX_MATCH, right);
-            return negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
+            left = negated ? new UnaryExpr(UnaryExpr.UnaryOp.NOT, result) : result;
+            // Fall through
         }
 
         // Comparison operators
@@ -688,7 +690,7 @@ public class ExpressionParser {
                 return new AnyAllArrayExpr(left, BinaryExpr.BinOp.EQUAL, arrayExpr, true);
             }
             checkNotBooleanConnective(); // val = AND → syntax error
-            return new BinaryExpr(left, BinaryExpr.BinOp.EQUAL, parseAddition());
+            return new BinaryExpr(left, BinaryExpr.BinOp.EQUAL, parseOtherOps());
         }
         if (match(TokenType.NOT_EQUALS)) return parseComparisonRhs(left, BinaryExpr.BinOp.NOT_EQUAL);
         if (match(TokenType.LESS_THAN)) return parseComparisonRhs(left, BinaryExpr.BinOp.LESS_THAN);
@@ -697,43 +699,43 @@ public class ExpressionParser {
         if (match(TokenType.GREATER_EQUALS)) return parseComparisonRhs(left, BinaryExpr.BinOp.GREATER_EQUAL);
 
         // Array/JSON operators
-        if (match(TokenType.CONTAINS)) return new BinaryExpr(left, BinaryExpr.BinOp.CONTAINS, parseAddition());
-        if (match(TokenType.CONTAINED_BY)) return new BinaryExpr(left, BinaryExpr.BinOp.CONTAINED_BY, parseAddition());
-        if (match(TokenType.OVERLAP)) return new BinaryExpr(left, BinaryExpr.BinOp.OVERLAP, parseAddition());
-        if (match(TokenType.TS_MATCH)) return new BinaryExpr(left, BinaryExpr.BinOp.TS_MATCH, parseAddition());
-        if (match(TokenType.JSONB_PATH_EXISTS_OP)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_PATH_EXISTS_OP, parseAddition());
+        if (match(TokenType.CONTAINS)) return new BinaryExpr(left, BinaryExpr.BinOp.CONTAINS, parseOtherOps());
+        if (match(TokenType.CONTAINED_BY)) return new BinaryExpr(left, BinaryExpr.BinOp.CONTAINED_BY, parseOtherOps());
+        if (match(TokenType.OVERLAP)) return new BinaryExpr(left, BinaryExpr.BinOp.OVERLAP, parseOtherOps());
+        if (match(TokenType.TS_MATCH)) return new BinaryExpr(left, BinaryExpr.BinOp.TS_MATCH, parseOtherOps());
+        if (match(TokenType.JSONB_PATH_EXISTS_OP)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_PATH_EXISTS_OP, parseOtherOps());
 
         // JSONB key existence operators
-        if (match(TokenType.JSONB_EXISTS)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_EXISTS, parseAddition());
-        if (match(TokenType.JSONB_EXISTS_ANY)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_EXISTS_ANY, parseAddition());
-        if (match(TokenType.JSONB_EXISTS_ALL)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_EXISTS_ALL, parseAddition());
+        if (match(TokenType.JSONB_EXISTS)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_EXISTS, parseOtherOps());
+        if (match(TokenType.JSONB_EXISTS_ANY)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_EXISTS_ANY, parseOtherOps());
+        if (match(TokenType.JSONB_EXISTS_ALL)) return new BinaryExpr(left, BinaryExpr.BinOp.JSONB_EXISTS_ALL, parseOtherOps());
 
         // Operator forms of LIKE/ILIKE and NOT LIKE/NOT ILIKE
-        if (match(TokenType.DOUBLE_TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.LIKE, parseAddition());
-        if (match(TokenType.DOUBLE_TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, parseAddition());
-        if (match(TokenType.NOT_DOUBLE_TILDE)) return new UnaryExpr(UnaryExpr.UnaryOp.NOT, new BinaryExpr(left, BinaryExpr.BinOp.LIKE, parseAddition()));
-        if (match(TokenType.NOT_DOUBLE_TILDE_STAR)) return new UnaryExpr(UnaryExpr.UnaryOp.NOT, new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, parseAddition()));
+        if (match(TokenType.DOUBLE_TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.LIKE, parseOtherOps());
+        if (match(TokenType.DOUBLE_TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, parseOtherOps());
+        if (match(TokenType.NOT_DOUBLE_TILDE)) return new UnaryExpr(UnaryExpr.UnaryOp.NOT, new BinaryExpr(left, BinaryExpr.BinOp.LIKE, parseOtherOps()));
+        if (match(TokenType.NOT_DOUBLE_TILDE_STAR)) return new UnaryExpr(UnaryExpr.UnaryOp.NOT, new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, parseOtherOps()));
         // POSIX regex operators
-        if (match(TokenType.TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.REGEX_MATCH, parseAddition());
-        if (match(TokenType.TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.REGEX_IMATCH, parseAddition());
-        if (match(TokenType.EXCL_TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_MATCH, parseAddition());
-        if (match(TokenType.EXCL_TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_IMATCH, parseAddition());
+        if (match(TokenType.TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.REGEX_MATCH, parseOtherOps());
+        if (match(TokenType.TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.REGEX_IMATCH, parseOtherOps());
+        if (match(TokenType.EXCL_TILDE)) return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_MATCH, parseOtherOps());
+        if (match(TokenType.EXCL_TILDE_STAR)) return new BinaryExpr(left, BinaryExpr.BinOp.NOT_REGEX_IMATCH, parseOtherOps());
 
-        // Geometric operators (DISTANCE is handled in parseAddition for correct precedence)
-        if (match(TokenType.APPROX_EQUAL)) return new BinaryExpr(left, BinaryExpr.BinOp.APPROX_EQUAL, parseAddition());
-        if (match(TokenType.GEO_BELOW)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_BELOW, parseAddition());
-        if (match(TokenType.GEO_ABOVE)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_ABOVE, parseAddition());
-        if (match(TokenType.GEO_NOT_EXTEND_RIGHT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_RIGHT, parseAddition());
-        if (match(TokenType.GEO_NOT_EXTEND_LEFT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_LEFT, parseAddition());
-        if (match(TokenType.GEO_NOT_EXTEND_ABOVE)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_ABOVE, parseAddition());
-        if (match(TokenType.GEO_NOT_EXTEND_BELOW)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_BELOW, parseAddition());
-        if (match(TokenType.GEO_INTERSECTS)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_INTERSECTS, parseAddition());
-        if (match(TokenType.GEO_CLOSEST_POINT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_CLOSEST_POINT, parseAddition());
-        if (match(TokenType.GEO_PARALLEL)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_PARALLEL, parseAddition());
-        if (match(TokenType.GEO_PERPENDICULAR)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_PERPENDICULAR, parseAddition());
+        // Geometric operators (DISTANCE is handled in parseOtherOps for correct precedence)
+        if (match(TokenType.APPROX_EQUAL)) return new BinaryExpr(left, BinaryExpr.BinOp.APPROX_EQUAL, parseOtherOps());
+        if (match(TokenType.GEO_BELOW)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_BELOW, parseOtherOps());
+        if (match(TokenType.GEO_ABOVE)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_ABOVE, parseOtherOps());
+        if (match(TokenType.GEO_NOT_EXTEND_RIGHT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_RIGHT, parseOtherOps());
+        if (match(TokenType.GEO_NOT_EXTEND_LEFT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_LEFT, parseOtherOps());
+        if (match(TokenType.GEO_NOT_EXTEND_ABOVE)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_ABOVE, parseOtherOps());
+        if (match(TokenType.GEO_NOT_EXTEND_BELOW)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_NOT_EXTEND_BELOW, parseOtherOps());
+        if (match(TokenType.GEO_INTERSECTS)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_INTERSECTS, parseOtherOps());
+        if (match(TokenType.GEO_CLOSEST_POINT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_CLOSEST_POINT, parseOtherOps());
+        if (match(TokenType.GEO_PARALLEL)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_PARALLEL, parseOtherOps());
+        if (match(TokenType.GEO_PERPENDICULAR)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_PERPENDICULAR, parseOtherOps());
 
         // Range adjacency operator: -|-
-        if (match(TokenType.RANGE_ADJACENT)) return new BinaryExpr(left, BinaryExpr.BinOp.RANGE_ADJACENT, parseAddition());
+        if (match(TokenType.RANGE_ADJACENT)) return new BinaryExpr(left, BinaryExpr.BinOp.RANGE_ADJACENT, parseOtherOps());
 
         // OPERATOR(schema.op) infix syntax: expr OPERATOR(pg_catalog.+) expr
         if (checkKeyword("OPERATOR")) {
@@ -743,7 +745,7 @@ public class ExpressionParser {
         // SQL OVERLAPS syntax: (start, end) OVERLAPS (start, end) -> boolean
         if (checkIdentifier("overlaps")) {
             advance(); // consume OVERLAPS
-            Expression right = parseAddition();
+            Expression right = parseOtherOps();
             return new FunctionCallExpr("overlaps", java.util.Arrays.asList(left, right), false, false);
         }
 
@@ -772,26 +774,39 @@ public class ExpressionParser {
             expect(TokenType.RIGHT_PAREN);
             return new AnyAllArrayExpr(left, op, arrayExpr, isAll);
         }
-        return new BinaryExpr(left, op, parseAddition());
+        return new BinaryExpr(left, op, parseOtherOps());
     }
 
-    // Package-private so ExprSpecialFormParser can call it for qualified operator RHS
-    Expression parseAddition() {
-        Expression left = parseBitOr();
+    /**
+     * PG "other operators" level: ||, |, #, &, <<, >>, <->, custom operators.
+     * All sit BELOW +/- and ABOVE comparison in PG's precedence table.
+     * They are all left-associative at the same flat precedence level.
+     * Package-private so ExprSpecialFormParser can call it for qualified operator RHS.
+     */
+    Expression parseOtherOps() {
+        Expression left = parseAddition();
         while (true) {
-            if (match(TokenType.PLUS)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.ADD, parseBitOr());
-            } else if (match(TokenType.MINUS)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.SUBTRACT, parseBitOr());
-            } else if (match(TokenType.CONCAT)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.CONCAT, parseBitOr());
+            if (match(TokenType.CONCAT)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.CONCAT, parseAddition());
+            } else if (match(TokenType.PIPE)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_OR, parseAddition());
+            } else if (match(TokenType.HASH)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_XOR, parseAddition());
+            } else if (match(TokenType.AMPERSAND)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_AND, parseAddition());
+            } else if (match(TokenType.SHIFT_LEFT)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.SHIFT_LEFT, parseAddition());
+            } else if (match(TokenType.SHIFT_RIGHT)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.SHIFT_RIGHT, parseAddition());
+            } else if (match(TokenType.INET_CONTAINED_BY_EQUALS)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINED_BY_EQUALS, parseAddition());
+            } else if (match(TokenType.INET_CONTAINS_EQUALS)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINS_EQUALS, parseAddition());
             } else if (match(TokenType.DISTANCE)) {
-                // <-> operator: higher precedence than comparison, same as addition
-                left = new BinaryExpr(left, BinaryExpr.BinOp.DISTANCE, parseBitOr());
+                left = new BinaryExpr(left, BinaryExpr.BinOp.DISTANCE, parseAddition());
             } else if (check(TokenType.CUSTOM_OPERATOR)) {
-                // User-defined multi-char operators: same precedence as addition (left-associative)
                 String opSymbol = advance().value();
-                left = new CustomOperatorExpr(null, opSymbol, left, parseBitOr());
+                left = new CustomOperatorExpr(null, opSymbol, left, parseAddition());
             } else {
                 break;
             }
@@ -799,41 +814,13 @@ public class ExpressionParser {
         return left;
     }
 
-    private Expression parseBitOr() {
-        Expression left = parseBitXor();
-        while (match(TokenType.PIPE)) {
-            left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_OR, parseBitXor());
-        }
-        return left;
-    }
-
-    private Expression parseBitXor() {
-        Expression left = parseBitAnd();
-        while (match(TokenType.HASH)) {
-            left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_XOR, parseBitAnd());
-        }
-        return left;
-    }
-
-    private Expression parseBitAnd() {
-        Expression left = parseBitShift();
-        while (match(TokenType.AMPERSAND)) {
-            left = new BinaryExpr(left, BinaryExpr.BinOp.BIT_AND, parseBitShift());
-        }
-        return left;
-    }
-
-    private Expression parseBitShift() {
+    private Expression parseAddition() {
         Expression left = parseMultiplication();
         while (true) {
-            if (match(TokenType.INET_CONTAINED_BY_EQUALS)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINED_BY_EQUALS, parseMultiplication());
-            } else if (match(TokenType.INET_CONTAINS_EQUALS)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.INET_CONTAINS_EQUALS, parseMultiplication());
-            } else if (match(TokenType.SHIFT_LEFT)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.SHIFT_LEFT, parseMultiplication());
-            } else if (match(TokenType.SHIFT_RIGHT)) {
-                left = new BinaryExpr(left, BinaryExpr.BinOp.SHIFT_RIGHT, parseMultiplication());
+            if (match(TokenType.PLUS)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.ADD, parseMultiplication());
+            } else if (match(TokenType.MINUS)) {
+                left = new BinaryExpr(left, BinaryExpr.BinOp.SUBTRACT, parseMultiplication());
             } else {
                 break;
             }
@@ -859,9 +846,9 @@ public class ExpressionParser {
 
     private Expression parsePower() {
         Expression left = parseUnary();
-        // Right-associative: 2^3^4 = 2^(3^4)
-        if (match(TokenType.CARET)) {
-            return new BinaryExpr(left, BinaryExpr.BinOp.POWER, parsePower());
+        // Left-associative (PG): 2^3^2 = (2^3)^2 = 64
+        while (match(TokenType.CARET)) {
+            left = new BinaryExpr(left, BinaryExpr.BinOp.POWER, parseUnary());
         }
         return left;
     }
