@@ -524,11 +524,11 @@ class ExprSpecialFormParser {
                 break;
             default:
                 // User-defined operator: create CustomOperatorExpr for runtime dispatch
-                Expression right = ep.parseAddition();
+                Expression right = ep.parseOtherOps();
                 return new CustomOperatorExpr(spec.schema, spec.opSymbol, left, right);
         }
 
-        Expression rhs = ep.parseAddition();
+        Expression rhs = ep.parseOtherOps();
         Expression result = new BinaryExpr(left, binOp, rhs);
         // Wrap in QualifiedOperatorExpr to preserve schema for validation at runtime
         if (spec.schema != null) {
