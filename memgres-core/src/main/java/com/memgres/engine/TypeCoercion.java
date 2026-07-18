@@ -453,7 +453,7 @@ public final class TypeCoercion {
         if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
         if (val instanceof java.math.BigDecimal) {
             java.math.BigDecimal bd = (java.math.BigDecimal) val;
-            long lv = bd.setScale(0, java.math.RoundingMode.HALF_EVEN).longValueExact();
+            long lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
             if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
                 throw integerOutOfRange();
             return (int) lv;
@@ -471,7 +471,7 @@ public final class TypeCoercion {
         try {
             if (s.contains(".")) {
                 java.math.BigDecimal bd = new java.math.BigDecimal(s);
-                long lv = bd.setScale(0, java.math.RoundingMode.HALF_EVEN).longValueExact();
+                long lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
                 if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
                     throw integerOutOfRange();
                 return (int) lv;
@@ -1409,11 +1409,9 @@ public final class TypeCoercion {
             }
         }
 
-        // String comparison: use PostgreSQL-like collation ordering.
-        // Alphanumeric characters use standard codepoint ordering (C locale),
-        // while non-alphanumeric characters (punctuation, symbols) sort after
-        // all alphanumeric characters (as in en_US.UTF-8 locale).
-        return pgStringCompare(a.toString(), b.toString());
+        // String comparison: strip trailing spaces first (consistent with areEqual)
+        // to handle CHAR(n) values, then use codepoint ordering.
+        return pgStringCompare(stripTrailingSpaces(a.toString()), stripTrailingSpaces(b.toString()));
     }
 
     /**
@@ -1423,6 +1421,13 @@ public final class TypeCoercion {
      */
     static int pgStringCompare(String a, String b) {
         return a.compareTo(b);
+    }
+
+    /** Strip trailing space characters from a string (for CHAR(n) comparison semantics). */
+    private static String stripTrailingSpaces(String s) {
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == ' ') end--;
+        return end == s.length() ? s : s.substring(0, end);
     }
 
     /**
@@ -1615,17 +1620,13 @@ public final class TypeCoercion {
             } catch (Exception e) { /* fall through */ }
         }
 
-        // Fall back to string comparison, using trailing-space-insensitive comparison
-        // to handle CHAR(n) values which PG pads with spaces but compares ignoring trailing spaces
-        String sa2 = a.toString();
-        String sb2 = b.toString();
-        if (sa2.equals(sb2)) return true;
-        if (sa2.length() != sb2.length()) {
-            // Pad shorter to longer length with spaces (CHAR semantics)
-            int maxLen = Math.max(sa2.length(), sb2.length());
-            return String.format("%-" + maxLen + "s", sa2).equals(String.format("%-" + maxLen + "s", sb2));
-        }
-        return false;
+        // Fall back to string comparison with trailing-space-insensitive semantics.
+        // This handles CHAR(n) values which PG pads with spaces but compares ignoring trailing spaces.
+        // Must be consistent with compare() — both strip trailing spaces so that = and < never
+        // both return true for the same pair of values.
+        String sa2 = stripTrailingSpaces(a.toString());
+        String sb2 = stripTrailingSpaces(b.toString());
+        return sa2.equals(sb2);
     }
 
     private static boolean isDateTime(Object val) {

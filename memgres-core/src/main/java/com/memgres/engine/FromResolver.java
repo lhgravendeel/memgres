@@ -538,7 +538,10 @@ class FromResolver {
                     allMatch = false;
                     break;
                 }
-                keyValues[i] = val;
+                // Coerce the lookup value to match the column's storage type.
+                // For CHAR(n) columns, the stored value is padded with spaces; the
+                // literal must be padded too so the index hash lookup matches.
+                keyValues[i] = TypeCoercion.coerceForStorage(val, col);
             }
             if (!allMatch) continue;
 

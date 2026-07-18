@@ -256,7 +256,8 @@ class BinaryOpEvaluator {
                     }
                     return result;
                 }
-                return (int)(executor.toLong(left) & executor.toLong(right));
+                { long r = executor.toLong(left) & executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case BIT_OR: {
                 if (left == null || right == null) return null;
@@ -272,7 +273,8 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return NetworkOperations.bitwiseOr(ls, rs);
                 }
-                return (int)(executor.toLong(left) | executor.toLong(right));
+                { long r = executor.toLong(left) | executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case BIT_XOR: {
                 if (left == null || right == null) return null;
@@ -290,7 +292,8 @@ class BinaryOpEvaluator {
                     Object result = GeometricOperations.intersectionGeneral(ls, rs);
                     return result != null ? GeometricOperations.format(result) : null;
                 }
-                return (int)(executor.toLong(left) ^ executor.toLong(right));
+                { long r = executor.toLong(left) ^ executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case SHIFT_LEFT: {
                 if (left == null || right == null) return null;
@@ -307,7 +310,8 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return NetworkOperations.containedBy(ls, rs);
                 }
-                return (int)(executor.toLong(left) << executor.toLong(right));
+                { long r = executor.toLong(left) << executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case SHIFT_RIGHT: {
                 if (left == null || right == null) return null;
@@ -324,7 +328,8 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return NetworkOperations.contains(ls, rs);
                 }
-                return (int)(executor.toLong(left) >> executor.toLong(right));
+                { long r = executor.toLong(left) >> executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case INET_CONTAINS_EQUALS: {
                 if (left == null || right == null) return null;
@@ -1211,7 +1216,8 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return NetworkOperations.bitwiseAnd(ls, rs);
                 }
-                return (int)(executor.toLong(left) & executor.toLong(right));
+                { long r = executor.toLong(left) & executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case BIT_OR: {
                 if (left == null || right == null) return null;
@@ -1227,7 +1233,8 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return NetworkOperations.bitwiseOr(ls, rs);
                 }
-                return (int)(executor.toLong(left) | executor.toLong(right));
+                { long r = executor.toLong(left) | executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case BIT_XOR: {
                 if (left == null || right == null) return null;
@@ -1245,7 +1252,8 @@ class BinaryOpEvaluator {
                     Object result = GeometricOperations.intersectionGeneral(ls, rs);
                     return result != null ? GeometricOperations.format(result) : null;
                 }
-                return (int)(executor.toLong(left) ^ executor.toLong(right));
+                { long r = executor.toLong(left) ^ executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case SHIFT_LEFT: {
                 if (left == null || right == null) return null;
@@ -1254,7 +1262,8 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return NetworkOperations.containedBy(ls, rs);
                 }
-                return (int)(executor.toLong(left) << executor.toLong(right));
+                { long r = executor.toLong(left) << executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case SHIFT_RIGHT: {
                 if (left == null || right == null) return null;
@@ -1263,7 +1272,8 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return NetworkOperations.contains(ls, rs);
                 }
-                return (int)(executor.toLong(left) >> executor.toLong(right));
+                { long r = executor.toLong(left) >> executor.toLong(right);
+                return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case INET_CONTAINS_EQUALS: {
                 if (left == null || right == null) return null;

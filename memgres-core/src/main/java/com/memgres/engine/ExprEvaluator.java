@@ -1437,12 +1437,14 @@ class ExprEvaluator {
         if (esc != null && esc.length() > 1) {
             throw new MemgresException("invalid escape string", "22025");
         }
+        // PG uses backslash as the default escape when no ESCAPE clause is specified
+        if (esc == null) esc = "\\";
 
         // Build regex from LIKE pattern with escape character support
         StringBuilder regex = new StringBuilder();
         for (int i = 0; i < pat.length(); i++) {
             char ch = pat.charAt(i);
-            if (esc != null && !esc.isEmpty() && ch == esc.charAt(0) && i + 1 < pat.length()) {
+            if (!esc.isEmpty() && ch == esc.charAt(0) && i + 1 < pat.length()) {
                 // Next character is literal (escaped)
                 i++;
                 regex.append(java.util.regex.Pattern.quote(String.valueOf(pat.charAt(i))));
@@ -1771,12 +1773,17 @@ class ExprEvaluator {
         return true;
     }
 
-    /** Convert a SQL LIKE pattern to a Java regex, properly escaping regex special chars in literal parts. */
+    /** Convert a SQL LIKE pattern to a Java regex, using backslash as the default escape. */
     static String likeToRegex(String likePattern) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < likePattern.length(); i++) {
             char c = likePattern.charAt(i);
-            if (c == '%') {
+            if (c == '\\' && i + 1 < likePattern.length()) {
+                // Backslash escapes the next character (PG default escape)
+                i++;
+                char next = likePattern.charAt(i);
+                sb.append(java.util.regex.Pattern.quote(String.valueOf(next)));
+            } else if (c == '%') {
                 sb.append(".*");
             } else if (c == '_') {
                 sb.append(".");

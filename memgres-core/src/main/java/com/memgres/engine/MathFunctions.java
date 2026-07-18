@@ -59,7 +59,9 @@ class MathFunctions {
                             .setScale(scale, java.math.RoundingMode.HALF_UP);
                     return bd;
                 }
-                return (long) Math.round(val);
+                // Use HALF_UP (round away from zero) to match PG: round(-2.5) = -3
+                return java.math.BigDecimal.valueOf(val)
+                        .setScale(0, java.math.RoundingMode.HALF_UP).longValue();
             }
             case "random": {
                 if (fn.args().size() == 2) {
