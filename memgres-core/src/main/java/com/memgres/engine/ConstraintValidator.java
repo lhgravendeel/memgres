@@ -595,6 +595,8 @@ class ConstraintValidator {
                                 sc.getOnDelete() == StoredConstraint.FkAction.CASCADE ? "delete" : "update");
                     }
 
+                    String childSchemaName = schema.getName();
+
                     switch (sc.getOnDelete()) {
                         case CASCADE: {
                             // Collect rows to delete, then use Table.deleteRows for proper index maintenance
@@ -610,7 +612,13 @@ class ConstraintValidator {
                                 if (matches) deleteSet.add(childRow);
                             }
                             if (!deleteSet.isEmpty()) {
+                                // Recurse: handle FK cascades on the child table's dependents before deleting
+                                for (Object[] childRow : deleteSet) {
+                                    handleFkOnDelete(childTable, childRow);
+                                }
                                 childTable.deleteRows(deleteSet);
+                                // Record undo so ROLLBACK can restore the deleted rows
+                                recordCascadeDeleteUndo(childSchemaName, childTable.getName(), new ArrayList<>(deleteSet));
                             }
                             break;
                         }
@@ -641,6 +649,9 @@ class ConstraintValidator {
                                         newVals[idx] = null;
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
+                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
+                                    // Recurse: the child row's FK columns changed, so its dependents may need cascading
+                                    handleFkOnUpdate(childTable, oldVals, childRow);
                                 }
                             }
                             break;
@@ -664,6 +675,8 @@ class ConstraintValidator {
                                                 : null;
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
+                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
+                                    handleFkOnUpdate(childTable, oldVals, childRow);
                                 }
                             }
                             break;
@@ -760,6 +773,8 @@ class ConstraintValidator {
                         newParentVals[i] = newRow[parentColIndices[i]];
                     }
 
+                    String childSchemaName = schema.getName();
+
                     switch (sc.getOnUpdate()) {
                         case CASCADE: {
                             for (Object[] childRow : childTable.getRows()) {
@@ -777,6 +792,9 @@ class ConstraintValidator {
                                         newVals[childColIndices[i]] = newParentVals[i];
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
+                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
+                                    // Recurse: the child row's FK columns changed
+                                    handleFkOnUpdate(childTable, oldVals, childRow);
                                 }
                             }
                             break;
@@ -808,6 +826,8 @@ class ConstraintValidator {
                                         newVals[idx] = null;
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
+                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
+                                    handleFkOnUpdate(childTable, oldVals, childRow);
                                 }
                             }
                             break;
@@ -831,6 +851,8 @@ class ConstraintValidator {
                                                 : null;
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
+                                    recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
+                                    handleFkOnUpdate(childTable, oldVals, childRow);
                                 }
                             }
                             break;
@@ -1357,6 +1379,23 @@ class ConstraintValidator {
     /** Check if a string matches the pg_lsn format: hex/hex (e.g., "0/4000000"). */
     private static boolean isLsnString(String s) {
         return s.matches("[0-9a-fA-F]+/[0-9a-fA-F]+");
+    }
+
+    /** Record an undo entry for cascaded child row deletes so ROLLBACK can restore them. */
+    private void recordCascadeDeleteUndo(String schemaName, String tableName, List<Object[]> rows) {
+        if (rows.isEmpty()) return;
+        executor.recordUndo(new Session.DeleteUndo(schemaName, tableName, rows));
+        if (executor.session != null) {
+            executor.session.trackUncommittedDelete(schemaName + "." + tableName, rows);
+        }
+    }
+
+    /** Record an undo entry for a cascaded child row update so ROLLBACK can restore it. */
+    private void recordCascadeUpdateUndo(String schemaName, String tableName, Object[] row, Object[] oldValues) {
+        executor.recordUndo(new Session.UpdateUndo(schemaName, tableName, row, oldValues));
+        if (executor.session != null) {
+            executor.session.trackUncommittedUpdate(schemaName + "." + tableName, row, oldValues);
+        }
     }
 
     /** Check if a child table affected by FK cascade is published and needs replica identity. */
