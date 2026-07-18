@@ -806,11 +806,10 @@ class SelectExecutor {
         // with distinct DISTINCT ON keys but an incidentally-equal projection collapse into one
         // (mtask-8 Group 4) -- PostgreSQL keeps both.
         if (stmt.distinct() && (stmt.distinctOn() == null || stmt.distinctOn().isEmpty())) {
-            Set<String> seen = new LinkedHashSet<>();
+            Set<RowKey> seen = new LinkedHashSet<>();
             List<Object[]> deduped = new ArrayList<>();
             for (Object[] row : resultRows) {
-                String key = Arrays.deepToString(row);
-                if (seen.add(key)) {
+                if (seen.add(new RowKey(row))) {
                     deduped.add(row);
                 }
             }
@@ -899,7 +898,32 @@ class SelectExecutor {
                             }
                             resultColumns.add(binding.table().getColumns().get(i));
                             final int colIdx = i;
-                            projections.add(ctx -> ctx.getBindings().get(bindingIdx).row()[colIdx]);
+                            // For USING columns, use COALESCE(left, right) so unmatched
+                            // right rows show the right side's value (PG behavior)
+                            if (usingColumnsForDedup != null && usingColumnsForDedup.contains(colNameLower)) {
+                                // Find the same column in other bindings for COALESCE
+                                final String usingCol = colNameLower;
+                                final int leftBindingIdx = bindingIdx;
+                                final int leftColIdx = colIdx;
+                                projections.add(ctx -> {
+                                    Object val = ctx.getBindings().get(leftBindingIdx).row()[leftColIdx];
+                                    if (val != null) return val;
+                                    // Left is null — search other bindings for the same column
+                                    for (int bi = 0; bi < ctx.getBindings().size(); bi++) {
+                                        if (bi == leftBindingIdx) continue;
+                                        RowContext.TableBinding ob = ctx.getBindings().get(bi);
+                                        for (int ci = 0; ci < ob.table().getColumns().size(); ci++) {
+                                            if (ob.table().getColumns().get(ci).getName().equalsIgnoreCase(usingCol)) {
+                                                Object rval = ob.row()[ci];
+                                                if (rval != null) return rval;
+                                            }
+                                        }
+                                    }
+                                    return null;
+                                });
+                            } else {
+                                projections.add(ctx -> ctx.getBindings().get(bindingIdx).row()[colIdx]);
+                            }
                         }
                     }
                 }

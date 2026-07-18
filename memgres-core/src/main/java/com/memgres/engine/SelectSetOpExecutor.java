@@ -124,12 +124,12 @@ class SelectSetOpExecutor {
             case INTERSECT: {
                 if (stmt.all()) {
                     // Multiset semantics: each left row matches at most once per right occurrence.
-                    Map<String, Integer> rightCounts = new HashMap<>();
+                    Map<RowKey, Integer> rightCounts = new HashMap<>();
                     for (Object[] row : rightResult.getRows()) {
-                        rightCounts.merge(Arrays.deepToString(row), 1, Integer::sum);
+                        rightCounts.merge(new RowKey(row), 1, Integer::sum);
                     }
                     for (Object[] row : leftResult.getRows()) {
-                        String key = Arrays.deepToString(row);
+                        RowKey key = new RowKey(row);
                         int remaining = rightCounts.getOrDefault(key, 0);
                         if (remaining > 0) {
                             resultRows.add(row);
@@ -137,13 +137,13 @@ class SelectSetOpExecutor {
                         }
                     }
                 } else {
-                    Set<String> rightKeys = new HashSet<>();
+                    Set<RowKey> rightKeys = new HashSet<>();
                     for (Object[] row : rightResult.getRows()) {
-                        rightKeys.add(Arrays.deepToString(row));
+                        rightKeys.add(new RowKey(row));
                     }
-                    Set<String> seen = new HashSet<>();
+                    Set<RowKey> seen = new HashSet<>();
                     for (Object[] row : leftResult.getRows()) {
-                        String key = Arrays.deepToString(row);
+                        RowKey key = new RowKey(row);
                         if (rightKeys.contains(key) && seen.add(key)) {
                             resultRows.add(row);
                         }
@@ -152,13 +152,13 @@ class SelectSetOpExecutor {
                 break;
             }
             case EXCEPT: {
-                Map<String, Integer> rightCounts = new HashMap<>();
+                Map<RowKey, Integer> rightCounts = new HashMap<>();
                 for (Object[] row : rightResult.getRows()) {
-                    rightCounts.merge(Arrays.deepToString(row), 1, Integer::sum);
+                    rightCounts.merge(new RowKey(row), 1, Integer::sum);
                 }
-                Set<String> seen = new HashSet<>();
+                Set<RowKey> seen = new HashSet<>();
                 for (Object[] row : leftResult.getRows()) {
-                    String key = Arrays.deepToString(row);
+                    RowKey key = new RowKey(row);
                     if (stmt.all()) {
                         int remaining = rightCounts.getOrDefault(key, 0);
                         if (remaining > 0) {
@@ -257,10 +257,10 @@ class SelectSetOpExecutor {
     }
 
     static List<Object[]> deduplicateRows(List<Object[]> rows) {
-        Set<String> seen = new LinkedHashSet<>();
+        Set<RowKey> seen = new LinkedHashSet<>();
         List<Object[]> result = new ArrayList<>();
         for (Object[] row : rows) {
-            if (seen.add(Arrays.deepToString(row))) {
+            if (seen.add(new RowKey(row))) {
                 result.add(row);
             }
         }

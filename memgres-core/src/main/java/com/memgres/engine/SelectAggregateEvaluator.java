@@ -175,7 +175,7 @@ class SelectAggregateEvaluator {
                 StringBuilder keyBuilder = new StringBuilder();
                 for (Expression groupExpr : resolvedGroupBy) {
                     Object val = executor.evalExpr(groupExpr, ctx);
-                    keyBuilder.append(val == null ? "\0NULL" : val.toString()).append('\1');
+                    keyBuilder.append(RowKey.valueKey(val)).append('\1');
                 }
                 groupMap.computeIfAbsent(keyBuilder.toString(), k -> new ArrayList<>()).add(ctx);
             }
