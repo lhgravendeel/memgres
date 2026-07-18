@@ -573,6 +573,11 @@ public class Session {
     }
 
     public void commit() {
+        // If the transaction is in FAILED (aborted) state, COMMIT acts as ROLLBACK (PG behavior)
+        if (status == TransactionStatus.FAILED) {
+            rollback();
+            return;
+        }
         // SSI write-skew detection: must happen before any commit side effects
         try {
             checkSsiConflicts();
