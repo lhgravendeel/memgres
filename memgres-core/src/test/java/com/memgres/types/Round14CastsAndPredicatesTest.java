@@ -265,9 +265,9 @@ class Round14CastsAndPredicatesTest {
 
     @Test
     void numeric_to_int_rounding_half_away() throws SQLException {
-        // PG rounds half away from zero (banker's rounding for numeric::int? actually half-to-even)
-        assertEquals(2, scalarInt("SELECT (2.5)::int"));
-        assertEquals(4, scalarInt("SELECT (3.5)::int"));  // half-to-even
+        // PG rounds half away from zero (HALF_UP): 2.5 → 3, 3.5 → 4
+        assertEquals(3, scalarInt("SELECT (2.5)::int"));
+        assertEquals(4, scalarInt("SELECT (3.5)::int"));
     }
 
     @Test
