@@ -434,23 +434,23 @@ class DmlExecutor {
                         }
                         Object[] oldRow = Arrays.copyOf(conflictRow, conflictRow.length);
                         Object[] newRow = Arrays.copyOf(conflictRow, conflictRow.length);
-                        try {
-                            for (InsertStmt.SetClause set : stmt.onConflict().doUpdate()) {
-                                int colIdx = conflictTable.getColumnIndex(set.column());
-                                if (colIdx < 0) {
-                                    throw new MemgresException("Column not found: " + set.column());
-                                }
-                                Object val = executor.evalExpr(set.value(), conflictCtx);
-                                newRow[colIdx] = TypeCoercion.coerceForStorage(val, conflictTable.getColumns().get(colIdx));
+                        for (InsertStmt.SetClause set : stmt.onConflict().doUpdate()) {
+                            int colIdx = conflictTable.getColumnIndex(set.column());
+                            if (colIdx < 0) {
+                                throw new MemgresException("Column not found: " + set.column());
                             }
-                            computeGeneratedColumns(conflictTable, newRow);
+                            Object val = executor.evalExpr(set.value(), conflictCtx);
+                            newRow[colIdx] = TypeCoercion.coerceForStorage(val, conflictTable.getColumns().get(colIdx));
+                        }
+                        computeGeneratedColumns(conflictTable, newRow);
+                        // Validate constraints BEFORE mutating the row to avoid index corruption
+                        executor.constraintValidator.validateConstraints(conflictTable, newRow, conflictRow);
+                        try {
                             conflictTable.updateRowInPlace(conflictRow, oldRow, newRow);
                         } catch (Exception e) {
-                            // Restore old values and re-add to index on failure
-                            conflictTable.updateRowInPlace(conflictRow, conflictRow, oldRow);
+                            conflictTable.updateRowInPlace(conflictRow, newRow, oldRow);
                             throw e;
                         }
-                        executor.constraintValidator.validateConstraints(conflictTable, conflictRow, conflictRow);
                         recordUpdateUndo(stmt.schema(), conflictTable.getName(), conflictRow, oldRow);
                         if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                             returningRows.add(evalReturning(stmt.returning(), conflictTable, stmt.alias(), conflictRow, oldRow, conflictRow));
