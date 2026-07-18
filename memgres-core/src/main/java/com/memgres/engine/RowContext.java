@@ -182,6 +182,9 @@ public class RowContext {
                 }
                 if (!found) {
                     result = b.row()[idx];
+                } else if (isUsingCol && result == null) {
+                    // USING column COALESCE: if left side is NULL, use right side
+                    result = b.row()[idx];
                 }
                 found = true;
             }

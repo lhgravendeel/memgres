@@ -508,15 +508,29 @@ class SelectWindowEvaluator {
                 }
                 case "last_value": {
                     Expression arg = wf.args().get(0);
-                    if (wf.frame() != null || wf.orderBy() == null || wf.orderBy().isEmpty()) {
+                    if (wf.orderBy() == null || wf.orderBy().isEmpty()) {
+                        // No ORDER BY: frame is entire partition
                         Object lastVal = sortedPartition.isEmpty() ? null :
                                 executor.evalExpr(arg, contexts.get(sortedPartition.get(sortedPartition.size() - 1)));
                         for (int idx : sortedPartition) {
                             results[idx] = lastVal;
                         }
                     } else {
+                        // With ORDER BY: default RANGE frame ends at last peer
                         for (int i = 0; i < sortedPartition.size(); i++) {
-                            results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(i)));
+                            int frameEnd;
+                            if (wf.frame() != null) {
+                                frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size(),
+                                        wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
+                            } else {
+                                frameEnd = i;
+                                while (frameEnd + 1 < sortedPartition.size() && orderByValuesEqual(wf.orderBy(), contexts,
+                                        sortedPartition.get(i), sortedPartition.get(frameEnd + 1))) {
+                                    frameEnd++;
+                                }
+                            }
+                            frameEnd = Math.min(sortedPartition.size() - 1, frameEnd);
+                            results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameEnd)));
                         }
                     }
                     break;
@@ -534,9 +548,13 @@ class SelectWindowEvaluator {
                             frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size(),
                                     wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
                         } else if (hasOrderBy) {
-                            // Default frame with ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            // Default frame with ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW (including peers)
                             frameStart = 0;
                             frameEnd = i;
+                            while (frameEnd + 1 < sortedPartition.size() && orderByValuesEqual(wf.orderBy(), contexts,
+                                    sortedPartition.get(i), sortedPartition.get(frameEnd + 1))) {
+                                frameEnd++;
+                            }
                         } else {
                             frameStart = 0;
                             frameEnd = sortedPartition.size() - 1;
@@ -613,8 +631,14 @@ class SelectWindowEvaluator {
                 frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size(),
                         wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
             } else if (hasOrderBy) {
+                // Default frame with ORDER BY is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW,
+                // which includes all peers (rows with the same ORDER BY values)
                 frameStart = 0;
                 frameEnd = i;
+                while (frameEnd + 1 < sortedPartition.size() && orderByValuesEqual(wf.orderBy(), contexts,
+                        sortedPartition.get(i), sortedPartition.get(frameEnd + 1))) {
+                    frameEnd++;
+                }
             } else {
                 frameStart = 0;
                 frameEnd = sortedPartition.size() - 1;

@@ -175,11 +175,14 @@ class SelectCteExecutor {
         String cteLower = cte.name().toLowerCase();
         detectMutualRecursionCycle(cte, cteLower);
         executor.executingCtes.add(cteLower);
-        int maxIterations = 1000;
-        int maxRows = 10000; // safety cap to prevent OOM in mutual recursion scenarios
+        int maxIterations = 100000;
+        int maxRows = 10000000; // safety cap to prevent OOM in mutual recursion scenarios
         try {
         for (int iter = 0; iter < maxIterations && !workingSet.isEmpty(); iter++) {
-            if (allRows.size() > maxRows) break; // prevent runaway growth
+            if (allRows.size() > maxRows) {
+                throw new MemgresException(
+                        "recursive query exceeded maximum number of rows (" + maxRows + ")", "54001");
+            }
             String cteName = cte.name().toLowerCase();
             Schema targetSchema = executor.database.getOrCreateSchema(executor.defaultSchema());
             Table previousTable = targetSchema.getTable(cteName);
