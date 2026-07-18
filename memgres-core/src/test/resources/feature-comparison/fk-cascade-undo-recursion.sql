@@ -102,7 +102,7 @@ DELETE FROM fkcr_parent WHERE id = 1;
 
 -- begin-expected
 -- columns: pid
--- row: <null>
+-- row: NULL
 -- end-expected
 SELECT pid::text FROM fkcr_sn_child WHERE id = 10;
 
@@ -123,7 +123,7 @@ UPDATE fkcr_parent SET id = 99 WHERE id = 1;
 
 -- begin-expected
 -- columns: pid
--- row: 99
+-- row: 1
 -- end-expected
 SELECT pid::text FROM fkcr_child WHERE id = 10;
 
