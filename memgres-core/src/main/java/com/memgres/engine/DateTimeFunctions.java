@@ -327,7 +327,7 @@ class DateTimeFunctions {
         java.time.LocalDateTime dt;
         if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
         else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
-        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).toLocalDateTime();
+        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).withOffsetSameInstant(java.time.ZoneOffset.UTC).toLocalDateTime();
         else dt = TypeCoercion.toLocalDateTime(source);
 
         switch (field) {
@@ -434,7 +434,7 @@ class DateTimeFunctions {
         boolean isDate = source instanceof java.time.LocalDate;
         if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
         else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
-        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).toLocalDateTime();
+        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).withOffsetSameInstant(java.time.ZoneOffset.UTC).toLocalDateTime();
         else dt = TypeCoercion.toLocalDateTime(source);
 
         java.time.LocalDateTime result;

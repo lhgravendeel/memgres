@@ -164,6 +164,15 @@ class PgWireBinaryCodec {
         if (dscale > 0) {
             sb.append('.');
             int fracDigitsWritten = 0;
+            // When weight < -1, there are leading zero groups before the first digit.
+            // E.g. weight=-2 means 1 group of "0000" padding before digits[0].
+            int leadingZeroGroups = Math.max(-intGroups, 0);
+            for (int z = 0; z < leadingZeroGroups && fracDigitsWritten < dscale; z++) {
+                for (int j = 0; j < 4 && fracDigitsWritten < dscale; j++) {
+                    sb.append('0');
+                    fracDigitsWritten++;
+                }
+            }
             for (int i = Math.max(intGroups, 0); i < ndigits && fracDigitsWritten < dscale; i++) {
                 String group = String.format("%04d", digits[i]);
                 for (int j = 0; j < 4 && fracDigitsWritten < dscale; j++) {

@@ -1391,6 +1391,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         StringBuilder current = new StringBuilder();
         boolean inString = false;
         char stringChar = 0;
+        boolean eString = false; // true when inside E'...' (backslash escaping)
         // Track BEGIN ATOMIC ... END blocks so semicolons inside are not treated as statement separators.
         // caseDepth counts nested CASE expressions whose END should not close the block.
         boolean inBeginAtomic = false;
@@ -1407,15 +1408,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     current.append(delimiter);
                     i = j + 1;
                     int close = -1;
-                    boolean inBodyString = false;
+                    // Dollar-quoted bodies are fully literal — no apostrophe tracking needed.
                     for (int k = i; k <= sql.length() - delimiter.length(); k++) {
-                        char bc = sql.charAt(k);
-                        if (inBodyString) {
-                            if (bc == '\'' && k + 1 < sql.length() && sql.charAt(k + 1) == '\'') { k++; }
-                            else if (bc == '\'') { inBodyString = false; }
-                            continue;
-                        }
-                        if (bc == '\'') { inBodyString = true; continue; }
                         if (sql.startsWith(delimiter, k)) { close = k; break; }
                     }
                     if (close >= 0) {
@@ -1454,16 +1448,28 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
             if (inString) {
                 current.append(c);
-                if (c == stringChar) {
+                if (eString && c == '\\' && i + 1 < sql.length()) {
+                    // In E-strings, backslash escapes the next character
+                    current.append(sql.charAt(++i));
+                } else if (c == stringChar) {
                     if (i + 1 < sql.length() && sql.charAt(i + 1) == stringChar) {
                         current.append(sql.charAt(++i));
                     } else {
                         inString = false;
+                        eString = false;
                     }
                 }
             } else if (c == '\'' || c == '"') {
                 inString = true;
                 stringChar = c;
+                // Check if this is an E-string (E' or e') — E must not be part of a longer identifier
+                if (c == '\'' && current.length() > 0) {
+                    char prev = current.charAt(current.length() - 1);
+                    if ((prev == 'E' || prev == 'e') &&
+                            (current.length() == 1 || !Character.isLetterOrDigit(current.charAt(current.length() - 2)) && current.charAt(current.length() - 2) != '_')) {
+                        eString = true;
+                    }
+                }
                 current.append(c);
             } else if (c == '/' && i + 1 < sql.length() && sql.charAt(i + 1) == '*') {
                 current.append(c);
