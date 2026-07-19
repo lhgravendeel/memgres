@@ -1818,14 +1818,13 @@ class CopyProtocolTest {
     }
 
     @Test @Order(411)
-    void whitespace_onlyWhitespaceLines_ignored() throws Exception {
+    void whitespace_blankLine_multiColumn_errors() throws Exception {
         exec("CREATE TABLE cf_wsl(id int, val text)");
-        // Empty/blank lines between data lines
-        copyIn("COPY cf_wsl FROM STDIN WITH (FORMAT csv)", "1,first\n\n2,second\n");
-        // Blank line may be treated as a row with empty fields or ignored
-        // PG treats blank lines as a row with all-null columns in CSV
-        // This test just verifies it doesn't crash
-        assertTrue(rowCount("cf_wsl") >= 2, "At least the real rows should be imported");
+        // A blank line in CSV is a data row with a single (NULL) field, so for a
+        // multi-column table PG raises 22P04 "missing data for column".
+        SQLException ex = assertThrows(SQLException.class,
+                () -> copyIn("COPY cf_wsl FROM STDIN WITH (FORMAT csv)", "1,first\n\n2,second\n"));
+        assertEquals("22P04", ex.getSQLState(), "blank line for a 2-column table must raise 22P04");
         exec("DROP TABLE cf_wsl");
     }
 
