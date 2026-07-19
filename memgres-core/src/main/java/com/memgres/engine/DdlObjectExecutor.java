@@ -1353,7 +1353,7 @@ class DdlObjectExecutor {
                     stmt.name(), timing, trigEvent, stmt.table(), stmt.functionName(),
                     trigEvent == PgTrigger.Event.UPDATE ? stmt.updateOfColumns() : null,
                     stmt.newTransitionTable(), stmt.oldTransitionTable(), stmt.forEachStatement(),
-                    stmt.whenClause(), stmt.deferrable, stmt.initiallyDeferred);
+                    stmt.whenClause(), stmt.deferrable, stmt.initiallyDeferred, stmt.functionArgs());
             trigger.setSchemaName(triggerTableSchema);
             executor.database.addTrigger(trigger);
         }

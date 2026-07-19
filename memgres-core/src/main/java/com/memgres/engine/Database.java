@@ -1291,7 +1291,11 @@ public class Database {
     }
 
     public List<PgTrigger> getTriggersForTable(String tableName) {
-        return triggers.getOrDefault(tableName.toLowerCase(), Cols.listOf());
+        List<PgTrigger> list = triggers.get(tableName.toLowerCase());
+        if (list == null || list.isEmpty()) return Cols.listOf();
+        List<PgTrigger> sorted = new ArrayList<>(list);
+        sorted.sort(java.util.Comparator.comparing(t -> t.getName().toLowerCase()));
+        return sorted;
     }
 
     public Map<String, List<PgTrigger>> getAllTriggers() {
@@ -1303,6 +1307,10 @@ public class Database {
         if (list != null) {
             list.removeIf(t -> t.getName().equalsIgnoreCase(name));
         }
+    }
+
+    public void removeTriggersForTable(String tableName) {
+        triggers.remove(tableName.toLowerCase());
     }
 
     // Event triggers

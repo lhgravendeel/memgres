@@ -20,6 +20,7 @@ public class PgTrigger {
     private final String whenClause; // WHEN (condition) clause text
     private final boolean deferrable; // CONSTRAINT TRIGGER ... DEFERRABLE
     private final boolean initiallyDeferred; // DEFERRABLE INITIALLY DEFERRED
+    private final java.util.List<String> args; // function arguments from EXECUTE FUNCTION func(arg1, arg2, ...)
     private String schemaName; // schema where the trigger's table lives
     private boolean disabled; // true when ALTER TABLE ... DISABLE TRIGGER sets this
 
@@ -37,6 +38,14 @@ public class PgTrigger {
     public PgTrigger(String name, Timing timing, Event event, String tableName, String functionName,
                      java.util.List<String> updateColumns, String newTransitionTable, String oldTransitionTable,
                      boolean forEachStatement, String whenClause, boolean deferrable, boolean initiallyDeferred) {
+        this(name, timing, event, tableName, functionName, updateColumns, newTransitionTable, oldTransitionTable,
+                forEachStatement, whenClause, deferrable, initiallyDeferred, null);
+    }
+
+    public PgTrigger(String name, Timing timing, Event event, String tableName, String functionName,
+                     java.util.List<String> updateColumns, String newTransitionTable, String oldTransitionTable,
+                     boolean forEachStatement, String whenClause, boolean deferrable, boolean initiallyDeferred,
+                     java.util.List<String> args) {
         this.name = name;
         this.timing = timing;
         this.event = event;
@@ -49,6 +58,7 @@ public class PgTrigger {
         this.whenClause = whenClause;
         this.deferrable = deferrable;
         this.initiallyDeferred = initiallyDeferred;
+        this.args = args;
     }
 
     public String getName() {
@@ -113,5 +123,9 @@ public class PgTrigger {
 
     public boolean isInitiallyDeferred() {
         return initiallyDeferred;
+    }
+
+    public java.util.List<String> getArgs() {
+        return args;
     }
 }

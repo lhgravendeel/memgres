@@ -21,6 +21,7 @@ public final class CreateTriggerStmt implements Statement {
     public final boolean forEachStatement;
     public final boolean deferrable;
     public final boolean initiallyDeferred;
+    public final List<String> functionArgs;
 
     public CreateTriggerStmt(
             String name,
@@ -56,6 +57,28 @@ public final class CreateTriggerStmt implements Statement {
             boolean deferrable,
             boolean initiallyDeferred
     ) {
+        this(name, timing, events, table, schema, functionName, orReplace, whenClause,
+                updateOfColumns, newTransitionTable, oldTransitionTable, forEachStatement,
+                deferrable, initiallyDeferred, null);
+    }
+
+    public CreateTriggerStmt(
+            String name,
+            String timing,
+            List<String> events,
+            String table,
+            String schema,
+            String functionName,
+            boolean orReplace,
+            String whenClause,
+            List<String> updateOfColumns,
+            String newTransitionTable,
+            String oldTransitionTable,
+            boolean forEachStatement,
+            boolean deferrable,
+            boolean initiallyDeferred,
+            List<String> functionArgs
+    ) {
         this.name = name;
         this.timing = timing;
         this.events = events;
@@ -70,6 +93,7 @@ public final class CreateTriggerStmt implements Statement {
         this.forEachStatement = forEachStatement;
         this.deferrable = deferrable;
         this.initiallyDeferred = initiallyDeferred;
+        this.functionArgs = functionArgs;
     }
 
     /** Backward-compatible constructor without whenClause. */
@@ -97,6 +121,7 @@ public final class CreateTriggerStmt implements Statement {
     public String newTransitionTable() { return newTransitionTable; }
     public String oldTransitionTable() { return oldTransitionTable; }
     public boolean forEachStatement() { return forEachStatement; }
+    public List<String> functionArgs() { return functionArgs; }
 
     @Override
     public boolean equals(Object o) {

@@ -198,7 +198,12 @@ class DmlExecutor {
             }
         }
 
+        // Fire BEFORE STATEMENT triggers
+        triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, table, null, null);
+
         List<Object[]> insertedRows = new ArrayList<>(); // for transition tables in statement triggers
+        List<Object[]> afterRowTriggerNewRows = new ArrayList<>(); // queue AFTER ROW triggers
+        List<Table> afterRowTriggerTables = new ArrayList<>(); // corresponding target tables for AFTER ROW
         for (List<Expression> valueRow : valueRows) {
             Object[] row = new Object[table.getColumns().size()];
 
@@ -319,8 +324,10 @@ class DmlExecutor {
                 continue;
             }
 
-            // BEFORE INSERT triggers
-            row = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, table);
+            // BEFORE INSERT triggers (use leaf partition for correct TG_TABLE_NAME)
+            Table beforeTrigTable = table;
+            try { beforeTrigTable = partitionHelper.routeToPartition(table, row); } catch (Exception ignored) {}
+            row = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, beforeTrigTable);
             if (row == null) {
                 // BEFORE trigger returned NULL: skip this row (not inserted, not counted, no RETURNING)
                 continue;
@@ -536,13 +543,20 @@ class DmlExecutor {
             inserted++;
             insertedRows.add(Arrays.copyOf(row, row.length));
 
-            // AFTER INSERT triggers (row-level)
-            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, row, null, table);
+            // Queue AFTER INSERT row triggers (PG fires all AFTER ROW triggers after all rows are processed)
+            afterRowTriggerNewRows.add(Arrays.copyOf(row, row.length));
+            afterRowTriggerTables.add(targetTable);
 
             // Collect RETURNING row
             if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                 returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, null, row));
             }
+        }
+
+        // Fire queued AFTER ROW triggers (use leaf partition table for correct TG_TABLE_NAME)
+        for (int i = 0; i < afterRowTriggerNewRows.size(); i++) {
+            Table trigTable = afterRowTriggerTables.get(i);
+            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, afterRowTriggerNewRows.get(i), null, trigTable);
         }
 
         // Fire statement-level AFTER triggers with transition tables
@@ -1033,6 +1047,9 @@ class DmlExecutor {
             rows.addAll(table.getRows());
         }
 
+        // Fire BEFORE STATEMENT triggers
+        triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, table, null, null);
+
         boolean fromUpdateHasVirtual = hasVirtualColumns(table);
         if (fromContexts != null) {
             // Multi-table UPDATE: join main table with FROM tables
@@ -1052,6 +1069,10 @@ class DmlExecutor {
             // Process matched rows with their FROM context
             Set<Object[]> updated = Collections.newSetFromMap(new IdentityHashMap<>());
             int updatedCount = 0;
+            List<Object[]> fromOldRows = new ArrayList<>();
+            List<Object[]> fromNewRows = new ArrayList<>();
+            List<Object[]> fromAfterOld = new ArrayList<>();
+            List<Object[]> fromAfterNew = new ArrayList<>();
             for (int i = 0; i < matchedRows.size(); i++) {
                 Object[] row = matchedRows.get(i);
                 if (updated.contains(row)) continue; // Each row updated at most once
@@ -1059,7 +1080,6 @@ class DmlExecutor {
                 Object[] oldRow = Arrays.copyOf(row, row.length);
                 Object[] newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
                 if (newRow == null) {
-                    // BEFORE trigger returned NULL: leave row untouched, not counted, no RETURNING
                     continue;
                 }
                 RowContext ctx = matchedContexts.get(i);
@@ -1072,14 +1092,21 @@ class DmlExecutor {
                 recordRowUpdateMeta(stmt.schema(), table, row);
                 updatedCount++;
                 executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
-                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
+                fromOldRows.add(oldRow);
+                fromNewRows.add(Arrays.copyOf(row, row.length));
+                fromAfterOld.add(oldRow);
+                fromAfterNew.add(Arrays.copyOf(row, row.length));
                 if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                     returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, oldRow, row));
                 }
             }
+            // Fire queued AFTER ROW triggers
+            for (int i = 0; i < fromAfterNew.size(); i++) {
+                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, fromAfterNew.get(i), fromAfterOld.get(i), table, updatedColumnNames);
+            }
             int count = updatedCount;
-            // Fire statement-level AFTER UPDATE triggers
-            triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, null, null);
+            // Fire statement-level AFTER UPDATE triggers with transition tables
+            triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, fromNewRows, fromOldRows);
             // Track DML statistics
             if (count > 0) table.incrementTupUpdated(count);
             if (stmt.returning() != null && !stmt.returning().isEmpty()) {
@@ -1105,6 +1132,10 @@ class DmlExecutor {
         }
 
         int updatedCount = 0;
+        List<Object[]> simpleOldRows = new ArrayList<>();
+        List<Object[]> simpleNewRows = new ArrayList<>();
+        List<Object[]> simpleAfterOld = new ArrayList<>();
+        List<Object[]> simpleAfterNew = new ArrayList<>();
         for (Object[] row : rows) {
             Object[] oldRow = Arrays.copyOf(row, row.length);
 
@@ -1118,29 +1149,18 @@ class DmlExecutor {
             // BEFORE UPDATE triggers (see NEW with SET-applied values, can further modify NEW)
             newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, table, updatedColumnNames);
             if (newRow == null) {
-                // BEFORE trigger returned NULL: leave row untouched, not counted, no RETURNING
                 continue;
             }
 
-            // Recompute generated columns after setting new values
             computeGeneratedColumns(table, newRow);
-
-            // Validate WITH CHECK OPTION
             validationHelper.enforceViewCheckOption(viewCheckExprs, table, newRow);
-
-            // Validate constraints (pass original row reference to exclude self from uniqueness check)
             executor.constraintValidator.validateConstraints(table, newRow, row);
-
-            // Validate domain CHECK constraints
             validationHelper.validateDomainChecks(newRow, table);
-
-            // Record undo before applying the update
             recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
 
             // Check if partition key changed and row needs to move between partitions
             if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
                 Table newTarget = partitionHelper.routeToPartition(table, newRow);
-                // Find which partition currently owns this row
                 Table currentPartition = null;
                 List<Table> allParts = new ArrayList<>();
                 DmlPartitionHelper.collectAllPartitionTables(table, allParts);
@@ -1151,7 +1171,6 @@ class DmlExecutor {
                     }
                 }
                 if (currentPartition != null && currentPartition != newTarget) {
-                    // Move row: delete from old partition, insert into new
                     currentPartition.deleteRow(row);
                     Object[] movedRow = Arrays.copyOf(newRow, newRow.length);
                     newTarget.insertRow(movedRow);
@@ -1167,21 +1186,26 @@ class DmlExecutor {
                 recordRowUpdateMeta(stmt.schema(), table, row);
             }
             updatedCount++;
-
-            // Handle FK ON UPDATE cascades
             executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
 
-            // AFTER UPDATE triggers
-            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
+            // Queue AFTER ROW triggers
+            simpleOldRows.add(oldRow);
+            simpleNewRows.add(Arrays.copyOf(row, row.length));
+            simpleAfterOld.add(oldRow);
+            simpleAfterNew.add(Arrays.copyOf(row, row.length));
 
-            // Collect RETURNING row
             if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                 returningRows.add(evalReturning(stmt.returning(), table, updateAlias, row, oldRow, row));
             }
         }
 
-        // Fire statement-level AFTER UPDATE triggers
-        triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, null, null);
+        // Fire queued AFTER ROW triggers
+        for (int i = 0; i < simpleAfterNew.size(); i++) {
+            triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, simpleAfterNew.get(i), simpleAfterOld.get(i), table, updatedColumnNames);
+        }
+
+        // Fire statement-level AFTER UPDATE triggers with transition tables
+        triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, simpleNewRows, simpleOldRows);
 
         // Track DML statistics
         if (updatedCount > 0) table.incrementTupUpdated(updatedCount);
@@ -1463,10 +1487,13 @@ class DmlExecutor {
 
         // Fire BEFORE DELETE triggers (for DELETE, OLD = deleted row, NEW = null)
         List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(table.getName());
+
+        // Fire BEFORE STATEMENT triggers
+        triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, table, null, null);
+
         if (!triggers.isEmpty()) {
             Set<Object[]> skipRows = Collections.newSetFromMap(new IdentityHashMap<>());
             for (Object[] row : new ArrayList<>(toDelete)) {
-                // For DELETE triggers, pass row as OLD; the trigger function should RETURN OLD
                 Object[] result = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.DELETE, row, row, table);
                 if (result == null) skipRows.add(row);
             }
@@ -1475,8 +1502,6 @@ class DmlExecutor {
 
         List<Object[]> deletedRows = new ArrayList<>();
         List<Object[]> returningRows = new ArrayList<>();
-        // Collect returning data before deleting, using deleteOrder for USING joins to match PG row order.
-        // For non-USING deletes, preserve original table row order (PG returns rows in heap order).
         List<Object[]> orderedDelete;
         if (!deleteOrder.isEmpty()) {
             orderedDelete = deleteOrder;
@@ -1491,6 +1516,11 @@ class DmlExecutor {
                 returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, row, null));
             }
         }
+        // Capture old rows for transition tables before deletion
+        List<Object[]> oldRowsForTransition = new ArrayList<>();
+        for (Object[] row : toDelete) {
+            oldRowsForTransition.add(Arrays.copyOf(row, row.length));
+        }
         deletedRows.addAll(toDelete);
         // Remove matching rows atomically from each owning table
         for (Table t : tablesToScan) {
@@ -1499,15 +1529,15 @@ class DmlExecutor {
         int deleted = deletedRows.size();
         recordDeleteUndo(stmt.schema(), stmt.table(), deletedRows);
 
-        // Fire AFTER DELETE triggers (for DELETE, OLD = deleted row)
+        // Fire queued AFTER DELETE row triggers
         if (!triggers.isEmpty()) {
-            for (Object[] row : deletedRows) {
+            for (Object[] row : oldRowsForTransition) {
                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, row, row, table);
             }
         }
 
-        // Fire statement-level AFTER DELETE triggers
-        triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, table, null, null);
+        // Fire statement-level AFTER DELETE triggers with transition tables
+        triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, table, null, oldRowsForTransition);
 
         // Track DML statistics
         if (deleted > 0) table.incrementTupDeleted(deleted);

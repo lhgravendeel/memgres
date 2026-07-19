@@ -782,6 +782,8 @@ class DdlTableExecutor {
                 executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable));
             }
             schema.removeTable(name);
+            // Remove triggers associated with this table
+            executor.database.removeTriggersForTable(name);
             // Drop implicit sequences owned by SERIAL/IDENTITY columns
             // Only drop sequences that were auto-created (SERIAL types or __identity__ defaults),
             // NOT independently-created sequences referenced via DEFAULT nextval(...)

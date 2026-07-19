@@ -700,15 +700,21 @@ class DdlParser {
         String funcName = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) funcName = parser.readIdentifier();
         parser.expect(TokenType.LEFT_PAREN);
+        List<String> funcArgs = new ArrayList<>();
         while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-            parser.advance();
+            String argToken = parser.advance().value;
+            // Strip surrounding quotes from string literal args
+            if (argToken.length() >= 2 && argToken.startsWith("'") && argToken.endsWith("'")) {
+                argToken = argToken.substring(1, argToken.length() - 1);
+            }
+            funcArgs.add(argToken);
             parser.match(TokenType.COMMA);
         }
         parser.expect(TokenType.RIGHT_PAREN);
 
         return new CreateTriggerStmt(name, timing, events, table, tableSchema, funcName, orReplace, whenClause,
                 updateOfColumns.isEmpty() ? null : updateOfColumns, newTransitionTable, oldTransitionTable, !forEachRow,
-                trigDeferrable, trigInitiallyDeferred);
+                trigDeferrable, trigInitiallyDeferred, funcArgs.isEmpty() ? null : funcArgs);
     }
 
     // ---- CREATE VIEW ----

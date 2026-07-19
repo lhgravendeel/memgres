@@ -750,23 +750,27 @@ class CatalogConstraintBuilder {
             }
             int relOid = t != null ? oids.oid("rel:" + trigSchema + "." + first.getTableName()) : 0;
 
-            // Build tgtype bitmask: bit 0=ROW, bit 1=BEFORE, bit 2=AFTER, bit 3=INSERT, bit 4=DELETE, bit 5=UPDATE, bit 6=TRUNCATE
+            // Build tgtype bitmask (PG convention):
+            // bit 0 = ROW (1), bit 1 = BEFORE (2), bit 2 = INSERT (4),
+            // bit 3 = DELETE (8), bit 4 = UPDATE (16), bit 5 = TRUNCATE (32),
+            // bit 6 = INSTEAD (64)
             int tgtype = first.isForEachStatement() ? 0 : 1; // bit 0 = FOR EACH ROW
             if (first.getTiming() == PgTrigger.Timing.BEFORE) tgtype |= (1 << 1);
-            else if (first.getTiming() == PgTrigger.Timing.AFTER) tgtype |= (1 << 2);
+            else if (first.getTiming() == PgTrigger.Timing.INSTEAD_OF) tgtype |= (1 << 6);
+            // AFTER has no dedicated bit in PG (absence of BEFORE = AFTER)
             for (PgTrigger trig : entry.getValue()) {
                 switch (trig.getEvent()) {
                     case INSERT:
-                        tgtype |= (1 << 3);
+                        tgtype |= (1 << 2);
                         break;
                     case DELETE:
-                        tgtype |= (1 << 4);
+                        tgtype |= (1 << 3);
                         break;
                     case UPDATE:
-                        tgtype |= (1 << 5);
+                        tgtype |= (1 << 4);
                         break;
                     case TRUNCATE:
-                        tgtype |= (1 << 6);
+                        tgtype |= (1 << 5);
                         break;
                 }
             }
