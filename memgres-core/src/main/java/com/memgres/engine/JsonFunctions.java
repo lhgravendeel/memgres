@@ -346,10 +346,7 @@ class JsonFunctions {
                         || executor.isTruthy(executor.evalExpr(fn.args().get(3), ctx));
                 List<String> path = parsePathArg(pathArg);
                 String newValStr = jsonValueStr(newVal);
-                if (!createMissing && JsonOperations.extractPath(json.toString(), path) == null) {
-                    return json.toString();
-                }
-                return JsonOperations.jsonbSet(json.toString(), path, newValStr);
+                return JsonOperations.jsonbSet(json.toString(), path, newValStr, createMissing);
             }
             case "jsonb_set_lax": {
                 // PG 13+: jsonb_set_lax(target, path, new_value [, create_if_missing [, null_value_treatment]])
@@ -391,12 +388,7 @@ class JsonFunctions {
                     }
                 }
                 String newValStr = jsonValueStr(newVal);
-                // create_if_missing is true by default (and our jsonbSet always creates),
-                // so when it's explicitly false we should check existence first.
-                if (!createIfMissing && JsonOperations.extractPath(json.toString(), path) == null) {
-                    return json.toString();
-                }
-                return JsonOperations.jsonbSet(json.toString(), path, newValStr);
+                return JsonOperations.jsonbSet(json.toString(), path, newValStr, createIfMissing);
             }
             case "jsonb_strip_nulls": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
