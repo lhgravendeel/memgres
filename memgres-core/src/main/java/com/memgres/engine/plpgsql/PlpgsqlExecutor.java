@@ -472,12 +472,18 @@ public class PlpgsqlExecutor {
         if (trigger != null) {
             scope.declare("tg_op", trigger.getEvent().name());
             scope.declare("tg_name", trigger.getName());
-            scope.declare("tg_table_name", trigger.getTableName());
+            scope.declare("tg_table_name", table.getName());
             scope.declare("tg_table_schema", "public");
             scope.declare("tg_when", trigger.getTiming().name());
             scope.declare("tg_level", trigger.isForEachStatement() ? "STATEMENT" : "ROW");
-            scope.declare("tg_nargs", 0);
-            scope.declare("tg_argv", new String[0]);
+            java.util.List<String> trigArgs = trigger.getArgs();
+            if (trigArgs != null && !trigArgs.isEmpty()) {
+                scope.declare("tg_nargs", trigArgs.size());
+                scope.declare("tg_argv", trigArgs.toArray(new String[0]));
+            } else {
+                scope.declare("tg_nargs", 0);
+                scope.declare("tg_argv", new String[0]);
+            }
             // TG_RELID: OID of the table that caused the trigger invocation
             int relid = astExecutor.getSystemCatalog().getOid("rel:public." + trigger.getTableName());
             scope.declare("tg_relid", relid);
@@ -1765,6 +1771,9 @@ public class PlpgsqlExecutor {
                     if (!map.containsKey(lowerField)) {
                         String upperQ = qualifier.toUpperCase();
                         if (upperQ.equals("NEW") || upperQ.equals("OLD")) {
+                            // In PG, OLD is NULL during INSERT and NEW is NULL during DELETE.
+                            // An empty map means the record is effectively NULL — return null.
+                            if (map.isEmpty()) return null;
                             throw new MemgresException(
                                     "record \"" + qualifier.toLowerCase() + "\" has no field \"" + lowerField + "\"",
                                     "42703");
@@ -1927,6 +1936,11 @@ public class PlpgsqlExecutor {
                         if (!map.containsKey(field)) {
                             String qualifier = t.value().toUpperCase();
                             if (qualifier.equals("NEW") || qualifier.equals("OLD")) {
+                                if (map.isEmpty()) {
+                                    appendValue(sb, null);
+                                    i += 2;
+                                    continue;
+                                }
                                 throw new MemgresException(
                                         "record \"" + t.value().toLowerCase() + "\" has no field \"" + field + "\"",
                                         "42703");
@@ -1995,9 +2009,20 @@ public class PlpgsqlExecutor {
                             continue;
                         }
                         Object val = scope.get(t.value());
+                        // Handle String[] with direct subscript: TG_ARGV[0]
+                        if (val instanceof String[] && i + 3 < tokens.size()
+                                && tokens.get(i + 1).type() == TokenType.LEFT_BRACKET) {
+                            String[] arr = (String[]) val;
+                            String idxStr = tokens.get(i + 2).value();
+                            try {
+                                int idx = Integer.parseInt(idxStr);
+                                String elem = (idx >= 0 && idx < arr.length) ? arr[idx] : null;
+                                appendValue(sb, elem);
+                                i += 3; // skip [, idx, ]
+                                continue;
+                            } catch (NumberFormatException ignored) {}
+                        }
                         if (val instanceof Map) {
-                            // For single-entry maps not followed by DOT, substitute with the value
-                            // This handles FOR loop variables used as scalars: total := total + r
                             @SuppressWarnings("unchecked")
                             Map<String, Object> mapVal = (Map<String, Object>) val;
                             boolean followedByDot = i + 1 < tokens.size() && tokens.get(i + 1).type() == TokenType.DOT;
@@ -2252,6 +2277,15 @@ public class PlpgsqlExecutor {
                 sb.append(String.format("%02x", b & 0xff));
             }
             sb.append("'::bytea");
+        } else if (val instanceof String[]) {
+            String[] arr = (String[]) val;
+            sb.append("(ARRAY[");
+            for (int i = 0; i < arr.length; i++) {
+                if (i > 0) sb.append(",");
+                if (arr[i] == null) sb.append("NULL");
+                else sb.append("'").append(arr[i].replace("'", "''")).append("'");
+            }
+            sb.append("])");
         } else if (val instanceof java.util.List<?>) {
             java.util.List<?> list = (java.util.List<?>) val;
             // Format as parenthesized PG array: (ARRAY['a','b','c'])
