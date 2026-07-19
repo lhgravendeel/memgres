@@ -388,9 +388,7 @@ class CatalogCoreBuilder {
             StringBuilder sb = new StringBuilder("FOR VALUES IN (");
             for (int i = 0; i < t.getPartitionValues().size(); i++) {
                 if (i > 0) sb.append(", ");
-                Object v = t.getPartitionValues().get(i);
-                if (v instanceof String) sb.append("'").append(v).append("'");
-                else sb.append(v);
+                sb.append(formatBoundValue(t.getPartitionValues().get(i)));
             }
             sb.append(")");
             return sb.toString();
@@ -403,10 +401,25 @@ class CatalogCoreBuilder {
     }
 
     private static String formatBoundValue(Object val) {
+        if (val == null) return "NULL";
+        if (val instanceof PartitionBound) return val.toString();
+        if (val instanceof java.util.List) {
+            java.util.List<?> vals = (java.util.List<?>) val;
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < vals.size(); i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(formatBoundValue(vals.get(i)));
+            }
+            return sb.toString();
+        }
         if (val instanceof String) {
             String s = (String) val;
             if (s.equalsIgnoreCase("MINVALUE") || s.equalsIgnoreCase("MAXVALUE")) return s;
             return "'" + s + "'";
+        }
+        if (val instanceof java.time.LocalDate || val instanceof java.time.LocalDateTime
+                || val instanceof java.time.LocalTime || val instanceof java.time.OffsetDateTime) {
+            return "'" + val + "'";
         }
         return String.valueOf(val);
     }
