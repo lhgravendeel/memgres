@@ -959,7 +959,15 @@ public class Session {
             // Autocommit mode, deliver immediately
             database.getNotificationManager().notify(channel, payload != null ? payload : "", pid);
         } else {
-            // Inside transaction, defer until COMMIT
+            // Inside transaction, defer until COMMIT.
+            // PG delivers identical notifications (same channel + payload) signaled
+            // multiple times within one transaction only once: the enqueue is skipped
+            // when an identical entry is already pending in this transaction.
+            for (Notification pending : deferredNotifications) {
+                if (pending.channel().equals(n.channel()) && pending.payload().equals(n.payload())) {
+                    return;
+                }
+            }
             deferredNotifications.add(n);
         }
     }
