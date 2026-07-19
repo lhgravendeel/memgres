@@ -487,81 +487,59 @@ class SelectWindowEvaluator {
                 }
                 case "first_value": {
                     Expression arg = wf.args().get(0);
-                    if (wf.ignoreNulls()) {
-                        // IGNORE NULLS: find first non-null value in partition
-                        Object firstNonNull = null;
-                        for (int idx : sortedPartition) {
-                            Object val = executor.evalExpr(arg, contexts.get(idx));
-                            if (val != null) { firstNonNull = val; break; }
+                    for (int i = 0; i < sortedPartition.size(); i++) {
+                        int[] bounds = resolveFrameBounds(wf, i, contexts, sortedPartition);
+                        int frameStart = bounds[0];
+                        int frameEnd = bounds[1];
+                        Object val = null;
+                        if (frameStart <= frameEnd) {
+                            if (wf.ignoreNulls()) {
+                                // IGNORE NULLS: find first non-null value in the frame
+                                for (int fi = frameStart; fi <= frameEnd; fi++) {
+                                    Object v = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
+                                    if (v != null) { val = v; break; }
+                                }
+                            } else {
+                                val = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameStart)));
+                            }
                         }
-                        for (int idx : sortedPartition) {
-                            results[idx] = firstNonNull;
-                        }
-                    } else {
-                        Object firstVal = sortedPartition.isEmpty() ? null :
-                                executor.evalExpr(arg, contexts.get(sortedPartition.get(0)));
-                        for (int idx : sortedPartition) {
-                            results[idx] = firstVal;
-                        }
+                        results[sortedPartition.get(i)] = val;
                     }
                     break;
                 }
                 case "last_value": {
                     Expression arg = wf.args().get(0);
-                    if (wf.orderBy() == null || wf.orderBy().isEmpty()) {
-                        // No ORDER BY: frame is entire partition
-                        Object lastVal = sortedPartition.isEmpty() ? null :
-                                executor.evalExpr(arg, contexts.get(sortedPartition.get(sortedPartition.size() - 1)));
-                        for (int idx : sortedPartition) {
-                            results[idx] = lastVal;
-                        }
-                    } else {
-                        // With ORDER BY: default RANGE frame ends at last peer
-                        for (int i = 0; i < sortedPartition.size(); i++) {
-                            int frameEnd;
-                            if (wf.frame() != null) {
-                                frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size(),
-                                        wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
-                            } else {
-                                frameEnd = i;
-                                while (frameEnd + 1 < sortedPartition.size() && orderByValuesEqual(wf.orderBy(), contexts,
-                                        sortedPartition.get(i), sortedPartition.get(frameEnd + 1))) {
-                                    frameEnd++;
+                    for (int i = 0; i < sortedPartition.size(); i++) {
+                        int[] bounds = resolveFrameBounds(wf, i, contexts, sortedPartition);
+                        int frameStart = bounds[0];
+                        int frameEnd = bounds[1];
+                        Object val = null;
+                        if (frameStart <= frameEnd) {
+                            if (wf.ignoreNulls()) {
+                                // IGNORE NULLS: find last non-null value in the frame
+                                for (int fi = frameEnd; fi >= frameStart; fi--) {
+                                    Object v = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
+                                    if (v != null) { val = v; break; }
                                 }
+                            } else {
+                                val = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameEnd)));
                             }
-                            frameEnd = Math.min(sortedPartition.size() - 1, frameEnd);
-                            results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameEnd)));
                         }
+                        results[sortedPartition.get(i)] = val;
                     }
                     break;
                 }
                 case "nth_value": {
                     Expression arg = wf.args().get(0);
                     int nth = wf.args().size() > 1 ? executor.toInt(executor.evalExpr(wf.args().get(1), null)) : 1;
-                    boolean hasOrderBy = wf.orderBy() != null && !wf.orderBy().isEmpty();
-                    boolean hasFrame = wf.frame() != null;
                     for (int i = 0; i < sortedPartition.size(); i++) {
-                        int frameStart, frameEnd;
-                        if (hasFrame) {
-                            frameStart = resolveFrameBound(wf.frame().start(), i, sortedPartition.size(),
-                                    wf.frame().type(), wf.orderBy(), contexts, sortedPartition, true);
-                            frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size(),
-                                    wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
-                        } else if (hasOrderBy) {
-                            // Default frame with ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW (including peers)
-                            frameStart = 0;
-                            frameEnd = i;
-                            while (frameEnd + 1 < sortedPartition.size() && orderByValuesEqual(wf.orderBy(), contexts,
-                                    sortedPartition.get(i), sortedPartition.get(frameEnd + 1))) {
-                                frameEnd++;
-                            }
-                        } else {
-                            frameStart = 0;
-                            frameEnd = sortedPartition.size() - 1;
-                        }
-                        frameStart = Math.max(0, frameStart);
-                        frameEnd = Math.min(sortedPartition.size() - 1, frameEnd);
-                        if (wf.ignoreNulls()) {
+                        int[] bounds = resolveFrameBounds(wf, i, contexts, sortedPartition);
+                        int frameStart = bounds[0];
+                        int frameEnd = bounds[1];
+                        if (frameStart > frameEnd) {
+                            // Empty frame
+                            results[sortedPartition.get(i)] = null;
+                        } else if (wf.ignoreNulls()) {
                             // IGNORE NULLS: find the nth non-null value in frame
                             int count = 0;
                             Object found = null;
@@ -618,34 +596,13 @@ class SelectWindowEvaluator {
                                                    List<RowContext> contexts,
                                                    List<Integer> sortedPartition,
                                                    Object[] results) {
-        boolean hasOrderBy = wf.orderBy() != null && !wf.orderBy().isEmpty();
         boolean hasFrame = wf.frame() != null;
         WindowFuncExpr.ExcludeMode excludeMode = hasFrame ? wf.frame().excludeMode() : null;
 
         for (int i = 0; i < sortedPartition.size(); i++) {
-            int frameStart, frameEnd;
-
-            if (hasFrame) {
-                frameStart = resolveFrameBound(wf.frame().start(), i, sortedPartition.size(),
-                        wf.frame().type(), wf.orderBy(), contexts, sortedPartition, true);
-                frameEnd = resolveFrameBound(wf.frame().end(), i, sortedPartition.size(),
-                        wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
-            } else if (hasOrderBy) {
-                // Default frame with ORDER BY is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW,
-                // which includes all peers (rows with the same ORDER BY values)
-                frameStart = 0;
-                frameEnd = i;
-                while (frameEnd + 1 < sortedPartition.size() && orderByValuesEqual(wf.orderBy(), contexts,
-                        sortedPartition.get(i), sortedPartition.get(frameEnd + 1))) {
-                    frameEnd++;
-                }
-            } else {
-                frameStart = 0;
-                frameEnd = sortedPartition.size() - 1;
-            }
-
-            frameStart = Math.max(0, frameStart);
-            frameEnd = Math.min(sortedPartition.size() - 1, frameEnd);
+            int[] bounds = resolveFrameBounds(wf, i, contexts, sortedPartition);
+            int frameStart = bounds[0];
+            int frameEnd = bounds[1];
 
             List<RowContext> frameRows = new ArrayList<>();
             for (int fi = frameStart; fi <= frameEnd; fi++) {
@@ -691,6 +648,45 @@ class SelectWindowEvaluator {
             default:
                 return false;
         }
+    }
+
+    /**
+     * Resolve both frame bounds for the row at position {@code currentIdx} of the sorted
+     * partition, honoring an explicit frame clause or the default frame (RANGE BETWEEN
+     * UNBOUNDED PRECEDING AND CURRENT ROW including peers when ORDER BY is present,
+     * the whole partition otherwise).
+     * <p>
+     * The returned bounds are clamped to the partition extents in a way that preserves
+     * empty frames: if {@code result[0] > result[1]} the frame is empty.
+     */
+    private int[] resolveFrameBounds(WindowFuncExpr wf, int currentIdx,
+                                      List<RowContext> contexts, List<Integer> sortedPartition) {
+        int size = sortedPartition.size();
+        boolean hasOrderBy = wf.orderBy() != null && !wf.orderBy().isEmpty();
+        int frameStart, frameEnd;
+        if (wf.frame() != null) {
+            frameStart = resolveFrameBound(wf.frame().start(), currentIdx, size,
+                    wf.frame().type(), wf.orderBy(), contexts, sortedPartition, true);
+            frameEnd = resolveFrameBound(wf.frame().end(), currentIdx, size,
+                    wf.frame().type(), wf.orderBy(), contexts, sortedPartition, false);
+        } else if (hasOrderBy) {
+            // Default frame with ORDER BY is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW,
+            // which includes all peers (rows with the same ORDER BY values)
+            frameStart = 0;
+            frameEnd = currentIdx;
+            while (frameEnd + 1 < size && orderByValuesEqual(wf.orderBy(), contexts,
+                    sortedPartition.get(currentIdx), sortedPartition.get(frameEnd + 1))) {
+                frameEnd++;
+            }
+        } else {
+            frameStart = 0;
+            frameEnd = size - 1;
+        }
+        // Clamp toward the partition extents without hiding empty frames:
+        // a start beyond the end (or an end before the start) must stay start > end.
+        if (frameStart < 0) frameStart = 0;
+        if (frameEnd > size - 1) frameEnd = size - 1;
+        return new int[]{frameStart, frameEnd};
     }
 
     private int resolveFrameBound(WindowFuncExpr.FrameBound bound, int currentIdx, int partitionSize,
@@ -760,27 +756,47 @@ class SelectWindowEvaluator {
         if (orderBy == null || orderBy.isEmpty()) return isStartBound ? 0 : partitionSize - 1;
         // Use first ORDER BY expression for RANGE comparison
         Expression orderExpr = orderBy.get(0).expr();
+        boolean descending = orderBy.get(0).descending();
         Object currentVal = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(currentIdx)));
-        double currentNum = currentVal == null ? Double.NaN : ((Number) currentVal).doubleValue();
-        double boundaryVal = currentNum + direction; // direction already has sign
+        if (currentVal == null) {
+            // PG: rows with a NULL sort key have a frame consisting of their NULL peers
+            int idx = currentIdx;
+            if (isStartBound) {
+                while (idx > 0 && executor.evalExpr(orderExpr,
+                        contexts.get(sortedPartition.get(idx - 1))) == null) {
+                    idx--;
+                }
+            } else {
+                while (idx + 1 < partitionSize && executor.evalExpr(orderExpr,
+                        contexts.get(sortedPartition.get(idx + 1))) == null) {
+                    idx++;
+                }
+            }
+            return idx;
+        }
+        double currentNum = ((Number) currentVal).doubleValue();
+        // For DESC ordering the offset moves opposite to the value axis:
+        // N PRECEDING means values GREATER than the current one (toward the start
+        // of the descending sequence), N FOLLOWING means values smaller.
+        double boundaryVal = currentNum + (descending ? -direction : direction);
 
         if (isStartBound) {
-            // Find first row >= boundaryVal (for ascending)
+            // Find first row >= boundaryVal (ascending) / <= boundaryVal (descending)
             for (int i = 0; i < partitionSize; i++) {
                 Object v = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(i)));
                 if (v != null) {
                     double d = ((Number) v).doubleValue();
-                    if (orderBy.get(0).descending() ? d <= boundaryVal : d >= boundaryVal) return i;
+                    if (descending ? d <= boundaryVal : d >= boundaryVal) return i;
                 }
             }
             return partitionSize; // no rows in range
         } else {
-            // Find last row <= boundaryVal (for ascending)
+            // Find last row <= boundaryVal (ascending) / >= boundaryVal (descending)
             for (int i = partitionSize - 1; i >= 0; i--) {
                 Object v = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(i)));
                 if (v != null) {
                     double d = ((Number) v).doubleValue();
-                    if (orderBy.get(0).descending() ? d >= boundaryVal : d <= boundaryVal) return i;
+                    if (descending ? d >= boundaryVal : d <= boundaryVal) return i;
                 }
             }
             return -1; // no rows in range
@@ -816,10 +832,16 @@ class SelectWindowEvaluator {
         }
         int targetGroup = currentGroup + direction;
         if (isStartBound) {
-            targetGroup = Math.max(0, targetGroup);
+            // A start bound past the last group means an empty frame (start > end);
+            // a start bound before the first group clamps to the partition start.
+            if (targetGroup >= groups.size()) return partitionSize;
+            if (targetGroup < 0) targetGroup = 0;
             return groups.get(targetGroup)[0];
         } else {
-            targetGroup = Math.min(groups.size() - 1, targetGroup);
+            // An end bound before the first group means an empty frame (end < start);
+            // an end bound past the last group clamps to the partition end.
+            if (targetGroup < 0) return -1;
+            if (targetGroup >= groups.size()) targetGroup = groups.size() - 1;
             return groups.get(targetGroup)[1];
         }
     }
