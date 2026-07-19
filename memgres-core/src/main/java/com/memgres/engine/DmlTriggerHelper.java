@@ -79,6 +79,11 @@ class DmlTriggerHelper {
                 if (function != null) {
                     PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
                     newRow = plExec.executeTriggerFunction(function, newRow, oldRow, table, trigger);
+                    if (newRow == null) {
+                        // BEFORE/INSTEAD OF row trigger returned NULL: skip the operation on
+                        // this row and suppress any remaining triggers (PostgreSQL semantics)
+                        return null;
+                    }
                 }
             }
         }
