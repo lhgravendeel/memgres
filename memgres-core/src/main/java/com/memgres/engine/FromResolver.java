@@ -915,7 +915,10 @@ class FromResolver {
 
         for (Object[] deletedRow : otherUncommittedDeletes) {
             if (!otherUncommittedInserts.contains(deletedRow)) {
-                filtered.add(new RowContext(table, alias, deletedRow));
+                // If the row was updated before being deleted, the committed
+                // state is the pre-update old values, not its current contents.
+                Object[] oldValues = otherUncommittedUpdates.get(deletedRow);
+                filtered.add(new RowContext(table, alias, oldValues != null ? oldValues : deletedRow));
             }
         }
 
