@@ -729,6 +729,17 @@ class BinaryOpEvaluator {
                         }
                         return null;
                     }
+                    // name-style subscript (pg_dump: typname[0] = '_'): PG's name type
+                    // supports zero-based single-character access; out of range is NULL.
+                    // Only plain strings land here — JSON/array containers were handled above.
+                    if (left instanceof String) {
+                        String plain = (String) left;
+                        String trimmed = plain.trim();
+                        if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("\"")) {
+                            int idx = n.intValue();
+                            return (idx >= 0 && idx < plain.length()) ? String.valueOf(plain.charAt(idx)) : null;
+                        }
+                    }
                 }
                 // Check for array subscript with non-integer key (e.g., b['x'])
                 if (left instanceof List<?> || (left instanceof String && ((String) left).trim().startsWith("{") && !((String) left).trim().startsWith("{\"") && ((String) left).trim().endsWith("}"))) {
