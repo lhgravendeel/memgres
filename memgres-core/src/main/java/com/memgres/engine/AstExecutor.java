@@ -56,6 +56,8 @@ public class AstExecutor {
     String currentMergeAction = null;
     // Raw SQL text of the current top-level statement (for pg_prepared_statements/pg_cursors verbatim display)
     String currentRawSql = null;
+    // View column mapping: view_column_name -> base_table_column_name (set by resolveViewToBaseTable)
+    Map<String, String> lastViewColumnMapping = null;
     // When true, column references with no context throw instead of returning column name as string
     private boolean strictColumnRefs = false;
 
@@ -486,6 +488,7 @@ public class AstExecutor {
     }
 
     Table resolveTable(String schemaName, String tableName) {
+        lastViewColumnMapping = null; // reset before each resolution
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
         // Resolve pg_temp alias to the actual session temp schema
         if ("pg_temp".equalsIgnoreCase(schemaName)) {
@@ -528,6 +531,13 @@ public class AstExecutor {
         if (view != null) {
             Table underlying = resolveViewToBaseTable(view);
             if (underlying != null) return underlying;
+            // Check for INSTEAD OF triggers — if present, the view is DML-capable
+            List<PgTrigger> viewTriggers = database.getTriggersForTable(tableName);
+            if (viewTriggers != null && viewTriggers.stream().anyMatch(
+                    t -> t.getTiming() == PgTrigger.Timing.INSTEAD_OF)) {
+                // Create a virtual table from the view's column definitions
+                return buildVirtualTableForView(view, tableName);
+            }
             throw new MemgresException("cannot insert into view \"" + tableName + "\"", "55000");
         }
         // Sequences are queryable as relations in PG (columns: last_value, log_cnt, is_called)
@@ -570,8 +580,58 @@ public class AstExecutor {
         if (sel.groupBy() != null && !sel.groupBy().isEmpty()) return null;
         if (sel.having() != null) return null;
         if (sel.limit() != null || sel.offset() != null) return null;
+        // Check for aggregate functions in SELECT targets (PG: view is not auto-updatable)
+        if (sel.targets() != null) {
+            for (SelectStmt.SelectTarget target : sel.targets()) {
+                if (containsAggregate(target.expr())) return null;
+            }
+        }
         String refSchema = ref.schema() != null ? ref.schema() : defaultSchema();
-        try { return resolveTable(refSchema, ref.table()); } catch (MemgresException e) { return null; }
+        Table baseTable;
+        try { baseTable = resolveTable(refSchema, ref.table()); } catch (MemgresException e) { return null; }
+        // Build column mapping: view alias → base column name
+        lastViewColumnMapping = null;
+        if (sel.targets() != null) {
+            Map<String, String> mapping = new LinkedHashMap<>();
+            for (SelectStmt.SelectTarget target : sel.targets()) {
+                String baseCol = null;
+                if (target.expr() instanceof ColumnRef) {
+                    baseCol = ((ColumnRef) target.expr()).column();
+                }
+                String viewCol = target.alias() != null ? target.alias() : baseCol;
+                if (viewCol != null && baseCol != null && !viewCol.equalsIgnoreCase(baseCol)) {
+                    mapping.put(viewCol.toLowerCase(), baseCol);
+                }
+            }
+            if (!mapping.isEmpty()) lastViewColumnMapping = mapping;
+        }
+        return baseTable;
+    }
+
+    private Table buildVirtualTableForView(Database.ViewDef view, String viewName) {
+        // Execute the view query to determine column structure
+        try {
+            QueryResult result = executeStatement(view.query());
+            List<Column> cols = new ArrayList<>();
+            for (Column c : result.getColumns()) {
+                cols.add(new Column(c.getName(), c.getType(), c.isNullable(), false, null));
+            }
+            return new Table(viewName, cols);
+        } catch (Exception e) {
+            throw new MemgresException("cannot insert into view \"" + viewName + "\"", "55000");
+        }
+    }
+
+    private boolean containsAggregate(Expression expr) {
+        if (expr instanceof FunctionCallExpr) {
+            String name = ((FunctionCallExpr) expr).name().toLowerCase();
+            if (name.contains(".")) name = name.substring(name.lastIndexOf('.') + 1);
+            if (SelectExecutor.AGGREGATE_FUNCTIONS.contains(name)) return true;
+            for (Expression arg : ((FunctionCallExpr) expr).args()) {
+                if (containsAggregate(arg)) return true;
+            }
+        }
+        return false;
     }
 
     Table resolveTableAnySchema(String tableName) {
