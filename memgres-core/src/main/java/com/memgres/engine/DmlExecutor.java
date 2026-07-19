@@ -28,6 +28,14 @@ class DmlExecutor {
         this.triggerHelper = new DmlTriggerHelper(executor);
     }
 
+    /** Translate a view column name to the base table column name using the current mapping. */
+    private String mapViewColumn(String colName) {
+        Map<String, String> mapping = executor.lastViewColumnMapping;
+        if (mapping == null || colName == null) return colName;
+        String mapped = mapping.get(colName.toLowerCase());
+        return mapped != null ? mapped : colName;
+    }
+
     /** Returns true when session_replication_role suppresses user triggers. */
     private boolean triggersDisabled() {
         if (executor.session == null) return false;
@@ -200,7 +208,8 @@ class DmlExecutor {
                 for (int i = 0; i < stmt.columns().size(); i++) {
                     // Skip DEFAULT keyword; let the serial/default logic handle it
                     if (valueRow.get(i) instanceof Literal && ((Literal) valueRow.get(i)).literalType() == Literal.LiteralType.DEFAULT) continue;
-                    int colIdx = table.getColumnIndex(stmt.columns().get(i));
+                    String colName = mapViewColumn(stmt.columns().get(i));
+                    int colIdx = table.getColumnIndex(colName);
                     if (colIdx < 0) {
                         throw new MemgresException("Column not found: " + stmt.columns().get(i));
                     }
@@ -991,7 +1000,7 @@ class DmlExecutor {
 
         // Pre-flight: reject writes to GENERATED ALWAYS columns (even on empty tables, PG errors at plan time)
         for (InsertStmt.SetClause set : stmt.setClauses()) {
-            int colIdx = table.getColumnIndex(set.column());
+            int colIdx = table.getColumnIndex(mapViewColumn(set.column()));
             if (colIdx >= 0) {
                 Column genCol = table.getColumns().get(colIdx);
                 if (genCol.isGenerated() && !(set.value() instanceof Literal && ((Literal) set.value()).literalType() == Literal.LiteralType.DEFAULT)) {
@@ -1187,7 +1196,7 @@ class DmlExecutor {
     /** Apply SET clauses to a row. DRYs the duplicate logic between multi-table and simple UPDATE paths. */
     private void applySetClauses(List<InsertStmt.SetClause> setClauses, Table table, Object[] newRow, RowContext ctx) {
         for (InsertStmt.SetClause set : setClauses) {
-            int colIdx = table.getColumnIndex(set.column());
+            int colIdx = table.getColumnIndex(mapViewColumn(set.column()));
             if (colIdx < 0) {
                 throw new MemgresException("Column not found: " + set.column());
             }

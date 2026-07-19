@@ -101,32 +101,33 @@ class DmlValidationHelper {
      */
     List<Expression> collectViewCheckExprs(String targetName) {
         List<Expression> exprs = new ArrayList<>();
-        collectViewCheckExprsRecursive(targetName, true, exprs, new HashSet<>());
+        collectViewCheckExprsRecursive(targetName, false, exprs, new HashSet<>());
         return exprs;
     }
 
-    private void collectViewCheckExprsRecursive(String viewName, boolean first,
+    private void collectViewCheckExprsRecursive(String viewName, boolean cascading,
                                                   List<Expression> exprs,
                                                   Set<String> visited) {
         if (!visited.add(viewName.toLowerCase())) return;
         Database.ViewDef view = executor.database.getView(viewName);
         if (view == null) return;
-        // Add this view's WHERE clause if it has a CHECK OPTION (or if cascaded from parent)
-        if (view.checkOption() != null && view.query() instanceof SelectStmt && ((SelectStmt) view.query()).where() != null) {
+        // Add this view's WHERE clause if it has a CHECK OPTION OR if a parent is cascading
+        boolean hasCheck = view.checkOption() != null;
+        if ((hasCheck || cascading) && view.query() instanceof SelectStmt && ((SelectStmt) view.query()).where() != null) {
             SelectStmt sel = (SelectStmt) view.query();
             exprs.add(sel.where());
         }
-        // If CASCADED, also check base views
-        if ("CASCADED".equals(view.checkOption()) || first) {
-            // Find base views this view reads from
+        // Recurse into base views if this view is CASCADED (or a parent is cascading through)
+        boolean shouldCascade = "CASCADED".equals(view.checkOption()) || cascading;
+        if (shouldCascade) {
             if (view.query() instanceof SelectStmt && ((SelectStmt) view.query()).from() != null) {
                 SelectStmt sel = (SelectStmt) view.query();
                 for (SelectStmt.FromItem fromItem : sel.from()) {
                     if (fromItem instanceof SelectStmt.TableRef) {
                         SelectStmt.TableRef ref = (SelectStmt.TableRef) fromItem;
                         Database.ViewDef baseView = executor.database.getView(ref.table());
-                        if (baseView != null && baseView.checkOption() != null) {
-                            collectViewCheckExprsRecursive(ref.table(), false, exprs, visited);
+                        if (baseView != null) {
+                            collectViewCheckExprsRecursive(ref.table(), true, exprs, visited);
                         }
                     }
                 }

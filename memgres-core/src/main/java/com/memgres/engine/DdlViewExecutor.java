@@ -35,6 +35,20 @@ class DdlViewExecutor {
                 if (newResult.getColumns().size() < oldResult.getColumns().size()) {
                     throw new MemgresException("cannot drop columns from view", "42P16");
                 }
+                // PG rejects column name changes and type changes for existing columns
+                int checkCount = Math.min(oldResult.getColumns().size(), newResult.getColumns().size());
+                for (int i = 0; i < checkCount; i++) {
+                    Column oldCol = oldResult.getColumns().get(i);
+                    Column newCol = newResult.getColumns().get(i);
+                    if (!oldCol.getName().equalsIgnoreCase(newCol.getName())) {
+                        throw new MemgresException("cannot change name of view column \"" + oldCol.getName()
+                                + "\" to \"" + newCol.getName() + "\"", "42P16");
+                    }
+                    if (oldCol.getType() != newCol.getType()) {
+                        throw new MemgresException("cannot change data type of view column \"" + oldCol.getName()
+                                + "\" from " + oldCol.getType() + " to " + newCol.getType(), "42P16");
+                    }
+                }
             } catch (MemgresException e) {
                 throw e;
             } catch (Exception e) {

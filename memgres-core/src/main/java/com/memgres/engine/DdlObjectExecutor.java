@@ -1294,9 +1294,6 @@ class DdlObjectExecutor {
 
     QueryResult executeCreateTrigger(CreateTriggerStmt stmt) {
         String triggerTableSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
-        if (stmt.table() != null) {
-            executor.resolveTable(triggerTableSchema, stmt.table());
-        }
         PgTrigger.Timing timing;
         switch (stmt.timing()) {
             case "BEFORE":
@@ -1318,6 +1315,10 @@ class DdlObjectExecutor {
         }
         if ((timing == PgTrigger.Timing.BEFORE || timing == PgTrigger.Timing.AFTER) && isView) {
             throw new MemgresException("\"" + stmt.table() + "\" is a view\n  Detail: Views cannot have BEFORE or AFTER row-level triggers.", "42809");
+        }
+        // Validate table/view existence (skip for INSTEAD OF on views — resolveTable rejects non-updatable views)
+        if (stmt.table() != null && !(timing == PgTrigger.Timing.INSTEAD_OF && isView)) {
+            executor.resolveTable(triggerTableSchema, stmt.table());
         }
         List<PgTrigger.Event> trigEvents = new ArrayList<>();
         for (String event : stmt.events()) {

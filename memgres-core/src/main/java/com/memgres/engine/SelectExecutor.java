@@ -29,7 +29,7 @@ class SelectExecutor {
                 || lc.equals("xmax") || lc.equals("cmin") || lc.equals("cmax");
     }
 
-    private static final Set<String> AGGREGATE_FUNCTIONS = Cols.setOf(
+    static final Set<String> AGGREGATE_FUNCTIONS = Cols.setOf(
             "count", "sum", "avg", "min", "max", "string_agg", "array_agg",
             "bool_and", "bool_or", "every",
             "bit_and", "bit_or", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
