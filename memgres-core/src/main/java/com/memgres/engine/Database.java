@@ -1757,6 +1757,12 @@ public class Database {
         public final String sourceSQL;
         public final String checkOption;
         public final Map<String, String> reloptions;
+        /**
+         * Whether a materialized view holds data. False for CREATE MATERIALIZED VIEW ...
+         * WITH NO DATA (and after REFRESH ... WITH NO DATA) until the next REFRESH.
+         * Always true for regular views.
+         */
+        public final boolean populated;
 
         public ViewDef(
                 String name,
@@ -1784,6 +1790,22 @@ public class Database {
                 String checkOption,
                 Map<String, String> reloptions
         ) {
+            this(name, schemaName, query, orReplace, materialized, cachedColumns, cachedRows, sourceSQL, checkOption, reloptions, true);
+        }
+
+        public ViewDef(
+                String name,
+                String schemaName,
+                Statement query,
+                boolean orReplace,
+                boolean materialized,
+                List<Column> cachedColumns,
+                List<Object[]> cachedRows,
+                String sourceSQL,
+                String checkOption,
+                Map<String, String> reloptions,
+                boolean populated
+        ) {
             this.name = name;
             this.schemaName = schemaName;
             this.query = query;
@@ -1794,6 +1816,7 @@ public class Database {
             this.sourceSQL = sourceSQL;
             this.checkOption = checkOption;
             this.reloptions = reloptions;
+            this.populated = populated;
         }
 
         /** Convenience constructor (full, without checkOption). */
@@ -1834,6 +1857,7 @@ public class Database {
         public String sourceSQL() { return sourceSQL; }
         public String checkOption() { return checkOption; }
         public Map<String, String> reloptions() { return reloptions; }
+        public boolean populated() { return populated; }
 
         @Override
         public boolean equals(Object o) {

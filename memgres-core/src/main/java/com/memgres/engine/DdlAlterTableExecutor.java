@@ -926,9 +926,25 @@ class DdlAlterTableExecutor {
             if (updated.equals(sql)) continue;
             try {
                 Statement parsed = com.memgres.engine.parser.Parser.parse(updated);
+                // Keep regular-view column metadata (used by catalogs) in sync with the
+                // rewritten output names. Materialized views keep their own column names.
+                List<Column> newCachedCols = vd.cachedColumns;
+                if (!vd.materialized && vd.cachedColumns != null) {
+                    newCachedCols = new ArrayList<>();
+                    for (Column c : vd.cachedColumns) {
+                        if (c.getName().equalsIgnoreCase(oldCol)) {
+                            newCachedCols.add(new Column(newCol, c.getType(), c.isNullable(), c.isPrimaryKey(),
+                                    c.getDefaultValue(), c.getEnumTypeName(), c.getPrecision(), c.getScale(),
+                                    c.getGeneratedExpr(), c.isVirtual(), c.getDomainTypeName(),
+                                    c.getCompositeTypeName(), c.getArrayElementType()));
+                        } else {
+                            newCachedCols.add(c);
+                        }
+                    }
+                }
                 Database.ViewDef newView = new Database.ViewDef(
                         vd.name, vd.schemaName, parsed, vd.orReplace, vd.materialized,
-                        vd.cachedColumns, vd.cachedRows, updated, vd.checkOption, vd.reloptions);
+                        newCachedCols, vd.cachedRows, updated, vd.checkOption, vd.reloptions, vd.populated);
                 executor.database.addView(newView);
             } catch (Exception ignored) {
                 // If re-parse fails, leave the view as-is
