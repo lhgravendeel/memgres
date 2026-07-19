@@ -1741,126 +1741,68 @@ class SessionExecutor {
         return max[0];
     }
 
+    /**
+     * Generic AST walk used for $N parameter inference. Instead of hand-enumerating every
+     * expression slot of every statement type (which historically missed JOIN ON conditions,
+     * CTE bodies, GROUP BY/HAVING, VALUES-in-FROM, set-operation branches, window definitions,
+     * DISTINCT ON, ON CONFLICT clauses, ...), this reflectively descends into every field of
+     * every AST node. All AST node classes (and their nested helper classes such as
+     * {@code SelectStmt.JoinFrom} or {@code SelectStmt.CommonTableExpr}) live in the
+     * {@code com.memgres.engine.parser.ast} package, so any object from that package is walked;
+     * collections and maps are traversed element-wise; everything else is a leaf.
+     */
     private void walkExpressions(Object node, int[] max) {
+        walkForParamRefs(node, max,
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>()));
+    }
+
+    private void walkForParamRefs(Object node, int[] max, java.util.Set<Object> visited) {
         if (node == null) return;
         if (node instanceof ParamRef) {
             ParamRef p = (ParamRef) node;
             if (p.index() > max[0]) max[0] = p.index();
             return;
         }
-        // Walk into common expression types
-        if (node instanceof BinaryExpr) {
-            BinaryExpr b = (BinaryExpr) node;
-            walkExpressions(b.left(), max);
-            walkExpressions(b.right(), max);
-        } else if (node instanceof CustomOperatorExpr) {
-            CustomOperatorExpr c = (CustomOperatorExpr) node;
-            if (c.left() != null) walkExpressions(c.left(), max);
-            walkExpressions(c.right(), max);
-        } else if (node instanceof UnaryExpr) {
-            UnaryExpr u = (UnaryExpr) node;
-            walkExpressions(u.operand(), max);
-        } else if (node instanceof CastExpr) {
-            CastExpr c = (CastExpr) node;
-            walkExpressions(c.expr(), max);
-        } else if (node instanceof FunctionCallExpr) {
-            FunctionCallExpr fc = (FunctionCallExpr) node;
-            if (fc.args() != null) fc.args().forEach(a -> walkExpressions(a, max));
-        } else if (node instanceof IsNullExpr) {
-            IsNullExpr n = (IsNullExpr) node;
-            walkExpressions(n.expr(), max);
-        } else if (node instanceof IsBooleanExpr) {
-            IsBooleanExpr ib = (IsBooleanExpr) node;
-            walkExpressions(ib.expr(), max);
-        } else if (node instanceof BetweenExpr) {
-            BetweenExpr bt = (BetweenExpr) node;
-            walkExpressions(bt.expr(), max);
-            walkExpressions(bt.low(), max);
-            walkExpressions(bt.high(), max);
-        } else if (node instanceof InExpr) {
-            InExpr ie = (InExpr) node;
-            walkExpressions(ie.expr(), max);
-            if (ie.values() != null) ie.values().forEach(v -> walkExpressions(v, max));
-        } else if (node instanceof LikeExpr) {
-            LikeExpr le = (LikeExpr) node;
-            walkExpressions(le.left(), max);
-            walkExpressions(le.pattern(), max);
-        } else if (node instanceof CaseExpr) {
-            CaseExpr ce = (CaseExpr) node;
-            walkExpressions(ce.operand(), max);
-            if (ce.whenClauses() != null) {
-                for (CaseExpr.WhenClause w : ce.whenClauses()) {
-                    walkExpressions(w.condition(), max);
-                    walkExpressions(w.result(), max);
-                }
+        if (node instanceof Iterable) {
+            for (Object item : (Iterable<?>) node) {
+                walkForParamRefs(item, max, visited);
             }
-            walkExpressions(ce.elseExpr(), max);
-        } else if (node instanceof ArrayExpr) {
-            ArrayExpr ae = (ArrayExpr) node;
-            if (ae.elements() != null) ae.elements().forEach(e -> walkExpressions(e, max));
-        } else if (node instanceof AtTimeZoneExpr) {
-            AtTimeZoneExpr atz = (AtTimeZoneExpr) node;
-            walkExpressions(atz.expr(), max);
-            walkExpressions(atz.zone(), max);
-        } else if (node instanceof AnyAllArrayExpr) {
-            AnyAllArrayExpr aa = (AnyAllArrayExpr) node;
-            walkExpressions(aa.left(), max);
-            walkExpressions(aa.array(), max);
-        } else if (node instanceof SubqueryExpr) {
-            SubqueryExpr sq = (SubqueryExpr) node;
-            walkExpressions(sq.subquery(), max);
-        } else if (node instanceof ExistsExpr) {
-            ExistsExpr ex = (ExistsExpr) node;
-            walkExpressions(ex.subquery(), max);
-        } else if (node instanceof NamedArgExpr) {
-            NamedArgExpr na = (NamedArgExpr) node;
-            walkExpressions(na.value(), max);
-        } else if (node instanceof FieldAccessExpr) {
-            FieldAccessExpr fa = (FieldAccessExpr) node;
-            walkExpressions(fa.expr(), max);
-        } else if (node instanceof ArraySliceExpr) {
-            ArraySliceExpr as = (ArraySliceExpr) node;
-            walkExpressions(as.array(), max);
-            walkExpressions(as.lower(), max);
-            walkExpressions(as.upper(), max);
+            return;
         }
-        // Walk into statement types
-        else if (node instanceof SelectStmt) {
-            SelectStmt sel = (SelectStmt) node;
-            if (sel.targets() != null) sel.targets().forEach(t -> walkExpressions(t.expr(), max));
-            walkExpressions(sel.where(), max);
-            walkExpressions(sel.having(), max);
-            if (sel.orderBy() != null) sel.orderBy().forEach(o -> walkExpressions(o.expr(), max));
-            walkExpressions(sel.limit(), max);
-            walkExpressions(sel.offset(), max);
-            if (sel.from() != null) {
-                for (SelectStmt.FromItem f : sel.from()) {
-                    if (f instanceof SelectStmt.SubqueryFrom) walkExpressions(((SelectStmt.SubqueryFrom) f).subquery(), max);
-                }
+        if (node instanceof java.util.Map) {
+            for (Object value : ((java.util.Map<?, ?>) node).values()) {
+                walkForParamRefs(value, max, visited);
             }
-        } else if (node instanceof InsertStmt) {
-            InsertStmt ins = (InsertStmt) node;
-            if (ins.values() != null) {
-                for (List<Expression> row : ins.values()) {
-                    if (row != null) row.forEach(v -> walkExpressions(v, max));
-                }
-            }
-            if (ins.returning() != null) ins.returning().forEach(r -> walkExpressions(r.expr(), max));
-            if (ins.selectStmt() != null) walkExpressions(ins.selectStmt(), max);
-        } else if (node instanceof UpdateStmt) {
-            UpdateStmt upd = (UpdateStmt) node;
-            if (upd.setClauses() != null) upd.setClauses().forEach(a -> walkExpressions(a.value(), max));
-            walkExpressions(upd.where(), max);
-            if (upd.returning() != null) upd.returning().forEach(r -> walkExpressions(r.expr(), max));
-        } else if (node instanceof DeleteStmt) {
-            DeleteStmt del = (DeleteStmt) node;
-            walkExpressions(del.where(), max);
-            if (del.returning() != null) del.returning().forEach(r -> walkExpressions(r.expr(), max));
-        } else if (node instanceof SetOpStmt) {
-            SetOpStmt sop = (SetOpStmt) node;
-            walkExpressions(sop.left(), max);
-            walkExpressions(sop.right(), max);
+            return;
         }
+        Class<?> cls = node.getClass();
+        if (node instanceof Enum || !isAstNodeClass(cls)) return;
+        if (!visited.add(node)) return; // identity-based guard against shared/cyclic subtrees
+        for (Class<?> c = cls; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field field : c.getDeclaredFields()) {
+                if (java.lang.reflect.Modifier.isStatic(field.getModifiers())) continue;
+                Class<?> fieldType = field.getType();
+                // Skip leaf-typed fields that can never contain an AST node
+                if (fieldType.isPrimitive() || fieldType == String.class || fieldType.isEnum()
+                        || Number.class.isAssignableFrom(fieldType)
+                        || fieldType == Boolean.class || fieldType == Character.class) {
+                    continue;
+                }
+                Object value;
+                try {
+                    field.setAccessible(true);
+                    value = field.get(node);
+                } catch (Exception e) {
+                    continue; // inaccessible field: treat as leaf
+                }
+                walkForParamRefs(value, max, visited);
+            }
+        }
+    }
+
+    /** True if the class is an AST node (or a nested helper class of one). */
+    private static boolean isAstNodeClass(Class<?> cls) {
+        return cls.getName().startsWith("com.memgres.engine.parser.ast.");
     }
 
     // ---- Cursors ----
@@ -1948,6 +1890,9 @@ class SessionExecutor {
                 break;
             case LAST:
                 addRow(result, cursor, total - 1);
+                // PG: FETCH LAST is ABSOLUTE -1; on an empty result it returns
+                // nothing and positions before the first row
+                if (result.isEmpty()) cursor.setPosition(-1);
                 break;
             case ABSOLUTE: {
                 // PG: ABSOLUTE 0 positions before first row (returns nothing)
@@ -1956,7 +1901,14 @@ class SessionExecutor {
                 if (count == 0) {
                     cursor.setPosition(-1); // before first
                 } else {
-                    addRow(result, cursor, count > 0 ? count - 1 : total + count);
+                    int target = count > 0 ? count - 1 : total + count;
+                    addRow(result, cursor, target);
+                    // PG: an out-of-range target still repositions the cursor:
+                    // beyond the end → after last row (PRIOR then returns the last row);
+                    // beyond the start → before first row (NEXT then returns the first row)
+                    if (result.isEmpty()) {
+                        cursor.setPosition(target >= total ? total : -1);
+                    }
                 }
                 break;
             }
