@@ -32,7 +32,7 @@ SELECT substring('hello', 0, 3) AS result;
 
 -- begin-expected
 -- columns: result
--- row: (empty)
+-- row:
 -- end-expected
 SELECT substring('hello', 0, 1) AS result;
 

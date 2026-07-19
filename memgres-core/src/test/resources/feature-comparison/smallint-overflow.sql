@@ -20,7 +20,7 @@ SELECT 32767::smallint AS result;
 -- 2. smallint overflow (positive) → error
 -- ============================================================================
 
--- begin-expected
+-- begin-expected-error
 -- error: 22003
 -- end-expected
 SELECT 40000::smallint;
@@ -29,7 +29,7 @@ SELECT 40000::smallint;
 -- 3. smallint overflow (negative) → error
 -- ============================================================================
 
--- begin-expected
+-- begin-expected-error
 -- error: 22003
 -- end-expected
 SELECT (-40000)::smallint;
@@ -38,7 +38,7 @@ SELECT (-40000)::smallint;
 -- 4. real overflow → error
 -- ============================================================================
 
--- begin-expected
+-- begin-expected-error
 -- error: 22003
 -- end-expected
 SELECT 1e40::real;
