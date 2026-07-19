@@ -722,6 +722,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             PgWireDescribeHelper.DescribePortalResult result;
             try {
                 result = describeHelper.describePortal(ctx, portal.sql(), portal.paramValues());
+            } catch (PgWireDescribeHelper.DescribeExecutionFailedException dfe) {
+                sendExtendedError(ctx, dfe.sqlState, dfe.getMessage());
+                return;
             } finally {
                 if (session != null) session.setIdleState();
             }

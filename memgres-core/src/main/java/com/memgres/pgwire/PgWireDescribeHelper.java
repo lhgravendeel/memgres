@@ -47,6 +47,24 @@ class PgWireDescribeHelper {
         }
     }
 
+    /**
+     * A deadlock, lock timeout, or cancel raised while a describe probe waited on a lock
+     * is a real statement outcome, not a metadata-inference miss. Swallowing it into
+     * NoData and retrying re-enters the same lock wait: with two mutually-blocked
+     * sessions, each side's 40P01 gets eaten by its own Describe and the wait-for edges
+     * flap until a timeout fires — the deadlock is detected repeatedly but never
+     * surfaces. These states must propagate to the client as the statement's error.
+     */
+    private static String lockWaitSqlState(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof MemgresException) {
+                String s = ((MemgresException) t).getSqlState();
+                if ("40P01".equals(s) || "55P03".equals(s) || "57014".equals(s)) return s;
+            }
+        }
+        return null;
+    }
+
     private static String sqlStateOf(Exception e) {
         if (e instanceof MemgresException) {
             String state = ((MemgresException) e).getSqlState();
@@ -140,6 +158,10 @@ class PgWireDescribeHelper {
                 LOG.warn("[PROTO] Describe Stmt LIMIT 0 failed: {} | {}", e.getMessage(),
                         sql.substring(0, Math.min(70, sql.length())).replace("\n"," "));
                 session.restoreStatus(savedStatus);
+                String lockState = lockWaitSqlState(e);
+                if (lockState != null) {
+                    throw new DescribeExecutionFailedException(lockState, e.getMessage());
+                }
                 describeFailure = e;
             }
         }
@@ -277,6 +299,10 @@ class PgWireDescribeHelper {
                 LOG.warn("[PROTO] Describe Portal FAILED: {} | {}", e.getMessage(), sqlSnip);
                 LOG.debug("Full exception:", e);
                 session.restoreStatus(savedStatusPortal);
+                String lockState = lockWaitSqlState(e);
+                if (lockState != null) {
+                    throw new DescribeExecutionFailedException(lockState, e.getMessage());
+                }
                 // Fallback: re-execute with LIMIT 0 to get column metadata without side effects
                 String upper2 = stripLeadingComments(sql).toUpperCase();
                 if (upper2.startsWith("SELECT")) {
