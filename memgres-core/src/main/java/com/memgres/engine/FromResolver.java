@@ -282,7 +282,13 @@ class FromResolver {
                     }
                 }
                 accumulated = newAccumulated;
-            } else if (isFunctionFrom && accumulated != null && !accumulated.isEmpty()) {
+            } else if (isFunctionFrom && accumulated != null) {
+                // Implicit LATERAL for functions-in-FROM. Note this branch must also own
+                // the zero-left-rows case: with no rows to iterate the function is never
+                // evaluated (PG semantics). Falling through to the generic branch would
+                // evaluate its arguments without any row context, so a column-ref arg
+                // like pg_get_sequence_data(seqrelid) degrades to a bare string and
+                // crashes — pg_dump hits exactly that on a database with no sequences.
                 SelectStmt.FunctionFrom funcFrom = (SelectStmt.FunctionFrom) fromItem;
                 List<RowContext> newAccumulated = new ArrayList<>();
                 for (RowContext leftCtx : accumulated) {

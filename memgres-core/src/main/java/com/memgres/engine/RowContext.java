@@ -127,12 +127,17 @@ public class RowContext {
     }
 
     /**
-     * Find the binding for a given table name or alias.
+     * Find the binding for a given table name or alias. Follows PG scoping: an alias
+     * hides the table's real name, so "SELECT pg_type.x FROM pg_type te" must NOT bind
+     * the inner scan — the qualified reference either correlates to an outer query
+     * level or errors. The underlying table name therefore only matches bindings that
+     * carry no alias (or whose alias is the table name itself).
      */
     public TableBinding getBinding(String qualifier) {
         for (TableBinding b : bindings) {
-            if ((b.alias() != null && b.alias().equalsIgnoreCase(qualifier))
-                    || b.table().getName().equalsIgnoreCase(qualifier)) {
+            if (b.alias() != null) {
+                if (b.alias().equalsIgnoreCase(qualifier)) return b;
+            } else if (b.table().getName().equalsIgnoreCase(qualifier)) {
                 return b;
             }
         }
