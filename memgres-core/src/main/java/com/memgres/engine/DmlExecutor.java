@@ -298,7 +298,11 @@ class DmlExecutor {
 
             // INSTEAD OF INSERT triggers (on views): trigger handles the insert, skip normal path
             if (hasInsteadOfInsert) {
-                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.INSTEAD_OF, PgTrigger.Event.INSERT, row, null, table);
+                Object[] insteadRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.INSTEAD_OF, PgTrigger.Event.INSERT, row, null, table);
+                if (insteadRow == null) {
+                    // INSTEAD OF trigger returned NULL: row skipped (not counted, no RETURNING)
+                    continue;
+                }
                 inserted++;
                 if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                     returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, null, row));
@@ -308,6 +312,10 @@ class DmlExecutor {
 
             // BEFORE INSERT triggers
             row = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, row, null, table);
+            if (row == null) {
+                // BEFORE trigger returned NULL: skip this row (not inserted, not counted, no RETURNING)
+                continue;
+            }
 
             // Validate enum values
             validationHelper.validateEnumValues(row, table);
@@ -754,10 +762,11 @@ class DmlExecutor {
             }
         }
 
-        // FORCE_NOT_NULL: for specified columns, convert null to empty string
+        // FORCE_NOT_NULL: for specified columns, do not match against the null string
         List<String> forceNotNull = stmt.forceNotNull();
-        // FORCE_NULL: for specified columns, convert empty string to null
+        // FORCE_NULL: for specified columns, match the (possibly quoted) value against the null string
         List<String> forceNull = stmt.forceNull();
+        String effectiveNullStr = stmt.nullString() != null ? stmt.nullString() : "";
 
         for (int i = 0; i < values.size() && i < colIndices.size(); i++) {
             String val = values.get(i);
@@ -770,16 +779,18 @@ class DmlExecutor {
                 continue;
             }
 
-            // FORCE_NOT_NULL: if this column is in the list and value is null, use empty string
+            // FORCE_NOT_NULL: if this column is in the list and the field matched the
+            // null string, keep it as the literal null-string data instead of NULL
             if (val == null && forceNotNull != null) {
                 String colName = col.getName();
                 if (forceNotNull.contains("*") || forceNotNull.stream().anyMatch(c -> c.equalsIgnoreCase(colName))) {
-                    val = "";
+                    val = effectiveNullStr;
                 }
             }
 
-            // FORCE_NULL: if this column is in the list and value is empty string, convert to null
-            if (val != null && val.isEmpty() && forceNull != null) {
+            // FORCE_NULL: if this column is in the list and the (possibly quoted) value
+            // equals the null string, convert to null
+            if (val != null && val.equals(effectiveNullStr) && forceNull != null) {
                 String colName = col.getName();
                 if (forceNull.contains("*") || forceNull.stream().anyMatch(c -> c.equalsIgnoreCase(colName))) {
                     val = null;
@@ -1031,12 +1042,17 @@ class DmlExecutor {
             }
             // Process matched rows with their FROM context
             Set<Object[]> updated = Collections.newSetFromMap(new IdentityHashMap<>());
+            int updatedCount = 0;
             for (int i = 0; i < matchedRows.size(); i++) {
                 Object[] row = matchedRows.get(i);
                 if (updated.contains(row)) continue; // Each row updated at most once
                 updated.add(row);
                 Object[] oldRow = Arrays.copyOf(row, row.length);
                 Object[] newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
+                if (newRow == null) {
+                    // BEFORE trigger returned NULL: leave row untouched, not counted, no RETURNING
+                    continue;
+                }
                 RowContext ctx = matchedContexts.get(i);
                 applySetClauses(stmt.setClauses(), table, newRow, ctx);
                 computeGeneratedColumns(table, newRow);
@@ -1045,13 +1061,14 @@ class DmlExecutor {
                 recordUpdateUndo(stmt.schema(), stmt.table(), row, oldRow);
                 table.updateRowInPlace(row, oldRow, newRow);
                 recordRowUpdateMeta(stmt.schema(), table, row);
+                updatedCount++;
                 executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
                 triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, row, oldRow, table, updatedColumnNames);
                 if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                     returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, oldRow, row));
                 }
             }
-            int count = updated.size();
+            int count = updatedCount;
             // Fire statement-level AFTER UPDATE triggers
             triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, null, null);
             // Track DML statistics
@@ -1078,6 +1095,7 @@ class DmlExecutor {
                     .collect(Collectors.toList());
         }
 
+        int updatedCount = 0;
         for (Object[] row : rows) {
             Object[] oldRow = Arrays.copyOf(row, row.length);
 
@@ -1090,6 +1108,10 @@ class DmlExecutor {
 
             // BEFORE UPDATE triggers (see NEW with SET-applied values, can further modify NEW)
             newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, table, updatedColumnNames);
+            if (newRow == null) {
+                // BEFORE trigger returned NULL: leave row untouched, not counted, no RETURNING
+                continue;
+            }
 
             // Recompute generated columns after setting new values
             computeGeneratedColumns(table, newRow);
@@ -1135,6 +1157,7 @@ class DmlExecutor {
                 table.updateRowInPlace(row, oldRow, newRow);
                 recordRowUpdateMeta(stmt.schema(), table, row);
             }
+            updatedCount++;
 
             // Handle FK ON UPDATE cascades
             executor.constraintValidator.handleFkOnUpdate(table, oldRow, row);
@@ -1152,13 +1175,13 @@ class DmlExecutor {
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, table, null, null);
 
         // Track DML statistics
-        if (!rows.isEmpty()) table.incrementTupUpdated(rows.size());
+        if (updatedCount > 0) table.incrementTupUpdated(updatedCount);
 
         if (stmt.returning() != null && !stmt.returning().isEmpty()) {
             return QueryResult.returning(QueryResult.Type.UPDATE,
-                    buildReturningColumns(stmt.returning(), table), returningRows, rows.size());
+                    buildReturningColumns(stmt.returning(), table), returningRows, updatedCount);
         }
-        return QueryResult.command(QueryResult.Type.UPDATE, rows.size());
+        return QueryResult.command(QueryResult.Type.UPDATE, updatedCount);
     }
 
     /** Apply SET clauses to a row. DRYs the duplicate logic between multi-table and simple UPDATE paths. */

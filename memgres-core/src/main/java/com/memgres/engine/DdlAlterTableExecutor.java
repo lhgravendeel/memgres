@@ -117,8 +117,7 @@ class DdlAlterTableExecutor {
             Table partition = executor.resolveTable(detachSchemaName, detach.partitionName());
             table.removePartition(partition);
             partition.setPartitionParent(null);
-            partition.setPartitionValues(null);
-            partition.setDefaultPartition(false);
+            partition.clearPartitionBounds();
         } else if (action instanceof AlterTableStmt.RenameConstraint) {
             AlterTableStmt.RenameConstraint renameConstraint = (AlterTableStmt.RenameConstraint) action;
             StoredConstraint oldConstraint = table.getConstraint(renameConstraint.oldName());
@@ -1047,11 +1046,13 @@ class DdlAlterTableExecutor {
             throw new MemgresException("table \"" + attach.partitionName()
                     + "\" is already a partition of \"" + stmt.table() + "\"", "42809");
         }
-        partition.setPartitionParent(table);
-        table.addPartition(partition);
+        // Validate bounds before attaching, so overlapping bounds (42P17) don't leave
+        // the table half-attached to the parent's routing list
         if (attach.bounds() != null && !attach.bounds().isEmpty()) {
             ddl.tableExecutor.applyPartitionBounds(partition, table, attach.bounds(), attach.partitionName());
         }
+        partition.setPartitionParent(table);
+        table.addPartition(partition);
     }
 
     private void setTriggerEnabled(Table table, String triggerName, boolean disabled) {
@@ -1139,9 +1140,25 @@ class DdlAlterTableExecutor {
             if (updated.equals(sql)) continue;
             try {
                 Statement parsed = com.memgres.engine.parser.Parser.parse(updated);
+                // Keep regular-view column metadata (used by catalogs) in sync with the
+                // rewritten output names. Materialized views keep their own column names.
+                List<Column> newCachedCols = vd.cachedColumns;
+                if (!vd.materialized && vd.cachedColumns != null) {
+                    newCachedCols = new ArrayList<>();
+                    for (Column c : vd.cachedColumns) {
+                        if (c.getName().equalsIgnoreCase(oldCol)) {
+                            newCachedCols.add(new Column(newCol, c.getType(), c.isNullable(), c.isPrimaryKey(),
+                                    c.getDefaultValue(), c.getEnumTypeName(), c.getPrecision(), c.getScale(),
+                                    c.getGeneratedExpr(), c.isVirtual(), c.getDomainTypeName(),
+                                    c.getCompositeTypeName(), c.getArrayElementType()));
+                        } else {
+                            newCachedCols.add(c);
+                        }
+                    }
+                }
                 Database.ViewDef newView = new Database.ViewDef(
                         vd.name, vd.schemaName, parsed, vd.orReplace, vd.materialized,
-                        vd.cachedColumns, vd.cachedRows, updated, vd.checkOption, vd.reloptions);
+                        newCachedCols, vd.cachedRows, updated, vd.checkOption, vd.reloptions, vd.populated);
                 executor.database.addView(newView);
             } catch (Exception ignored) {
                 // If re-parse fails, leave the view as-is

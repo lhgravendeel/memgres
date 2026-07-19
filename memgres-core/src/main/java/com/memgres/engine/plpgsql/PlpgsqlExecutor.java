@@ -30,6 +30,10 @@ public class PlpgsqlExecutor {
     private int exceptionBlockDepth;
     // Track current function name for PG_EXCEPTION_CONTEXT
     private String currentFunctionName;
+    // Parameter names (lower-cased) of the current function. In PG, the hidden outer block
+    // labeled with the function name contains ONLY the parameters, so function-name
+    // qualification (funcname.x) resolves parameters but never body-DECLAREd variables.
+    private java.util.Set<String> currentFunctionParams;
 
     // Control flow signals
     private static class ReturnSignal extends RuntimeException {
@@ -130,6 +134,8 @@ public class PlpgsqlExecutor {
         }
         // DO blocks are anonymous code blocks that support transaction control (PG 11+)
         this.isProcedureExecution = true;
+        this.currentFunctionName = null;
+        this.currentFunctionParams = null;
         Scope scope = new Scope(null);
         scope.declare("found", false);
         try {
@@ -205,6 +211,14 @@ public class PlpgsqlExecutor {
     private Object executeFunctionBody(PgFunction function, List<Object> args) {
         PlpgsqlStatement.Block block;
         String lang = function.getLanguage() != null ? function.getLanguage().toLowerCase() : "plpgsql";
+
+        // Record parameter names for function-name-qualified references (funcname.param)
+        java.util.Set<String> paramNames = new java.util.HashSet<>();
+        for (int i = 0; i < function.getParams().size(); i++) {
+            PgFunction.Param p = function.getParams().get(i);
+            paramNames.add(p.name() != null ? p.name().toLowerCase() : ("$" + (i + 1)));
+        }
+        this.currentFunctionParams = paramNames;
 
         if (lang.equals("sql")) {
             // SQL language function: execute body as SQL with param substitution
@@ -386,7 +400,8 @@ public class PlpgsqlExecutor {
             scope.declare(pName, val);
             argIdx++;
         }
-        String substituted = substituteVariables(body, scope);
+        // SQL-language functions resolve parameter/column name conflicts in favor of the column
+        String substituted = substituteVariables(body, scope, true);
 
         // Split body into individual statements (supports multi-statement SQL bodies)
         List<String> stmts = splitSqlBody(substituted);
@@ -425,9 +440,19 @@ public class PlpgsqlExecutor {
         return null;
     }
 
+    /**
+     * Execute a trigger function.
+     *
+     * <p>Returns the (possibly modified) NEW row. For BEFORE / INSTEAD OF row-level triggers,
+     * returns {@code null} when the trigger function returned NULL, which signals that the
+     * operation on this row must be skipped (PostgreSQL semantics). The return value of
+     * AFTER triggers is ignored, as in PostgreSQL.
+     */
     public Object[] executeTriggerFunction(PgFunction function, Object[] newRow, Object[] oldRow,
                                            Table table, PgTrigger trigger) {
         PlpgsqlStatement.Block block = PlpgsqlParser.parse(function.getBody());
+        this.currentFunctionName = function.getName();
+        this.currentFunctionParams = new java.util.HashSet<>(); // trigger functions take no parameters
         Scope scope = new Scope(null);
 
         Map<String, Object> newMap = new LinkedHashMap<>();
@@ -469,24 +494,38 @@ public class PlpgsqlExecutor {
             scope.declare("tg_relid", relid);
         }
 
+        boolean rowLevel = trigger == null || !trigger.isForEachStatement();
+        boolean afterTiming = trigger != null && trigger.getTiming() == PgTrigger.Timing.AFTER;
+        // BEFORE and INSTEAD OF row-level triggers may skip the row by returning NULL
+        boolean skipCapable = rowLevel && !afterTiming;
+
         try {
             executeBlock(block, scope);
         } catch (ReturnSignal rs) {
             Object retVal = rs.value;
-            if (retVal == null) return newRow;
+            if (retVal == null) {
+                // BEFORE/INSTEAD OF row triggers: RETURN NULL skips the row.
+                // AFTER (and statement-level) triggers: the return value is ignored.
+                return skipCapable ? null : newRow;
+            }
             if (retVal instanceof Map) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> retMap = (Map<String, Object>) retVal;
-                copyMapToRow(retMap, newRow, table);
+                // AFTER triggers: PG ignores the returned row entirely
+                if (!afterTiming && newRow != null) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> retMap = (Map<String, Object>) retVal;
+                    copyMapToRow(retMap, newRow, table);
+                }
                 return newRow;
             }
         }
 
-        // Copy NEW map back
-        @SuppressWarnings("unchecked")
-        Map<String, Object> finalNew = (Map<String, Object>) scope.get("new");
-        if (finalNew != null && newRow != null) {
-            copyMapToRow(finalNew, newRow, table);
+        // Copy NEW map back (skipped for AFTER triggers: modifications to NEW are ignored, as in PG)
+        if (!afterTiming) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> finalNew = (Map<String, Object>) scope.get("new");
+            if (finalNew != null && newRow != null) {
+                copyMapToRow(finalNew, newRow, table);
+            }
         }
         return newRow;
     }
@@ -894,16 +933,24 @@ public class PlpgsqlExecutor {
         int lower = toInt(evalExpr(stmt.lower(), scope));
         int upper = toInt(evalExpr(stmt.upper(), scope));
         int step = stmt.step() != null ? toInt(evalExpr(stmt.step(), scope)) : 1;
-        if (stmt.reverse()) step = -Math.abs(step);
+        // PG requires a strictly positive BY value, for both forward and REVERSE loops
+        // (REVERSE negates the step internally)
+        if (step <= 0) {
+            throw new MemgresException("BY value of FOR loop must be greater than zero", "22023");
+        }
+        if (stmt.reverse()) step = -step;
 
-        scope.declare(stmt.varName(), null);
+        // The loop variable lives in an implicit inner block: it must not clobber a
+        // same-named variable in the enclosing scope, and it vanishes after the loop (PG semantics)
+        Scope loopScope = new Scope(scope);
+        loopScope.declare(stmt.varName(), null);
         boolean anyIteration = false;
 
         for (int i = lower; stmt.reverse() ? i >= upper : i <= upper; i += step) {
             anyIteration = true;
-            scope.set(stmt.varName(), i);
+            loopScope.declare(stmt.varName(), i);
             try {
-                executeStatements(stmt.body(), scope);
+                executeStatements(stmt.body(), loopScope);
             } catch (ExitSignal e) {
                 if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
                 throw e;
@@ -921,8 +968,16 @@ public class PlpgsqlExecutor {
 
         List<String> varNames = stmt.varNames();
         boolean multiVar = varNames.size() > 1;
-        for (String vn : varNames) {
-            scope.declare(vn, null);
+        // PG semantics: a record target is implicitly declared in an inner block (it must not
+        // clobber a same-named outer variable and vanishes after the loop), while a
+        // comma-separated scalar list targets previously declared variables (values persist).
+        Scope loopScope = new Scope(scope);
+        if (multiVar) {
+            for (String vn : varNames) {
+                if (!scope.has(vn)) scope.declare(vn, null);
+            }
+        } else {
+            loopScope.declare(varNames.get(0), null);
         }
         boolean anyIteration = false;
 
@@ -939,10 +994,10 @@ public class PlpgsqlExecutor {
                 for (int i = 0; i < result.getColumns().size(); i++) {
                     record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
                 }
-                scope.set(varNames.get(0), record);
+                loopScope.declare(varNames.get(0), record);
             }
             try {
-                executeStatements(stmt.body(), scope);
+                executeStatements(stmt.body(), loopScope);
             } catch (ExitSignal e) {
                 if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
                 throw e;
@@ -956,25 +1011,28 @@ public class PlpgsqlExecutor {
 
     private void executeForExecute(PlpgsqlStatement.ForExecuteStmt stmt, Scope scope) {
         // Evaluate the SQL expression (which may be a string literal or expression)
-        String sqlExpr = substituteVariables(stmt.sqlExpr(), scope);
-        Object sqlObj = evalExpr(sqlExpr, scope);
-        String sql = sqlObj != null ? sqlObj.toString() : sqlExpr;
-
-        // Handle USING parameters by substituting $1, $2, etc.
-        if (stmt.usingExprs() != null && !stmt.usingExprs().isEmpty()) {
-            for (int u = 0; u < stmt.usingExprs().size(); u++) {
-                Object paramVal = evalExpr(substituteVariables(stmt.usingExprs().get(u), scope), scope);
-                String replacement = paramVal == null ? "NULL" : paramVal.toString();
-                sql = sql.replace("$" + (u + 1), replacement);
-            }
+        Object sqlObj = evalExpr(stmt.sqlExpr(), scope);
+        if (sqlObj == null) {
+            throw new MemgresException("query string argument of EXECUTE is null", "22004");
         }
+        String sql = String.valueOf(sqlObj);
+        // Splice USING parameters ($1, $2, ...) into the SQL string
+        sql = substituteUsingParams(sql, stmt.usingExprs(), scope);
 
         QueryResult result = astExecutor.execute(sql);
 
         List<String> varNames = stmt.varNames();
         boolean multiVar = varNames.size() > 1;
-        for (String vn : varNames) {
-            scope.declare(vn, null);
+        // PG semantics: a record target is implicitly declared in an inner block (it must not
+        // clobber a same-named outer variable and vanishes after the loop), while a
+        // comma-separated scalar list targets previously declared variables (values persist).
+        Scope loopScope = new Scope(scope);
+        if (multiVar) {
+            for (String vn : varNames) {
+                if (!scope.has(vn)) scope.declare(vn, null);
+            }
+        } else {
+            loopScope.declare(varNames.get(0), null);
         }
         boolean anyIteration = false;
 
@@ -989,10 +1047,10 @@ public class PlpgsqlExecutor {
                 for (int i = 0; i < result.getColumns().size(); i++) {
                     record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
                 }
-                scope.set(varNames.get(0), record);
+                loopScope.declare(varNames.get(0), record);
             }
             try {
-                executeStatements(stmt.body(), scope);
+                executeStatements(stmt.body(), loopScope);
             } catch (ExitSignal e) {
                 if (e.label == null || e.label.equalsIgnoreCase(stmt.label())) break;
                 throw e;
@@ -1016,8 +1074,13 @@ public class PlpgsqlExecutor {
         // For example, SLICE 1 on a 2D array [[1,2],[3,4],[5,6]] yields [1,2], [3,4], [5,6].
         List<?> slices = sliceDepth > 0 ? sliceArray(list, sliceDepth) : list;
 
-        scope.declare(stmt.varName(), null);
+        // FOREACH targets an existing declared variable (it keeps its last value after the loop)
+        if (!scope.has(stmt.varName())) {
+            scope.declare(stmt.varName(), null);
+        }
+        boolean anyIteration = false;
         for (Object element : slices) {
+            anyIteration = true;
             scope.set(stmt.varName(), element);
             try {
                 executeStatements(stmt.body(), scope);
@@ -1029,6 +1092,7 @@ public class PlpgsqlExecutor {
                 throw c;
             }
         }
+        scope.set("found", anyIteration);
     }
 
     /**
@@ -1134,6 +1198,8 @@ public class PlpgsqlExecutor {
     private void executeReturnQuery(PlpgsqlStatement.ReturnQueryStmt stmt, Scope scope) {
         String sql = substituteVariables(stmt.sql(), scope);
         QueryResult result = astExecutor.execute(sql);
+        // PG sets FOUND after RETURN QUERY based on whether the query produced rows
+        scope.set("found", !result.getRows().isEmpty());
         List<Object> results = (List<Object>) scope.get("__return_next_results__");
         if (results != null) {
             for (Object[] row : result.getRows()) {
@@ -1149,24 +1215,11 @@ public class PlpgsqlExecutor {
             throw new MemgresException("query string argument of EXECUTE is null", "22004");
         }
         String sql = String.valueOf(sqlVal);
-        // Substitute USING parameters ($1, $2, ...) into the SQL string
-        if (stmt.usingExprs() != null && !stmt.usingExprs().isEmpty()) {
-            for (int i = stmt.usingExprs().size(); i >= 1; i--) {
-                Object paramVal = evalExpr(stmt.usingExprs().get(i - 1), scope);
-                String replacement;
-                if (paramVal == null) {
-                    replacement = "NULL";
-                } else if (paramVal instanceof Number) {
-                    replacement = paramVal.toString();
-                } else if (paramVal instanceof Boolean) {
-                    replacement = paramVal.toString();
-                } else {
-                    replacement = "'" + paramVal.toString().replace("'", "''") + "'";
-                }
-                sql = sql.replace("$" + i, replacement);
-            }
-        }
+        // Splice USING parameters ($1, $2, ...) into the SQL string
+        sql = substituteUsingParams(sql, stmt.usingExprs(), scope);
         QueryResult result = astExecutor.execute(sql);
+        // PG sets FOUND after RETURN QUERY EXECUTE based on whether the query produced rows
+        scope.set("found", !result.getRows().isEmpty());
         List<Object> results = (List<Object>) scope.get("__return_next_results__");
         if (results != null) {
             for (Object[] row : result.getRows()) {
@@ -1328,38 +1381,57 @@ public class PlpgsqlExecutor {
             throw new MemgresException("query string argument of EXECUTE is null", "22004");
         }
         String sql = String.valueOf(sqlVal);
-        // Substitute USING parameters ($1, $2, ...) into the SQL string
-        if (stmt.usingExprs() != null && !stmt.usingExprs().isEmpty()) {
-            for (int i = stmt.usingExprs().size(); i >= 1; i--) {
-                Object paramVal = evalExpr(stmt.usingExprs().get(i - 1), scope);
-                String replacement;
-                if (paramVal == null) {
-                    replacement = "NULL";
-                } else if (paramVal instanceof Number) {
-                    replacement = paramVal.toString();
-                } else if (paramVal instanceof Boolean) {
-                    replacement = paramVal.toString();
-                } else {
-                    replacement = "'" + paramVal.toString().replace("'", "''") + "'";
-                }
-                sql = sql.replace("$" + i, replacement);
-            }
-        }
+        // Splice USING parameters ($1, $2, ...) into the SQL string
+        sql = substituteUsingParams(sql, stmt.usingExprs(), scope);
         boolean prev = astExecutor.isStrictColumnRefs();
         astExecutor.setStrictColumnRefs(true);
         try {
             QueryResult result = astExecutor.execute(sql);
             scope.lastRowCount = result.getAffectedRows();
 
-            if (stmt.intoVars() != null && !result.getRows().isEmpty()) {
-                setFromRow(scope, stmt.intoVars(), result);
-                scope.set("found", true);
-            } else if (stmt.intoVars() != null) {
-                scope.set("found", false);
+            // Note: PG's EXECUTE never changes FOUND (it does update GET DIAGNOSTICS ROW_COUNT)
+            if (stmt.intoVars() != null) {
+                if (!result.getRows().isEmpty()) {
+                    setFromRow(scope, stmt.intoVars(), result);
+                } else {
+                    // Non-STRICT EXECUTE ... INTO with no rows sets all targets to NULL (PG semantics)
+                    for (String varName : stmt.intoVars()) {
+                        scope.set(varName, null);
+                    }
+                }
             }
         } finally {
             astExecutor.setStrictColumnRefs(prev);
         }
+    }
+
+    /**
+     * Evaluate USING parameter expressions and splice them into a dynamic SQL string in place
+     * of $1..$n placeholders. Shared by EXECUTE, FOR ... IN EXECUTE and RETURN QUERY EXECUTE.
+     *
+     * <p>Values are rendered as SQL literals (quoted/escaped/typed via {@link #appendValue}).
+     * Substitution happens in a single pass over the placeholders so that $1 can never corrupt
+     * $10 and spliced values are never re-scanned for further placeholders.
+     */
+    private String substituteUsingParams(String sql, List<String> usingExprs, Scope scope) {
+        if (usingExprs == null || usingExprs.isEmpty()) return sql;
+        // Evaluate all parameter expressions first, in order (PG evaluates USING exprs once)
+        List<String> literals = new ArrayList<>();
+        for (String expr : usingExprs) {
+            Object paramVal = evalExpr(expr, scope);
+            StringBuilder sb = new StringBuilder();
+            appendValue(sb, paramVal);
+            literals.add(sb.toString().trim());
+        }
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\$([0-9]+)").matcher(sql);
+        StringBuffer out = new StringBuffer();
+        while (m.find()) {
+            int idx = Integer.parseInt(m.group(1));
+            String replacement = (idx >= 1 && idx <= literals.size()) ? literals.get(idx - 1) : m.group(0);
+            m.appendReplacement(out, java.util.regex.Matcher.quoteReplacement(replacement));
+        }
+        m.appendTail(out);
+        return out.toString();
     }
 
     // ---- SQL statement execution ----
@@ -1377,6 +1449,14 @@ public class PlpgsqlExecutor {
         QueryResult result = astExecutor.execute(sql);
         scope.lastRowCount = result.getAffectedRows();
 
+        // PG sets FOUND after INSERT/UPDATE/DELETE/MERGE based on whether at least one row
+        // was affected (rows skipped by a BEFORE trigger returning NULL do not count)
+        QueryResult.Type resultType = result.getType();
+        if (resultType == QueryResult.Type.INSERT || resultType == QueryResult.Type.UPDATE
+                || resultType == QueryResult.Type.DELETE || resultType == QueryResult.Type.MERGE) {
+            scope.set("found", result.getAffectedRows() > 0);
+        }
+
         if (stmt.intoVars() != null) {
             int rowCount = result.getRows().size();
             if (stmt.strict()) {
@@ -1391,6 +1471,10 @@ public class PlpgsqlExecutor {
                 setFromRow(scope, stmt.intoVars(), result);
                 scope.set("found", true);
             } else {
+                // Non-STRICT SELECT INTO with no rows sets all targets to NULL (PG semantics)
+                for (String varName : stmt.intoVars()) {
+                    scope.set(varName, null);
+                }
                 scope.set("found", false);
             }
         }
@@ -1506,6 +1590,13 @@ public class PlpgsqlExecutor {
                     scope.set(qualifier, map);
                     return;
                 }
+            } else if (currentFunctionName != null && qualifier.equalsIgnoreCase(currentFunctionName)
+                    && currentFunctionParams != null && currentFunctionParams.contains(field.toLowerCase())
+                    && scope.has(field)) {
+                // Function-name-qualified assignment reaches parameters only (PG: the block
+                // labeled with the function name contains just the parameters)
+                scope.set(field, value);
+                return;
             }
         }
         // Check that the variable is declared; PG gives 42601 for undeclared variables
@@ -1747,10 +1838,24 @@ public class PlpgsqlExecutor {
     // ---- Variable substitution in SQL ----
 
     String substituteVariables(String sql, Scope scope) {
+        return substituteVariables(sql, scope, false);
+    }
+
+    /**
+     * Substitute PL/pgSQL variables into a SQL statement.
+     *
+     * @param columnWins conflict-resolution mode for identifiers that match both a variable
+     *        and a column of a table referenced by the statement. SQL-language functions pass
+     *        {@code true}: the column silently wins. PL/pgSQL passes {@code false}: such a
+     *        reference raises 42702 "column reference ... is ambiguous", which is PostgreSQL's
+     *        default {@code plpgsql.variable_conflict = error} behavior.
+     */
+    String substituteVariables(String sql, Scope scope, boolean columnWins) {
         if (sql == null) return null;
         try {
             List<Token> tokens = new Lexer(sql).tokenize();
             StringBuilder sb = new StringBuilder();
+            StatementScan scan = scanStatement(tokens);
 
             // Track INSERT column list context to avoid substituting column names
             // INSERT INTO tablename(col1, col2, ...) - identifiers inside are column names, not variables
@@ -1782,6 +1887,32 @@ public class PlpgsqlExecutor {
             for (int i = 0; i < tokens.size(); i++) {
                 Token t = tokens.get(i);
                 if (t.type() == TokenType.EOF) break;
+
+                // Handle function-name-qualified reference: funcname.x. In PG, the hidden outer
+                // block labeled with the function name contains ONLY the parameters, so this
+                // resolves parameters but never body-DECLAREd variables — those fall through to
+                // table resolution, which fails with 42P01 (unless funcname names a real
+                // table/alias in this statement).
+                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
+                        && currentFunctionName != null
+                        && t.value().equalsIgnoreCase(currentFunctionName)
+                        && !scope.has(t.value())
+                        && i + 2 < tokens.size()
+                        && tokens.get(i + 1).type() == TokenType.DOT
+                        && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
+                            || tokens.get(i + 2).type() == TokenType.KEYWORD)
+                        && !scan.tableRefNames.contains(t.value().toLowerCase())) {
+                    String qualField = tokens.get(i + 2).value().toLowerCase();
+                    if (currentFunctionParams != null && currentFunctionParams.contains(qualField)
+                            && scope.has(qualField)) {
+                        appendValue(sb, scope.get(qualField));
+                        i += 2;
+                        continue;
+                    }
+                    throw new MemgresException(
+                            "missing FROM-clause entry for table \"" + t.value().toLowerCase() + "\"",
+                            "42P01");
+                }
 
                 // Handle NEW.col / OLD.col / record.field
                 if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
@@ -1841,9 +1972,28 @@ public class PlpgsqlExecutor {
                     boolean isOutputOnly = scope.isOutputOnly(t.value());
                     // Don't substitute if preceded by dot (it's a field access like table.column)
                     // Don't substitute if inside INSERT column list (these are column names, not variables)
+                    // Don't substitute table names/aliases or UPDATE SET target columns
                     // Don't substitute output-only variables (OUT params of RETURNS TABLE functions)
                     // Also don't substitute common SQL keywords that happen to match variable names
-                    if (!isPrecededByDot && !isInInsertColList && !isOutputOnly && isSubstitutableVariable(t.value(), scope)) {
+                    if (!isPrecededByDot && !isInInsertColList && !isOutputOnly
+                            && !scan.protectedTokens.contains(i)
+                            && isSubstitutableVariable(t.value(), scope)) {
+                        // An identifier that matches both a variable and a column of a table
+                        // referenced by this statement is ambiguous. PL/pgSQL (with the PG
+                        // default plpgsql.variable_conflict = error) raises 42702; SQL-language
+                        // functions resolve it in favor of the column.
+                        String lowerName = t.value().toLowerCase();
+                        boolean conflictsWithColumn = scan.scopeColumns.contains(lowerName)
+                                || (scan.returningIdx >= 0 && i > scan.returningIdx
+                                    && scan.insertTargetColumns.contains(lowerName));
+                        if (conflictsWithColumn) {
+                            if (!columnWins) {
+                                throw new MemgresException(
+                                        "column reference \"" + lowerName + "\" is ambiguous", "42702");
+                            }
+                            appendTokenToSb(sb, t);
+                            continue;
+                        }
                         Object val = scope.get(t.value());
                         if (val instanceof Map) {
                             // For single-entry maps not followed by DOT, substitute with the value
@@ -1870,6 +2020,209 @@ public class PlpgsqlExecutor {
             throw e;
         } catch (Exception e) {
             return sql;
+        }
+    }
+
+    /**
+     * Result of a lightweight scan over the tokenized SQL statement, used to keep variable
+     * substitution from corrupting column references.
+     */
+    private static class StatementScan {
+        /** Token indexes that must never be substituted: table names, aliases, SET targets. */
+        final java.util.Set<Integer> protectedTokens = new java.util.HashSet<>();
+        /** Lower-cased column names of tables whose columns are in scope for expressions. */
+        final java.util.Set<String> scopeColumns = new java.util.HashSet<>();
+        /** Lower-cased column names of an INSERT's target table (in scope only after RETURNING). */
+        final java.util.Set<String> insertTargetColumns = new java.util.HashSet<>();
+        /** Lower-cased table names, schema names and aliases referenced by the statement. */
+        final java.util.Set<String> tableRefNames = new java.util.HashSet<>();
+        /** Index of the first top-level RETURNING keyword, or -1. */
+        int returningIdx = -1;
+    }
+
+    /**
+     * Scan a token stream to find (a) referenced tables and their columns (for detecting
+     * variable/column ambiguity), (b) UPDATE SET target columns and table names/aliases
+     * (which must never be substituted).
+     */
+    private StatementScan scanStatement(List<Token> tokens) {
+        StatementScan scan = new StatementScan();
+
+        // First meaningful word determines the statement kind
+        String firstWord = null;
+        for (Token t : tokens) {
+            if (t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER) {
+                firstWord = t.value().toUpperCase();
+                break;
+            }
+            if (t.type() != TokenType.LEFT_PAREN) break;
+        }
+        boolean isUpdateStmt = "UPDATE".equals(firstWord);
+
+        // Track, per paren level, whether the parenthesis introduces a query context
+        // (subquery) or a function-call argument list. FROM inside EXTRACT(x FROM y),
+        // SUBSTRING(s FROM n), TRIM(... FROM ...) must not be treated as a table clause.
+        java.util.ArrayDeque<Boolean> queryCtx = new java.util.ArrayDeque<>();
+        int depth = 0;
+        boolean inSetList = false;
+        int setDepth = 0;
+        String prevWord = null;
+
+        for (int i = 0; i < tokens.size(); i++) {
+            Token t = tokens.get(i);
+            TokenType tt = t.type();
+            if (tt == TokenType.EOF) break;
+            if (tt == TokenType.LEFT_PAREN) {
+                depth++;
+                // Peek at the next meaningful token to classify the paren
+                boolean isQuery = false;
+                for (int k = i + 1; k < tokens.size(); k++) {
+                    TokenType kt = tokens.get(k).type();
+                    if (kt == TokenType.LEFT_PAREN) continue;
+                    if (kt == TokenType.KEYWORD || kt == TokenType.IDENTIFIER) {
+                        String kw = tokens.get(k).value().toUpperCase();
+                        isQuery = kw.equals("SELECT") || kw.equals("WITH") || kw.equals("VALUES")
+                                || kw.equals("INSERT") || kw.equals("UPDATE") || kw.equals("DELETE");
+                    }
+                    break;
+                }
+                queryCtx.push(isQuery);
+                continue;
+            }
+            if (tt == TokenType.RIGHT_PAREN) {
+                depth--;
+                if (!queryCtx.isEmpty()) queryCtx.pop();
+                if (inSetList && depth < setDepth) inSetList = false;
+                continue;
+            }
+            boolean isWord = tt == TokenType.KEYWORD || tt == TokenType.IDENTIFIER;
+            if (!isWord) continue;
+            String w = t.value().toUpperCase();
+            boolean inQueryContext = queryCtx.isEmpty() || Boolean.TRUE.equals(queryCtx.peek());
+
+            if (inSetList && depth == setDepth
+                    && (w.equals("WHERE") || w.equals("FROM") || w.equals("RETURNING"))) {
+                inSetList = false;
+            }
+            // UPDATE SET target: identifier directly followed by '=' inside the SET list.
+            // These are always column names; never substitute a variable for them.
+            if (inSetList && depth == setDepth && i + 1 < tokens.size()
+                    && tokens.get(i + 1).type() == TokenType.EQUALS) {
+                scan.protectedTokens.add(i);
+            }
+
+            if (w.equals("SET") && !inSetList
+                    && ("UPDATE".equals(prevWord) || (isUpdateStmt && depth == 0))) {
+                inSetList = true;
+                setDepth = depth;
+            } else if (w.equals("RETURNING") && depth == 0 && scan.returningIdx < 0) {
+                scan.returningIdx = i;
+            } else if (w.equals("UPDATE") && prevWord == null) {
+                // Top-level UPDATE target table: its columns are in scope for SET/WHERE/RETURNING
+                i = collectTableList(tokens, i + 1, scan, scan.scopeColumns, false, true);
+            } else if ((w.equals("FROM") || w.equals("JOIN")) && inQueryContext) {
+                i = collectTableList(tokens, i + 1, scan, scan.scopeColumns, w.equals("FROM"), false);
+            } else if (w.equals("USING") && inQueryContext
+                    && i + 1 < tokens.size() && tokens.get(i + 1).type() != TokenType.LEFT_PAREN) {
+                // DELETE ... USING / MERGE ... USING table list (JOIN ... USING (cols) is excluded
+                // by the paren check above)
+                i = collectTableList(tokens, i + 1, scan, scan.scopeColumns, true, false);
+            } else if (w.equals("INTO") && "INSERT".equals(prevWord)) {
+                // INSERT target columns are only in scope for the RETURNING clause
+                i = collectTableList(tokens, i + 1, scan, scan.insertTargetColumns, false, true);
+            } else if (w.equals("INTO") && "MERGE".equals(prevWord)) {
+                i = collectTableList(tokens, i + 1, scan, scan.scopeColumns, false, true);
+            }
+            prevWord = w;
+        }
+        return scan;
+    }
+
+    /**
+     * Collect one table reference (or a comma-separated list when {@code allowList}) starting
+     * at token index {@code start}. Adds the referenced tables' column names (lower-cased) to
+     * {@code cols} and marks table-name/alias tokens as protected. Returns the index of the
+     * last consumed token.
+     */
+    private int collectTableList(List<Token> tokens, int start, StatementScan scan,
+                                 java.util.Set<String> cols, boolean allowList, boolean isDmlTarget) {
+        int i = start;
+        while (true) {
+            // Skip noise words that may precede a table name
+            while (i < tokens.size()
+                    && (tokens.get(i).type() == TokenType.KEYWORD || tokens.get(i).type() == TokenType.IDENTIFIER)
+                    && ("ONLY".equalsIgnoreCase(tokens.get(i).value())
+                        || "LATERAL".equalsIgnoreCase(tokens.get(i).value()))) {
+                i++;
+            }
+            if (i >= tokens.size()) return i - 1;
+            Token t = tokens.get(i);
+            if (t.type() != TokenType.IDENTIFIER && t.type() != TokenType.QUOTED_IDENTIFIER) {
+                return start - 1; // subquery, VALUES, literal, etc. — not a plain table reference
+            }
+            // Function call like generate_series(...) — not a table. DML targets are exempt:
+            // in INSERT INTO t (col, ...) the paren is the column list, not a call.
+            if (!isDmlTarget && i + 1 < tokens.size() && tokens.get(i + 1).type() == TokenType.LEFT_PAREN) {
+                return start - 1;
+            }
+            String schemaName = null;
+            String tableName = t.value();
+            int end = i;
+            if (i + 2 < tokens.size() && tokens.get(i + 1).type() == TokenType.DOT
+                    && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
+                        || tokens.get(i + 2).type() == TokenType.QUOTED_IDENTIFIER)) {
+                schemaName = tableName;
+                tableName = tokens.get(i + 2).value();
+                end = i + 2;
+                if (!isDmlTarget && end + 1 < tokens.size() && tokens.get(end + 1).type() == TokenType.LEFT_PAREN) {
+                    return start - 1; // schema-qualified function call
+                }
+            }
+            for (int k = i; k <= end; k++) {
+                scan.protectedTokens.add(k);
+            }
+            if (schemaName != null) scan.tableRefNames.add(schemaName.toLowerCase());
+            scan.tableRefNames.add(tableName.toLowerCase());
+            Table tbl = resolveTableForScan(schemaName, tableName);
+            if (tbl != null) {
+                for (Column c : tbl.getColumns()) {
+                    cols.add(c.getName().toLowerCase());
+                }
+            }
+            i = end + 1;
+            // Optional alias: [AS] identifier
+            if (i < tokens.size() && tokens.get(i).type() == TokenType.KEYWORD
+                    && "AS".equalsIgnoreCase(tokens.get(i).value())) {
+                i++;
+                if (i < tokens.size() && (tokens.get(i).type() == TokenType.IDENTIFIER
+                        || tokens.get(i).type() == TokenType.QUOTED_IDENTIFIER)) {
+                    scan.protectedTokens.add(i);
+                    scan.tableRefNames.add(tokens.get(i).value().toLowerCase());
+                    i++;
+                }
+            } else if (i < tokens.size() && tokens.get(i).type() == TokenType.IDENTIFIER) {
+                scan.protectedTokens.add(i);
+                scan.tableRefNames.add(tokens.get(i).value().toLowerCase());
+                i++;
+            }
+            if (allowList && i < tokens.size() && tokens.get(i).type() == TokenType.COMMA) {
+                i++;
+                continue;
+            }
+            return i - 1;
+        }
+    }
+
+    private Table resolveTableForScan(String schemaName, String tableName) {
+        try {
+            String name = tableName.toLowerCase();
+            if (schemaName != null) {
+                Schema schema = database.getSchema(schemaName.toLowerCase());
+                return schema != null ? schema.getTable(name) : null;
+            }
+            return database.getTable(name);
+        } catch (RuntimeException e) {
+            return null;
         }
     }
 

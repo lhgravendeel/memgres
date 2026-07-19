@@ -207,10 +207,10 @@ class CatalogCoreBuilder {
                     0, 0, viewOwnerOid, 0, vOid, 0,
                     0, 0.0, 0, 0, 0,
                     false, false, "p", vd.materialized() ? "m" : "v",
-                    (short) 0, (short) 0,
+                    (short) (vd.cachedColumns() != null ? vd.cachedColumns().size() : 0), (short) 0,
                     true, false, false, false, false,
                     false, // relhasoids
-                    true, "n", false,
+                    !vd.materialized() || vd.populated(), "n", false,
                     0, 0, 0,
                     null, viewRelOptions, null, 1
             });
@@ -388,9 +388,7 @@ class CatalogCoreBuilder {
             StringBuilder sb = new StringBuilder("FOR VALUES IN (");
             for (int i = 0; i < t.getPartitionValues().size(); i++) {
                 if (i > 0) sb.append(", ");
-                Object v = t.getPartitionValues().get(i);
-                if (v instanceof String) sb.append("'").append(v).append("'");
-                else sb.append(v);
+                sb.append(formatBoundValue(t.getPartitionValues().get(i)));
             }
             sb.append(")");
             return sb.toString();
@@ -403,10 +401,25 @@ class CatalogCoreBuilder {
     }
 
     private static String formatBoundValue(Object val) {
+        if (val == null) return "NULL";
+        if (val instanceof PartitionBound) return val.toString();
+        if (val instanceof java.util.List) {
+            java.util.List<?> vals = (java.util.List<?>) val;
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < vals.size(); i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(formatBoundValue(vals.get(i)));
+            }
+            return sb.toString();
+        }
         if (val instanceof String) {
             String s = (String) val;
             if (s.equalsIgnoreCase("MINVALUE") || s.equalsIgnoreCase("MAXVALUE")) return s;
             return "'" + s + "'";
+        }
+        if (val instanceof java.time.LocalDate || val instanceof java.time.LocalDateTime
+                || val instanceof java.time.LocalTime || val instanceof java.time.OffsetDateTime) {
+            return "'" + val + "'";
         }
         return String.valueOf(val);
     }
@@ -445,8 +458,25 @@ class CatalogCoreBuilder {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 Table t = tableEntry.getValue();
                 int relOid = oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName());
-                for (int i = 0; i < t.getColumns().size(); i++) {
-                    Column c = t.getColumns().get(i);
+                addUserRelationAttributes(table, relOid, t.getColumns());
+            }
+        }
+
+        // View columns (regular and materialized): resolved output columns stored on the ViewDef
+        for (Database.ViewDef vd : database.getViews().values()) {
+            if (vd.cachedColumns() == null || vd.cachedColumns().isEmpty()) continue;
+            String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
+            int vRelOid = oids.oid("rel:" + vSchema + "." + vd.name());
+            addUserRelationAttributes(table, vRelOid, vd.cachedColumns());
+        }
+        addPgAttributeExtras(table);
+        return table;
+    }
+
+    /** Insert one pg_attribute row per column for a user relation (table or view). */
+    private void addUserRelationAttributes(Table table, int relOid, List<Column> columns) {
+        for (int i = 0; i < columns.size(); i++) {
+                    Column c = columns.get(i);
                     // Determine identity type
                     // SERIAL/BIGSERIAL/SMALLSERIAL are NOT identity columns (attidentity stays empty)
                     // Only actual GENERATED AS IDENTITY columns get 'd' or 'a'
@@ -548,10 +578,11 @@ class CatalogCoreBuilder {
                             null,      // attmissingval
                             "i"        // attalign
                     });
-                }
-            }
         }
+    }
 
+    /** pg_attribute rows for foreign tables, composite types, and system catalogs. */
+    private void addPgAttributeExtras(Table table) {
         // Foreign table columns
         for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
             int ftRelOid = oids.oid("rel:public." + ft.tableName);
@@ -643,8 +674,6 @@ class CatalogCoreBuilder {
                 16, 16, 16, 23,        // rolcreatedb=bool, rolcanlogin=bool, rolreplication=bool, rolconnlimit=int4
                 1184, 16, 25, 25       // rolvaliduntil=timestamptz, rolbypassrls=bool, rolconfig=text, rolpassword=text
         });
-
-        return table;
     }
 
     /** Helper: add pg_attribute rows for a system catalog table. */

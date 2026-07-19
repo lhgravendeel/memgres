@@ -38,12 +38,8 @@ class ArrayOperationHandler {
             elements = (List<?>) arrVal;
             isMultiDim = isChainedSlice && !elements.isEmpty() && elements.get(0) instanceof List<?>;
         } else if (arrVal instanceof String && ((String) arrVal).startsWith("{") && ((String) arrVal).endsWith("}")) {
-            String s = (String) arrVal;
-            String inner = s.substring(1, s.length() - 1);
-            if (inner.isEmpty()) elements = java.util.Collections.emptyList();
-            else {
-                elements = java.util.Arrays.asList(inner.split(",", -1));
-            }
+            // Quote- and nesting-aware parse (commas inside quoted elements are not separators)
+            elements = FunctionEvaluator.parseSimplePgArray((String) arrVal);
         } else {
             return arrVal; // not an array, return as-is
         }
@@ -106,10 +102,22 @@ class ArrayOperationHandler {
             Object e = elements.get(i);
             if (e == null) sb.append("NULL");
             else if (e instanceof List<?>) sb.append(formatArrayForOutput((List<?>) e));
-            else sb.append(e);
+            else if (e instanceof String && needsArrayQuoting((String) e)) {
+                sb.append("\"").append(((String) e).replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+            } else sb.append(e);
         }
         sb.append("}");
         return sb.toString();
+    }
+
+    /** True if a string element must be double-quoted in PG array output syntax. */
+    private static boolean needsArrayQuoting(String s) {
+        if (s.isEmpty() || s.equalsIgnoreCase("NULL")) return true;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || Character.isWhitespace(c)) return true;
+        }
+        return false;
     }
 
     List<Object> parsePostgresArrayLiteral(String s) {
@@ -150,6 +158,28 @@ class ArrayOperationHandler {
                 }
                 result.add(sb.toString());
                 // Skip comma
+                while (i < inner.length() && (inner.charAt(i) == ',' || inner.charAt(i) == ' ')) i++;
+            } else if (inner.charAt(i) == '{') {
+                // Nested sub-array: find the matching close brace (quote-aware)
+                int depth = 0;
+                boolean inQ = false;
+                int start = i;
+                int j = i;
+                for (; j < inner.length(); j++) {
+                    char cc = inner.charAt(j);
+                    if (inQ) {
+                        if (cc == '\\') j++;
+                        else if (cc == '"') inQ = false;
+                    } else if (cc == '"') inQ = true;
+                    else if (cc == '{') depth++;
+                    else if (cc == '}') {
+                        depth--;
+                        if (depth == 0) break;
+                    }
+                }
+                int end = Math.min(j, inner.length() - 1);
+                result.add(parsePostgresArrayLiteral(inner.substring(start, end + 1), rawStrings));
+                i = end + 1;
                 while (i < inner.length() && (inner.charAt(i) == ',' || inner.charAt(i) == ' ')) i++;
             } else {
                 // Unquoted element

@@ -653,7 +653,8 @@ public final class TypeCoercion {
                 sb.append("\"").append(rowStr.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
             } else if (elem instanceof String) {
                 String s = (String) elem;
-                if (s.startsWith("(") || s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains(" ") || s.isEmpty()) {
+                // The literal string "NULL" must be quoted to distinguish it from SQL NULL
+                if (s.startsWith("(") || s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains("\\") || s.contains(" ") || s.isEmpty() || s.equalsIgnoreCase("NULL")) {
                     sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
                 } else {
                     sb.append(s);
