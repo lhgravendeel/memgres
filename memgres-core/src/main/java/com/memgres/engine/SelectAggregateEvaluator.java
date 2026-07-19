@@ -49,8 +49,24 @@ class SelectAggregateEvaluator {
             for (Expression e : effectiveGroupBy) {
                 if (e instanceof ColumnRef) groupingSetColNames.add(((ColumnRef) e).column().toLowerCase());
                 else groupingSetColNames.add(executor.exprToAlias(e).toLowerCase());
+                // Composite grouping element like (a, b): its member columns are grouped
+                // individually as far as GROUPING() and the select list are concerned.
+                if (e instanceof ArrayExpr && ((ArrayExpr) e).isRow()) {
+                    for (Expression el : ((ArrayExpr) e).elements()) {
+                        if (el instanceof ColumnRef) groupingSetColNames.add(((ColumnRef) el).column().toLowerCase());
+                        else groupingSetColNames.add(executor.exprToAlias(el).toLowerCase());
+                    }
+                }
             }
             currentGroupingSetColumns.set(groupingSetColNames);
+
+            // Column names that are functionally grouped in this grouping set. Select-list
+            // expressions built over these columns evaluate against the group's key values;
+            // any other column reads as NULL for this grouping set (PG semantics).
+            Set<String> groupedColumnNames = new HashSet<>();
+            for (Expression e : effectiveGroupBy) {
+                collectColumnNames(e, groupedColumnNames);
+            }
 
             List<List<RowContext>> groups;
             if (effectiveGroupBy.isEmpty()) {
@@ -75,31 +91,19 @@ class SelectAggregateEvaluator {
 
             for (List<RowContext> group : groups) {
                 RowContext representative = group.isEmpty() ? null : group.get(0);
+                // Ungrouped columns read as NULL for this grouping set; grouped columns keep
+                // their key values, so expressions over them (e.g. a+10 with ROLLUP(a))
+                // evaluate normally in the sets that group them.
+                RowContext maskedRep = maskUngroupedColumns(representative, groupedColumnNames);
                 Object[] row = new Object[stmt.targets().size()];
                 for (int i = 0; i < stmt.targets().size(); i++) {
                     SelectStmt.SelectTarget target = stmt.targets().get(i);
                     Expression expr = target.expr();
-                    if (!select.isAggregateOrConstant(expr)) {
-                        boolean inGroupBy = false;
-                        for (Expression ge : effectiveGroupBy) {
-                            if (ge.equals(expr)) { inGroupBy = true; break; }
-                            if (ge instanceof ColumnRef && expr instanceof ColumnRef
-                                    && ((ColumnRef) ge).column().equalsIgnoreCase(((ColumnRef) expr).column())) {
-                                ColumnRef ecr = (ColumnRef) expr;
-                                ColumnRef gcr = (ColumnRef) ge;
-                                inGroupBy = true; break;
-                            }
-                        }
-                        if (!inGroupBy) {
-                            row[i] = null;
-                            continue;
-                        }
-                    }
-                    row[i] = evalAggregateExpr(expr, group, representative);
+                    row[i] = evalAggregateExpr(expr, group, maskedRep);
                 }
 
                 if (stmt.having() != null) {
-                    Object havingResult = evalAggregateExpr(stmt.having(), group, representative);
+                    Object havingResult = evalAggregateExpr(stmt.having(), group, maskedRep);
                     if (!executor.isTruthy(havingResult)) continue;
                 }
                 allResultRows.add(row);
@@ -134,6 +138,83 @@ class SelectAggregateEvaluator {
         allResultRows = select.applyOffsetAndLimit(stmt, allResultRows);
 
         return QueryResult.select(resultColumns, allResultRows);
+    }
+
+    /** Recursively collect the (lowercased) column names referenced anywhere in an expression. */
+    private static void collectColumnNames(Expression expr, Set<String> out) {
+        if (expr == null) return;
+        if (expr instanceof ColumnRef) {
+            out.add(((ColumnRef) expr).column().toLowerCase());
+        } else if (expr instanceof BinaryExpr) {
+            collectColumnNames(((BinaryExpr) expr).left(), out);
+            collectColumnNames(((BinaryExpr) expr).right(), out);
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr c = (CustomOperatorExpr) expr;
+            collectColumnNames(c.left(), out);
+            collectColumnNames(c.right(), out);
+        } else if (expr instanceof UnaryExpr) {
+            collectColumnNames(((UnaryExpr) expr).operand(), out);
+        } else if (expr instanceof CastExpr) {
+            collectColumnNames(((CastExpr) expr).expr(), out);
+        } else if (expr instanceof FunctionCallExpr) {
+            for (Expression arg : ((FunctionCallExpr) expr).args()) {
+                collectColumnNames(arg, out);
+            }
+        } else if (expr instanceof ArrayExpr) {
+            for (Expression el : ((ArrayExpr) expr).elements()) {
+                collectColumnNames(el, out);
+            }
+        } else if (expr instanceof IsNullExpr) {
+            collectColumnNames(((IsNullExpr) expr).expr(), out);
+        } else if (expr instanceof IsJsonExpr) {
+            collectColumnNames(((IsJsonExpr) expr).expr(), out);
+        } else if (expr instanceof InExpr) {
+            InExpr in = (InExpr) expr;
+            collectColumnNames(in.expr(), out);
+            if (in.values() != null) {
+                for (Expression v : in.values()) collectColumnNames(v, out);
+            }
+        } else if (expr instanceof LikeExpr) {
+            collectColumnNames(((LikeExpr) expr).left(), out);
+            collectColumnNames(((LikeExpr) expr).pattern(), out);
+        } else if (expr instanceof CaseExpr) {
+            CaseExpr c = (CaseExpr) expr;
+            collectColumnNames(c.operand(), out);
+            for (CaseExpr.WhenClause when : c.whenClauses()) {
+                collectColumnNames(when.condition(), out);
+                collectColumnNames(when.result(), out);
+            }
+            collectColumnNames(c.elseExpr(), out);
+        }
+    }
+
+    /**
+     * Build a copy of the representative row context where every column whose name is not
+     * functionally grouped in the current grouping set is replaced with NULL. This implements
+     * the PG semantics that, within a grouping set, ungrouped columns read as NULL while
+     * grouped columns keep their group-key values.
+     */
+    private RowContext maskUngroupedColumns(RowContext representative, Set<String> groupedColumnNames) {
+        if (representative == null) return null;
+        List<RowContext.TableBinding> masked = new ArrayList<>();
+        for (RowContext.TableBinding b : representative.getBindings()) {
+            Object[] row = b.row();
+            Object[] copy = row;
+            if (row != null) {
+                copy = Arrays.copyOf(row, row.length);
+                List<Column> cols = b.table().getColumns();
+                for (int ci = 0; ci < copy.length && ci < cols.size(); ci++) {
+                    if (!groupedColumnNames.contains(cols.get(ci).getName().toLowerCase())) {
+                        copy[ci] = null;
+                    }
+                }
+            }
+            masked.add(new RowContext.TableBinding(b.table(), b.alias(), copy, b.sourceTable()));
+        }
+        RowContext ctx = new RowContext(masked);
+        ctx.setUsingColumns(representative.getUsingColumns());
+        ctx.setOuterJoinNullPadded(representative.isOuterJoinNullPadded());
+        return ctx;
     }
 
     QueryResult executeAggregateSelect(SelectStmt stmt, List<RowContext> contexts,
@@ -461,6 +542,28 @@ class SelectAggregateEvaluator {
                     Literal.ofString(pattern.toString()),
                     like.escape(), like.caseInsensitive(), like.negated());
             return executor.evalExpr(resolved, representative);
+        } else if (expr instanceof CaseExpr && select.containsAggregate(expr)) {
+            // Evaluate CASE in aggregate context so aggregates and grouping() inside
+            // conditions/results are computed over the group, e.g. the disambiguation
+            // idiom CASE WHEN grouping(a, b) = 3 THEN 'total' ... END.
+            CaseExpr c = (CaseExpr) expr;
+            if (c.operand() != null) {
+                Object opVal = evalAggregateExpr(c.operand(), group, representative);
+                for (CaseExpr.WhenClause when : c.whenClauses()) {
+                    Object condVal = evalAggregateExpr(when.condition(), group, representative);
+                    if (opVal != null && condVal != null && TypeCoercion.areEqual(opVal, condVal)) {
+                        return evalAggregateExpr(when.result(), group, representative);
+                    }
+                }
+            } else {
+                for (CaseExpr.WhenClause when : c.whenClauses()) {
+                    Object condVal = evalAggregateExpr(when.condition(), group, representative);
+                    if (executor.isTruthy(condVal)) {
+                        return evalAggregateExpr(when.result(), group, representative);
+                    }
+                }
+            }
+            return c.elseExpr() != null ? evalAggregateExpr(c.elseExpr(), group, representative) : null;
         } else if (expr instanceof WindowFuncExpr) {
             return null;
         } else if (expr instanceof Literal) {
@@ -643,12 +746,13 @@ class SelectAggregateEvaluator {
             case "cume_dist": {
                 if (osa.args().isEmpty()) return null;
                 Object hypoObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
-                if (vals.isEmpty()) return 1.0;
                 long countLE = 0;
                 for (Object v : vals) {
                     if (executor.compareValues(v, hypoObj) <= 0) countLE++;
                 }
-                return (double) countLE / vals.size();
+                // The hypothetical row joins both the numerator and the denominator:
+                // (countLE + 1) / (N + 1). Empty group: (0 + 1) / (0 + 1) = 1.0.
+                return (double) (countLE + 1) / (vals.size() + 1);
             }
             default: {
                 return null; 
@@ -686,7 +790,7 @@ class SelectAggregateEvaluator {
                     Set<String> seen = new HashSet<>();
                     for (RowContext ctx : group) {
                         Object val = executor.evalExpr(arg, ctx);
-                        if (val != null) seen.add(val.toString());
+                        if (val != null) seen.add(distinctKey(val));
                     }
                     return (long) seen.size();
                 }
@@ -704,12 +808,10 @@ class SelectAggregateEvaluator {
                 BigDecimal bdSum = BigDecimal.ZERO;
                 try {
                     if (fn.distinct()) {
-                        Set<Object> seen = new LinkedHashSet<>();
+                        Set<String> seenKeys = new HashSet<>();
                         for (RowContext ctx : group) {
                             Object val = executor.evalExpr(arg, ctx);
-                            if (val != null) seen.add(val);
-                        }
-                        for (Object val : seen) {
+                            if (val == null || !seenKeys.add(distinctKey(val))) continue;
                             hasValue = true;
                             bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                             if (!(val instanceof Integer || val instanceof Long)) allInts = false;
@@ -739,12 +841,10 @@ class SelectAggregateEvaluator {
                 BigDecimal bdSum = BigDecimal.ZERO;
                 long count = 0;
                 if (fn.distinct()) {
-                    Set<Object> seen = new LinkedHashSet<>();
+                    Set<String> seenKeys = new HashSet<>();
                     for (RowContext ctx : group) {
                         Object val = executor.evalExpr(arg, ctx);
-                        if (val != null) seen.add(val);
-                    }
-                    for (Object val : seen) {
+                        if (val == null || !seenKeys.add(distinctKey(val))) continue;
                         bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                         count++;
                     }
@@ -797,7 +897,7 @@ class SelectAggregateEvaluator {
                     Object val = executor.evalExpr(arg, ctx);
                     if (val != null) {
                         String sv = val.toString();
-                        if (seen != null && !seen.add(sv)) continue;
+                        if (seen != null && !seen.add(distinctKey(val))) continue;
                         if (!first) sb.append(delim);
                         sb.append(sv);
                         first = false;
@@ -813,7 +913,7 @@ class SelectAggregateEvaluator {
                 Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
                 for (RowContext ctx : orderedGroup) {
                     Object val = executor.evalExpr(arg, ctx);
-                    if (seen != null && val != null && !seen.add(val.toString())) continue;
+                    if (seen != null && val != null && !seen.add(distinctKey(val))) continue;
                     list.add(val);
                 }
                 StringBuilder sb = new StringBuilder("{");
@@ -1132,11 +1232,16 @@ class SelectAggregateEvaluator {
                 if (currentGroupSet == null) {
                     throw new MemgresException("GROUPING is not supported without GROUPING SETS, ROLLUP, or CUBE", "42803");
                 }
-                if (fn.args().isEmpty()) return 0;
-                Expression arg = fn.args().get(0);
-                String colName = arg instanceof ColumnRef ? ((ColumnRef) arg).column().toLowerCase() :
-                        executor.exprToAlias(arg).toLowerCase();
-                return currentGroupSet.contains(colName) ? 0 : 1;
+                // Result is a bitmask: bit i (from the left, most significant first) is 1
+                // if argument i is NOT grouped in the current grouping set.
+                // grouping(a, b) over ROLLUP(a, b): detail rows 0, a-subtotals 1, grand total 3.
+                int mask = 0;
+                for (Expression arg : fn.args()) {
+                    String colName = arg instanceof ColumnRef ? ((ColumnRef) arg).column().toLowerCase() :
+                            executor.exprToAlias(arg).toLowerCase();
+                    mask = (mask << 1) | (currentGroupSet.contains(colName) ? 0 : 1);
+                }
+                return mask;
             }
             case "corr": {
                 RegressionData rd = RegressionData.compute(group, fn.args(), executor);
@@ -1284,7 +1389,7 @@ class SelectAggregateEvaluator {
             // DISTINCT: skip duplicate value tuples
             if (seen != null) {
                 String key = argValues.stream()
-                        .map(v -> v == null ? "\0" : v.toString())
+                        .map(v -> v == null ? "\0" : distinctKey(v))
                         .collect(Collectors.joining("\1"));
                 if (!seen.add(key)) continue;
             }
@@ -1322,6 +1427,28 @@ class SelectAggregateEvaluator {
     }
 
     // ---- DRY helpers ----
+
+    /**
+     * Dedup key for DISTINCT aggregates with value semantics: numeric values that compare
+     * equal map to the same key even when their representations differ (numeric 1.0 vs 1.00,
+     * or int 1 vs numeric 1.0), matching PostgreSQL's equality-based DISTINCT.
+     */
+    private static String distinctKey(Object val) {
+        if (val instanceof BigDecimal) {
+            BigDecimal bd = (BigDecimal) val;
+            if (bd.signum() == 0) return "0";
+            return bd.stripTrailingZeros().toPlainString();
+        }
+        if (val instanceof Double || val instanceof Float) {
+            double d = ((Number) val).doubleValue();
+            if (!Double.isNaN(d) && !Double.isInfinite(d)) {
+                if (d == 0.0) return "0";
+                return BigDecimal.valueOf(d).stripTrailingZeros().toPlainString();
+            }
+            return String.valueOf(d);
+        }
+        return val.toString();
+    }
 
     /** Sort a group by the aggregate's ORDER BY clause (used by string_agg, array_agg, json_agg, etc.). */
     private List<RowContext> sortGroupForAggregate(List<RowContext> group, FunctionCallExpr fn) {
