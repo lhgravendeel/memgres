@@ -929,16 +929,18 @@ class FunctionEvaluator {
                 }
                 if (arr instanceof List<?>) {
                     List<?> list = (List<?>) arr;
+                    // PG returns NULL for empty arrays (they have no dimensions)
+                    if (list.isEmpty()) return null;
                     if (dim2 == 1) return list.size();
-                    if (dim2 == 2 && !list.isEmpty() && list.get(0) instanceof List<?>) return ((List<?>) list.get(0)).size();
+                    if (dim2 == 2 && list.get(0) instanceof List<?>) return ((List<?>) list.get(0)).size();
                     return null;
                 }
                 if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
                     String s = (String) arr;
                     if (dim2 != 1) return null;
                     String inner = s.substring(1, s.length() - 1).trim();
-                    if (inner.isEmpty()) return 0;
-                    return inner.split(",").length;
+                    if (inner.isEmpty()) return null; // PG returns NULL for empty arrays
+                    return countArrayElements(inner);
                 }
                 return null;
             }
@@ -1069,12 +1071,12 @@ class FunctionEvaluator {
             case "array_to_string": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object delim = executor.evalExpr(fn.args().get(1), ctx);
-                // Handle string-formatted arrays like {a,b,c}
+                // Handle string-formatted arrays like {a,b,c} (quote-aware, nested arrays flattened)
                 if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
                     String s = (String) arr;
                     String inner = s.substring(1, s.length() - 1);
                     if (inner.isEmpty()) return "";
-                    arr = java.util.Arrays.asList(inner.split(","));
+                    arr = flattenArray(parseSimplePgArray(s));
                 }
                 if (arr instanceof List<?>) {
                     List<?> list = (List<?>) arr;
@@ -1099,7 +1101,8 @@ class FunctionEvaluator {
                     String s = arr.toString().trim();
                     if (s.equals("{}")) return 0;
                     if (s.startsWith("{") && s.endsWith("}")) {
-                        return countLeafElementsFromString(s);
+                        // Quote-aware count (commas inside quoted elements are not separators)
+                        return countLeafElements(parseSimplePgArray(s));
                     }
                 }
                 return null;
@@ -1121,7 +1124,8 @@ class FunctionEvaluator {
                     return "(" + sb + ")";
                 }
                 if (arr instanceof List<?>) {
-                    return new ArrayList<>((List<?>) arr); // Return as List for SRF expansion
+                    // PG unnest fully flattens multidimensional arrays into scalar elements
+                    return flattenArray((List<?>) arr); // Return as List for SRF expansion
                 }
                 // Multirange unnest: expand into individual range strings
                 if (arr instanceof String && RangeOperations.isMultirangeOrEmpty(((String) arr))) {
@@ -1134,7 +1138,7 @@ class FunctionEvaluator {
                 }
                 if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
                     String s = (String) arr;
-                    List<Object> parsed = new ArrayList<>(parseSimplePgArray(s));
+                    List<Object> parsed = flattenArray(parseSimplePgArray(s));
                     // If this is an enum array, wrap elements as PgEnum for ordinal-based sorting
                     String enumTypeName = resolveEnumTypeFromArrayArg(fn.args().get(0), ctx);
                     if (enumTypeName != null) {
@@ -2601,6 +2605,20 @@ class FunctionEvaluator {
         try { Double.parseDouble(t); return true; } catch (NumberFormatException e) { return false; }
     }
 
+    /** Recursively flatten a (possibly nested) array into a flat list of scalar elements. */
+    static List<Object> flattenArray(List<?> list) {
+        List<Object> out = new ArrayList<>();
+        flattenArrayInto(list, out);
+        return out;
+    }
+
+    private static void flattenArrayInto(List<?> list, List<Object> out) {
+        for (Object o : list) {
+            if (o instanceof List<?>) flattenArrayInto((List<?>) o, out);
+            else out.add(o);
+        }
+    }
+
     /** Recursively count all leaf elements in a nested list. */
     private static int countLeafElements(List<?> list) {
         int count = 0;
@@ -2609,15 +2627,6 @@ class FunctionEvaluator {
             else count++;
         }
         return count;
-    }
-
-    /** Count all leaf elements from a PG array string like {{1,2},{3,4}}. */
-    private static int countLeafElementsFromString(String s) {
-        // Count commas outside of nested braces at the deepest level
-        // Simple approach: strip all braces and count comma-separated elements
-        String stripped = s.replaceAll("[{}]", "");
-        if (stripped.isEmpty()) return 0;
-        return stripped.split(",", -1).length;
     }
 
     /** Build a filled multi-dimensional array string. */
@@ -2656,26 +2665,91 @@ class FunctionEvaluator {
         return count;
     }
 
-    /** Parse a simple PG array string like {a,b,c} into a List. */
+    /**
+     * Parse a PG array literal like {a,"b,c",NULL,{1,2}} into a List.
+     * Honors PG array literal syntax: double-quoted elements (commas/braces inside
+     * quotes are literal, backslash escapes both inside and outside quotes),
+     * unquoted NULL keyword becomes SQL null while quoted "NULL" stays a string,
+     * and nested braces produce nested Lists.
+     */
     static List<Object> parseSimplePgArray(String s) {
-        if (s == null || !s.startsWith("{") || !s.endsWith("}")) return Cols.listOf();
-        String inner = s.substring(1, s.length() - 1).trim();
-        if (inner.isEmpty()) return Cols.listOf();
+        if (s == null) return Cols.listOf();
+        s = s.trim();
+        if (!s.startsWith("{") || !s.endsWith("}")) return Cols.listOf();
+        int[] pos = {1};
+        return parsePgArrayBody(s, pos);
+    }
+
+    /** Parse array body starting just after an opening brace; consumes the matching closing brace. */
+    private static List<Object> parsePgArrayBody(String s, int[] pos) {
         List<Object> result = new ArrayList<>();
-        for (String elem : inner.split(",", -1)) {
-            String trimmed = elem.trim();
-            if (trimmed.equalsIgnoreCase("NULL")) result.add(null);
-            else if (trimmed.startsWith("\"") && trimmed.endsWith("\""))
-                result.add(trimmed.substring(1, trimmed.length() - 1));
-            else {
-                try { result.add(Integer.parseInt(trimmed)); }
-                catch (NumberFormatException e) {
-                    try { result.add(Long.parseLong(trimmed)); }
-                    catch (NumberFormatException e2) { result.add(trimmed); }
+        skipArrayWhitespace(s, pos);
+        if (pos[0] < s.length() && s.charAt(pos[0]) == '}') {
+            pos[0]++;
+            return result;
+        }
+        while (pos[0] < s.length()) {
+            skipArrayWhitespace(s, pos);
+            char c = pos[0] < s.length() ? s.charAt(pos[0]) : '}';
+            if (c == '{') {
+                pos[0]++;
+                result.add(parsePgArrayBody(s, pos));
+            } else if (c == '"') {
+                // Quoted element: commas/braces are literal; \x escapes to x
+                pos[0]++;
+                StringBuilder sb = new StringBuilder();
+                while (pos[0] < s.length()) {
+                    char q = s.charAt(pos[0]);
+                    if (q == '\\' && pos[0] + 1 < s.length()) {
+                        sb.append(s.charAt(pos[0] + 1));
+                        pos[0] += 2;
+                    } else if (q == '"') {
+                        pos[0]++;
+                        break;
+                    } else {
+                        sb.append(q);
+                        pos[0]++;
+                    }
                 }
+                result.add(sb.toString());
+            } else {
+                // Unquoted token until top-level ',' or '}'
+                StringBuilder sb = new StringBuilder();
+                while (pos[0] < s.length() && s.charAt(pos[0]) != ',' && s.charAt(pos[0]) != '}') {
+                    char u = s.charAt(pos[0]);
+                    if (u == '\\' && pos[0] + 1 < s.length()) {
+                        sb.append(s.charAt(pos[0] + 1));
+                        pos[0] += 2;
+                    } else {
+                        sb.append(u);
+                        pos[0]++;
+                    }
+                }
+                result.add(parseUnquotedArrayElement(sb.toString().trim()));
             }
+            skipArrayWhitespace(s, pos);
+            if (pos[0] < s.length() && s.charAt(pos[0]) == ',') {
+                pos[0]++;
+                continue;
+            }
+            if (pos[0] < s.length() && s.charAt(pos[0]) == '}') {
+                pos[0]++;
+            }
+            break;
         }
         return result;
+    }
+
+    private static void skipArrayWhitespace(String s, int[] pos) {
+        while (pos[0] < s.length() && Character.isWhitespace(s.charAt(pos[0]))) pos[0]++;
+    }
+
+    /** Convert an unquoted array element: NULL keyword → null, numeric → Integer/Long, else text. */
+    private static Object parseUnquotedArrayElement(String t) {
+        if (t.equalsIgnoreCase("NULL")) return null;
+        try { return Integer.valueOf(t); } catch (NumberFormatException e) { /* not int */ }
+        try { return Long.valueOf(t); } catch (NumberFormatException e) { /* not long */ }
+        return t;
     }
 
     /**
