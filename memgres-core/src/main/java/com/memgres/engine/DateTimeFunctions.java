@@ -23,7 +23,8 @@ class DateTimeFunctions {
                     if (arg == null) return null; // age(NULL) → NULL
                     // age(xid) → int4: transaction age (return small constant for memgres)
                     if (arg instanceof Number) return 1;
-                    java.time.LocalDateTime dt1 = java.time.LocalDateTime.now();
+                    // PG: single-arg age() uses current_date (midnight), not now()
+                    java.time.LocalDateTime dt1 = java.time.LocalDate.now().atStartOfDay();
                     java.time.LocalDateTime dt2 = TypeCoercion.toLocalDateTime(arg);
                     return computeAge(dt1, dt2);
                 }
@@ -118,7 +119,8 @@ class DateTimeFunctions {
                 java.time.LocalDateTime origin = TypeCoercion.toLocalDateTime(originObj);
                 long intervalMicros = iv.getDays() * 24L * 3600 * 1_000_000 + iv.getMicroseconds();
                 long sourceMicros = java.time.Duration.between(origin, source).toNanos() / 1000;
-                long bins = sourceMicros / intervalMicros;
+                // Use Math.floorDiv to floor toward -infinity for pre-origin values
+                long bins = Math.floorDiv(sourceMicros, intervalMicros);
                 long binStartMicros = bins * intervalMicros;
                 return origin.plusNanos(binStartMicros * 1000);
             }

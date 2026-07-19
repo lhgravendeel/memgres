@@ -424,11 +424,7 @@ class DmlExecutor {
                         if (stmt.onConflict().doUpdateWhereClause() != null) {
                             Object whereResult = executor.evalExpr(stmt.onConflict().doUpdateWhereClause(), conflictCtx);
                             if (!(whereResult instanceof Boolean && ((Boolean) whereResult))) {
-                                // WHERE clause evaluated to false/null: skip the update, keep existing row
-                                if (stmt.returning() != null && !stmt.returning().isEmpty()) {
-                                    returningRows.add(evalReturning(stmt.returning(), conflictTable, stmt.alias(), conflictRow, conflictRow, conflictRow));
-                                }
-                                inserted++;
+                                // WHERE clause evaluated to false/null: skip entirely — no update, no count, no RETURNING
                                 continue;
                             }
                         }
@@ -1088,11 +1084,12 @@ class DmlExecutor {
             // Build new row values on a COPY; don't modify live data until validated
             Object[] newRow = Arrays.copyOf(row, row.length);
 
-            // BEFORE UPDATE triggers
-            newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, table, updatedColumnNames);
-
+            // Apply SET clauses first, then fire BEFORE UPDATE triggers so they see NEW with proposed values
             Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
             applySetClauses(stmt.setClauses(), table, newRow, new RowContext(table, updateAlias, evalRow));
+
+            // BEFORE UPDATE triggers (see NEW with SET-applied values, can further modify NEW)
+            newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, table, updatedColumnNames);
 
             // Recompute generated columns after setting new values
             computeGeneratedColumns(table, newRow);
@@ -1335,8 +1332,10 @@ class DmlExecutor {
             for (Table t : allTables) {
                 allRowsCopy.addAll(t.getRows());
             }
+            java.util.Set<Object[]> deleteSet = Collections.newSetFromMap(new IdentityHashMap<>());
+            deleteSet.addAll(allRowsCopy);
             for (Object[] row : allRowsCopy) {
-                executor.constraintValidator.handleFkOnDelete(table, row);
+                executor.constraintValidator.handleFkOnDelete(table, row, deleteSet);
             }
             // Collect RETURNING before deleting
             List<Object[]> returningRows = new ArrayList<>();
@@ -1426,7 +1425,7 @@ class DmlExecutor {
         // Validate FK references before deleting (handle CASCADE/RESTRICT/SET NULL/SET DEFAULT)
         for (Object[] row : allRows) {
             if (toDelete.contains(row)) {
-                executor.constraintValidator.handleFkOnDelete(table, row);
+                executor.constraintValidator.handleFkOnDelete(table, row, toDelete);
             }
         }
 
@@ -1631,15 +1630,22 @@ class DmlExecutor {
                                 processedTargetRows.add(targetRow);
                                 mergeCount++;
                             } else if (wm.setClauses() != null && !wm.setClauses().isEmpty()) {
-                                // UPDATE
+                                // UPDATE — evaluate all SET RHS against original row snapshot, then assign
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
-                                for (InsertStmt.SetClause set : wm.setClauses()) {
+                                int[] setIndices = new int[wm.setClauses().size()];
+                                Object[] setValues = new Object[wm.setClauses().size()];
+                                for (int si = 0; si < wm.setClauses().size(); si++) {
+                                    InsertStmt.SetClause set = wm.setClauses().get(si);
                                     int colIdx = targetTable.getColumnIndex(set.column());
                                     if (colIdx < 0) {
                                         throw new MemgresException("Column not found: " + set.column());
                                     }
-                                    Object val = executor.evalExpr(set.value(), combined);
-                                    targetRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
+                                    setIndices[si] = colIdx;
+                                    setValues[si] = TypeCoercion.coerceForStorage(
+                                            executor.evalExpr(set.value(), combined), targetTable.getColumns().get(colIdx));
+                                }
+                                for (int si = 0; si < setIndices.length; si++) {
+                                    targetRow[setIndices[si]] = setValues[si];
                                 }
                                 computeGeneratedColumns(targetTable, targetRow);
                                 executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);

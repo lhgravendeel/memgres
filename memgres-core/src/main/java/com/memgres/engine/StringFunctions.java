@@ -231,19 +231,22 @@ class StringFunctions {
                         }
                     }
                 }
-                int start = executor.toInt(arg1) - 1; // PG is 1-based
+                int start = executor.toInt(arg1); // PG 1-based position
                 String strVal = str.toString();
                 if (fn.args().size() > 2) {
-                    int len = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
-                    if (len < 0) {
+                    int count = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                    if (count < 0) {
                         throw new MemgresException("negative substring length not allowed", "22023");
                     }
-                    int from = Math.max(0, start);
-                    int to = Math.min(strVal.length(), Math.max(0, start) + len);
-                    if (from >= strVal.length()) return "";
+                    // PG semantics: end = start + count (1-based exclusive).
+                    // Clip start to [1, len+1], clip end to [start, len+1].
+                    int end = start + count; // 1-based exclusive
+                    int from = Math.max(1, start) - 1; // 0-based inclusive
+                    int to = Math.min(strVal.length(), Math.max(0, end - 1)); // 0-based exclusive
+                    if (from >= strVal.length() || to <= from) return "";
                     return strVal.substring(from, to);
                 }
-                int from = Math.max(0, start);
+                int from = Math.max(1, start) - 1; // 0-based
                 if (from >= strVal.length()) return "";
                 return strVal.substring(from);
             }
@@ -615,11 +618,12 @@ class StringFunctions {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                String[] parts = str.toString().split(pattern);
+                String[] parts = str.toString().split(pattern, -1); // -1 preserves trailing empties
                 StringBuilder sb = new StringBuilder("{");
                 for (int i = 0; i < parts.length; i++) {
                     if (i > 0) sb.append(",");
-                    sb.append(parts[i]);
+                    if (parts[i].isEmpty()) sb.append("\"\"");
+                    else sb.append(parts[i]);
                 }
                 sb.append("}");
                 return sb.toString();
@@ -853,7 +857,7 @@ class StringFunctions {
                 String format = fmt.toString().toLowerCase();
                 if (format.equals("base64")) {
                     try {
-                        return new String(java.util.Base64.getDecoder().decode(data.toString()), java.nio.charset.StandardCharsets.UTF_8);
+                        return java.util.Base64.getDecoder().decode(data.toString());
                     } catch (IllegalArgumentException e) {
                         throw new MemgresException("invalid input for decoding: \"" + data + "\"", "22023");
                     }

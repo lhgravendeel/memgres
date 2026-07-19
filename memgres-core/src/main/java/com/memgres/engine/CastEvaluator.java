@@ -208,11 +208,23 @@ class CastEvaluator {
             case "int8":
                 return TypeCoercion.toLong(val);
             case "smallint":
-            case "int2":
-                return (short) TypeCoercion.toInteger(val).intValue();
+            case "int2": {
+                int iv = TypeCoercion.toInteger(val).intValue();
+                if (iv < Short.MIN_VALUE || iv > Short.MAX_VALUE) {
+                    throw new MemgresException("smallint out of range", "22003");
+                }
+                return (short) iv;
+            }
             case "real":
-            case "float4":
-                return (float) TypeCoercion.toDouble(val).doubleValue();
+            case "float4": {
+                double dv = TypeCoercion.toDouble(val).doubleValue();
+                float fv = (float) dv;
+                if (Float.isInfinite(fv) && !Double.isInfinite(dv)
+                        && !(val instanceof String && isInfinityLiteral(((String) val).trim()))) {
+                    throw new MemgresException("\"" + val + "\" is out of range for type real", "22003");
+                }
+                return fv;
+            }
             case "double precision":
             case "float8":
             case "float": {

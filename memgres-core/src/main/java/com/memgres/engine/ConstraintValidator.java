@@ -552,6 +552,10 @@ class ConstraintValidator {
      * Handle FK ON DELETE actions for all tables that reference the given table.
      */
     void handleFkOnDelete(Table parentTable, Object[] deletedRow) {
+        handleFkOnDelete(parentTable, deletedRow, null);
+    }
+
+    void handleFkOnDelete(Table parentTable, Object[] deletedRow, java.util.Set<Object[]> alsoDeleting) {
         String parentSchemaName = findSchemaName(parentTable);
         // Find all tables with FK constraints referencing this table
         for (Schema schema : executor.database.getSchemas().values()) {
@@ -685,6 +689,8 @@ class ConstraintValidator {
                         case NO_ACTION: {
                             // Check if any child rows reference this parent row
                             for (Object[] childRow : childTable.getRows()) {
+                                // Skip rows that are also being deleted in the same statement
+                                if (alsoDeleting != null && alsoDeleting.contains(childRow)) continue;
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
                                     if (!valuesEqual(parentVals[i], childRow[childColIndices[i]])) {

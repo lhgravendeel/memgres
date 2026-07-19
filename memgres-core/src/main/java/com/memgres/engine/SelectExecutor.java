@@ -560,9 +560,12 @@ class SelectExecutor {
                     Object vb = colIdx < b.length ? b[colIdx] : null;
                     int cmp;
                     if (va == null && vb == null) cmp = 0;
-                    else if (va == null) cmp = item.nullsFirst() != null && item.nullsFirst() ? -1 : 1;
-                    else if (vb == null) cmp = item.nullsFirst() != null && item.nullsFirst() ? 1 : -1;
-                    else {
+                    else if (va == null || vb == null) {
+                        boolean effectiveNullsFirst = item.nullsFirst() != null ? item.nullsFirst() : item.descending();
+                        if (va == null) cmp = effectiveNullsFirst ? -1 : 1;
+                        else cmp = effectiveNullsFirst ? 1 : -1;
+                        if (cmp != 0) return cmp; else continue;
+                    } else {
                         String collation = item.expr() instanceof CollateExpr
                                 ? ((CollateExpr) item.expr()).collation() : null;
                         if (collation != null && va instanceof String && vb instanceof String) {
@@ -1287,9 +1290,13 @@ class SelectExecutor {
                         Object vb = colIdx < b.length ? b[colIdx] : null;
                         int cmp;
                         if (va == null && vb == null) cmp = 0;
-                        else if (va == null) cmp = item.nullsFirst() != null && item.nullsFirst() ? -1 : 1;
-                        else if (vb == null) cmp = item.nullsFirst() != null && item.nullsFirst() ? 1 : -1;
-                        else {
+                        else if (va == null || vb == null) {
+                            // Effective nulls-first: explicit setting, or default (DESC→first, ASC→last)
+                            boolean effectiveNullsFirst = item.nullsFirst() != null ? item.nullsFirst() : item.descending();
+                            if (va == null) cmp = effectiveNullsFirst ? -1 : 1;
+                            else cmp = effectiveNullsFirst ? 1 : -1;
+                            if (cmp != 0) return cmp; else continue;
+                        } else {
                             String collation = item.expr() instanceof CollateExpr
                                     ? ((CollateExpr) item.expr()).collation() : null;
                             if (collation != null && va instanceof String && vb instanceof String) {

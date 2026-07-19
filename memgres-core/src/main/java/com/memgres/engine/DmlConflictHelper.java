@@ -38,12 +38,21 @@ class DmlConflictHelper {
                 }
             }
             if (conflictCols == null || conflictCols.isEmpty()) {
-                // Default: use PRIMARY KEY columns
+                // No explicit target: check ALL unique constraints (PK + UNIQUE).
+                // PG's targetless ON CONFLICT DO NOTHING suppresses any unique violation.
+                List<List<String>> allUniqueSets = new ArrayList<>();
                 for (StoredConstraint sc : table.getConstraints()) {
-                    if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
-                        conflictCols = sc.getColumns();
-                        break;
+                    if ((sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE)
+                            && sc.getColumns() != null && !sc.getColumns().isEmpty()) {
+                        allUniqueSets.add(sc.getColumns());
                     }
+                }
+                if (!allUniqueSets.isEmpty()) {
+                    for (List<String> cols : allUniqueSets) {
+                        Object[] hit = findRowByColumns(table, proposedRow, cols);
+                        if (hit != null) return hit;
+                    }
+                    return null;
                 }
             }
         }
@@ -107,6 +116,46 @@ class DmlConflictHelper {
             }
         }
 
+        for (Object[] existingRow : table.getRows()) {
+            boolean allMatch = true;
+            for (int i = 0; i < colIndices.length; i++) {
+                if (!executor.valuesEqual(proposedVals[i], existingRow[colIndices[i]])) {
+                    allMatch = false;
+                    break;
+                }
+            }
+            if (allMatch) return existingRow;
+        }
+        return null;
+    }
+
+    /** Find an existing row that conflicts on the given column set. */
+    private Object[] findRowByColumns(Table table, Object[] proposedRow, List<String> cols) {
+        int[] colIndices = new int[cols.size()];
+        Object[] proposedVals = new Object[cols.size()];
+        for (int i = 0; i < cols.size(); i++) {
+            colIndices[i] = table.getColumnIndex(cols.get(i));
+            if (colIndices[i] < 0) return null;
+            proposedVals[i] = proposedRow[colIndices[i]];
+            if (proposedVals[i] == null) return null; // NULL never conflicts
+        }
+        // Try index lookup
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) continue;
+            if (sc.getName() == null) continue;
+            List<String> scCols = sc.getColumns();
+            if (scCols.size() != cols.size()) continue;
+            boolean colMatch = true;
+            for (int i = 0; i < cols.size(); i++) {
+                if (!cols.get(i).equalsIgnoreCase(scCols.get(i))) { colMatch = false; break; }
+            }
+            if (!colMatch) continue;
+            TableIndex idx = table.getIndex(sc.getName());
+            if (idx != null) {
+                return idx.findConflict(proposedRow, null);
+            }
+        }
+        // Fall back to sequential scan
         for (Object[] existingRow : table.getRows()) {
             boolean allMatch = true;
             for (int i = 0; i < colIndices.length; i++) {

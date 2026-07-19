@@ -661,8 +661,8 @@ class SelectWindowEvaluator {
                     ? new FunctionCallExpr(funcName, wf.args(), wf.distinct(), wf.star(), null, wf.filter())
                     : new FunctionCallExpr(funcName, wf.args(), wf.distinct(), wf.star());
             Object val = select.aggregateEvaluator.evalAggregate(fn, frameRows);
-            // If no rows in frame after exclusion, aggregate should be NULL (not 0)
-            if (frameRows.isEmpty()) val = null;
+            // If no rows in frame, most aggregates return NULL — but count returns 0
+            if (frameRows.isEmpty() && !funcName.equalsIgnoreCase("count")) val = null;
             results[sortedPartition.get(i)] = val;
         }
     }

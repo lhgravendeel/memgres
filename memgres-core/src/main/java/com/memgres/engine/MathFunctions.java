@@ -101,12 +101,12 @@ class MathFunctions {
                         return parts[0] + ":" + parts[1] + ":" + parts[2] + ":00:00:00";
                     }
                 }
-                double val = executor.toDouble(arg);
                 if (fn.args().size() > 1) {
                     int scale = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
-                    double factor = Math.pow(10, scale);
-                    return (long) (val * factor) / factor;
+                    java.math.BigDecimal bd = new java.math.BigDecimal(arg.toString());
+                    return bd.setScale(scale, java.math.RoundingMode.DOWN);
                 }
+                double val = executor.toDouble(arg);
                 return (long) val;
             }
             case "mod": {
