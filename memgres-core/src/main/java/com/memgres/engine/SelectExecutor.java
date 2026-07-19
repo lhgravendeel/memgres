@@ -77,12 +77,28 @@ class SelectExecutor {
         }
 
         try {
-            return executeSelectInner(stmt);
+            QueryResult result = executeSelectInner(stmt);
+            // Force-execute any unreferenced DML CTEs (PG always executes data-modifying CTEs)
+            if (stmt.withClauses() != null) {
+                for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
+                    if (isDmlCte(cte.query())) {
+                        String key = cte.name().toLowerCase();
+                        if (!executor.cteResultCache.containsKey(key)) {
+                            cteExecutor.executeCte(cte);
+                        }
+                    }
+                }
+            }
+            return result;
         } finally {
             if (pushedCteScope) {
                 executor.cteStack.pop();
             }
         }
+    }
+
+    private static boolean isDmlCte(Statement stmt) {
+        return stmt instanceof InsertStmt || stmt instanceof UpdateStmt || stmt instanceof DeleteStmt;
     }
 
     private QueryResult executeSelectInner(SelectStmt stmt) {

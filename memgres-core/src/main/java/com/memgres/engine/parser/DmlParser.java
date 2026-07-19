@@ -420,22 +420,27 @@ class DmlParser {
                     if (parser.matchKeywords("DO", "NOTHING")) {
                         whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, true, null, null));
                     } else if (parser.matchKeyword("INSERT")) {
-                        List<String> columns = null;
-                        if (parser.match(TokenType.LEFT_PAREN)) {
-                            columns = new ArrayList<>();
+                        // INSERT DEFAULT VALUES — no columns, no values
+                        if (parser.matchKeywords("DEFAULT", "VALUES")) {
+                            whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, false, null, null));
+                        } else {
+                            List<String> columns = null;
+                            if (parser.match(TokenType.LEFT_PAREN)) {
+                                columns = new ArrayList<>();
+                                do {
+                                    columns.add(parser.readIdentifier());
+                                } while (parser.match(TokenType.COMMA));
+                                parser.expect(TokenType.RIGHT_PAREN);
+                            }
+                            parser.expectKeyword("VALUES");
+                            parser.expect(TokenType.LEFT_PAREN);
+                            List<Expression> values = new ArrayList<>();
                             do {
-                                columns.add(parser.readIdentifier());
+                                values.add(parser.parseExpression());
                             } while (parser.match(TokenType.COMMA));
                             parser.expect(TokenType.RIGHT_PAREN);
+                            whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, false, columns, values));
                         }
-                        parser.expectKeyword("VALUES");
-                        parser.expect(TokenType.LEFT_PAREN);
-                        List<Expression> values = new ArrayList<>();
-                        do {
-                            values.add(parser.parseExpression());
-                        } while (parser.match(TokenType.COMMA));
-                        parser.expect(TokenType.RIGHT_PAREN);
-                        whenClauses.add(new MergeStmt.WhenNotMatched(andCondition, false, columns, values));
                     } else {
                         throw new ParseException("Expected INSERT or DO NOTHING after WHEN NOT MATCHED THEN", parser.peek());
                     }

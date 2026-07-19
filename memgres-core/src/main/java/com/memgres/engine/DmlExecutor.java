@@ -89,10 +89,31 @@ class DmlExecutor {
             pushed = true;
         }
         try {
-            return action.get();
+            T result = action.get();
+            // Force-execute any unreferenced DML CTEs (PG always executes data-modifying CTEs)
+            if (withClauses != null) {
+                executePendingDmlCtes(withClauses);
+            }
+            return result;
         } finally {
             if (pushed) executor.cteStack.pop();
         }
+    }
+
+    /** Execute any DML CTEs that haven't been executed yet (not in cache). */
+    private void executePendingDmlCtes(List<SelectStmt.CommonTableExpr> withClauses) {
+        for (SelectStmt.CommonTableExpr cte : withClauses) {
+            if (isDmlStatement(cte.query())) {
+                String key = cte.name().toLowerCase();
+                if (!executor.cteResultCache.containsKey(key)) {
+                    executor.selectExecutor.executeCte(cte);
+                }
+            }
+        }
+    }
+
+    private static boolean isDmlStatement(Statement stmt) {
+        return stmt instanceof InsertStmt || stmt instanceof UpdateStmt || stmt instanceof DeleteStmt;
     }
 
     // ---- INSERT ----
@@ -1055,6 +1076,7 @@ class DmlExecutor {
             // Multi-table UPDATE: join main table with FROM tables
             List<Object[]> matchedRows = new ArrayList<>();
             List<RowContext> matchedContexts = new ArrayList<>();
+            List<RowContext> matchedFromContexts = new ArrayList<>();
             for (Object[] row : rows) {
                 for (RowContext fromCtx : fromContexts) {
                     Object[] evalRow = fromUpdateHasVirtual ? computeVirtualColumns(table, row) : row;
@@ -1063,6 +1085,7 @@ class DmlExecutor {
                     if (stmt.where() == null || executor.isTruthy(executor.evalExpr(stmt.where(), combined))) {
                         matchedRows.add(row);
                         matchedContexts.add(combined);
+                        matchedFromContexts.add(fromCtx);
                     }
                 }
             }
@@ -1097,7 +1120,7 @@ class DmlExecutor {
                 fromAfterOld.add(oldRow);
                 fromAfterNew.add(Arrays.copyOf(row, row.length));
                 if (stmt.returning() != null && !stmt.returning().isEmpty()) {
-                    returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, oldRow, row));
+                    returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, oldRow, row, matchedFromContexts.get(i)));
                 }
             }
             // Fire queued AFTER ROW triggers
@@ -1432,9 +1455,9 @@ class DmlExecutor {
         List<Object[]> deleteOrder = new ArrayList<>();
 
         boolean deleteHasVirtual = hasVirtualColumns(table);
+        Map<Object[], RowContext> deleteUsingCtxMap = new IdentityHashMap<>();
         if (stmt.using() != null && !stmt.using().isEmpty()) {
             // DELETE ... USING: join main table with USING tables, delete matching main rows
-            // Match using merge-join style: collect all matching rows, sorted by join key
             List<RowContext> usingContexts = executor.fromResolver.resolveFromClause(stmt.using());
             for (Object[] row : allRows) {
                 Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
@@ -1444,6 +1467,7 @@ class DmlExecutor {
                     if (stmt.where() == null || executor.isTruthy(executor.evalExpr(stmt.where(), merged))) {
                         toDelete.add(row);
                         deleteOrder.add(row);
+                        deleteUsingCtxMap.put(row, usingCtx);
                         break;
                     }
                 }
@@ -1513,7 +1537,8 @@ class DmlExecutor {
         }
         if (hasReturning) {
             for (Object[] row : orderedDelete) {
-                returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, row, null));
+                RowContext usingCtx = deleteUsingCtxMap.get(row);
+                returningRows.add(evalReturning(stmt.returning(), table, stmt.alias(), row, row, null, usingCtx));
             }
         }
         // Capture old rows for transition tables before deletion
@@ -1657,11 +1682,15 @@ class DmlExecutor {
             // Find matching target rows for this source row using the original snapshot
             List<Object[]> matchedTargetRows = new ArrayList<>();
             for (Object[] targetRow : originalTargetRows) {
-                if (processedTargetRows.contains(targetRow)) continue;
                 Object[] evalRow = mergeTargetHasVirtual ? computeVirtualColumns(targetTable, targetRow) : targetRow;
                 RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
                 RowContext combined = targetCtx.merge(sourceCtx);
                 if (executor.isTruthy(executor.evalExpr(stmt.onCondition(), combined))) {
+                    // PG 21000: if this target row was already affected by a previous source row, error
+                    if (processedTargetRows.contains(targetRow)) {
+                        throw new MemgresException(
+                                "MERGE command cannot affect row a second time", "21000");
+                    }
                     matchedTargetRows.add(targetRow);
                 }
             }
@@ -2165,7 +2194,7 @@ class DmlExecutor {
 
     /**
      * Evaluate RETURNING expressions with OLD/NEW and MERGE source support.
-     * @param sourceCtx source row context for MERGE (null for non-MERGE)
+     * @param sourceCtx source row context for MERGE or FROM/USING (null for simple DML)
      */
     private Object[] evalReturning(List<SelectStmt.SelectTarget> returning, Table table, String alias,
                                     Object[] row, Object[] oldRow, Object[] newRow,
@@ -2219,6 +2248,10 @@ class DmlExecutor {
             }
         }
         RowContext ctx = new RowContext(bindings);
+        // Merge source context (FROM/USING/MERGE source tables) so RETURNING can reference them
+        if (sourceCtx != null) {
+            ctx = ctx.merge(sourceCtx);
+        }
         if (usesOldNew) {
             // Mark all table columns as "using" columns to suppress ambiguity
             // between primary binding and OLD/NEW bindings for unqualified refs
