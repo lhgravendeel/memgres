@@ -33,14 +33,25 @@ class DmlPartitionHelper {
 
     /** Route an INSERT row to the correct partition, or return the table itself if not partitioned. */
     Table routeToPartition(Table table, Object[] row) {
-        if (table.getPartitionStrategy() == null || table.getPartitions().isEmpty()) return table;
+        if (table.getPartitionStrategy() == null) return table;
 
         String partCol = table.getPartitionColumn();
+        if (partCol == null) return table;
         Object value;
         if (partCol.contains("(")) {
             // Expression-based partition key (e.g., "(lower(s))")
             // Build a row context and evaluate the expression
             value = evaluatePartitionExpression(table, partCol, row);
+        } else if (partCol.contains(",")) {
+            // Multi-column partition key: build a tuple in key order
+            String[] keyCols = partCol.split(",");
+            List<Object> tuple = new java.util.ArrayList<>(keyCols.length);
+            for (String keyCol : keyCols) {
+                int colIdx = table.getColumnIndex(keyCol.trim());
+                if (colIdx < 0) return table;
+                tuple.add(row[colIdx]);
+            }
+            value = tuple;
         } else {
             int colIdx = table.getColumnIndex(partCol);
             if (colIdx < 0) return table;
@@ -51,9 +62,11 @@ class DmlPartitionHelper {
         for (Table partition : table.getPartitions()) {
             switch (table.getPartitionStrategy().toUpperCase()) {
                 case "RANGE": {
-                    if (partition.getPartitionLower() != null && partition.getPartitionUpper() != null) {
-                        if (executor.compareValues(value, partition.getPartitionLower()) >= 0
-                                && executor.compareValues(value, partition.getPartitionUpper()) < 0) {
+                    // NULL keys never match a range partition (they go to DEFAULT or error)
+                    if (!containsNull(value)
+                            && partition.getPartitionLower() != null && partition.getPartitionUpper() != null) {
+                        if (compareToBound(value, partition.getPartitionLower()) >= 0
+                                && compareToBound(value, partition.getPartitionUpper()) < 0) {
                             matched = partition;
                         }
                     }
@@ -62,7 +75,14 @@ class DmlPartitionHelper {
                 case "LIST": {
                     if (partition.getPartitionValues() != null) {
                         for (Object pv : partition.getPartitionValues()) {
-                            if (executor.compareValues(value, pv) == 0) { matched = partition; break; }
+                            boolean eq;
+                            if (value == null || pv == null) {
+                                // SQL NULL routes to a LIST partition declaring NULL in its IN-list
+                                eq = value == null && pv == null;
+                            } else {
+                                eq = executor.compareValues(value, pv) == 0;
+                            }
+                            if (eq) { matched = partition; break; }
                         }
                     }
                     break;
@@ -94,6 +114,38 @@ class DmlPartitionHelper {
             return routeToPartition(matched, row);
         }
         return matched;
+    }
+
+    /** Whether a routing key value is (or, for tuples, contains) SQL NULL. */
+    private static boolean containsNull(Object value) {
+        if (value == null) return true;
+        if (value instanceof List) {
+            for (Object v : (List<?>) value) {
+                if (v == null) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Compare a row's partition key value against a partition bound.
+     * MINVALUE/MAXVALUE sentinels compare below/above every value regardless of key type;
+     * multi-column keys compare lexicographically element by element.
+     */
+    private int compareToBound(Object value, Object bound) {
+        if (bound == PartitionBound.MINVALUE) return 1;   // every value is above MINVALUE
+        if (bound == PartitionBound.MAXVALUE) return -1;  // every value is below MAXVALUE
+        if (value instanceof List && bound instanceof List) {
+            List<?> lv = (List<?>) value;
+            List<?> lb = (List<?>) bound;
+            int minLen = Math.min(lv.size(), lb.size());
+            for (int i = 0; i < minLen; i++) {
+                int cmp = compareToBound(lv.get(i), lb.get(i));
+                if (cmp != 0) return cmp;
+            }
+            return Integer.compare(lv.size(), lb.size());
+        }
+        return executor.compareValues(value, bound);
     }
 
     /**

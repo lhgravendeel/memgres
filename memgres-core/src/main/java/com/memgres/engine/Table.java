@@ -173,7 +173,8 @@ public class Table {
             }
         }
         for (Table partition : partitions) {
-            allRows.addAll(partition.getRows());
+            // Recurse so multi-level partitioning (partition of a partition) is included
+            allRows.addAll(partition.getAllRows());
         }
         return allRows;
     }
@@ -242,9 +243,8 @@ public class Table {
             }
         }
         for (Table partition : partitions) {
-            for (Object[] row : partition.getRows()) {
-                allRows.add(new RowWithSource(partition, row));
-            }
+            // Recurse so multi-level partitioning (partition of a partition) is included
+            allRows.addAll(partition.getAllRowsWithSource());
         }
         return allRows;
     }
@@ -669,6 +669,16 @@ public class Table {
     public boolean isDefaultPartition() { return defaultPartition; }
     public void setDefaultPartition(boolean defaultPartition) { this.defaultPartition = defaultPartition; }
     public void removePartition(Table partition) { partitions.remove(partition); }
+
+    /** Clear all partition bound metadata (used when a partition is detached from its parent). */
+    public void clearPartitionBounds() {
+        this.partitionLower = null;
+        this.partitionUpper = null;
+        this.partitionValues = null;
+        this.partitionModulus = null;
+        this.partitionRemainder = null;
+        this.defaultPartition = false;
+    }
 
     // Row-level security
     public boolean isRlsEnabled() { return rlsEnabled; }

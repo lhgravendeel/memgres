@@ -94,8 +94,7 @@ class DdlAlterTableExecutor {
             Table partition = executor.resolveTable(detachSchemaName, detach.partitionName());
             table.removePartition(partition);
             partition.setPartitionParent(null);
-            partition.setPartitionValues(null);
-            partition.setDefaultPartition(false);
+            partition.clearPartitionBounds();
         } else if (action instanceof AlterTableStmt.RenameConstraint) {
             AlterTableStmt.RenameConstraint renameConstraint = (AlterTableStmt.RenameConstraint) action;
             StoredConstraint oldConstraint = table.getConstraint(renameConstraint.oldName());
@@ -882,11 +881,13 @@ class DdlAlterTableExecutor {
             throw new MemgresException("table \"" + attach.partitionName()
                     + "\" is already a partition of \"" + stmt.table() + "\"", "42809");
         }
-        partition.setPartitionParent(table);
-        table.addPartition(partition);
+        // Validate bounds before attaching, so overlapping bounds (42P17) don't leave
+        // the table half-attached to the parent's routing list
         if (attach.bounds() != null && !attach.bounds().isEmpty()) {
             ddl.tableExecutor.applyPartitionBounds(partition, table, attach.bounds(), attach.partitionName());
         }
+        partition.setPartitionParent(table);
+        table.addPartition(partition);
     }
 
     private void setTriggerEnabled(Table table, String triggerName, boolean disabled) {

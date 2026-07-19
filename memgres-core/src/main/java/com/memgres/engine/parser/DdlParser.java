@@ -1120,13 +1120,14 @@ class DdlParser {
     TruncateStmt parseTruncate() {
         parser.expectKeyword("TRUNCATE");
         parser.matchKeyword("TABLE");
-        parser.matchKeyword("ONLY");
         List<String> tables = new ArrayList<>();
+        List<Boolean> onlyFlags = new ArrayList<>();
+        onlyFlags.add(parser.matchKeyword("ONLY"));
         String tbl = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) tbl = tbl + "." + parser.readIdentifier();
         tables.add(tbl);
         while (parser.match(TokenType.COMMA)) {
-            parser.matchKeyword("ONLY");
+            onlyFlags.add(parser.matchKeyword("ONLY"));
             String next = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) next = next + "." + parser.readIdentifier();
             tables.add(next);
@@ -1136,7 +1137,7 @@ class DdlParser {
         else if (parser.matchKeyword("CONTINUE")) { parser.expectKeyword("IDENTITY"); }
         boolean cascade = parser.matchKeyword("CASCADE");
         parser.matchKeyword("RESTRICT");
-        return new TruncateStmt(tables, cascade, restartIdentity);
+        return new TruncateStmt(tables, cascade, restartIdentity, onlyFlags);
     }
 
     // ---- ALTER specific types ----
@@ -1287,12 +1288,19 @@ class DdlParser {
             parser.advance(); // skip the type keyword
             String value = parser.advance().value();
             skipBoundCast(parser);
-            return value;
+            // The lexer strips quotes; re-add them so string values stay distinguishable
+            // from the bare keywords NULL / MINVALUE / MAXVALUE / TRUE / FALSE
+            return "'" + value + "'";
         }
 
         // Plain literal with optional cast
-        String value = parser.advance().value();
+        Token valueTok = parser.advance();
+        String value = valueTok.value();
         skipBoundCast(parser);
+        if (valueTok.type() == TokenType.STRING_LITERAL
+                || valueTok.type() == TokenType.DOLLAR_STRING_LITERAL) {
+            return "'" + value + "'";
+        }
         return value;
     }
 

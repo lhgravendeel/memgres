@@ -1710,7 +1710,14 @@ public class Session {
         @Override
         public void undo(Database db) {
             Schema s = db.getSchema(schema);
-            if (s != null) s.removeTable(tableName);
+            if (s != null) {
+                Table t = s.getTable(tableName);
+                // If the created table was a partition, detach it from its parent's routing list
+                if (t != null && t.getPartitionParent() != null) {
+                    t.getPartitionParent().removePartition(t);
+                }
+                s.removeTable(tableName);
+            }
         }
 
         public String schema() { return schema; }
@@ -1752,6 +1759,11 @@ public class Session {
         public void undo(Database db) {
             Schema s = db.getSchema(schema);
             if (s != null) s.addTable(table);
+            // If the dropped table was a partition, re-attach it to its parent's routing list
+            Table parent = table.getPartitionParent();
+            if (parent != null && !parent.getPartitions().contains(table)) {
+                parent.addPartition(table);
+            }
         }
 
         public String schema() { return schema; }
