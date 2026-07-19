@@ -50,11 +50,13 @@ public class StoredConstraint {
 
     private String name;
     private final Type type;
-    private final List<String> columns;
-    private final Expression checkExpr;
+    // Not final: rewritten in place by renameColumn()/renameReferencedColumn() when a column
+    // they reference is renamed via ALTER TABLE ... RENAME COLUMN.
+    private List<String> columns;
+    private Expression checkExpr;
     private final String referencesTable;
     private String referencesSchema; // schema of the referenced table (null = resolve via search_path)
-    private final List<String> referencesColumns;
+    private List<String> referencesColumns;
     private final FkAction onDelete;
     private final FkAction onUpdate;
     private boolean nullsNotDistinct;
@@ -146,6 +148,130 @@ public class StoredConstraint {
     /** Returns true if this constraint should be deferred (checked at commit time). */
     public boolean isCurrentlyDeferred() {
         return deferrable && initiallyDeferred;
+    }
+
+    /**
+     * Rewrites every reference this constraint holds to a column of its OWN table after that
+     * column is renamed: the key column list, EXCLUDE elements, ON DELETE/UPDATE SET NULL
+     * column lists, and any expressions (CHECK, partial-index WHERE, expression index columns).
+     * Without this, renaming a column silently detaches PK/UNIQUE enforcement (the constraint
+     * still names the old column) and breaks CHECK evaluation with 42703 on every DML.
+     */
+    void renameColumn(String oldName, String newName) {
+        columns = renameInList(columns, oldName, newName);
+        onDeleteSetNullColumns = renameInList(onDeleteSetNullColumns, oldName, newName);
+        onUpdateSetNullColumns = renameInList(onUpdateSetNullColumns, oldName, newName);
+        if (excludeElements != null) {
+            List<ExcludeElement> updated = new java.util.ArrayList<>();
+            boolean changed = false;
+            for (ExcludeElement e : excludeElements) {
+                if (e.column != null && e.column.equalsIgnoreCase(oldName)) {
+                    updated.add(new ExcludeElement(newName, e.operator));
+                    changed = true;
+                } else {
+                    updated.add(e);
+                }
+            }
+            if (changed) excludeElements = updated;
+        }
+        checkExpr = renameInExpr(checkExpr, oldName, newName);
+        whereExpr = renameInExpr(whereExpr, oldName, newName);
+        if (expressionColumns != null) {
+            List<Expression> updated = new java.util.ArrayList<>();
+            for (Expression e : expressionColumns) {
+                updated.add(renameInExpr(e, oldName, newName));
+            }
+            expressionColumns = updated;
+        }
+    }
+
+    /**
+     * Rewrites references to a renamed column of the table this FOREIGN KEY points AT
+     * (the referenced table's column, not this table's own columns).
+     */
+    void renameReferencedColumn(String oldName, String newName) {
+        referencesColumns = renameInList(referencesColumns, oldName, newName);
+    }
+
+    /**
+     * True if this constraint depends on the given column of its own table: as a key column,
+     * an EXCLUDE element, or referenced from a CHECK / partial-index WHERE / expression-index
+     * expression. Used by DROP COLUMN to drop dependent constraints, as PostgreSQL does.
+     */
+    boolean dependsOnColumn(String columnName) {
+        if (containsIgnoreCase(columns, columnName)) return true;
+        if (excludeElements != null) {
+            for (ExcludeElement e : excludeElements) {
+                if (e.column != null && e.column.equalsIgnoreCase(columnName)) return true;
+            }
+        }
+        if (exprReferences(checkExpr, columnName)) return true;
+        if (exprReferences(whereExpr, columnName)) return true;
+        if (expressionColumns != null) {
+            for (Expression e : expressionColumns) {
+                if (exprReferences(e, columnName)) return true;
+            }
+        }
+        return false;
+    }
+
+    static boolean containsIgnoreCase(List<String> list, String value) {
+        if (list == null) return false;
+        for (String s : list) {
+            if (s != null && s.equalsIgnoreCase(value)) return true;
+        }
+        return false;
+    }
+
+    /** Case-insensitive whole-word rename of an identifier inside a SQL text fragment. */
+    static String renameIdentifier(String text, String oldName, String newName) {
+        return text.replaceAll("(?i)\\b" + java.util.regex.Pattern.quote(oldName) + "\\b",
+                java.util.regex.Matcher.quoteReplacement(newName));
+    }
+
+    private static List<String> renameInList(List<String> cols, String oldName, String newName) {
+        if (cols == null || cols.isEmpty()) return cols;
+        boolean changed = false;
+        List<String> out = new java.util.ArrayList<>(cols.size());
+        for (String c : cols) {
+            if (c != null && c.equalsIgnoreCase(oldName)) {
+                out.add(newName);
+                changed = true;
+            } else {
+                out.add(c);
+            }
+        }
+        return changed ? Cols.listCopyOf(out) : cols;
+    }
+
+    /**
+     * Renames a column reference inside an expression by unparsing to SQL, replacing the
+     * identifier (whole-word, case-insensitive) and re-parsing — the same approach used for
+     * dependent views. If unparse/re-parse fails, the original expression is kept unchanged.
+     */
+    static Expression renameInExpr(Expression expr, String oldName, String newName) {
+        if (expr == null) return null;
+        try {
+            String sql = SqlUnparser.exprToSql(expr);
+            String updated = renameIdentifier(sql, oldName, newName);
+            if (updated.equals(sql)) return expr;
+            return com.memgres.engine.parser.Parser.parseExpression(updated);
+        } catch (Exception e) {
+            return expr;
+        }
+    }
+
+    /** True if the expression references the given column (whole-word, case-insensitive). */
+    static boolean exprReferences(Expression expr, String columnName) {
+        if (expr == null) return false;
+        try {
+            String sql = SqlUnparser.exprToSql(expr);
+            return java.util.regex.Pattern
+                    .compile("(?i)\\b" + java.util.regex.Pattern.quote(columnName) + "\\b")
+                    .matcher(sql).find();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /**
