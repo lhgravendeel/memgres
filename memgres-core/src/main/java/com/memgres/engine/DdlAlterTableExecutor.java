@@ -640,7 +640,8 @@ class DdlAlterTableExecutor {
             // string type to anything else (text->integer, text->date, varchar->enum, ...) are
             // explicit-only and must fail with 42804.
             if (fromCat != toCat && toCat != TypeCoercion.TypeCategory.STRING) {
-                String targetName = newEnumTypeName != null ? newEnumTypeName : dt.getPgName();
+                String targetName = newEnumTypeName != null ? newEnumTypeName : dt.toRegtypeDisplay();
+                if (isArrayType) targetName += "[]";
                 throw new MemgresException("column \"" + alterCol.column() + "\" cannot be cast automatically to type "
                         + targetName + "\n  Hint: You might need to specify \"USING "
                         + alterCol.column() + "::" + targetName + "\".", "42804");

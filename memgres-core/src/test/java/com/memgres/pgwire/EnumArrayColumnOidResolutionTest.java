@@ -86,7 +86,8 @@ class EnumArrayColumnOidResolutionTest {
                 break;
             case ALTER_COLUMN_TYPE:
                 exec(conn, "CREATE TABLE eacor_sellers (id serial primary key, name text, regions text)");
-                exec(conn, "ALTER TABLE eacor_sellers ALTER COLUMN regions TYPE eacor_region[]");
+                // PG requires USING for text -> enum[] (no assignment cast between categories)
+                exec(conn, "ALTER TABLE eacor_sellers ALTER COLUMN regions TYPE eacor_region[] USING regions::eacor_region[]");
                 break;
         }
         exec(conn, "INSERT INTO eacor_sellers(name, regions) VALUES ('acme', ARRAY['north','south']::eacor_region[])");

@@ -269,12 +269,14 @@ class DDLTest {
         try (Statement stmt = conn.createStatement()) {
             stmt.execute("CREATE TABLE type_test (id INTEGER, val TEXT)");
             stmt.execute("INSERT INTO type_test VALUES (1, '42')");
-            stmt.execute("ALTER TABLE type_test ALTER COLUMN val TYPE INTEGER");
-            // Column type changed; existing data should still be readable
+            // PG requires USING for text -> integer (no assignment cast between categories)
+            SQLException ex = assertThrows(SQLException.class,
+                    () -> stmt.execute("ALTER TABLE type_test ALTER COLUMN val TYPE INTEGER"));
+            assertEquals("42804", ex.getSQLState());
+            stmt.execute("ALTER TABLE type_test ALTER COLUMN val TYPE INTEGER USING val::integer");
             ResultSet rs = stmt.executeQuery("SELECT val FROM type_test");
             assertTrue(rs.next());
-            // The string '42' is still stored; type metadata changed
-            assertNotNull(rs.getObject("val"));
+            assertEquals(42, rs.getInt("val"));
         }
     }
 
