@@ -1633,12 +1633,14 @@ class DDLObjectsCoverageTest {
 
     @Test
     void vw_column_list_syntax() throws SQLException {
-        // CREATE VIEW with column list parses successfully; columns accessed by underlying names
+        // CREATE VIEW with a column list renames the view's output columns (PG behavior);
+        // the underlying column names are not visible through the view
         exec("CREATE TABLE vw_collist_tbl (id SERIAL PRIMARY KEY, first_name TEXT, last_name TEXT)");
         exec("INSERT INTO vw_collist_tbl (first_name, last_name) VALUES ('Jane', 'Smith')");
         exec("CREATE VIEW vw_collist (fname, lname) AS SELECT first_name, last_name FROM vw_collist_tbl");
-        assertEquals("Jane", query1("SELECT first_name FROM vw_collist"));
-        assertEquals("Smith", query1("SELECT last_name FROM vw_collist"));
+        assertEquals("Jane", query1("SELECT fname FROM vw_collist"));
+        assertEquals("Smith", query1("SELECT lname FROM vw_collist"));
+        assertThrows(SQLException.class, () -> query1("SELECT first_name FROM vw_collist"));
         exec("DROP VIEW IF EXISTS vw_collist");
         exec("DROP TABLE vw_collist_tbl");
     }

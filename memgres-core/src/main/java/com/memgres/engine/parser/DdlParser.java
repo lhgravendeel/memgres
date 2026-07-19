@@ -800,7 +800,13 @@ class DdlParser {
         parser.expectKeyword("VIEW");
         parser.matchKeyword("CONCURRENTLY");
         String name = parser.readIdentifier();
-        return new RefreshMaterializedViewStmt(name);
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        boolean withData = true;
+        if (parser.matchKeyword("WITH")) {
+            if (parser.matchKeyword("NO")) { parser.expectKeyword("DATA"); withData = false; }
+            else parser.expectKeyword("DATA");
+        }
+        return new RefreshMaterializedViewStmt(name, withData);
     }
 
     // ---- Misc small CREATE statements ----

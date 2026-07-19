@@ -187,6 +187,16 @@ public class InfoSchemaBuilder {
             }
         }
 
+        // View columns: resolved output columns stored on the ViewDef. Materialized
+        // views are excluded — PG's information_schema covers only SQL-standard
+        // objects, so matviews appear in pg_attribute/pg_class but not here.
+        for (Database.ViewDef vd : database.getViews().values()) {
+            if (vd.materialized()) continue;
+            if (vd.cachedColumns() == null || vd.cachedColumns().isEmpty()) continue;
+            String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
+            addColumnsForTable(table, vSchema, new Table(vd.name(), vd.cachedColumns()), false);
+        }
+
         // Also add pg_catalog virtual table columns so that queries like
         // SELECT ... FROM information_schema.columns WHERE table_schema = 'pg_catalog' work.
         PgCatalogBuilder pgBuilder = new PgCatalogBuilder(database, oids);

@@ -1892,7 +1892,22 @@ class CatalogStubBuilder {
                 col("ispopulated", DataType.BOOLEAN),
                 col("definition", DataType.TEXT)
         );
-        return new Table("pg_matviews", cols); // empty, no materialized views
+        Table table = new Table("pg_matviews", cols);
+        for (Database.ViewDef vd : database.getViews().values()) {
+            if (!vd.materialized()) continue;
+            String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
+            String owner = database.getObjectOwner("view:" + vSchema + "." + vd.name());
+            if (owner == null) owner = "memgres";
+            String definition = null;
+            if (vd.query() != null) {
+                definition = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
+                if (definition != null) definition = definition + ";";
+            }
+            table.insertRow(new Object[]{
+                    vSchema, vd.name(), owner, null, false, vd.populated(), definition
+            });
+        }
+        return table;
     }
 
     Table buildPgRulesView() {
