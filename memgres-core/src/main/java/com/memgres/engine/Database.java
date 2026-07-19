@@ -7,6 +7,7 @@ import com.memgres.engine.parser.ast.Statement;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.IdentityHashMap;
@@ -1691,15 +1692,15 @@ public class Database {
                         return;
                     }
                     if (session != null) {
-                        // Deadlock detection via the shared wait-for graph (also used by row locks),
-                        // so advisory-vs-row-lock cycles are caught too. Because waiters re-check
-                        // the graph periodically, pick a deterministic victim (the cycle member
-                        // with the highest pid) so exactly one waiter aborts, like PG.
-                        Session victim = advisoryDeadlockVictim(session, blocker);
-                        if (victim == session) {
+                        // Deadlock detection via the shared wait-for graph (also used by row locks).
+                        // The session that completes the cycle (the last to arrive) is always the
+                        // victim — this matches PG's behavior where the deadlock detector aborts
+                        // the waiter that triggers detection.
+                        waitingFor.put(session, blocker);
+                        if (advisoryDeadlockVictim(session, blocker) != null) {
+                            waitingFor.remove(session);
                             throw new MemgresException("deadlock detected", "40P01");
                         }
-                        waitingFor.put(session, blocker);
                     }
                     if (System.currentTimeMillis() >= deadline) {
                         throw new MemgresException("canceling statement due to lock timeout", "55P03");
@@ -1843,23 +1844,15 @@ public class Database {
 
     /**
      * Walks the wait-for chain starting at {@code blocker}. If it cycles back to
-     * {@code requester} (a deadlock), returns the chosen victim: the cycle member with the
-     * highest pid. Every cycle member computes the same victim, so exactly one waiter aborts.
+     * {@code requester} (a deadlock), returns the requester (non-null signals deadlock).
      * Returns null when there is no deadlock involving {@code requester}.
      */
     private Session advisoryDeadlockVictim(Session requester, Session blocker) {
-        List<Session> chain = new ArrayList<>();
+        Set<Session> visited = new HashSet<>();
         Session current = blocker;
         while (current != null) {
-            if (current == requester) {
-                Session victim = requester;
-                for (Session s : chain) {
-                    if (s.getPid() > victim.getPid()) victim = s;
-                }
-                return victim;
-            }
-            if (chain.contains(current)) return null; // cycle that does not involve the requester
-            chain.add(current);
+            if (current == requester) return requester;
+            if (!visited.add(current)) return null; // cycle that does not involve the requester
             current = waitingFor.get(current);
         }
         return null;

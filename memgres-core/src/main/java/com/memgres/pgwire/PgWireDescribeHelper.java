@@ -277,9 +277,9 @@ class PgWireDescribeHelper {
                 LOG.warn("[PROTO] Describe Portal FAILED: {} | {}", e.getMessage(), sqlSnip);
                 LOG.debug("Full exception:", e);
                 session.restoreStatus(savedStatusPortal);
-                // Fallback for SELECT with FOR UPDATE/SHARE
+                // Fallback: re-execute with LIMIT 0 to get column metadata without side effects
                 String upper2 = stripLeadingComments(sql).toUpperCase();
-                if (upper2.startsWith("SELECT") && upper2.contains("FOR ")) {
+                if (upper2.startsWith("SELECT")) {
                     Session.TransactionStatus savedFallback = session.getStatus();
                     try {
                         String metaSql = sql.replaceAll(";\\s*$", "").trim()

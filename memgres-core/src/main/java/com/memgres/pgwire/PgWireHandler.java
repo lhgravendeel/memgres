@@ -842,6 +842,13 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     sendRowDescription(ctx, result);
                     for (Object[] row : result.getRows()) sendDataRow(ctx, row, result.getColumns(), portal.resultFormatCodes());
                     sendCommandCompleteWithNotices(ctx, "CALL");
+                } else if (!portal.rowDescriptionSent && portal.describeAttempted
+                        && result.getType() == QueryResult.Type.SELECT
+                        && !result.getColumns().isEmpty() && !result.getRows().isEmpty()) {
+                    // Describe was attempted but sent NoData (speculative execution failed), then
+                    // Execute succeeded. Sending DataRow without prior RowDescription violates
+                    // protocol. Just send CommandComplete — side effects (e.g. lock) still happened.
+                    sendCommandCompleteWithNotices(ctx, commandTag(result));
                 } else {
                     sendResultDataOnly(ctx, result, portal.resultFormatCodes());
                 }
