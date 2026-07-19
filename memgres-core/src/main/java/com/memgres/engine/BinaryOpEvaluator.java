@@ -157,11 +157,21 @@ class BinaryOpEvaluator {
         // jsonb || jsonb: when an operand is explicitly cast to jsonb, both sides are
         // jsonb in PG. This handles scalar jsonb operands (e.g. '1'::jsonb || '2'::jsonb)
         // that the container-string heuristics in evalBuiltinBinary cannot recognize.
+        // The other operand must itself be jsonb or an untyped literal PG would coerce;
+        // there is no implicit cast from other types, so jsonb || 1 is 42883 in PG.
         if (bin.op() == BinaryExpr.BinOp.CONCAT
                 && (isCastToType(bin.left(), "jsonb") || isCastToType(bin.right(), "jsonb"))
                 && !(left instanceof List) && !(right instanceof List)
                 && !(left instanceof HstoreValue) && !(right instanceof HstoreValue)) {
             if (left == null || right == null) return null;
+            if (!isCastToType(bin.left(), "jsonb") && !(left instanceof String)) {
+                throw new MemgresException("operator does not exist: "
+                        + AstExecutor.pgTypeNameOf(left) + " || jsonb", "42883");
+            }
+            if (!isCastToType(bin.right(), "jsonb") && !(right instanceof String)) {
+                throw new MemgresException("operator does not exist: jsonb || "
+                        + AstExecutor.pgTypeNameOf(right), "42883");
+            }
             return JsonOperations.concatenate(left.toString(), right.toString());
         }
 
