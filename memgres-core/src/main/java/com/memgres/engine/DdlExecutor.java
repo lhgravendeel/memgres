@@ -701,23 +701,49 @@ class DdlExecutor {
 
     /** Parse a partition bound value string to an appropriate type. */
     static Object parseBoundValue(String val) {
-        if (val.equalsIgnoreCase("MINVALUE")) return Long.MIN_VALUE;
-        if (val.equalsIgnoreCase("MAXVALUE")) return Long.MAX_VALUE;
-        if (val.startsWith("'") && val.endsWith("'")) return val.substring(1, val.length() - 1);
+        // Quoted values are always string literals ('MINVALUE' is the text, MINVALUE the keyword)
+        if (val.length() >= 2 && val.startsWith("'") && val.endsWith("'")) {
+            return val.substring(1, val.length() - 1);
+        }
+        if (val.equalsIgnoreCase("MINVALUE")) return PartitionBound.MINVALUE;
+        if (val.equalsIgnoreCase("MAXVALUE")) return PartitionBound.MAXVALUE;
+        if (val.equalsIgnoreCase("NULL")) return null;
+        if (val.equalsIgnoreCase("TRUE")) return Boolean.TRUE;
+        if (val.equalsIgnoreCase("FALSE")) return Boolean.FALSE;
         try { return Long.parseLong(val); } catch (NumberFormatException e) { /* ignore */ }
         try { return Double.parseDouble(val); } catch (NumberFormatException e) { /* ignore */ }
         return val;
     }
 
-    /** Compare two partition bound values. */
+    /** Compare two partition bound values (sentinel-, tuple-, and NULL-aware). */
+    @SuppressWarnings({"unchecked", "rawtypes"})
     static int comparePartitionBound(Object a, Object b) {
-        if (a == null && b == null) return 0;
+        if (a == b) return 0;
+        // MINVALUE sorts below everything, MAXVALUE above everything, regardless of key type
+        if (a == PartitionBound.MINVALUE) return -1;
+        if (b == PartitionBound.MINVALUE) return 1;
+        if (a == PartitionBound.MAXVALUE) return 1;
+        if (b == PartitionBound.MAXVALUE) return -1;
         if (a == null) return -1;
         if (b == null) return 1;
+        // Multi-column bounds compare lexicographically, element by element
+        if (a instanceof List && b instanceof List) {
+            List<?> la = (List<?>) a;
+            List<?> lb = (List<?>) b;
+            int minLen = Math.min(la.size(), lb.size());
+            for (int i = 0; i < minLen; i++) {
+                int cmp = comparePartitionBound(la.get(i), lb.get(i));
+                if (cmp != 0) return cmp;
+            }
+            return Integer.compare(la.size(), lb.size());
+        }
         if (a instanceof Number && b instanceof Number) {
             Number nb = (Number) b;
             Number na = (Number) a;
             return Double.compare(na.doubleValue(), nb.doubleValue());
+        }
+        if (a.getClass() == b.getClass() && a instanceof Comparable) {
+            return ((Comparable) a).compareTo(b);
         }
         return String.valueOf(a).compareTo(String.valueOf(b));
     }

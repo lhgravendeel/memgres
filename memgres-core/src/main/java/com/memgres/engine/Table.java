@@ -173,7 +173,8 @@ public class Table {
             }
         }
         for (Table partition : partitions) {
-            allRows.addAll(partition.getRows());
+            // Recurse so multi-level partitioning (partition of a partition) is included
+            allRows.addAll(partition.getAllRows());
         }
         return allRows;
     }
@@ -242,9 +243,8 @@ public class Table {
             }
         }
         for (Table partition : partitions) {
-            for (Object[] row : partition.getRows()) {
-                allRows.add(new RowWithSource(partition, row));
-            }
+            // Recurse so multi-level partitioning (partition of a partition) is included
+            allRows.addAll(partition.getAllRowsWithSource());
         }
         return allRows;
     }
@@ -334,6 +334,18 @@ public class Table {
         try {
             int idx = getColumnIndex(columnName);
             if (idx < 0) throw new MemgresException("Column not found: " + columnName);
+            // PG drops constraints that depend on the column automatically: single-column
+            // constraints, multi-column PK/UNIQUE/FK containing it, and CHECK/EXCLUDE/partial
+            // constraints whose expressions reference it. Without this they linger in
+            // pg_constraint referencing a nonexistent column.
+            List<StoredConstraint> dependent = new ArrayList<>();
+            for (StoredConstraint sc : constraints) {
+                if (sc.dependsOnColumn(columnName)) dependent.add(sc);
+            }
+            for (StoredConstraint sc : dependent) {
+                constraints.remove(sc);
+                if (sc.getName() != null) indexes.remove(sc.getName());
+            }
             columns.remove(idx);
             List<Object[]> current = rows;
             List<Object[]> newRows = new ArrayList<>(current.size());
@@ -413,12 +425,37 @@ public class Table {
         }
     }
 
+    /**
+     * Renames a column, preserving ALL column attributes (virtual/domain/composite/array
+     * element type, catalog attributes) and rewriting every reference this table holds to
+     * the old name: PK/UNIQUE/FK/CHECK/EXCLUDE constraint definitions and generated-column
+     * expressions of other columns. Backing {@link TableIndex}es are positional, so they
+     * stay valid without a rebuild. References from OTHER tables (incoming foreign keys)
+     * and database-level index metadata are rewritten by the ALTER TABLE executor.
+     */
     public void renameColumn(String oldName, String newName) {
-        int idx = getColumnIndex(oldName);
-        if (idx < 0) throw new MemgresException("Column not found: " + oldName);
-        Column old = columns.get(idx);
-        columns.set(idx, new Column(newName, old.getType(), old.isNullable(), old.isPrimaryKey(),
-                old.getDefaultValue(), old.getEnumTypeName(), old.getPrecision(), old.getScale(), old.getGeneratedExpr()));
+        writeLock.lock();
+        try {
+            int idx = getColumnIndex(oldName);
+            if (idx < 0) throw new MemgresException("Column not found: " + oldName);
+            Column old = columns.get(idx);
+            columns.set(idx, old.withName(newName));
+            // Keep constraints attached to the column under its new name
+            for (StoredConstraint sc : constraints) {
+                sc.renameColumn(oldName, newName);
+            }
+            // Rewrite generated-column expressions on other columns that reference the old name
+            for (int i = 0; i < columns.size(); i++) {
+                Column c = columns.get(i);
+                if (i == idx || c.getGeneratedExpr() == null) continue;
+                String updated = StoredConstraint.renameIdentifier(c.getGeneratedExpr(), oldName, newName);
+                if (!updated.equals(c.getGeneratedExpr())) {
+                    columns.set(i, c.withGeneratedExpr(updated));
+                }
+            }
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     public void alterColumnType(String columnName, DataType newType) {
@@ -452,25 +489,19 @@ public class Table {
         int idx = getColumnIndex(columnName);
         if (idx < 0) throw new MemgresException("Column not found: " + columnName);
         Column old = columns.get(idx);
-        columns.set(idx, new Column(old.getName(), newType, old.isNullable(), old.isPrimaryKey(),
-                old.getDefaultValue(), enumTypeName, precision, scale, old.getGeneratedExpr(), false,
-                null, null, arrayElementType));
+        columns.set(idx, old.withType(newType, precision, scale, enumTypeName, arrayElementType));
     }
 
     public void alterColumnDefault(String columnName, String defaultValue) {
         int idx = getColumnIndex(columnName);
         if (idx < 0) throw new MemgresException("Column not found: " + columnName);
-        Column old = columns.get(idx);
-        columns.set(idx, new Column(old.getName(), old.getType(), old.isNullable(), old.isPrimaryKey(),
-                defaultValue, old.getEnumTypeName(), old.getPrecision(), old.getScale(), old.getGeneratedExpr()));
+        columns.set(idx, columns.get(idx).withDefault(defaultValue));
     }
 
     public void alterColumnNullable(String columnName, boolean nullable) {
         int idx = getColumnIndex(columnName);
         if (idx < 0) throw new MemgresException("Column not found: " + columnName);
-        Column old = columns.get(idx);
-        columns.set(idx, new Column(old.getName(), old.getType(), nullable, old.isPrimaryKey(),
-                old.getDefaultValue(), old.getEnumTypeName(), old.getPrecision(), old.getScale(), old.getGeneratedExpr()));
+        columns.set(idx, columns.get(idx).withNullable(nullable));
     }
 
     public long getSerialCounter() {
@@ -594,6 +625,68 @@ public class Table {
         }
     }
 
+    /**
+     * Validates existing rows against a PK/UNIQUE constraint that is about to be added
+     * (ALTER TABLE ADD CONSTRAINT). PostgreSQL validates the data while building the
+     * backing unique index; memgres' {@link TableIndex#put} silently overwrites duplicate
+     * keys, so without this check duplicates would persist under the new constraint.
+     * <p>
+     * Rows of partitions/children are included (row storage of a partitioned table lives on
+     * the leaves). Expression-based and partial (WHERE) constraints are skipped — their keys
+     * cannot be computed here without an evaluator.
+     *
+     * @throws MemgresException 23502 if a PRIMARY KEY column contains NULLs,
+     *                          23505 if the key columns contain duplicate values
+     */
+    public void validateNewUniqueConstraint(StoredConstraint sc) {
+        if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) return;
+        if (sc.getExpressionColumns() != null && !sc.getExpressionColumns().isEmpty()) return;
+        if (sc.getWhereExpr() != null) return;
+        if (sc.getColumns().isEmpty()) return;
+        for (String col : sc.getColumns()) {
+            if (getColumnIndex(col) < 0) {
+                throw new MemgresException("column \"" + col + "\" named in key does not exist", "42703");
+            }
+        }
+        int[] colIndices = resolveColumnIndices(sc.getColumns());
+        if (colIndices == null) return;
+        List<Object[]> allRows = getAllRows();
+        if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+            // PG: ADD PRIMARY KEY implies NOT NULL; existing NULLs abort with 23502
+            for (Object[] row : allRows) {
+                for (int ci = 0; ci < colIndices.length; ci++) {
+                    if (row[colIndices[ci]] == null) {
+                        throw new MemgresException("column \"" + sc.getColumns().get(ci)
+                                + "\" of relation \"" + name + "\" contains null values", "23502");
+                    }
+                }
+            }
+        }
+        TableIndex probe = new TableIndex(sc.getName(), colIndices, true);
+        java.util.Set<TableIndex.IndexKey> seen = new java.util.HashSet<>();
+        for (Object[] row : allRows) {
+            TableIndex.IndexKey key = probe.extractKey(row);
+            if (!sc.isNullsNotDistinct()) {
+                boolean hasNull = false;
+                for (Object v : key.values) {
+                    if (v == null) { hasNull = true; break; }
+                }
+                if (hasNull) continue; // NULLs are distinct: never conflict
+            }
+            if (!seen.add(key)) {
+                StringBuilder keyDesc = new StringBuilder();
+                StringBuilder valDesc = new StringBuilder();
+                for (int ci = 0; ci < colIndices.length; ci++) {
+                    if (ci > 0) { keyDesc.append(", "); valDesc.append(", "); }
+                    keyDesc.append(sc.getColumns().get(ci));
+                    valDesc.append(row[colIndices[ci]]);
+                }
+                throw new MemgresException("could not create unique index \"" + sc.getName()
+                        + "\"\n  Detail: Key (" + keyDesc + ")=(" + valDesc + ") is duplicated.", "23505");
+            }
+        }
+    }
+
     // Constraint management
     public List<StoredConstraint> getConstraints() { return constraints; }
     public void addConstraint(StoredConstraint constraint) {
@@ -669,6 +762,16 @@ public class Table {
     public boolean isDefaultPartition() { return defaultPartition; }
     public void setDefaultPartition(boolean defaultPartition) { this.defaultPartition = defaultPartition; }
     public void removePartition(Table partition) { partitions.remove(partition); }
+
+    /** Clear all partition bound metadata (used when a partition is detached from its parent). */
+    public void clearPartitionBounds() {
+        this.partitionLower = null;
+        this.partitionUpper = null;
+        this.partitionValues = null;
+        this.partitionModulus = null;
+        this.partitionRemainder = null;
+        this.defaultPartition = false;
+    }
 
     // Row-level security
     public boolean isRlsEnabled() { return rlsEnabled; }

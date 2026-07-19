@@ -60,39 +60,76 @@ public class RangeOperations {
             return (lowerInclusive ? "[" : "(") + lo + "," + hi + (upperInclusive ? "]" : ")");
         }
 
+        /** Convert a bound to BigDecimal for exact comparison (no rounding of numrange bounds). */
+        private static java.math.BigDecimal big(Number n) {
+            if (n instanceof java.math.BigDecimal) return (java.math.BigDecimal) n;
+            if (n instanceof Double || n instanceof Float) return new java.math.BigDecimal(n.toString());
+            return java.math.BigDecimal.valueOf(n.longValue());
+        }
+
+        /**
+         * Compare two lower bounds: negative if a starts before b.
+         * A null bound is -infinity; at equal values an inclusive bound starts earlier.
+         */
+        private static int cmpLowerBounds(Number aVal, boolean aInc, Number bVal, boolean bInc) {
+            if (aVal == null) return bVal == null ? 0 : -1;
+            if (bVal == null) return 1;
+            int c = big(aVal).compareTo(big(bVal));
+            if (c != 0) return c;
+            if (aInc == bInc) return 0;
+            return aInc ? -1 : 1;
+        }
+
+        /**
+         * Compare two upper bounds: positive if a ends after b.
+         * A null bound is +infinity; at equal values an inclusive bound ends later.
+         */
+        private static int cmpUpperBounds(Number aVal, boolean aInc, Number bVal, boolean bInc) {
+            if (aVal == null) return bVal == null ? 0 : 1;
+            if (bVal == null) return -1;
+            int c = big(aVal).compareTo(big(bVal));
+            if (c != 0) return c;
+            if (aInc == bInc) return 0;
+            return aInc ? 1 : -1;
+        }
+
+        /** True if a lower bound admits at least one point before the given upper bound. */
+        private static boolean lowerBeforeUpper(Number lo, boolean loInc, Number hi, boolean hiInc) {
+            if (lo == null || hi == null) return true;
+            int c = big(lo).compareTo(big(hi));
+            if (c < 0) return true;
+            if (c > 0) return false;
+            return loInc && hiInc;
+        }
+
         /** Check if this range contains a value. */
         public boolean contains(Number value) {
             if (empty || value == null) return false;
-            long v = value.longValue();
+            java.math.BigDecimal v = big(value);
             if (lower != null) {
-                long lo = lower.longValue();
-                if (lowerInclusive ? v < lo : v <= lo) return false;
+                int c = v.compareTo(big(lower));
+                if (lowerInclusive ? c < 0 : c <= 0) return false;
             }
             if (upper != null) {
-                long hi = upper.longValue();
-                if (upperInclusive ? v > hi : v >= hi) return false;
+                int c = v.compareTo(big(upper));
+                if (upperInclusive ? c > 0 : c >= 0) return false;
             }
             return true;
         }
 
-        /** Check if this range contains another range. */
+        /** Check if this range contains another range. Every range contains the empty range. */
         public boolean containsRange(PgRange other) {
-            if (empty || other.empty) return empty == other.empty;
-            long thisLo = effectiveLower();
-            long thisHi = effectiveUpper();
-            long otherLo = other.effectiveLower();
-            long otherHi = other.effectiveUpper();
-            return thisLo <= otherLo && thisHi >= otherHi;
+            if (other.isEmpty()) return true;
+            if (isEmpty()) return false;
+            return cmpLowerBounds(lower, lowerInclusive, other.lower, other.lowerInclusive) <= 0
+                && cmpUpperBounds(upper, upperInclusive, other.upper, other.upperInclusive) >= 0;
         }
 
-        /** Check if this range overlaps with another. */
+        /** Check if this range overlaps with another. Empty ranges never overlap. */
         public boolean overlaps(PgRange other) {
-            if (empty || other.empty) return false;
-            long thisLo = effectiveLower();
-            long thisHi = effectiveUpper();
-            long otherLo = other.effectiveLower();
-            long otherHi = other.effectiveUpper();
-            return thisLo < otherHi && otherLo < thisHi;
+            if (isEmpty() || other.isEmpty()) return false;
+            return lowerBeforeUpper(lower, lowerInclusive, other.upper, other.upperInclusive)
+                && lowerBeforeUpper(other.lower, other.lowerInclusive, upper, upperInclusive);
         }
 
         /** Effective lower bound (inclusive, for integer ranges). */
@@ -109,7 +146,9 @@ public class RangeOperations {
 
         public boolean isEmpty() {
             if (empty) return true;
-            return effectiveLower() >= effectiveUpper();
+            if (lower == null || upper == null) return false;
+            int c = big(lower).compareTo(big(upper));
+            return c > 0 || (c == 0 && !(lowerInclusive && upperInclusive));
         }
 
         /** Get the lower bound (null if unbounded). */
@@ -282,8 +321,12 @@ public class RangeOperations {
     }
 
     /** Parse a range from string format: [1,10), (5,15], empty, etc. */
-    /** Parse a range bound string that may be integer or decimal (rounds decimal to integer). */
-    private static Long parseRangeBoundLong(String s) {
+    /**
+     * Parse a range bound string. Integer bounds parse as Long, decimal bounds
+     * as BigDecimal (kept exact — numrange bounds must not be rounded), and
+     * date/timestamp bounds as epoch days/seconds (Long).
+     */
+    private static Number parseRangeBound(String s) {
         s = s.trim();
         // Strip surrounding quotes (timestamp ranges use quoted bounds)
         if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) {
@@ -301,12 +344,11 @@ public class RangeOperations {
             return java.time.LocalDate.parse(s).toEpochDay();
         }
         try {
-            return (long) Integer.parseInt(s);
+            return Long.parseLong(s);
         } catch (NumberFormatException e) {
             try {
-                // Handle decimal values by rounding to nearest integer
-                double d = Double.parseDouble(s);
-                return Math.round(d);
+                // Decimal bounds (numrange): keep exact, no rounding
+                return new java.math.BigDecimal(s);
             } catch (NumberFormatException e2) {
                 throw new MemgresException("invalid input syntax for type integer: \"" + s + "\"", "22P02");
             }
@@ -337,23 +379,26 @@ public class RangeOperations {
         String loDisplay = stripQuotes(loRaw);
         String hiDisplay = stripQuotes(hiRaw);
 
-        Long lo = loRaw.isEmpty() ? null : parseRangeBoundLong(loRaw);
-        Long hi = hiRaw.isEmpty() ? null : parseRangeBoundLong(hiRaw);
+        Number lo = loRaw.isEmpty() ? null : parseRangeBound(loRaw);
+        Number hi = hiRaw.isEmpty() ? null : parseRangeBound(hiRaw);
 
-        // Determine if this is a non-integer type (dates, timestamps, decimals)
-        boolean isNonInteger = isNonIntegerBound(loRaw.isEmpty() ? hiRaw : loRaw);
+        // Determine if this is a non-integer type (dates, timestamps, decimals) — either bound counts
+        boolean isNonInteger = (!loRaw.isEmpty() && isNonIntegerBound(loRaw))
+                || (!hiRaw.isEmpty() && isNonIntegerBound(hiRaw));
 
-        if (lo != null && hi != null && !isNonInteger) {
-            // Canonicalize integer ranges to [lo, hi)
-            long canonLo = li ? lo : lo + 1;
-            long canonHi = ui ? hi + 1 : hi;
-            if (canonLo > canonHi) {
-                throw new MemgresException("range lower bound must be less than or equal to range upper bound", "22000");
+        if (!isNonInteger && (lo != null || hi != null)) {
+            // Canonicalize discrete (integer) ranges to [lo, hi), including half-unbounded ones
+            Long canonLo = lo == null ? null : (li ? lo.longValue() : lo.longValue() + 1);
+            Long canonHi = hi == null ? null : (ui ? hi.longValue() + 1 : hi.longValue());
+            if (canonLo != null && canonHi != null) {
+                if (canonLo > canonHi) {
+                    throw new MemgresException("range lower bound must be less than or equal to range upper bound", "22000");
+                }
+                if (canonLo.longValue() == canonHi.longValue()) {
+                    return new PgRange(null, null, true, false, true);
+                }
             }
-            if (canonLo == canonHi) {
-                return new PgRange(null, null, true, false, true);
-            }
-            return new PgRange(canonLo, canonHi, true, false, false);
+            return new PgRange(canonLo, canonHi, canonLo != null, false, false);
         }
         // For non-integer types, preserve original string representations
         return new PgRange(lo, hi, li, ui, false,
@@ -387,22 +432,18 @@ public class RangeOperations {
      * For int4range: [1,5) -|- [5,10) is true since 5 = upper(a) = lower(b)
      */
     public static boolean areAdjacent(PgRange a, PgRange b) {
-        if (a.empty() || b.empty()) return false;
+        // Empty ranges are never adjacent to anything
+        if (a.isEmpty() || b.isEmpty()) return false;
         // Check if upper of a equals lower of b (with bound consideration)
         // For integer ranges: [1,5) upper=5 exclusive, [5,10) lower=5 inclusive → adjacent
-        // Upper bound of a: value at upper
         Number aUpper = a.upper();
         Number bLower = b.lower();
         Number aLower = a.lower();
         Number bUpper = b.upper();
         if (aUpper != null && bLower != null) {
             // a's upper = b's lower; adjacent if one is exclusive and the other inclusive
-            // In PG: ranges are adjacent if they share a "boundary"
             // For int4range [1,5) -|- [5,10): aUpper=5(excl), bLower=5(incl) → 5==5 → adjacent
-            double au = aUpper.doubleValue() + (a.upperInclusive() ? 0 : 0);
-            double bl = bLower.doubleValue() + (b.lowerInclusive() ? 0 : 0);
-            // Normalized: [lo,hi) style. a's upper exclusive point = aUpper value, b's lower inclusive start = bLower
-            if (aUpper.doubleValue() == bLower.doubleValue()) {
+            if (new java.math.BigDecimal(aUpper.toString()).compareTo(new java.math.BigDecimal(bLower.toString())) == 0) {
                 // One is exclusive, other is inclusive → adjacent
                 if (!a.upperInclusive() && b.lowerInclusive()) return true;
                 if (a.upperInclusive() && !b.lowerInclusive()) return true;
@@ -410,7 +451,7 @@ public class RangeOperations {
         }
         if (aLower != null && bUpper != null) {
             // b's upper = a's lower
-            if (bUpper.doubleValue() == aLower.doubleValue()) {
+            if (new java.math.BigDecimal(bUpper.toString()).compareTo(new java.math.BigDecimal(aLower.toString())) == 0) {
                 if (!b.upperInclusive() && a.lowerInclusive()) return true;
                 if (b.upperInclusive() && !a.lowerInclusive()) return true;
             }

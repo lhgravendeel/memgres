@@ -94,9 +94,6 @@ public class Session {
                 return t;
             });
 
-    // Transaction-scoped advisory locks: released on commit/rollback
-    private final Set<Long> xactAdvisoryLocks = new LinkedHashSet<>();
-
     // Explicit table locks acquired via LOCK TABLE: table_key -> lock mode (e.g. "AccessExclusiveLock")
     private final Map<String, String> tableLocks = new LinkedHashMap<>();
 
@@ -959,7 +956,15 @@ public class Session {
             // Autocommit mode, deliver immediately
             database.getNotificationManager().notify(channel, payload != null ? payload : "", pid);
         } else {
-            // Inside transaction, defer until COMMIT
+            // Inside transaction, defer until COMMIT.
+            // PG delivers identical notifications (same channel + payload) signaled
+            // multiple times within one transaction only once: the enqueue is skipped
+            // when an identical entry is already pending in this transaction.
+            for (Notification pending : deferredNotifications) {
+                if (pending.channel().equals(n.channel()) && pending.payload().equals(n.payload())) {
+                    return;
+                }
+            }
             deferredNotifications.add(n);
         }
     }
@@ -1030,6 +1035,9 @@ public class Session {
         cursors.clear();
         preparedStatements.clear();
         dropTempObjects();
+        // Release all advisory locks (session- and transaction-level) held by this session,
+        // matching PG's backend-exit cleanup.
+        database.releaseAllAdvisoryLocks(this);
         database.unregisterSession(this);
     }
 
@@ -1139,17 +1147,9 @@ public class Session {
 
     // ---- ON COMMIT DROP tables ----
 
-    /** Track an advisory lock acquired with pg_advisory_xact_lock / pg_try_advisory_xact_lock. */
-    public void addXactAdvisoryLock(long key) {
-        xactAdvisoryLocks.add(key);
-    }
-
     /** Release all transaction-scoped advisory locks. Called on commit/rollback. */
     private void releaseXactAdvisoryLocks() {
-        for (Long key : xactAdvisoryLocks) {
-            database.advisoryUnlock(key, this);
-        }
-        xactAdvisoryLocks.clear();
+        database.releaseXactAdvisoryLocks(this);
     }
 
     /** Track explicit LOCK TABLE lock for pg_locks visibility. */
@@ -1272,6 +1272,11 @@ public class Session {
             uncommittedInserts.computeIfAbsent(schemaTable,
                     k -> Collections.synchronizedSet(Collections.newSetFromMap(new IdentityHashMap<>()))).add(row);
             if (isSerializable()) ssiWriteTables.add(schemaTable);
+            // Keep an existing RR snapshot in sync: this transaction's own
+            // uncommitted changes must remain visible to itself. Add the live
+            // row reference so later in-place updates are visible too.
+            List<Object[]> snapshot = rrSnapshots.get(schemaTable);
+            if (snapshot != null) snapshot.add(row);
         }
     }
 
@@ -1283,6 +1288,11 @@ public class Session {
             // Only record the FIRST (original) old value; don't overwrite with intermediate values
             tableUpdates.putIfAbsent(row, oldValues);
             if (isSerializable()) ssiWriteTables.add(schemaTable);
+            // Keep an existing RR snapshot in sync: swap the snapshotted copy
+            // (holding the pre-update values) for the live row reference so this
+            // transaction sees its own update.
+            List<Object[]> snapshot = rrSnapshots.get(schemaTable);
+            if (snapshot != null) swapInLiveRow(snapshot, row, oldValues);
         }
     }
 
@@ -1292,6 +1302,48 @@ public class Session {
             uncommittedDeletes.computeIfAbsent(schemaTable,
                     k -> Collections.synchronizedList(new ArrayList<>())).addAll(rows);
             if (isSerializable()) ssiWriteTables.add(schemaTable);
+            // Keep an existing RR snapshot in sync: this transaction must no
+            // longer see rows it deleted itself.
+            List<Object[]> snapshot = rrSnapshots.get(schemaTable);
+            if (snapshot != null) {
+                for (Object[] row : rows) {
+                    removeRowFromSnapshot(snapshot, row);
+                }
+            }
+        }
+    }
+
+    /**
+     * Replace the snapshot entry matching {@code matchValues} with the live
+     * {@code row} reference. If the live row is already present (e.g. an insert
+     * from this transaction), nothing needs to change: in-place updates to it
+     * are visible automatically.
+     */
+    private static void swapInLiveRow(List<Object[]> snapshot, Object[] row, Object[] matchValues) {
+        for (int i = 0; i < snapshot.size(); i++) {
+            if (snapshot.get(i) == row) return;
+        }
+        for (int i = 0; i < snapshot.size(); i++) {
+            if (Arrays.deepEquals(snapshot.get(i), matchValues)) {
+                snapshot.set(i, row);
+                return;
+            }
+        }
+    }
+
+    /** Remove one snapshot entry matching the given row (by identity, else by value). */
+    private static void removeRowFromSnapshot(List<Object[]> snapshot, Object[] row) {
+        for (int i = 0; i < snapshot.size(); i++) {
+            if (snapshot.get(i) == row) {
+                snapshot.remove(i);
+                return;
+            }
+        }
+        for (int i = 0; i < snapshot.size(); i++) {
+            if (Arrays.deepEquals(snapshot.get(i), row)) {
+                snapshot.remove(i);
+                return;
+            }
         }
     }
 
@@ -1362,12 +1414,10 @@ public class Session {
         if (snapshotImported && rrSnapshots.containsKey(schemaTable)) {
             return rrSnapshots.get(schemaTable);
         }
-        // Use putIfAbsent with the MVCC-visible rows from the caller.
-        // snapshotAllTables() provides a fast pre-population, but its snapshots
-        // don't account for uncommitted changes from other sessions.  The very
-        // first read for each table comes through applyMvccVisibility which
-        // already filtered out uncommitted changes, so always prefer the
-        // caller-supplied rows over what snapshotAllTables stored.
+        // Prefer the MVCC-visible rows from the caller over what
+        // snapshotAllTables() stored: the caller's rows come through
+        // applyMvccVisibility (filtered the same way) but additionally include
+        // partition/inheritance child rows via getAllRowsWithSource.
         List<Object[]> snapshot = new ArrayList<>(currentVisibleRows.size());
         for (Object[] row : currentVisibleRows) {
             snapshot.add(Arrays.copyOf(row, row.length));
@@ -1387,15 +1437,47 @@ public class Session {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 String key = schemaName + "." + tableEntry.getKey();
                 if (!rrSnapshots.containsKey(key)) {
-                    List<Object[]> rows = tableEntry.getValue().getRows();
-                    List<Object[]> snapshot = new ArrayList<>(rows.size());
-                    for (Object[] row : rows) {
-                        snapshot.add(Arrays.copyOf(row, row.length));
-                    }
-                    rrSnapshots.put(key, snapshot);
+                    rrSnapshots.put(key, buildCommittedSnapshot(key, tableEntry.getValue()));
                 }
             }
         }
+    }
+
+    /**
+     * Build a snapshot of a table's committed state (plus this session's own
+     * uncommitted changes). Tables are mutated in place, so the live rows may
+     * contain other sessions' uncommitted changes; reverse-apply them:
+     * exclude their uncommitted inserts, restore the old values of their
+     * uncommitted updates, and re-add their uncommitted deletes. This mirrors
+     * FromResolver.applyMvccVisibility.
+     */
+    private List<Object[]> buildCommittedSnapshot(String schemaTable, Table table) {
+        Set<Object[]> otherInserts = Collections.newSetFromMap(new IdentityHashMap<>());
+        Map<Object[], Object[]> otherUpdates = new IdentityHashMap<>();
+        List<Object[]> otherDeletes = new ArrayList<>();
+        for (Session other : database.getActiveSessions()) {
+            if (other == this || !other.isInTransaction()) continue;
+            otherInserts.addAll(other.getUncommittedInserts(schemaTable));
+            otherUpdates.putAll(other.getUncommittedUpdates(schemaTable));
+            otherDeletes.addAll(other.getUncommittedDeletes(schemaTable));
+        }
+        List<Object[]> rows = table.getRows();
+        List<Object[]> snapshot = new ArrayList<>(rows.size());
+        for (Object[] row : rows) {
+            if (otherInserts.contains(row)) continue; // uncommitted insert: invisible
+            Object[] oldValues = otherUpdates.get(row);
+            Object[] src = oldValues != null ? oldValues : row;
+            snapshot.add(Arrays.copyOf(src, src.length));
+        }
+        for (Object[] deletedRow : otherDeletes) {
+            if (otherInserts.contains(deletedRow)) continue; // inserted+deleted in same txn
+            // If the row was updated before being deleted, the committed state
+            // is the pre-update old values, not the row's current contents.
+            Object[] oldValues = otherUpdates.get(deletedRow);
+            Object[] src = oldValues != null ? oldValues : deletedRow;
+            snapshot.add(Arrays.copyOf(src, src.length));
+        }
+        return snapshot;
     }
 
     /** Check if a REPEATABLE READ snapshot already exists for this table. */
@@ -1535,11 +1617,37 @@ public class Session {
         // Apply in reverse order from end to fromPosition
         for (int i = undoLog.size() - 1; i >= fromPosition; i--) {
             UndoEntry entry = undoLog.get(i);
+            syncSnapshotBeforeUndo(entry);
             entry.undo(database);
         }
         // Truncate the undo log
         if (fromPosition < undoLog.size()) {
             undoLog.subList(fromPosition, undoLog.size()).clear();
+        }
+    }
+
+    /**
+     * Keep RR snapshots consistent when this session's own DML is undone
+     * (ROLLBACK TO SAVEPOINT while the transaction stays open). Full ROLLBACK
+     * clears the snapshots before applying undo, making this a no-op there.
+     */
+    private void syncSnapshotBeforeUndo(UndoEntry entry) {
+        if (rrSnapshots.isEmpty()) return;
+        if (entry instanceof InsertUndo) {
+            InsertUndo iu = (InsertUndo) entry;
+            List<Object[]> snapshot = rrSnapshots.get(iu.schema + "." + iu.tableName);
+            if (snapshot != null) removeRowFromSnapshot(snapshot, iu.row);
+        } else if (entry instanceof DeleteUndo) {
+            DeleteUndo du = (DeleteUndo) entry;
+            List<Object[]> snapshot = rrSnapshots.get(du.schema + "." + du.tableName);
+            if (snapshot != null) snapshot.addAll(du.rows);
+        } else if (entry instanceof UpdateUndo) {
+            UpdateUndo uu = (UpdateUndo) entry;
+            List<Object[]> snapshot = rrSnapshots.get(uu.schema + "." + uu.tableName);
+            // Ensure the snapshot holds the live row reference (matched by its
+            // current, pre-undo contents) so the in-place restore of the old
+            // values is visible to this transaction.
+            if (snapshot != null) swapInLiveRow(snapshot, uu.row, uu.row);
         }
     }
 
@@ -1710,7 +1818,14 @@ public class Session {
         @Override
         public void undo(Database db) {
             Schema s = db.getSchema(schema);
-            if (s != null) s.removeTable(tableName);
+            if (s != null) {
+                Table t = s.getTable(tableName);
+                // If the created table was a partition, detach it from its parent's routing list
+                if (t != null && t.getPartitionParent() != null) {
+                    t.getPartitionParent().removePartition(t);
+                }
+                s.removeTable(tableName);
+            }
         }
 
         public String schema() { return schema; }
@@ -1752,6 +1867,11 @@ public class Session {
         public void undo(Database db) {
             Schema s = db.getSchema(schema);
             if (s != null) s.addTable(table);
+            // If the dropped table was a partition, re-attach it to its parent's routing list
+            Table parent = table.getPartitionParent();
+            if (parent != null && !parent.getPartitions().contains(table)) {
+                parent.addPartition(table);
+            }
         }
 
         public String schema() { return schema; }

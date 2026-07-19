@@ -12,9 +12,30 @@ class DdlAlterTableExecutor {
     private final DdlExecutor ddl;
     private final AstExecutor executor;
 
+    /**
+     * VOLATILE built-in functions whose DEFAULT must be evaluated once per existing row when
+     * added via ALTER TABLE ADD COLUMN (PG rewrites the table, calling the default per row).
+     * STABLE functions (now(), current_timestamp, statement_timestamp()) are intentionally
+     * absent: one value per statement is correct for them.
+     */
+    private static final java.util.Set<String> PER_ROW_VOLATILE_FUNCTIONS = com.memgres.engine.util.Cols.setOf(
+            "random", "random_normal", "setseed", "gen_random_uuid", "uuid_generate_v4",
+            "uuid_generate_v1", "uuidv4", "uuidv7", "gen_random_bytes", "nextval",
+            "clock_timestamp", "timeofday"
+    );
+
     DdlAlterTableExecutor(DdlExecutor ddl) {
         this.ddl = ddl;
         this.executor = ddl.executor;
+    }
+
+    /** True if the expression text calls a built-in VOLATILE function (see PER_ROW_VOLATILE_FUNCTIONS). */
+    private static boolean hasVolatileFunction(String exprStr) {
+        String norm = exprStr.toLowerCase().replaceAll("\\s+", "");
+        for (String fn : PER_ROW_VOLATILE_FUNCTIONS) {
+            if (norm.contains(fn + "(")) return true;
+        }
+        return false;
     }
 
     QueryResult executeAlterTable(AlterTableStmt stmt) {
@@ -48,6 +69,8 @@ class DdlAlterTableExecutor {
                 throw new MemgresException("column \"" + rename.newName() + "\" of relation \"" + stmt.table() + "\" already exists", "42701");
             }
             table.renameColumn(rename.oldName(), rename.newName());
+            rewriteIncomingForeignKeys(stmt.table(), schemaName, rename.oldName(), rename.newName());
+            rewriteIndexMetadata(stmt.table(), schemaName, rename.oldName(), rename.newName());
             rewriteDependentViews(stmt.table(), rename.oldName(), rename.newName());
             executor.recordUndo(new Session.RenameColumnUndo(schemaName, stmt.table(), rename.newName(), rename.oldName()));
         } else if (action instanceof AlterTableStmt.SetReplicaIdentity) {
@@ -94,8 +117,7 @@ class DdlAlterTableExecutor {
             Table partition = executor.resolveTable(detachSchemaName, detach.partitionName());
             table.removePartition(partition);
             partition.setPartitionParent(null);
-            partition.setPartitionValues(null);
-            partition.setDefaultPartition(false);
+            partition.clearPartitionBounds();
         } else if (action instanceof AlterTableStmt.RenameConstraint) {
             AlterTableStmt.RenameConstraint renameConstraint = (AlterTableStmt.RenameConstraint) action;
             StoredConstraint oldConstraint = table.getConstraint(renameConstraint.oldName());
@@ -219,16 +241,29 @@ class DdlAlterTableExecutor {
                     + "\" of relation \"" + stmt.table() + "\" contains null values", "23502");
         }
 
+        // SERIAL and GENERATED AS IDENTITY columns are implicitly NOT NULL (same as CREATE TABLE)
+        boolean notNull = def.notNull()
+                || dt == DataType.SERIAL || dt == DataType.BIGSERIAL || dt == DataType.SMALLSERIAL
+                || def.identity() != null;
+
         // Carry the resolved compositeTypeName/arrayElementType through, same as CREATE TABLE
         // (DdlTableExecutor) — hardcoding them to null made an ALTER-added "enum_type[]" column
         // indistinguishable from a scalar enum column, so PgWireValueFormatter.columnTypeOid
         // advertised the enum element's OID instead of the array type's.
-        Column col = new Column(def.name(), dt, !def.notNull(), def.primaryKey(), defaultVal,
+        Column col = new Column(def.name(), dt, !notNull, def.primaryKey(), defaultVal,
                 enumTypeName, def.precision(), def.scale(), genExpr, def.generatedVirtual(), domainTypeName,
                 compositeTypeName, arrayElementType);
-        // Don't pre-evaluate serial/nextval/identity defaults — they should be evaluated per-row
+        // Don't pre-evaluate serial/nextval/identity defaults — they are evaluated per-row below.
+        // Likewise, other VOLATILE defaults (random(), gen_random_uuid(), ...) must produce a
+        // distinct value per existing row, matching PG's table rewrite. STABLE functions such as
+        // now()/current_timestamp correctly evaluate once per statement and take the single-value
+        // path.
+        boolean sequenceBacked = defaultVal != null
+                && (defaultVal.contains("nextval(") || defaultVal.startsWith("__identity__"));
+        boolean volatileDefault = !sequenceBacked && defaultVal != null && genExpr == null
+                && hasVolatileFunction(defaultVal);
         Object evaluatedDefault;
-        if (defaultVal != null && (defaultVal.contains("nextval(") || defaultVal.startsWith("__identity__"))) {
+        if (sequenceBacked || volatileDefault) {
             evaluatedDefault = null;
         } else {
             evaluatedDefault = defaultVal != null ? executor.evaluateDefault(defaultVal, dt) : null;
@@ -285,6 +320,37 @@ class DdlAlterTableExecutor {
         table.addColumn(col, evaluatedDefault);
         executor.recordUndo(new Session.AddColumnUndo(schemaName, stmt.table(), def.name()));
 
+        // Backfill existing rows for sequence-backed (serial/identity/nextval) and volatile
+        // defaults, evaluating once per row. PG never leaves existing rows NULL for a serial/
+        // identity column, and gives each existing row its own random()/gen_random_uuid() value.
+        if ((sequenceBacked || volatileDefault) && !table.getRows().isEmpty()) {
+            int newColIdx = table.getColumnIndex(def.name());
+            if (newColIdx >= 0) {
+                String identitySeqName = null;
+                if (defaultVal.startsWith("__identity__") && defaultVal.contains(":seq:")) {
+                    identitySeqName = defaultVal.substring(defaultVal.indexOf(":seq:") + 5);
+                }
+                for (Object[] row : table.getRows()) {
+                    Object v;
+                    if (defaultVal.startsWith("__identity__")) {
+                        Sequence seq = identitySeqName != null
+                                ? executor.database.getSequence(identitySeqName) : null;
+                        v = seq != null ? seq.nextVal() : table.nextSerial();
+                    } else {
+                        v = executor.evaluateDefault(defaultVal, dt);
+                    }
+                    if (v != null) {
+                        try {
+                            v = TypeCoercion.coerceForStorage(v, col);
+                        } catch (Exception ignored) {
+                            // keep the uncoerced value rather than losing it
+                        }
+                    }
+                    row[newColIdx] = v;
+                }
+            }
+        }
+
         // Compute STORED generated column values for existing rows (VIRTUAL columns are computed on read)
         if (genExpr != null && !def.generatedVirtual()) {
             int colIdx = table.getColumnIndex(def.name());
@@ -333,6 +399,23 @@ class DdlAlterTableExecutor {
                             + "\" because view \"" + viewEntry.getKey() + "\" depends on it", "42P16");
                 }
             }
+            // FOREIGN KEY constraints (on any table, including self-references) whose REFERENCED
+            // columns include the dropped column depend on it via the unique index — PG requires
+            // CASCADE to drop them.
+            for (Schema sch : executor.database.getSchemas().values()) {
+                for (Table t : sch.getTables().values()) {
+                    for (StoredConstraint sc : t.getConstraints()) {
+                        if (isFkReferencing(sc, stmt.table(), schemaName, dropCol.column())
+                                && !StoredConstraint.containsIgnoreCase(sc.getColumns(), dropCol.column())) {
+                            throw new MemgresException("cannot drop column " + dropCol.column()
+                                    + " of table " + stmt.table()
+                                    + " because other objects depend on it\n  Detail: constraint "
+                                    + sc.getName() + " on table " + t.getName() + " depends on column "
+                                    + dropCol.column(), "2BP01");
+                        }
+                    }
+                }
+            }
         }
         Column droppedCol = table.getColumns().get(colIdx);
         List<Object> colValues = new ArrayList<>();
@@ -341,6 +424,48 @@ class DdlAlterTableExecutor {
         }
         executor.recordUndo(new Session.DropColumnUndo(schemaName, stmt.table(), droppedCol, colIdx, colValues));
         table.removeColumn(dropCol.column());
+        // Drop incoming FOREIGN KEY constraints that referenced the dropped column (reached only
+        // with CASCADE, or when the FK's own columns also contained the dropped column).
+        for (Schema sch : executor.database.getSchemas().values()) {
+            for (Table t : sch.getTables().values()) {
+                List<String> fkToDrop = new ArrayList<>();
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (isFkReferencing(sc, stmt.table(), schemaName, dropCol.column())) {
+                        fkToDrop.add(sc.getName());
+                    }
+                }
+                for (String fkName : fkToDrop) {
+                    if (fkName != null) t.removeConstraint(fkName);
+                }
+            }
+        }
+        // Drop database-level index metadata for indexes that used the dropped column, so they
+        // don't linger in pg_indexes (PG drops such indexes automatically).
+        String qualifiedTable = schemaName + "." + stmt.table();
+        List<String> idxToDrop = new ArrayList<>();
+        java.util.regex.Pattern colWord = java.util.regex.Pattern.compile(
+                "(?i)\\b" + java.util.regex.Pattern.quote(dropCol.column()) + "\\b");
+        for (Map.Entry<String, List<String>> idxEntry : executor.database.getIndexColumns().entrySet()) {
+            String idxTable = executor.database.getIndexTable(idxEntry.getKey());
+            if (idxTable == null || !idxTable.equalsIgnoreCase(qualifiedTable)) continue;
+            boolean usesColumn = false;
+            if (idxEntry.getValue() != null) {
+                for (String c : idxEntry.getValue()) {
+                    if (c.equalsIgnoreCase(dropCol.column()) || colWord.matcher(c).find()) {
+                        usesColumn = true;
+                        break;
+                    }
+                }
+            }
+            String whereClause = executor.database.getIndexWhereClause(idxEntry.getKey());
+            if (!usesColumn && whereClause != null && colWord.matcher(whereClause).find()) {
+                usesColumn = true;
+            }
+            if (usesColumn) idxToDrop.add(idxEntry.getKey());
+        }
+        for (String idxName : idxToDrop) {
+            executor.database.removeIndex(idxName);
+        }
         // CASCADE: also drop dependent generated columns
         if (dropCol.cascade() && !dependentGenCols.isEmpty()) {
             for (String depCol : dependentGenCols) {
@@ -356,6 +481,15 @@ class DdlAlterTableExecutor {
                 }
             }
         }
+    }
+
+    /** True if sc is a FOREIGN KEY whose referenced table/column match the given table and column. */
+    private static boolean isFkReferencing(StoredConstraint sc, String tableName, String schemaName, String column) {
+        return sc.getType() == StoredConstraint.Type.FOREIGN_KEY
+                && sc.getReferencesTable() != null
+                && sc.getReferencesTable().equalsIgnoreCase(tableName)
+                && (sc.getReferencesSchema() == null || sc.getReferencesSchema().equalsIgnoreCase(schemaName))
+                && StoredConstraint.containsIgnoreCase(sc.getReferencesColumns(), column);
     }
 
     private Table executeRenameTable(AlterTableStmt.RenameTable rename, Table table,
@@ -500,8 +634,17 @@ class DdlAlterTableExecutor {
         if (setType.usingExpr() == null && currentType != null && dt != null && currentType != dt) {
             TypeCoercion.TypeCategory fromCat = TypeCoercion.categoryOf(currentType);
             TypeCoercion.TypeCategory toCat = TypeCoercion.categoryOf(dt);
-            if (fromCat != toCat && fromCat != TypeCoercion.TypeCategory.STRING && toCat != TypeCoercion.TypeCategory.STRING) {
-                throw new MemgresException("column \"" + alterCol.column() + "\" cannot be cast automatically to type " + dt.getPgName(), "42804");
+            // Without USING, PG only applies assignment casts: conversions within the same type
+            // category (varchar<->text, int->bigint, ...) and conversions TO a string-category
+            // type (any type is I/O-coercible to text in assignment context). Conversions FROM a
+            // string type to anything else (text->integer, text->date, varchar->enum, ...) are
+            // explicit-only and must fail with 42804.
+            if (fromCat != toCat && toCat != TypeCoercion.TypeCategory.STRING) {
+                String targetName = newEnumTypeName != null ? newEnumTypeName : dt.toRegtypeDisplay();
+                if (isArrayType) targetName += "[]";
+                throw new MemgresException("column \"" + alterCol.column() + "\" cannot be cast automatically to type "
+                        + targetName + "\n  Hint: You might need to specify \"USING "
+                        + alterCol.column() + "::" + targetName + "\".", "42804");
             }
         }
         // Check for view dependencies
@@ -767,8 +910,18 @@ class DdlAlterTableExecutor {
                 // constraint must include every partition key column. Validate before adding
                 // to (or propagating onto) the table, matching creation-time ordering.
                 DdlTableExecutor.validatePartitionKeyCoverage(table, sc);
+                // PG validates existing data while building the unique index: duplicates abort
+                // with 23505, and NULLs in a new PRIMARY KEY column abort with 23502.
+                if (!sc.isNotEnforced()) {
+                    table.validateNewUniqueConstraint(sc);
+                }
             }
             table.addConstraint(sc);
+            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+                // PG: ADD PRIMARY KEY marks the key columns NOT NULL (attnotnull /
+                // information_schema.columns.is_nullable = 'NO'), on the table and its partitions.
+                setColumnsNotNull(table, sc.getColumns());
+            }
             if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
                 propagateConstraintToPartitions(table, sc);
             }
@@ -786,6 +939,18 @@ class DdlAlterTableExecutor {
      * {@code StoredConstraint} copy (see {@link StoredConstraint#copyForPartition}) rather than
      * sharing the parent's instance.
      */
+    /** Marks the given columns NOT NULL on a table and, recursively, on all its partitions. */
+    private void setColumnsNotNull(Table table, List<String> columns) {
+        for (String col : columns) {
+            if (table.getColumnIndex(col) >= 0) {
+                table.alterColumnNullable(col, false);
+            }
+        }
+        for (Table partition : table.getPartitions()) {
+            setColumnsNotNull(partition, columns);
+        }
+    }
+
     private void propagateConstraintToPartitions(Table table, StoredConstraint sc) {
         for (Table partition : table.getPartitions()) {
             DdlTableExecutor.validatePartitionKeyCoverage(partition, sc);
@@ -882,11 +1047,13 @@ class DdlAlterTableExecutor {
             throw new MemgresException("table \"" + attach.partitionName()
                     + "\" is already a partition of \"" + stmt.table() + "\"", "42809");
         }
-        partition.setPartitionParent(table);
-        table.addPartition(partition);
+        // Validate bounds before attaching, so overlapping bounds (42P17) don't leave
+        // the table half-attached to the parent's routing list
         if (attach.bounds() != null && !attach.bounds().isEmpty()) {
             ddl.tableExecutor.applyPartitionBounds(partition, table, attach.bounds(), attach.partitionName());
         }
+        partition.setPartitionParent(table);
+        table.addPartition(partition);
     }
 
     private void setTriggerEnabled(Table table, String triggerName, boolean disabled) {
@@ -901,6 +1068,55 @@ class DdlAlterTableExecutor {
                     t.setDisabled(disabled);
                 }
             }
+        }
+    }
+
+    /**
+     * After renaming a column, rewrite FOREIGN KEY constraints on ANY table (including
+     * self-references) whose referenced columns point at the renamed column of this table.
+     * Without this, FK enforcement against the renamed column silently breaks.
+     */
+    private void rewriteIncomingForeignKeys(String tableName, String schemaName, String oldCol, String newCol) {
+        for (Schema sch : executor.database.getSchemas().values()) {
+            for (Table t : sch.getTables().values()) {
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
+                            && sc.getReferencesTable() != null
+                            && sc.getReferencesTable().equalsIgnoreCase(tableName)
+                            && (sc.getReferencesSchema() == null
+                                || sc.getReferencesSchema().equalsIgnoreCase(schemaName))) {
+                        sc.renameReferencedColumn(oldCol, newCol);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * After renaming a column, rewrite database-level index metadata (pg_indexes /
+     * USING INDEX lookups) for indexes on this table so their column lists — including
+     * expression columns — reference the new column name.
+     */
+    private void rewriteIndexMetadata(String tableName, String schemaName, String oldCol, String newCol) {
+        String qualified = schemaName + "." + tableName;
+        for (Map.Entry<String, List<String>> entry : executor.database.getIndexColumns().entrySet()) {
+            String idxTable = executor.database.getIndexTable(entry.getKey());
+            if (idxTable == null || !idxTable.equalsIgnoreCase(qualified)) continue;
+            List<String> cols = entry.getValue();
+            if (cols == null || cols.isEmpty()) continue;
+            boolean changed = false;
+            List<String> updated = new ArrayList<>(cols.size());
+            for (String c : cols) {
+                String u;
+                if (c.equalsIgnoreCase(oldCol)) {
+                    u = newCol;
+                } else {
+                    u = StoredConstraint.renameIdentifier(c, oldCol, newCol);
+                }
+                if (!u.equals(c)) changed = true;
+                updated.add(u);
+            }
+            if (changed) entry.setValue(updated);
         }
     }
 
@@ -925,9 +1141,25 @@ class DdlAlterTableExecutor {
             if (updated.equals(sql)) continue;
             try {
                 Statement parsed = com.memgres.engine.parser.Parser.parse(updated);
+                // Keep regular-view column metadata (used by catalogs) in sync with the
+                // rewritten output names. Materialized views keep their own column names.
+                List<Column> newCachedCols = vd.cachedColumns;
+                if (!vd.materialized && vd.cachedColumns != null) {
+                    newCachedCols = new ArrayList<>();
+                    for (Column c : vd.cachedColumns) {
+                        if (c.getName().equalsIgnoreCase(oldCol)) {
+                            newCachedCols.add(new Column(newCol, c.getType(), c.isNullable(), c.isPrimaryKey(),
+                                    c.getDefaultValue(), c.getEnumTypeName(), c.getPrecision(), c.getScale(),
+                                    c.getGeneratedExpr(), c.isVirtual(), c.getDomainTypeName(),
+                                    c.getCompositeTypeName(), c.getArrayElementType()));
+                        } else {
+                            newCachedCols.add(c);
+                        }
+                    }
+                }
                 Database.ViewDef newView = new Database.ViewDef(
                         vd.name, vd.schemaName, parsed, vd.orReplace, vd.materialized,
-                        vd.cachedColumns, vd.cachedRows, updated, vd.checkOption, vd.reloptions);
+                        newCachedCols, vd.cachedRows, updated, vd.checkOption, vd.reloptions, vd.populated);
                 executor.database.addView(newView);
             } catch (Exception ignored) {
                 // If re-parse fails, leave the view as-is

@@ -86,6 +86,71 @@ public class Column {
         }
     }
 
+    /**
+     * Copies the mutable runtime attributes (catalog/wire metadata that lives outside the
+     * constructor) onto another column. Used by the {@code with*} copy methods so ALTER
+     * TABLE operations that rebuild a column never silently lose these attributes.
+     */
+    private void copyRuntimeAttrsTo(Column c) {
+        c.tableOid = tableOid;
+        c.attNum = attNum;
+        c.attStattarget = attStattarget;
+        c.attStorageOverride = attStorageOverride;
+        c.attCompression = attCompression;
+        c.attHasMissing = attHasMissing;
+    }
+
+    /** Copy of this column with a new name; every other attribute is preserved. */
+    public Column withName(String newName) {
+        Column c = new Column(newName, type, nullable, primaryKey, defaultValue, enumTypeName,
+                precision, scale, generatedExpr, virtual, domainTypeName, compositeTypeName, arrayElementType);
+        copyRuntimeAttrsTo(c);
+        c.parsedDefaultExpr = parsedDefaultExpr;
+        return c;
+    }
+
+    /** Copy of this column with a new nullability; every other attribute is preserved. */
+    public Column withNullable(boolean newNullable) {
+        Column c = new Column(name, type, newNullable, primaryKey, defaultValue, enumTypeName,
+                precision, scale, generatedExpr, virtual, domainTypeName, compositeTypeName, arrayElementType);
+        copyRuntimeAttrsTo(c);
+        c.parsedDefaultExpr = parsedDefaultExpr;
+        return c;
+    }
+
+    /** Copy of this column with a new default expression; every other attribute is preserved. */
+    public Column withDefault(String newDefault) {
+        Column c = new Column(name, type, nullable, primaryKey, newDefault, enumTypeName,
+                precision, scale, generatedExpr, virtual, domainTypeName, compositeTypeName, arrayElementType);
+        copyRuntimeAttrsTo(c);
+        // parsedDefaultExpr intentionally NOT copied: the constructor re-parses the new default
+        return c;
+    }
+
+    /** Copy of this column with a new generation expression; every other attribute is preserved. */
+    public Column withGeneratedExpr(String newGeneratedExpr) {
+        Column c = new Column(name, type, nullable, primaryKey, defaultValue, enumTypeName,
+                precision, scale, newGeneratedExpr, virtual, domainTypeName, compositeTypeName, arrayElementType);
+        copyRuntimeAttrsTo(c);
+        c.parsedDefaultExpr = parsedDefaultExpr;
+        return c;
+    }
+
+    /**
+     * Copy of this column with a replaced type spec (type, precision/scale, enum identity,
+     * array element type — all coming from the new declaration). Name, nullability, PK flag,
+     * default, generation expression/virtual flag, and runtime attributes are preserved.
+     * Domain/composite identity is dropped: ALTER COLUMN TYPE replaces the type spec entirely.
+     */
+    public Column withType(DataType newType, Integer newPrecision, Integer newScale,
+                           String newEnumTypeName, DataType newArrayElementType) {
+        Column c = new Column(name, newType, nullable, primaryKey, defaultValue, newEnumTypeName,
+                newPrecision, newScale, generatedExpr, virtual, null, null, newArrayElementType);
+        copyRuntimeAttrsTo(c);
+        c.parsedDefaultExpr = parsedDefaultExpr;
+        return c;
+    }
+
     public String getName() { return name; }
     public DataType getType() { return type; }
     public boolean isNullable() { return nullable; }

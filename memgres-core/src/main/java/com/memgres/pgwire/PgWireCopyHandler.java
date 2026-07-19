@@ -44,6 +44,9 @@ class PgWireCopyHandler {
         boolean header = copyStmt != null && copyStmt.header();
         String quoteChar = copyStmt != null && copyStmt.quote() != null ? copyStmt.quote() : "\"";
         String escapeChar = copyStmt != null && copyStmt.escape() != null ? copyStmt.escape() : quoteChar;
+        char delimC = delimiter != null && !delimiter.isEmpty() ? delimiter.charAt(0) : (isCsv ? ',' : '\t');
+        char quoteC = quoteChar.isEmpty() ? '"' : quoteChar.charAt(0);
+        char escapeC = escapeChar.isEmpty() ? quoteC : escapeChar.charAt(0);
         List<String> forceQuote = copyStmt != null ? copyStmt.forceQuote() : null;
 
         Set<Integer> forceQuoteIndices = new HashSet<>();
@@ -97,13 +100,16 @@ class PgWireCopyHandler {
                 } else {
                     String text = PgWireValueFormatter.formatValue(val, null);
                     if (isCsv) {
-                        if (forceQuoteIndices.contains(i)) {
-                            sb.append(quoteChar).append(text.replace(quoteChar, escapeChar + quoteChar)).append(quoteChar);
+                        if (forceQuoteIndices.contains(i)
+                                || (numCols == 1 && "\\.".equals(text))) {
+                            // Force-quoted, or a lone \. field that would otherwise
+                            // read back as the end-of-data marker.
+                            sb.append(csvQuote(text, quoteC, escapeC));
                         } else {
                             sb.append(csvQuoteIfNeeded(text, delimiter, quoteChar, escapeChar, nullString));
                         }
                     } else {
-                        sb.append(escapeTextCopy(text));
+                        sb.append(escapeTextCopy(text, delimC));
                     }
                 }
             }
@@ -217,30 +223,46 @@ class PgWireCopyHandler {
                 if (nullStr == null) nullStr = isCsv ? "" : "\\N";
                 boolean header = activeCopyStmt.header();
                 boolean onErrorIgnore = "ignore".equalsIgnoreCase(activeCopyStmt.onError());
+                String defaultStr = activeCopyStmt.defaultString();
+                char quoteC = activeCopyStmt.quote() != null && !activeCopyStmt.quote().isEmpty()
+                        ? activeCopyStmt.quote().charAt(0) : '"';
+                char escapeC = activeCopyStmt.escape() != null && !activeCopyStmt.escape().isEmpty()
+                        ? activeCopyStmt.escape().charAt(0) : quoteC;
 
                 String[] lines;
                 if (isCsv) {
-                    lines = splitCsvLines(data);
+                    lines = splitCsvLines(data, quoteC, escapeC);
                 } else {
                     lines = data.split("\n", -1);
+                    // The segment after the final newline is not a row (a trailing
+                    // terminator must not create a phantom empty row); a line
+                    // without a trailing newline still counts.
+                    if (lines.length > 0 && lines[lines.length - 1].isEmpty()) {
+                        lines = Arrays.copyOf(lines, lines.length - 1);
+                    }
                 }
 
                 boolean first = true;
                 for (String rawLine : lines) {
-                    String line = rawLine.endsWith("\r") ? rawLine.substring(0, rawLine.length() - 1) : rawLine;
-                    if (line.isEmpty()) continue;
-                    if (!isCsv && line.equals("\\.")) break;
+                    // CSV lines have terminators already handled in splitCsvLines;
+                    // for text, strip a trailing \r (CRLF input).
+                    String line = !isCsv && rawLine.endsWith("\r")
+                            ? rawLine.substring(0, rawLine.length() - 1) : rawLine;
+                    if (line.equals("\\.")) break; // end-of-data marker (both formats)
                     if (header && first) {
                         first = false;
                         // HEADER MATCH: validate column names match
                         if (activeCopyStmt.headerMatch()) {
                             List<String> headerValues;
                             if (isCsv) {
-                                headerValues = parseCsvLine(line, delimiter, nullStr);
+                                headerValues = parseCsvLine(line, delimiter, nullStr, null, quoteC, escapeC);
                             } else {
                                 headerValues = parseTextLine(line, delimiter, nullStr);
                             }
                             List<String> expectedCols = activeCopyStmt.columns();
+                            if (expectedCols == null || expectedCols.isEmpty()) {
+                                expectedCols = resolveActiveCopyColumnNames();
+                            }
                             if (expectedCols != null && !expectedCols.isEmpty()) {
                                 if (headerValues.size() != expectedCols.size()) {
                                     throw new com.memgres.engine.MemgresException(
@@ -264,9 +286,9 @@ class PgWireCopyHandler {
 
                     List<String> values;
                     if (isCsv) {
-                        values = parseCsvLine(line, delimiter, nullStr);
+                        values = parseCsvLine(line, delimiter, nullStr, defaultStr, quoteC, escapeC);
                     } else {
-                        values = parseTextLine(line, delimiter, nullStr);
+                        values = parseTextLine(line, delimiter, nullStr, defaultStr);
                     }
 
                     try {
@@ -331,6 +353,22 @@ class PgWireCopyHandler {
         }
     }
 
+    /** Resolve column names for the active COPY FROM statement's table (for HEADER MATCH). */
+    private List<String> resolveActiveCopyColumnNames() {
+        if (activeCopyStmt == null || activeCopyStmt.table() == null) return null;
+        try {
+            Table table = session.resolveTable(activeCopyStmt.table());
+            if (table == null) return null;
+            List<String> names = new ArrayList<>();
+            for (Column col : table.getColumns()) {
+                names.add(col.getName());
+            }
+            return names;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /** Resolve column types for the active COPY FROM statement. */
     private DataType[] resolveActiveCopyColumnTypes() {
         if (activeCopyStmt == null || activeCopyStmt.table() == null) return null;
@@ -392,8 +430,17 @@ class PgWireCopyHandler {
 
     // ---- Text/CSV format helpers ----
 
-    /** Escape a value for text-format COPY output. */
+    /** Escape a value for text-format COPY output (default tab delimiter). */
     static String escapeTextCopy(String val) {
+        return escapeTextCopy(val, '\t');
+    }
+
+    /**
+     * Escape a value for text-format COPY output. Matches PostgreSQL's
+     * CopyAttributeOutText: backslash, the active delimiter, and the control
+     * characters \b \f \n \r \t \v are escaped; everything else passes through.
+     */
+    static String escapeTextCopy(String val, char delimiter) {
         StringBuilder sb = new StringBuilder(val.length());
         for (int i = 0; i < val.length(); i++) {
             char c = val.charAt(i);
@@ -401,8 +448,11 @@ class PgWireCopyHandler {
                 case '\\':
                     sb.append("\\\\");
                     break;
-                case '\t':
-                    sb.append("\\t");
+                case '\b':
+                    sb.append("\\b");
+                    break;
+                case '\f':
+                    sb.append("\\f");
                     break;
                 case '\n':
                     sb.append("\\n");
@@ -410,7 +460,16 @@ class PgWireCopyHandler {
                 case '\r':
                     sb.append("\\r");
                     break;
+                case '\t':
+                    sb.append("\\t");
+                    break;
+                case '\u000B': // vertical tab
+                    sb.append("\\v");
+                    break;
                 default:
+                    if (c == delimiter) {
+                        sb.append('\\');
+                    }
                     sb.append(c);
                     break;
             }
@@ -418,132 +477,265 @@ class PgWireCopyHandler {
         return sb.toString();
     }
 
+    /** Quote a value with the given CSV quote/escape chars, escaping embedded quote and escape chars. */
+    static String csvQuote(String val, char quote, char escape) {
+        StringBuilder sb = new StringBuilder(val.length() + 2);
+        sb.append(quote);
+        for (int i = 0; i < val.length(); i++) {
+            char c = val.charAt(i);
+            if (c == quote || c == escape) {
+                sb.append(escape);
+            }
+            sb.append(c);
+        }
+        sb.append(quote);
+        return sb.toString();
+    }
+
     /** Quote a value for CSV-format COPY output if needed. */
     static String csvQuoteIfNeeded(String val, String delimiter, String quoteChar, String escapeChar, String nullString) {
-        boolean mustQuoteEmpty = val.isEmpty() && nullString.isEmpty();
-        if (mustQuoteEmpty || val.contains(quoteChar) || val.contains(delimiter) || val.contains("\n") || val.contains("\r")) {
-            return quoteChar + val.replace(quoteChar, escapeChar + quoteChar) + quoteChar;
+        char quote = quoteChar.isEmpty() ? '"' : quoteChar.charAt(0);
+        char escape = escapeChar.isEmpty() ? quote : escapeChar.charAt(0);
+        // A data value equal to the NULL marker must be quoted so it round-trips as data.
+        boolean needsQuote = val.equals(nullString)
+                || val.indexOf(quote) >= 0 || val.indexOf(escape) >= 0
+                || val.contains(delimiter) || val.indexOf('\n') >= 0 || val.indexOf('\r') >= 0;
+        if (needsQuote) {
+            return csvQuote(val, quote, escape);
         }
         return val;
     }
 
-    /** Parse a line in text COPY format. */
+    /**
+     * Parse a line in text COPY format.
+     *
+     * <p>As in PostgreSQL, the NULL marker (and DEFAULT marker) are compared against
+     * the RAW field text before unescaping: input {@code \N} is NULL, while
+     * {@code \\N} unescapes to the literal two-character string {@code \N}.
+     * The full PG escape set is supported: {@code \b \f \n \r \t \v \\},
+     * octal ({@code \o}, {@code \oo}, {@code \ooo}) and hex ({@code \xh}, {@code \xhh});
+     * an unrecognized escaped character is taken literally (backslash dropped),
+     * which also makes {@code \<delimiter>} a literal delimiter character.</p>
+     */
     static List<String> parseTextLine(String line, String delimiter, String nullStr) {
+        return parseTextLine(line, delimiter, nullStr, null);
+    }
+
+    static List<String> parseTextLine(String line, String delimiter, String nullStr, String defaultStr) {
         List<String> values = new ArrayList<>();
         StringBuilder current = new StringBuilder();
+        int fieldStart = 0;
         int i = 0;
         while (i < line.length()) {
             if (line.startsWith(delimiter, i)) {
-                String val = current.toString();
-                values.add(val.equals(nullStr) ? null : val);
+                addTextField(values, line.substring(fieldStart, i), current.toString(), nullStr, defaultStr);
                 current.setLength(0);
                 i += delimiter.length();
-            } else if (line.charAt(i) == '\\' && i + 1 < line.length()) {
+                fieldStart = i;
+            } else if (line.charAt(i) == '\\') {
+                if (i + 1 >= line.length()) {
+                    // Data ending in a lone backslash: kept literally (as PG does).
+                    current.append('\\');
+                    i++;
+                    continue;
+                }
                 char next = line.charAt(i + 1);
+                i += 2;
                 switch (next) {
+                    case 'b':
+                        current.append('\b');
+                        break;
+                    case 'f':
+                        current.append('\f');
+                        break;
                     case 'n':
                         current.append('\n');
-                        break;
-                    case 't':
-                        current.append('\t');
                         break;
                     case 'r':
                         current.append('\r');
                         break;
+                    case 't':
+                        current.append('\t');
+                        break;
+                    case 'v':
+                        current.append('\u000B');
+                        break;
                     case '\\':
                         current.append('\\');
                         break;
-                    case 'N':
-                        current.append("\\N");
-                        break;
-                    default: {
-                        current.append('\\'); current.append(next); 
+                    case 'x': {
+                        // \xh or \xhh hex escape; \x with no hex digit is a literal 'x'
+                        int val = 0;
+                        int digits = 0;
+                        while (digits < 2 && i < line.length() && isHexDigit(line.charAt(i))) {
+                            val = val * 16 + hexValue(line.charAt(i));
+                            i++;
+                            digits++;
+                        }
+                        if (digits == 0) {
+                            current.append('x');
+                        } else {
+                            current.append((char) val);
+                        }
                         break;
                     }
+                    default:
+                        if (next >= '0' && next <= '7') {
+                            // Octal escape: up to 3 digits total
+                            int val = next - '0';
+                            int digits = 1;
+                            while (digits < 3 && i < line.length()
+                                    && line.charAt(i) >= '0' && line.charAt(i) <= '7') {
+                                val = (val << 3) + (line.charAt(i) - '0');
+                                i++;
+                                digits++;
+                            }
+                            current.append((char) (val & 0xFF));
+                        } else {
+                            // Unknown escape: the backslash is dropped, the char kept.
+                            current.append(next);
+                        }
+                        break;
                 }
-                i += 2;
             } else {
                 current.append(line.charAt(i));
                 i++;
             }
         }
-        String val = current.toString();
-        values.add(val.equals(nullStr) ? null : val);
+        addTextField(values, line.substring(fieldStart), current.toString(), nullStr, defaultStr);
         return values;
     }
 
-    /** Parse a CSV line respecting quoting. */
+    /** Add one text-format field: NULL/DEFAULT markers match against the RAW (pre-unescape) text. */
+    private static void addTextField(List<String> values, String raw, String unescaped,
+                                     String nullStr, String defaultStr) {
+        if (raw.equals(nullStr)) {
+            values.add(null);
+        } else if (defaultStr != null && raw.equals(defaultStr)) {
+            // Preserve the marker verbatim so the executor's DEFAULT substitution matches.
+            values.add(defaultStr);
+        } else {
+            values.add(unescaped);
+        }
+    }
+
+    private static boolean isHexDigit(char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    }
+
+    private static int hexValue(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return c - 'A' + 10;
+    }
+
+    /** Parse a CSV line with default quote/escape ('"'). */
     static List<String> parseCsvLine(String line, String delimiter, String nullStr) {
+        return parseCsvLine(line, delimiter, nullStr, null, '"', '"');
+    }
+
+    /**
+     * Parse a CSV line respecting the configured QUOTE and ESCAPE characters.
+     * A field that was quoted (even partially) is never NULL; an unquoted field
+     * equal to the NULL marker is NULL. Inside quotes, escape+quote or
+     * escape+escape yield the literal character; when escape == quote this is
+     * the standard doubled-quote rule.
+     */
+    static List<String> parseCsvLine(String line, String delimiter, String nullStr,
+                                     String defaultStr, char quote, char escape) {
         List<String> values = new ArrayList<>();
+        int len = line.length();
         int i = 0;
-        while (i <= line.length()) {
-            if (i == line.length()) {
-                values.add(null);
-                break;
-            }
-            if (line.charAt(i) == '"') {
-                StringBuilder sb = new StringBuilder();
-                i++;
-                while (i < line.length()) {
-                    if (line.charAt(i) == '"') {
-                        if (i + 1 < line.length() && line.charAt(i + 1) == '"') {
-                            sb.append('"');
+        while (true) {
+            StringBuilder sb = new StringBuilder();
+            boolean sawQuote = false;
+            int rawStart = i;
+            while (i < len) {
+                char c = line.charAt(i);
+                if (c == quote) {
+                    sawQuote = true;
+                    i++;
+                    while (i < len) {
+                        char q = line.charAt(i);
+                        if (q == escape && i + 1 < len
+                                && (line.charAt(i + 1) == quote || line.charAt(i + 1) == escape)) {
+                            sb.append(line.charAt(i + 1));
                             i += 2;
-                        } else {
+                        } else if (q == quote) {
                             i++;
                             break;
+                        } else {
+                            sb.append(q);
+                            i++;
                         }
-                    } else {
-                        sb.append(line.charAt(i));
-                        i++;
                     }
-                }
-                values.add(sb.toString());
-                if (i < line.length() && line.startsWith(delimiter, i)) {
-                    i += delimiter.length();
-                } else {
+                } else if (line.startsWith(delimiter, i)) {
                     break;
+                } else {
+                    sb.append(c);
+                    i++;
                 }
+            }
+            String raw = line.substring(rawStart, i);
+            if (!sawQuote && raw.equals(nullStr)) {
+                values.add(null);
+            } else if (!sawQuote && defaultStr != null && raw.equals(defaultStr)) {
+                values.add(defaultStr);
             } else {
-                int delimIdx = line.indexOf(delimiter, i);
-                String field;
-                if (delimIdx >= 0) {
-                    field = line.substring(i, delimIdx);
-                    i = delimIdx + delimiter.length();
-                } else {
-                    field = line.substring(i);
-                    i = line.length();
-                }
-                if (field.equals(nullStr) || (nullStr.isEmpty() && field.isEmpty())) {
-                    values.add(null);
-                } else {
-                    values.add(field);
-                }
-                if (delimIdx < 0) break;
+                values.add(sb.toString());
+            }
+            if (i < len) {
+                i += delimiter.length(); // consume delimiter, parse next field
+            } else {
+                break;
             }
         }
         return values;
     }
 
-    /** Split CSV data into lines, respecting quoted fields that may contain newlines. */
+    /** Split CSV data into lines with default quote/escape ('"'). */
     static String[] splitCsvLines(String data) {
+        return splitCsvLines(data, '"', '"');
+    }
+
+    /**
+     * Split CSV data into lines, respecting quoted fields that may contain newlines.
+     * Empty lines between terminators are preserved (they are data rows in CSV);
+     * a trailing final newline does not create a phantom row. Both \n, \r\n and
+     * bare \r act as line terminators outside quotes.
+     */
+    static String[] splitCsvLines(String data, char quote, char escape) {
         List<String> lines = new ArrayList<>();
         StringBuilder current = new StringBuilder();
         boolean inQuote = false;
-        for (int i = 0; i < data.length(); i++) {
+        int i = 0;
+        while (i < data.length()) {
             char c = data.charAt(i);
-            if (c == '"') {
-                inQuote = !inQuote;
-                current.append(c);
-            } else if (c == '\n' && !inQuote) {
-                if (current.length() > 0) {
-                    lines.add(current.toString());
-                    current.setLength(0);
+            if (inQuote) {
+                if (c == escape && i + 1 < data.length()
+                        && (data.charAt(i + 1) == quote || data.charAt(i + 1) == escape)) {
+                    current.append(c).append(data.charAt(i + 1));
+                    i += 2;
+                    continue;
                 }
-            } else if (c == '\r' && !inQuote) {
-                // Skip \r
-            } else {
+                if (c == quote) {
+                    inQuote = false;
+                }
                 current.append(c);
+                i++;
+            } else if (c == '\n' || c == '\r') {
+                if (c == '\r' && i + 1 < data.length() && data.charAt(i + 1) == '\n') {
+                    i++; // \r\n is a single terminator
+                }
+                lines.add(current.toString());
+                current.setLength(0);
+                i++;
+            } else {
+                if (c == quote) {
+                    inQuote = true;
+                }
+                current.append(c);
+                i++;
             }
         }
         if (current.length() > 0) {

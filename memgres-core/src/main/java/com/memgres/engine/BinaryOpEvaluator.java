@@ -810,61 +810,70 @@ class BinaryOpEvaluator {
                     HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
                     return lh.containsAll(rh);
                 }
-                String ls = left.toString().trim();
-                String rs = right.toString().trim();
-                // Multirange containment: multirange @> value/range/multirange
-                if (RangeOperations.isMultirangeOrEmpty(ls)) {
-                    if (RangeOperations.isMultirangeOrEmpty(rs)) return RangeOperations.multirangeContainsMultirange(ls, rs);
-                    if (RangeOperations.isRangeString(rs)) return RangeOperations.multirangeContainsRange(ls, RangeOperations.parse(rs));
-                    if (right instanceof Number) return RangeOperations.multirangeContains(ls, ((Number) right));
-                    try { return RangeOperations.multirangeContains(ls, Long.parseLong(rs)); } catch (NumberFormatException ignore) {}
-                    return false;
-                }
-                // Range containment: range @> value or range @> range or range @> multirange
-                if (RangeOperations.isRangeString(ls)) {
-                    RangeOperations.PgRange range = RangeOperations.parse(ls);
-                    if (right instanceof Number) return range.contains(((Number) right));
-                    if (right instanceof java.time.LocalDateTime) return range.contains(((java.time.LocalDateTime) right).toEpochSecond(java.time.ZoneOffset.UTC));
-                    if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
-                    // range @> multirange: true if range contains every sub-range
-                    if (RangeOperations.isMultirangeOrEmpty(rs)) {
-                        return RangeOperations.multirangeContainsMultirange("{" + ls + "}", rs);
+                // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
+                // (which stringify as "[1, 5]") are never mistaken for range literals
+                boolean lIsList = left instanceof List;
+                boolean rIsList = right instanceof List;
+                String ls = lIsList ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
+                String rs = rIsList ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
+                // Range/multirange semantics only apply when neither operand is a real array
+                if (!lIsList && !rIsList) {
+                    // Multirange containment: multirange @> value/range/multirange
+                    if (RangeOperations.isMultirangeOrEmpty(ls)) {
+                        if (RangeOperations.isMultirangeOrEmpty(rs)) return RangeOperations.multirangeContainsMultirange(ls, rs);
+                        if (RangeOperations.isRangeString(rs)) return RangeOperations.multirangeContainsRange(ls, RangeOperations.parse(rs));
+                        if (right instanceof Number) return RangeOperations.multirangeContains(ls, ((Number) right));
+                        try { return RangeOperations.multirangeContains(ls, Long.parseLong(rs)); } catch (NumberFormatException ignore) {}
+                        return false;
                     }
-                    if (RangeOperations.isRangeString(rs)) return range.containsRange(RangeOperations.parse(rs));
-                    // PG: range @> non-range-non-number -> try parsing
-                    try {
-                        return range.contains(Long.parseLong(rs));
-                    } catch (NumberFormatException e) {
-                        // Try timestamp
-                        if (rs.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}.*")) {
-                            try {
-                                java.time.LocalDateTime ldt = TypeCoercion.toLocalDateTime(rs);
-                                return range.contains(ldt.toEpochSecond(java.time.ZoneOffset.UTC));
-                            } catch (Exception ignored) {}
+                    // Range containment: range @> value or range @> range or range @> multirange
+                    if (RangeOperations.isRangeString(ls)) {
+                        RangeOperations.PgRange range = RangeOperations.parse(ls);
+                        if (right instanceof Number) return range.contains(((Number) right));
+                        if (right instanceof java.time.LocalDateTime) return range.contains(((java.time.LocalDateTime) right).toEpochSecond(java.time.ZoneOffset.UTC));
+                        if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
+                        // range @> multirange: true if range contains every sub-range
+                        if (RangeOperations.isMultirangeOrEmpty(rs)) {
+                            return RangeOperations.multirangeContainsMultirange("{" + ls + "}", rs);
                         }
-                        // Try date
-                        if (rs.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
-                            return range.contains(java.time.LocalDate.parse(rs.substring(0, 10)).toEpochDay());
+                        if (RangeOperations.isRangeString(rs)) return range.containsRange(RangeOperations.parse(rs));
+                        // PG: range @> non-range-non-number -> try parsing
+                        try {
+                            return range.contains(Long.parseLong(rs));
+                        } catch (NumberFormatException e) {
+                            // Try decimal (numrange @> numeric-as-string)
+                            try { return range.contains(new java.math.BigDecimal(rs)); } catch (NumberFormatException ignored) {}
+                            // Try timestamp
+                            if (rs.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}.*")) {
+                                try {
+                                    java.time.LocalDateTime ldt = TypeCoercion.toLocalDateTime(rs);
+                                    return range.contains(ldt.toEpochSecond(java.time.ZoneOffset.UTC));
+                                } catch (Exception ignored) {}
+                            }
+                            // Try date
+                            if (rs.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
+                                return range.contains(java.time.LocalDate.parse(rs.substring(0, 10)).toEpochDay());
+                            }
+                            throw new MemgresException("malformed range literal: \"" + rs + "\"", "22P02");
                         }
-                        throw new MemgresException("malformed range literal: \"" + rs + "\"", "22P02");
                     }
                 }
                 // PG array containment: {1,2,3} @> {2,3}
-                // Convert Lists to PG array strings for uniform handling
-                if (left instanceof List) ls = TypeCoercion.formatPgArray((List<?>) left);
-                if (right instanceof List) rs = TypeCoercion.formatPgArray((List<?>) right);
-                boolean lIsPgArray = ls.startsWith("{") && !ls.startsWith("{\"");
-                boolean rIsPgArray = rs.startsWith("{") && !rs.startsWith("{\"");
+                boolean lIsPgArray = lIsList || (ls.startsWith("{") && !ls.startsWith("{\""));
+                boolean rIsPgArray = rIsList || (rs.startsWith("{") && !rs.startsWith("{\""));
                 if (lIsPgArray && rIsPgArray) {
-                    List<Object> la = new ArrayList<>(FunctionEvaluator.parseSimplePgArray(ls));
-                    List<Object> ra = new ArrayList<>(FunctionEvaluator.parseSimplePgArray(rs));
-                    // String-based containsAll for PG arrays (compare as strings)
-                    List<String> laStr = la.stream().map(o -> o == null ? "NULL" : o.toString()).collect(Collectors.toList());
-                    List<String> raStr = ra.stream().map(o -> o == null ? "NULL" : o.toString()).collect(Collectors.toList());
-                    return laStr.containsAll(raStr);
+                    List<Object> la = FunctionEvaluator.parseSimplePgArray(ls);
+                    List<Object> ra = FunctionEvaluator.parseSimplePgArray(rs);
+                    return arrayContainsAll(la, ra);
                 }
                 if (lIsPgArray && !rIsPgArray) {
                     throw new MemgresException("malformed array literal: \"" + rs + "\"", "22P02");
+                }
+                if (rIsList && !lIsPgArray) {
+                    if (!(left instanceof String)) {
+                        throw new MemgresException("operator does not exist: " + AstExecutor.pgTypeNameOf(left) + " @> " + AstExecutor.pgTypeNameOf(right), "42883");
+                    }
+                    throw new MemgresException("malformed array literal: \"" + ls + "\"", "22P02");
                 }
                 // JSON containment
                 if ((ls.startsWith("{") || ls.startsWith("[")) && (rs.startsWith("{") || rs.startsWith("["))) {
@@ -876,9 +885,6 @@ class BinaryOpEvaluator {
                 if (JsonOperations.isJsonScalar(rs)
                         && (ls.startsWith("{") || ls.startsWith("[") || JsonOperations.isJsonScalar(ls))) {
                     return JsonOperations.contains(ls, rs);
-                }
-                if (left instanceof List && right instanceof List) {
-                    return ((List<?>) left).containsAll((List<?>) right);
                 }
                 if (GeometricOperations.isGeometricString(ls) || GeometricOperations.isGeometricString(rs)) {
                     return GeometricOperations.contains(ls, rs);
@@ -893,25 +899,53 @@ class BinaryOpEvaluator {
                     HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
                     return lh.containedBy(rh);
                 }
-                String ls = left.toString().trim();
-                String rs = right.toString().trim();
-                // Multirange/range containment: a <@ b means b @> a
-                if (RangeOperations.isMultirangeOrEmpty(rs)) {
-                    if (RangeOperations.isMultirangeOrEmpty(ls)) return RangeOperations.multirangeContainsMultirange(rs, ls);
-                    if (RangeOperations.isRangeString(ls)) return RangeOperations.multirangeContainsRange(rs, RangeOperations.parse(ls));
-                    if (left instanceof Number) return RangeOperations.multirangeContains(rs, ((Number) left));
-                    try { return RangeOperations.multirangeContains(rs, Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
-                    return false;
-                }
-                if (RangeOperations.isRangeString(rs)) {
-                    RangeOperations.PgRange range = RangeOperations.parse(rs);
-                    // multirange <@ range: true if range contains every sub-range
-                    if (RangeOperations.isMultirangeOrEmpty(ls)) {
-                        return RangeOperations.multirangeContainsMultirange("{" + rs + "}", ls);
+                // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
+                // (which stringify as "[1, 5]") are never mistaken for range literals
+                boolean lIsList = left instanceof List;
+                boolean rIsList = right instanceof List;
+                String ls = lIsList ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
+                String rs = rIsList ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
+                // Range/multirange semantics only apply when neither operand is a real array
+                if (!lIsList && !rIsList) {
+                    // Multirange/range containment: a <@ b means b @> a
+                    if (RangeOperations.isMultirangeOrEmpty(rs)) {
+                        if (RangeOperations.isMultirangeOrEmpty(ls)) return RangeOperations.multirangeContainsMultirange(rs, ls);
+                        if (RangeOperations.isRangeString(ls)) return RangeOperations.multirangeContainsRange(rs, RangeOperations.parse(ls));
+                        if (left instanceof Number) return RangeOperations.multirangeContains(rs, ((Number) left));
+                        try { return RangeOperations.multirangeContains(rs, Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
+                        return false;
                     }
-                    if (RangeOperations.isRangeString(ls)) return range.containsRange(RangeOperations.parse(ls));
-                    if (left instanceof Number) return range.contains(((Number) left));
-                    try { return range.contains(Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
+                    if (RangeOperations.isRangeString(rs)) {
+                        RangeOperations.PgRange range = RangeOperations.parse(rs);
+                        // multirange <@ range: true if range contains every sub-range
+                        if (RangeOperations.isMultirangeOrEmpty(ls)) {
+                            return RangeOperations.multirangeContainsMultirange("{" + rs + "}", ls);
+                        }
+                        if (RangeOperations.isRangeString(ls)) return range.containsRange(RangeOperations.parse(ls));
+                        if (left instanceof Number) return range.contains(((Number) left));
+                        try { return range.contains(Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
+                        try { return range.contains(new java.math.BigDecimal(ls)); } catch (NumberFormatException ignore) {}
+                    }
+                }
+                // PG array containment: {2,3} <@ {1,2,3}
+                boolean lIsPgArray = lIsList || (ls.startsWith("{") && !ls.startsWith("{\""));
+                boolean rIsPgArray = rIsList || (rs.startsWith("{") && !rs.startsWith("{\""));
+                if (lIsPgArray && rIsPgArray) {
+                    List<Object> la = FunctionEvaluator.parseSimplePgArray(ls);
+                    List<Object> ra = FunctionEvaluator.parseSimplePgArray(rs);
+                    return arrayContainsAll(ra, la);
+                }
+                if (lIsList && !rIsPgArray) {
+                    if (!(right instanceof String)) {
+                        throw new MemgresException("operator does not exist: " + AstExecutor.pgTypeNameOf(left) + " <@ " + AstExecutor.pgTypeNameOf(right), "42883");
+                    }
+                    throw new MemgresException("malformed array literal: \"" + rs + "\"", "22P02");
+                }
+                if (rIsList && !lIsPgArray) {
+                    if (!(left instanceof String)) {
+                        throw new MemgresException("operator does not exist: " + AstExecutor.pgTypeNameOf(left) + " <@ " + AstExecutor.pgTypeNameOf(right), "42883");
+                    }
+                    throw new MemgresException("malformed array literal: \"" + ls + "\"", "22P02");
                 }
                 if ((ls.startsWith("{") || ls.startsWith("[")) && (rs.startsWith("{") || rs.startsWith("["))) {
                     return JsonOperations.contains(rs, ls);
@@ -921,9 +955,6 @@ class BinaryOpEvaluator {
                 if (JsonOperations.isJsonScalar(ls)
                         && (rs.startsWith("{") || rs.startsWith("[") || JsonOperations.isJsonScalar(rs))) {
                     return JsonOperations.contains(rs, ls);
-                }
-                if (left instanceof List && right instanceof List) {
-                    return ((List<?>) right).containsAll((List<?>) left);
                 }
                 if (GeometricOperations.isGeometricString(ls) || GeometricOperations.isGeometricString(rs)) {
                     return GeometricOperations.contains(rs, ls);
@@ -981,29 +1012,36 @@ class BinaryOpEvaluator {
                 if (left instanceof TsQuery) return TsQuery.and((TsQuery) left, TsQuery.parse(right.toString()));
                 if (right instanceof TsQuery) return TsQuery.and(TsQuery.parse(left.toString()), (TsQuery) right);
                 // Convert Lists to PG format for uniform handling
-                String oLs = (left instanceof List) ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
-                String oRs = (right instanceof List) ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
-                // Multirange overlap checks
-                if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
-                    return RangeOperations.multirangeOverlapsMultirange(oLs, oRs);
+                boolean oLIsList = left instanceof List;
+                boolean oRIsList = right instanceof List;
+                String oLs = oLIsList ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
+                String oRs = oRIsList ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
+                // Range/multirange semantics only apply when neither operand is a real array
+                if (!oLIsList && !oRIsList) {
+                    // Multirange overlap checks
+                    if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
+                        return RangeOperations.multirangeOverlapsMultirange(oLs, oRs);
+                    }
+                    if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isRangeString(oRs)) {
+                        return RangeOperations.multirangeOverlapsRange(oLs, RangeOperations.parse(oRs));
+                    }
+                    if (RangeOperations.isRangeString(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
+                        return RangeOperations.multirangeOverlapsRange(oRs, RangeOperations.parse(oLs));
+                    }
+                    if (RangeOperations.isRangeString(oLs) && RangeOperations.isRangeString(oRs)) {
+                        return RangeOperations.parse(oLs).overlaps(RangeOperations.parse(oRs));
+                    }
                 }
-                if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isRangeString(oRs)) {
-                    return RangeOperations.multirangeOverlapsRange(oLs, RangeOperations.parse(oRs));
-                }
-                if (RangeOperations.isRangeString(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
-                    return RangeOperations.multirangeOverlapsRange(oRs, RangeOperations.parse(oLs));
-                }
-                if (RangeOperations.isRangeString(oLs) && RangeOperations.isRangeString(oRs)) {
-                    return RangeOperations.parse(oLs).overlaps(RangeOperations.parse(oRs));
-                }
-                // Array overlap: check if arrays share any element
-                boolean lArr = oLs.startsWith("{") && !oLs.startsWith("{\"");
-                boolean rArr = oRs.startsWith("{") && !oRs.startsWith("{\"");
+                // Array overlap: check if arrays share any element (NULL elements never match)
+                boolean lArr = oLIsList || (oLs.startsWith("{") && !oLs.startsWith("{\""));
+                boolean rArr = oRIsList || (oRs.startsWith("{") && !oRs.startsWith("{\""));
                 if (lArr && rArr) {
                     List<Object> la = FunctionEvaluator.parseSimplePgArray(oLs);
                     List<Object> ra = FunctionEvaluator.parseSimplePgArray(oRs);
-                    Set<String> laStrs = la.stream().map(o -> o == null ? "NULL" : o.toString()).collect(Collectors.toSet());
-                    return ra.stream().anyMatch(o -> laStrs.contains(o == null ? "NULL" : o.toString()));
+                    return arrayOverlaps(la, ra);
+                }
+                if (lArr != rArr && (oLIsList || oRIsList)) {
+                    throw new MemgresException("malformed array literal: \"" + (lArr ? oRs : oLs) + "\"", "22P02");
                 }
                 return GeometricOperations.overlaps(oLs, oRs);
             }
@@ -1126,6 +1164,53 @@ class BinaryOpEvaluator {
      * This handles the case where a built-in operator symbol (like +) is overloaded
      * for custom types.
      */
+    /** Recursively collect leaf elements of a (possibly nested) array into a flat list. */
+    private static void collectLeafElements(List<?> list, List<Object> out) {
+        for (Object o : list) {
+            if (o instanceof List<?>) collectLeafElements((List<?>) o, out);
+            else out.add(o);
+        }
+    }
+
+    private static List<Object> leafElements(List<?> list) {
+        List<Object> out = new ArrayList<>();
+        collectLeafElements(list, out);
+        return out;
+    }
+
+    /**
+     * PG array containment (@>): every element of sub must equal some element of sup.
+     * NULL elements never match anything, so a sub containing NULL is never contained.
+     */
+    private static boolean arrayContainsAll(List<?> sup, List<?> sub) {
+        List<Object> supFlat = leafElements(sup);
+        for (Object o : leafElements(sub)) {
+            if (o == null) return false; // NULL never equals anything
+            String os = o.toString();
+            boolean found = false;
+            for (Object s : supFlat) {
+                if (s != null && s.toString().equals(os)) { found = true; break; }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /**
+     * PG array overlap (&&): true if the arrays share any non-NULL element.
+     * NULL elements never match anything.
+     */
+    private static boolean arrayOverlaps(List<?> a, List<?> b) {
+        Set<String> as = new HashSet<>();
+        for (Object o : leafElements(a)) {
+            if (o != null) as.add(o.toString());
+        }
+        for (Object o : leafElements(b)) {
+            if (o != null && as.contains(o.toString())) return true;
+        }
+        return false;
+    }
+
     Object tryUserDefinedOperator(String opSymbol, Object left, Object right) {
         String leftType = AstExecutor.pgTypeNameOf(left);
         String rightType = AstExecutor.pgTypeNameOf(right);
@@ -1537,28 +1622,41 @@ class BinaryOpEvaluator {
                     HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
                     return lh.containsAll(rh);
                 }
-                String lStr = left.toString().trim();
-                String rStr = right.toString().trim();
-                // Multirange containment
-                if (RangeOperations.isMultirangeOrEmpty(lStr)) {
-                    if (right instanceof Number) return RangeOperations.multirangeContains(lStr, ((Number) right));
-                    try { return RangeOperations.multirangeContains(lStr, Long.parseLong(rStr)); } catch (NumberFormatException ignore) {}
-                    return false;
+                // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
+                // (which stringify as "[1, 5]") are never mistaken for range literals
+                boolean lIsList = left instanceof List;
+                boolean rIsList = right instanceof List;
+                String lStr = lIsList ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
+                String rStr = rIsList ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
+                if (!lIsList && !rIsList) {
+                    // Multirange containment
+                    if (RangeOperations.isMultirangeOrEmpty(lStr)) {
+                        if (right instanceof Number) return RangeOperations.multirangeContains(lStr, ((Number) right));
+                        try { return RangeOperations.multirangeContains(lStr, Long.parseLong(rStr)); } catch (NumberFormatException ignore) {}
+                        return false;
+                    }
+                    // Range containment
+                    if (RangeOperations.isRangeString(lStr)) {
+                        RangeOperations.PgRange range = RangeOperations.parse(lStr);
+                        if (right instanceof Number) return range.contains(((Number) right));
+                        if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
+                        // range @> multirange: true if range contains every sub-range
+                        if (RangeOperations.isMultirangeOrEmpty(rStr)) {
+                            return RangeOperations.multirangeContainsMultirange("{" + lStr + "}", rStr);
+                        }
+                        if (RangeOperations.isRangeString(rStr)) return range.containsRange(RangeOperations.parse(rStr));
+                        if (rStr.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
+                            return range.contains(java.time.LocalDate.parse(rStr.substring(0, 10)).toEpochDay());
+                        }
+                        try { return range.contains(Long.parseLong(rStr)); } catch (NumberFormatException ignore) {}
+                        try { return range.contains(new java.math.BigDecimal(rStr)); } catch (NumberFormatException ignore) {}
+                    }
                 }
-                // Range containment
-                if (RangeOperations.isRangeString(lStr)) {
-                    RangeOperations.PgRange range = RangeOperations.parse(lStr);
-                    if (right instanceof Number) return range.contains(((Number) right));
-                    if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
-                    // range @> multirange: true if range contains every sub-range
-                    if (RangeOperations.isMultirangeOrEmpty(rStr)) {
-                        return RangeOperations.multirangeContainsMultirange("{" + lStr + "}", rStr);
-                    }
-                    if (RangeOperations.isRangeString(rStr)) return range.containsRange(RangeOperations.parse(rStr));
-                    if (rStr.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
-                        return range.contains(java.time.LocalDate.parse(rStr.substring(0, 10)).toEpochDay());
-                    }
-                    try { return range.contains(Long.parseLong(rStr)); } catch (NumberFormatException ignore) {}
+                // PG array containment (NULL elements never match)
+                boolean lIsPgArray = lIsList || (lStr.startsWith("{") && !lStr.startsWith("{\""));
+                boolean rIsPgArray = rIsList || (rStr.startsWith("{") && !rStr.startsWith("{\""));
+                if (lIsPgArray && rIsPgArray) {
+                    return arrayContainsAll(FunctionEvaluator.parseSimplePgArray(lStr), FunctionEvaluator.parseSimplePgArray(rStr));
                 }
                 if ((lStr.startsWith("{") || lStr.startsWith("[")) && (rStr.startsWith("{") || rStr.startsWith("["))) {
                     return JsonOperations.contains(lStr, rStr);
@@ -1567,9 +1665,6 @@ class BinaryOpEvaluator {
                 if (JsonOperations.isJsonScalar(rStr)
                         && (lStr.startsWith("{") || lStr.startsWith("[") || JsonOperations.isJsonScalar(lStr))) {
                     return JsonOperations.contains(lStr, rStr);
-                }
-                if (left instanceof List && right instanceof List) {
-                    return ((List<?>) left).containsAll((List<?>) right);
                 }
                 if (GeometricOperations.isGeometricString(lStr) || GeometricOperations.isGeometricString(rStr)) {
                     return GeometricOperations.contains(lStr, rStr);
@@ -1584,25 +1679,38 @@ class BinaryOpEvaluator {
                     HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
                     return lh.containedBy(rh);
                 }
-                String lStr = left.toString().trim();
-                String rStr = right.toString().trim();
-                // Multirange/range containment: a <@ b means b @> a
-                if (RangeOperations.isMultirangeOrEmpty(rStr)) {
-                    if (RangeOperations.isMultirangeOrEmpty(lStr)) return RangeOperations.multirangeContainsMultirange(rStr, lStr);
-                    if (RangeOperations.isRangeString(lStr)) return RangeOperations.multirangeContainsRange(rStr, RangeOperations.parse(lStr));
-                    if (left instanceof Number) return RangeOperations.multirangeContains(rStr, ((Number) left));
-                    try { return RangeOperations.multirangeContains(rStr, Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
-                    return false;
-                }
-                if (RangeOperations.isRangeString(rStr)) {
-                    RangeOperations.PgRange range = RangeOperations.parse(rStr);
-                    // multirange <@ range: true if range contains every sub-range
-                    if (RangeOperations.isMultirangeOrEmpty(lStr)) {
-                        return RangeOperations.multirangeContainsMultirange("{" + rStr + "}", lStr);
+                // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
+                // (which stringify as "[1, 5]") are never mistaken for range literals
+                boolean lIsList = left instanceof List;
+                boolean rIsList = right instanceof List;
+                String lStr = lIsList ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
+                String rStr = rIsList ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
+                if (!lIsList && !rIsList) {
+                    // Multirange/range containment: a <@ b means b @> a
+                    if (RangeOperations.isMultirangeOrEmpty(rStr)) {
+                        if (RangeOperations.isMultirangeOrEmpty(lStr)) return RangeOperations.multirangeContainsMultirange(rStr, lStr);
+                        if (RangeOperations.isRangeString(lStr)) return RangeOperations.multirangeContainsRange(rStr, RangeOperations.parse(lStr));
+                        if (left instanceof Number) return RangeOperations.multirangeContains(rStr, ((Number) left));
+                        try { return RangeOperations.multirangeContains(rStr, Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
+                        return false;
                     }
-                    if (RangeOperations.isRangeString(lStr)) return range.containsRange(RangeOperations.parse(lStr));
-                    if (left instanceof Number) return range.contains(((Number) left));
-                    try { return range.contains(Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
+                    if (RangeOperations.isRangeString(rStr)) {
+                        RangeOperations.PgRange range = RangeOperations.parse(rStr);
+                        // multirange <@ range: true if range contains every sub-range
+                        if (RangeOperations.isMultirangeOrEmpty(lStr)) {
+                            return RangeOperations.multirangeContainsMultirange("{" + rStr + "}", lStr);
+                        }
+                        if (RangeOperations.isRangeString(lStr)) return range.containsRange(RangeOperations.parse(lStr));
+                        if (left instanceof Number) return range.contains(((Number) left));
+                        try { return range.contains(Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
+                        try { return range.contains(new java.math.BigDecimal(lStr)); } catch (NumberFormatException ignore) {}
+                    }
+                }
+                // PG array containment (NULL elements never match)
+                boolean lIsPgArray = lIsList || (lStr.startsWith("{") && !lStr.startsWith("{\""));
+                boolean rIsPgArray = rIsList || (rStr.startsWith("{") && !rStr.startsWith("{\""));
+                if (lIsPgArray && rIsPgArray) {
+                    return arrayContainsAll(FunctionEvaluator.parseSimplePgArray(rStr), FunctionEvaluator.parseSimplePgArray(lStr));
                 }
                 if ((lStr.startsWith("{") || lStr.startsWith("[")) && (rStr.startsWith("{") || rStr.startsWith("["))) {
                     return JsonOperations.contains(rStr, lStr);
@@ -1611,9 +1719,6 @@ class BinaryOpEvaluator {
                 if (JsonOperations.isJsonScalar(lStr)
                         && (rStr.startsWith("{") || rStr.startsWith("[") || JsonOperations.isJsonScalar(rStr))) {
                     return JsonOperations.contains(rStr, lStr);
-                }
-                if (left instanceof List && right instanceof List) {
-                    return ((List<?>) right).containsAll((List<?>) left);
                 }
                 if (GeometricOperations.isGeometricString(lStr) || GeometricOperations.isGeometricString(rStr)) {
                     return GeometricOperations.contains(rStr, lStr);
@@ -1671,29 +1776,36 @@ class BinaryOpEvaluator {
                 if (left instanceof TsQuery) return TsQuery.and((TsQuery) left, TsQuery.parse(right.toString()));
                 if (right instanceof TsQuery) return TsQuery.and(TsQuery.parse(left.toString()), (TsQuery) right);
                 // Convert Lists to PG format for uniform handling
-                String oLs = (left instanceof List) ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
-                String oRs = (right instanceof List) ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
-                // Multirange overlap checks
-                if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
-                    return RangeOperations.multirangeOverlapsMultirange(oLs, oRs);
+                boolean oLIsList = left instanceof List;
+                boolean oRIsList = right instanceof List;
+                String oLs = oLIsList ? TypeCoercion.formatPgArray((List<?>) left) : left.toString().trim();
+                String oRs = oRIsList ? TypeCoercion.formatPgArray((List<?>) right) : right.toString().trim();
+                // Range/multirange semantics only apply when neither operand is a real array
+                if (!oLIsList && !oRIsList) {
+                    // Multirange overlap checks
+                    if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
+                        return RangeOperations.multirangeOverlapsMultirange(oLs, oRs);
+                    }
+                    if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isRangeString(oRs)) {
+                        return RangeOperations.multirangeOverlapsRange(oLs, RangeOperations.parse(oRs));
+                    }
+                    if (RangeOperations.isRangeString(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
+                        return RangeOperations.multirangeOverlapsRange(oRs, RangeOperations.parse(oLs));
+                    }
+                    if (RangeOperations.isRangeString(oLs) && RangeOperations.isRangeString(oRs)) {
+                        return RangeOperations.parse(oLs).overlaps(RangeOperations.parse(oRs));
+                    }
                 }
-                if (RangeOperations.isMultirangeOrEmpty(oLs) && RangeOperations.isRangeString(oRs)) {
-                    return RangeOperations.multirangeOverlapsRange(oLs, RangeOperations.parse(oRs));
-                }
-                if (RangeOperations.isRangeString(oLs) && RangeOperations.isMultirangeOrEmpty(oRs)) {
-                    return RangeOperations.multirangeOverlapsRange(oRs, RangeOperations.parse(oLs));
-                }
-                if (RangeOperations.isRangeString(oLs) && RangeOperations.isRangeString(oRs)) {
-                    return RangeOperations.parse(oLs).overlaps(RangeOperations.parse(oRs));
-                }
-                // Array overlap: check if arrays share any element
-                boolean lArr = oLs.startsWith("{") && !oLs.startsWith("{\"");
-                boolean rArr = oRs.startsWith("{") && !oRs.startsWith("{\"");
+                // Array overlap: check if arrays share any element (NULL elements never match)
+                boolean lArr = oLIsList || (oLs.startsWith("{") && !oLs.startsWith("{\""));
+                boolean rArr = oRIsList || (oRs.startsWith("{") && !oRs.startsWith("{\""));
                 if (lArr && rArr) {
                     List<Object> la = FunctionEvaluator.parseSimplePgArray(oLs);
                     List<Object> ra = FunctionEvaluator.parseSimplePgArray(oRs);
-                    Set<String> laStrs = la.stream().map(o -> o == null ? "NULL" : o.toString()).collect(java.util.stream.Collectors.toSet());
-                    return ra.stream().anyMatch(o -> laStrs.contains(o == null ? "NULL" : o.toString()));
+                    return arrayOverlaps(la, ra);
+                }
+                if (lArr != rArr && (oLIsList || oRIsList)) {
+                    throw new MemgresException("malformed array literal: \"" + (lArr ? oRs : oLs) + "\"", "22P02");
                 }
                 return GeometricOperations.overlaps(oLs, oRs);
             }

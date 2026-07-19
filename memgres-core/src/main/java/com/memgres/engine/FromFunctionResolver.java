@@ -460,7 +460,8 @@ class FromFunctionResolver {
                 arr = mrElements;
             }
         }
-        List<Object> elements = toElementList(arr);
+        // PG unnest fully flattens multidimensional arrays into scalar elements
+        List<Object> elements = FunctionEvaluator.flattenArray(toElementList(arr));
 
         String colName = firstColAlias(colAliases, alias);
         List<Column> cols = new ArrayList<>();
@@ -485,7 +486,8 @@ class FromFunctionResolver {
         List<List<Object>> allElements = new ArrayList<>();
         int maxLen = 0;
         for (Object arr : evalArgs) {
-            List<Object> elems = toElementList(arr);
+            // PG unnest fully flattens multidimensional arrays into scalar elements
+            List<Object> elems = FunctionEvaluator.flattenArray(toElementList(arr));
             allElements.add(elems);
             maxLen = Math.max(maxLen, elems.size());
         }
@@ -1238,15 +1240,11 @@ class FromFunctionResolver {
             return result;
         }
         if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
-            String s = (String) arr;
-            String inner = s.substring(1, s.length() - 1).trim();
-            if (inner.isEmpty()) return new ArrayList<>();
+            // Quote- and nesting-aware parse (commas inside quoted elements are not separators)
+            List<Object> parsed = FunctionEvaluator.parseSimplePgArray((String) arr);
             List<Object> result = new ArrayList<>();
-            for (String part : inner.split(",", -1)) {
-                String t = part.trim();
-                if (t.equalsIgnoreCase("NULL")) result.add(null);
-                else if (t.startsWith("\"") && t.endsWith("\"")) result.add(t.substring(1, t.length()-1));
-                else result.add(parseNumericIfPossible(t));
+            for (Object e : parsed) {
+                result.add(e instanceof String ? parseNumericIfPossible((String) e) : e);
             }
             return result;
         }

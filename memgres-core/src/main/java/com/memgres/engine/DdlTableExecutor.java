@@ -349,7 +349,6 @@ class DdlTableExecutor {
         Table parent = executor.resolveTable(schemaName, stmt.partitionOfParent());
         Table partition = new Table(stmt.name(), new ArrayList<>(parent.getColumns()));
         partition.setPartitionParent(parent);
-        parent.addPartition(partition);
 
         // Partitions must enforce the parent's PK/UNIQUE constraints themselves: actual row
         // storage lives on the leaf partition, not the parent, so without a copy here the
@@ -375,6 +374,9 @@ class DdlTableExecutor {
             partition.setPartitionColumn(stmt.partitionColumn());
         }
 
+        // Attach to the parent only after bound validation succeeded, so a rejected
+        // partition (e.g. overlapping bounds) doesn't linger in the parent's routing list
+        parent.addPartition(partition);
         schema.addTable(partition);
         executor.recordUndo(new Session.CreateTableUndo(schemaName, stmt.name()));
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
@@ -426,8 +428,20 @@ class DdlTableExecutor {
         if (boundType.equals("DEFAULT")) {
             partition.setDefaultPartition(true);
         } else if (boundType.equals("FROM") && bounds.size() >= 4) {
-            Object newLow = DdlExecutor.parseBoundValue(bounds.get(1));
-            Object newHigh = DdlExecutor.parseBoundValue(bounds.get(3));
+            // bounds format: FROM, v1[, v2, ...], TO, v1[, v2, ...]
+            int toIdx = bounds.indexOf("TO");
+            if (toIdx < 0) toIdx = 2; // defensive; parser always emits TO
+            List<Column> keyCols = partitionKeyColumns(parent);
+            List<Object> lowerVals = new ArrayList<>();
+            for (int i = 1; i < toIdx; i++) {
+                lowerVals.add(coerceBoundToKeyType(DdlExecutor.parseBoundValue(bounds.get(i)), keyCols, i - 1));
+            }
+            List<Object> upperVals = new ArrayList<>();
+            for (int i = toIdx + 1; i < bounds.size(); i++) {
+                upperVals.add(coerceBoundToKeyType(DdlExecutor.parseBoundValue(bounds.get(i)), keyCols, i - toIdx - 1));
+            }
+            Object newLow = lowerVals.size() == 1 ? lowerVals.get(0) : lowerVals;
+            Object newHigh = upperVals.size() == 1 ? upperVals.get(0) : upperVals;
             // Check for overlap with existing RANGE partitions
             for (Table existingPart : parent.getPartitions()) {
                 if (existingPart == partition) continue;
@@ -457,16 +471,24 @@ class DdlTableExecutor {
             }
             partition.setPartitionBounds(newLow, newHigh);
         } else if (boundType.equals("IN")) {
+            List<Column> keyCols = partitionKeyColumns(parent);
             List<Object> values = new ArrayList<>();
             for (int i = 1; i < bounds.size(); i++) {
-                values.add(DdlExecutor.parseBoundValue(bounds.get(i)));
+                values.add(coerceBoundToKeyType(DdlExecutor.parseBoundValue(bounds.get(i)), keyCols, 0));
             }
             for (Table existingPart : parent.getPartitions()) {
                 if (existingPart == partition) continue;
                 List<Object> existingVals = existingPart.getPartitionValues();
                 if (existingVals != null) {
                     for (Object v : values) {
-                        if (existingVals.stream().anyMatch(ev -> String.valueOf(ev).equals(String.valueOf(v)))) {
+                        boolean overlaps;
+                        if (v == null) {
+                            overlaps = existingVals.stream().anyMatch(ev -> ev == null);
+                        } else {
+                            overlaps = existingVals.stream().anyMatch(ev -> ev != null
+                                    && String.valueOf(ev).equals(String.valueOf(v)));
+                        }
+                        if (overlaps) {
                             throw new MemgresException("partition \"" + partitionName
                                     + "\" would overlap partition \"" + existingPart.getName() + "\"", "42P17");
                         }
@@ -501,6 +523,37 @@ class DdlTableExecutor {
                 }
             }
             partition.setPartitionHash(modulus, remainder);
+        }
+    }
+
+    /**
+     * Resolve the parent's partition key to its Column definitions, in key order.
+     * Returns null for expression-based keys or unresolvable column names.
+     */
+    private static List<Column> partitionKeyColumns(Table parent) {
+        String partCol = parent.getPartitionColumn();
+        if (partCol == null || partCol.contains("(")) return null;
+        List<Column> cols = new ArrayList<>();
+        for (String part : partCol.split(",")) {
+            int idx = parent.getColumnIndex(part.trim());
+            if (idx < 0) return null;
+            cols.add(parent.getColumns().get(idx));
+        }
+        return cols;
+    }
+
+    /**
+     * Coerce a parsed bound literal to the partition key column's type (e.g. '2026-01-01'
+     * to LocalDate for a date key) so routing compares typed values instead of strings.
+     * Sentinels (MINVALUE/MAXVALUE) and NULL pass through untouched.
+     */
+    private static Object coerceBoundToKeyType(Object value, List<Column> keyCols, int keyIndex) {
+        if (value == null || value instanceof PartitionBound) return value;
+        if (keyCols == null || keyIndex < 0 || keyIndex >= keyCols.size()) return value;
+        try {
+            return TypeCoercion.coerce(value, keyCols.get(keyIndex).getType());
+        } catch (Exception e) {
+            return value;
         }
     }
 
@@ -713,6 +766,19 @@ class DdlTableExecutor {
                     }
                     for (String f : funcsToDrop) executor.database.removeFunction(f);
                 }
+                // PG drops all partitions together with a partitioned parent (no CASCADE needed)
+                if (!droppedTable.getPartitions().isEmpty()) {
+                    for (Table part : new ArrayList<>(droppedTable.getPartitions())) {
+                        String partSchemaName = findSchemaNameOf(part, schemaName);
+                        dropSingleTable(partSchemaName, part.getName(), true, cascade);
+                    }
+                }
+                // Dropping a partition must remove it from the parent's routing list so
+                // routed INSERTs can't land in (and reads can't see) a dropped table
+                Table partitionParent = droppedTable.getPartitionParent();
+                if (partitionParent != null) {
+                    partitionParent.removePartition(droppedTable);
+                }
                 executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable));
             }
             schema.removeTable(name);
@@ -757,6 +823,16 @@ class DdlTableExecutor {
         }
     }
 
+    /** Find the schema name that holds this exact table instance, falling back to the given name. */
+    private String findSchemaNameOf(Table table, String fallback) {
+        for (Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
+            if (entry.getValue().getTable(table.getName()) == table) {
+                return entry.getKey();
+            }
+        }
+        return fallback;
+    }
+
     /**
      * Check if a SQL-language function body references the given table name.
      * Covers RETURNS type, SETOF type, and FROM/INTO/UPDATE/DELETE table references in the body.
@@ -784,7 +860,9 @@ class DdlTableExecutor {
 
     QueryResult executeTruncate(TruncateStmt stmt) {
         int totalCount = 0;
-        for (String tableName : stmt.tables()) {
+        for (int tableIdx = 0; tableIdx < stmt.tables().size(); tableIdx++) {
+            String tableName = stmt.tables().get(tableIdx);
+            boolean truncateOnly = stmt.only(tableIdx);
             boolean found = false;
             // Check if table name is schema-qualified
             String explicitSchema = null;
@@ -808,7 +886,14 @@ class DdlTableExecutor {
                     Table table = schema.getTable(bareName);
                     if (table != null) {
                         found = true;
-                        List<Object[]> oldRows = new ArrayList<>(table.getRows());
+                        // PG rejects TRUNCATE ONLY on a partitioned table: rows live in the
+                        // partitions, so ONLY (which excludes them) can never be honored
+                        if (truncateOnly && table.getPartitionStrategy() != null) {
+                            throw new MemgresException(
+                                    "cannot truncate only a partitioned table\n"
+                                    + "  Hint: Do not specify the ONLY keyword, or use TRUNCATE ONLY on the partitions directly.",
+                                    "42809");
+                        }
                         // Check FK dependencies: tables referencing this one
                         if (!stmt.cascade()) {
                             for (Schema s : executor.database.getSchemas().values()) {
@@ -832,7 +917,15 @@ class DdlTableExecutor {
                                 }
                             }
                         }
-                        executor.recordUndo(new Session.TruncateUndo(schemaName, bareName, oldRows, table.getSerialCounter()));
+                        // A partitioned parent holds no rows itself: truncate the whole
+                        // partition tree (parent + all partitions, recursively) like PG does
+                        List<Table> truncateTargets = new ArrayList<>();
+                        DmlPartitionHelper.collectAllPartitionTables(table, truncateTargets);
+                        for (Table target : truncateTargets) {
+                            String targetSchema = target == table ? schemaName : findSchemaNameOf(target, schemaName);
+                            executor.recordUndo(new Session.TruncateUndo(targetSchema, target.getName(),
+                                    new ArrayList<>(target.getRows()), target.getSerialCounter()));
+                        }
                         // Fire BEFORE TRUNCATE statement-level triggers
                         List<PgTrigger> triggers = executor.database.getTriggersForTable(bareName);
                         for (PgTrigger trig : triggers) {
@@ -845,7 +938,9 @@ class DdlTableExecutor {
                                 }
                             }
                         }
-                        totalCount += table.deleteAll();
+                        for (Table target : truncateTargets) {
+                            totalCount += target.deleteAll();
+                        }
                         // CASCADE: truncate dependent tables
                         if (stmt.cascade()) {
                             for (Schema s : executor.database.getSchemas().values()) {
@@ -863,7 +958,9 @@ class DdlTableExecutor {
                             }
                         }
                         if (stmt.restartIdentity()) {
-                            table.resetSerialCounter(1);
+                            for (Table target : truncateTargets) {
+                                target.resetSerialCounter(1);
+                            }
                             // Also restart real sequences for SERIAL/IDENTITY columns
                             for (Column col : table.getColumns()) {
                                 String seqName = null;

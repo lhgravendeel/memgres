@@ -588,17 +588,15 @@ class CatalogSecurityBuilder {
             }
         }
 
-        // Expose advisory locks
-        for (Map.Entry<Long, java.util.Set<Session>> entry : database.getAdvisoryLocks().entrySet()) {
-            long key = entry.getKey();
-            for (Session s : entry.getValue()) {
-                table.insertRow(new Object[]{
-                        "advisory", dbOid, null, null, null, null, null,
-                        0, (int) key, (short) 1,
-                        String.valueOf(s.getPid()) + "/1", s.getPid(),
-                        "ExclusiveLock", true, false, null
-                });
-            }
+        // Expose advisory locks: one row per (session, lock, mode), with the key split into
+        // classid (high 32 bits / first int) and objid (low 32 bits / second int) like PG.
+        for (Database.AdvisoryLockRow row : database.getAdvisoryLockRows()) {
+            table.insertRow(new Object[]{
+                    "advisory", dbOid, null, null, null, null, null,
+                    row.classId, row.objId, row.objSubId,
+                    String.valueOf(row.session.getPid()) + "/1", row.session.getPid(),
+                    row.exclusive ? "ExclusiveLock" : "ShareLock", true, false, null
+            });
         }
         return table;
     }

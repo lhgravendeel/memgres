@@ -50,6 +50,14 @@ class FromResolver {
             // Check views
             Database.ViewDef view = executor.database.getView(tableRef.table());
             if (view != null) {
+                // Materialized views know their columns without re-running the query
+                // (and an unpopulated matview must still be describable).
+                if (view.materialized() && view.cachedColumns() != null && !view.cachedColumns().isEmpty()) {
+                    List<Column> mvCols = view.cachedColumns();
+                    bindings.add(new RowContext.TableBinding(
+                            new Table(alias, mvCols), alias, new Object[mvCols.size()]));
+                    return;
+                }
                 try {
                     QueryResult vr = executor.executeStatement(view.query());
                     if (!vr.getColumns().isEmpty()) {
@@ -370,6 +378,12 @@ class FromResolver {
         // Check views
         Database.ViewDef view = executor.database.getView(tableRef.table());
         if (view != null) {
+            if (view.materialized() && !view.populated()) {
+                MemgresException ex = new MemgresException(
+                        "materialized view \"" + view.name() + "\" has not been populated", "55000");
+                ex.setHint("Use the REFRESH MATERIALIZED VIEW command.");
+                throw ex;
+            }
             String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
             List<Column> cols;
             List<Object[]> rows;
@@ -915,7 +929,10 @@ class FromResolver {
 
         for (Object[] deletedRow : otherUncommittedDeletes) {
             if (!otherUncommittedInserts.contains(deletedRow)) {
-                filtered.add(new RowContext(table, alias, deletedRow));
+                // If the row was updated before being deleted, the committed
+                // state is the pre-update old values, not its current contents.
+                Object[] oldValues = otherUncommittedUpdates.get(deletedRow);
+                filtered.add(new RowContext(table, alias, oldValues != null ? oldValues : deletedRow));
             }
         }
 

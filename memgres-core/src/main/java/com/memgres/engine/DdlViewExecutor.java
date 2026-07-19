@@ -43,22 +43,41 @@ class DdlViewExecutor {
         }
 
         String viewSchema = executor.defaultSchema();
+
+        // PG expands SELECT * when the view is defined, freezing the column list.
+        // Adding a column to a base table later must not change the view's output.
+        Statement query = expandWildcardTargets(stmt.query());
+
+        // Apply the optional column alias list: CREATE [MATERIALIZED] VIEW v(a, b) AS ...
+        query = applyColumnAliasList(stmt, query);
+
         int rowCount = 0;
         if (stmt.materialized()) {
             if (stmt.withData()) {
-                QueryResult result = executor.executeStatement(stmt.query());
+                QueryResult result = executor.executeStatement(query);
                 List<Column> cols = new ArrayList<>(result.getColumns());
                 List<Object[]> rows = new ArrayList<>(result.getRows());
                 rowCount = rows.size();
-                executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, stmt.query(), stmt.orReplace(),
-                        true, cols, rows));
+                executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
+                        true, cols, rows, null, null, stmt.withOptions(), true));
             } else {
-                executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, stmt.query(), stmt.orReplace(),
-                        true, Cols.listOf(), Cols.listOf()));
+                // WITH NO DATA: resolve column metadata but leave the view unpopulated —
+                // any scan must fail with 55000 until REFRESH MATERIALIZED VIEW.
+                List<Column> cols = Cols.listOf();
+                try {
+                    QueryResult result = executor.executeStatement(query);
+                    cols = new ArrayList<>(result.getColumns());
+                } catch (Exception ignored) {
+                    // Column metadata unavailable; the view is still created (matches lenient CREATE VIEW path)
+                }
+                executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
+                        true, cols, Cols.listOf(), null, null, stmt.withOptions(), false));
             }
         } else {
+            List<Column> resolvedColumns = null;
             try {
-                executor.executeStatement(stmt.query());
+                QueryResult result = executor.executeStatement(query);
+                resolvedColumns = new ArrayList<>(result.getColumns());
             } catch (MemgresException e) {
                 if ("42P01".equals(e.getSqlState()) && e.getMessage() != null
                         && e.getMessage().contains("does not exist") && !e.getMessage().contains("missing FROM-clause")) {
@@ -70,8 +89,8 @@ class DdlViewExecutor {
             } catch (Exception e) {
                 // Silently ignore execution errors during view validation
             }
-            executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, stmt.query(), stmt.orReplace(),
-                    false, null, null, null, stmt.checkOption(), stmt.withOptions()));
+            executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
+                    false, resolvedColumns, null, null, stmt.checkOption(), stmt.withOptions(), true));
         }
 
         executor.database.registerSchemaObject(viewSchema, "view", stmt.name());
@@ -84,6 +103,258 @@ class DdlViewExecutor {
             return QueryResult.command(QueryResult.Type.SELECT_INTO, rowCount);
         }
         return QueryResult.message(QueryResult.Type.SET, "CREATE VIEW");
+    }
+
+    // ---- SELECT * freeze (star expansion at CREATE VIEW time) ----
+
+    /**
+     * Expand wildcard SELECT targets ({@code *} and {@code alias.*}) into explicit
+     * column references resolved against the current schema. Returns the original
+     * query unchanged when expansion is not possible (unresolvable FROM items,
+     * NATURAL joins, CTEs) or when the expanded query would not produce the same
+     * columns as the original (verified by executing both).
+     */
+    private Statement expandWildcardTargets(Statement query) {
+        Statement expanded = expandStarsRec(query);
+        if (expanded == query) return query;
+        // Safety net: expansion must be behavior-preserving for the view's output columns.
+        try {
+            QueryResult original = executor.executeStatement(query);
+            QueryResult replacement = executor.executeStatement(expanded);
+            if (!columnNamesOf(original).equals(columnNamesOf(replacement))) {
+                return query;
+            }
+        } catch (Exception e) {
+            return query;
+        }
+        return expanded;
+    }
+
+    private static List<String> columnNamesOf(QueryResult result) {
+        List<String> names = new ArrayList<>();
+        for (Column c : result.getColumns()) names.add(c.getName().toLowerCase());
+        return names;
+    }
+
+    private Statement expandStarsRec(Statement query) {
+        if (query instanceof SetOpStmt) {
+            SetOpStmt so = (SetOpStmt) query;
+            Statement left = expandStarsRec(so.left());
+            Statement right = expandStarsRec(so.right());
+            if (left == so.left() && right == so.right()) return so;
+            return new SetOpStmt(left, so.op(), so.all(), right, so.orderBy(), so.limit(), so.offset());
+        }
+        if (!(query instanceof SelectStmt)) return query;
+        SelectStmt s = (SelectStmt) query;
+        if (s.targets() == null || s.from() == null || s.from().isEmpty()) return s;
+        // CTE columns are not resolvable outside statement execution; leave those queries as-is.
+        if (s.withClauses() != null && !s.withClauses().isEmpty()) return s;
+        boolean hasStar = false;
+        for (SelectStmt.SelectTarget t : s.targets()) {
+            if (t.expr() instanceof WildcardExpr) { hasStar = true; break; }
+        }
+        if (!hasStar) return s;
+        // NATURAL joins merge common columns without an explicit USING list; the plain
+        // bindings don't reflect that merge, so leave those queries unexpanded.
+        if (hasNaturalJoin(s.from())) return s;
+        List<RowContext.TableBinding> bindings;
+        try {
+            bindings = executor.fromResolver.resolveTableBindings(s.from());
+        } catch (Exception e) {
+            return s;
+        }
+        if (bindings.isEmpty()) return s;
+        Set<String> usingCols = new HashSet<>();
+        collectUsingColumns(s.from(), usingCols);
+
+        List<SelectStmt.SelectTarget> newTargets = new ArrayList<>();
+        for (SelectStmt.SelectTarget target : s.targets()) {
+            if (!(target.expr() instanceof WildcardExpr)) {
+                newTargets.add(target);
+                continue;
+            }
+            WildcardExpr w = (WildcardExpr) target.expr();
+            if (w.table() != null) {
+                boolean matched = false;
+                for (RowContext.TableBinding b : bindings) {
+                    if (b.alias().equalsIgnoreCase(w.table()) || b.table().getName().equalsIgnoreCase(w.table())) {
+                        matched = true;
+                        for (Column c : b.table().getColumns()) {
+                            newTargets.add(new SelectStmt.SelectTarget(new ColumnRef(w.table(), c.getName()), null));
+                        }
+                    }
+                }
+                if (!matched) return s; // unresolvable qualifier — leave the query unexpanded
+            } else {
+                Set<String> emittedUsing = new HashSet<>();
+                for (RowContext.TableBinding b : bindings) {
+                    for (Column c : b.table().getColumns()) {
+                        String lower = c.getName().toLowerCase();
+                        if (usingCols.contains(lower)) {
+                            // USING columns are merged: emit once, unqualified so the
+                            // runtime COALESCE(left, right) semantics are preserved.
+                            if (!emittedUsing.add(lower)) continue;
+                            newTargets.add(new SelectStmt.SelectTarget(new ColumnRef(null, c.getName()), null));
+                        } else {
+                            newTargets.add(new SelectStmt.SelectTarget(new ColumnRef(b.alias(), c.getName()), null));
+                        }
+                    }
+                }
+            }
+        }
+        return new SelectStmt(s.distinct(), s.distinctOn(), newTargets, s.from(), s.where(), s.groupBy(),
+                s.having(), s.windowDefs(), s.orderBy(), s.limit(), s.offset(), s.withClauses(),
+                s.groupingSets(), s.lockClause(), s.withTies());
+    }
+
+    private static void collectUsingColumns(List<SelectStmt.FromItem> items, Set<String> out) {
+        for (SelectStmt.FromItem item : items) {
+            collectUsingColumnsFromItem(item, out);
+        }
+    }
+
+    private static void collectUsingColumnsFromItem(SelectStmt.FromItem item, Set<String> out) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom j = (SelectStmt.JoinFrom) item;
+            if (j.using() != null) {
+                for (String col : j.using()) out.add(col.toLowerCase());
+            }
+            collectUsingColumnsFromItem(j.left(), out);
+            collectUsingColumnsFromItem(j.right(), out);
+        }
+    }
+
+    private static boolean hasNaturalJoin(List<SelectStmt.FromItem> items) {
+        for (SelectStmt.FromItem item : items) {
+            if (hasNaturalJoinItem(item)) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasNaturalJoinItem(SelectStmt.FromItem item) {
+        if (!(item instanceof SelectStmt.JoinFrom)) return false;
+        SelectStmt.JoinFrom j = (SelectStmt.JoinFrom) item;
+        switch (j.joinType()) {
+            case NATURAL:
+            case NATURAL_LEFT:
+            case NATURAL_RIGHT:
+            case NATURAL_FULL:
+                return true;
+            default:
+                return hasNaturalJoinItem(j.left()) || hasNaturalJoinItem(j.right());
+        }
+    }
+
+    // ---- Column alias list: CREATE VIEW v(a, b) AS ... ----
+
+    private Statement applyColumnAliasList(CreateViewStmt stmt, Statement query) {
+        List<String> names = stmt.columnNames();
+        if (names == null || names.isEmpty()) return query;
+
+        int columnCount = countOutputColumns(query);
+        if (columnCount < 0) {
+            try {
+                columnCount = executor.executeStatement(query).getColumns().size();
+            } catch (Exception e) {
+                columnCount = -1;
+            }
+        }
+        if (columnCount >= 0 && names.size() > columnCount) {
+            if (stmt.materialized()) {
+                // PG routes matviews through CREATE TABLE AS, which reports a syntax error
+                throw new MemgresException("too many column names were specified", "42601");
+            }
+            throw new MemgresException("CREATE VIEW specifies more column names than columns", "42601");
+        }
+
+        Statement renamed = renameLeadingTargets(query, names);
+        if (renamed != null) return renamed;
+
+        // Fallback for query shapes whose targets can't be rewritten directly
+        // (wildcards left unexpanded, composite stars): wrap the query in a
+        // derived table whose column alias list applies the names.
+        List<SelectStmt.SelectTarget> star = new ArrayList<>();
+        star.add(new SelectStmt.SelectTarget(new WildcardExpr(), null));
+        List<SelectStmt.FromItem> from = new ArrayList<>();
+        from.add(new SelectStmt.SubqueryFrom(query, stmt.name(), false, names));
+        return new SelectStmt(false, null, star, from, null, null, null, null, null, null, null, null, null, null, false);
+    }
+
+    /** Number of output columns statically derivable from the query, or -1 if unknown. */
+    private static int countOutputColumns(Statement query) {
+        if (query instanceof SetOpStmt) return countOutputColumns(((SetOpStmt) query).left());
+        if (!(query instanceof SelectStmt)) return -1;
+        SelectStmt s = (SelectStmt) query;
+        if (s.targets() == null) return -1;
+        for (SelectStmt.SelectTarget t : s.targets()) {
+            if (t.expr() instanceof WildcardExpr || t.expr() instanceof CompositeStarExpr) return -1;
+        }
+        return s.targets().size();
+    }
+
+    /**
+     * Re-alias the first {@code names.size()} SELECT targets (set operations rename
+     * the left branch, which provides the output column names). Returns null when
+     * the targets cannot be renamed statically.
+     */
+    private Statement renameLeadingTargets(Statement query, List<String> names) {
+        if (query instanceof SetOpStmt) {
+            SetOpStmt so = (SetOpStmt) query;
+            Statement left = renameLeadingTargets(so.left(), names);
+            if (left == null) return null;
+            return new SetOpStmt(left, so.op(), so.all(), so.right(), so.orderBy(), so.limit(), so.offset());
+        }
+        if (!(query instanceof SelectStmt)) return null;
+        SelectStmt s = (SelectStmt) query;
+        if (s.targets() == null) return null;
+        int renameCount = Math.min(names.size(), s.targets().size());
+        for (int i = 0; i < renameCount; i++) {
+            Expression e = s.targets().get(i).expr();
+            if (e instanceof WildcardExpr || e instanceof CompositeStarExpr) return null;
+        }
+        List<SelectStmt.SelectTarget> newTargets = new ArrayList<>(s.targets());
+        Map<String, String> renames = new LinkedHashMap<>();
+        for (int i = 0; i < renameCount; i++) {
+            SelectStmt.SelectTarget old = newTargets.get(i);
+            String oldName = old.alias() != null ? old.alias() : executor.exprToAlias(old.expr());
+            if (oldName != null && !oldName.equalsIgnoreCase(names.get(i))) {
+                renames.put(oldName.toLowerCase(), names.get(i));
+            }
+            newTargets.set(i, new SelectStmt.SelectTarget(old.expr(), names.get(i)));
+        }
+        // ORDER BY may reference an output column by its old name; keep it resolvable.
+        List<SelectStmt.OrderByItem> newOrderBy = s.orderBy();
+        if (newOrderBy != null && !renames.isEmpty()) {
+            List<SelectStmt.OrderByItem> rewritten = new ArrayList<>(newOrderBy.size());
+            for (SelectStmt.OrderByItem item : newOrderBy) {
+                Expression e = item.expr();
+                if (e instanceof ColumnRef && ((ColumnRef) e).table() == null && ((ColumnRef) e).column() != null) {
+                    String replacement = renames.get(((ColumnRef) e).column().toLowerCase());
+                    if (replacement != null && !isFromColumn(s, ((ColumnRef) e).column())) {
+                        rewritten.add(new SelectStmt.OrderByItem(new ColumnRef(null, replacement),
+                                item.descending(), item.nullsFirst()));
+                        continue;
+                    }
+                }
+                rewritten.add(item);
+            }
+            newOrderBy = rewritten;
+        }
+        return new SelectStmt(s.distinct(), s.distinctOn(), newTargets, s.from(), s.where(), s.groupBy(),
+                s.having(), s.windowDefs(), newOrderBy, s.limit(), s.offset(), s.withClauses(),
+                s.groupingSets(), s.lockClause(), s.withTies());
+    }
+
+    /** True if the name resolves to a column of one of the FROM tables (which takes precedence in ORDER BY). */
+    private boolean isFromColumn(SelectStmt s, String name) {
+        if (s.from() == null || s.from().isEmpty()) return false;
+        try {
+            for (RowContext.TableBinding b : executor.fromResolver.resolveTableBindings(s.from())) {
+                if (b.table().getColumnIndex(name) >= 0) return true;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 
     // ---- ALTER VIEW ----
@@ -101,7 +372,8 @@ class DdlViewExecutor {
             executor.database.removeView(stmt.name());
             executor.database.addView(new Database.ViewDef(stmt.newName(), existing.schemaName(), existing.query(),
                     existing.orReplace(), existing.materialized(),
-                    existing.cachedColumns(), existing.cachedRows(), existing.sourceSQL()));
+                    existing.cachedColumns(), existing.cachedRows(), existing.sourceSQL(),
+                    existing.checkOption(), existing.reloptions(), existing.populated()));
         }
         if (stmt.action() == AlterViewStmt.Action.OWNER_TO) {
             String newOwner = ddl.resolveOwnerName(stmt.newName());
@@ -126,7 +398,7 @@ class DdlViewExecutor {
             executor.database.addView(new Database.ViewDef(existing.name(), existing.schemaName(), existing.query(),
                     existing.orReplace(), existing.materialized(),
                     existing.cachedColumns(), existing.cachedRows(), existing.sourceSQL(),
-                    existing.checkOption(), merged));
+                    existing.checkOption(), merged, existing.populated()));
         }
         if (stmt.action() == AlterViewStmt.Action.NO_OP) {
             Database.ViewDef existing = executor.database.getView(stmt.name());
@@ -148,11 +420,26 @@ class DdlViewExecutor {
         if (!view.materialized()) {
             throw new MemgresException("\"" + stmt.name() + "\" is not a materialized view");
         }
+        if (!stmt.withData()) {
+            // REFRESH ... WITH NO DATA: discard rows and mark the view unpopulated again
+            List<Column> cols = view.cachedColumns();
+            if (cols == null || cols.isEmpty()) {
+                try {
+                    cols = new ArrayList<>(executor.executeStatement(view.query()).getColumns());
+                } catch (Exception e) {
+                    cols = Cols.listOf();
+                }
+            }
+            executor.database.addView(new Database.ViewDef(view.name(), view.schemaName(), view.query(),
+                    view.orReplace(), true, cols, Cols.listOf(), view.sourceSQL(),
+                    view.checkOption(), view.reloptions(), false));
+            return QueryResult.message(QueryResult.Type.SET, "REFRESH MATERIALIZED VIEW");
+        }
         QueryResult result = executor.executeStatement(view.query());
         List<Column> cols = new ArrayList<>(result.getColumns());
         List<Object[]> rows = new ArrayList<>(result.getRows());
         executor.database.addView(new Database.ViewDef(view.name(), view.schemaName(), view.query(), view.orReplace(),
-                true, cols, rows));
+                true, cols, rows, view.sourceSQL(), view.checkOption(), view.reloptions(), true));
         return QueryResult.message(QueryResult.Type.SET, "REFRESH MATERIALIZED VIEW");
     }
 }
