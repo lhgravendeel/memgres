@@ -754,10 +754,11 @@ class DmlExecutor {
             }
         }
 
-        // FORCE_NOT_NULL: for specified columns, convert null to empty string
+        // FORCE_NOT_NULL: for specified columns, do not match against the null string
         List<String> forceNotNull = stmt.forceNotNull();
-        // FORCE_NULL: for specified columns, convert empty string to null
+        // FORCE_NULL: for specified columns, match the (possibly quoted) value against the null string
         List<String> forceNull = stmt.forceNull();
+        String effectiveNullStr = stmt.nullString() != null ? stmt.nullString() : "";
 
         for (int i = 0; i < values.size() && i < colIndices.size(); i++) {
             String val = values.get(i);
@@ -770,16 +771,18 @@ class DmlExecutor {
                 continue;
             }
 
-            // FORCE_NOT_NULL: if this column is in the list and value is null, use empty string
+            // FORCE_NOT_NULL: if this column is in the list and the field matched the
+            // null string, keep it as the literal null-string data instead of NULL
             if (val == null && forceNotNull != null) {
                 String colName = col.getName();
                 if (forceNotNull.contains("*") || forceNotNull.stream().anyMatch(c -> c.equalsIgnoreCase(colName))) {
-                    val = "";
+                    val = effectiveNullStr;
                 }
             }
 
-            // FORCE_NULL: if this column is in the list and value is empty string, convert to null
-            if (val != null && val.isEmpty() && forceNull != null) {
+            // FORCE_NULL: if this column is in the list and the (possibly quoted) value
+            // equals the null string, convert to null
+            if (val != null && val.equals(effectiveNullStr) && forceNull != null) {
                 String colName = col.getName();
                 if (forceNull.contains("*") || forceNull.stream().anyMatch(c -> c.equalsIgnoreCase(colName))) {
                     val = null;
