@@ -497,7 +497,46 @@ public class Lexer {
                         break;
                     }
                     default: {
-                        sb.append(c); pos++; 
+                        // Octal escape: \ooo (1-3 octal digits)
+                        if (next >= '0' && next <= '7') {
+                            int val = next - '0';
+                            pos += 2;
+                            for (int oi = 0; oi < 2 && pos < length; oi++) {
+                                char oc = sql.charAt(pos);
+                                if (oc >= '0' && oc <= '7') { val = val * 8 + (oc - '0'); pos++; }
+                                else break;
+                            }
+                            sb.append((char) val);
+                        } else if (next == 'x' || next == 'X') {
+                            // Hex escape: \xHH (1-2 hex digits)
+                            pos += 2;
+                            int val = 0;
+                            int hexCount = 0;
+                            while (pos < length && hexCount < 2) {
+                                char hc = sql.charAt(pos);
+                                int hv = Character.digit(hc, 16);
+                                if (hv < 0) break;
+                                val = val * 16 + hv;
+                                pos++;
+                                hexCount++;
+                            }
+                            sb.append((char) val);
+                        } else if (next == 'u' || next == 'U') {
+                            // Unicode escape: backslash-u XXXX or backslash-U XXXXXXXX
+                            int digits = (next == 'u') ? 4 : 8;
+                            pos += 2;
+                            int val = 0;
+                            for (int ui = 0; ui < digits && pos < length; ui++) {
+                                char uc = sql.charAt(pos);
+                                int uv = Character.digit(uc, 16);
+                                if (uv < 0) break;
+                                val = val * 16 + uv;
+                                pos++;
+                            }
+                            sb.appendCodePoint(val);
+                        } else {
+                            sb.append(c); pos++;
+                        }
                         break;
                     }
                 }
@@ -726,6 +765,9 @@ public class Lexer {
             if (Character.isDigit(c)) {
                 sb.append(c);
                 pos++;
+            } else if (c == '_' && sb.length() > 0 && pos + 1 < length && Character.isDigit(sql.charAt(pos + 1))) {
+                // PG 16+ numeric underscore separator — skip it
+                pos++;
             } else if (c == '.' && !hasDecimal) {
                 // Check it's not a dot-separator (e.g., schema.table)
                 if (pos + 1 < length && Character.isDigit(sql.charAt(pos + 1))) {
@@ -767,7 +809,7 @@ public class Lexer {
         StringBuilder sb = new StringBuilder();
         while (pos < length) {
             char c = sql.charAt(pos);
-            if (Character.isLetterOrDigit(c) || c == '_') {
+            if (Character.isLetterOrDigit(c) || c == '_' || c == '$') {
                 sb.append(c);
                 pos++;
             } else {

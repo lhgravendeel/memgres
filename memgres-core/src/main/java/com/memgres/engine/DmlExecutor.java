@@ -1332,8 +1332,10 @@ class DmlExecutor {
             for (Table t : allTables) {
                 allRowsCopy.addAll(t.getRows());
             }
+            java.util.Set<Object[]> deleteSet = Collections.newSetFromMap(new IdentityHashMap<>());
+            deleteSet.addAll(allRowsCopy);
             for (Object[] row : allRowsCopy) {
-                executor.constraintValidator.handleFkOnDelete(table, row);
+                executor.constraintValidator.handleFkOnDelete(table, row, deleteSet);
             }
             // Collect RETURNING before deleting
             List<Object[]> returningRows = new ArrayList<>();
@@ -1423,7 +1425,7 @@ class DmlExecutor {
         // Validate FK references before deleting (handle CASCADE/RESTRICT/SET NULL/SET DEFAULT)
         for (Object[] row : allRows) {
             if (toDelete.contains(row)) {
-                executor.constraintValidator.handleFkOnDelete(table, row);
+                executor.constraintValidator.handleFkOnDelete(table, row, toDelete);
             }
         }
 

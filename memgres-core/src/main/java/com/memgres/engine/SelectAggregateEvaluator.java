@@ -976,6 +976,7 @@ class SelectAggregateEvaluator {
             }
             case "json_agg":
             case "jsonb_agg": {
+                if (group.isEmpty()) return null;
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
                 StringBuilder sb = new StringBuilder("[");
                 boolean first = true;
@@ -993,6 +994,7 @@ class SelectAggregateEvaluator {
             }
             case "json_object_agg":
             case "jsonb_object_agg": {
+                if (group.isEmpty()) return null;
                 StringBuilder sb = new StringBuilder("{");
                 boolean first = true;
                 for (RowContext r : group) {

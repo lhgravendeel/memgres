@@ -739,8 +739,16 @@ class PgWireDescribeHelper {
 
     static int countParameters(String sql) {
         int max = 0;
-        for (int i = 0; i < sql.length() - 1; i++) {
-            if (sql.charAt(i) == '$' && Character.isDigit(sql.charAt(i + 1))) {
+        boolean inString = false;
+        for (int i = 0; i < sql.length(); i++) {
+            char c = sql.charAt(i);
+            if (inString) {
+                if (c == '\'' && i + 1 < sql.length() && sql.charAt(i + 1) == '\'') { i++; }
+                else if (c == '\'') { inString = false; }
+                continue;
+            }
+            if (c == '\'') { inString = true; continue; }
+            if (c == '$' && i + 1 < sql.length() && Character.isDigit(sql.charAt(i + 1))) {
                 int j = i + 1;
                 while (j < sql.length() && Character.isDigit(sql.charAt(j))) j++;
                 int paramNum = Integer.parseInt(sql.substring(i + 1, j));

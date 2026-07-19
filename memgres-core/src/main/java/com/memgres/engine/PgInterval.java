@@ -42,11 +42,17 @@ public class PgInterval implements Comparable<PgInterval> {
     }
 
     public PgInterval multiply(double factor) {
-        return new PgInterval(
-                (int) Math.round(months * factor),
-                (int) Math.round(days * factor),
-                Math.round(microseconds * factor)
-        );
+        // PG cascades fractional parts: fractional months → days, fractional days → microseconds
+        double totalMonths = months * factor;
+        int newMonths = (int) totalMonths;
+        double fracMonths = totalMonths - newMonths;
+        // 1 month = 30 days in PG interval arithmetic
+        double totalDays = days * factor + fracMonths * 30.0;
+        int newDays = (int) totalDays;
+        double fracDays = totalDays - newDays;
+        // 1 day = 24 hours = 86400000000 microseconds
+        long newMicros = Math.round(microseconds * factor + fracDays * 86400_000_000L);
+        return new PgInterval(newMonths, newDays, newMicros);
     }
 
     /**
