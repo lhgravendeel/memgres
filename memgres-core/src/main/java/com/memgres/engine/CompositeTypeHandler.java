@@ -128,10 +128,11 @@ class CompositeTypeHandler {
                     if (fields.get(i).name().equalsIgnoreCase(fieldName)) {
                         if (i < parts.length) {
                             String part = parts[i];
-                            if (part.startsWith("\"") && part.endsWith("\"")) {
+                            boolean quoted = part.length() >= 2 && part.startsWith("\"") && part.endsWith("\"");
+                            if (quoted) {
                                 part = part.substring(1, part.length() - 1);
                             }
-                            return coerceFieldValue(part, fields.get(i).typeName());
+                            return coerceFieldValue(part, fields.get(i).typeName(), quoted);
                         }
                         return null;
                     }
@@ -183,11 +184,12 @@ class CompositeTypeHandler {
         List<Object> values = new ArrayList<>();
         for (int i = 0; i < parts.length; i++) {
             String part = parts[i].trim();
-            if (part.startsWith("\"") && part.endsWith("\"")) {
+            boolean quoted = part.length() >= 2 && part.startsWith("\"") && part.endsWith("\"");
+            if (quoted) {
                 part = part.substring(1, part.length() - 1);
             }
             if (fields != null && i < fields.size()) {
-                values.add(coerceFieldValue(part, fields.get(i).typeName()));
+                values.add(coerceFieldValue(part, fields.get(i).typeName(), quoted));
             } else {
                 values.add(part);
             }
@@ -240,14 +242,26 @@ class CompositeTypeHandler {
         for (CreateTypeStmt.CompositeField f : fields) {
             if (hs.getData().containsKey(f.name())) {
                 String val = hs.get(f.name());
-                result.put(f.name(), val == null ? null : coerceFieldValue(val, f.typeName()));
+                // hstore values are already unquoted; an empty string is a real empty
+                // string (hstore NULL is represented as Java null), so pass quoted=true
+                result.put(f.name(), val == null ? null : coerceFieldValue(val, f.typeName(), true));
             }
         }
         return result;
     }
 
     Object coerceFieldValue(String val, String typeName) {
-        if (val == null || val.isEmpty()) return null;
+        return coerceFieldValue(val, typeName, false);
+    }
+
+    /**
+     * Coerce a composite field's text value to its Java type. In a composite literal
+     * only an UNQUOTED empty field means NULL; a quoted empty string ("") is the
+     * empty string, so callers must pass {@code quoted} accordingly.
+     */
+    Object coerceFieldValue(String val, String typeName, boolean quoted) {
+        if (val == null) return null;
+        if (val.isEmpty() && !quoted) return null;
         String lt = typeName.toLowerCase().trim();
         try {
             switch (lt) {

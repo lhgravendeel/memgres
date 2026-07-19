@@ -220,11 +220,26 @@ public final class HstoreValue {
         return data.hashCode();
     }
 
+    /**
+     * PG hstore key ordering (used for text output): shorter keys first,
+     * then byte order — the same ordering hstore uses for its stored pairs.
+     */
+    private static final java.util.Comparator<String> HSTORE_KEY_ORDER = new java.util.Comparator<String>() {
+        @Override
+        public int compare(String a, String b) {
+            if (a.length() != b.length()) return Integer.compare(a.length(), b.length());
+            return a.compareTo(b);
+        }
+    };
+
     @Override
     public String toString() {
+        // PG outputs hstore pairs sorted by key; lookup semantics are unaffected
+        Map<String, String> sorted = new java.util.TreeMap<>(HSTORE_KEY_ORDER);
+        sorted.putAll(data);
         StringBuilder sb = new StringBuilder();
         boolean first = true;
-        for (Map.Entry<String, String> entry : data.entrySet()) {
+        for (Map.Entry<String, String> entry : sorted.entrySet()) {
             if (!first) sb.append(", ");
             first = false;
             sb.append('"').append(entry.getKey()).append('"');

@@ -29,43 +29,124 @@ public final class JsonOperations {
 
     /** Extract text value by path. Implements #>>. */
     public static String extractPathText(String json, List<String> path) {
-        String result = extractPath(json, path);
-        if (result == null) return null;
-        result = result.trim();
-        if (result.startsWith("\"") && result.endsWith("\"")) {
-            return result.substring(1, result.length() - 1);
+        return jsonValueToText(extractPath(json, path));
+    }
+
+    /**
+     * Convert a JSON value to the SQL text form returned by the ->> and #>> operators:
+     * JSON null maps to SQL NULL, JSON strings are unquoted and fully unescaped,
+     * and any other value is returned as its JSON text.
+     */
+    public static String jsonValueToText(String value) {
+        if (value == null) return null;
+        value = value.trim();
+        if (value.equals("null")) return null;
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            return unescapeJsonString(value.substring(1, value.length() - 1));
         }
-        return result;
+        return value;
+    }
+
+    /** Unescape the contents of a JSON string literal (without the surrounding quotes). */
+    public static String unescapeJsonString(String s) {
+        if (s.indexOf('\\') < 0) return s;
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' && i + 1 < s.length()) {
+                char n = s.charAt(++i);
+                switch (n) {
+                    case '"': sb.append('"'); break;
+                    case '\\': sb.append('\\'); break;
+                    case '/': sb.append('/'); break;
+                    case 'n': sb.append('\n'); break;
+                    case 't': sb.append('\t'); break;
+                    case 'r': sb.append('\r'); break;
+                    case 'b': sb.append('\b'); break;
+                    case 'f': sb.append('\f'); break;
+                    case 'u':
+                        if (i + 4 < s.length()) {
+                            try {
+                                sb.append((char) Integer.parseInt(s.substring(i + 1, i + 5), 16));
+                                i += 4;
+                            } catch (NumberFormatException e) {
+                                sb.append('u');
+                            }
+                        } else {
+                            sb.append('u');
+                        }
+                        break;
+                    default: sb.append(n); break;
+                }
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /** True if the string is a JSON scalar literal (string, number, boolean or null). */
+    public static boolean isJsonScalar(String s) {
+        if (s == null) return false;
+        s = s.trim();
+        if (s.isEmpty() || s.startsWith("{") || s.startsWith("[")) return false;
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) return true;
+        if (s.equals("true") || s.equals("false") || s.equals("null")) return true;
+        try {
+            new java.math.BigDecimal(s);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 
     /** Check if left JSON contains right JSON. Implements @> (recursive). */
     public static boolean contains(String left, String right) {
+        return contains(left, right, true);
+    }
+
+    private static boolean contains(String left, String right, boolean topLevel) {
         left = left.trim();
         right = right.trim();
 
-        if (right.startsWith("{") && left.startsWith("{")) {
+        boolean leftIsObj = left.startsWith("{");
+        boolean rightIsObj = right.startsWith("{");
+        boolean leftIsArr = left.startsWith("[");
+        boolean rightIsArr = right.startsWith("[");
+
+        if (rightIsObj && leftIsObj) {
             Map<String, String> leftMap = parseObjectKeys(left);
             Map<String, String> rightMap = parseObjectKeys(right);
             for (Map.Entry<String, String> entry : rightMap.entrySet()) {
                 String leftVal = leftMap.get(entry.getKey());
                 if (leftVal == null) return false;
                 // Recursive containment check for nested objects/arrays
-                if (!contains(leftVal.trim(), entry.getValue().trim())) return false;
+                if (!contains(leftVal.trim(), entry.getValue().trim(), false)) return false;
             }
             return true;
         }
-        if (right.startsWith("[") && left.startsWith("[")) {
+        if (rightIsArr && leftIsArr) {
             List<String> leftElems = parseArrayElements(left);
             List<String> rightElems = parseArrayElements(right);
             for (String re : rightElems) {
                 boolean found = false;
                 for (String le : leftElems) {
-                    if (contains(le.trim(), re.trim())) { found = true; break; }
+                    if (contains(le.trim(), re.trim(), false)) { found = true; break; }
                 }
                 if (!found) return false;
             }
             return true;
         }
+        // PG special case, at the TOP level only: an array contains a scalar
+        // if the scalar equals one of its elements. Nested levels do not get this.
+        if (topLevel && leftIsArr && !rightIsObj) {
+            for (String le : parseArrayElements(left)) {
+                if (contains(le.trim(), right, false)) return true;
+            }
+            return false;
+        }
+        // Structural mismatch (object vs array, container vs scalar): not contained
+        if (leftIsObj || leftIsArr || rightIsObj || rightIsArr) return false;
         return left.equals(right);
     }
 
@@ -77,13 +158,16 @@ public final class JsonOperations {
             return map.containsKey(key);
         }
         if (json.startsWith("[")) {
+            // For arrays, ? matches top-level *string* elements only (PG semantics)
             List<String> elems = parseArrayElements(json);
             for (String e : elems) {
                 String trimmed = e.trim();
-                if (trimmed.equals("\"" + key + "\"") || trimmed.equals(key)) return true;
+                if (trimmed.startsWith("\"") && key.equals(jsonValueToText(trimmed))) return true;
             }
+            return false;
         }
-        return false;
+        // A top-level scalar string matches the key if it equals it (PG semantics)
+        return json.startsWith("\"") && key.equals(jsonValueToText(json));
     }
 
     /** Check if any key exists. Implements ?|. */
@@ -114,6 +198,9 @@ public final class JsonOperations {
             try {
                 int idx = Integer.parseInt(key);
                 List<String> elems = parseArrayElements(json);
+                // Negative index counts from the end (PG semantics); out-of-range
+                // indexes (either sign) leave the array unchanged.
+                if (idx < 0) idx += elems.size();
                 if (idx >= 0 && idx < elems.size()) elems.remove(idx);
                 return elemsToJsonArray(elems);
             } catch (NumberFormatException e) {
@@ -142,7 +229,12 @@ public final class JsonOperations {
         return json;
     }
 
-    /** Concatenate two JSON values. Implements || for jsonb. */
+    /**
+     * Concatenate two JSONB values. Implements || for jsonb using PG 18 semantics:
+     * two objects are merged (right wins on key conflicts); in all other cases each
+     * non-array input is wrapped as a single-element array and the two arrays are
+     * concatenated.
+     */
     public static String concatenate(String left, String right) {
         left = left.trim();
         right = right.trim();
@@ -152,89 +244,111 @@ public final class JsonOperations {
             lMap.putAll(rMap);
             return mapToJson(lMap);
         }
-        if (left.startsWith("[") && right.startsWith("[")) {
-            List<String> lElems = parseArrayElements(left);
-            List<String> rElems = parseArrayElements(right);
-            lElems.addAll(rElems);
-            return elemsToJsonArray(lElems);
-        }
-        if (left.startsWith("[")) {
-            List<String> lElems = parseArrayElements(left);
-            lElems.add(right);
-            return elemsToJsonArray(lElems);
-        }
-        if (right.startsWith("[")) {
-            List<String> rElems = parseArrayElements(right);
-            rElems.add(0, left);
-            return elemsToJsonArray(rElems);
-        }
-        return left;
+        List<String> elems = new ArrayList<>();
+        if (left.startsWith("[")) elems.addAll(parseArrayElements(left));
+        else elems.add(left);
+        if (right.startsWith("[")) elems.addAll(parseArrayElements(right));
+        else elems.add(right);
+        return elemsToJsonArray(elems);
     }
 
-    /** jsonb_set implementation */
+    /** jsonb_set implementation with create_missing = true. */
     public static String jsonbSet(String json, List<String> path, String newValue) {
-        if (path.isEmpty()) return newValue;
+        return jsonbSet(json, path, newValue, true);
+    }
+
+    /**
+     * jsonb_set implementation. PG semantics: intermediate path steps are never
+     * created — if one is missing, the target is returned unchanged. The
+     * create_missing flag only controls whether the FINAL path step may be added.
+     * Negative array indexes count from the end.
+     */
+    public static String jsonbSet(String json, List<String> path, String newValue, boolean createMissing) {
         json = json.trim();
+        if (path.isEmpty()) return json;
         String key = path.get(0);
-        if (path.size() == 1) {
-            if (json.startsWith("{")) {
-                Map<String, String> map = parseObjectKeys(json);
+        boolean last = path.size() == 1;
+        if (json.startsWith("{")) {
+            Map<String, String> map = parseObjectKeys(json);
+            if (last) {
+                if (!map.containsKey(key) && !createMissing) return json;
                 map.put(key, newValue);
                 return mapToJson(map);
             }
-            if (json.startsWith("[")) {
-                try {
-                    int idx = Integer.parseInt(key);
-                    List<String> elems = parseArrayElements(json);
-                    if (idx >= 0 && idx < elems.size()) elems.set(idx, newValue);
-                    return elemsToJsonArray(elems);
-                } catch (NumberFormatException e) { return json; }
+            String child = map.get(key);
+            if (child == null) return json; // missing intermediate step: unchanged
+            map.put(key, jsonbSet(child, path.subList(1, path.size()), newValue, createMissing));
+            return mapToJson(map);
+        }
+        if (json.startsWith("[")) {
+            int idx;
+            try { idx = Integer.parseInt(key); } catch (NumberFormatException e) { return json; }
+            List<String> elems = parseArrayElements(json);
+            if (idx < 0) idx += elems.size(); // negative index counts from the end
+            if (last) {
+                if (idx >= 0 && idx < elems.size()) {
+                    elems.set(idx, newValue);
+                } else if (createMissing) {
+                    // Out-of-range last step: prepend for negative, append for positive
+                    if (idx < 0) elems.add(0, newValue);
+                    else elems.add(newValue);
+                }
+                return elemsToJsonArray(elems);
             }
-        } else {
-            if (json.startsWith("{")) {
-                Map<String, String> map = parseObjectKeys(json);
-                String child = map.getOrDefault(key, "{}");
-                map.put(key, jsonbSet(child, path.subList(1, path.size()), newValue));
-                return mapToJson(map);
+            if (idx >= 0 && idx < elems.size()) {
+                elems.set(idx, jsonbSet(elems.get(idx), path.subList(1, path.size()), newValue, createMissing));
+                return elemsToJsonArray(elems);
             }
+            return json; // missing intermediate step: unchanged
         }
         return json;
     }
 
-    /** jsonb_insert implementation */
+    /**
+     * jsonb_insert implementation. PG semantics: missing intermediate path steps
+     * leave the target unchanged; inserting at an existing object key is an error;
+     * negative array indexes count from the end; out-of-range array positions
+     * prepend (negative) or append (positive).
+     */
     public static String jsonbInsert(String json, List<String> path, String newValue, boolean insertAfter) {
         if (path.isEmpty()) return json;
         json = json.trim();
-        if (path.size() == 1 && json.startsWith("[")) {
-            try {
-                int idx = Integer.parseInt(path.get(0));
-                List<String> elems = parseArrayElements(json);
+        String key = path.get(0);
+        boolean last = path.size() == 1;
+        if (json.startsWith("[")) {
+            int idx;
+            try { idx = Integer.parseInt(key); } catch (NumberFormatException e) { return json; }
+            List<String> elems = parseArrayElements(json);
+            if (idx < 0) idx += elems.size(); // negative index counts from the end
+            if (last) {
                 int insertIdx = insertAfter ? idx + 1 : idx;
-                if (insertIdx >= 0 && insertIdx <= elems.size()) elems.add(insertIdx, newValue);
+                if (insertIdx < 0) insertIdx = 0;                       // out-of-range negative: prepend
+                if (insertIdx > elems.size()) insertIdx = elems.size(); // out-of-range positive: append
+                elems.add(insertIdx, newValue);
                 return elemsToJsonArray(elems);
-            } catch (NumberFormatException e) { /* fall through */ }
+            }
+            if (idx >= 0 && idx < elems.size()) {
+                elems.set(idx, jsonbInsert(elems.get(idx), path.subList(1, path.size()), newValue, insertAfter));
+                return elemsToJsonArray(elems);
+            }
+            return json; // missing intermediate step: unchanged
         }
-        // Navigate into nested object/array and insert at the final level
-        if (path.size() > 1) {
-            String key = path.get(0);
-            if (json.startsWith("{")) {
-                Map<String, String> map = parseObjectKeys(json);
-                String child = map.getOrDefault(key, "{}");
-                map.put(key, jsonbInsert(child, path.subList(1, path.size()), newValue, insertAfter));
+        if (json.startsWith("{")) {
+            Map<String, String> map = parseObjectKeys(json);
+            if (last) {
+                if (map.containsKey(key)) {
+                    throw new MemgresException("cannot replace existing key\n"
+                            + "  Hint: Try using the function jsonb_set to replace key value.", "22023");
+                }
+                map.put(key, newValue);
                 return mapToJson(map);
             }
-            if (json.startsWith("[")) {
-                try {
-                    int idx = Integer.parseInt(key);
-                    List<String> elems = parseArrayElements(json);
-                    if (idx >= 0 && idx < elems.size()) {
-                        elems.set(idx, jsonbInsert(elems.get(idx), path.subList(1, path.size()), newValue, insertAfter));
-                    }
-                    return elemsToJsonArray(elems);
-                } catch (NumberFormatException e) { /* fall through */ }
-            }
+            String child = map.get(key);
+            if (child == null) return json; // missing intermediate step: unchanged
+            map.put(key, jsonbInsert(child, path.subList(1, path.size()), newValue, insertAfter));
+            return mapToJson(map);
         }
-        return jsonbSet(json, path, newValue);
+        return json;
     }
 
     /** Strip null values from JSON object */

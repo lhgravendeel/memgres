@@ -220,8 +220,9 @@ class ExprEvaluator {
                             if (fields.get(i).name().equalsIgnoreCase(fieldName)) {
                                 if (i < parts.length) {
                                     String part = parts[i];
-                                    // Unquote if needed
-                                    if (part.startsWith("\"") && part.endsWith("\"")) {
+                                    // Unquote if needed (only an UNQUOTED empty field means NULL)
+                                    boolean quoted = part.length() >= 2 && part.startsWith("\"") && part.endsWith("\"");
+                                    if (quoted) {
                                         part = part.substring(1, part.length() - 1);
                                     }
                                     // Coerce to the declared field type
@@ -230,7 +231,7 @@ class ExprEvaluator {
                                         // Nested composite, return as PgRow for further chaining
                                         return executor.parseCompositeToRow(part, fieldType);
                                     }
-                                    return executor.coerceFieldValue(part, fieldType);
+                                    return executor.compositeTypeHandler.coerceFieldValue(part, fieldType, quoted);
                                 }
                                 return null;
                             }

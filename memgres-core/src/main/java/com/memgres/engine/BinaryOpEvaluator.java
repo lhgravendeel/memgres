@@ -154,6 +154,17 @@ class BinaryOpEvaluator {
             return left.toString() + right.toString();
         }
 
+        // jsonb || jsonb: when an operand is explicitly cast to jsonb, both sides are
+        // jsonb in PG. This handles scalar jsonb operands (e.g. '1'::jsonb || '2'::jsonb)
+        // that the container-string heuristics in evalBuiltinBinary cannot recognize.
+        if (bin.op() == BinaryExpr.BinOp.CONCAT
+                && (isCastToType(bin.left(), "jsonb") || isCastToType(bin.right(), "jsonb"))
+                && !(left instanceof List) && !(right instanceof List)
+                && !(left instanceof HstoreValue) && !(right instanceof HstoreValue)) {
+            if (left == null || right == null) return null;
+            return JsonOperations.concatenate(left.toString(), right.toString());
+        }
+
         // Operator type mismatch validation (before coercion)
         executor.validateOperatorTypes(bin.op(), left, right);
 
@@ -746,28 +757,16 @@ class BinaryOpEvaluator {
                     // Left is a JSON array string from a previous -> operation
                     String leftJsonStr = left.toString().trim();
                     if (leftJsonStr.startsWith("[")) {
-                        String arrElem = JsonOperations.extractArrayElement(leftJsonStr, n.intValue());
-                        if (arrElem != null) {
-                            arrElem = arrElem.trim();
-                            if (arrElem.startsWith("\"") && arrElem.endsWith("\"")) arrElem = arrElem.substring(1, arrElem.length() - 1);
-                            if (arrElem.equals("null")) return null;
-                            return arrElem;
-                        }
-                        return null;
+                        // ->> maps JSON null to SQL NULL and unquotes/unescapes strings
+                        return JsonOperations.jsonValueToText(
+                                JsonOperations.extractArrayElement(leftJsonStr, n.intValue()));
                     }
                 }
-                // Object key access on JSON string; ->> returns text (unquoted)
+                // Object key access on JSON string; ->> returns text (unquoted, unescaped),
+                // and SQL NULL for JSON null values (unlike -> which returns "null")
                 String json2 = left.toString().trim();
                 String key2 = right.toString();
-                String result2 = executor.functionEvaluator.extractJsonKey(json2, key2);
-                if (result2 != null && result2.startsWith("\"") && result2.endsWith("\"")) {
-                    result2 = result2.substring(1, result2.length() - 1);
-                }
-                // ->> returns SQL NULL for JSON null values (unlike -> which returns "null")
-                if (result2 != null && result2.trim().equals("null")) {
-                    return null;
-                }
-                return result2;
+                return JsonOperations.jsonValueToText(executor.functionEvaluator.extractJsonKey(json2, key2));
             }
             case TS_MATCH: {
                 if (left == null || right == null) return false;
@@ -871,6 +870,13 @@ class BinaryOpEvaluator {
                 if ((ls.startsWith("{") || ls.startsWith("[")) && (rs.startsWith("{") || rs.startsWith("["))) {
                     return JsonOperations.contains(ls, rs);
                 }
+                // jsonb containment with a scalar operand (e.g. '[1,2,3]'::jsonb @> '3'::jsonb,
+                // '"foo"'::jsonb @> '"foo"'::jsonb). PG array strings were already handled
+                // above, so a '['/'{' prefix here is JSON.
+                if (JsonOperations.isJsonScalar(rs)
+                        && (ls.startsWith("{") || ls.startsWith("[") || JsonOperations.isJsonScalar(ls))) {
+                    return JsonOperations.contains(ls, rs);
+                }
                 if (left instanceof List && right instanceof List) {
                     return ((List<?>) left).containsAll((List<?>) right);
                 }
@@ -908,6 +914,12 @@ class BinaryOpEvaluator {
                     try { return range.contains(Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
                 }
                 if ((ls.startsWith("{") || ls.startsWith("[")) && (rs.startsWith("{") || rs.startsWith("["))) {
+                    return JsonOperations.contains(rs, ls);
+                }
+                // jsonb scalar <@ jsonb container/scalar (e.g. '3'::jsonb <@ '[1,2,3]'::jsonb).
+                // Range/multirange strings were already handled above.
+                if (JsonOperations.isJsonScalar(ls)
+                        && (rs.startsWith("{") || rs.startsWith("[") || JsonOperations.isJsonScalar(rs))) {
                     return JsonOperations.contains(rs, ls);
                 }
                 if (left instanceof List && right instanceof List) {
@@ -1551,6 +1563,11 @@ class BinaryOpEvaluator {
                 if ((lStr.startsWith("{") || lStr.startsWith("[")) && (rStr.startsWith("{") || rStr.startsWith("["))) {
                     return JsonOperations.contains(lStr, rStr);
                 }
+                // jsonb containment with a scalar operand (e.g. '[1,2,3]'::jsonb @> '3'::jsonb)
+                if (JsonOperations.isJsonScalar(rStr)
+                        && (lStr.startsWith("{") || lStr.startsWith("[") || JsonOperations.isJsonScalar(lStr))) {
+                    return JsonOperations.contains(lStr, rStr);
+                }
                 if (left instanceof List && right instanceof List) {
                     return ((List<?>) left).containsAll((List<?>) right);
                 }
@@ -1588,6 +1605,11 @@ class BinaryOpEvaluator {
                     try { return range.contains(Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
                 }
                 if ((lStr.startsWith("{") || lStr.startsWith("[")) && (rStr.startsWith("{") || rStr.startsWith("["))) {
+                    return JsonOperations.contains(rStr, lStr);
+                }
+                // jsonb scalar <@ jsonb container/scalar (e.g. '3'::jsonb <@ '[1,2,3]'::jsonb)
+                if (JsonOperations.isJsonScalar(lStr)
+                        && (rStr.startsWith("{") || rStr.startsWith("[") || JsonOperations.isJsonScalar(rStr))) {
                     return JsonOperations.contains(rStr, lStr);
                 }
                 if (left instanceof List && right instanceof List) {
@@ -1827,16 +1849,11 @@ class BinaryOpEvaluator {
                 if (left instanceof HstoreValue) {
                     return ((HstoreValue) left).get(right.toString());
                 }
-                // json ->> key (returns text)
+                // json ->> key (returns text; JSON null maps to SQL NULL,
+                // strings are unquoted and unescaped)
                 String jsonStr = left.toString().trim();
                 Object extracted = executor.functionEvaluator.extractJsonKey(jsonStr, right.toString());
-                if (extracted == null) return null;
-                String s = extracted.toString();
-                // Strip surrounding quotes for string values
-                if (s.startsWith("\"") && s.endsWith("\"")) {
-                    s = s.substring(1, s.length() - 1);
-                }
-                return s;
+                return JsonOperations.jsonValueToText(extracted == null ? null : extracted.toString());
             }
             default:
                 return null;
