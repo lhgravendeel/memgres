@@ -94,9 +94,6 @@ public class Session {
                 return t;
             });
 
-    // Transaction-scoped advisory locks: released on commit/rollback
-    private final Set<Long> xactAdvisoryLocks = new LinkedHashSet<>();
-
     // Explicit table locks acquired via LOCK TABLE: table_key -> lock mode (e.g. "AccessExclusiveLock")
     private final Map<String, String> tableLocks = new LinkedHashMap<>();
 
@@ -1038,6 +1035,9 @@ public class Session {
         cursors.clear();
         preparedStatements.clear();
         dropTempObjects();
+        // Release all advisory locks (session- and transaction-level) held by this session,
+        // matching PG's backend-exit cleanup.
+        database.releaseAllAdvisoryLocks(this);
         database.unregisterSession(this);
     }
 
@@ -1147,17 +1147,9 @@ public class Session {
 
     // ---- ON COMMIT DROP tables ----
 
-    /** Track an advisory lock acquired with pg_advisory_xact_lock / pg_try_advisory_xact_lock. */
-    public void addXactAdvisoryLock(long key) {
-        xactAdvisoryLocks.add(key);
-    }
-
     /** Release all transaction-scoped advisory locks. Called on commit/rollback. */
     private void releaseXactAdvisoryLocks() {
-        for (Long key : xactAdvisoryLocks) {
-            database.advisoryUnlock(key, this);
-        }
-        xactAdvisoryLocks.clear();
+        database.releaseXactAdvisoryLocks(this);
     }
 
     /** Track explicit LOCK TABLE lock for pg_locks visibility. */

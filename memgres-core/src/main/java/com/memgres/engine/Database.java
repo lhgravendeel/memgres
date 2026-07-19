@@ -6,6 +6,9 @@ import com.memgres.engine.parser.ast.CreateTypeStmt;
 import com.memgres.engine.parser.ast.Statement;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -330,10 +333,90 @@ public class Database {
         return true;
     }
 
-    // Advisory locks: key -> set of sessions holding the lock
-    private final Map<Long, Set<Session>> advisoryLocks = new ConcurrentHashMap<>();
-    // Advisory shared locks: key -> set of sessions holding the shared lock
-    private final Set<Long> advisorySharedKeys = ConcurrentHashMap.newKeySet();
+    // Advisory locks: lock id -> per-session holds. All access is guarded by advisoryMonitor,
+    // which also serves as the wait/notify point for blocking acquisitions.
+    private final Map<AdvisoryLockId, List<AdvisoryHold>> advisoryLocks = new HashMap<>();
+    private final Object advisoryMonitor = new Object();
+
+    /**
+     * Identifies an advisory lock target. PostgreSQL keeps the one-argument (single bigint)
+     * and two-argument (two int4) forms in distinct keyspaces: pg_advisory_lock(1) does not
+     * conflict with pg_advisory_lock(0, 1).
+     */
+    public static final class AdvisoryLockId {
+        private final long key;
+        private final boolean pairForm;
+
+        public AdvisoryLockId(long key, boolean pairForm) {
+            this.key = key;
+            this.pairForm = pairForm;
+        }
+
+        /** classid column for pg_locks: high 32 bits of the key (first int of the two-arg form). */
+        public int classId() { return (int) (key >>> 32); }
+
+        /** objid column for pg_locks: low 32 bits of the key (second int of the two-arg form). */
+        public int objId() { return (int) key; }
+
+        /** objsubid column for pg_locks: 1 for the one-arg form, 2 for the two-arg form (PG convention). */
+        public short objSubId() { return pairForm ? (short) 2 : (short) 1; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof AdvisoryLockId)) return false;
+            AdvisoryLockId other = (AdvisoryLockId) o;
+            return key == other.key && pairForm == other.pairForm;
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * (int) (key ^ (key >>> 32)) + (pairForm ? 1 : 0);
+        }
+
+        @Override
+        public String toString() {
+            return pairForm ? "(" + classId() + "," + objId() + ")" : String.valueOf(key);
+        }
+    }
+
+    /**
+     * One session's holds on one advisory lock. PostgreSQL reference-counts advisory lock
+     * acquisitions, tracks shared vs exclusive mode separately, and distinguishes
+     * session-level ownership (released only by explicit unlock or disconnect) from
+     * transaction-level ownership (released automatically at COMMIT/ROLLBACK and never
+     * releasable by pg_advisory_unlock).
+     */
+    private static final class AdvisoryHold {
+        final Session session;
+        int sessionExclusive;
+        int sessionShared;
+        int xactExclusive;
+        int xactShared;
+
+        AdvisoryHold(Session session) { this.session = session; }
+
+        boolean holdsExclusive() { return sessionExclusive + xactExclusive > 0; }
+        boolean holdsShared() { return sessionShared + xactShared > 0; }
+        boolean empty() { return sessionExclusive == 0 && sessionShared == 0 && xactExclusive == 0 && xactShared == 0; }
+    }
+
+    /** Read-only row describing one advisory lock hold, for the pg_locks catalog view. */
+    public static final class AdvisoryLockRow {
+        public final int classId;
+        public final int objId;
+        public final short objSubId;
+        public final Session session;
+        public final boolean exclusive;
+
+        AdvisoryLockRow(int classId, int objId, short objSubId, Session session, boolean exclusive) {
+            this.classId = classId;
+            this.objId = objId;
+            this.objSubId = objSubId;
+            this.session = session;
+            this.exclusive = exclusive;
+        }
+    }
 
     // Roles: name -> attributes map
     private final Map<String, Map<String, String>> roles = new ConcurrentHashMap<>();
@@ -692,9 +775,23 @@ public class Database {
     public void setClusteredIndex(String indexName) { clusteredIndexes.add(indexName.toLowerCase()); }
     public boolean isClusteredIndex(String indexName) { return clusteredIndexes.contains(indexName.toLowerCase()); }
 
-    /** Get advisory locks map (for pg_locks). */
-    public Map<Long, Set<Session>> getAdvisoryLocks() {
-        return advisoryLocks;
+    /** Snapshot of all advisory lock holds (for pg_locks). One row per (session, lock, mode). */
+    public List<AdvisoryLockRow> getAdvisoryLockRows() {
+        List<AdvisoryLockRow> rows = new ArrayList<>();
+        synchronized (advisoryMonitor) {
+            for (Map.Entry<AdvisoryLockId, List<AdvisoryHold>> e : advisoryLocks.entrySet()) {
+                AdvisoryLockId id = e.getKey();
+                for (AdvisoryHold h : e.getValue()) {
+                    if (h.holdsExclusive()) {
+                        rows.add(new AdvisoryLockRow(id.classId(), id.objId(), id.objSubId(), h.session, true));
+                    }
+                    if (h.holdsShared()) {
+                        rows.add(new AdvisoryLockRow(id.classId(), id.objId(), id.objSubId(), h.session, false));
+                    }
+                }
+            }
+        }
+        return rows;
     }
 
     public Schema getSchema(String name) {
@@ -1502,68 +1599,204 @@ public class Database {
         return domains;
     }
 
-    // Advisory locks
-    public boolean tryAdvisoryLock(long key, Session session) {
-        Set<Session> holders = advisoryLocks.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
-        // Synchronize on the holder set to make check-then-add atomic.
-        // Without this, two sessions could both see an empty set, both pass
-        // the check, and both add themselves — violating mutual exclusion.
-        synchronized (holders) {
-            // Exclusive lock: fail if any other session holds it (exclusive or shared)
-            if (advisorySharedKeys.contains(key)) {
-                // Key is held in shared mode by someone; exclusive lock fails if other sessions hold it
-                for (Session holder : holders) {
-                    if (holder != session) return false;
+    // ==================== Advisory locks ====================
+
+    /** Find this session's hold in the list, or null. Caller must hold advisoryMonitor. */
+    private static AdvisoryHold findAdvisoryHold(List<AdvisoryHold> holds, Session session) {
+        if (holds == null) return null;
+        for (AdvisoryHold h : holds) {
+            if (h.session == session) return h;
+        }
+        return null;
+    }
+
+    /**
+     * Returns a session whose hold conflicts with the requested acquisition, or null when
+     * the lock can be granted. Shared requests conflict only with exclusive holds; exclusive
+     * requests conflict with any hold. A session never conflicts with itself (PG allows the
+     * same backend to stack modes freely). Caller must hold advisoryMonitor.
+     */
+    private Session advisoryBlocker(AdvisoryLockId id, Session session, boolean shared) {
+        List<AdvisoryHold> holds = advisoryLocks.get(id);
+        if (holds == null) return null;
+        for (AdvisoryHold h : holds) {
+            if (h.session == session) continue;
+            if (h.holdsExclusive() || (!shared && h.holdsShared())) return h.session;
+        }
+        return null;
+    }
+
+    /** Record one acquisition (increment the matching reference count). Caller must hold advisoryMonitor. */
+    private void grantAdvisory(AdvisoryLockId id, Session session, boolean shared, boolean xact) {
+        List<AdvisoryHold> holds = advisoryLocks.get(id);
+        if (holds == null) {
+            holds = new ArrayList<>();
+            advisoryLocks.put(id, holds);
+        }
+        AdvisoryHold h = findAdvisoryHold(holds, session);
+        if (h == null) {
+            h = new AdvisoryHold(session);
+            holds.add(h);
+        }
+        if (xact) {
+            if (shared) h.xactShared++; else h.xactExclusive++;
+        } else {
+            if (shared) h.sessionShared++; else h.sessionExclusive++;
+        }
+    }
+
+    /** Drop empty hold entries and empty lock lists. Caller must hold advisoryMonitor. */
+    private void cleanupAdvisory(AdvisoryLockId id, List<AdvisoryHold> holds, AdvisoryHold h) {
+        if (h.empty()) holds.remove(h);
+        if (holds.isEmpty()) advisoryLocks.remove(id);
+    }
+
+    /**
+     * Non-blocking advisory lock acquisition (pg_try_advisory_lock and friends).
+     * Each successful call increments a per-(session, lock, mode, ownership) reference
+     * count and needs a matching unlock (or transaction end for xact ownership).
+     */
+    public boolean tryAdvisoryLock(AdvisoryLockId id, Session session, boolean shared, boolean xact) {
+        synchronized (advisoryMonitor) {
+            if (advisoryBlocker(id, session, shared) != null) return false;
+            grantAdvisory(id, session, shared, xact);
+            return true;
+        }
+    }
+
+    /**
+     * Blocking advisory lock acquisition (pg_advisory_lock and friends). Waits on the
+     * advisory monitor until the lock is grantable; every release path calls notifyAll.
+     * Like PostgreSQL, the wait blocks only the calling backend's thread.
+     *
+     * @throws MemgresException 40P01 when a wait-for cycle with another session is detected
+     * @throws MemgresException 55P03 when lock_timeout (or the safety timeout) expires
+     * @throws MemgresException 57014 when the wait is interrupted (statement cancel)
+     */
+    public void advisoryLock(AdvisoryLockId id, Session session, boolean shared, boolean xact) {
+        // Safety net: memgres processes each connection on a Netty event-loop thread, so an
+        // unbounded wait could starve other connections pinned to the same loop. Real PG
+        // waits forever when lock_timeout is disabled; we cap the wait instead.
+        final long safetyTimeoutMs = 30_000L;
+        long lockTimeoutMs = session != null
+                ? GucSettings.parseTimeoutMillis(session.getGucSettings().get("lock_timeout")) : 0L;
+        final long timeoutMs = lockTimeoutMs > 0 ? lockTimeoutMs : safetyTimeoutMs;
+        final long deadline = System.currentTimeMillis() + timeoutMs;
+
+        synchronized (advisoryMonitor) {
+            try {
+                while (true) {
+                    Session blocker = advisoryBlocker(id, session, shared);
+                    if (blocker == null) {
+                        grantAdvisory(id, session, shared, xact);
+                        return;
+                    }
+                    if (session != null) {
+                        // Deadlock detection via the shared wait-for graph (also used by row locks).
+                        // The session that completes the cycle (the last to arrive) is always the
+                        // victim — this matches PG's behavior where the deadlock detector aborts
+                        // the waiter that triggers detection.
+                        waitingFor.put(session, blocker);
+                        if (advisoryDeadlockVictim(session, blocker) != null) {
+                            waitingFor.remove(session);
+                            throw new MemgresException("deadlock detected", "40P01");
+                        }
+                    }
+                    if (System.currentTimeMillis() >= deadline) {
+                        throw new MemgresException("canceling statement due to lock timeout", "55P03");
+                    }
+                    try {
+                        // Short slices so deadlocks formed after we started waiting are detected.
+                        advisoryMonitor.wait(50L);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new MemgresException("canceling statement due to user request", "57014");
+                    }
                 }
+            } finally {
+                if (session != null) waitingFor.remove(session);
+            }
+        }
+    }
+
+    /**
+     * Release one session-level hold of the given mode (pg_advisory_unlock /
+     * pg_advisory_unlock_shared). Returns false as a no-op when the session does not hold
+     * the lock in that mode; transaction-level holds are never released here (PG semantics).
+     */
+    public boolean advisoryUnlock(AdvisoryLockId id, Session session, boolean shared) {
+        synchronized (advisoryMonitor) {
+            List<AdvisoryHold> holds = advisoryLocks.get(id);
+            AdvisoryHold h = findAdvisoryHold(holds, session);
+            if (h == null) return false;
+            if (shared) {
+                if (h.sessionShared == 0) return false;
+                h.sessionShared--;
             } else {
-                for (Session holder : holders) {
-                    if (holder != session) return false;
-                }
+                if (h.sessionExclusive == 0) return false;
+                h.sessionExclusive--;
             }
-            holders.add(session);
+            cleanupAdvisory(id, holds, h);
+            advisoryMonitor.notifyAll();
             return true;
         }
     }
 
-    /** Try to acquire a shared advisory lock. Multiple sessions can hold shared locks concurrently. */
-    public boolean tryAdvisoryLockShared(long key, Session session) {
-        Set<Session> holders = advisoryLocks.computeIfAbsent(key, k -> ConcurrentHashMap.newKeySet());
-        synchronized (holders) {
-            // Shared lock: fail only if another session holds an exclusive lock
-            if (!advisorySharedKeys.contains(key) && !holders.isEmpty()) {
-                // Key held exclusively by someone; check if it's us
-                for (Session holder : holders) {
-                    if (holder != session) return false;
-                }
-            }
-            advisorySharedKeys.add(key);
-            holders.add(session);
-            return true;
-        }
-    }
-
-    public boolean advisoryUnlock(long key, Session session) {
-        Set<Session> holders = advisoryLocks.get(key);
-        if (holders != null) {
-            synchronized (holders) {
-                boolean removed = holders.remove(session);
-                if (holders.isEmpty()) {
-                    advisorySharedKeys.remove(key);
-                }
-                return removed;
-            }
-        }
-        return false;
-    }
-
+    /**
+     * pg_advisory_unlock_all: release every session-level hold of this session regardless of
+     * reference counts. Transaction-level holds are left in place (they end with the transaction).
+     */
     public void advisoryUnlockAll(Session session) {
-        for (Map.Entry<Long, Set<Session>> entry : advisoryLocks.entrySet()) {
-            synchronized (entry.getValue()) {
-                entry.getValue().remove(session);
-                if (entry.getValue().isEmpty()) {
-                    advisorySharedKeys.remove(entry.getKey());
+        synchronized (advisoryMonitor) {
+            Iterator<Map.Entry<AdvisoryLockId, List<AdvisoryHold>>> it = advisoryLocks.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<AdvisoryLockId, List<AdvisoryHold>> e = it.next();
+                List<AdvisoryHold> holds = e.getValue();
+                AdvisoryHold h = findAdvisoryHold(holds, session);
+                if (h != null) {
+                    h.sessionExclusive = 0;
+                    h.sessionShared = 0;
+                    if (h.empty()) holds.remove(h);
+                    if (holds.isEmpty()) it.remove();
                 }
             }
+            advisoryMonitor.notifyAll();
+        }
+    }
+
+    /** Release all transaction-scoped advisory holds of a session. Called at COMMIT/ROLLBACK/PREPARE. */
+    public void releaseXactAdvisoryLocks(Session session) {
+        synchronized (advisoryMonitor) {
+            Iterator<Map.Entry<AdvisoryLockId, List<AdvisoryHold>>> it = advisoryLocks.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<AdvisoryLockId, List<AdvisoryHold>> e = it.next();
+                List<AdvisoryHold> holds = e.getValue();
+                AdvisoryHold h = findAdvisoryHold(holds, session);
+                if (h != null) {
+                    h.xactExclusive = 0;
+                    h.xactShared = 0;
+                    if (h.empty()) holds.remove(h);
+                    if (holds.isEmpty()) it.remove();
+                }
+            }
+            advisoryMonitor.notifyAll();
+        }
+    }
+
+    /** Release every advisory hold (both ownerships) of a session. Called on disconnect. */
+    public void releaseAllAdvisoryLocks(Session session) {
+        synchronized (advisoryMonitor) {
+            Iterator<Map.Entry<AdvisoryLockId, List<AdvisoryHold>>> it = advisoryLocks.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<AdvisoryLockId, List<AdvisoryHold>> e = it.next();
+                List<AdvisoryHold> holds = e.getValue();
+                AdvisoryHold h = findAdvisoryHold(holds, session);
+                if (h != null) {
+                    holds.remove(h);
+                    if (holds.isEmpty()) it.remove();
+                }
+            }
+            advisoryMonitor.notifyAll();
         }
     }
 
@@ -1605,6 +1838,22 @@ public class Database {
             if (existing.session != requester && !lockModesCompatible(existing.mode, mode)) {
                 return existing.session;
             }
+        }
+        return null;
+    }
+
+    /**
+     * Walks the wait-for chain starting at {@code blocker}. If it cycles back to
+     * {@code requester} (a deadlock), returns the requester (non-null signals deadlock).
+     * Returns null when there is no deadlock involving {@code requester}.
+     */
+    private Session advisoryDeadlockVictim(Session requester, Session blocker) {
+        Set<Session> visited = new HashSet<>();
+        Session current = blocker;
+        while (current != null) {
+            if (current == requester) return requester;
+            if (!visited.add(current)) return null; // cycle that does not involve the requester
+            current = waitingFor.get(current);
         }
         return null;
     }
