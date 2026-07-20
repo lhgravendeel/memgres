@@ -509,42 +509,9 @@ class DmlExecutor {
 
             // Enforce RLS WITH CHECK policies for INSERT
             if (table.isRlsEnabled()) {
-                // Determine the current effective role
-                String currentRole = null;
-                if (executor.session != null) {
-                    currentRole = executor.session.getGucSettings().get("role");
-                }
-                boolean isSuperuser = currentRole == null
-                        || "test".equalsIgnoreCase(currentRole)
-                        || "postgres".equalsIgnoreCase(currentRole)
-                        || "memgres".equalsIgnoreCase(currentRole);
-                if (!isSuperuser || table.isRlsForced()) {
-                    String effectiveRole = currentRole != null ? currentRole : "test";
-                    boolean anyPolicyMatched = false;
-                    for (RlsPolicy policy : table.getRlsPolicies()) {
-                        if (policy.appliesTo("INSERT") && policy.getWithCheckExpr() != null
-                                && policy.appliesToRole(effectiveRole)) {
-                            anyPolicyMatched = true;
-                            RowContext rlsCtx = new RowContext(table, null, row);
-                            try {
-                                Object result = executor.evalExpr(policy.getWithCheckExpr(), rlsCtx);
-                                if (!Boolean.TRUE.equals(result)) {
-                                    throw new MemgresException(
-                                        "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
-                                }
-                            } catch (MemgresException e) {
-                                throw e;
-                            } catch (Exception e) {
-                                throw new MemgresException(
-                                    "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
-                            }
-                        }
-                    }
-                    // If RLS is enabled but no INSERT policies match this role, deny the insert
-                    if (!anyPolicyMatched) {
-                        throw new MemgresException(
-                            "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
-                    }
+                String insertRlsSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+                if (!executor.shouldBypassRls(table, insertRlsSchema)) {
+                    enforceRlsWithCheck(table, row, "INSERT");
                 }
             }
 
@@ -1080,6 +1047,15 @@ class DmlExecutor {
         // Fire BEFORE STATEMENT triggers
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, table, null, null);
 
+        // Check if RLS applies to UPDATE
+        boolean rlsUpdateActive = false;
+        if (table.isRlsEnabled()) {
+            String rlsSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+            if (!executor.shouldBypassRls(table, rlsSchema)) {
+                rlsUpdateActive = true;
+            }
+        }
+
         boolean fromUpdateHasVirtual = hasVirtualColumns(table);
         if (fromContexts != null) {
             // Multi-table UPDATE: join main table with FROM tables
@@ -1114,8 +1090,17 @@ class DmlExecutor {
                 if (newRow == null) {
                     continue;
                 }
+                // RLS USING filter: skip rows not visible under UPDATE policy
+                if (rlsUpdateActive) {
+                    List<Object[]> rlsCheck = filterRowsByRlsUsing(table, Collections.singletonList(row), "UPDATE", stmt.alias());
+                    if (rlsCheck.isEmpty()) continue;
+                }
                 RowContext ctx = matchedContexts.get(i);
                 applySetClauses(stmt.setClauses(), table, newRow, ctx);
+                // RLS WITH CHECK on the new row
+                if (rlsUpdateActive) {
+                    enforceRlsWithCheck(table, newRow, "UPDATE");
+                }
                 computeGeneratedColumns(table, newRow);
                 executor.constraintValidator.validateConstraints(table, newRow, row);
                 validationHelper.validateDomainChecks(newRow, table);
@@ -1163,6 +1148,11 @@ class DmlExecutor {
                     .collect(Collectors.toList());
         }
 
+        // RLS USING filter for UPDATE: restrict which rows can be updated
+        if (rlsUpdateActive) {
+            rows = filterRowsByRlsUsing(table, rows, "UPDATE", updateAlias);
+        }
+
         int updatedCount = 0;
         List<Object[]> simpleOldRows = new ArrayList<>();
         List<Object[]> simpleNewRows = new ArrayList<>();
@@ -1177,6 +1167,11 @@ class DmlExecutor {
             // Apply SET clauses first, then fire BEFORE UPDATE triggers so they see NEW with proposed values
             Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
             applySetClauses(stmt.setClauses(), table, newRow, new RowContext(table, updateAlias, evalRow));
+
+            // RLS WITH CHECK on the new row after SET clauses
+            if (rlsUpdateActive) {
+                enforceRlsWithCheck(table, newRow, "UPDATE");
+            }
 
             // BEFORE UPDATE triggers (see NEW with SET-applied values, can further modify NEW)
             newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, table, updatedColumnNames);
@@ -1247,6 +1242,89 @@ class DmlExecutor {
                     buildReturningColumns(stmt.returning(), table), returningRows, updatedCount);
         }
         return QueryResult.command(QueryResult.Type.UPDATE, updatedCount);
+    }
+
+    /**
+     * Enforce RLS WITH CHECK policies for INSERT/UPDATE.
+     * Throws 42501 if the new row doesn't satisfy all applicable WITH CHECK policies,
+     * or if no policies apply (default-deny).
+     */
+    private void enforceRlsWithCheck(Table table, Object[] row, String command) {
+        String effectiveRole = executor.currentRole();
+        boolean anyPolicyMatched = false;
+        for (RlsPolicy policy : table.getRlsPolicies()) {
+            if (policy.appliesTo(command) && policy.appliesToRole(effectiveRole)) {
+                // For WITH CHECK: use withCheckExpr if present, else fall back to usingExpr (PG semantics)
+                Expression checkExpr = policy.getWithCheckExpr();
+                if (checkExpr == null) checkExpr = policy.getUsingExpr();
+                if (checkExpr == null) continue;
+                anyPolicyMatched = true;
+                RowContext rlsCtx = new RowContext(table, null, row);
+                try {
+                    Object result = executor.evalExpr(checkExpr, rlsCtx);
+                    if (!Boolean.TRUE.equals(result)) {
+                        throw new MemgresException(
+                            "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
+                    }
+                } catch (MemgresException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new MemgresException(
+                        "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
+                }
+            }
+        }
+        if (!anyPolicyMatched) {
+            throw new MemgresException(
+                "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
+        }
+    }
+
+    /**
+     * Filter rows by RLS USING policies for UPDATE/DELETE.
+     * Returns only the rows that pass applicable USING policies.
+     */
+    private List<Object[]> filterRowsByRlsUsing(Table table, List<Object[]> rows, String command, String alias) {
+        String effectiveRole = executor.currentRole();
+        List<RlsPolicy> permissivePolicies = new ArrayList<>();
+        List<RlsPolicy> restrictivePolicies = new ArrayList<>();
+        for (RlsPolicy p : table.getRlsPolicies()) {
+            if (p.appliesTo(command) && p.getUsingExpr() != null && p.appliesToRole(effectiveRole)) {
+                if (p.isRestrictive()) {
+                    restrictivePolicies.add(p);
+                } else {
+                    permissivePolicies.add(p);
+                }
+            }
+        }
+        // Default-deny: no applicable policies → 0 rows
+        if (permissivePolicies.isEmpty() && restrictivePolicies.isEmpty()) {
+            return new ArrayList<>();
+        }
+        List<Object[]> filtered = new ArrayList<>();
+        for (Object[] row : rows) {
+            RowContext ctx = new RowContext(table, alias, row);
+            boolean passesPermissive = permissivePolicies.isEmpty() ? false : false;
+            if (!permissivePolicies.isEmpty()) {
+                for (RlsPolicy policy : permissivePolicies) {
+                    try {
+                        Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
+                        if (Boolean.TRUE.equals(result)) { passesPermissive = true; break; }
+                    } catch (Exception e) { /* row doesn't pass */ }
+                }
+            }
+            boolean passesRestrictive = true;
+            for (RlsPolicy policy : restrictivePolicies) {
+                try {
+                    Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
+                    if (!Boolean.TRUE.equals(result)) { passesRestrictive = false; break; }
+                } catch (Exception e) { passesRestrictive = false; break; }
+            }
+            if (passesPermissive && passesRestrictive) {
+                filtered.add(row);
+            }
+        }
+        return filtered;
     }
 
     /** Apply SET clauses to a row. DRYs the duplicate logic between multi-table and simple UPDATE paths. */
@@ -1413,6 +1491,12 @@ class DmlExecutor {
             }
         }
 
+        // Check if RLS applies to DELETE
+        boolean rlsDeleteActive = false;
+        if (table.isRlsEnabled() && !executor.shouldBypassRls(table, schemaName)) {
+            rlsDeleteActive = true;
+        }
+
         if (stmt.where() == null) {
             // Collect all tables (including partitions) for DELETE ALL
             List<Table> allTables = new ArrayList<>();
@@ -1421,6 +1505,10 @@ class DmlExecutor {
             List<Object[]> allRowsCopy = new ArrayList<>();
             for (Table t : allTables) {
                 allRowsCopy.addAll(t.getRows());
+            }
+            // RLS USING filter for DELETE: restrict which rows can be deleted
+            if (rlsDeleteActive) {
+                allRowsCopy = filterRowsByRlsUsing(table, allRowsCopy, "DELETE", stmt.alias());
             }
             java.util.Set<Object[]> deleteSet = Collections.newSetFromMap(new IdentityHashMap<>());
             deleteSet.addAll(allRowsCopy);
@@ -1435,9 +1523,18 @@ class DmlExecutor {
                 }
             }
             recordDeleteUndo(stmt.schema(), stmt.table(), allRowsCopy);
-            int count = 0;
-            for (Table t : allTables) {
-                count += t.deleteAll();
+            int count;
+            if (rlsDeleteActive) {
+                // RLS filtered: delete specific rows, not all
+                count = allRowsCopy.size();
+                for (Table t : allTables) {
+                    t.deleteRows(deleteSet);
+                }
+            } else {
+                count = 0;
+                for (Table t : allTables) {
+                    count += t.deleteAll();
+                }
             }
             // Track DML statistics
             if (count > 0) table.incrementTupDeleted(count);
@@ -1511,6 +1608,15 @@ class DmlExecutor {
                     toDelete.add(row);
                 }
             }
+        }
+
+        // RLS USING filter for DELETE: remove rows that don't pass DELETE policies
+        if (rlsDeleteActive) {
+            List<Object[]> rlsAllowed = filterRowsByRlsUsing(table, new ArrayList<>(toDelete), "DELETE", stmt.alias());
+            Set<Object[]> rlsAllowedSet = Collections.newSetFromMap(new IdentityHashMap<>());
+            rlsAllowedSet.addAll(rlsAllowed);
+            toDelete.retainAll(rlsAllowedSet);
+            deleteOrder.removeIf(r -> !rlsAllowedSet.contains(r));
         }
 
         // Validate FK references before deleting (handle CASCADE/RESTRICT/SET NULL/SET DEFAULT)
