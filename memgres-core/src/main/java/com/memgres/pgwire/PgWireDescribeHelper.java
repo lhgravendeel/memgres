@@ -875,7 +875,8 @@ class PgWireDescribeHelper {
         buf.writeInt(4 + 2 + numParams * 4);
         buf.writeShort(numParams);
         for (int i = 0; i < numParams; i++) {
-            int oid = (oids != null && i < oids.length && oids[i] != 0) ? oids[i] : 0;
+            // Use provided OID, or default to TEXT (25) instead of 0 to avoid pgjdbc crash
+            int oid = (oids != null && i < oids.length && oids[i] != 0) ? oids[i] : 25;
             buf.writeInt(oid);
         }
         ctx.write(buf);

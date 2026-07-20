@@ -42,6 +42,7 @@ public final class TypeCoercion {
             case BIGSERIAL:
             case SMALLSERIAL:
             case MONEY:
+            case OID:
                 return TypeCategory.NUMERIC;
             case VARCHAR:
             case CHAR:
@@ -97,8 +98,28 @@ public final class TypeCoercion {
                 return TypeCategory.UNKNOWN;
             case XML:
                 return TypeCategory.STRING;
-            case TEXT_ARRAY:
+            case BOOL_ARRAY:
+            case INT2_ARRAY:
             case INT4_ARRAY:
+            case INT8_ARRAY:
+            case FLOAT4_ARRAY:
+            case FLOAT8_ARRAY:
+            case NUMERIC_ARRAY:
+            case TEXT_ARRAY:
+            case VARCHAR_ARRAY:
+            case CHAR_ARRAY:
+            case NAME_ARRAY:
+            case DATE_ARRAY:
+            case TIMESTAMP_ARRAY:
+            case TIMESTAMPTZ_ARRAY:
+            case TIME_ARRAY:
+            case TIMETZ_ARRAY:
+            case UUID_ARRAY:
+            case BYTEA_ARRAY:
+            case INTERVAL_ARRAY:
+            case JSON_ARRAY:
+            case JSONB_ARRAY:
+            case INET_ARRAY:
             case ACLITEM_ARRAY:
                 return TypeCategory.UNKNOWN;
             case ENUM:
@@ -118,6 +139,7 @@ public final class TypeCoercion {
                 return 1;
             case INTEGER:
             case SERIAL:
+            case OID:
                 return 2;
             case BIGINT:
             case BIGSERIAL:
@@ -206,6 +228,7 @@ public final class TypeCoercion {
                 return toShort(value);
             case INTEGER:
             case SERIAL:
+            case OID:
                 return toInteger(value);
             case BIGINT:
             case BIGSERIAL:

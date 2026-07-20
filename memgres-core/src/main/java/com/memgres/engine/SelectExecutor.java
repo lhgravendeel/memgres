@@ -898,7 +898,7 @@ class SelectExecutor {
                                 binding.table().getName().equalsIgnoreCase(w.table())) {
                             final int bindingIdx = bIdx;
                             for (int i = 0; i < binding.table().getColumns().size(); i++) {
-                                resultColumns.add(binding.table().getColumns().get(i));
+                                resultColumns.add(copyColumnWithOid(binding.table(), i));
                                 final int colIdx = i;
                                 projections.add(ctx -> ctx.getBindings().get(bindingIdx).row()[colIdx]);
                             }
@@ -915,7 +915,7 @@ class SelectExecutor {
                                     && !emittedUsingCols.add(colNameLower)) {
                                 continue;
                             }
-                            resultColumns.add(binding.table().getColumns().get(i));
+                            resultColumns.add(copyColumnWithOid(binding.table(), i));
                             final int colIdx = i;
                             // For USING columns, use COALESCE(left, right) so unmatched
                             // right rows show the right side's value (PG behavior)
@@ -1017,6 +1017,19 @@ class SelectExecutor {
                 }
             }
         }
+    }
+
+    /** Copy a column from a table, setting tableOid and attNum for RowDescription metadata. */
+    private Column copyColumnWithOid(Table table, int colIdx) {
+        Column src = table.getColumns().get(colIdx);
+        Column rc = new Column(src.getName(), src.getType(), src.isNullable(), src.isPrimaryKey(), null,
+                src.getEnumTypeName(), src.getPrecision(), src.getScale(), null,
+                src.getDomainTypeName(), src.getCompositeTypeName(), src.getArrayElementType());
+        String schemaKey = "public";
+        int tblOid = executor.systemCatalog.getOid("rel:" + schemaKey + "." + table.getName());
+        rc.setTableOid(tblOid);
+        rc.setAttNum((short) (colIdx + 1));
+        return rc;
     }
 
     private String resolveCompositeTypeFromBindings(Expression expr, List<RowContext.TableBinding> baseBindings) {
