@@ -487,20 +487,22 @@ class SelectWindowEvaluator {
                 }
                 case "first_value": {
                     Expression arg = wf.args().get(0);
+                    WindowFuncExpr.ExcludeMode fvExclude = wf.frame() != null ? wf.frame().excludeMode() : null;
                     for (int i = 0; i < sortedPartition.size(); i++) {
                         int[] bounds = resolveFrameBounds(wf, i, contexts, sortedPartition);
                         int frameStart = bounds[0];
                         int frameEnd = bounds[1];
                         Object val = null;
                         if (frameStart <= frameEnd) {
-                            if (wf.ignoreNulls()) {
-                                // IGNORE NULLS: find first non-null value in the frame
-                                for (int fi = frameStart; fi <= frameEnd; fi++) {
-                                    Object v = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
-                                    if (v != null) { val = v; break; }
+                            for (int fi = frameStart; fi <= frameEnd; fi++) {
+                                if (fvExclude != null && fvExclude != WindowFuncExpr.ExcludeMode.NO_OTHERS
+                                        && shouldExcludeRow(fvExclude, wf.orderBy(), contexts, sortedPartition, i, fi)) {
+                                    continue;
                                 }
-                            } else {
-                                val = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameStart)));
+                                Object v = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
+                                if (wf.ignoreNulls() && v == null) continue;
+                                val = v;
+                                break;
                             }
                         }
                         results[sortedPartition.get(i)] = val;
@@ -509,20 +511,22 @@ class SelectWindowEvaluator {
                 }
                 case "last_value": {
                     Expression arg = wf.args().get(0);
+                    WindowFuncExpr.ExcludeMode lvExclude = wf.frame() != null ? wf.frame().excludeMode() : null;
                     for (int i = 0; i < sortedPartition.size(); i++) {
                         int[] bounds = resolveFrameBounds(wf, i, contexts, sortedPartition);
                         int frameStart = bounds[0];
                         int frameEnd = bounds[1];
                         Object val = null;
                         if (frameStart <= frameEnd) {
-                            if (wf.ignoreNulls()) {
-                                // IGNORE NULLS: find last non-null value in the frame
-                                for (int fi = frameEnd; fi >= frameStart; fi--) {
-                                    Object v = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
-                                    if (v != null) { val = v; break; }
+                            for (int fi = frameEnd; fi >= frameStart; fi--) {
+                                if (lvExclude != null && lvExclude != WindowFuncExpr.ExcludeMode.NO_OTHERS
+                                        && shouldExcludeRow(lvExclude, wf.orderBy(), contexts, sortedPartition, i, fi)) {
+                                    continue;
                                 }
-                            } else {
-                                val = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameEnd)));
+                                Object v = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
+                                if (wf.ignoreNulls() && v == null) continue;
+                                val = v;
+                                break;
                             }
                         }
                         results[sortedPartition.get(i)] = val;
@@ -532,50 +536,46 @@ class SelectWindowEvaluator {
                 case "nth_value": {
                     Expression arg = wf.args().get(0);
                     int nth = wf.args().size() > 1 ? executor.toInt(executor.evalExpr(wf.args().get(1), null)) : 1;
+                    // PG raises 22016 for nth <= 0
+                    if (nth <= 0) {
+                        throw new MemgresException(
+                                "argument of nth_value must be greater than zero", "22016");
+                    }
+                    WindowFuncExpr.ExcludeMode nvExclude = wf.frame() != null ? wf.frame().excludeMode() : null;
                     for (int i = 0; i < sortedPartition.size(); i++) {
                         int[] bounds = resolveFrameBounds(wf, i, contexts, sortedPartition);
                         int frameStart = bounds[0];
                         int frameEnd = bounds[1];
                         if (frameStart > frameEnd) {
-                            // Empty frame
                             results[sortedPartition.get(i)] = null;
-                        } else if (wf.ignoreNulls()) {
-                            // IGNORE NULLS: find the nth non-null value in frame
+                        } else {
+                            // Iterate frame rows, respecting EXCLUDE and IGNORE NULLS
                             int count = 0;
                             Object found = null;
                             if (wf.fromLast()) {
                                 for (int fi = frameEnd; fi >= frameStart; fi--) {
-                                    Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
-                                    if (val != null) {
-                                        count++;
-                                        if (count == nth) { found = val; break; }
+                                    if (nvExclude != null && nvExclude != WindowFuncExpr.ExcludeMode.NO_OTHERS
+                                            && shouldExcludeRow(nvExclude, wf.orderBy(), contexts, sortedPartition, i, fi)) {
+                                        continue;
                                     }
+                                    Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
+                                    if (wf.ignoreNulls() && val == null) continue;
+                                    count++;
+                                    if (count == nth) { found = val; break; }
                                 }
                             } else {
                                 for (int fi = frameStart; fi <= frameEnd; fi++) {
-                                    Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
-                                    if (val != null) {
-                                        count++;
-                                        if (count == nth) { found = val; break; }
+                                    if (nvExclude != null && nvExclude != WindowFuncExpr.ExcludeMode.NO_OTHERS
+                                            && shouldExcludeRow(nvExclude, wf.orderBy(), contexts, sortedPartition, i, fi)) {
+                                        continue;
                                     }
+                                    Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(fi)));
+                                    if (wf.ignoreNulls() && val == null) continue;
+                                    count++;
+                                    if (count == nth) { found = val; break; }
                                 }
                             }
                             results[sortedPartition.get(i)] = found;
-                        } else if (wf.fromLast()) {
-                            // FROM LAST: count from end of frame
-                            int frameSize = frameEnd - frameStart + 1;
-                            if (nth >= 1 && nth <= frameSize) {
-                                results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameEnd - nth + 1)));
-                            } else {
-                                results[sortedPartition.get(i)] = null;
-                            }
-                        } else {
-                            int frameSize = frameEnd - frameStart + 1;
-                            if (nth >= 1 && nth <= frameSize) {
-                                results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(frameStart + nth - 1)));
-                            } else {
-                                results[sortedPartition.get(i)] = null;
-                            }
                         }
                     }
                     break;
@@ -722,22 +722,24 @@ class SelectWindowEvaluator {
                 }
                 return currentIdx;
             case PRECEDING: {
-                int offsetVal = executor.toInt(executor.evalExpr(bound.offset(), null));
+                Object rawOffset = executor.evalExpr(bound.offset(), null);
                 if (frameType == WindowFuncExpr.FrameType.RANGE) {
-                    return resolveRangeOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, -offsetVal, isStartBound);
+                    return resolveRangeOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, rawOffset, true, isStartBound);
                 } else if (frameType == WindowFuncExpr.FrameType.GROUPS) {
+                    int offsetVal = executor.toInt(rawOffset);
                     return resolveGroupsOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, -offsetVal, isStartBound);
                 }
-                return currentIdx - offsetVal;
+                return currentIdx - executor.toInt(rawOffset);
             }
             case FOLLOWING: {
-                int offsetVal = executor.toInt(executor.evalExpr(bound.offset(), null));
+                Object rawOffset = executor.evalExpr(bound.offset(), null);
                 if (frameType == WindowFuncExpr.FrameType.RANGE) {
-                    return resolveRangeOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, offsetVal, isStartBound);
+                    return resolveRangeOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, rawOffset, false, isStartBound);
                 } else if (frameType == WindowFuncExpr.FrameType.GROUPS) {
+                    int offsetVal = executor.toInt(rawOffset);
                     return resolveGroupsOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, offsetVal, isStartBound);
                 }
-                return currentIdx + offsetVal;
+                return currentIdx + executor.toInt(rawOffset);
             }
             default:
                 throw new IllegalStateException("Unknown bound type: " + bound.boundType());
@@ -745,16 +747,17 @@ class SelectWindowEvaluator {
     }
 
     /**
-     * For RANGE frame with numeric offset: find the boundary index by comparing ORDER BY values.
-     * direction is negative for PRECEDING, positive for FOLLOWING.
+     * For RANGE frame with offset: find the boundary index by comparing ORDER BY values.
+     * Supports both numeric and temporal (date/timestamp ± interval) offsets.
+     * @param preceding true for PRECEDING, false for FOLLOWING
      */
     private int resolveRangeOffsetBound(List<SelectStmt.OrderByItem> orderBy,
                                          List<RowContext> contexts,
                                          List<Integer> sortedPartition,
                                          int currentIdx, int partitionSize,
-                                         int direction, boolean isStartBound) {
+                                         Object offset, boolean preceding,
+                                         boolean isStartBound) {
         if (orderBy == null || orderBy.isEmpty()) return isStartBound ? 0 : partitionSize - 1;
-        // Use first ORDER BY expression for RANGE comparison
         Expression orderExpr = orderBy.get(0).expr();
         boolean descending = orderBy.get(0).descending();
         Object currentVal = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(currentIdx)));
@@ -774,33 +777,71 @@ class SelectWindowEvaluator {
             }
             return idx;
         }
-        double currentNum = ((Number) currentVal).doubleValue();
-        // For DESC ordering the offset moves opposite to the value axis:
-        // N PRECEDING means values GREATER than the current one (toward the start
-        // of the descending sequence), N FOLLOWING means values smaller.
-        double boundaryVal = currentNum + (descending ? -direction : direction);
+
+        // Compute boundary value: currentVal ± offset
+        // For PRECEDING: boundary = current - offset (ascending) or current + offset (descending)
+        // For FOLLOWING: boundary = current + offset (ascending) or current - offset (descending)
+        boolean subtract = preceding != descending; // XOR: preceding+asc=sub, preceding+desc=add, following+asc=add, following+desc=sub
+        java.lang.Comparable<?> boundaryVal = computeRangeBoundary(currentVal, offset, subtract);
 
         if (isStartBound) {
-            // Find first row >= boundaryVal (ascending) / <= boundaryVal (descending)
             for (int i = 0; i < partitionSize; i++) {
                 Object v = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(i)));
                 if (v != null) {
-                    double d = ((Number) v).doubleValue();
-                    if (descending ? d <= boundaryVal : d >= boundaryVal) return i;
+                    @SuppressWarnings("unchecked")
+                    int cmp = ((java.lang.Comparable<Object>) boundaryVal).compareTo(v);
+                    // ascending start: first row >= boundary; descending start: first row <= boundary
+                    if (descending ? cmp >= 0 : cmp <= 0) return i;
                 }
             }
-            return partitionSize; // no rows in range
+            return partitionSize;
         } else {
-            // Find last row <= boundaryVal (ascending) / >= boundaryVal (descending)
             for (int i = partitionSize - 1; i >= 0; i--) {
                 Object v = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(i)));
                 if (v != null) {
-                    double d = ((Number) v).doubleValue();
-                    if (descending ? d >= boundaryVal : d <= boundaryVal) return i;
+                    @SuppressWarnings("unchecked")
+                    int cmp = ((java.lang.Comparable<Object>) boundaryVal).compareTo(v);
+                    // ascending end: last row <= boundary; descending end: last row >= boundary
+                    if (descending ? cmp <= 0 : cmp >= 0) return i;
                 }
             }
-            return -1; // no rows in range
+            return -1;
         }
+    }
+
+    /** Compute currentVal ± offset for RANGE frame boundaries. */
+    @SuppressWarnings("unchecked")
+    private java.lang.Comparable<?> computeRangeBoundary(Object currentVal, Object offset, boolean subtract) {
+        if (offset instanceof PgInterval) {
+            PgInterval iv = (PgInterval) offset;
+            long totalDays = iv.getMonths() * 30L + iv.getDays();
+            long totalMicros = iv.getMicroseconds();
+            if (currentVal instanceof java.time.LocalDate) {
+                java.time.LocalDate d = (java.time.LocalDate) currentVal;
+                long days = totalDays + totalMicros / (24L * 3600 * 1_000_000);
+                return subtract ? d.minusDays(days) : d.plusDays(days);
+            }
+            if (currentVal instanceof java.time.LocalDateTime) {
+                java.time.LocalDateTime dt = (java.time.LocalDateTime) currentVal;
+                dt = subtract ? dt.minusDays(totalDays) : dt.plusDays(totalDays);
+                long nanos = totalMicros * 1000;
+                return subtract ? dt.minusNanos(nanos) : dt.plusNanos(nanos);
+            }
+            if (currentVal instanceof java.time.OffsetDateTime) {
+                java.time.OffsetDateTime dt = (java.time.OffsetDateTime) currentVal;
+                dt = subtract ? dt.minusDays(totalDays) : dt.plusDays(totalDays);
+                long nanos = totalMicros * 1000;
+                return subtract ? dt.minusNanos(nanos) : dt.plusNanos(nanos);
+            }
+        }
+        // Numeric offset — preserve the type of currentVal so compareTo works
+        double numOffset = ((Number) offset).doubleValue();
+        double currentNum = ((Number) currentVal).doubleValue();
+        double result = subtract ? currentNum - numOffset : currentNum + numOffset;
+        if (currentVal instanceof Integer) return (int) result;
+        if (currentVal instanceof Long) return (long) result;
+        if (currentVal instanceof Float) return (float) result;
+        return result;
     }
 
     /**

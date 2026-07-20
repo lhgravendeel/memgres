@@ -1431,14 +1431,70 @@ public class PlpgsqlExecutor {
             appendValue(sb, paramVal);
             literals.add(sb.toString().trim());
         }
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\$([0-9]+)").matcher(sql);
-        StringBuffer out = new StringBuffer();
-        while (m.find()) {
-            int idx = Integer.parseInt(m.group(1));
-            String replacement = (idx >= 1 && idx <= literals.size()) ? literals.get(idx - 1) : m.group(0);
-            m.appendReplacement(out, java.util.regex.Matcher.quoteReplacement(replacement));
+        // Replace $N placeholders but skip those inside string literals and dollar-quoted strings.
+        // We lex through the SQL character by character, tracking quoting state.
+        StringBuilder out = new StringBuilder(sql.length());
+        int len = sql.length();
+        for (int i = 0; i < len; ) {
+            char c = sql.charAt(i);
+            // Single-quoted string literal
+            if (c == '\'') {
+                int end = i + 1;
+                while (end < len) {
+                    if (sql.charAt(end) == '\'') {
+                        if (end + 1 < len && sql.charAt(end + 1) == '\'') {
+                            end += 2; // escaped quote
+                        } else {
+                            end++;
+                            break;
+                        }
+                    } else {
+                        end++;
+                    }
+                }
+                out.append(sql, i, end);
+                i = end;
+                continue;
+            }
+            // Dollar-quoted string
+            if (c == '$') {
+                // Check for dollar-quote tag: $tag$ or $$
+                int tagStart = i;
+                int tagEnd = i + 1;
+                while (tagEnd < len && (Character.isLetterOrDigit(sql.charAt(tagEnd)) || sql.charAt(tagEnd) == '_')) {
+                    tagEnd++;
+                }
+                if (tagEnd < len && sql.charAt(tagEnd) == '$') {
+                    String tag = sql.substring(tagStart, tagEnd + 1);
+                    int bodyStart = tagEnd + 1;
+                    int closeIdx = sql.indexOf(tag, bodyStart);
+                    if (closeIdx >= 0) {
+                        out.append(sql, i, closeIdx + tag.length());
+                        i = closeIdx + tag.length();
+                        continue;
+                    }
+                }
+                // Not a dollar-quote; check for $N parameter reference
+                if (i + 1 < len && Character.isDigit(sql.charAt(i + 1))) {
+                    int numStart = i + 1;
+                    int numEnd = numStart;
+                    while (numEnd < len && Character.isDigit(sql.charAt(numEnd))) numEnd++;
+                    int idx = Integer.parseInt(sql.substring(numStart, numEnd));
+                    if (idx >= 1 && idx <= literals.size()) {
+                        out.append(literals.get(idx - 1));
+                    } else {
+                        out.append(sql, i, numEnd);
+                    }
+                    i = numEnd;
+                    continue;
+                }
+                out.append(c);
+                i++;
+                continue;
+            }
+            out.append(c);
+            i++;
         }
-        m.appendTail(out);
         return out.toString();
     }
 
@@ -1895,9 +1951,12 @@ public class PlpgsqlExecutor {
                 }
             }
 
+            int substDepth = 0; // track paren depth during substitution
             for (int i = 0; i < tokens.size(); i++) {
                 Token t = tokens.get(i);
                 if (t.type() == TokenType.EOF) break;
+                if (t.type() == TokenType.LEFT_PAREN) substDepth++;
+                else if (t.type() == TokenType.RIGHT_PAREN) substDepth--;
 
                 // Handle function-name-qualified reference: funcname.x. In PG, the hidden outer
                 // block labeled with the function name contains ONLY the parameters, so this
@@ -1999,9 +2058,19 @@ public class PlpgsqlExecutor {
                         // default plpgsql.variable_conflict = error) raises 42702; SQL-language
                         // functions resolve it in favor of the column.
                         String lowerName = t.value().toLowerCase();
-                        boolean conflictsWithColumn = scan.scopeColumns.contains(lowerName)
-                                || (scan.returningIdx >= 0 && i > scan.returningIdx
-                                    && scan.insertTargetColumns.contains(lowerName));
+                        // A variable conflicts with a column only when the identifier appears at the
+                        // same paren depth as (or deeper than) the FROM/JOIN that introduced the column.
+                        // This avoids false positives when a subquery references a table whose column
+                        // name matches an outer variable used outside the subquery.
+                        boolean conflictsWithColumn = false;
+                        if (scan.scopeColumns.contains(lowerName)) {
+                            Integer colDepth = scan.scopeColumnDepths.get(lowerName);
+                            conflictsWithColumn = colDepth == null || substDepth >= colDepth;
+                        }
+                        if (!conflictsWithColumn && scan.returningIdx >= 0 && i > scan.returningIdx
+                                    && scan.insertTargetColumns.contains(lowerName)) {
+                            conflictsWithColumn = true;
+                        }
                         if (conflictsWithColumn) {
                             if (!columnWins) {
                                 throw new MemgresException(
@@ -2059,6 +2128,8 @@ public class PlpgsqlExecutor {
         final java.util.Set<Integer> protectedTokens = new java.util.HashSet<>();
         /** Lower-cased column names of tables whose columns are in scope for expressions. */
         final java.util.Set<String> scopeColumns = new java.util.HashSet<>();
+        /** Minimum paren depth at which each scope column was found. */
+        final java.util.Map<String, Integer> scopeColumnDepths = new java.util.HashMap<>();
         /** Lower-cased column names of an INSERT's target table (in scope only after RETURNING). */
         final java.util.Set<String> insertTargetColumns = new java.util.HashSet<>();
         /** Lower-cased table names, schema names and aliases referenced by the statement. */
@@ -2148,7 +2219,16 @@ public class PlpgsqlExecutor {
                 // Top-level UPDATE target table: its columns are in scope for SET/WHERE/RETURNING
                 i = collectTableList(tokens, i + 1, scan, scan.scopeColumns, false, true);
             } else if ((w.equals("FROM") || w.equals("JOIN")) && inQueryContext) {
+                // Record the depth at which FROM/JOIN tables are found, so we only flag
+                // ambiguity when a variable reference is at the same paren depth.
+                int sizeBefore = scan.scopeColumns.size();
                 i = collectTableList(tokens, i + 1, scan, scan.scopeColumns, w.equals("FROM"), false);
+                // Track depth for newly added columns
+                for (String col : scan.scopeColumns) {
+                    if (!scan.scopeColumnDepths.containsKey(col)) {
+                        scan.scopeColumnDepths.put(col, depth);
+                    }
+                }
             } else if (w.equals("USING") && inQueryContext
                     && i + 1 < tokens.size() && tokens.get(i + 1).type() != TokenType.LEFT_PAREN) {
                 // DELETE ... USING / MERGE ... USING table list (JOIN ... USING (cols) is excluded

@@ -399,7 +399,12 @@ class ExprSpecialFormParser {
             ep.expectKeyword("ROW");
             return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.CURRENT_ROW, null);
         }
+        // Parse offset expression including ::type casts (e.g. '1 day'::interval)
         Expression offset = ep.parsePrimary();
+        while (ep.match(TokenType.CAST)) {
+            String typeName = ep.parseTypeName();
+            offset = new CastExpr(offset, typeName);
+        }
         if (ep.matchKeyword("PRECEDING")) return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.PRECEDING, offset);
         ep.expectKeyword("FOLLOWING");
         return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.FOLLOWING, offset);
