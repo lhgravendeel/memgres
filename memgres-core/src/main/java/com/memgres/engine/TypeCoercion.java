@@ -289,6 +289,13 @@ public final class TypeCoercion {
             case HSTORE:
                 if (value instanceof HstoreValue) return value;
                 return HstoreValue.parse(value.toString());
+            case TSVECTOR:
+                if (value instanceof TsVector) return value;
+                TsVector tv = TsVector.parseLiteral(value.toString());
+                return tv != null ? tv : TsVector.empty();
+            case TSQUERY:
+                if (value instanceof TsQuery) return value;
+                return TsQuery.parse(value.toString());
             default:
                 return value;
         }
@@ -407,6 +414,10 @@ public final class TypeCoercion {
                 return value instanceof Macaddr8Value;
             case HSTORE:
                 return value instanceof HstoreValue;
+            case TSVECTOR:
+                return value instanceof TsVector;
+            case TSQUERY:
+                return value instanceof TsQuery;
             default:
                 return value instanceof String;
         }

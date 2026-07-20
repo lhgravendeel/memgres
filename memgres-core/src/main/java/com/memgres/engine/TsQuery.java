@@ -32,15 +32,24 @@ public class TsQuery {
 
     public static TsQuery term(String t) {
         String stemmed = TsVector.simpleStem(t.toLowerCase());
-        // Treat stop words as empty terms (matches anything, like PG behavior)
         if (TsVector.isStopWord(stemmed)) stemmed = "";
         return new TsQuery(Op.TERM, stemmed, false, null, null, null, 0);
+    }
+
+    /** Create a term with explicit stemming control. */
+    public static TsQuery termRaw(String t) {
+        return new TsQuery(Op.TERM, t, false, null, null, null, 0);
     }
 
     public static TsQuery term(String t, boolean prefix, Set<Character> weights) {
         String stemmed = TsVector.simpleStem(t.toLowerCase());
         if (TsVector.isStopWord(stemmed)) stemmed = "";
         return new TsQuery(Op.TERM, stemmed, prefix, weights, null, null, 0);
+    }
+
+    /** Create a term without stemming (for 'simple' config). */
+    public static TsQuery termSimple(String t, boolean prefix, Set<Character> weights) {
+        return new TsQuery(Op.TERM, t.toLowerCase(), prefix, weights, null, null, 0);
     }
 
     public static TsQuery and(TsQuery l, TsQuery r) {
@@ -59,6 +68,11 @@ public class TsQuery {
         return new TsQuery(Op.PHRASE, null, false, null, l, r, distance);
     }
 
+    /** Create an empty query (represents the empty tsquery value). */
+    public static TsQuery emptyQuery() {
+        return new TsQuery(Op.TERM, "", false, null, null, null, 0);
+    }
+
     public Op getOp() { return op; }
     public String getTerm() { return term; }
     public TsQuery getLeft() { return left; }
@@ -67,12 +81,19 @@ public class TsQuery {
     public boolean isPrefix() { return prefix; }
     public Set<Character> getWeights() { return weights; }
 
+    /** Check if this query is empty (represents ''::tsquery or stopword-only result). */
+    public boolean isEmpty() {
+        if (op == Op.TERM && (term == null || term.isEmpty()) && !prefix) return true;
+        return false;
+    }
+
     /**
      * Parse a tsquery string like 'word1 & word2 | !word3' or 'fat <-> cat' or 'pre:*A'.
      */
     public static TsQuery parse(String input) {
-        if (input == null || input.trim().isEmpty()) return term("");
+        if (input == null || input.trim().isEmpty()) return emptyQuery();
         List<String> tokens = tokenize(input);
+        if (tokens.isEmpty()) return emptyQuery();
         int[] pos = {0};
         return parseOr(tokens, pos);
     }
@@ -106,7 +127,6 @@ public class TsQuery {
                 TsQuery right = parsePrimary(tokens, pos);
                 left = phrase(left, right, 1);
             } else if (tok.startsWith("<") && tok.endsWith(">")) {
-                // <N> distance operator
                 try {
                     int dist = Integer.parseInt(tok.substring(1, tok.length() - 1));
                     pos[0]++;
@@ -123,9 +143,13 @@ public class TsQuery {
     }
 
     private static TsQuery parsePrimary(List<String> tokens, int[] pos) {
-        if (pos[0] >= tokens.size()) return term("");
+        if (pos[0] >= tokens.size()) return emptyQuery();
         String t = tokens.get(pos[0]);
-        if (t.equals("!") || t.equals("!!")) {
+        if (t.equals("!")) {
+            pos[0]++;
+            return not(parsePrimary(tokens, pos));
+        }
+        if (t.equals("!!")) {
             pos[0]++;
             return not(parsePrimary(tokens, pos));
         }
@@ -232,7 +256,6 @@ public class TsQuery {
             case TERM: {
                 if (term == null || term.isEmpty()) return true;
                 if (prefix) {
-                    // Prefix match: check if any lexeme starts with term
                     boolean found = vector.getLexemes().stream()
                             .anyMatch(l -> l.startsWith(term));
                     if (found && weights != null) {
@@ -259,10 +282,13 @@ public class TsQuery {
                     // For complex phrase subexpressions, fall back to AND
                     return left.matches(vector) && right.matches(vector);
                 }
+                if (left.term == null || left.term.isEmpty() || right.term == null || right.term.isEmpty()) {
+                    // Empty terms (from stopwords) match anything
+                    return left.matches(vector) && right.matches(vector);
+                }
                 List<Integer> leftPositions = vector.getPositions(left.term);
                 List<Integer> rightPositions = vector.getPositions(right.term);
                 if (leftPositions.isEmpty() || rightPositions.isEmpty()) return false;
-                // Check if any right position = left position + phraseDistance
                 for (int lp : leftPositions) {
                     for (int rp : rightPositions) {
                         if (rp - lp == phraseDistance) return true;
@@ -309,24 +335,52 @@ public class TsQuery {
         }
     }
 
-    /** Return a text representation of the query tree (like querytree()). */
+    /** Return a text representation of the query tree (like PG's querytree()).
+     *  PG's querytree() strips NOT branches entirely and shows 'T' for them. */
     public String queryTree() {
+        // If the entire query is just NOT, return 'T'
+        if (op == Op.NOT) return "T";
+        return queryTreeInner();
+    }
+
+    private String queryTreeInner() {
         switch (op) {
             case TERM: {
                 if (term == null || term.isEmpty()) return "T";
                 return "'" + term + "'";
             }
-            case AND:
-                return "( " + left.queryTree() + " & " + right.queryTree() + " )";
-            case OR:
-                return "( " + left.queryTree() + " | " + right.queryTree() + " )";
+            case AND: {
+                String l = stripNot(left);
+                String r = stripNot(right);
+                if ("T".equals(l) && "T".equals(r)) return "T";
+                if ("T".equals(l)) return r;
+                if ("T".equals(r)) return l;
+                return "( " + l + " & " + r + " )";
+            }
+            case OR: {
+                String l = stripNot(left);
+                String r = stripNot(right);
+                if ("T".equals(l) && "T".equals(r)) return "T";
+                if ("T".equals(l)) return r;
+                if ("T".equals(r)) return l;
+                return "( " + l + " | " + r + " )";
+            }
             case NOT:
-                return "!( " + left.queryTree() + " )";
-            case PHRASE:
-                return "( " + left.queryTree() + " <" + phraseDistance + "> " + right.queryTree() + " )";
+                return "T";
+            case PHRASE: {
+                String l = stripNot(left);
+                String r = stripNot(right);
+                if ("T".equals(l) || "T".equals(r)) return "T";
+                return "( " + l + " <" + phraseDistance + "> " + r + " )";
+            }
             default:
                 throw new IllegalStateException("Unknown op: " + op);
         }
+    }
+
+    private static String stripNot(TsQuery q) {
+        if (q.op == Op.NOT) return "T";
+        return q.queryTreeInner();
     }
 
     /** Collect all terms from the query. */
@@ -346,28 +400,57 @@ public class TsQuery {
 
     @Override
     public String toString() {
+        // PG displays empty tsquery as empty string
+        if (isEmpty()) return "";
+        return toStringInner(false, null);
+    }
+
+    private String toStringInner(boolean parentNeedsParens, Op parentOp) {
         switch (op) {
             case TERM: {
-                StringBuilder sb = new StringBuilder("'").append(term != null ? term : "").append("'");
+                if (term == null || term.isEmpty()) return "";
+                StringBuilder sb = new StringBuilder("'").append(term).append("'");
                 if (prefix || weights != null) {
                     sb.append(":");
-                    if (prefix) sb.append("*");
                     if (weights != null) {
                         List<Character> sorted = new ArrayList<>(weights);
                         Collections.sort(sorted);
                         for (char w : sorted) sb.append(w);
                     }
+                    if (prefix) sb.append("*");
                 }
                 return sb.toString();
             }
-            case AND:
-                return left + " & " + right;
-            case OR:
-                return left + " | " + right;
-            case NOT:
-                return "!" + left;
-            case PHRASE:
-                return left + " " + (phraseDistance == 1 ? "<->" : "<" + phraseDistance + ">") + " " + right;
+            case AND: {
+                String l = left.toStringInner(true, Op.AND);
+                String r = right.toStringInner(true, Op.AND);
+                String result = l + " & " + r;
+                // Need parens if parent is a phrase or if this is inside a NOT
+                if (parentOp == Op.PHRASE) return "( " + result + " )";
+                return result;
+            }
+            case OR: {
+                String l = left.toStringInner(true, Op.OR);
+                String r = right.toStringInner(true, Op.OR);
+                String result = l + " | " + r;
+                // OR has lower precedence than AND and PHRASE
+                if (parentOp == Op.AND || parentOp == Op.PHRASE) return "( " + result + " )";
+                return result;
+            }
+            case NOT: {
+                String inner = left.toStringInner(true, Op.NOT);
+                // If the child is a compound expr, it will have its own parens
+                if (left.op == Op.AND || left.op == Op.OR || left.op == Op.PHRASE) {
+                    return "!( " + left.toStringInner(false, null) + " )";
+                }
+                return "!" + inner;
+            }
+            case PHRASE: {
+                String l = left.toStringInner(true, Op.PHRASE);
+                String r = right.toStringInner(true, Op.PHRASE);
+                String distStr = phraseDistance == 1 ? "<->" : "<" + phraseDistance + ">";
+                return l + " " + distStr + " " + r;
+            }
             default:
                 throw new IllegalStateException("Unknown op: " + op);
         }

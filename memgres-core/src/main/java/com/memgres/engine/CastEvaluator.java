@@ -512,8 +512,13 @@ class CastEvaluator {
                 return GeometricOperations.format(GeometricOperations.parsePolygon(val.toString()));
             case "circle":
                 return GeometricOperations.format(GeometricOperations.parseCircle(val.toString()));
-            case "tsvector":
-                return val instanceof TsVector ? ((TsVector) val) : TsVector.fromText(val.toString());
+            case "tsvector": {
+                if (val instanceof TsVector) return val;
+                String tsInput = val.toString();
+                // ::tsvector cast uses tsvector input format (literal parsing), NOT to_tsvector
+                TsVector parsed = TsVector.parseLiteral(tsInput);
+                return parsed != null ? parsed : TsVector.empty();
+            }
             case "tsquery":
                 return val instanceof TsQuery ? ((TsQuery) val) : TsQuery.parse(val.toString());
             case "xml":

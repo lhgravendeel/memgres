@@ -12,69 +12,194 @@ import java.util.regex.Pattern;
  */
 public class TextSearchOperations {
 
-    /** phraseto_tsquery: treats input as a phrase (words connected by <->). */
+    /** phraseto_tsquery: treats input as a phrase (words connected by <N> where N accounts for stopwords).
+     *  Stopwords are removed and their positions are accounted for by increasing the distance. */
     public static TsQuery phraseToTsQuery(String input) {
-        if (input == null || input.trim().isEmpty()) return TsQuery.term("");
-        String[] words = input.trim().split("\\s+");
-        List<String> filtered = new ArrayList<>();
+        return phraseToTsQuery(input, "english");
+    }
+
+    public static TsQuery phraseToTsQuery(String input, String config) {
+        if (input == null || input.trim().isEmpty()) return TsQuery.emptyQuery();
+        boolean isSimple = "simple".equalsIgnoreCase(config);
+
+        // Strip punctuation and tokenize
+        String cleaned = input.replaceAll("[^a-zA-Z0-9\\s]", " ");
+        String[] words = cleaned.trim().split("\\s+");
+
+        List<String> stems = new ArrayList<>();
+        List<Integer> origPositions = new ArrayList<>(); // original word index (1-based)
+        int wordIdx = 0;
         for (String w : words) {
-            if (!w.isEmpty()) filtered.add(w);
+            if (w.isEmpty()) continue;
+            wordIdx++;
+            String lower = w.toLowerCase();
+            if (isSimple) {
+                stems.add(lower);
+                origPositions.add(wordIdx);
+            } else {
+                if (TsVector.isStopWord(lower)) continue;
+                stems.add(TsVector.simpleStem(lower));
+                origPositions.add(wordIdx);
+            }
         }
-        if (filtered.isEmpty()) return TsQuery.term("");
-        if (filtered.size() == 1) return TsQuery.term(filtered.get(0));
-        TsQuery result = TsQuery.term(filtered.get(0));
-        for (int i = 1; i < filtered.size(); i++) {
-            result = TsQuery.phrase(result, TsQuery.term(filtered.get(i)), 1);
+        if (stems.isEmpty()) return TsQuery.emptyQuery();
+        if (stems.size() == 1) return TsQuery.termRaw(stems.get(0));
+
+        // Build phrase chain with correct distances accounting for removed stopwords
+        TsQuery result = TsQuery.termRaw(stems.get(0));
+        for (int i = 1; i < stems.size(); i++) {
+            int distance = origPositions.get(i) - origPositions.get(i - 1);
+            result = TsQuery.phrase(result, TsQuery.termRaw(stems.get(i)), distance);
+        }
+        return result;
+    }
+
+    /** plainto_tsquery: words joined by AND, no special chars, strip punctuation. */
+    public static TsQuery plainToTsQuery(String input, String config) {
+        if (input == null || input.trim().isEmpty()) return TsQuery.emptyQuery();
+        boolean isSimple = "simple".equalsIgnoreCase(config);
+
+        // Strip punctuation
+        String cleaned = input.replaceAll("[^a-zA-Z0-9\\s]", " ");
+        String[] words = cleaned.trim().split("\\s+");
+        List<TsQuery> terms = new ArrayList<>();
+        for (String w : words) {
+            if (w.isEmpty()) continue;
+            String lower = w.toLowerCase();
+            if (isSimple) {
+                terms.add(TsQuery.termRaw(lower));
+            } else {
+                if (TsVector.isStopWord(lower)) continue;
+                terms.add(TsQuery.termRaw(TsVector.simpleStem(lower)));
+            }
+        }
+        if (terms.isEmpty()) return TsQuery.emptyQuery();
+        TsQuery result = terms.get(0);
+        for (int i = 1; i < terms.size(); i++) {
+            result = TsQuery.and(result, terms.get(i));
         }
         return result;
     }
 
     /** websearch_to_tsquery: Google-style query parsing. Quoted = phrase, - = NOT, OR = OR, rest = AND. */
     public static TsQuery websearchToTsQuery(String input) {
-        if (input == null || input.trim().isEmpty()) return TsQuery.term("");
-        List<TsQuery> parts = new ArrayList<>();
-        Matcher quoteMatcher = Pattern.compile("\"([^\"]+)\"").matcher(input);
-        String remaining = input;
-        int lastEnd = 0;
+        return websearchToTsQuery(input, "english");
+    }
 
-        while (quoteMatcher.find()) {
-            // Process unquoted text before this quote
-            String before = remaining.substring(lastEnd, quoteMatcher.start());
-            addWebsearchTerms(before, parts);
-            // Process quoted phrase
-            String phrase = quoteMatcher.group(1);
-            TsQuery phraseQuery = phraseToTsQuery(phrase);
-            parts.add(phraseQuery);
-            lastEnd = quoteMatcher.end();
+    public static TsQuery websearchToTsQuery(String input, String config) {
+        if (input == null || input.trim().isEmpty()) return TsQuery.emptyQuery();
+        List<TsQuery> parts = new ArrayList<>();
+        int i = 0;
+        String s = input.trim();
+
+        while (i < s.length()) {
+            // Skip whitespace
+            while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
+            if (i >= s.length()) break;
+
+            char c = s.charAt(i);
+
+            if (c == '"') {
+                // Quoted phrase
+                int end = s.indexOf('"', i + 1);
+                if (end < 0) end = s.length();
+                String phrase = s.substring(i + 1, end);
+                i = end + 1;
+                TsQuery pq = phraseToTsQuery(phrase, config);
+                if (!pq.isEmpty()) {
+                    addWebPart(parts, pq, false);
+                }
+            } else if (c == '-' && i + 1 < s.length()) {
+                i++;
+                // Negation
+                if (i < s.length() && s.charAt(i) == '"') {
+                    // -"phrase"
+                    int end = s.indexOf('"', i + 1);
+                    if (end < 0) end = s.length();
+                    String phrase = s.substring(i + 1, end);
+                    i = end + 1;
+                    TsQuery pq = phraseToTsQuery(phrase, config);
+                    if (!pq.isEmpty()) {
+                        addWebPart(parts, TsQuery.not(pq), false);
+                    }
+                } else {
+                    // -word
+                    StringBuilder sb = new StringBuilder();
+                    while (i < s.length() && !Character.isWhitespace(s.charAt(i)) && s.charAt(i) != '"') {
+                        sb.append(s.charAt(i));
+                        i++;
+                    }
+                    String word = sb.toString();
+                    if (!word.isEmpty()) {
+                        String cleaned = word.replaceAll("[^a-zA-Z0-9]", "");
+                        if (!cleaned.isEmpty()) {
+                            TsQuery tq = "simple".equalsIgnoreCase(config)
+                                ? TsQuery.termRaw(cleaned.toLowerCase())
+                                : TsQuery.term(cleaned);
+                            if (!tq.isEmpty()) {
+                                addWebPart(parts, TsQuery.not(tq), false);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Regular word or OR
+                StringBuilder sb = new StringBuilder();
+                while (i < s.length() && !Character.isWhitespace(s.charAt(i)) && s.charAt(i) != '"') {
+                    sb.append(s.charAt(i));
+                    i++;
+                }
+                String tok = sb.toString();
+                if (tok.equalsIgnoreCase("or")) {
+                    // Mark last part as needing OR with next
+                    if (!parts.isEmpty()) {
+                        // Set flag for OR
+                        addWebPart(parts, null, true);
+                    }
+                } else {
+                    String cleaned = tok.replaceAll("[^a-zA-Z0-9]", "");
+                    if (!cleaned.isEmpty()) {
+                        TsQuery tq = "simple".equalsIgnoreCase(config)
+                            ? TsQuery.termRaw(cleaned.toLowerCase())
+                            : TsQuery.term(cleaned);
+                        if (!tq.isEmpty()) {
+                            addWebPart(parts, tq, false);
+                        }
+                    }
+                }
+            }
         }
-        // Process remaining text after last quote
-        if (lastEnd < remaining.length()) {
-            addWebsearchTerms(remaining.substring(lastEnd), parts);
+
+        // Build final query: process OR markers
+        List<TsQuery> finalParts = new ArrayList<>();
+        for (int j = 0; j < parts.size(); j++) {
+            TsQuery p = parts.get(j);
+            if (p == null) continue; // OR marker
+            if (j + 2 < parts.size() && parts.get(j + 1) == null) {
+                // This part OR next part
+                TsQuery next = parts.get(j + 2);
+                if (next != null) {
+                    finalParts.add(TsQuery.or(p, next));
+                    j += 2;
+                    continue;
+                }
+            }
+            finalParts.add(p);
         }
-        if (parts.isEmpty()) return TsQuery.term("");
-        TsQuery result = parts.get(0);
-        for (int i = 1; i < parts.size(); i++) {
-            result = TsQuery.and(result, parts.get(i));
+
+        if (finalParts.isEmpty()) return TsQuery.emptyQuery();
+        TsQuery result = finalParts.get(0);
+        for (int j = 1; j < finalParts.size(); j++) {
+            result = TsQuery.and(result, finalParts.get(j));
         }
         return result;
     }
 
-    private static void addWebsearchTerms(String text, List<TsQuery> parts) {
-        String[] tokens = text.trim().split("\\s+");
-        for (int i = 0; i < tokens.length; i++) {
-            String tok = tokens[i].trim();
-            if (tok.isEmpty()) continue;
-            if (tok.equalsIgnoreCase("OR") && !parts.isEmpty() && i + 1 < tokens.length) {
-                // OR: combine previous with next
-                String next = tokens[++i].trim();
-                if (next.isEmpty()) continue;
-                TsQuery prev = parts.remove(parts.size() - 1);
-                parts.add(TsQuery.or(prev, TsQuery.term(next)));
-            } else if (tok.startsWith("-") && tok.length() > 1) {
-                parts.add(TsQuery.not(TsQuery.term(tok.substring(1))));
-            } else {
-                parts.add(TsQuery.term(tok));
-            }
+    private static void addWebPart(List<TsQuery> parts, TsQuery q, boolean isOr) {
+        if (isOr) {
+            parts.add(null); // OR marker
+        } else {
+            parts.add(q);
         }
     }
 
@@ -91,8 +216,7 @@ public class TextSearchOperations {
         String stopSel = "</b>";
         int maxWords = 35;
         int minWords = 15;
-        String shortWord = "";
-        String maxFragments = "0";
+        boolean highlightAll = false;
 
         if (options != null) {
             for (String opt : options.split(",")) {
@@ -113,44 +237,49 @@ public class TextSearchOperations {
                         case "minwords":
                             minWords = Integer.parseInt(val);
                             break;
+                        case "highlightall":
+                            highlightAll = val.equalsIgnoreCase("true") || val.equals("1");
+                            break;
                     }
                 }
             }
         }
 
+        // Strip HTML tags from the document for matching
+        String stripped = document.replaceAll("<[^>]+>", "");
+
         // Collect terms from query
         List<String> terms = query.collectTerms();
         Set<String> termSet = new HashSet<>(terms);
 
-        String[] words = document.split("\\s+");
+        String[] words = stripped.split("\\s+");
         StringBuilder sb = new StringBuilder();
         int shown = 0;
         boolean inFragment = false;
         int lastMatchIdx = -1;
+        boolean outputtingMinWords = true;
 
-        boolean outputtingMinWords = true; // track whether we're in the initial minWords segment
-        for (int i = 0; i < words.length && shown < maxWords; i++) {
-            String word = words[i];
+        for (int idx = 0; idx < words.length && (highlightAll || shown < maxWords); idx++) {
+            String word = words[idx];
             String stem = TsVector.simpleStem(word.toLowerCase().replaceAll("[^a-zA-Z0-9]", ""));
             boolean isMatch = termSet.contains(stem);
             if (isMatch) {
-                lastMatchIdx = i;
-                // Only add "..." separator when there's an actual gap (not during initial output)
+                lastMatchIdx = idx;
                 if (!inFragment && sb.length() > 0 && !outputtingMinWords) sb.append("... ");
                 inFragment = true;
             }
-            if (inFragment || shown < minWords) {
+            if (inFragment || shown < minWords || highlightAll) {
                 if (isMatch) {
                     sb.append(startSel).append(word).append(stopSel);
                 } else {
                     sb.append(word);
                 }
-                if (i < words.length - 1) sb.append(" ");
+                if (idx < words.length - 1) sb.append(" ");
                 shown++;
             } else {
                 outputtingMinWords = false;
             }
-            if (inFragment && !isMatch && i - lastMatchIdx > 5) {
+            if (inFragment && !isMatch && idx - lastMatchIdx > 5) {
                 inFragment = false;
                 outputtingMinWords = false;
             }
@@ -165,7 +294,6 @@ public class TextSearchOperations {
 
     /** ts_rewrite: replace occurrences of target query with substitute in query tree. */
     public static TsQuery tsRewrite(TsQuery query, TsQuery target, TsQuery substitute) {
-        // Simple: if query matches target structure, replace
         if (queryEquals(query, target)) return substitute;
         if (query.getOp() == TsQuery.Op.TERM) return query;
         if (query.getOp() == TsQuery.Op.NOT) {
@@ -230,7 +358,6 @@ public class TextSearchOperations {
         String[] words = text.split("\\s+");
         for (String word : words) {
             if (!word.isEmpty()) {
-                // tokid 1 = word, 12 = blank
                 result.add(new Object[]{1, word});
             }
         }
@@ -268,8 +395,6 @@ public class TextSearchOperations {
 
     /** ts_stat: statistics for a tsvector column query. */
     public static List<Object[]> tsStat(String sqlResult) {
-        // Returns word | ndoc | nentry
-        // Since we can't execute SQL here, return empty
         return Cols.listOf();
     }
 
@@ -288,7 +413,6 @@ public class TextSearchOperations {
                 positions.add(pe.position());
                 weights.add(pe.weight());
             }
-            // Format as arrays
             String posArr = "{" + positions.stream().map(String::valueOf).reduce((a, b) -> a + "," + b).orElse("") + "}";
             String wArr = "{" + weights.stream().map(String::valueOf).reduce((a, b) -> a + "," + b).orElse("") + "}";
             result.add(new Object[]{entry.getKey(), posArr, wArr});
