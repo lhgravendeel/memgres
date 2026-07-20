@@ -629,7 +629,7 @@ class XmlCoverageTest {
              ResultSet rs = st.executeQuery("SELECT table_to_xml('xml_data', true, false, '')")) {
             assertTrue(rs.next());
             String result = rs.getString(1);
-            assertTrue(result.contains("<xml_data>"));
+            assertTrue(result.contains("<xml_data"), "Should contain opening xml_data tag");
             assertTrue(result.contains("<row>"));
             assertTrue(result.contains("<name>doc1</name>"));
             assertTrue(result.contains("</xml_data>"));

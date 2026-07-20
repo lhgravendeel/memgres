@@ -1188,8 +1188,9 @@ class SelectAggregateEvaluator {
                 return sb4.toString();
             }
             case "xmlagg": {
+                List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
                 StringBuilder sb = new StringBuilder();
-                for (RowContext r : group) {
+                for (RowContext r : orderedGroup) {
                     Object v = executor.evalExpr(fn.args().get(0), r);
                     if (v != null) sb.append(v);
                 }

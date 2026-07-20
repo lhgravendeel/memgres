@@ -64,11 +64,15 @@ class XmlFunctions {
                     } else {
                         Object val = executor.evalExpr(argExpr, ctx);
                         if (val == null && argExpr instanceof Literal && ((Literal) argExpr).literalType() == Literal.LiteralType.NULL) {
-                            Literal lit = (Literal) argExpr;
                             // Skip null placeholder for attributes
                             continue;
                         }
-                        contents.add(val == null ? null : XmlOperations.escapeXml(val.toString()));
+                        // XML-producing expressions: pass through without escaping (PG behavior)
+                        if (val != null && isXmlExpr(argExpr)) {
+                            contents.add(val.toString());
+                        } else {
+                            contents.add(val == null ? null : XmlOperations.escapeXml(val.toString()));
+                        }
                     }
                 }
                 return XmlOperations.xmlelement(tagName, attributes, contents);
@@ -139,8 +143,12 @@ class XmlFunctions {
             case "xpath": {
                 String xpathExpr = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
                 String xml = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                List<String> results = XmlOperations.xpath(xpathExpr, xml);
-                return "{" + String.join(",", results) + "}";
+                Map<String, String> nsMap = null;
+                if (fn.args().size() > 2) {
+                    nsMap = parseNamespaceArray(executor.evalExpr(fn.args().get(2), ctx));
+                }
+                List<String> results = XmlOperations.xpath(xpathExpr, xml, nsMap);
+                return XmlOperations.formatXpathResult(results);
             }
             case "xpath_exists": {
                 String xpathExpr = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
@@ -182,5 +190,40 @@ class XmlFunctions {
             default:
                 return NOT_HANDLED;
         }
+    }
+
+    /** Check if an expression produces XML (and thus should not be escaped). */
+    private static boolean isXmlExpr(Expression expr) {
+        if (expr instanceof FunctionCallExpr) {
+            String n = ((FunctionCallExpr) expr).name().toLowerCase();
+            return n.startsWith("xml") || n.equals("__xmlattributes__");
+        }
+        if (expr instanceof CastExpr) {
+            String targetType = ((CastExpr) expr).typeName().toLowerCase();
+            return targetType.equals("xml");
+        }
+        return false;
+    }
+
+    /** Parse a PG namespace array like ARRAY[ARRAY['prefix','uri'], ...] into a Map. */
+    private static Map<String, String> parseNamespaceArray(Object nsArrayObj) {
+        if (nsArrayObj == null) return null;
+        String s = nsArrayObj.toString().trim();
+        if (s.isEmpty() || s.equals("{}")) return null;
+        Map<String, String> nsMap = new LinkedHashMap<>();
+        // Parse {{prefix,uri},{prefix,uri}} or similar
+        s = s.replaceAll("^\\{|\\}$", "");
+        // Split on "},{" to get pairs
+        String[] pairs = s.split("\\}\\s*,\\s*\\{");
+        for (String pair : pairs) {
+            pair = pair.replaceAll("^\\{|\\}$", "");
+            String[] parts = pair.split(",", 2);
+            if (parts.length == 2) {
+                String prefix = parts[0].trim().replaceAll("^\"|\"$", "");
+                String uri = parts[1].trim().replaceAll("^\"|\"$", "");
+                nsMap.put(prefix, uri);
+            }
+        }
+        return nsMap.isEmpty() ? null : nsMap;
     }
 }

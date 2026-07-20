@@ -38,6 +38,26 @@ public final class XmlOperations {
         return text;
     }
 
+    /** Validate a string as XML content (for ::xml cast). Throws 2200N on failure. */
+    public static String validateXmlCast(String text) {
+        if (text == null) return null;
+        text = text.trim();
+        // Try as document first
+        try {
+            parseDocument(text);
+            return text;
+        } catch (MemgresException e) {
+            // Try as content
+        }
+        // Try as content — this throws 2200N on failure
+        try {
+            parseContent(text);
+        } catch (MemgresException e) {
+            throw new MemgresException("invalid XML content: " + extractXmlError(text), "2200N");
+        }
+        return text;
+    }
+
     /** XMLSERIALIZE(CONTENT xml AS text) or XMLSERIALIZE(DOCUMENT xml AS type) */
     public static String xmlserialize(String xml) {
         if (xml == null) return null;
@@ -118,14 +138,14 @@ public final class XmlOperations {
         return escapeXml(text);
     }
 
-    /** xmlcomment(text): creates an XML comment: <!-- text -->. */
+    /** xmlcomment(text): creates an XML comment: &lt;!-- text --&gt;. */
     public static String xmlcomment(String text) {
         if (text == null) return null;
         if (text.contains("--")) {
-            throw new MemgresException("XML comment must not contain \"--\"");
+            throw new MemgresException("XML comment must not contain \"--\"", "2200S");
         }
         if (text.endsWith("-")) {
-            throw new MemgresException("XML comment must not end with \"-\"");
+            throw new MemgresException("XML comment must not end with \"-\"", "2200S");
         }
         return "<!--" + text + "-->";
     }
@@ -149,14 +169,17 @@ public final class XmlOperations {
     /**
      * xmlelement(name, xmlattributes(...), content...)
      * Builds an XML element with optional attributes and content.
+     * Content strings are already escaped or raw XML — they are appended as-is.
      */
     public static String xmlelement(String tagName, Map<String, String> attributes, List<String> contents) {
         if (tagName == null) return null;
+        String safeName = escapeXmlName(tagName);
         StringBuilder sb = new StringBuilder();
-        sb.append('<').append(tagName);
+        sb.append('<').append(safeName);
         if (attributes != null && !attributes.isEmpty()) {
             for (Map.Entry<String, String> entry : attributes.entrySet()) {
-                sb.append(' ').append(entry.getKey()).append("=\"").append(escapeXmlAttr(entry.getValue())).append('"');
+                sb.append(' ').append(escapeXmlName(entry.getKey()))
+                  .append("=\"").append(escapeXmlAttr(entry.getValue())).append('"');
             }
         }
         if (contents == null || contents.isEmpty() || contents.stream().allMatch(Objects::isNull)) {
@@ -168,7 +191,7 @@ public final class XmlOperations {
                     sb.append(content);
                 }
             }
-            sb.append("</").append(tagName).append('>');
+            sb.append("</").append(safeName).append('>');
         }
         return sb.toString();
     }
@@ -184,10 +207,10 @@ public final class XmlOperations {
         for (int i = 0; i < names.size(); i++) {
             Object val = i < values.size() ? values.get(i) : null;
             if (val == null) continue; // NULL values produce no element
-            String name = names.get(i);
-            sb.append('<').append(name).append('>');
+            String safeName = escapeXmlName(names.get(i));
+            sb.append('<').append(safeName).append('>');
             sb.append(escapeXml(val.toString()));
-            sb.append("</").append(name).append('>');
+            sb.append("</").append(safeName).append('>');
             hasContent = true;
         }
         return hasContent ? sb.toString() : null;
@@ -197,10 +220,10 @@ public final class XmlOperations {
     public static String xmlpi(String target, String content) {
         if (target == null) return null;
         if (target.equalsIgnoreCase("xml")) {
-            throw new MemgresException("invalid XML processing instruction target \"xml\"");
+            throw new MemgresException("invalid XML processing instruction target \"xml\"", "2200T");
         }
         if (content != null && content.contains("?>")) {
-            throw new MemgresException("XML processing instruction content must not contain \"?>\"");
+            throw new MemgresException("XML processing instruction content must not contain \"?>\"", "2200T");
         }
         if (content == null || content.isEmpty()) {
             return "<?" + target + "?>";
@@ -229,11 +252,39 @@ public final class XmlOperations {
 
     /** xpath(xpath_expr, xml [, nsarray]): evaluates XPath and returns xml[]. */
     public static List<String> xpath(String xpathExpr, String xml) {
+        return xpath(xpathExpr, xml, null);
+    }
+
+    /** xpath with namespace support. nsMap maps prefix→URI. */
+    public static List<String> xpath(String xpathExpr, String xml, Map<String, String> nsMap) {
         if (xpathExpr == null || xml == null) return Cols.listOf();
         try {
-            Document doc = parseToDocument(xml);
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            factory.setNamespaceAware(nsMap != null && !nsMap.isEmpty());
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            builder.setErrorHandler(new SilentErrorHandler());
+            Document doc;
+            try {
+                doc = builder.parse(new InputSource(new StringReader(xml)));
+            } catch (Exception e) {
+                String wrapped = "<_root>" + xml + "</_root>";
+                doc = builder.parse(new InputSource(new StringReader(wrapped)));
+            }
+
             XPathFactory xpf = XPathFactory.newInstance();
             XPath xp = xpf.newXPath();
+            if (nsMap != null && !nsMap.isEmpty()) {
+                final Map<String, String> ns = nsMap;
+                xp.setNamespaceContext(new javax.xml.namespace.NamespaceContext() {
+                    @Override public String getNamespaceURI(String prefix) {
+                        String uri = ns.get(prefix);
+                        return uri != null ? uri : javax.xml.XMLConstants.NULL_NS_URI;
+                    }
+                    @Override public String getPrefix(String uri) { return null; }
+                    @Override public java.util.Iterator<String> getPrefixes(String uri) { return null; }
+                });
+            }
             NodeList nodes = (NodeList) xp.evaluate(xpathExpr, doc, XPathConstants.NODESET);
             List<String> results = new ArrayList<>();
             for (int i = 0; i < nodes.getLength(); i++) {
@@ -287,8 +338,16 @@ public final class XmlOperations {
     public static String tableToXml(String tableName, List<String> columnNames, List<Object[]> rows,
                                      boolean nulls, boolean tableforest, String targetns) {
         StringBuilder sb = new StringBuilder();
+        String ns = (targetns != null && !targetns.isEmpty()) ? targetns : "";
         if (!tableforest) {
-            sb.append("<").append(tableName).append(">\n");
+            sb.append("<").append(tableName);
+            if (!ns.isEmpty()) {
+                sb.append(" xmlns=\"").append(escapeXmlAttr(ns)).append("\"");
+            }
+            if (nulls) {
+                sb.append(" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"");
+            }
+            sb.append(">\n");
         }
         for (Object[] row : rows) {
             sb.append("  <row>\n");
@@ -337,6 +396,61 @@ public final class XmlOperations {
                    .replace("'", "&apos;");
     }
 
+    /**
+     * Escape invalid XML name characters using PG's _xHHHH_ convention.
+     * Valid XML name start: letter, underscore.
+     * Valid XML name chars: letter, digit, hyphen, dot, underscore, colon.
+     */
+    static String escapeXmlName(String name) {
+        if (name == null || name.isEmpty()) return name;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (i == 0) {
+                // Name start char: letter or underscore
+                if (Character.isLetter(c) || c == '_') {
+                    sb.append(c);
+                } else {
+                    sb.append(String.format("_x%04x_", (int) c));
+                }
+            } else {
+                // Name char: letter, digit, hyphen, dot, underscore, colon
+                if (Character.isLetterOrDigit(c) || c == '-' || c == '.' || c == '_' || c == ':') {
+                    sb.append(c);
+                } else {
+                    sb.append(String.format("_x%04x_", (int) c));
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Format xpath result array as PG-style text array.
+     * Elements containing special chars are quoted.
+     */
+    static String formatXpathResult(List<String> results) {
+        if (results.isEmpty()) return "{}";
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < results.size(); i++) {
+            if (i > 0) sb.append(",");
+            String val = results.get(i);
+            // Check if quoting is needed (contains comma, brace, quote, whitespace, backslash, or is empty)
+            boolean needsQuote = val.isEmpty() || val.contains(",") || val.contains("{") || val.contains("}")
+                    || val.contains("\"") || val.contains("\\") || val.contains(" ")
+                    || val.contains("<") || val.contains(">");
+            if (needsQuote) {
+                sb.append("\"");
+                sb.append(val.replace("\\", "\\\\").replace("\"", "\\\""));
+                sb.append("\"");
+            } else {
+                sb.append(val);
+            }
+        }
+        sb.append("}");
+        return sb.toString();
+    }
+
     private static String stripXmlDeclaration(String xml) {
         if (xml == null) return null;
         return xml.replaceFirst("^<\\?xml[^?]*\\?>\\s*", "");
@@ -366,7 +480,7 @@ public final class XmlOperations {
             builder.setErrorHandler(new SilentErrorHandler());
             builder.parse(new InputSource(new StringReader(wrapped)));
         } catch (Exception e) {
-            throw new MemgresException("invalid XML content: " + e.getMessage(), "2200M");
+            throw new MemgresException("invalid XML content: " + e.getMessage(), "2200N");
         }
     }
 
@@ -395,7 +509,11 @@ public final class XmlOperations {
 
     private static String nodeToString(Node node) {
         try {
-            if (node.getNodeType() == Node.TEXT_NODE || node.getNodeType() == Node.ATTRIBUTE_NODE) {
+            if (node.getNodeType() == Node.TEXT_NODE) {
+                // Text nodes: escape for XML re-serialization (PG behavior)
+                return escapeXml(node.getTextContent());
+            }
+            if (node.getNodeType() == Node.ATTRIBUTE_NODE) {
                 return node.getTextContent();
             }
             TransformerFactory tf = TransformerFactory.newInstance();
@@ -406,6 +524,22 @@ public final class XmlOperations {
             return writer.toString();
         } catch (TransformerException e) {
             return node.getTextContent();
+        }
+    }
+
+    /** Extract a short error description for XML validation failures. */
+    private static String extractXmlError(String text) {
+        try {
+            String wrapped = "<_root>" + text + "</_root>";
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            builder.setErrorHandler(new SilentErrorHandler());
+            builder.parse(new InputSource(new StringReader(wrapped)));
+            return text; // shouldn't reach here
+        } catch (Exception e) {
+            String msg = e.getMessage();
+            return msg != null ? msg : text;
         }
     }
 

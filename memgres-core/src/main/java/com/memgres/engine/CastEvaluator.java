@@ -522,7 +522,7 @@ class CastEvaluator {
             case "tsquery":
                 return val instanceof TsQuery ? ((TsQuery) val) : TsQuery.parse(val.toString());
             case "xml":
-                return val.toString();
+                return XmlOperations.validateXmlCast(val.toString());
             case "int4range":
             case "int8range":
             case "numrange":

@@ -1293,7 +1293,9 @@ public class ExpressionParser {
                     return specialFormParser.parseXmlexists(); 
                 }
                 case "XMLAGG": {
-                    return specialFormParser.parseBuiltinFunction(); 
+                    // xmlagg is an aggregate that supports ORDER BY inside
+                    advance(); // consume XMLAGG keyword
+                    return parseFunctionCallExpr("xmlagg");
                 }
                 case "COALESCE":
                 case "NULLIF":
