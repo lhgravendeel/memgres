@@ -349,6 +349,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     // Count autocommit statements as committed transactions
                     if (!session.isExplicitTransactionBlock()) {
                         database.incrementXactCommit();
+                        // PG releases xact-level advisory locks at statement end in autocommit
+                        database.releaseXactAdvisoryLocks(session);
                     }
                     sendQueryResult(ctx, result);
                     // Emit ParameterStatus updates for tracked GUC parameters after SET
@@ -888,8 +890,13 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         rowDescSentByDescribe = false;
         errorPendingUntilSync = false;
         // In autocommit mode, reset failed transaction state (PG auto-rolls back)
-        if (session != null && session.isFailed() && !session.isExplicitTransactionBlock()) {
-            session.rollback();
+        if (session != null && !session.isExplicitTransactionBlock()) {
+            if (session.isFailed()) {
+                session.rollback();
+            } else {
+                // PG releases xact-level advisory locks at statement end in autocommit
+                database.releaseXactAdvisoryLocks(session);
+            }
         }
         sendReadyForQuery(ctx, session);
     }

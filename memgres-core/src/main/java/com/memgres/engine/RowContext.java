@@ -163,6 +163,16 @@ public class RowContext {
         if (tableQualifier != null) {
             TableBinding b = getBinding(tableQualifier);
             if (b == null) {
+                // Check if the qualifier matches a table whose real name is hidden by an alias
+                for (TableBinding tb : bindings) {
+                    if (tb.alias() != null && !tb.alias().equalsIgnoreCase(tb.table().getName())
+                            && tb.table().getName().equalsIgnoreCase(tableQualifier)) {
+                        MemgresException ex = new MemgresException(
+                                "invalid reference to FROM-clause entry for table \"" + tableQualifier + "\"", "42P01");
+                        ex.setHint("Perhaps you meant to reference the table alias \"" + tb.alias() + "\".");
+                        throw ex;
+                    }
+                }
                 throw new MemgresException("missing FROM-clause entry for table \"" + tableQualifier + "\"", "42P01");
             }
             int idx = b.table().getColumnIndex(columnName);

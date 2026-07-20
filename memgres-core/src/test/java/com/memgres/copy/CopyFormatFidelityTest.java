@@ -364,8 +364,10 @@ class CopyFormatFidelityTest {
         exec("CREATE TABLE ff_e1(id int, val text)");
         exec("INSERT INTO ff_e1 VALUES (1, 'has\"quote'), (2, E'has\\\\backslash')");
         String out = copyOut("COPY ff_e1 TO STDOUT WITH (FORMAT csv, ESCAPE '\\')");
-        assertEquals("1,\"has\\\"quote\"\n2,\"has\\\\backslash\"\n", out,
-                "with ESCAPE distinct from QUOTE, both embedded quote and escape chars are escaped");
+        // PG only quotes fields containing the QUOTE char, not the ESCAPE char alone.
+        // "has\"quote" is quoted (contains "), "has\backslash" is NOT quoted (only contains \).
+        assertEquals("1,\"has\\\"quote\"\n2,has\\backslash\n", out,
+                "with ESCAPE distinct from QUOTE, only embedded quote char triggers quoting");
 
         exec("CREATE TABLE ff_e2(id int, val text)");
         copyIn("COPY ff_e2 FROM STDIN WITH (FORMAT csv, ESCAPE '\\')", out);
