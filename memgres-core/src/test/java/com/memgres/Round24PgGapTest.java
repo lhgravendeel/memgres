@@ -218,7 +218,7 @@ class Round24PgGapTest {
 
     @Test
     void hostmask_of_cidr_returns_inverse_of_netmask() throws SQLException {
-        // hostmask('192.168.1.0/24'::cidr) -> 0.0.0.255
+        // hostmask('192.168.1.0/24'::cidr)::text -> 0.0.0.255/32 (PG inet::text includes prefix)
         assertEquals("0.0.0.255/32", q("SELECT hostmask('192.168.1.0/24'::cidr)::text"));
         assertEquals("0.0.0.0/32",   q("SELECT hostmask('10.0.0.0/32'::cidr)::text"));
     }

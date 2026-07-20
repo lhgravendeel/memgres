@@ -256,6 +256,10 @@ class CastEvaluator {
             case "char":
             case "character":
             case "name": {
+                // PG inet::text uses network_show which always includes /prefix
+                if (val instanceof InetValue) {
+                    return ((InetValue) val).text();
+                }
                 if (val instanceof RegclassValue) {
                     RegclassValue rc = (RegclassValue) val;
                     return formatRegclassDisplay(rc.name());
@@ -574,18 +578,15 @@ class CastEvaluator {
                 }
                 return jsonStr;
             }
-            case "inet":
+            case "inet": {
+                if (val instanceof InetValue) return val;
+                if (val instanceof CidrValue) return val; // cidr is-a InetValue, usable as inet
+                return InetValue.parse(val.toString());
+            }
             case "cidr": {
-                String inetStr = val.toString().trim();
-                // Validate inet/cidr format: must be a valid IP address (with optional /prefix)
-                if (!inetStr.isEmpty() && !(val instanceof Number)) {
-                    String ipPart = inetStr.contains("/") ? inetStr.substring(0, inetStr.indexOf('/')) : inetStr;
-                    // Check basic IP format: must contain dots (IPv4) or colons (IPv6)
-                    if (!ipPart.contains(".") && !ipPart.contains(":")) {
-                        throw new MemgresException("invalid input syntax for type inet: \"" + val + "\"", "22P02");
-                    }
-                }
-                return inetStr;
+                if (val instanceof CidrValue) return val;
+                if (val instanceof InetValue) return CidrValue.fromInet((InetValue) val);
+                return CidrValue.parse(val.toString());
             }
             case "hstore":
                 if (!executor.database.hasExtension("hstore")) {
@@ -594,9 +595,16 @@ class CastEvaluator {
                 }
                 if (val instanceof HstoreValue) return val;
                 return HstoreValue.parse(val.toString());
-            case "macaddr":
-            case "macaddr8":
-                return val.toString();
+            case "macaddr": {
+                if (val instanceof MacaddrValue) return val;
+                if (val instanceof Macaddr8Value) return ((Macaddr8Value) val).toMacaddr();
+                return MacaddrValue.parse(val.toString());
+            }
+            case "macaddr8": {
+                if (val instanceof Macaddr8Value) return val;
+                if (val instanceof MacaddrValue) return ((MacaddrValue) val).toMacaddr8();
+                return Macaddr8Value.parse(val.toString());
+            }
             case "regconfig":
             case "regdictionary":
             case "regrole":

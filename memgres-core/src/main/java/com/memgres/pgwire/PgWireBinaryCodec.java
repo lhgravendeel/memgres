@@ -443,21 +443,29 @@ class PgWireBinaryCodec {
                 }
                 case MACADDR: {
                     // PG binary macaddr: 6 bytes
-                    String s = val.toString().trim();
-                    String[] octets = s.split(":");
                     buf.writeInt(6);
-                    for (int i = 0; i < 6; i++) {
-                        buf.writeByte(Integer.parseInt(octets[i], 16));
+                    if (val instanceof com.memgres.engine.MacaddrValue) {
+                        buf.writeBytes(((com.memgres.engine.MacaddrValue) val).getBytesRef());
+                    } else {
+                        String s = val.toString().trim();
+                        String[] octets = s.split(":");
+                        for (int i = 0; i < 6; i++) {
+                            buf.writeByte(Integer.parseInt(octets[i], 16));
+                        }
                     }
                     break;
                 }
                 case MACADDR8: {
                     // PG binary macaddr8: 8 bytes
-                    String s = val.toString().trim();
-                    String[] octets = s.split(":");
                     buf.writeInt(8);
-                    for (int i = 0; i < 8; i++) {
-                        buf.writeByte(Integer.parseInt(octets[i], 16));
+                    if (val instanceof com.memgres.engine.Macaddr8Value) {
+                        buf.writeBytes(((com.memgres.engine.Macaddr8Value) val).getBytesRef());
+                    } else {
+                        String s = val.toString().trim();
+                        String[] octets = s.split(":");
+                        for (int i = 0; i < 8; i++) {
+                            buf.writeByte(Integer.parseInt(octets[i], 16));
+                        }
                     }
                     break;
                 }
