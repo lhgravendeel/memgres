@@ -61,9 +61,15 @@ class CatalogStubBuilder {
         );
         Table table = new Table("pg_tables", cols);
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
-            for (String tableName : schemaEntry.getValue().getTables().keySet()) {
+            for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
+                String tableName = tableEntry.getKey();
+                Table t = tableEntry.getValue();
+                // M22: compute hasindexes/hastriggers from actual state
+                boolean hasIdx = !t.getConstraints().isEmpty() || database.getIndexColumns().keySet().stream()
+                        .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.endsWith("." + tableName); });
+                boolean hasTrig = database.getAllTriggers().containsKey(tableName);
                 table.insertRow(new Object[]{
-                        schemaEntry.getKey(), tableName, "memgres", null, false, false, false
+                        schemaEntry.getKey(), tableName, "memgres", null, hasIdx, false, hasTrig
                 });
             }
         }
@@ -337,6 +343,21 @@ class CatalogStubBuilder {
                         0L, 0L, 0L, 0L                 // counts
                 });
             }
+        }
+        // L12: PG includes materialized views in pg_stat_user_tables
+        for (Database.ViewDef vd : database.getViews().values()) {
+            if (!vd.materialized()) continue;
+            String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
+            table.insertRow(new Object[]{
+                    oids.oid("rel:" + vSchema + "." + vd.name()),
+                    vSchema, vd.name(),
+                    0L, null, 0L, 0L, null, 0L,
+                    0L, 0L, 0L, 0L,
+                    0L, 0L,
+                    0L, 0L,
+                    null, null, null, null,
+                    0L, 0L, 0L, 0L
+            });
         }
         return table;
     }

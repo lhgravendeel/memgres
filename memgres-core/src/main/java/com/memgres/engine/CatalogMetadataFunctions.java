@@ -416,7 +416,8 @@ class CatalogMetadataFunctions {
             return colNo <= cols.size() ? cols.get(colNo - 1) : "";
         }
         if (cols == null) return "";
-        boolean unique = executor.database.isUniqueIndex(indexName);
+        // H16: constraint-backed indexes (PK/UNIQUE) are always unique
+        boolean unique = constraintTableName != null || executor.database.isUniqueIndex(indexName);
         String tableName = constraintTableName != null
                 ? constraintTableName
                 : executor.database.getIndexTable(indexName);
@@ -605,6 +606,15 @@ class CatalogMetadataFunctions {
                         }
                     }
                 }
+            }
+        }
+        // M20: fallback — check sequences with OWNED BY pointing to this table.column
+        for (java.util.Map.Entry<String, Sequence> seqEntry : executor.database.getSequences().entrySet()) {
+            Sequence seq = seqEntry.getValue();
+            if (seq.getOwnedByTable() != null && seq.getOwnedByTable().equalsIgnoreCase(tblName)
+                    && seq.getOwnedByColumn() != null && seq.getOwnedByColumn().equalsIgnoreCase(colName)) {
+                String seqSchema = explicitSchema != null ? explicitSchema : "public";
+                return seqSchema + "." + seq.getName();
             }
         }
         return null;

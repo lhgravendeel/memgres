@@ -287,6 +287,10 @@ class CastEvaluator {
                     if (offsetStr.equals("Z")) offsetStr = "+00";
                     return odt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd")) + " " + timePart + offsetStr;
                 }
+                // H17: PgVector (int2vector/oidvector) to text: space-separated format
+                if (val instanceof PgVector) {
+                    return val.toString();
+                }
                 // Array (List) to text: use PostgreSQL {e1,e2,...} format
                 if (val instanceof java.util.List<?>) {
                     return formatListAsPgArray((java.util.List<?>) val);
@@ -632,14 +636,23 @@ class CastEvaluator {
                     // If not found, return as-is (number)
                     return val;
                 }
-                String relName = val.toString();
+                String relName = val.toString().trim();
                 String schemaPrefix = null;
                 if (relName.contains(".")) {
                     int dotIdx = relName.lastIndexOf('.');
                     schemaPrefix = relName.substring(0, dotIdx);
                     relName = relName.substring(dotIdx + 1);
                 }
-                String lowerName = relName.toLowerCase();
+                // M15: Handle quoted identifiers — preserve case if double-quoted
+                boolean relQuoted = relName.startsWith("\"") && relName.endsWith("\"") && relName.length() > 1;
+                if (relQuoted) {
+                    relName = relName.substring(1, relName.length() - 1);
+                }
+                if (schemaPrefix != null && schemaPrefix.startsWith("\"") && schemaPrefix.endsWith("\"") && schemaPrefix.length() > 1) {
+                    schemaPrefix = schemaPrefix.substring(1, schemaPrefix.length() - 1);
+                }
+                // PG lowercases unquoted identifiers
+                String lowerName = relQuoted ? relName : relName.toLowerCase();
                 // Validate relation exists before returning OID
                 boolean rcExists = false;
                 if (schemaPrefix != null) {
@@ -866,7 +879,9 @@ class CastEvaluator {
                     }
                     return new RegtypeValue(dt.getOid(), canonical);
                 }
-                return new RegtypeValue(0, val.toString());
+                // Custom enum or domain — resolve OID from catalog
+                int customOid = executor.systemCatalog.getOid("type:" + rtName);
+                return new RegtypeValue(customOid, val.toString());
             }
             case "oid": {
                 if (val instanceof RegclassValue) return ((RegclassValue) val).oid();

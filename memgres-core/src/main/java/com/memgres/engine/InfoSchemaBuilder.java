@@ -122,6 +122,8 @@ public class InfoSchemaBuilder {
         }
 
         for (Database.ViewDef vd : database.getViews().values()) {
+            // M21: PG's information_schema excludes materialized views
+            if (vd.materialized()) continue;
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             table.insertRow(new Object[]{
                     catalogName(), vSchema, vd.name(), "VIEW",
@@ -219,7 +221,17 @@ public class InfoSchemaBuilder {
         for (int i = 0; i < t.getColumns().size(); i++) {
             Column col = t.getColumns().get(i);
             DataType dt = col.getType();
-            String dataType = CatalogHelper.pgTypeName(dt);
+            boolean isArrayType = dt == DataType.TEXT_ARRAY || dt == DataType.INT4_ARRAY
+                    || dt == DataType.ACLITEM_ARRAY || dt == DataType.NAME_ARRAY;
+            // H14: data_type — arrays report "ARRAY", domains report "USER-DEFINED"
+            String dataType;
+            if (isArrayType) {
+                dataType = "ARRAY";
+            } else if (col.getDomainTypeName() != null) {
+                dataType = "USER-DEFINED";
+            } else {
+                dataType = CatalogHelper.pgTypeName(dt);
+            }
             boolean isCharType = dt == DataType.VARCHAR || dt == DataType.CHAR || dt == DataType.TEXT || dt == DataType.NAME;
             boolean isNumericType = dt == DataType.SMALLINT || dt == DataType.INTEGER || dt == DataType.BIGINT
                     || dt == DataType.SERIAL || dt == DataType.BIGSERIAL || dt == DataType.SMALLSERIAL
@@ -227,8 +239,10 @@ public class InfoSchemaBuilder {
             boolean isDateTimeType = dt == DataType.TIMESTAMP || dt == DataType.TIMESTAMPTZ
                     || dt == DataType.TIME || dt == DataType.DATE || dt == DataType.INTERVAL;
 
-            Integer charMaxLen = null;
+            // H14: character_maximum_length from column precision for varchar(N)/char(N)
+            Integer charMaxLen = (dt == DataType.VARCHAR || dt == DataType.CHAR) ? col.getPrecision() : null;
             Integer charOctetLen = isCharType ? Integer.valueOf(1073741824) : null;
+            if (charMaxLen != null) charOctetLen = charMaxLen * 4; // UTF-8 worst case
             Integer numPrec = CatalogHelper.numericPrecision(dt);
             // For NUMERIC columns, use the column's declared precision/scale if available
             if (dt == DataType.NUMERIC && col.getPrecision() != null) {
@@ -248,16 +262,43 @@ public class InfoSchemaBuilder {
             if (dt == DataType.DATE) datetimePrec = Integer.valueOf(0);
             Integer intervalPrec = dt == DataType.INTERVAL ? Integer.valueOf(6) : null;
 
+            // H14: udt_name — serial/bigserial/smallserial report int4/int8/int2
             String udtSchema = "pg_catalog";
-            String udtName = col.getType().getPgName();
+            String udtName;
+            switch (dt) {
+                case SERIAL: udtName = "int4"; break;
+                case BIGSERIAL: udtName = "int8"; break;
+                case SMALLSERIAL: udtName = "int2"; break;
+                default: udtName = col.getType().getPgName(); break;
+            }
             if (isUserTable) {
-                udtSchema = isCharType || isNumericType || isDateTimeType || dt == DataType.BOOLEAN
-                        || dt == DataType.BYTEA || dt == DataType.UUID || dt == DataType.JSON || dt == DataType.JSONB
-                        || dt == DataType.XML ? "pg_catalog" : (dt == DataType.ENUM ? schemaName : "pg_catalog");
                 if (dt == DataType.ENUM && col.getEnumTypeName() != null) {
+                    udtSchema = schemaName;
                     udtName = col.getEnumTypeName();
+                } else if (col.getDomainTypeName() != null) {
+                    udtSchema = schemaName;
+                    udtName = col.getDomainTypeName();
                 }
             }
+
+            // H14: is_identity — detect __identity__ marker in default value
+            String defaultVal = col.getDefaultValue();
+            boolean isIdentity = isUserTable && defaultVal != null && defaultVal.startsWith("__identity__");
+            String identityGeneration = null;
+            if (isIdentity) {
+                identityGeneration = defaultVal.contains(":always:") ? "ALWAYS" : "BY DEFAULT";
+            }
+
+            // H14: domain_* fields
+            String domainCatalog = null, domainSchema = null, domainName = null;
+            if (isUserTable && col.getDomainTypeName() != null) {
+                domainCatalog = catalogName();
+                domainSchema = schemaName;
+                domainName = col.getDomainTypeName();
+            }
+
+            // H14: is_nullable — view columns are always YES (PG semantics)
+            String isNullable = isUserTable ? (col.isNullable() ? "YES" : "NO") : "YES";
 
             isTable.insertRow(new Object[]{
                     catalogName(),                           // table_catalog
@@ -266,7 +307,7 @@ public class InfoSchemaBuilder {
                     col.getName(),                          // column_name
                     i + 1,                                  // ordinal_position
                     isUserTable ? CatalogHelper.formatColumnDefault(col) : null, // column_default
-                    col.isNullable() ? "YES" : "NO",       // is_nullable
+                    isNullable,                             // is_nullable
                     dataType,                               // data_type
                     charMaxLen,                             // character_maximum_length
                     charOctetLen,                           // character_octet_length
@@ -278,7 +319,7 @@ public class InfoSchemaBuilder {
                     intervalPrec,                           // interval_precision
                     null, null, null,                       // character_set_*
                     null, null, null,                       // collation_*
-                    null, null, null,                       // domain_*
+                    domainCatalog, domainSchema, domainName, // domain_*
                     catalogName(),                           // udt_catalog
                     udtSchema,                              // udt_schema
                     udtName,                                // udt_name
@@ -286,8 +327,9 @@ public class InfoSchemaBuilder {
                     null,                                   // maximum_cardinality
                     String.valueOf(i + 1),                  // dtd_identifier
                     "NO",                                   // is_self_referencing
-                    "NO",                                   // is_identity
-                    null, null, null, null, null, null,     // identity_*
+                    isIdentity ? "YES" : "NO",              // is_identity
+                    identityGeneration,                     // identity_generation
+                    null, null, null, null, null,           // identity_start..identity_cycle
                     isUserTable && col.isGenerated() ? "ALWAYS" : "NEVER", // is_generated
                     isUserTable ? col.getGeneratedExpr() : null, // generation_expression
                     "YES"                                   // is_updatable
@@ -310,6 +352,7 @@ public class InfoSchemaBuilder {
         }
         table.insertRow(new Object[]{catalogName(), "pg_catalog", "memgres", null, null, null});
         table.insertRow(new Object[]{catalogName(), "information_schema", "memgres", null, null, null});
+        table.insertRow(new Object[]{catalogName(), "pg_toast", "memgres", null, null, null});
         return table;
     }
 
@@ -656,7 +699,20 @@ public class InfoSchemaBuilder {
                 new Column("cycle_option", DataType.TEXT, true, false, null)
         );
         Table table = new Table("sequences", cols);
+        // M14: collect identity-owned sequence names to exclude from information_schema
+        java.util.Set<String> identitySeqs = new java.util.HashSet<>();
+        for (Schema schema : database.getSchemas().values()) {
+            for (Table tbl : schema.getTables().values()) {
+                for (Column col : tbl.getColumns()) {
+                    String def = col.getDefaultValue();
+                    if (def != null && def.contains(":seq:")) {
+                        identitySeqs.add(def.substring(def.indexOf(":seq:") + 5));
+                    }
+                }
+            }
+        }
         for (String seqName : CatalogHelper.getSequenceNames(database)) {
+            if (identitySeqs.contains(seqName)) continue; // M14: exclude identity sequences
             Sequence seq = database.getSequence(seqName);
             if (seq != null) {
                 String dataType = seq.getDataType() != null ? seq.getDataType() : "bigint";
@@ -690,6 +746,8 @@ public class InfoSchemaBuilder {
         );
         Table table = new Table("views", cols);
         for (Database.ViewDef vd : database.getViews().values()) {
+            // M21: PG's information_schema.views excludes materialized views
+            if (vd.materialized()) continue;
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             String viewDef = "";
             if (vd.query() != null) {
@@ -754,7 +812,7 @@ public class InfoSchemaBuilder {
                     if (sc.getType() == StoredConstraint.Type.CHECK && sc.getName() != null) {
                         table.insertRow(new Object[]{
                                 catalogName(), schemaEntry.getKey(), sc.getName(),
-                                sc.getCheckExpr() != null ? sc.getCheckExpr().toString() : ""
+                                sc.getCheckExpr() != null ? SqlUnparser.exprToSql(sc.getCheckExpr()) : ""
                         });
                     }
                 }
@@ -777,7 +835,22 @@ public class InfoSchemaBuilder {
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 for (StoredConstraint sc : tableEntry.getValue().getConstraints()) {
-                    if (sc.getName() != null && sc.getColumns() != null) {
+                    if (sc.getName() == null) continue;
+                    // M21: EXCLUDE constraints not shown in information_schema
+                    if (sc.getType() == StoredConstraint.Type.EXCLUDE) continue;
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
+                        // M21: FK shows referenced table/column, not the FK's own
+                        String refSchema = sc.getReferencesSchema() != null ? sc.getReferencesSchema() : schemaEntry.getKey();
+                        String refTable = sc.getReferencesTable();
+                        if (refTable != null && sc.getReferencesColumns() != null) {
+                            for (String refCol : sc.getReferencesColumns()) {
+                                table.insertRow(new Object[]{
+                                        catalogName(), refSchema, refTable, refCol,
+                                        catalogName(), schemaEntry.getKey(), sc.getName()
+                                });
+                            }
+                        }
+                    } else if (sc.getColumns() != null) {
                         for (String col : sc.getColumns()) {
                             table.insertRow(new Object[]{
                                     catalogName(), schemaEntry.getKey(), tableEntry.getKey(), col,

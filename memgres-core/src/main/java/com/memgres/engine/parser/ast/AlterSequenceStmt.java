@@ -14,6 +14,36 @@ public final class AlterSequenceStmt implements Statement {
     public final Boolean cycle;
     public final String ownerTo;
     public final String renameTo;
+    public final String ownedByTable;
+    public final String ownedByColumn;
+
+    public AlterSequenceStmt(
+            String name,
+            boolean restart,
+            Long restartWith,
+            Long incrementBy,
+            Long minValue,
+            Long maxValue,
+            Long startWith,
+            Boolean cycle,
+            String ownerTo,
+            String renameTo,
+            String ownedByTable,
+            String ownedByColumn
+    ) {
+        this.name = name;
+        this.restart = restart;
+        this.restartWith = restartWith;
+        this.incrementBy = incrementBy;
+        this.minValue = minValue;
+        this.maxValue = maxValue;
+        this.startWith = startWith;
+        this.cycle = cycle;
+        this.ownerTo = ownerTo;
+        this.renameTo = renameTo;
+        this.ownedByTable = ownedByTable;
+        this.ownedByColumn = ownedByColumn;
+    }
 
     public AlterSequenceStmt(
             String name,
@@ -27,16 +57,7 @@ public final class AlterSequenceStmt implements Statement {
             String ownerTo,
             String renameTo
     ) {
-        this.name = name;
-        this.restart = restart;
-        this.restartWith = restartWith;
-        this.incrementBy = incrementBy;
-        this.minValue = minValue;
-        this.maxValue = maxValue;
-        this.startWith = startWith;
-        this.cycle = cycle;
-        this.ownerTo = ownerTo;
-        this.renameTo = renameTo;
+        this(name, restart, restartWith, incrementBy, minValue, maxValue, startWith, cycle, ownerTo, renameTo, null, null);
     }
 
     public AlterSequenceStmt(
@@ -77,6 +98,8 @@ public final class AlterSequenceStmt implements Statement {
     public Boolean cycle() { return cycle; }
     public String ownerTo() { return ownerTo; }
     public String renameTo() { return renameTo; }
+    public String ownedByTable() { return ownedByTable; }
+    public String ownedByColumn() { return ownedByColumn; }
 
     @Override
     public boolean equals(Object o) {

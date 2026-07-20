@@ -170,8 +170,16 @@ public class SqlUnparser {
             }
         } else if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
-            return fn.name() + "(" +
-                    fn.args().stream().map(SqlUnparser::exprToSql).collect(Collectors.joining(", ")) + ")";
+            // M19: handle count(*) and DISTINCT
+            StringBuilder fnSb = new StringBuilder(fn.name()).append('(');
+            if (fn.distinct()) fnSb.append("DISTINCT ");
+            if (fn.star()) {
+                fnSb.append('*');
+            } else {
+                fnSb.append(fn.args().stream().map(SqlUnparser::exprToSql).collect(Collectors.joining(", ")));
+            }
+            fnSb.append(')');
+            return fnSb.toString();
         } else if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
             return exprToSql(cast.expr()) + "::" + cast.typeName();

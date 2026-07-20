@@ -55,7 +55,7 @@ class CatalogSecurityBuilder {
         // Category and description info for well-known settings
         Map<String, String[]> meta = new LinkedHashMap<>();
         meta.put("server_version", new String[]{"Preset Options", "Shows the server version.", "internal", "string"});
-        meta.put("server_version_num", new String[]{"Preset Options", "Shows the server version as an integer.", "internal", "string"});
+        meta.put("server_version_num", new String[]{"Preset Options", "Shows the server version as an integer.", "internal", "integer"});
         meta.put("server_encoding", new String[]{"Client Connection Defaults", "Shows the server (database) character set encoding.", "internal", "string"});
         meta.put("client_encoding", new String[]{"Client Connection Defaults", "Sets the client's character set encoding.", "user", "string"});
         meta.put("search_path", new String[]{"Client Connection Defaults", "Sets the schema search order for names that are not schema-qualified.", "user", "string"});

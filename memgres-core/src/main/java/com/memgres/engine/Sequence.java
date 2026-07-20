@@ -17,6 +17,8 @@ public class Sequence {
     private int cache = 1;
     private final AtomicLong currentValue;
     private volatile boolean called = false;
+    private String ownedByTable;
+    private String ownedByColumn;
 
     public Sequence(String name, Long startWith, Long incrementBy, Long minValue, Long maxValue) {
         this.name = name;
@@ -135,4 +137,8 @@ public class Sequence {
     public void setDataType(String dataType) { this.dataType = dataType; }
     public int getCache() { return cache; }
     public synchronized void setCache(int cache) { this.cache = Math.max(1, cache); }
+    public String getOwnedByTable() { return ownedByTable; }
+    public void setOwnedByTable(String ownedByTable) { this.ownedByTable = ownedByTable; }
+    public String getOwnedByColumn() { return ownedByColumn; }
+    public void setOwnedByColumn(String ownedByColumn) { this.ownedByColumn = ownedByColumn; }
 }

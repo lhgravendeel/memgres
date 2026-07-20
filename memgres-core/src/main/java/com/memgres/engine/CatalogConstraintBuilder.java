@@ -182,6 +182,16 @@ class CatalogConstraintBuilder {
                     if (!c.isNullable() && !isPromotedUnique) {
                         String conname = t.getName() + "_" + c.getName() + "_not_null";
                         List<Object> nnConkey = columnNamesToAttnums(t, Cols.listOf(c.getName()));
+                        // L13: partition children inherit NOT NULL from parent — PG sets coninhcount=1, conparentid=0
+                        int coninhcount = 0;
+                        Table parent = t.getPartitionParent();
+                        if (parent != null) {
+                            int parentColIdx = parent.getColumnIndex(c.getName());
+                            Column parentCol = parentColIdx >= 0 ? parent.getColumns().get(parentColIdx) : null;
+                            if (parentCol != null && !parentCol.isNullable()) {
+                                coninhcount = 1;
+                            }
+                        }
                         table.insertRow(new Object[]{
                                 oids.oid("con:" + t.getName() + "." + conname),
                                 conname,
@@ -194,7 +204,7 @@ class CatalogConstraintBuilder {
                                 false, false, true,
                                 true, 0,
                                 " ", " ",
-                                " " /*confmatchtype*/, null, null, null, null, 0 /*conpfeqop,conppeqop,conffeqop,confdelsetcols,coninhcount*/,
+                                " " /*confmatchtype*/, null, null, null, null, coninhcount,
                                 false,
                                 true, // conenforced
                                 null, null, false, 0, 0, 1
@@ -524,10 +534,34 @@ class CatalogConstraintBuilder {
                     }
                     if (seqName != null) {
                         int seqOid = oids.oid("rel:" + schemaName + "." + seqName);
-                        // 'a' = auto dependency (sequence owned by table column)
-                        table.insertRow(new Object[]{pgClassOid, seqOid, 0, pgClassOid, tableOid, i + 1, "a"});
+                        // M20: 'a' = auto dependency (serial), 'i' = internal (identity)
+                        String deptype = (c.getDefaultValue() != null && c.getDefaultValue().contains("__identity__")) ? "i" : "a";
+                        table.insertRow(new Object[]{pgClassOid, seqOid, 0, pgClassOid, tableOid, i + 1, deptype});
                     }
                 }
+            }
+        }
+
+        // M20: Dependencies for sequences with OWNED BY -> their owning table+column
+        for (java.util.Map.Entry<String, Sequence> seqEntry : database.getSequences().entrySet()) {
+            Sequence seq = seqEntry.getValue();
+            if (seq.getOwnedByTable() == null) continue;
+            // Find the owning table and column index
+            for (java.util.Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+                Table ownerTbl = schemaEntry.getValue().getTable(seq.getOwnedByTable());
+                if (ownerTbl == null) continue;
+                int colIdx = -1;
+                for (int ci = 0; ci < ownerTbl.getColumns().size(); ci++) {
+                    if (ownerTbl.getColumns().get(ci).getName().equalsIgnoreCase(seq.getOwnedByColumn())) {
+                        colIdx = ci + 1; break;
+                    }
+                }
+                if (colIdx > 0) {
+                    int seqOid = oids.oid("rel:" + schemaEntry.getKey() + "." + seq.getName());
+                    int ownerTblOid = oids.oid("rel:" + schemaEntry.getKey() + "." + ownerTbl.getName());
+                    table.insertRow(new Object[]{pgClassOid, seqOid, 0, pgClassOid, ownerTblOid, colIdx, "a"});
+                }
+                break;
             }
         }
 
