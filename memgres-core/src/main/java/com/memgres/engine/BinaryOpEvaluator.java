@@ -252,6 +252,10 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return GeometricOperations.divide(ls, rs);
                 }
+                // money / money → float8 (PG behavior)
+                if (left instanceof PgMoney && right instanceof PgMoney) {
+                    return ((PgMoney) left).divideByMoney((PgMoney) right);
+                }
                 return executor.numericOp(left, right, (a, b) -> a / b, (a, b) -> a / b,
                     (a, b) -> a.divide(b, 20, java.math.RoundingMode.HALF_UP));
             }
@@ -346,6 +350,12 @@ class BinaryOpEvaluator {
             }
             case SHIFT_LEFT: {
                 if (left == null || right == null) return null;
+                // Bit string shift: B'1101' << 2 -> B'0100'
+                if (left instanceof AstExecutor.PgBitString) {
+                    String bits = ((AstExecutor.PgBitString) left).bits();
+                    int shift = executor.toInt(right);
+                    return new AstExecutor.PgBitString(shiftBitString(bits, shift, true));
+                }
                 // Check for geometric "strictly left of": box << box
                 if (left instanceof String && right instanceof String
                         && GeometricOperations.isGeometricString(((String) left))) {
@@ -362,6 +372,12 @@ class BinaryOpEvaluator {
             }
             case SHIFT_RIGHT: {
                 if (left == null || right == null) return null;
+                // Bit string shift: B'1101' >> 2 -> B'0011'
+                if (left instanceof AstExecutor.PgBitString) {
+                    String bits = ((AstExecutor.PgBitString) left).bits();
+                    int shift = executor.toInt(right);
+                    return new AstExecutor.PgBitString(shiftBitString(bits, shift, false));
+                }
                 // Check for geometric "strictly right of": box >> box
                 if (left instanceof String && right instanceof String
                         && GeometricOperations.isGeometricString(((String) left))) {
@@ -1321,6 +1337,31 @@ class BinaryOpEvaluator {
         return InetValue.parse(val.toString());
     }
 
+    /** Shift a bit string left or right, filling with zeros. Preserves length. */
+    private static String shiftBitString(String bits, int shift, boolean leftShift) {
+        int len = bits.length();
+        if (shift >= len || shift <= -len) {
+            // All bits shifted out
+            char[] zeros = new char[len];
+            java.util.Arrays.fill(zeros, '0');
+            return new String(zeros);
+        }
+        if (shift < 0) {
+            // Negative shift reverses direction
+            return shiftBitString(bits, -shift, !leftShift);
+        }
+        if (shift == 0) return bits;
+        StringBuilder sb = new StringBuilder(len);
+        if (leftShift) {
+            sb.append(bits, shift, len);
+            for (int i = 0; i < shift; i++) sb.append('0');
+        } else {
+            for (int i = 0; i < shift; i++) sb.append('0');
+            sb.append(bits, 0, len - shift);
+        }
+        return sb.toString();
+    }
+
     Object evalBinaryValues(BinaryExpr.BinOp op, Object left, Object right) {
         // Apply type validation before computation
         executor.validateOperatorTypes(op, left, right);
@@ -1355,6 +1396,10 @@ class BinaryOpEvaluator {
                     String rs = (String) right;
                     String ls = (String) left;
                     return GeometricOperations.divide(ls, rs);
+                }
+                // money / money → float8 (PG behavior)
+                if (left instanceof PgMoney && right instanceof PgMoney) {
+                    return ((PgMoney) left).divideByMoney((PgMoney) right);
                 }
                 return executor.numericOp(left, right, (a, b) -> a / b, (a, b) -> a / b,
                     (a, b) -> a.divide(b, 20, java.math.RoundingMode.HALF_UP));

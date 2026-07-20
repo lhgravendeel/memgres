@@ -143,7 +143,7 @@ class ByteaFunctions {
                     int byteIdx = p / 8;
                     int bitIdx = p % 8;
                     if (byteIdx < 0 || byteIdx >= bytes.length) {
-                        throw new MemgresException("index " + p + " out of valid range, 0.." + (bytes.length * 8 - 1), "22000");
+                        throw new MemgresException("index " + p + " out of valid range, 0.." + (bytes.length * 8 - 1), "2202E");
                     }
                     return (bytes[byteIdx] >> bitIdx) & 1;
                 }
@@ -164,7 +164,7 @@ class ByteaFunctions {
                     int byteIdx = p / 8;
                     int bitIdx = p % 8;
                     if (byteIdx < 0 || byteIdx >= bytes.length) {
-                        throw new MemgresException("index " + p + " out of valid range, 0.." + (bytes.length * 8 - 1), "22000");
+                        throw new MemgresException("index " + p + " out of valid range, 0.." + (bytes.length * 8 - 1), "2202E");
                     }
                     byte[] result = bytes.clone();
                     if (nb == 1) {

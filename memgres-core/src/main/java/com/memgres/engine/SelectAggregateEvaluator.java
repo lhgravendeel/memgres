@@ -805,6 +805,7 @@ class SelectAggregateEvaluator {
                 Expression arg = fn.args().get(0);
                 boolean hasValue = false;
                 boolean allInts = true;
+                boolean isMoney = false;
                 BigDecimal bdSum = BigDecimal.ZERO;
                 try {
                     if (fn.distinct()) {
@@ -813,6 +814,7 @@ class SelectAggregateEvaluator {
                             Object val = executor.evalExpr(arg, ctx);
                             if (val == null || !seenKeys.add(distinctKey(val))) continue;
                             hasValue = true;
+                            if (val instanceof PgMoney) isMoney = true;
                             bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                             if (!(val instanceof Integer || val instanceof Long)) allInts = false;
                         }
@@ -821,6 +823,7 @@ class SelectAggregateEvaluator {
                             Object val = executor.evalExpr(arg, ctx);
                             if (val != null) {
                                 hasValue = true;
+                                if (val instanceof PgMoney) isMoney = true;
                                 bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                                 if (!(val instanceof Integer || val instanceof Long)) allInts = false;
                             }
@@ -830,6 +833,7 @@ class SelectAggregateEvaluator {
                     throw new MemgresException("function sum(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
                 }
                 if (!hasValue) return null;
+                if (isMoney) return new PgMoney(bdSum);
                 if (allInts) {
                     try { return bdSum.longValueExact(); } catch (ArithmeticException e) { /* fall through */ }
                 }

@@ -233,8 +233,13 @@ class ArrayOperationHandler {
                 for (Object v : list) {
                     if (v != null && v instanceof String) {
                         String s = (String) v;
-                        try { new java.math.BigDecimal(s); } catch (NumberFormatException e) {
-                            throw new MemgresException("invalid input syntax for type integer: \"" + s + "\"", "22P02");
+                        // Allow special float values (NaN, Infinity, -Infinity) alongside numeric literals
+                        String lower = s.trim().toLowerCase();
+                        if (!lower.equals("nan") && !lower.equals("infinity") && !lower.equals("-infinity")
+                                && !lower.equals("+infinity") && !lower.equals("inf") && !lower.equals("-inf")) {
+                            try { new java.math.BigDecimal(s); } catch (NumberFormatException e) {
+                                throw new MemgresException("invalid input syntax for type integer: \"" + s + "\"", "22P02");
+                            }
                         }
                     }
                 }
