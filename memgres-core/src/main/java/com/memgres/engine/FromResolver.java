@@ -416,8 +416,30 @@ class FromResolver {
 
         // Check system catalogs
         String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
+        // H35: pass userQualified=true when user explicitly wrote schema.table
+        boolean userQualified = tableRef.schema() != null;
+        // H35: empty search_path with unqualified name → reject unless temp table exists
+        // PG always implicitly includes pg_temp, so temp tables are still findable
+        if (!userQualified && executor.session != null) {
+            String sp = executor.session.getGucSettings().get("search_path");
+            if (sp != null) {
+                boolean hasEntries = false;
+                for (String part : sp.split(",")) {
+                    String s = part.trim().replace("\"", "").replace("'", "");
+                    if (!s.isEmpty() && !s.equals("$user")) { hasEntries = true; break; }
+                }
+                if (!hasEntries) {
+                    // Check if temp table exists before rejecting (pg_temp is always implicit)
+                    String tempSchemaName = executor.session.getTempSchemaName();
+                    Schema pgTemp = executor.database.getSchema(tempSchemaName);
+                    if (pgTemp == null || pgTemp.getTable(tableRef.table()) == null) {
+                        throw new MemgresException("relation \"" + tableRef.table() + "\" does not exist", "42P01");
+                    }
+                }
+            }
+        }
         boolean userTableExists = false;
-        try { executor.resolveTable(schemaName, tableRef.table()); userTableExists = true; } catch (MemgresException ignored) {}
+        try { executor.resolveTable(schemaName, tableRef.table(), userQualified); userTableExists = true; } catch (MemgresException ignored) {}
         if (!userTableExists && SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())) {
             Table catalogTable = executor.systemCatalog.resolve(tableRef.schema(), tableRef.table(), executor.session);
             if (catalogTable != null) {
@@ -431,7 +453,7 @@ class FromResolver {
                 return contexts;
             }
         }
-        Table table = executor.resolveTable(schemaName, tableRef.table());
+        Table table = executor.resolveTable(schemaName, tableRef.table(), userQualified);
         // C6: Enforce SELECT privilege on user tables
         executor.checkTablePrivilege("SELECT", schemaName, tableRef.table());
         String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();

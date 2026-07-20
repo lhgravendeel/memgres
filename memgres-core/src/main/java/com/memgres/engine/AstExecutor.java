@@ -503,9 +503,11 @@ public class AstExecutor {
             String lower = role.toLowerCase();
             if ("memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower)) return;
         }
-        // Owner check
-        String ownerKey = "table:" + schemaName.toLowerCase() + "." + tableName.toLowerCase();
-        String owner = database.getObjectOwner(ownerKey);
+        // Owner check — try both "table:" and "view:" keys since views are DML-capable
+        String qualName = schemaName.toLowerCase() + "." + tableName.toLowerCase();
+        String owner = database.getObjectOwner("table:" + qualName);
+        if (owner != null && owner.equalsIgnoreCase(role)) return;
+        owner = database.getObjectOwner("view:" + qualName);
         if (owner != null && owner.equalsIgnoreCase(role)) return;
         // Direct or inherited privilege check (including PUBLIC grants)
         if (hasPrivilegeDirectOrInherited(role, privilege, "TABLE", tableName.toLowerCase())) return;
@@ -594,6 +596,14 @@ public class AstExecutor {
     }
 
     Table resolveTable(String schemaName, String tableName) {
+        return resolveTable(schemaName, tableName, false);
+    }
+
+    /**
+     * @param userQualified true when the user explicitly wrote schema.table in SQL
+     *                      (prevents temp tables from shadowing the explicit schema)
+     */
+    Table resolveTable(String schemaName, String tableName, boolean userQualified) {
         lastViewColumnMapping = null; // reset before each resolution
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
         // Resolve pg_temp alias to the actual session temp schema
@@ -605,31 +615,46 @@ public class AstExecutor {
             }
             throw new MemgresException("relation \"" + schemaName + "." + tableName + "\" does not exist", "42P01");
         }
-        Schema pgTemp = database.getSchema(tempSchemaName);
-        if (pgTemp != null) {
-            Table tempTable = pgTemp.getTable(tableName);
-            if (tempTable != null) return tempTable;
-        }
-        Schema schema = schemaName != null ? database.getSchema(schemaName) : null;
-        if (schema != null) {
-            Table table = schema.getTable(tableName);
-            if (table != null) return table;
-        }
-        if (session != null) {
-            String searchPath = session.getGucSettings().get("search_path");
-            if (searchPath != null) {
-                for (String sp : searchPath.split(",")) {
-                    String s = sp.trim().replace("\"", "").replace("'", "");
-                    if (s.equals("$user")) continue;
-                    Schema spSchema = database.getSchema(s);
-                    if (spSchema != null) {
-                        Table table = spSchema.getTable(tableName);
-                        if (table != null) return table;
+        // H35: When user explicitly wrote schema.table, do NOT let temp tables shadow it —
+        // resolve directly in the specified schema without checking temp first.
+        if (userQualified && schemaName != null) {
+            Schema schema = database.getSchema(schemaName);
+            if (schema != null) {
+                Table table = schema.getTable(tableName);
+                if (table != null) return table;
+            }
+            // Fall through to view/sequence resolution below
+        } else {
+            // Check temp schema first (temp tables shadow search_path)
+            Schema pgTemp = database.getSchema(tempSchemaName);
+            if (pgTemp != null) {
+                Table tempTable = pgTemp.getTable(tableName);
+                if (tempTable != null) return tempTable;
+            }
+            // Then check explicit/default schema
+            Schema schema = schemaName != null ? database.getSchema(schemaName) : null;
+            if (schema != null) {
+                Table table = schema.getTable(tableName);
+                if (table != null) return table;
+            }
+            // Then walk search_path
+            if (session != null) {
+                String searchPath = session.getGucSettings().get("search_path");
+                if (searchPath != null) {
+                    for (String sp : searchPath.split(",")) {
+                        String s = sp.trim().replace("\"", "").replace("'", "");
+                        if (s.isEmpty() || s.equals("$user")) continue;
+                        Schema spSchema = database.getSchema(s);
+                        if (spSchema != null) {
+                            Table table = spSchema.getTable(tableName);
+                            if (table != null) return table;
+                        }
                     }
                 }
             }
         }
-        if (schema == null && schemaName != null && !"pg_catalog".equalsIgnoreCase(schemaName)
+        if (schemaName != null && database.getSchema(schemaName) == null
+                && !"pg_catalog".equalsIgnoreCase(schemaName)
                 && !"information_schema".equalsIgnoreCase(schemaName)) {
             throw new MemgresException("schema \"" + schemaName + "\" does not exist", "3F000");
         }

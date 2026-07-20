@@ -39,6 +39,10 @@ class PgDumpSchemaAccuracyTest {
         // Restore the reference dump
         String rawSql = IO.readString(findFixture("pgdump-fixtures/reference-dump.sql"), StandardCharsets.UTF_8);
         restoreDump(conn, rawSql);
+        // pg_dump sets search_path to '' — restore it so tests can use unqualified names
+        try (Statement s = conn.createStatement()) {
+            s.execute("SET search_path = '\"$user\", public'");
+        }
     }
 
     @AfterAll

@@ -1488,6 +1488,11 @@ public class Database {
         return indexTableNames.get(name.toLowerCase());
     }
 
+    /** Returns all index → table name mappings (used by CLUSTER to find clustered indexes for a table). */
+    public Map<String, String> getIndexTableNames() {
+        return indexTableNames;
+    }
+
     public boolean isUniqueIndex(String name) {
         return indexUniqueFlags.getOrDefault(name.toLowerCase(), false);
     }

@@ -353,8 +353,17 @@ class CatalogSystemFunctions {
                         throw new MemgresException("parameter \"max_connections\" cannot be changed without restarting the server");
                     }
                     String settingValue = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                    boolean isLocal = fn.args().size() >= 3 && executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
                     if (executor.session != null) {
-                        executor.session.getGucSettings().set(settingName, settingValue);
+                        if (isLocal) {
+                            // M13: set_config(..., true) is LOCAL — no-op outside txn
+                            if (executor.session.isInTransaction()) {
+                                executor.session.getGucSettings().setLocal(settingName, settingValue);
+                            }
+                            // Outside txn: silently ignored (PG behavior)
+                        } else {
+                            executor.session.getGucSettings().set(settingName, settingValue);
+                        }
                     }
                     return settingValue;
                 }

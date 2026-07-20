@@ -630,6 +630,8 @@ class UtilityCommandsCoverageTest {
     void clusterVerbose() throws Exception {
         exec("CREATE TABLE clust_t2 (id int)");
         exec("CREATE INDEX clust_idx2 ON clust_t2 (id)");
+        // L8: Must first cluster with a specific index before re-clustering
+        exec("CLUSTER clust_t2 USING clust_idx2");
         assertDoesNotThrow(() -> exec("CLUSTER VERBOSE clust_t2"));
     }
 

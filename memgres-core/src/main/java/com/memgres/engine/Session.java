@@ -85,6 +85,8 @@ public class Session {
 
     // GUC settings for this session
     private final GucSettings gucSettings = new GucSettings();
+    // Snapshot of session GUC overrides at BEGIN for transactional rollback (M13)
+    private java.util.Map<String, String> gucSessionSnapshot = null;
 
     // Shared scheduler for statement_timeout cancellation (one per JVM is sufficient)
     private static final ScheduledExecutorService TIMEOUT_SCHEDULER =
@@ -562,6 +564,8 @@ public class Session {
         commandId = 0;
         undoLog.clear();
         savepoints.clear();
+        // M13: snapshot session GUC overrides so plain SET can be rolled back
+        gucSessionSnapshot = gucSettings.snapshotSessionOverrides();
     }
 
     /** Returns the transaction start timestamp (frozen for now()/current_timestamp stability), or null if not in a transaction. */
@@ -634,6 +638,8 @@ public class Session {
         snapshotImported = false;
         // Clear transaction-scoped GUC overrides (SET LOCAL)
         gucSettings.clearTransactionOverrides();
+        // M13: discard GUC snapshot (changes are committed, no rollback needed)
+        gucSessionSnapshot = null;
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
@@ -692,6 +698,11 @@ public class Session {
         snapshotImported = false;
         // Clear transaction-scoped GUC overrides (SET LOCAL)
         gucSettings.clearTransactionOverrides();
+        // M13: restore session GUC overrides to pre-BEGIN state (plain SET rollback)
+        if (gucSessionSnapshot != null) {
+            gucSettings.restoreSessionOverrides(gucSessionSnapshot);
+            gucSessionSnapshot = null;
+        }
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
@@ -1060,13 +1071,19 @@ public class Session {
     public String getEffectiveSchema() {
         String searchPath = gucSettings.get("search_path");
         if (searchPath != null) {
+            // Check if search_path is effectively empty (all entries blank or $user)
+            boolean hasEntries = false;
             for (String sp : searchPath.split(",")) {
                 String s = sp.trim().replace("\"", "").replace("'", "");
                 if (s.isEmpty() || s.equals("$user")) continue;
+                hasEntries = true;
                 // pg_catalog is always a valid schema (virtual, not stored in Database)
                 if ("pg_catalog".equals(s) || "information_schema".equals(s)
                         || database.getSchema(s) != null) return s;
             }
+            // If search_path has entries but none are valid schemas, still return "public"
+            // (this handles cases like SET search_path = 'nonexistent')
+            // If search_path is genuinely empty, return "public" for DDL default schema
         }
         return "public";
     }
