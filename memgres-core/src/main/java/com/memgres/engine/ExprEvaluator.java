@@ -494,6 +494,7 @@ class ExprEvaluator {
             // so we catch the "missing FROM-clause" error and fall through to outer contexts.
             Object result = null;
             boolean foundInCurrent = false;
+            MemgresException aliasHidingError = null;
             try {
                 result = ctx.resolveColumn(ref.table(), ref.column());
                 foundInCurrent = true;
@@ -509,6 +510,10 @@ class ExprEvaluator {
                     throw e;
                 }
                 if (!"42P01".equals(e.getSqlState())) throw e;
+                // Save alias-hiding errors for later — outer contexts may resolve this (correlated subqueries)
+                if (e.getMessage() != null && e.getMessage().startsWith("invalid reference")) {
+                    aliasHidingError = e;
+                }
                 // table not in current context, will try outer contexts below
             }
             if (foundInCurrent) {
@@ -535,7 +540,8 @@ class ExprEvaluator {
                     // table not in this outer context either, continue searching
                 }
             }
-            // Not found in any context; throw the original error
+            // Not found in any context; prefer alias-hiding error if detected
+            if (aliasHidingError != null) throw aliasHidingError;
             throw new MemgresException("missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
         }
     }

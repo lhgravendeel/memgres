@@ -162,8 +162,20 @@ class SelectExecutor {
                         boolean tableFound = false;
                         boolean colFound = false;
                         boolean mayResolveViaAttributeNotation = false;
+                        String hiddenByAlias = null; // alias that hides the real table name
                         for (RowContext.TableBinding b : baseBindings) {
-                            if (!cr.table().equalsIgnoreCase(b.alias()) && !cr.table().equalsIgnoreCase(b.table().getName())) continue;
+                            // PG scoping: an alias hides the table's real name.
+                            // Only match by alias; if alias differs from table name,
+                            // do NOT match by raw table name.
+                            boolean matchesByAlias = cr.table().equalsIgnoreCase(b.alias());
+                            boolean matchesByTableName = cr.table().equalsIgnoreCase(b.table().getName());
+                            if (!matchesByAlias && matchesByTableName
+                                    && b.alias() != null && !b.alias().equalsIgnoreCase(b.table().getName())) {
+                                // Table name is hidden by a different alias
+                                hiddenByAlias = b.alias();
+                                continue;
+                            }
+                            if (!matchesByAlias && !matchesByTableName) continue;
                             tableFound = true;
                             if (b.table().getColumnIndex(cr.column()) >= 0) { colFound = true; break; }
                             // Mirror ExprEvaluator.tryAttributeNotationFallback's guard: a
@@ -177,6 +189,12 @@ class SelectExecutor {
                             }
                         }
                         if (!tableFound) {
+                            if (hiddenByAlias != null) {
+                                MemgresException ex = new MemgresException(
+                                        "invalid reference to FROM-clause entry for table \"" + cr.table() + "\"", "42P01");
+                                ex.setHint("Perhaps you meant to reference the table alias \"" + hiddenByAlias + "\".");
+                                throw ex;
+                            }
                             throw new MemgresException("missing FROM-clause entry for table \"" + cr.table() + "\"", "42P01");
                         }
                         if (!colFound && !mayResolveViaAttributeNotation) {

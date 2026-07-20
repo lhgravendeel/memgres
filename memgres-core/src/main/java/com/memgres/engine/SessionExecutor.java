@@ -1283,6 +1283,17 @@ class SessionExecutor {
         if (executor.session.getPreparedStatement(stmt.name()) != null) {
             throw new MemgresException("prepared statement \"" + stmt.name() + "\" already exists", "42P05");
         }
+        // PG only allows optimizable statements (SELECT, INSERT, UPDATE, DELETE, MERGE, VALUES,
+        // and set operations like UNION/INTERSECT/EXCEPT) in PREPARE.
+        // DDL / utility statements are rejected with 42601.
+        if (!(stmt.body() instanceof com.memgres.engine.parser.ast.SelectStmt)
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.InsertStmt)
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.UpdateStmt)
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.DeleteStmt)
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.SetOpStmt)
+                && !(stmt.body() instanceof com.memgres.engine.parser.ast.MergeStmt)) {
+            throw new MemgresException("utility statements cannot be prepared", "42601");
+        }
         // Always infer param count from $N references in body
         List<String> paramTypes = stmt.paramTypes();
         int inferredCount = maxParamIndex(stmt.body());

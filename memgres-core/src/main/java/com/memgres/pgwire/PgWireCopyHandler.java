@@ -497,8 +497,9 @@ class PgWireCopyHandler {
         char quote = quoteChar.isEmpty() ? '"' : quoteChar.charAt(0);
         char escape = escapeChar.isEmpty() ? quote : escapeChar.charAt(0);
         // A data value equal to the NULL marker must be quoted so it round-trips as data.
+        // PG only quotes for the QUOTE char, not the ESCAPE char (unless escape == quote).
         boolean needsQuote = val.equals(nullString)
-                || val.indexOf(quote) >= 0 || val.indexOf(escape) >= 0
+                || val.indexOf(quote) >= 0
                 || val.contains(delimiter) || val.indexOf('\n') >= 0 || val.indexOf('\r') >= 0;
         if (needsQuote) {
             return csvQuote(val, quote, escape);

@@ -44,6 +44,28 @@ class BinaryOpEvaluator {
         return false;
     }
 
+    /**
+     * Check if an expression resolves to jsonb type — covers explicit casts AND column references
+     * to jsonb-typed columns. Used for || operator to distinguish jsonb concat from text concat.
+     */
+    private boolean isJsonbExpression(Expression expr, RowContext ctx) {
+        if (isCastToType(expr, "jsonb")) return true;
+        if (expr instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) expr;
+            for (RowContext.TableBinding b : ctx.getBindings()) {
+                if (ref.table != null) {
+                    String bindName = b.alias() != null ? b.alias() : b.table().getName();
+                    if (!bindName.equalsIgnoreCase(ref.table)) continue;
+                }
+                int idx = b.table().getColumnIndex(ref.column);
+                if (idx >= 0 && b.table().getColumns().get(idx).getType() == DataType.JSONB) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private static boolean isCastToTextType(Expression expr) {
         if (expr instanceof CastExpr) {
             String tn = ((CastExpr) expr).typeName().toLowerCase();
@@ -154,25 +176,31 @@ class BinaryOpEvaluator {
             return left.toString() + right.toString();
         }
 
-        // jsonb || jsonb: when an operand is explicitly cast to jsonb, both sides are
-        // jsonb in PG. This handles scalar jsonb operands (e.g. '1'::jsonb || '2'::jsonb)
+        // jsonb || jsonb: when an operand is jsonb (explicit cast or jsonb column), both
+        // sides are jsonb in PG. This handles scalar jsonb operands (e.g. '1'::jsonb || '2'::jsonb)
         // that the container-string heuristics in evalBuiltinBinary cannot recognize.
         // The other operand must itself be jsonb or an untyped literal PG would coerce;
         // there is no implicit cast from other types, so jsonb || 1 is 42883 in PG.
         if (bin.op() == BinaryExpr.BinOp.CONCAT
-                && (isCastToType(bin.left(), "jsonb") || isCastToType(bin.right(), "jsonb"))
+                && (isJsonbExpression(bin.left(), ctx) || isJsonbExpression(bin.right(), ctx))
                 && !(left instanceof List) && !(right instanceof List)
                 && !(left instanceof HstoreValue) && !(right instanceof HstoreValue)) {
             if (left == null || right == null) return null;
-            if (!isCastToType(bin.left(), "jsonb") && !(left instanceof String)) {
+            if (!isJsonbExpression(bin.left(), ctx) && !(left instanceof String)) {
                 throw new MemgresException("operator does not exist: "
                         + AstExecutor.pgTypeNameOf(left) + " || jsonb", "42883");
             }
-            if (!isCastToType(bin.right(), "jsonb") && !(right instanceof String)) {
+            if (!isJsonbExpression(bin.right(), ctx) && !(right instanceof String)) {
                 throw new MemgresException("operator does not exist: jsonb || "
                         + AstExecutor.pgTypeNameOf(right), "42883");
             }
             return JsonOperations.concatenate(left.toString(), right.toString());
+        }
+
+        // text -> int is not supported in PG; reject if left is explicitly text-typed
+        if ((bin.op() == BinaryExpr.BinOp.JSON_ARROW || bin.op() == BinaryExpr.BinOp.JSON_ARROW_TEXT)
+                && isCastToTextType(bin.left()) && left instanceof String) {
+            throw new MemgresException("operator does not exist: text -> integer", "42883");
         }
 
         // Operator type mismatch validation (before coercion)
@@ -774,10 +802,18 @@ class BinaryOpEvaluator {
                     // name-style subscript (pg_dump: typname[0] = '_'): PG's name type
                     // supports zero-based single-character access; out of range is NULL.
                     // Only plain strings land here — JSON/array containers were handled above.
+                    // Skip jsonb scalars (numbers, booleans, null, quoted strings) which
+                    // should return NULL for integer subscript, not charAt.
                     if (left instanceof String) {
                         String plain = (String) left;
                         String trimmed = plain.trim();
                         if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("\"")) {
+                            // Check if this looks like a JSON scalar — if so, return NULL
+                            if (trimmed.equals("null") || trimmed.equals("true") || trimmed.equals("false")
+                                    || trimmed.matches("-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?")) {
+                                // jsonb scalar -> int = NULL (scalars are not subscriptable)
+                                return null;
+                            }
                             int idx = n.intValue();
                             return (idx >= 0 && idx < plain.length()) ? String.valueOf(plain.charAt(idx)) : null;
                         }
