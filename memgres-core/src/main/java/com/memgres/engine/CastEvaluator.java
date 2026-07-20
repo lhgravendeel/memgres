@@ -184,7 +184,10 @@ class CastEvaluator {
                 List<Object> castList = new ArrayList<>();
                 for (Object elem : list) {
                     if (elem == null) castList.add(null);
-                    else {
+                    else if (elem instanceof List<?>) {
+                        // Multidimensional array: recursively cast each sub-array
+                        castList.add(applyCast(elem, elemType + "[]"));
+                    } else {
                         // Do not trim: quoted elements may carry significant leading/trailing
                         // whitespace (already normalized by the parser above for unquoted ones).
                         String elemStr = elem instanceof String ? (String) elem : elem.toString();
@@ -410,6 +413,10 @@ class CastEvaluator {
             case "interval minute to second":
                 return TypeCoercion.toInterval(val);
             case "money":
+                // PG does not allow direct float→money cast (must go through numeric first)
+                if (val instanceof Double || val instanceof Float) {
+                    throw new MemgresException("cannot cast type double precision to money", "42846");
+                }
                 return TypeCoercion.toMoney(val);
             case "bytea": {
                 if (val instanceof byte[]) return val;
@@ -417,22 +424,76 @@ class CastEvaluator {
                 if (s.startsWith("\\x") || s.startsWith("\\X")) {
                     return ByteaOperations.parseHexFormat(s);
                 }
+                // Check for escape format: contains backslash-octal sequences
+                if (s.contains("\\")) {
+                    return ByteaOperations.parseEscapeFormat(s);
+                }
                 // Convert plain string to bytes (PG stores bytea as byte array)
                 return s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             }
             case "bit":
             case "bit varying":
             case "varbit": {
-                String bitStr = val instanceof AstExecutor.PgBitString ? ((AstExecutor.PgBitString) val).bits() : val.toString();
-                // Handle bit(N) by padding or raising error on truncation
-                if (lowerSpec.matches("bit\\(\\d+\\)")) {
-                    int n = Integer.parseInt(lowerSpec.replaceAll(".*\\((\\d+)\\).*", "$1"));
-                    if (bitStr.length() < n) {
-                        // Pad with zeros on the right (PG behavior)
-                        bitStr = bitStr + Strs.repeat("0", n - bitStr.length());
-                    } else if (bitStr.length() > n) {
-                        // PG silently truncates to first n bits for both literals and varbit
-                        bitStr = bitStr.substring(0, n);
+                String bitStr;
+                if (val instanceof AstExecutor.PgBitString) {
+                    bitStr = ((AstExecutor.PgBitString) val).bits();
+                } else if (val instanceof Number) {
+                    // Integer/long → bit: convert to two's complement binary
+                    long lv = ((Number) val).longValue();
+                    // Extract target length from type spec
+                    int targetLen = -1;
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\((\\d+)\\)").matcher(lowerSpec);
+                    if (m.find()) targetLen = Integer.parseInt(m.group(1));
+                    if (targetLen <= 0) targetLen = 32; // PG default for bit without length is 1, but for int casts uses 32
+                    if (targetLen <= 32) {
+                        // Use 32-bit two's complement, then take last targetLen bits
+                        String full = String.format("%32s", Integer.toBinaryString((int) lv)).replace(' ', '0');
+                        bitStr = full.substring(32 - targetLen);
+                    } else {
+                        // Use 64-bit two's complement, then take last targetLen bits
+                        String full = String.format("%64s", Long.toBinaryString(lv)).replace(' ', '0');
+                        if (targetLen <= 64) {
+                            bitStr = full.substring(64 - targetLen);
+                        } else {
+                            // Pad left with sign bit
+                            char signBit = lv < 0 ? '1' : '0';
+                            bitStr = Strs.repeat(String.valueOf(signBit), targetLen - 64) + full;
+                        }
+                    }
+                    return new AstExecutor.PgBitString(bitStr);
+                } else {
+                    bitStr = val.toString();
+                }
+                // Validate: only '0' and '1' allowed
+                for (int i = 0; i < bitStr.length(); i++) {
+                    char c = bitStr.charAt(i);
+                    if (c != '0' && c != '1') {
+                        throw new MemgresException("\"" + val + "\" is not a valid binary digit", "22P02");
+                    }
+                }
+                // Handle bit(N) length enforcement
+                java.util.regex.Matcher lenMatcher = java.util.regex.Pattern.compile("\\((\\d+)\\)").matcher(lowerSpec);
+                if (lenMatcher.find()) {
+                    int n = Integer.parseInt(lenMatcher.group(1));
+                    if (typeName.equals("bit")) {
+                        // bit(n): must be exactly n bits — pad right or truncate
+                        if (bitStr.length() < n) {
+                            bitStr = bitStr + Strs.repeat("0", n - bitStr.length());
+                        } else if (bitStr.length() > n) {
+                            bitStr = bitStr.substring(0, n);
+                        }
+                    } else {
+                        // varbit(n): max n bits — error if too long
+                        if (bitStr.length() > n) {
+                            throw new MemgresException("bit string too long for type bit varying(" + n + ")", "22001");
+                        }
+                    }
+                } else if (typeName.equals("bit") && bitStr.length() != 1) {
+                    // bare "bit" without length means bit(1)
+                    if (bitStr.length() < 1) {
+                        bitStr = "0";
+                    } else {
+                        bitStr = bitStr.substring(0, 1);
                     }
                 }
                 return new AstExecutor.PgBitString(bitStr);

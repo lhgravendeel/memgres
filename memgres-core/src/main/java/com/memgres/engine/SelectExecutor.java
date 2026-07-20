@@ -1472,6 +1472,7 @@ class SelectExecutor {
     // ---- Static utilities ----
 
     static java.math.BigDecimal toBigDecimal(Object val) {
+        if (val instanceof PgMoney) return ((PgMoney) val).getValue();
         if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val);
         if (val instanceof Integer) return java.math.BigDecimal.valueOf(((Integer) val));
         if (val instanceof Long) return java.math.BigDecimal.valueOf(((Long) val));

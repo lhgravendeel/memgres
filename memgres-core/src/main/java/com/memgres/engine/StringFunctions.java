@@ -157,6 +157,12 @@ class StringFunctions {
             case "btrim": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
+                // bytea btrim
+                if (arg instanceof byte[]) {
+                    byte[] data = (byte[]) arg;
+                    byte[] trimBytes = fn.args().size() > 1 ? toBytea(executor.evalExpr(fn.args().get(1), ctx)) : new byte[]{0x20};
+                    return byteaTrim(data, trimBytes, true, true);
+                }
                 if (fn.args().size() > 1) {
                     String chars = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                     String s = arg.toString();
@@ -236,7 +242,7 @@ class StringFunctions {
                 if (fn.args().size() > 2) {
                     int count = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
                     if (count < 0) {
-                        throw new MemgresException("negative substring length not allowed", "22023");
+                        throw new MemgresException("negative substring length not allowed", "22011");
                     }
                     // PG semantics: end = start + count (1-based exclusive).
                     // Clip start to [1, len+1], clip end to [start, len+1].
@@ -287,6 +293,12 @@ class StringFunctions {
             case "ltrim": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
+                // bytea ltrim
+                if (str instanceof byte[]) {
+                    byte[] data = (byte[]) str;
+                    byte[] trimBytes = fn.args().size() > 1 ? toBytea(executor.evalExpr(fn.args().get(1), ctx)) : new byte[]{0x20};
+                    return byteaTrim(data, trimBytes, true, false);
+                }
                 String chars = fn.args().size() > 1 ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)) : " ";
                 String s = str.toString();
                 int i = 0;
@@ -296,11 +308,17 @@ class StringFunctions {
             case "rtrim": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
+                // bytea rtrim
+                if (str instanceof byte[]) {
+                    byte[] data = (byte[]) str;
+                    byte[] trimBytes = fn.args().size() > 1 ? toBytea(executor.evalExpr(fn.args().get(1), ctx)) : new byte[]{0x20};
+                    return byteaTrim(data, trimBytes, false, true);
+                }
                 String chars = fn.args().size() > 1 ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)) : " ";
                 String s = str.toString();
-                int i = s.length() - 1;
-                while (i >= 0 && chars.indexOf(s.charAt(i)) >= 0) i--;
-                return s.substring(0, i + 1);
+                int i2 = s.length() - 1;
+                while (i2 >= 0 && chars.indexOf(s.charAt(i2)) >= 0) i2--;
+                return s.substring(0, i2 + 1);
             }
             case "lpad": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
@@ -724,7 +742,7 @@ class StringFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 int codepoint = executor.toInt(arg);
-                if (codepoint == 0) throw new MemgresException("null character not permitted", "22023");
+                if (codepoint == 0) throw new MemgresException("null character not permitted", "54000");
                 if (codepoint < 0) throw new MemgresException("requested character too large for encoding: " + codepoint, "22023");
                 if (codepoint > 1114111) throw new MemgresException("requested character too large for encoding: " + codepoint, "54000");
                 return new String(Character.toChars(codepoint));
@@ -737,7 +755,9 @@ class StringFunctions {
             }
             case "md5": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : ByteaOperations.md5(arg.toString());
+                if (arg == null) return null;
+                if (arg instanceof byte[]) return ByteaOperations.md5bytes((byte[]) arg);
+                return ByteaOperations.md5(arg.toString());
             }
             case "translate": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
@@ -828,22 +848,19 @@ class StringFunctions {
                     for (byte b : bytes) hex.append(String.format("%02x", b));
                     return hex.toString();
                 } else if (format.equals("escape")) {
-                    // PG bytea escape format:
+                    // PG encode(bytea, 'escape'):
                     // - Printable ASCII (32-126 except \): as-is
-                    // - Backslash (92): \\
-                    // - Zero byte and high bytes (0, 128-255): \\NNN (double backslash + octal)
-                    // - Control characters (1-31, 127): \NNN (single backslash + octal)
+                    // - Backslash (92): \\ (single escape pair)
+                    // - All other bytes: \NNN (single backslash + octal)
                     StringBuilder sb = new StringBuilder();
                     for (byte b : bytes) {
                         int unsigned = b & 0xFF;
                         if (unsigned >= 32 && unsigned <= 126 && unsigned != 92) {
                             sb.append((char) unsigned);
                         } else if (unsigned == 92) {
-                            sb.append((char) 92).append((char) 92);
-                        } else if (unsigned == 0 || unsigned > 127) {
-                            sb.append((char) 92).append((char) 92).append(String.format("%03o", unsigned));
+                            sb.append("\\\\");
                         } else {
-                            sb.append((char) 92).append(String.format("%03o", unsigned));
+                            sb.append('\\').append(String.format("%03o", unsigned));
                         }
                     }
                     return sb.toString();
@@ -935,6 +952,11 @@ class StringFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 if (arg instanceof byte[]) return ((byte[]) arg).length;
+                // Bit string: octet_length = ceil(bits / 8)
+                if (arg instanceof AstExecutor.PgBitString) {
+                    int bits = ((AstExecutor.PgBitString) arg).bits().length();
+                    return (bits + 7) / 8;
+                }
                 return arg.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
             }
             case "bit_length": {
@@ -942,8 +964,9 @@ class StringFunctions {
                 if (arg == null) return null;
                 if (arg instanceof byte[]) return ((byte[]) arg).length * 8;
                 // Bit string: bit_length(B'1010') = 4
+                if (arg instanceof AstExecutor.PgBitString)
+                    return ((AstExecutor.PgBitString) arg).bits().length();
                 String bs = arg.toString();
-                if (bs.matches("[01]+")) return bs.length();
                 return bs.getBytes(java.nio.charset.StandardCharsets.UTF_8).length * 8;
             }
             case "quote_literal": {
@@ -1133,5 +1156,26 @@ class StringFunctions {
             return new java.util.Locale(parts[0], parts[1]);
         }
         return new java.util.Locale(parts[0]);
+    }
+
+    /** Convert value to byte[] for bytea operations. */
+    private static byte[] toBytea(Object val) {
+        if (val instanceof byte[]) return (byte[]) val;
+        return val.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** Trim bytes from bytea: remove leading/trailing bytes that appear in trimBytes set. */
+    private static byte[] byteaTrim(byte[] data, byte[] trimBytes, boolean trimLeft, boolean trimRight) {
+        java.util.Set<Byte> trimSet = new java.util.HashSet<>();
+        for (byte b : trimBytes) trimSet.add(b);
+        int start = 0;
+        int end = data.length;
+        if (trimLeft) {
+            while (start < end && trimSet.contains(data[start])) start++;
+        }
+        if (trimRight) {
+            while (end > start && trimSet.contains(data[end - 1])) end--;
+        }
+        return java.util.Arrays.copyOfRange(data, start, end);
     }
 }

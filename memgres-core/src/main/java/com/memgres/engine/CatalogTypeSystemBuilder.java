@@ -352,8 +352,8 @@ class CatalogTypeSystemBuilder {
             // REFCURSOR
             {TEXT, REFCURSOR}, {REFCURSOR, TEXT},
 
-            // MONEY from float
-            {FLOAT4, MONEY}, {FLOAT8, MONEY},
+            // MONEY from float — PG does not allow direct float→money cast
+            // {FLOAT4, MONEY}, {FLOAT8, MONEY},
 
             // JSONB from other types
             {INT2, JSONB}, {INT4, JSONB}, {INT8, JSONB}, {FLOAT4, JSONB}, {FLOAT8, JSONB},

@@ -1119,17 +1119,17 @@ class SqlStateCorrectnessV2Test {
         assertSqlState("SELECT chr(-1)", "22023");
     }
 
-    @Test void chr_zero_gives_22023() {
-        assertSqlState("SELECT chr(0)", "22023");
+    @Test void chr_zero_gives_54000() {
+        assertSqlState("SELECT chr(0)", "54000");
     }
 
-    @Test void substring_negative_length_gives_22023() {
-        // In some PG versions, negative length in substring may give 22023
+    @Test void substring_negative_length_gives_22011() {
+        // PG returns 22011 for negative substring length
         try {
             exec("SELECT substring('hello' FROM 1 FOR -1)");
             // If it doesn't error, that's fine; PG behavior varies
         } catch (SQLException e) {
-            assertEquals("22023", e.getSQLState());
+            assertEquals("22011", e.getSQLState());
         }
     }
 
@@ -1309,8 +1309,8 @@ class SqlStateCorrectnessV2Test {
         }
     }
 
-    @Test void zero_length_character_string_gives_22023_for_chr() {
-        assertSqlState("SELECT chr(0)", "22023");
+    @Test void zero_length_character_string_gives_54000_for_chr() {
+        assertSqlState("SELECT chr(0)", "54000");
     }
 
     // ========================================================================

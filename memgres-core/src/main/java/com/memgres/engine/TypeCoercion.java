@@ -378,7 +378,7 @@ public final class TypeCoercion {
             case NUMERIC:
                 return value instanceof BigDecimal;
             case MONEY:
-                return value instanceof BigDecimal;
+                return value instanceof PgMoney;
             case BOOLEAN:
                 return value instanceof Boolean;
             case DATE:
@@ -434,6 +434,25 @@ public final class TypeCoercion {
         if (type == DataType.NUMERIC && column.getScale() != null && value instanceof BigDecimal) {
             BigDecimal bd = (BigDecimal) value;
             return bd.setScale(column.getScale(), RoundingMode.HALF_UP);
+        }
+        // BIT(n) / VARBIT(n) length enforcement
+        if (type == DataType.BIT && value instanceof AstExecutor.PgBitString && column.getPrecision() != null) {
+            String bits = ((AstExecutor.PgBitString) value).bits();
+            int n = column.getPrecision();
+            if (bits.length() < n) {
+                StringBuilder sb = new StringBuilder(bits);
+                while (sb.length() < n) sb.append('0');
+                return new AstExecutor.PgBitString(sb.toString());
+            } else if (bits.length() > n) {
+                throw new MemgresException("bit string length " + bits.length() + " does not match type bit(" + n + ")", "22026");
+            }
+        }
+        if (type == DataType.VARBIT && value instanceof AstExecutor.PgBitString && column.getPrecision() != null) {
+            String bits = ((AstExecutor.PgBitString) value).bits();
+            int n = column.getPrecision();
+            if (bits.length() > n) {
+                throw new MemgresException("bit string too long for type bit varying(" + n + ")", "22001");
+            }
         }
         return value;
     }
@@ -527,6 +546,12 @@ public final class TypeCoercion {
     }
 
     public static Long toLong(Object val) {
+        if (val instanceof AstExecutor.PgBitString) {
+            String bits = ((AstExecutor.PgBitString) val).bits();
+            if (bits.length() <= 63) return Long.parseLong(bits, 2);
+            // 64-bit: parse as unsigned then reinterpret as signed (two's complement)
+            return Long.parseUnsignedLong(bits.substring(bits.length() - 64), 2);
+        }
         if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val).setScale(0, java.math.RoundingMode.HALF_UP).longValue();
         if (val instanceof Number) return ((Number) val).longValue();
         if (val instanceof Boolean) return ((Boolean) val) ? 1L : 0L;
@@ -579,10 +604,7 @@ public final class TypeCoercion {
         if (val instanceof PgMoney) return (PgMoney) val;
         if (val instanceof BigDecimal) return new PgMoney((BigDecimal) val);
         if (val instanceof Number) return new PgMoney(BigDecimal.valueOf(((Number) val).doubleValue()));
-        String s = val.toString().trim();
-        // Strip '$' and ',' from money strings
-        s = s.replace("$", "").replace(",", "");
-        return new PgMoney(new BigDecimal(s));
+        return PgMoney.parse(val.toString());
     }
 
     public static BigDecimal toBigDecimal(Object val) {
