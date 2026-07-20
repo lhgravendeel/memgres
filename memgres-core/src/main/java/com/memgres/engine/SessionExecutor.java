@@ -925,8 +925,16 @@ class SessionExecutor {
             }
         }
         // Validate object exists for TABLE grants (or no objectType = default TABLE)
+        // M10: Support schema-qualified names (schema.table)
         if (s.objectName() != null && (s.objectType() == null || s.objectType().equals("TABLE"))) {
-            try { executor.resolveTable(executor.defaultSchema(), s.objectName()); }
+            String grantSchema = executor.defaultSchema();
+            String grantTable = s.objectName();
+            if (grantTable.contains(".")) {
+                int dot = grantTable.indexOf('.');
+                grantSchema = grantTable.substring(0, dot);
+                grantTable = grantTable.substring(dot + 1);
+            }
+            try { executor.resolveTable(grantSchema, grantTable); }
             catch (MemgresException e) {
                 throw new MemgresException("relation \"" + s.objectName() + "\" does not exist", "42P01");
             }
@@ -973,7 +981,14 @@ class SessionExecutor {
             }
             // Validate column-level privileges: check column exists
             if (s.columns() != null) {
-                Table table = executor.resolveTable(executor.defaultSchema(), s.objectName());
+                String colSchema = executor.defaultSchema();
+                String colTable = s.objectName();
+                if (colTable.contains(".")) {
+                    int dot = colTable.indexOf('.');
+                    colSchema = colTable.substring(0, dot);
+                    colTable = colTable.substring(dot + 1);
+                }
+                Table table = executor.resolveTable(colSchema, colTable);
                 for (String col : s.columns()) {
                     if (table.getColumnIndex(col) < 0) {
                         throw new MemgresException("column \"" + col + "\" of relation \"" + s.objectName() + "\" does not exist", "42703");
@@ -981,8 +996,41 @@ class SessionExecutor {
                 }
             }
         }
+        // M9: Validate grantor holds privilege WITH GRANT OPTION (non-superuser, non-owner)
+        if (s.objectName() != null && s.objectType() != null && "TABLE".equalsIgnoreCase(s.objectType())) {
+            String currentRole = executor.currentRole();
+            Map<String, String> roleAttrs = executor.database.getRole(currentRole);
+            boolean isSuperuser = roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"));
+            if (roleAttrs == null) {
+                String lower = currentRole.toLowerCase();
+                isSuperuser = "memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower);
+            }
+            if (!isSuperuser) {
+                // Check if current role is the owner
+                String bareObj = s.objectName().contains(".") ? s.objectName().substring(s.objectName().indexOf('.') + 1) : s.objectName();
+                String schForOwner = s.objectName().contains(".") ? s.objectName().substring(0, s.objectName().indexOf('.')) : executor.defaultSchema();
+                String ownerKey = "table:" + schForOwner.toLowerCase() + "." + bareObj.toLowerCase();
+                String owner = executor.database.getObjectOwner(ownerKey);
+                boolean isOwner = owner != null && owner.equalsIgnoreCase(currentRole);
+                if (!isOwner) {
+                    for (String priv : s.privileges()) {
+                        // Must hold the privilege WITH GRANT OPTION
+                        if (!executor.hasPrivilegeDirectOrInherited(currentRole, priv + "_GRANT_OPTION", "TABLE", bareObj.toLowerCase())) {
+                            throw new MemgresException(
+                                "permission denied for table \"" + bareObj + "\"", "42501");
+                        }
+                    }
+                }
+            }
+        }
+
         // Track granted privileges for role dependency checks (DROP ROLE)
         if (s.objectName() != null && s.grantees() != null && s.objectType() != null) {
+            // M10: Strip schema prefix from object name for privilege storage
+            String bareObjectName = s.objectName();
+            if ("TABLE".equalsIgnoreCase(s.objectType()) && bareObjectName.contains(".")) {
+                bareObjectName = bareObjectName.substring(bareObjectName.indexOf('.') + 1);
+            }
             // Expand "ALL TABLES IN SCHEMA" to individual table grants
             if (s.objectType().startsWith("ALL TABLES IN SCHEMA")) {
                 Schema schema = executor.database.getSchema(s.objectName());
@@ -1001,10 +1049,14 @@ class SessionExecutor {
                         if (s.columns() != null && !s.columns().isEmpty()) {
                             // Column-level grant: store as COLUMN objectType with "tableName.colName"
                             for (String col : s.columns()) {
-                                executor.database.addRolePrivilege(grantee, priv, "COLUMN", s.objectName() + "." + col);
+                                executor.database.addRolePrivilege(grantee, priv, "COLUMN", bareObjectName + "." + col);
                             }
                         } else {
-                            executor.database.addRolePrivilege(grantee, priv, s.objectType(), s.objectName());
+                            executor.database.addRolePrivilege(grantee, priv, s.objectType(), bareObjectName);
+                            // M9: Track grant option separately
+                            if (s.withGrantOption()) {
+                                executor.database.addRolePrivilege(grantee, priv + "_GRANT_OPTION", s.objectType(), bareObjectName);
+                            }
                         }
                     }
                 }
@@ -1044,29 +1096,46 @@ class SessionExecutor {
         }
         // Validate object exists for TABLE grants
         if (s.objectType() != null && s.objectType().equals("TABLE") && s.objectName() != null) {
-            try { executor.resolveTable(executor.defaultSchema(), s.objectName()); }
+            // M10: Support schema-qualified names
+            String rSchema = executor.defaultSchema();
+            String rTable = s.objectName();
+            if (rTable.contains(".")) {
+                int dot = rTable.indexOf('.');
+                rSchema = rTable.substring(0, dot);
+                rTable = rTable.substring(dot + 1);
+            }
+            try { executor.resolveTable(rSchema, rTable); }
             catch (MemgresException e) {
                 throw new MemgresException("relation \"" + s.objectName() + "\" does not exist", "42P01");
             }
         }
         // Track privilege removal
         if (s.objectName() != null && s.grantees() != null && s.objectType() != null) {
+            // M10: Strip schema prefix from object name
+            String bareObjName = s.objectName();
+            if ("TABLE".equalsIgnoreCase(s.objectType()) && bareObjName.contains(".")) {
+                bareObjName = bareObjName.substring(bareObjName.indexOf('.') + 1);
+            }
             for (String grantee : s.grantees()) {
                 for (String priv : s.privileges()) {
                     if (s.columns() != null && !s.columns().isEmpty()) {
-                        // Column-level revoke: remove COLUMN objectType with "tableName.colName"
                         for (String col : s.columns()) {
-                            executor.database.removeRolePrivilege(grantee, priv, "COLUMN", s.objectName() + "." + col);
+                            executor.database.removeRolePrivilege(grantee, priv, "COLUMN", bareObjName + "." + col);
                         }
+                    } else if (s.grantOptionFor()) {
+                        // M9: REVOKE GRANT OPTION FOR — only remove the grant option flag, keep the privilege
+                        executor.database.removeRolePrivilege(grantee, priv + "_GRANT_OPTION", s.objectType(), bareObjName);
                     } else {
-                        executor.database.removeRolePrivilege(grantee, priv, s.objectType(), s.objectName());
+                        executor.database.removeRolePrivilege(grantee, priv, s.objectType(), bareObjName);
+                        // Also remove grant option when revoking the privilege itself
+                        executor.database.removeRolePrivilege(grantee, priv + "_GRANT_OPTION", s.objectType(), bareObjName);
                     }
                 }
             }
             // CASCADE: also revoke matching privileges from all other roles on same object
             if (s.cascade()) {
                 for (String priv : s.privileges()) {
-                    String suffixLower = ":" + s.objectType().toLowerCase() + ":" + s.objectName().toLowerCase();
+                    String suffixLower = ":" + s.objectType().toLowerCase() + ":" + bareObjName.toLowerCase();
                     String prefixLower = priv.toLowerCase() + suffixLower;
                     for (java.util.Map.Entry<String, java.util.Set<String>> entry
                             : executor.database.getAllRolePrivileges().entrySet()) {

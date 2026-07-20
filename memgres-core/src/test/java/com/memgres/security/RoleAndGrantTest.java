@@ -219,6 +219,7 @@ class RoleAndGrantTest {
         exec("CREATE ROLE ragt_queryrole1");
         exec("GRANT ragt_queryrole1 TO memgres");
         exec("CREATE TABLE ragt_sr_t1(id int PRIMARY KEY, v text)");
+        exec("GRANT ALL ON ragt_sr_t1 TO ragt_queryrole1");
         try {
             exec("SET ROLE ragt_queryrole1");
             exec("INSERT INTO ragt_sr_t1 VALUES (1, 'hello')");

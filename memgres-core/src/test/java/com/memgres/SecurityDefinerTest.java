@@ -374,6 +374,7 @@ class SecurityDefinerTest {
                     + "SFUNC = sd_sum_sf, STYPE = integer, INITCOND = '0')");
 
             stmt.execute("CREATE ROLE agg_caller");
+            stmt.execute("GRANT SELECT ON sd_agg_data TO agg_caller");
             stmt.execute("SET ROLE agg_caller");
 
             try (ResultSet rs = stmt.executeQuery("SELECT sd_agg_sum(val) FROM sd_agg_data")) {

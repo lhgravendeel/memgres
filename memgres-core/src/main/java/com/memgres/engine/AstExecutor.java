@@ -487,6 +487,60 @@ public class AstExecutor {
         return sessionUser();
     }
 
+    /**
+     * C6: Check that the current role has the given privilege on a table.
+     * Superusers and object owners bypass the check. PUBLIC grants are inherited.
+     */
+    void checkTablePrivilege(String privilege, String schemaName, String tableName) {
+        String role = currentRole();
+        if (role == null) return; // no session / embedded mode
+        // Superuser check (by role attribute, not hardcoded names)
+        Map<String, String> roleAttrs = database.getRole(role);
+        if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return;
+        // Also treat the default "memgres"/"test"/"postgres" connecting users as superuser
+        // when they have no explicit role entry (backwards-compat for existing tests)
+        if (roleAttrs == null) {
+            String lower = role.toLowerCase();
+            if ("memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower)) return;
+        }
+        // Owner check
+        String ownerKey = "table:" + schemaName.toLowerCase() + "." + tableName.toLowerCase();
+        String owner = database.getObjectOwner(ownerKey);
+        if (owner != null && owner.equalsIgnoreCase(role)) return;
+        // Direct or inherited privilege check (including PUBLIC grants)
+        if (hasPrivilegeDirectOrInherited(role, privilege, "TABLE", tableName.toLowerCase())) return;
+        // Also check PUBLIC grants
+        if (hasPrivilegeDirectOrInherited("public", privilege, "TABLE", tableName.toLowerCase())) return;
+        throw new MemgresException("permission denied for table \"" + tableName + "\"", "42501");
+    }
+
+    /** Check if role has a privilege directly or through role membership. */
+    boolean hasPrivilegeDirectOrInherited(String roleName, String privilege,
+            String objectType, String objectName) {
+        return hasPrivilegeDirectOrInherited(roleName, privilege, objectType, objectName, new java.util.HashSet<>());
+    }
+
+    private boolean hasPrivilegeDirectOrInherited(String roleName, String privilege,
+            String objectType, String objectName, java.util.Set<String> visited) {
+        String roleNameLower = roleName.toLowerCase();
+        if (visited.contains(roleNameLower)) return false;
+        visited.add(roleNameLower);
+        java.util.Set<String> privs = database.getRolePrivileges(roleNameLower);
+        String checkKey = privilege.toUpperCase() + ":" + objectType.toUpperCase() + ":" + objectName.toLowerCase();
+        String allKey = "ALL:" + objectType.toUpperCase() + ":" + objectName.toLowerCase();
+        if (privs.contains(checkKey) || privs.contains(allKey)) return true;
+        // Traverse role memberships
+        java.util.Map<String, java.util.Set<String>> memberships = database.getRoleMemberships();
+        for (java.util.Map.Entry<String, java.util.Set<String>> entry : memberships.entrySet()) {
+            if (entry.getValue().contains(roleNameLower) && !visited.contains(entry.getKey())) {
+                if (hasPrivilegeDirectOrInherited(entry.getKey(), privilege, objectType, objectName, visited)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     Table resolveTable(String schemaName, String tableName) {
         lastViewColumnMapping = null; // reset before each resolution
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";

@@ -5,6 +5,7 @@ import com.memgres.engine.util.Cols;
 import com.memgres.engine.parser.ast.*;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -24,6 +25,7 @@ class DdlRoleParser {
         }
         String name = parser.readIdentifier();
         Map<String, String> options = new LinkedHashMap<>();
+        List<String> inRoles = new java.util.ArrayList<>();
 
         parser.matchKeyword("WITH"); // optional WITH
 
@@ -37,9 +39,9 @@ class DdlRoleParser {
             parser.advance();
             switch (kw) {
                 case "IN": {
-                    // IN ROLE role / IN GROUP role
+                    // M12: IN ROLE role / IN GROUP role — capture role names
                     if (parser.matchKeyword("ROLE") || parser.matchKeyword("GROUP")) {
-                        do { parser.readIdentifier(); } while (parser.match(TokenType.COMMA));
+                        do { inRoles.add(parser.readIdentifier()); } while (parser.match(TokenType.COMMA));
                     }
                     break;
                 }
@@ -63,7 +65,7 @@ class DdlRoleParser {
             }
         }
 
-        return new CreateRoleStmt(name, isUser, options);
+        return new CreateRoleStmt(name, isUser, options, inRoles);
     }
 
     AlterRoleStmt parseAlterRole() {

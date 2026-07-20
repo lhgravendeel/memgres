@@ -432,6 +432,8 @@ class FromResolver {
             }
         }
         Table table = executor.resolveTable(schemaName, tableRef.table());
+        // C6: Enforce SELECT privilege on user tables
+        executor.checkTablePrivilege("SELECT", schemaName, tableRef.table());
         String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
         lastResolvedRightTable = table;
         lastResolvedRightAlias = alias;

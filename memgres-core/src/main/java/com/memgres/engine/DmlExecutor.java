@@ -129,6 +129,8 @@ class DmlExecutor {
         // Collect WITH CHECK OPTION constraints from views we're inserting through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         Table table = executor.resolveTable(schemaName, stmt.table());
+        // C6: Enforce INSERT privilege
+        executor.checkTablePrivilege("INSERT", schemaName, stmt.table());
         // Check table-level locks (blocks if ACCESS EXCLUSIVE held by another session)
         executor.database.checkTableLockForDml(schemaName + "." + stmt.table(), executor.session);
 
@@ -1002,6 +1004,8 @@ class DmlExecutor {
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         Table table = executor.resolveTable(schemaName, stmt.table());
+        // C6: Enforce UPDATE privilege
+        executor.checkTablePrivilege("UPDATE", schemaName, stmt.table());
         // Check for attempts to assign to system columns (PG error 0A000, before replica identity check)
         for (InsertStmt.SetClause set : stmt.setClauses()) {
             String col = set.column().toLowerCase();
@@ -1391,6 +1395,8 @@ class DmlExecutor {
         checkReadOnly("DELETE");
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         Table table = executor.resolveTable(schemaName, stmt.table());
+        // C6: Enforce DELETE privilege
+        executor.checkTablePrivilege("DELETE", schemaName, stmt.table());
         checkReplicaIdentity(table, stmt.table(), "delete");
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);

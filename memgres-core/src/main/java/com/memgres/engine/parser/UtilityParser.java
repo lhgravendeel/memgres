@@ -1016,7 +1016,8 @@ class UtilityParser {
             objectType = "ALL " + what + " IN SCHEMA";
         } else if (parser.matchKeyword("TABLE")) {
             objectName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) objectName = parser.readIdentifier();
+            // M10: Preserve schema prefix for schema-qualified tables
+            if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
         } else if (parser.matchKeyword("SEQUENCE")) {
             objectType = "SEQUENCE";
             objectName = parser.readIdentifier();
@@ -1056,7 +1057,8 @@ class UtilityParser {
             objectName = parser.advance().value(); // OID is a number, not an identifier
         } else {
             objectName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) objectName = parser.readIdentifier();
+            // M10: Preserve schema prefix for default TABLE path
+            if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
         }
 
         parser.expectKeyword("TO");
@@ -1139,7 +1141,8 @@ class UtilityParser {
             objectType = "ALL " + what + " IN SCHEMA";
         } else if (parser.matchKeyword("TABLE")) {
             objectName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) objectName = parser.readIdentifier();
+            // M10: Preserve schema prefix
+            if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
         } else if (parser.matchKeyword("SEQUENCE")) {
             objectType = "SEQUENCE";
             objectName = parser.readIdentifier();
@@ -1178,7 +1181,8 @@ class UtilityParser {
             objectName = parser.advance().value(); // OID is a number, not an identifier
         } else {
             objectName = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) objectName = parser.readIdentifier();
+            // M10: Preserve schema prefix
+            if (parser.match(TokenType.DOT)) objectName = objectName + "." + parser.readIdentifier();
         }
 
         parser.expectKeyword("FROM");
