@@ -287,25 +287,29 @@ class CatalogMetadataFunctions {
                 }
             }
             case "_pg_expandarray": {
+                // SRF: returns (x, n) for each element — x=value, n=1-based ordinal
                 if (fn.args().isEmpty()) return null;
                 Object arrVal = executor.evalExpr(fn.args().get(0), ctx);
                 if (arrVal == null) return null;
+                List<Object> result = new java.util.ArrayList<>();
                 if (arrVal instanceof List<?>) {
                     List<?> list = (List<?>) arrVal;
-                    if (list.isEmpty()) return null;
-                    return Cols.listOf(list.get(0), 1);
-                }
-                if (arrVal instanceof String) {
-                    String s = (String) arrVal;
-                    String[] parts = s.trim().split("\\s+");
-                    if (parts.length == 0) return null;
-                    try {
-                        return Cols.listOf(Integer.parseInt(parts[0]), 1);
-                    } catch (NumberFormatException e) {
-                        return Cols.listOf(parts[0], 1);
+                    for (int i = 0; i < list.size(); i++) {
+                        result.add(Cols.listOf(list.get(i), i + 1));
+                    }
+                } else if (arrVal instanceof String) {
+                    String s = ((String) arrVal).trim();
+                    if (s.isEmpty()) return null;
+                    String[] parts = s.split("\\s+");
+                    for (int i = 0; i < parts.length; i++) {
+                        try {
+                            result.add(Cols.listOf(Integer.parseInt(parts[i]), i + 1));
+                        } catch (NumberFormatException e) {
+                            result.add(Cols.listOf(parts[i], i + 1));
+                        }
                     }
                 }
-                return null;
+                return result.isEmpty() ? null : result;
             }
             case "to_regclass":
                 return evalToRegclass(fn, ctx);

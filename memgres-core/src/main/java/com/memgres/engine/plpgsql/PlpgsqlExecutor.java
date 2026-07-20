@@ -1289,7 +1289,9 @@ public class PlpgsqlExecutor {
             case "LOG":
                 LOG.info("PL/pgSQL {}: {}", stmt.level(), message);
                 if (session != null) {
-                    String sqlState = stmt.errcode() != null ? conditionToSqlState(stmt.errcode()) : "00000";
+                    // PG default: WARNING→01000, NOTICE/INFO/LOG→00000
+                    String sqlState = stmt.errcode() != null ? conditionToSqlState(stmt.errcode())
+                            : ("WARNING".equals(stmt.level()) ? "01000" : "00000");
                     session.addNotice(stmt.level(), sqlState, message, hint);
                 }
                 break;
