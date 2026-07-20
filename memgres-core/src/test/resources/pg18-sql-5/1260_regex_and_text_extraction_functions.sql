@@ -14,9 +14,9 @@ INSERT INTO logs VALUES
 
 -- begin-expected
 -- columns: log_id,code
--- row: 1|code=E100
--- row: 2|code=E200
--- row: 3|code=OK
+-- row: 1|E100
+-- row: 2|E200
+-- row: 3|OK
 -- end-expected
 SELECT log_id, substring(line from 'code=([A-Z0-9]+)') AS code
 FROM logs

@@ -178,7 +178,7 @@ class StringFunctions {
                 StringBuilder sb = new StringBuilder();
                 for (Expression arg : fn.args()) {
                     Object val = executor.evalExpr(arg, ctx);
-                    if (val != null) sb.append(val);
+                    if (val != null) sb.append(pgTextOutput(val));
                 }
                 return sb.toString();
             }
@@ -191,7 +191,7 @@ class StringFunctions {
                     Object val = executor.evalExpr(fn.args().get(i), ctx);
                     if (val != null) {
                         if (!first) sb.append(sep);
-                        sb.append(val);
+                        sb.append(pgTextOutput(val));
                         first = false;
                     }
                 }
@@ -230,8 +230,9 @@ class StringFunctions {
                     } catch (Exception e) {
                         // Not an int, treat as regex pattern
                         try {
-                            java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern).matcher(str.toString());
-                            return m.find() ? m.group() : null;
+                            java.util.regex.Matcher m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern)).matcher(str.toString());
+                            // PG returns group 1 if it exists, else whole match
+                            return m.find() ? (m.groupCount() >= 1 && m.group(1) != null ? m.group(1) : m.group()) : null;
                         } catch (java.util.regex.PatternSyntaxException pse) {
                             throw new MemgresException("invalid regular expression: " + pse.getMessage(), "2201B");
                         }
@@ -324,9 +325,11 @@ class StringFunctions {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 int len = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                if (len < 0) return "";
                 String fill = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : " ";
                 String s = str.toString();
                 if (s.length() >= len) return s.substring(0, len);
+                if (fill.isEmpty()) return s; // avoid infinite loop
                 StringBuilder sb = new StringBuilder();
                 while (sb.length() + s.length() < len) {
                     sb.append(fill);
@@ -337,6 +340,7 @@ class StringFunctions {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 int len = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                if (len < 0) return "";
                 String fill = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : " ";
                 String s = str.toString();
                 if (s.length() >= len) return s.substring(0, len);
@@ -393,7 +397,12 @@ class StringFunctions {
                 int field = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
                 if (field == 0) throw new MemgresException("field position must not be zero", "22023");
                 if (str == null) return null;
-                String[] parts = str.toString().split(java.util.regex.Pattern.quote(delim.toString()), -1);
+                String ds = delim.toString();
+                // PG: empty delimiter → return whole string for any field position
+                if (ds.isEmpty()) {
+                    return (field == 1 || field == -1) ? str.toString() : "";
+                }
+                String[] parts = str.toString().split(java.util.regex.Pattern.quote(ds), -1);
                 if (field < 0) {
                     // Negative indexing: count from the end
                     int idx = parts.length + field;
@@ -409,11 +418,12 @@ class StringFunctions {
                 if (str == null) return null;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 String replacement = String.valueOf(executor.evalExpr(fn.args().get(2), ctx));
-                // Convert PG-style backreferences (\1, \2) to Java-style ($1, $2)
+                // Convert PG-style \& (whole match) to Java $0, and \N backrefs to $N
+                replacement = replacement.replace("\\&", "$0");
                 replacement = replacement.replaceAll("\\\\(\\d)", "\\$$1");
                 String flags = "";
                 int startPos = 1;
-                int nth = 0; // 0 means replace all when using PG15+ form; in old form, default is replaceFirst
+                int nth = 1; // PG15+ form default: replace first match only (0 = all)
                 boolean pg15Form = false;
                 if (fn.args().size() > 3) {
                     Object arg3 = executor.evalExpr(fn.args().get(3), ctx);
@@ -431,11 +441,14 @@ class StringFunctions {
                         flags = String.valueOf(arg3);
                     }
                 }
-                int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
+                int jflags = pgRegexFlags(flags);
                 try {
                     String s = str.toString();
-                    java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern, jflags);
+                    java.util.regex.Pattern p = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags);
                     if (pg15Form) {
+                        if (startPos < 1) {
+                            throw new MemgresException("invalid value for parameter \"start\": " + startPos, "22023");
+                        }
                         // PG15+ form: start position and nth match
                         String prefix = s.substring(0, Math.min(startPos - 1, s.length()));
                         String searchPart = s.substring(Math.min(startPos - 1, s.length()));
@@ -466,6 +479,9 @@ class StringFunctions {
                     }
                 } catch (java.util.regex.PatternSyntaxException e) {
                     throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B");
+                } catch (IndexOutOfBoundsException e) {
+                    // Invalid backref (e.g., \1 with no group) — PG treats gracefully as empty
+                    return str.toString();
                 }
             }
             case "regexp_match":
@@ -474,11 +490,11 @@ class StringFunctions {
                 if (str == null) return null;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 String flags = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : "";
-                int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
+                int jflags = pgRegexFlags(flags);
                 boolean global = flags.contains("g");
                 java.util.regex.Matcher m;
                 try {
-                    m = java.util.regex.Pattern.compile(pattern, jflags).matcher(str.toString());
+                    m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(str.toString());
                 } catch (java.util.regex.PatternSyntaxException pse) {
                     throw new MemgresException("invalid regular expression: " + pse.getDescription(), "2201B");
                 }
@@ -531,10 +547,10 @@ class StringFunctions {
                 if (fn.args().size() > 3) {
                     flags = String.valueOf(executor.evalExpr(fn.args().get(3), ctx));
                 }
-                int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
+                int jflags = pgRegexFlags(flags);
                 String s = str.toString();
                 String searchStr = start > 1 ? s.substring(Math.min(start - 1, s.length())) : s;
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern, jflags).matcher(searchStr);
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(searchStr);
                 int count = 0;
                 while (m.find()) count++;
                 return count;
@@ -544,8 +560,8 @@ class StringFunctions {
                 if (str == null) return false;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 String flags = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : "";
-                int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
-                return java.util.regex.Pattern.compile(pattern, jflags).matcher(str.toString()).find();
+                int jflags = pgRegexFlags(flags);
+                return java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(str.toString()).find();
             }
             case "regexp_substr": {
                 // regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])
@@ -568,10 +584,10 @@ class StringFunctions {
                 if (fn.args().size() > 5) {
                     subexpr = executor.toInt(executor.evalExpr(fn.args().get(5), ctx));
                 }
-                int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
+                int jflags = pgRegexFlags(flags);
                 String s = str.toString();
                 int offset = Math.min(start - 1, s.length());
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern, jflags).matcher(s);
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(s);
                 int found = 0;
                 int regionStart = offset;
                 while (m.find(regionStart)) {
@@ -613,10 +629,10 @@ class StringFunctions {
                 if (fn.args().size() > 6) {
                     subexpr = executor.toInt(executor.evalExpr(fn.args().get(6), ctx));
                 }
-                int jflags = flags.contains("i") ? java.util.regex.Pattern.CASE_INSENSITIVE : 0;
+                int jflags = pgRegexFlags(flags);
                 String s = str.toString();
                 int offset = Math.min(start - 1, s.length());
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(pattern, jflags).matcher(s);
+                java.util.regex.Matcher m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(s);
                 int found = 0;
                 int regionStart = offset;
                 while (m.find(regionStart)) {
@@ -647,94 +663,101 @@ class StringFunctions {
                 return sb.toString();
             }
             case "format": {
-                // format(formatstr, arg1, arg2, ...): PG-style %s, %I, %L
+                // format(formatstr, arg1, arg2, ...): PG-style %s, %I, %L with width/flags
                 Object fmt = executor.evalExpr(fn.args().get(0), ctx);
                 if (fmt == null) return null;
                 String fmtStr = fmt.toString();
-                // Validate format string for invalid specifiers and trailing %
-                for (int vi = 0; vi < fmtStr.length(); vi++) {
-                    if (fmtStr.charAt(vi) == '%') {
-                        if (vi + 1 >= fmtStr.length()) {
-                            throw new MemgresException("unterminated format() type specifier", "22023");
-                        }
-                        char vc = fmtStr.charAt(vi + 1);
-                        if (vc == '%' || vc == 's' || vc == 'I' || vc == 'L') {
-                            vi++; // skip known specifier
-                        } else if (Character.isDigit(vc)) {
-                            // Positional: skip digits and $
-                            int vj = vi + 1;
-                            while (vj < fmtStr.length() && Character.isDigit(fmtStr.charAt(vj))) vj++;
-                            if (vj < fmtStr.length() && fmtStr.charAt(vj) == '$' && vj + 1 < fmtStr.length()) {
-                                char spec = fmtStr.charAt(vj + 1);
-                                if (spec != 's' && spec != 'I' && spec != 'L') {
-                                    throw new MemgresException("unrecognized format() type specifier \"" + spec + "\"", "22023");
-                                }
-                                vi = vj + 1;
-                            } else {
-                                throw new MemgresException("unrecognized format() type specifier \"" + vc + "\"", "22023");
-                            }
-                        } else {
-                            throw new MemgresException("unrecognized format() type specifier \"" + vc + "\"", "22023");
-                        }
-                    }
-                }
                 List<Object> fmtArgs = new ArrayList<>();
                 for (int i = 1; i < fn.args().size(); i++) {
                     fmtArgs.add(executor.evalExpr(fn.args().get(i), ctx));
                 }
-                // PG-style format: %s, %I, %L, and positional %N$s, %N$I, %N$L
                 StringBuilder result = new StringBuilder();
                 int argIdx = 0;
                 for (int i = 0; i < fmtStr.length(); i++) {
-                    if (fmtStr.charAt(i) == '%' && i + 1 < fmtStr.length()) {
-                        char next = fmtStr.charAt(i + 1);
-                        // Check for positional: %N$X (e.g., %1$I, %2$L)
-                        if (Character.isDigit(next)) {
-                            int j = i + 1;
-                            while (j < fmtStr.length() && Character.isDigit(fmtStr.charAt(j))) j++;
-                            if (j < fmtStr.length() && fmtStr.charAt(j) == '$' && j + 1 < fmtStr.length()) {
-                                int posArgIdx = Integer.parseInt(fmtStr.substring(i + 1, j)) - 1; // 1-based -> 0-based
-                                char spec = fmtStr.charAt(j + 1);
-                                if (spec == 's' || spec == 'I' || spec == 'L') {
-                                    if (posArgIdx < 0 || posArgIdx >= fmtArgs.size()) {
-                                        throw new MemgresException("too few arguments for format()", "22023");
-                                    }
-                                    Object argVal = fmtArgs.get(posArgIdx);
-                                    if (spec == 'L') {
-                                        if (argVal == null) result.append("NULL");
-                                        else result.append('\'').append(argVal.toString().replace("'", "''")).append('\'');
-                                    } else if (spec == 'I') {
-                                        if (argVal == null) throw new MemgresException("null values cannot be formatted as an SQL identifier", "22004");
-                                        result.append(formatIdentifier(argVal.toString()));
-                                    } else {
-                                        result.append(argVal == null ? "" : argVal);
-                                    }
-                                    i = j + 1;
-                                    continue;
-                                }
-                            }
-                        }
-                        if ((next == 's' || next == 'I' || next == 'L') && argIdx < fmtArgs.size()) {
-                            Object argVal = fmtArgs.get(argIdx++);
-                            if (next == 'L') {
-                                if (argVal == null) result.append("NULL");
-                                else result.append('\'').append(argVal.toString().replace("'", "''")).append('\'');
-                            } else if (next == 'I') {
-                                if (argVal == null) throw new MemgresException("null values cannot be formatted as an SQL identifier", "22004");
-                                result.append(formatIdentifier(argVal.toString()));
-                            } else {
-                                // %s: NULL -> empty string
-                                result.append(argVal == null ? "" : argVal);
-                            }
-                            i++;
-                            continue;
-                        } else if (next == '%') {
-                            result.append('%');
-                            i++;
-                            continue;
+                    if (fmtStr.charAt(i) != '%') {
+                        result.append(fmtStr.charAt(i));
+                        continue;
+                    }
+                    if (i + 1 >= fmtStr.length()) {
+                        throw new MemgresException("unterminated format() type specifier", "22023");
+                    }
+                    // Parse format specifier: %[flags][width][position$]type
+                    int j = i + 1;
+                    char next = fmtStr.charAt(j);
+                    if (next == '%') { result.append('%'); i++; continue; }
+                    // Parse optional '-' flag (left-align)
+                    boolean leftAlign = false;
+                    if (next == '-') { leftAlign = true; j++; }
+                    // Parse optional width (digits or '*' for width from arg)
+                    int width = 0;
+                    boolean hasWidth = false;
+                    if (j < fmtStr.length() && fmtStr.charAt(j) == '*') {
+                        // Width from next argument
+                        if (argIdx >= fmtArgs.size()) throw new MemgresException("too few arguments for format()", "22023");
+                        Object wArg = fmtArgs.get(argIdx++);
+                        width = wArg instanceof Number ? ((Number) wArg).intValue() : Integer.parseInt(wArg.toString());
+                        if (width < 0) { leftAlign = true; width = -width; }
+                        hasWidth = true;
+                        j++;
+                    } else {
+                        while (j < fmtStr.length() && Character.isDigit(fmtStr.charAt(j))) {
+                            width = width * 10 + (fmtStr.charAt(j) - '0');
+                            hasWidth = true;
+                            j++;
                         }
                     }
-                    result.append(fmtStr.charAt(i));
+                    if (j >= fmtStr.length()) throw new MemgresException("unterminated format() type specifier", "22023");
+                    // Check for positional: N$type
+                    int useArgIdx = -1;
+                    if (fmtStr.charAt(j) == '$' && hasWidth && !leftAlign) {
+                        // The "width" digits were actually a position number
+                        useArgIdx = width - 1; // 1-based → 0-based
+                        width = 0;
+                        hasWidth = false;
+                        j++;
+                        // Re-parse optional flags and width after position
+                        if (j < fmtStr.length() && fmtStr.charAt(j) == '-') { leftAlign = true; j++; }
+                        while (j < fmtStr.length() && Character.isDigit(fmtStr.charAt(j))) {
+                            width = width * 10 + (fmtStr.charAt(j) - '0');
+                            hasWidth = true;
+                            j++;
+                        }
+                    }
+                    if (j >= fmtStr.length()) throw new MemgresException("unterminated format() type specifier", "22023");
+                    char spec = fmtStr.charAt(j);
+                    if (spec != 's' && spec != 'I' && spec != 'L') {
+                        throw new MemgresException("unrecognized format() type specifier \"" + spec + "\"", "22023");
+                    }
+                    // Get the argument value
+                    int aIdx = useArgIdx >= 0 ? useArgIdx : argIdx++;
+                    if (aIdx < 0 || aIdx >= fmtArgs.size()) {
+                        throw new MemgresException("too few arguments for format()", "22023");
+                    }
+                    Object argVal = fmtArgs.get(aIdx);
+                    // Format the value
+                    String formatted;
+                    if (spec == 'L') {
+                        if (argVal == null) formatted = "NULL";
+                        else formatted = "'" + argVal.toString().replace("'", "''") + "'";
+                    } else if (spec == 'I') {
+                        if (argVal == null) throw new MemgresException("null values cannot be formatted as an SQL identifier", "22004");
+                        formatted = formatIdentifier(argVal.toString());
+                    } else {
+                        formatted = argVal == null ? "" : argVal.toString();
+                    }
+                    // Apply width padding
+                    if (hasWidth && formatted.length() < width) {
+                        int pad = width - formatted.length();
+                        StringBuilder padSb = new StringBuilder();
+                        for (int p = 0; p < pad; p++) padSb.append(' ');
+                        if (leftAlign) {
+                            formatted = formatted + padSb;
+                        } else {
+                            formatted = padSb + formatted;
+                        }
+                    }
+                    result.append(formatted);
+                    i = j;
                 }
                 return result.toString();
             }
@@ -972,7 +995,13 @@ class StringFunctions {
             case "quote_literal": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                return "'" + arg.toString().replace("'", "''") + "'";
+                String s = arg.toString();
+                String escaped = s.replace("'", "''").replace("\\", "\\\\");
+                // PG uses E'' prefix when string contains backslashes
+                if (s.contains("\\")) {
+                    return "E'" + escaped + "'";
+                }
+                return "'" + escaped + "'";
             }
             case "quote_ident": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -987,7 +1016,10 @@ class StringFunctions {
             case "quote_nullable": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return "NULL";
-                return "'" + arg.toString().replace("'", "''") + "'";
+                String qs = arg.toString();
+                String qescaped = qs.replace("'", "''").replace("\\", "\\\\");
+                if (qs.contains("\\")) return "E'" + qescaped + "'";
+                return "'" + qescaped + "'";
             }
             case "to_hex": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -1012,13 +1044,31 @@ class StringFunctions {
                 String s = arg.toString();
                 StringBuilder sb = new StringBuilder();
                 for (int i = 0; i < s.length(); i++) {
-                    if (s.charAt(i) == '\\' && i + 4 < s.length()) {
-                        String hex = s.substring(i + 1, i + 5);
-                        try {
-                            sb.appendCodePoint(Integer.parseInt(hex, 16));
-                            i += 4;
+                    if (s.charAt(i) == '\\' && i + 1 < s.length()) {
+                        // \+NNNNNN — 6-digit codepoint
+                        if (s.charAt(i + 1) == '+' && i + 7 < s.length()) {
+                            String hex = s.substring(i + 2, i + 8);
+                            try {
+                                sb.appendCodePoint(Integer.parseInt(hex, 16));
+                                i += 7;
+                                continue;
+                            } catch (NumberFormatException e) { /* fall through */ }
+                        }
+                        // \NNNN — 4-digit codepoint
+                        if (i + 4 < s.length()) {
+                            String hex = s.substring(i + 1, i + 5);
+                            try {
+                                sb.appendCodePoint(Integer.parseInt(hex, 16));
+                                i += 4;
+                                continue;
+                            } catch (NumberFormatException e) { /* fall through */ }
+                        }
+                        // \\ — literal backslash
+                        if (s.charAt(i + 1) == '\\') {
+                            sb.append('\\');
+                            i++;
                             continue;
-                        } catch (NumberFormatException e) { /* fall through */ }
+                        }
                     }
                     sb.append(s.charAt(i));
                 }
@@ -1037,6 +1087,23 @@ class StringFunctions {
                 "function " + fn.name() + "() does not exist" +
                 (fn.args().isEmpty() ? "" : "\n  Hint: No function matches the given name and argument types."), "42883");
         }
+    }
+
+    /** Convert value to PG text output form. Booleans → "t"/"f". */
+    private static String pgTextOutput(Object val) {
+        if (val instanceof Boolean) return ((Boolean) val) ? "t" : "f";
+        return val.toString();
+    }
+
+    /** Convert PG regex flag string to Java Pattern flags. Handles i, n, m, s, x. */
+    private static int pgRegexFlags(String flags) {
+        int jflags = 0;
+        if (flags.contains("i")) jflags |= java.util.regex.Pattern.CASE_INSENSITIVE;
+        if (flags.contains("n")) jflags |= java.util.regex.Pattern.MULTILINE; // PG 'n' = newline-sensitive
+        if (flags.contains("m")) jflags |= java.util.regex.Pattern.MULTILINE; // PG 'm' synonym
+        if (flags.contains("s")) jflags |= java.util.regex.Pattern.DOTALL;
+        if (flags.contains("x")) jflags |= java.util.regex.Pattern.COMMENTS;
+        return jflags;
     }
 
     private static String similarToRegex(String pattern, String escapeChar) {
@@ -1074,6 +1141,16 @@ class StringFunctions {
             } else if (ch == '?') {
                 sb.append("?");
                 i++;
+            } else if (ch == '{') {
+                // Pass through bounded quantifier like {2}, {1,3} as-is
+                int end = pattern.indexOf('}', i);
+                if (end >= 0) {
+                    sb.append(pattern, i, end + 1);
+                    i = end + 1;
+                } else {
+                    sb.append(java.util.regex.Pattern.quote(String.valueOf(ch)));
+                    i++;
+                }
             } else if (ch == '[') {
                 // Pass character class through to regex, converting POSIX classes to Java equivalents
                 // Find closing ']' that isn't part of a POSIX class like [:alpha:]
