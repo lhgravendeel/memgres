@@ -151,7 +151,13 @@ class DdlTableExecutor {
             // SERIAL/BIGSERIAL/SMALLSERIAL — create a real sequence (PG-compatible)
             if (def.identity() == null && (dataType == DataType.SERIAL || dataType == DataType.BIGSERIAL || dataType == DataType.SMALLSERIAL)) {
                 String seqName = stmt.name() + "_" + def.name() + "_seq";
-                Sequence seq = new Sequence(seqName, null, null, null, null);
+                // M14: serial sequence bounds match column type (PG: int4 max=2147483647, int2 max=32767)
+                Long seqMax = dataType == DataType.SMALLSERIAL ? Long.valueOf(32767L)
+                        : dataType == DataType.SERIAL ? Long.valueOf(2147483647L) : Long.valueOf(9223372036854775807L);
+                Sequence seq = new Sequence(seqName, null, null, null, seqMax);
+                // M14: set sequence data type to match column type
+                if (dataType == DataType.SERIAL) seq.setDataType("integer");
+                else if (dataType == DataType.SMALLSERIAL) seq.setDataType("smallint");
                 executor.database.addSequence(seq);
                 executor.database.registerSchemaObject(schemaName, "sequence", seqName);
                 defaultVal = "nextval('" + seqName + "'::regclass)";

@@ -522,6 +522,32 @@ class ExprSpecialFormParser {
             case "~~*":
                 binOp = BinaryExpr.BinOp.ILIKE;
                 break;
+            case "!~~": {
+                Expression rhsNotLike = ep.parseOtherOps();
+                Expression likeExpr = new BinaryExpr(left, BinaryExpr.BinOp.LIKE, rhsNotLike);
+                Expression notLike = new UnaryExpr(UnaryExpr.UnaryOp.NOT, likeExpr);
+                if (spec.schema != null) notLike = new QualifiedOperatorExpr(spec.schema, spec.opSymbol, notLike);
+                return notLike;
+            }
+            case "!~~*": {
+                Expression rhsNotIlike = ep.parseOtherOps();
+                Expression ilikeExpr = new BinaryExpr(left, BinaryExpr.BinOp.ILIKE, rhsNotIlike);
+                Expression notIlike = new UnaryExpr(UnaryExpr.UnaryOp.NOT, ilikeExpr);
+                if (spec.schema != null) notIlike = new QualifiedOperatorExpr(spec.schema, spec.opSymbol, notIlike);
+                return notIlike;
+            }
+            case "~":
+                binOp = BinaryExpr.BinOp.REGEX_MATCH;
+                break;
+            case "~*":
+                binOp = BinaryExpr.BinOp.REGEX_IMATCH;
+                break;
+            case "!~":
+                binOp = BinaryExpr.BinOp.NOT_REGEX_MATCH;
+                break;
+            case "!~*":
+                binOp = BinaryExpr.BinOp.NOT_REGEX_IMATCH;
+                break;
             default:
                 // User-defined operator: create CustomOperatorExpr for runtime dispatch
                 Expression right = ep.parseOtherOps();

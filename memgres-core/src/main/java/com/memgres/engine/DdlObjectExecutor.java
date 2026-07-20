@@ -66,26 +66,19 @@ class DdlObjectExecutor {
                 if (!stmt.ifNotExists() && existing.isValidLabel(stmt.value())) {
                     throw new MemgresException("enum label \"" + stmt.value() + "\" already exists", "42710");
                 }
-                List<String> labels = new ArrayList<>(existing.getLabels());
+                // L11: use addLabel methods to preserve fractional enumsortorder
                 if ("BEFORE".equals(stmt.position())) {
-                    int idx = labels.indexOf(stmt.neighbor());
-                    if (idx < 0) throw new MemgresException("\"" + stmt.neighbor() + "\" is not an existing enum label", "22023");
-                    labels.add(idx, stmt.value());
+                    existing.addLabelBefore(stmt.value(), stmt.neighbor());
                 } else if ("AFTER".equals(stmt.position())) {
-                    int idx = labels.indexOf(stmt.neighbor());
-                    if (idx < 0) throw new MemgresException("\"" + stmt.neighbor() + "\" is not an existing enum label", "22023");
-                    labels.add(idx + 1, stmt.value());
+                    existing.addLabelAfter(stmt.value(), stmt.neighbor());
                 } else {
-                    labels.add(stmt.value());
+                    existing.addLabel(stmt.value());
                 }
-                executor.database.replaceCustomEnum(new CustomEnum(stmt.typeName(), labels));
                 break;
             }
             case RENAME_VALUE: {
-                List<String> labels = new ArrayList<>(existing.getLabels());
-                int idx = labels.indexOf(stmt.value());
-                if (idx >= 0) labels.set(idx, stmt.newValue());
-                executor.database.replaceCustomEnum(new CustomEnum(stmt.typeName(), labels));
+                int idx = existing.getLabels().indexOf(stmt.value());
+                if (idx >= 0) existing.getLabels().set(idx, stmt.newValue());
                 break;
             }
             case RENAME_TO: {

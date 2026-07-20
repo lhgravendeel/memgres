@@ -416,7 +416,8 @@ class CatalogMetadataFunctions {
             return colNo <= cols.size() ? cols.get(colNo - 1) : "";
         }
         if (cols == null) return "";
-        boolean unique = executor.database.isUniqueIndex(indexName);
+        // H16: constraint-backed indexes (PK/UNIQUE) are always unique
+        boolean unique = constraintTableName != null || executor.database.isUniqueIndex(indexName);
         String tableName = constraintTableName != null
                 ? constraintTableName
                 : executor.database.getIndexTable(indexName);
