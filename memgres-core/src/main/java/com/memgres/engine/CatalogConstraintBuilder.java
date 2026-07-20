@@ -182,16 +182,13 @@ class CatalogConstraintBuilder {
                     if (!c.isNullable() && !isPromotedUnique) {
                         String conname = t.getName() + "_" + c.getName() + "_not_null";
                         List<Object> nnConkey = columnNamesToAttnums(t, Cols.listOf(c.getName()));
-                        // L13: partition children inherit NOT NULL from parent — set conparentid + coninhcount
-                        int conparentid = 0;
+                        // L13: partition children inherit NOT NULL from parent — PG sets coninhcount=1, conparentid=0
                         int coninhcount = 0;
                         Table parent = t.getPartitionParent();
                         if (parent != null) {
                             int parentColIdx = parent.getColumnIndex(c.getName());
                             Column parentCol = parentColIdx >= 0 ? parent.getColumns().get(parentColIdx) : null;
                             if (parentCol != null && !parentCol.isNullable()) {
-                                String parentConname = parent.getName() + "_" + c.getName() + "_not_null";
-                                conparentid = oids.oid("con:" + parent.getName() + "." + parentConname);
                                 coninhcount = 1;
                             }
                         }
@@ -210,7 +207,7 @@ class CatalogConstraintBuilder {
                                 " " /*confmatchtype*/, null, null, null, null, coninhcount,
                                 false,
                                 true, // conenforced
-                                null, null, false, conparentid, 0, 1
+                                null, null, false, 0, 0, 1
                         });
                     }
                 }

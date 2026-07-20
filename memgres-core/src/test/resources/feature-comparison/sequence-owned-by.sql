@@ -29,7 +29,7 @@ ALTER SEQUENCE sob_seq OWNED BY NONE;
 
 -- begin-expected
 -- columns: result
--- row: (null)
+-- row: NULL
 -- end-expected
 SELECT pg_get_serial_sequence('sob_t', 'id') AS result;
 
@@ -51,7 +51,7 @@ CREATE TABLE sob_child PARTITION OF sob_parent FOR VALUES FROM (1) TO (100);
 
 -- begin-expected
 -- columns: has_parent
--- row: t
+-- row: f
 -- end-expected
 SELECT (child.conparentid > 0)::text AS has_parent
 FROM pg_constraint child

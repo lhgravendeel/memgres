@@ -30,31 +30,28 @@ class PartitionNotNullTest {
     }
 
     @Test
-    void partitionChildHasConparentid() throws Exception {
+    void partitionChildConparentidZeroConinhcountOne() throws Exception {
         try (Connection c = conn(); Statement st = c.createStatement()) {
             st.execute("CREATE TABLE l13_parent(id int NOT NULL, val text NOT NULL) PARTITION BY RANGE(id)");
             st.execute("CREATE TABLE l13_child PARTITION OF l13_parent FOR VALUES FROM (1) TO (100)");
-            // Child's NOT NULL constraint should have conparentid pointing to parent's constraint
+            // PG: partition child NOT NULL has conparentid=0 but coninhcount=1
             try (ResultSet rs = st.executeQuery(
-                    "SELECT child.conname, child.conparentid, parent.conname AS parent_conname " +
+                    "SELECT child.conname, child.conparentid, child.coninhcount " +
                     "FROM pg_constraint child " +
                     "JOIN pg_class cc ON cc.oid = child.conrelid " +
-                    "LEFT JOIN pg_constraint parent ON parent.oid = child.conparentid " +
                     "WHERE cc.relname = 'l13_child' AND child.contype = 'n' " +
                     "ORDER BY child.conname")) {
                 // id NOT NULL
                 assertTrue(rs.next());
                 String childConname = rs.getString("conname");
                 assertTrue(childConname.contains("l13_child"), "Child conname should use child table name: " + childConname);
-                int conparentid = rs.getInt("conparentid");
-                assertTrue(conparentid > 0, "conparentid should be > 0 for inherited constraint: " + conparentid);
-                String parentConname = rs.getString("parent_conname");
-                assertNotNull(parentConname, "Should resolve parent constraint name");
-                assertTrue(parentConname.contains("l13_parent"), "Parent conname should use parent table name: " + parentConname);
+                assertEquals(0, rs.getInt("conparentid"), "PG: conparentid=0 for partition NOT NULL");
+                assertEquals(1, rs.getInt("coninhcount"), "Inherited NOT NULL should have coninhcount=1");
 
                 // val NOT NULL
                 assertTrue(rs.next());
-                assertTrue(rs.getInt("conparentid") > 0, "val NOT NULL should also have conparentid");
+                assertEquals(0, rs.getInt("conparentid"));
+                assertEquals(1, rs.getInt("coninhcount"));
             } finally {
                 st.execute("DROP TABLE l13_parent CASCADE");
             }
