@@ -473,9 +473,9 @@ class FromResolver {
             contexts = applyMvccVisibility(contexts, table, alias, schemaTableKey, currentSession);
         }
 
-        // Apply Row-Level Security filtering
-        if (table.isRlsEnabled() && !table.getRlsPolicies().isEmpty()) {
-            contexts = applyRlsFiltering(contexts, table);
+        // Apply Row-Level Security filtering (default-deny: even with no policies, non-owner sees nothing)
+        if (table.isRlsEnabled()) {
+            contexts = applyRlsFiltering(contexts, table, schemaName);
         }
 
         return contexts;
@@ -599,8 +599,8 @@ class FromResolver {
                 contexts = applyMvccVisibility(contexts, table, alias, schemaTableKey, currentSession);
             }
             // RLS
-            if (table.isRlsEnabled() && !table.getRlsPolicies().isEmpty()) {
-                contexts = applyRlsFiltering(contexts, table);
+            if (table.isRlsEnabled()) {
+                contexts = applyRlsFiltering(contexts, table, schemaName);
             }
             return contexts;
         }
@@ -627,75 +627,69 @@ class FromResolver {
         return null;
     }
 
-    private List<RowContext> applyRlsFiltering(List<RowContext> contexts, Table table) {
-        String currentRole = null;
-        if (executor.session != null) {
-            currentRole = executor.session.getGucSettings().get("role");
-        }
-        boolean isSuperuser = currentRole == null
-                || "test".equalsIgnoreCase(currentRole)
-                || "postgres".equalsIgnoreCase(currentRole)
-                || "memgres".equalsIgnoreCase(currentRole);
-        if (!isSuperuser || table.isRlsForced()) {
-            String effectiveRole = currentRole != null ? currentRole : "test";
-            List<RlsPolicy> permissivePolicies = new ArrayList<>();
-            List<RlsPolicy> restrictivePolicies = new ArrayList<>();
-            for (RlsPolicy p : table.getRlsPolicies()) {
-                if (p.appliesTo("SELECT") && p.getUsingExpr() != null
-                        && p.appliesToRole(effectiveRole)) {
-                    if (p.isRestrictive()) {
-                        restrictivePolicies.add(p);
-                    } else {
-                        permissivePolicies.add(p);
-                    }
-                }
-            }
-            if (permissivePolicies.isEmpty() && restrictivePolicies.isEmpty()) {
-                return new ArrayList<>();
-            }
-            List<RowContext> filtered = new ArrayList<>();
-            for (RowContext ctx : contexts) {
-                // PG semantics: row must pass ALL restrictive policies
-                // AND at least ONE permissive policy (if any exist).
-                // If no permissive policies exist but restrictive ones do,
-                // default deny (no permissive policy to grant access).
-                boolean passesPermissive;
-                if (permissivePolicies.isEmpty()) {
-                    passesPermissive = false;
+    private List<RowContext> applyRlsFiltering(List<RowContext> contexts, Table table, String schemaName) {
+        if (executor.shouldBypassRls(table, schemaName)) return contexts;
+        return filterByRlsUsing(contexts, table, "SELECT");
+    }
+
+    /** Filter rows by RLS USING policies for the given command. Shared by SELECT/UPDATE/DELETE. */
+    List<RowContext> filterByRlsUsing(List<RowContext> contexts, Table table, String command) {
+        String effectiveRole = executor.currentRole();
+        List<RlsPolicy> permissivePolicies = new ArrayList<>();
+        List<RlsPolicy> restrictivePolicies = new ArrayList<>();
+        for (RlsPolicy p : table.getRlsPolicies()) {
+            if (p.appliesTo(command) && p.getUsingExpr() != null
+                    && p.appliesToRole(effectiveRole)) {
+                if (p.isRestrictive()) {
+                    restrictivePolicies.add(p);
                 } else {
-                    passesPermissive = false;
-                    for (RlsPolicy policy : permissivePolicies) {
-                        try {
-                            Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
-                            if (Boolean.TRUE.equals(result)) {
-                                passesPermissive = true;
-                                break;
-                            }
-                        } catch (Exception e) {
-                            // Expression evaluation failed; row does not pass this policy
-                        }
-                    }
+                    permissivePolicies.add(p);
                 }
-                boolean passesRestrictive = true;
-                for (RlsPolicy policy : restrictivePolicies) {
+            }
+        }
+        // Default-deny: no applicable policies → 0 rows
+        if (permissivePolicies.isEmpty() && restrictivePolicies.isEmpty()) {
+            return new ArrayList<>();
+        }
+        List<RowContext> filtered = new ArrayList<>();
+        for (RowContext ctx : contexts) {
+            // PG semantics: row must pass ALL restrictive policies
+            // AND at least ONE permissive policy (if any exist).
+            boolean passesPermissive;
+            if (permissivePolicies.isEmpty()) {
+                passesPermissive = false;
+            } else {
+                passesPermissive = false;
+                for (RlsPolicy policy : permissivePolicies) {
                     try {
                         Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
-                        if (!Boolean.TRUE.equals(result)) {
-                            passesRestrictive = false;
+                        if (Boolean.TRUE.equals(result)) {
+                            passesPermissive = true;
                             break;
                         }
                     } catch (Exception e) {
+                        // Expression evaluation failed; row does not pass this policy
+                    }
+                }
+            }
+            boolean passesRestrictive = true;
+            for (RlsPolicy policy : restrictivePolicies) {
+                try {
+                    Object result = executor.evalExpr(policy.getUsingExpr(), ctx);
+                    if (!Boolean.TRUE.equals(result)) {
                         passesRestrictive = false;
                         break;
                     }
-                }
-                if (passesPermissive && passesRestrictive) {
-                    filtered.add(ctx);
+                } catch (Exception e) {
+                    passesRestrictive = false;
+                    break;
                 }
             }
-            return filtered;
+            if (passesPermissive && passesRestrictive) {
+                filtered.add(ctx);
+            }
         }
-        return contexts;
+        return filtered;
     }
 
     private List<RowContext> resolveSubquery(SelectStmt.SubqueryFrom subqFrom) {

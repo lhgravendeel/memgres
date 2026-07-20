@@ -541,6 +541,58 @@ public class AstExecutor {
         return false;
     }
 
+    /**
+     * Check if a role is a superuser (by rolsuper attribute, or backwards-compat for default connecting users).
+     */
+    boolean isRoleSuperuser(String role) {
+        if (role == null) return true; // no session / embedded mode
+        Map<String, String> roleAttrs = database.getRole(role);
+        if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return true;
+        if (roleAttrs == null) {
+            String lower = role.toLowerCase();
+            return "memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower);
+        }
+        return false;
+    }
+
+    /**
+     * Check if the given role owns a table (by schema.table lookup in object owners).
+     */
+    boolean isTableOwner(String role, String schemaName, String tableName) {
+        String ownerKey = "table:" + schemaName.toLowerCase() + "." + tableName.toLowerCase();
+        String owner = database.getObjectOwner(ownerKey);
+        return owner != null && owner.equalsIgnoreCase(role);
+    }
+
+    /**
+     * Determine if RLS should be bypassed for the current role on a table.
+     * Returns true if the current role can bypass RLS (superuser/owner without FORCE, or row_security=off).
+     * Throws MemgresException if row_security=off but user has no bypass privilege.
+     */
+    boolean shouldBypassRls(Table table, String schemaName) {
+        String role = currentRole();
+        boolean isSuperuser = isRoleSuperuser(role);
+        boolean isOwner = isTableOwner(role, schemaName, table.getName());
+
+        // Check SET row_security GUC
+        String rowSecurityGuc = session != null ? session.getGucSettings().get("row_security") : "on";
+        if ("off".equalsIgnoreCase(rowSecurityGuc)) {
+            if (isSuperuser || isOwner) return true;
+            // non-owner/non-superuser with row_security=off: if any policies exist, error
+            if (!table.getRlsPolicies().isEmpty()) {
+                throw new MemgresException(
+                    "query would be affected by row-level security policy for table \"" + table.getName() + "\"", "55P04");
+            }
+            return true; // no policies, no filtering needed
+        }
+
+        // Superuser bypasses unless FORCE RLS
+        if (isSuperuser && !table.isRlsForced()) return true;
+        // Owner bypasses unless FORCE RLS
+        if (isOwner && !table.isRlsForced()) return true;
+        return false;
+    }
+
     Table resolveTable(String schemaName, String tableName) {
         lastViewColumnMapping = null; // reset before each resolution
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
