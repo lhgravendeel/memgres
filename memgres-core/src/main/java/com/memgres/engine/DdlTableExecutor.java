@@ -942,6 +942,11 @@ class DdlTableExecutor {
                         }
                         for (Table target : truncateTargets) {
                             totalCount += target.deleteAll();
+                            // C9: Sync RR snapshot — own TRUNCATE must be visible to itself
+                            if (executor.session != null) {
+                                String targetSchema = target == table ? schemaName : findSchemaNameOf(target, schemaName);
+                                executor.session.clearRRSnapshotForTable(targetSchema + "." + target.getName());
+                            }
                         }
                         // CASCADE: truncate dependent tables
                         if (stmt.cascade()) {
@@ -976,7 +981,12 @@ class DdlTableExecutor {
                                 }
                                 if (seqName != null) {
                                     Sequence seq = executor.database.getSequence(seqName);
-                                    if (seq != null) seq.restart();
+                                    if (seq != null) {
+                                        // C11: Record undo so ROLLBACK restores the sequence
+                                        executor.recordUndo(new Session.SequenceRestartUndo(
+                                                seqName, seq.currValRaw(), seq.isCalled()));
+                                        seq.restart();
+                                    }
                                 }
                             }
                         }

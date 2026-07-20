@@ -1429,6 +1429,42 @@ public class Session {
     /** Whether this transaction has taken its initial snapshot (for RR/SERIALIZABLE). */
     public boolean isRRSnapshotTaken() { return rrSnapshotTaken; }
 
+    /** C9: Clear the RR snapshot for a table (after TRUNCATE empties it). */
+    public void clearRRSnapshotForTable(String schemaTable) {
+        List<Object[]> snapshot = rrSnapshots.get(schemaTable);
+        if (snapshot != null) snapshot.clear();
+    }
+
+    /**
+     * M7: RR write-write conflict detection.
+     * Under REPEATABLE READ, if we try to modify a row that was changed by a concurrent
+     * committed transaction (i.e., it's not in our snapshot), raise 40001.
+     */
+    public void checkRRWriteConflict(String schemaTable, Object[] oldValues) {
+        String isolation = getEffectiveIsolationLevel();
+        if (!"repeatable read".equals(isolation) && !"serializable".equals(isolation)) return;
+        if (status != TransactionStatus.IN_TRANSACTION) return;
+        List<Object[]> snapshot = rrSnapshots.get(schemaTable);
+        if (snapshot == null) return;
+        // Check if oldValues (the row we're about to modify) exists in our snapshot.
+        // If it doesn't, another transaction must have modified it since our snapshot.
+        for (Object[] snapRow : snapshot) {
+            if (snapRow == oldValues || Arrays.deepEquals(snapRow, oldValues)) {
+                return; // Row is in our snapshot — no conflict
+            }
+        }
+        // Row not found in snapshot → concurrent modification
+        throw new MemgresException(
+            "could not serialize access due to concurrent update", "40001");
+    }
+
+    /** C10: Sync parent snapshot when an INSERT was routed to a child partition. */
+    public void syncParentSnapshotOnInsert(String parentSchemaTable, Object[] row) {
+        if (status != TransactionStatus.IN_TRANSACTION) return;
+        List<Object[]> snapshot = rrSnapshots.get(parentSchemaTable);
+        if (snapshot != null) snapshot.add(row);
+    }
+
     /** Eagerly snapshot all user tables for transaction-wide consistency. */
     private void snapshotAllTables() {
         if (database == null) return;
@@ -1648,6 +1684,14 @@ public class Session {
             // current, pre-undo contents) so the in-place restore of the old
             // values is visible to this transaction.
             if (snapshot != null) swapInLiveRow(snapshot, uu.row, uu.row);
+        } else if (entry instanceof TruncateUndo) {
+            // C9: Restore the snapshot to the pre-truncate rows on savepoint rollback
+            TruncateUndo tu = (TruncateUndo) entry;
+            List<Object[]> snapshot = rrSnapshots.get(tu.schema + "." + tu.tableName);
+            if (snapshot != null) {
+                snapshot.clear();
+                snapshot.addAll(tu.rows);
+            }
         }
     }
 
@@ -1949,6 +1993,30 @@ public class Session {
         @Override
         public String toString() {
             return "TruncateUndo[schema=" + schema + ", " + "tableName=" + tableName + ", " + "rows=" + rows + ", " + "serialCounter=" + serialCounter + "]";
+        }
+    }
+
+    /** C11: Undo a sequence restart (from TRUNCATE ... RESTART IDENTITY). */
+    public static final class SequenceRestartUndo implements UndoEntry {
+        public final String seqName;
+        public final long previousValue;
+        public final boolean wasCalled;
+
+        public SequenceRestartUndo(String seqName, long previousValue, boolean wasCalled) {
+            this.seqName = seqName;
+            this.previousValue = previousValue;
+            this.wasCalled = wasCalled;
+        }
+
+        @Override
+        public void undo(Database db) {
+            Sequence seq = db.getSequence(seqName);
+            if (seq == null) return;
+            if (wasCalled) {
+                seq.setVal(previousValue);
+            } else {
+                seq.restart(previousValue);
+            }
         }
     }
 

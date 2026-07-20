@@ -422,9 +422,10 @@ class MultisessionLockingIsolationTest {
                 cA.commit();
 
                 // Session B's update should fail with serialization failure (40001)
-                // or succeed with read-committed-like behavior depending on implementation
-                sB.execute("UPDATE msli_lostupdate SET counter = " + (valB + 20) + " WHERE id = 1");
+                // PG raises 40001 at UPDATE time (not commit time) when it detects
+                // a concurrent modification to the same row under RR.
                 try {
+                    sB.execute("UPDATE msli_lostupdate SET counter = " + (valB + 20) + " WHERE id = 1");
                     cB.commit();
                     // If commit succeeds, verify the final value is one of the two expected outcomes
                     try (Statement sV = cA.createStatement()) {
@@ -436,7 +437,7 @@ class MultisessionLockingIsolationTest {
                         cA.commit();
                     }
                 } catch (SQLException e) {
-                    // 40001 serialization failure is also acceptable
+                    // 40001 serialization failure is the expected PG behavior
                     assertTrue("40001".equals(e.getSQLState()) || "40P01".equals(e.getSQLState()),
                             "Expected serialization failure but got: " + e.getSQLState());
                     try { cB.rollback(); } catch (SQLException ignored) {}
