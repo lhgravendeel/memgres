@@ -560,6 +560,11 @@ class DmlExecutor {
                 targetTable.getWriteLock().unlock();
             }
             recordInsertUndo(stmt.schema(), targetTable.getName(), row);
+            // C10: If routed to a child partition, also sync parent's RR snapshot
+            if (targetTable != table && executor.session != null) {
+                String parentKey = (stmt.schema() != null ? stmt.schema() : executor.defaultSchema()) + "." + table.getName();
+                executor.session.syncParentSnapshotOnInsert(parentKey, row);
+            }
             recordRowMeta(stmt.schema(), targetTable, row);
             inserted++;
             insertedRows.add(Arrays.copyOf(row, row.length));
@@ -2164,6 +2169,11 @@ class DmlExecutor {
 
     private void recordUpdateUndo(String schema, String table, Object[] row, Object[] oldValues) {
         String schemaName = schema != null ? schema : executor.defaultSchema();
+        // M7: RR write-write conflict detection — if the row was modified by a committed
+        // transaction after our snapshot, raise 40001
+        if (executor.session != null) {
+            executor.session.checkRRWriteConflict(schemaName + "." + table, oldValues);
+        }
         executor.recordUndo(new Session.UpdateUndo(schemaName, table, row, oldValues));
         // Track for MVCC visibility
         if (executor.session != null) {

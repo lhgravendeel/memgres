@@ -1047,13 +1047,106 @@ class DdlAlterTableExecutor {
             throw new MemgresException("table \"" + attach.partitionName()
                     + "\" is already a partition of \"" + stmt.table() + "\"", "42809");
         }
+        // C4a: Validate column compatibility (names and types must match parent)
+        validatePartitionColumns(table, partition, attach.partitionName());
         // Validate bounds before attaching, so overlapping bounds (42P17) don't leave
         // the table half-attached to the parent's routing list
         if (attach.bounds() != null && !attach.bounds().isEmpty()) {
             ddl.tableExecutor.applyPartitionBounds(partition, table, attach.bounds(), attach.partitionName());
         }
+        // C4b: Validate existing rows satisfy partition bounds
+        validateExistingRowBounds(partition, table, attach.partitionName());
         partition.setPartitionParent(table);
         table.addPartition(partition);
+    }
+
+    /** C4a: Partition must have same columns (by name and compatible types) as parent. */
+    private void validatePartitionColumns(Table parent, Table partition, String partName) {
+        List<Column> parentCols = parent.getColumns();
+        List<Column> partCols = partition.getColumns();
+        // Check partition doesn't have columns not in parent
+        for (Column pc : partCols) {
+            boolean found = false;
+            for (Column pp : parentCols) {
+                if (pp.getName().equalsIgnoreCase(pc.getName())) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                throw new MemgresException("table \"" + partName
+                        + "\" contains column \"" + pc.getName()
+                        + "\" not found in parent \"" + parent.getName() + "\"", "42P16");
+            }
+        }
+        // Check parent columns exist in partition
+        for (Column pp : parentCols) {
+            boolean found = false;
+            for (Column pc : partCols) {
+                if (pc.getName().equalsIgnoreCase(pp.getName())) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                throw new MemgresException("child table is missing column \""
+                        + pp.getName() + "\"", "42P16");
+            }
+        }
+    }
+
+    /** C4b: All existing rows must satisfy the partition's bounds. */
+    private void validateExistingRowBounds(Table partition, Table parent, String partName) {
+        if (partition.getRows().isEmpty()) return;
+        String partCol = parent.getPartitionColumn();
+        if (partCol == null) return;
+        int colIdx = partition.getColumnIndex(partCol);
+        if (colIdx < 0) return;
+        String strategy = parent.getPartitionStrategy();
+        if (strategy == null) return;
+        for (Object[] row : partition.getRows()) {
+            Object value = row[colIdx];
+            if (!rowSatisfiesBounds(value, partition, strategy)) {
+                throw new MemgresException("partition constraint of relation \""
+                        + partName + "\" is violated by some row", "23514");
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private boolean rowSatisfiesBounds(Object value, Table partition, String strategy) {
+        switch (strategy.toUpperCase()) {
+            case "RANGE":
+                if (value == null) return false; // NULL never matches RANGE
+                if (partition.getPartitionLower() == null || partition.getPartitionUpper() == null) return true;
+                Comparable<Object> cv = (Comparable<Object>) value;
+                Object lower = partition.getPartitionLower();
+                Object upper = partition.getPartitionUpper();
+                return ((Comparable) value).compareTo(lower) >= 0
+                        && ((Comparable) value).compareTo(upper) < 0;
+            case "LIST":
+                if (partition.getPartitionValues() == null) return true;
+                for (Object pv : partition.getPartitionValues()) {
+                    if (value == null && pv == null) return true;
+                    if (value != null && value.equals(pv)) return true;
+                }
+                return false;
+            default:
+                return true; // HASH or unknown — skip validation
+        }
+    }
+
+    /** Build a row as the parent would see it (mapping partition columns to parent positions). */
+    private Object[] buildParentRow(Table parent, Table partition, Object[] partRow) {
+        Object[] parentRow = new Object[parent.getColumns().size()];
+        for (int i = 0; i < parent.getColumns().size(); i++) {
+            String colName = parent.getColumns().get(i).getName();
+            int partIdx = partition.getColumnIndex(colName);
+            if (partIdx >= 0 && partIdx < partRow.length) {
+                parentRow[i] = partRow[partIdx];
+            }
+        }
+        return parentRow;
     }
 
     private void setTriggerEnabled(Table table, String triggerName, boolean disabled) {
