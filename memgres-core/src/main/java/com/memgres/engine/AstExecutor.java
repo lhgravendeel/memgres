@@ -503,9 +503,11 @@ public class AstExecutor {
             String lower = role.toLowerCase();
             if ("memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower)) return;
         }
-        // Owner check
-        String ownerKey = "table:" + schemaName.toLowerCase() + "." + tableName.toLowerCase();
-        String owner = database.getObjectOwner(ownerKey);
+        // Owner check — try both "table:" and "view:" keys since views are DML-capable
+        String qualName = schemaName.toLowerCase() + "." + tableName.toLowerCase();
+        String owner = database.getObjectOwner("table:" + qualName);
+        if (owner != null && owner.equalsIgnoreCase(role)) return;
+        owner = database.getObjectOwner("view:" + qualName);
         if (owner != null && owner.equalsIgnoreCase(role)) return;
         // Direct or inherited privilege check (including PUBLIC grants)
         if (hasPrivilegeDirectOrInherited(role, privilege, "TABLE", tableName.toLowerCase())) return;

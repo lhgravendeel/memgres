@@ -116,14 +116,16 @@ class DmlTriggerHelper {
                     PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
                     plExec.executeTriggerFunction(function, null, null, table, trigger);
                 } finally {
-                    // Clean up transition tables
+                    // Clean up transition tables and their ownership records
                     if (newTransName != null) {
                         Schema schema = executor.database.getSchema(schemaName);
                         if (schema != null) schema.removeTable(newTransName);
+                        executor.database.removeObjectOwner("table:" + schemaName.toLowerCase() + "." + newTransName.toLowerCase());
                     }
                     if (oldTransName != null) {
                         Schema schema = executor.database.getSchema(schemaName);
                         if (schema != null) schema.removeTable(oldTransName);
+                        executor.database.removeObjectOwner("table:" + schemaName.toLowerCase() + "." + oldTransName.toLowerCase());
                     }
                 }
             }
@@ -143,6 +145,11 @@ class DmlTriggerHelper {
         Schema schema = executor.database.getSchema(schemaName);
         if (schema != null) {
             schema.addTable(transTable);
+            // Register ownership so privilege checks pass when trigger function queries the transition table
+            String ownerKey = "table:" + schemaName.toLowerCase() + "." + name.toLowerCase();
+            String role = executor.currentRole();
+            if (role == null) role = executor.sessionUser();
+            if (role != null) executor.database.setObjectOwner(ownerKey, role);
         }
     }
 }

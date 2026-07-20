@@ -418,7 +418,8 @@ class FromResolver {
         String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
         // H35: pass userQualified=true when user explicitly wrote schema.table
         boolean userQualified = tableRef.schema() != null;
-        // H35: empty search_path with unqualified name → reject immediately
+        // H35: empty search_path with unqualified name → reject unless temp table exists
+        // PG always implicitly includes pg_temp, so temp tables are still findable
         if (!userQualified && executor.session != null) {
             String sp = executor.session.getGucSettings().get("search_path");
             if (sp != null) {
@@ -428,7 +429,12 @@ class FromResolver {
                     if (!s.isEmpty() && !s.equals("$user")) { hasEntries = true; break; }
                 }
                 if (!hasEntries) {
-                    throw new MemgresException("relation \"" + tableRef.table() + "\" does not exist", "42P01");
+                    // Check if temp table exists before rejecting (pg_temp is always implicit)
+                    String tempSchemaName = executor.session.getTempSchemaName();
+                    Schema pgTemp = executor.database.getSchema(tempSchemaName);
+                    if (pgTemp == null || pgTemp.getTable(tableRef.table()) == null) {
+                        throw new MemgresException("relation \"" + tableRef.table() + "\" does not exist", "42P01");
+                    }
                 }
             }
         }

@@ -59,6 +59,7 @@ RESET custom.test_var;
 SELECT current_setting('custom.test_var', true); -- expect NULL
 
 -- L8: CLUSTER without previously clustered index
+RESET search_path;
 CREATE TABLE l8_t(id int);
 CLUSTER l8_t; -- expect error 42704
 DROP TABLE l8_t;
