@@ -997,21 +997,22 @@ class SessionExecutor {
             }
         }
         // M9: Validate grantor holds privilege WITH GRANT OPTION (non-superuser, non-owner)
+        // PG falls back to session_user when current_role can't grant (select_best_grantor)
         if (s.objectName() != null && s.objectType() != null && "TABLE".equalsIgnoreCase(s.objectType())) {
             String currentRole = executor.currentRole();
-            Map<String, String> roleAttrs = executor.database.getRole(currentRole);
-            boolean isSuperuser = roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"));
-            if (roleAttrs == null) {
-                String lower = currentRole.toLowerCase();
-                isSuperuser = "memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower);
+            String sessionUser = executor.sessionUser();
+            // Check if current role or session user is superuser
+            boolean isSuperuser = isRoleSuperuser(currentRole);
+            if (!isSuperuser && !currentRole.equalsIgnoreCase(sessionUser)) {
+                isSuperuser = isRoleSuperuser(sessionUser);
             }
             if (!isSuperuser) {
-                // Check if current role is the owner
+                // Check if current role or session user is the owner
                 String bareObj = s.objectName().contains(".") ? s.objectName().substring(s.objectName().indexOf('.') + 1) : s.objectName();
                 String schForOwner = s.objectName().contains(".") ? s.objectName().substring(0, s.objectName().indexOf('.')) : executor.defaultSchema();
                 String ownerKey = "table:" + schForOwner.toLowerCase() + "." + bareObj.toLowerCase();
                 String owner = executor.database.getObjectOwner(ownerKey);
-                boolean isOwner = owner != null && owner.equalsIgnoreCase(currentRole);
+                boolean isOwner = owner != null && (owner.equalsIgnoreCase(currentRole) || owner.equalsIgnoreCase(sessionUser));
                 if (!isOwner) {
                     for (String priv : s.privileges()) {
                         // Must hold the privilege WITH GRANT OPTION
@@ -2062,5 +2063,15 @@ class SessionExecutor {
             executor.session.removeCursor(stmt.cursorName());
         }
         return QueryResult.message(QueryResult.Type.SET, "CLOSE CURSOR");
+    }
+
+    private boolean isRoleSuperuser(String role) {
+        Map<String, String> roleAttrs = executor.database.getRole(role);
+        if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return true;
+        if (roleAttrs == null) {
+            String lower = role.toLowerCase();
+            return "memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower);
+        }
+        return false;
     }
 }

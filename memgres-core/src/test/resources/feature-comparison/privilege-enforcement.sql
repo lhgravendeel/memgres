@@ -70,6 +70,7 @@ CREATE TABLE m10_schema.m10_test(id int);
 CREATE ROLE m10_role LOGIN;
 
 GRANT SELECT ON m10_schema.m10_test TO m10_role; -- expect: success (not 42P01)
+GRANT USAGE ON SCHEMA m10_schema TO m10_role;
 SET ROLE m10_role;
 SELECT * FROM m10_schema.m10_test; -- expect: success
 RESET ROLE;
@@ -84,6 +85,7 @@ CREATE ROLE m11_creator LOGIN;
 CREATE ROLE m11_reader LOGIN;
 
 ALTER DEFAULT PRIVILEGES FOR ROLE m11_creator GRANT SELECT ON TABLES TO m11_reader;
+GRANT CREATE ON SCHEMA public TO m11_creator;
 
 SET ROLE m11_creator;
 CREATE TABLE m11_auto(id int);
@@ -94,7 +96,9 @@ SET ROLE m11_reader;
 SELECT * FROM m11_auto; -- expect: success (not 42501)
 RESET ROLE;
 
+ALTER DEFAULT PRIVILEGES FOR ROLE m11_creator REVOKE SELECT ON TABLES FROM m11_reader;
 DROP TABLE m11_auto;
+REVOKE CREATE ON SCHEMA public FROM m11_creator;
 DROP ROLE m11_reader;
 DROP ROLE m11_creator;
 

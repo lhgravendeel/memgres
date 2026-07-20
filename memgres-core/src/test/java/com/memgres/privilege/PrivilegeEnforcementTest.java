@@ -194,16 +194,19 @@ class PrivilegeEnforcementTest {
         exec("CREATE ROLE m9grantee LOGIN");
         exec("CREATE TABLE m9t(id int)");
         exec("GRANT SELECT ON m9t TO m9grantor WITH GRANT OPTION");
-        try {
-            exec("SET ROLE m9grantor");
-            // Can grant SELECT (held with grant option)
-            exec("GRANT SELECT ON m9t TO m9grantee");
-            // Cannot grant INSERT (not held)
-            SQLException ex = assertThrows(SQLException.class,
-                () -> exec("GRANT INSERT ON m9t TO m9grantee"));
-            assertEquals("42501", ex.getSQLState());
+        // Connect as m9grantor directly (not SET ROLE from superuser, which falls back to session user)
+        try (Connection grantorConn = DriverManager.getConnection(
+                memgres.getJdbcUrl() + "?preferQueryMode=simple", "m9grantor", "")) {
+            grantorConn.setAutoCommit(true);
+            try (Statement st = grantorConn.createStatement()) {
+                // Can grant SELECT (held with grant option)
+                st.execute("GRANT SELECT ON m9t TO m9grantee");
+                // Cannot grant INSERT (not held)
+                SQLException ex = assertThrows(SQLException.class,
+                    () -> st.execute("GRANT INSERT ON m9t TO m9grantee"));
+                assertEquals("42501", ex.getSQLState());
+            }
         } finally {
-            exec("RESET ROLE");
             exec("DROP TABLE IF EXISTS m9t");
             exec("DROP ROLE IF EXISTS m9grantee");
             exec("DROP ROLE IF EXISTS m9grantor");
