@@ -55,8 +55,8 @@ ORDER BY id;
 
 -- begin-expected
 -- columns: id|same_subnet|contained_by_net|family_no|masked_host|network_part|broadcast_addr
--- row: 1|t|t|4|192.168.1.10/24|192.168.1.0/24|192.168.1.255/24
--- row: 2|t|t|4|10.5.6.7/8|10.0.0.0/8|10.255.255.255/8
+-- row: 1|t|t|4|192.168.1.10/24|192.168.1.10/32|192.168.1.255/24
+-- row: 2|t|t|4|10.5.6.7/8|10.5.6.7/32|10.255.255.255/8
 -- end-expected
 SELECT id,
        host << net AS same_subnet,

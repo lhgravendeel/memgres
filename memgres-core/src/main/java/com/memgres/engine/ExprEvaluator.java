@@ -960,11 +960,10 @@ class ExprEvaluator {
                     }
                     return new AstExecutor.PgBitString(sb.toString());
                 }
-                // inet bitwise NOT
-                if (val instanceof String && ((String) val).contains(".")) {
-                    String s = (String) val;
-                    return NetworkOperations.bitwiseNot(s);
-                }
+                // inet/macaddr bitwise NOT
+                if (val instanceof InetValue) return ((InetValue) val).bitwiseNot();
+                if (val instanceof MacaddrValue) return ((MacaddrValue) val).bitwiseNot();
+                if (val instanceof Macaddr8Value) return ((Macaddr8Value) val).bitwiseNot();
                 if (val instanceof Integer) return ~((Integer) val);
                 if (val instanceof Long) return ~((Long) val);
                 return ~toLong(val);

@@ -93,14 +93,9 @@ class MathFunctions {
             case "trunc": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                // macaddr trunc: zero out the last 3 bytes
-                if (arg instanceof String) {
-                    String s = ((String) arg).trim().toLowerCase();
-                    if (s.matches("[0-9a-f]{2}(:[0-9a-f]{2}){5}")) {
-                        String[] parts = s.split(":");
-                        return parts[0] + ":" + parts[1] + ":" + parts[2] + ":00:00:00";
-                    }
-                }
+                // macaddr/macaddr8 trunc
+                if (arg instanceof MacaddrValue) return ((MacaddrValue) arg).trunc();
+                if (arg instanceof Macaddr8Value) return ((Macaddr8Value) arg).trunc();
                 if (fn.args().size() > 1) {
                     int scale = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                     java.math.BigDecimal bd = new java.math.BigDecimal(arg.toString());

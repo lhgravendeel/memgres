@@ -220,10 +220,30 @@ class BinaryOpEvaluator {
     private Object evalBuiltinBinary(BinaryExpr.BinOp op, Object left, Object right) {
         switch (op) {
             case ADD:
+                // inet + integer arithmetic
+                if (left instanceof InetValue && right instanceof Number) {
+                    return ((InetValue) left).add(((Number) right).longValue());
+                }
+                if (left instanceof Number && right instanceof InetValue) {
+                    return ((InetValue) right).add(((Number) left).longValue());
+                }
                 return executor.dateTimeAdd(left, right);
             case SUBTRACT:
+                // inet - integer or inet - inet
+                if (left instanceof InetValue && right instanceof Number) {
+                    return ((InetValue) left).subtract(((Number) right).longValue());
+                }
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) left).subtract((InetValue) right);
+                }
                 return executor.dateTimeSubtract(left, right);
             case MULTIPLY:
+                if (left instanceof InetValue || left instanceof MacaddrValue || left instanceof Macaddr8Value
+                        || right instanceof InetValue || right instanceof MacaddrValue || right instanceof Macaddr8Value) {
+                    String lt = ConstraintValidator.pgTypeNameOf(left);
+                    String rt = ConstraintValidator.pgTypeNameOf(right);
+                    throw new MemgresException("operator does not exist: " + lt + " * " + rt, "42883");
+                }
                 return executor.numericOrIntervalMul(left, right);
             case DIVIDE: {
                 if (left instanceof String && right instanceof String
@@ -258,11 +278,15 @@ class BinaryOpEvaluator {
                 if (lBits != null && rBits != null) {
                     return new AstExecutor.PgBitString(AstExecutor.bitwiseBitString(lBits, rBits, '&'));
                 }
-                // inet bitwise AND
-                if (left instanceof String && right instanceof String && ((String) left).contains(".") && ((String) right).contains(".")) {
-                    String rs = (String) right;
-                    String ls = (String) left;
-                    return NetworkOperations.bitwiseAnd(ls, rs);
+                // inet/macaddr bitwise AND
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) left).bitwiseAnd((InetValue) right);
+                }
+                if (left instanceof MacaddrValue && right instanceof MacaddrValue) {
+                    return ((MacaddrValue) left).bitwiseAnd((MacaddrValue) right);
+                }
+                if (left instanceof Macaddr8Value && right instanceof Macaddr8Value) {
+                    return ((Macaddr8Value) left).bitwiseAnd((Macaddr8Value) right);
                 }
                 // intarray intersection: int[] & int[] -> intersection
                 if (left instanceof java.util.List && right instanceof java.util.List) {
@@ -288,11 +312,15 @@ class BinaryOpEvaluator {
                 if (lBitsOr != null && rBitsOr != null) {
                     return new AstExecutor.PgBitString(AstExecutor.bitwiseBitString(lBitsOr, rBitsOr, '|'));
                 }
-                // inet bitwise OR
-                if (left instanceof String && right instanceof String && ((String) left).contains(".") && ((String) right).contains(".")) {
-                    String rs = (String) right;
-                    String ls = (String) left;
-                    return NetworkOperations.bitwiseOr(ls, rs);
+                // inet/macaddr bitwise OR
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) left).bitwiseOr((InetValue) right);
+                }
+                if (left instanceof MacaddrValue && right instanceof MacaddrValue) {
+                    return ((MacaddrValue) left).bitwiseOr((MacaddrValue) right);
+                }
+                if (left instanceof Macaddr8Value && right instanceof Macaddr8Value) {
+                    return ((Macaddr8Value) left).bitwiseOr((Macaddr8Value) right);
                 }
                 { long r = executor.toLong(left) | executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
@@ -325,11 +353,9 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return GeometricOperations.isStrictlyLeft(ls, rs);
                 }
-                // Check for inet containment: inet << inet
-                if (left instanceof String && right instanceof String && ((String) left).contains(".") && ((String) right).contains(".")) {
-                    String rs = (String) right;
-                    String ls = (String) left;
-                    return NetworkOperations.containedBy(ls, rs);
+                // inet << inet: left is strictly contained in right
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) right).contains((InetValue) left);
                 }
                 { long r = executor.toLong(left) << executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
@@ -343,22 +369,22 @@ class BinaryOpEvaluator {
                     String ls = (String) left;
                     return GeometricOperations.isStrictlyRight(ls, rs);
                 }
-                // Check for inet containment: inet >> inet
-                if (left instanceof String && right instanceof String && ((String) left).contains(".") && ((String) right).contains(".")) {
-                    String rs = (String) right;
-                    String ls = (String) left;
-                    return NetworkOperations.contains(ls, rs);
+                // inet >> inet: left strictly contains right
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) left).contains((InetValue) right);
                 }
                 { long r = executor.toLong(left) >> executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case INET_CONTAINS_EQUALS: {
                 if (left == null || right == null) return null;
-                return NetworkOperations.containsOrEquals(left.toString(), right.toString());
+                InetValue il = toInetValue(left), ir = toInetValue(right);
+                return il.containsOrEquals(ir);
             }
             case INET_CONTAINED_BY_EQUALS: {
                 if (left == null || right == null) return null;
-                return NetworkOperations.containedByOrEquals(left.toString(), right.toString());
+                InetValue il = toInetValue(left), ir = toInetValue(right);
+                return ir.containsOrEquals(il);
             }
             case EQUAL: {
                 if (left == null || right == null) return null; // NULL = x is NULL
@@ -1026,6 +1052,11 @@ class BinaryOpEvaluator {
             }
             case OVERLAP: {
                 if (left == null || right == null) return null;
+                // inet && inet: overlap (networks share any addresses)
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    InetValue il = (InetValue) left, ir = (InetValue) right;
+                    return il.containsOrEquals(ir) || ir.containsOrEquals(il);
+                }
                 // TsQuery && TsQuery — AND of two queries
                 if (left instanceof TsQuery && right instanceof TsQuery) {
                     return TsQuery.and((TsQuery) left, (TsQuery) right);
@@ -1285,15 +1316,38 @@ class BinaryOpEvaluator {
         }
     }
 
+    private static InetValue toInetValue(Object val) {
+        if (val instanceof InetValue) return (InetValue) val;
+        return InetValue.parse(val.toString());
+    }
+
     Object evalBinaryValues(BinaryExpr.BinOp op, Object left, Object right) {
         // Apply type validation before computation
         executor.validateOperatorTypes(op, left, right);
         switch (op) {
             case ADD:
+                if (left instanceof InetValue && right instanceof Number) {
+                    return ((InetValue) left).add(((Number) right).longValue());
+                }
+                if (left instanceof Number && right instanceof InetValue) {
+                    return ((InetValue) right).add(((Number) left).longValue());
+                }
                 return executor.dateTimeAdd(left, right);
             case SUBTRACT:
+                if (left instanceof InetValue && right instanceof Number) {
+                    return ((InetValue) left).subtract(((Number) right).longValue());
+                }
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) left).subtract((InetValue) right);
+                }
                 return executor.dateTimeSubtract(left, right);
             case MULTIPLY:
+                if (left instanceof InetValue || left instanceof MacaddrValue || left instanceof Macaddr8Value
+                        || right instanceof InetValue || right instanceof MacaddrValue || right instanceof Macaddr8Value) {
+                    String lt = ConstraintValidator.pgTypeNameOf(left);
+                    String rt = ConstraintValidator.pgTypeNameOf(right);
+                    throw new MemgresException("operator does not exist: " + lt + " * " + rt, "42883");
+                }
                 return executor.numericOrIntervalMul(left, right);
             case DIVIDE: {
                 if (left instanceof String && right instanceof String
@@ -1328,11 +1382,15 @@ class BinaryOpEvaluator {
                 if (lBits2 != null && rBits2 != null) {
                     return new AstExecutor.PgBitString(AstExecutor.bitwiseBitString(lBits2, rBits2, '&'));
                 }
-                // inet bitwise AND
-                if (left instanceof String && right instanceof String && ((String) left).contains(".") && ((String) right).contains(".")) {
-                    String rs = (String) right;
-                    String ls = (String) left;
-                    return NetworkOperations.bitwiseAnd(ls, rs);
+                // inet/macaddr bitwise AND
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) left).bitwiseAnd((InetValue) right);
+                }
+                if (left instanceof MacaddrValue && right instanceof MacaddrValue) {
+                    return ((MacaddrValue) left).bitwiseAnd((MacaddrValue) right);
+                }
+                if (left instanceof Macaddr8Value && right instanceof Macaddr8Value) {
+                    return ((Macaddr8Value) left).bitwiseAnd((Macaddr8Value) right);
                 }
                 { long r = executor.toLong(left) & executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
@@ -1345,11 +1403,15 @@ class BinaryOpEvaluator {
                 if (lBitsOr2 != null && rBitsOr2 != null) {
                     return new AstExecutor.PgBitString(AstExecutor.bitwiseBitString(lBitsOr2, rBitsOr2, '|'));
                 }
-                // inet bitwise OR
-                if (left instanceof String && right instanceof String && ((String) left).contains(".") && ((String) right).contains(".")) {
-                    String rs = (String) right;
-                    String ls = (String) left;
-                    return NetworkOperations.bitwiseOr(ls, rs);
+                // inet/macaddr bitwise OR
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) left).bitwiseOr((InetValue) right);
+                }
+                if (left instanceof MacaddrValue && right instanceof MacaddrValue) {
+                    return ((MacaddrValue) left).bitwiseOr((MacaddrValue) right);
+                }
+                if (left instanceof Macaddr8Value && right instanceof Macaddr8Value) {
+                    return ((Macaddr8Value) left).bitwiseOr((Macaddr8Value) right);
                 }
                 { long r = executor.toLong(left) | executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
@@ -1375,31 +1437,31 @@ class BinaryOpEvaluator {
             }
             case SHIFT_LEFT: {
                 if (left == null || right == null) return null;
-                if (left instanceof String && right instanceof String && ((String) left).contains(".") && ((String) right).contains(".")) {
-                    String rs = (String) right;
-                    String ls = (String) left;
-                    return NetworkOperations.containedBy(ls, rs);
+                // inet << inet: left is strictly contained in right
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) right).contains((InetValue) left);
                 }
                 { long r = executor.toLong(left) << executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case SHIFT_RIGHT: {
                 if (left == null || right == null) return null;
-                if (left instanceof String && right instanceof String && ((String) left).contains(".") && ((String) right).contains(".")) {
-                    String rs = (String) right;
-                    String ls = (String) left;
-                    return NetworkOperations.contains(ls, rs);
+                // inet >> inet: left strictly contains right
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    return ((InetValue) left).contains((InetValue) right);
                 }
                 { long r = executor.toLong(left) >> executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
             case INET_CONTAINS_EQUALS: {
                 if (left == null || right == null) return null;
-                return NetworkOperations.containsOrEquals(left.toString(), right.toString());
+                InetValue il = toInetValue(left), ir = toInetValue(right);
+                return il.containsOrEquals(ir);
             }
             case INET_CONTAINED_BY_EQUALS: {
                 if (left == null || right == null) return null;
-                return NetworkOperations.containedByOrEquals(left.toString(), right.toString());
+                InetValue il = toInetValue(left), ir = toInetValue(right);
+                return ir.containsOrEquals(il);
             }
             case EQUAL: {
                 if (left == null || right == null) return null;
@@ -1790,6 +1852,11 @@ class BinaryOpEvaluator {
             }
             case OVERLAP: {
                 if (left == null || right == null) return null;
+                // inet && inet: overlap (networks share any addresses)
+                if (left instanceof InetValue && right instanceof InetValue) {
+                    InetValue il = (InetValue) left, ir = (InetValue) right;
+                    return il.containsOrEquals(ir) || ir.containsOrEquals(il);
+                }
                 // TsQuery && TsQuery — AND of two queries
                 if (left instanceof TsQuery && right instanceof TsQuery) {
                     return TsQuery.and((TsQuery) left, (TsQuery) right);

@@ -1378,6 +1378,10 @@ class ConstraintValidator {
         if (value instanceof PgInterval) return "interval";
         if (value instanceof java.util.UUID) return "uuid";
         if (value instanceof AstExecutor.PgBitString) return "bit";
+        if (value instanceof CidrValue) return "cidr";
+        if (value instanceof InetValue) return "inet";
+        if (value instanceof MacaddrValue) return "macaddr";
+        if (value instanceof Macaddr8Value) return "macaddr8";
         if (value instanceof List) return "integer[]";
         return "text";
     }

@@ -215,7 +215,7 @@ class Round13BinaryCodecGapsTest {
     void inet_ipv6_roundTrip_binary() throws SQLException {
         String v = readColumnViaReusedPreparedStatement(
                 "'::1/128'::inet", 10);
-        assertEquals("::1/128", v);
+        assertEquals("::1", v);
     }
 
     // =========================================================================

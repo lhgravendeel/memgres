@@ -18,80 +18,113 @@ class NetworkFunctions {
         switch (name) {
             case "host": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : NetworkOperations.host(arg.toString());
+                if (arg == null) return null;
+                InetValue inet = toInet(arg);
+                return inet.host();
             }
             case "masklen": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : NetworkOperations.masklen(arg.toString());
+                if (arg == null) return null;
+                InetValue inet = toInet(arg);
+                return inet.getPrefixLength();
             }
             case "set_masklen": {
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
-                return arg1 == null ? null : NetworkOperations.setMasklen(arg1.toString(), executor.toInt(arg2));
+                if (arg1 == null) return null;
+                InetValue inet = toInet(arg1);
+                int len = executor.toInt(arg2);
+                if (arg1 instanceof CidrValue) {
+                    return ((CidrValue) arg1).setCidrMasklen(len);
+                }
+                return inet.setMasklen(len);
             }
             case "netmask": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : NetworkOperations.netmask(arg.toString());
+                if (arg == null) return null;
+                InetValue inet = toInet(arg);
+                return inet.netmask();
             }
             case "hostmask": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : NetworkOperations.hostmask(arg.toString());
+                if (arg == null) return null;
+                InetValue inet = toInet(arg);
+                return inet.hostmask();
             }
             case "broadcast": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : NetworkOperations.broadcast(arg.toString());
+                if (arg == null) return null;
+                InetValue inet = toInet(arg);
+                return inet.broadcast();
             }
             case "network": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : NetworkOperations.network(arg.toString());
+                if (arg == null) return null;
+                InetValue inet = toInet(arg);
+                InetValue net = inet.network();
+                return CidrValue.fromInet(net);
             }
             case "inet_same_family": {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
-                return (a == null || b == null) ? null : NetworkOperations.inetSameFamily(a.toString(), b.toString());
+                if (a == null || b == null) return null;
+                return toInet(a).sameFamily(toInet(b));
             }
             case "inet_merge": {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
-                return (a == null || b == null) ? null : NetworkOperations.inetMerge(a.toString(), b.toString());
+                if (a == null || b == null) return null;
+                InetValue merged = toInet(a).merge(toInet(b));
+                return CidrValue.fromInet(merged);
             }
             case "abbrev": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : NetworkOperations.abbrev(arg.toString());
+                if (arg == null) return null;
+                if (arg instanceof CidrValue) return ((CidrValue) arg).abbrev();
+                if (arg instanceof InetValue) return ((InetValue) arg).abbrev();
+                // fallback for string
+                return InetValue.parse(arg.toString()).abbrev();
             }
             case "family": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
-                return arg == null ? null : (arg.toString().contains(":") ? 6 : 4);
+                if (arg == null) return null;
+                return toInet(arg).family();
+            }
+            case "text": {
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                if (arg instanceof InetValue) return ((InetValue) arg).text();
+                return NOT_HANDLED;
             }
             case "macaddr8": {
                 // Convert macaddr (6-byte) to macaddr8 (8-byte) by inserting ff:fe in the middle
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                String mac = arg.toString().toLowerCase().trim();
-                String[] parts = mac.split(":");
-                if (parts.length == 6) {
-                    // EUI-48 to EUI-64: insert ff:fe between bytes 3 and 4
-                    return parts[0] + ":" + parts[1] + ":" + parts[2] + ":ff:fe:" + parts[3] + ":" + parts[4] + ":" + parts[5];
-                }
-                return mac; // already macaddr8 format or pass through
+                if (arg instanceof MacaddrValue) return ((MacaddrValue) arg).toMacaddr8();
+                return MacaddrValue.parse(arg.toString()).toMacaddr8();
             }
             case "macaddr8_set7bit": {
                 // Set the 7th bit (universal/local bit) of a macaddr8 value
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                String mac = arg.toString().toLowerCase().trim();
-                String[] parts = mac.split(":");
-                if (parts.length == 8) {
-                    // Set bit 1 (0x02) of the first octet (the 7th bit, counting from MSB as bit 0)
-                    int firstOctet = Integer.parseInt(parts[0], 16);
-                    firstOctet |= 0x02;
-                    parts[0] = String.format("%02x", firstOctet);
-                    return String.join(":", parts);
-                }
-                return mac;
+                if (arg instanceof Macaddr8Value) return ((Macaddr8Value) arg).set7bit();
+                return Macaddr8Value.parse(arg.toString()).set7bit();
+            }
+            case "trunc": {
+                // trunc(macaddr) or trunc(macaddr8)
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                if (arg instanceof MacaddrValue) return ((MacaddrValue) arg).trunc();
+                if (arg instanceof Macaddr8Value) return ((Macaddr8Value) arg).trunc();
+                return NOT_HANDLED;
             }
             default:
                 return NOT_HANDLED;
         }
+    }
+
+    private static InetValue toInet(Object val) {
+        if (val instanceof InetValue) return (InetValue) val;
+        return InetValue.parse(val.toString());
     }
 }

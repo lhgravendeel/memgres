@@ -274,8 +274,18 @@ public final class TypeCoercion {
             case JSON:
                 return value.toString();
             case INET:
+                if (value instanceof InetValue) return value;
+                return InetValue.parse(value.toString());
             case CIDR:
-                return NetworkOperations.normalizeAddress(value.toString());
+                if (value instanceof CidrValue) return value;
+                if (value instanceof InetValue) return CidrValue.fromInet((InetValue) value);
+                return CidrValue.parse(value.toString());
+            case MACADDR:
+                if (value instanceof MacaddrValue) return value;
+                return MacaddrValue.parse(value.toString());
+            case MACADDR8:
+                if (value instanceof Macaddr8Value) return value;
+                return Macaddr8Value.parse(value.toString());
             case HSTORE:
                 if (value instanceof HstoreValue) return value;
                 return HstoreValue.parse(value.toString());
@@ -388,8 +398,13 @@ public final class TypeCoercion {
             case JSONB:
                 return false;
             case INET:
+                return value instanceof InetValue;
             case CIDR:
-                return false;
+                return value instanceof CidrValue;
+            case MACADDR:
+                return value instanceof MacaddrValue;
+            case MACADDR8:
+                return value instanceof Macaddr8Value;
             case HSTORE:
                 return value instanceof HstoreValue;
             default:
@@ -1351,6 +1366,11 @@ public final class TypeCoercion {
             try { return java.util.UUID.fromString(sa).compareTo(ub); } catch (Exception e) { /* fall through */ }
         }
 
+        // Network type comparisons (InetValue, MacaddrValue, Macaddr8Value)
+        if (a instanceof InetValue && b instanceof InetValue) return ((InetValue) a).compareTo((InetValue) b);
+        if (a instanceof MacaddrValue && b instanceof MacaddrValue) return ((MacaddrValue) a).compareTo((MacaddrValue) b);
+        if (a instanceof Macaddr8Value && b instanceof Macaddr8Value) return ((Macaddr8Value) a).compareTo((Macaddr8Value) b);
+
         // Byte array comparison
         if (a instanceof byte[] && b instanceof byte[]) {
             byte[] ba = (byte[]) a;
@@ -1702,6 +1722,10 @@ public final class TypeCoercion {
         if (value instanceof OffsetDateTime) return DataType.TIMESTAMPTZ;
         if (value instanceof PgInterval) return DataType.INTERVAL;
         if (value instanceof java.util.UUID) return DataType.UUID;
+        if (value instanceof InetValue && !(value instanceof CidrValue)) return DataType.INET;
+        if (value instanceof CidrValue) return DataType.CIDR;
+        if (value instanceof MacaddrValue) return DataType.MACADDR;
+        if (value instanceof Macaddr8Value) return DataType.MACADDR8;
         if (value instanceof List) return DataType.TEXT; // arrays
         return DataType.TEXT;
     }
