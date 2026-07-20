@@ -108,6 +108,7 @@ class PgWireBinaryCodec {
                 return Short.toString((short) readInt2(data, 0));
             case INTEGER:
             case SERIAL:
+            case OID:
                 return Integer.toString(readInt4(data, 0));
             case BIGINT:
             case BIGSERIAL:
@@ -245,6 +246,7 @@ class PgWireBinaryCodec {
      * Writes the 4-byte length prefix followed by the encoded value.
      */
     static void writeBinaryValue(ByteBuf buf, Object val, DataType type) {
+        int savedWriterIndex = buf.writerIndex();
         try {
             if (type == null) type = DataType.TEXT;
             switch (type) {
@@ -261,7 +263,8 @@ class PgWireBinaryCodec {
                     break;
                 }
                 case INTEGER:
-                case SERIAL: {
+                case SERIAL:
+                case OID: {
                     buf.writeInt(4);
                     int iv = val instanceof Number ? ((Number) val).intValue() : Integer.parseInt(val.toString());
                     buf.writeInt(iv);
@@ -287,33 +290,62 @@ class PgWireBinaryCodec {
                     break;
                 }
                 case TIMESTAMP: {
+                    String tsStr = val instanceof String ? ((String) val).trim()
+                                 : val instanceof LocalDateTime ? null : val.toString().trim();
+                    if ("infinity".equalsIgnoreCase(tsStr)) {
+                        buf.writeInt(8); buf.writeLong(Long.MAX_VALUE); break;
+                    } else if ("-infinity".equalsIgnoreCase(tsStr)) {
+                        buf.writeInt(8); buf.writeLong(Long.MIN_VALUE); break;
+                    }
                     buf.writeInt(8);
                     LocalDateTime dt;
                     if (val instanceof LocalDateTime) dt = ((LocalDateTime) val);
-                    else dt = LocalDateTime.parse(val.toString().replace(' ', 'T'));
+                    else dt = LocalDateTime.parse(tsStr.replace(' ', 'T'));
                     LocalDateTime epoch = LocalDateTime.of(2000, 1, 1, 0, 0, 0);
                     long micros = Duration.between(epoch, dt).toNanos() / 1000;
                     buf.writeLong(micros);
                     break;
                 }
                 case TIMESTAMPTZ: {
+                    String tstzStr = val instanceof String ? ((String) val).trim()
+                                   : val instanceof OffsetDateTime ? null : val.toString().trim();
+                    if ("infinity".equalsIgnoreCase(tstzStr)) {
+                        buf.writeInt(8); buf.writeLong(Long.MAX_VALUE); break;
+                    } else if ("-infinity".equalsIgnoreCase(tstzStr)) {
+                        buf.writeInt(8); buf.writeLong(Long.MIN_VALUE); break;
+                    }
                     buf.writeInt(8);
                     OffsetDateTime odt;
                     if (val instanceof OffsetDateTime) odt = ((OffsetDateTime) val);
-                    else odt = OffsetDateTime.parse(val.toString());
-                    OffsetDateTime epoch = OffsetDateTime.of(2000, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
-                    long micros = Duration.between(epoch, odt).toNanos() / 1000;
+                    else odt = OffsetDateTime.parse(tstzStr);
+                    OffsetDateTime epochOdt = OffsetDateTime.of(2000, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
+                    long micros = Duration.between(epochOdt, odt).toNanos() / 1000;
                     buf.writeLong(micros);
                     break;
                 }
                 case DATE: {
+                    String dateStr = val instanceof String ? ((String) val).trim()
+                                   : val instanceof LocalDate ? null : val.toString().trim();
+                    if ("infinity".equalsIgnoreCase(dateStr)) {
+                        buf.writeInt(4); buf.writeInt(0x7FFFFFFF); break;
+                    } else if ("-infinity".equalsIgnoreCase(dateStr)) {
+                        buf.writeInt(4); buf.writeInt(0x80000000); break;
+                    }
                     buf.writeInt(4);
                     LocalDate ld;
                     if (val instanceof LocalDate) ld = ((LocalDate) val);
-                    else ld = LocalDate.parse(val.toString());
+                    else ld = LocalDate.parse(dateStr);
                     int days = (int) java.time.temporal.ChronoUnit.DAYS.between(
                             LocalDate.of(2000, 1, 1), ld);
                     buf.writeInt(days);
+                    break;
+                }
+                case TIME: {
+                    buf.writeInt(8);
+                    LocalTime lt;
+                    if (val instanceof LocalTime) lt = ((LocalTime) val);
+                    else lt = LocalTime.parse(val.toString().trim());
+                    buf.writeLong(lt.toNanoOfDay() / 1000);
                     break;
                 }
                 case UUID: {
@@ -327,10 +359,21 @@ class PgWireBinaryCodec {
                 }
                 case NUMERIC:
                 case MONEY: {
+                    // Handle NaN: PG sends sign=0xC000
+                    String numStr = val.toString();
+                    if ("NaN".equalsIgnoreCase(numStr) || (val instanceof Double && ((Double) val).isNaN())
+                            || (val instanceof Float && ((Float) val).isNaN())) {
+                        buf.writeInt(8);
+                        buf.writeShort(0); // ndigits
+                        buf.writeShort(0); // weight
+                        buf.writeShort(0xC000); // sign = NaN
+                        buf.writeShort(0); // dscale
+                        break;
+                    }
                     BigDecimal bd;
                     if (val instanceof BigDecimal) bd = ((BigDecimal) val);
                     else if (val instanceof Number) bd = BigDecimal.valueOf(((Number) val).doubleValue());
-                    else bd = new BigDecimal(val.toString());
+                    else bd = new BigDecimal(numStr);
                     encodeBinaryNumericToBuf(buf, bd);
                     break;
                 }
@@ -441,7 +484,9 @@ class PgWireBinaryCodec {
                 }
             }
         } catch (Exception e) {
-            // If binary encoding fails, fall back to text
+            // Reset to before the failed encoding attempt to avoid mis-framing
+            buf.writerIndex(savedWriterIndex);
+            // Fall back to text encoding
             String text = PgWireValueFormatter.formatValue(val, null);
             byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
             buf.writeInt(bytes.length);
@@ -463,7 +508,8 @@ class PgWireBinaryCodec {
                 return new byte[]{(byte) (s >> 8), (byte) s};
             }
             case INTEGER:
-            case SERIAL: {
+            case SERIAL:
+            case OID: {
                 int v = (val instanceof Number) ? ((Number) val).intValue() : Integer.parseInt(val.toString());
                 return intToBytes(v);
             }
@@ -591,16 +637,16 @@ class PgWireBinaryCodec {
     static void encodeBinaryNumericToBuf(ByteBuf buf, BigDecimal bd) {
         if (bd.signum() == 0) {
             buf.writeInt(8);
-            buf.writeShort(0);           // ndigits
-            buf.writeShort(0);           // weight
-            buf.writeShort(0x0000);      // sign: positive
-            buf.writeShort(bd.scale());  // dscale
+            buf.writeShort(0);                    // ndigits
+            buf.writeShort(0);                    // weight
+            buf.writeShort(0x0000);               // sign: positive
+            buf.writeShort(Math.max(bd.scale(), 0)); // dscale (clamp negative)
             return;
         }
 
         int sign = bd.signum() < 0 ? 0x4000 : 0x0000;
         bd = bd.abs();
-        int dscale = bd.scale();
+        int dscale = Math.max(bd.scale(), 0); // clamp negative dscale
 
         String unscaled = bd.unscaledValue().toString();
         int intDigitCount = unscaled.length() - dscale;
@@ -655,7 +701,10 @@ class PgWireBinaryCodec {
             for (int i = 0; i < inner.length(); i++) {
                 char c = inner.charAt(i);
                 if (inQuotes) {
-                    if (c == '"' && i + 1 < inner.length() && inner.charAt(i + 1) == '"') {
+                    if (c == '\\' && i + 1 < inner.length()) {
+                        // Backslash escape: emit the next char literally
+                        current.append(inner.charAt(++i));
+                    } else if (c == '"' && i + 1 < inner.length() && inner.charAt(i + 1) == '"') {
                         current.append('"');
                         i++;
                     } else if (c == '"') {

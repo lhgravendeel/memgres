@@ -222,6 +222,7 @@ class PgWireValueFormatter {
             case INTEGER:
             case SERIAL:
             case REAL:
+            case OID:
                 return 4;
             case BIGINT:
             case BIGSERIAL:
@@ -320,7 +321,41 @@ class PgWireValueFormatter {
             }
             return session.resolveOid(key);
         }
+        // For array columns, advertise the array OID instead of scalar
+        if (col != null && col.getArrayElementType() != null && col.getArrayElementType() != DataType.ENUM) {
+            DataType arrayOid = scalarToArrayOid(col.getArrayElementType());
+            if (arrayOid != null) return arrayOid.getOid();
+        }
         return colType.getOid();
+    }
+
+    /** Map scalar DataType to its array DataType for OID resolution. */
+    private static DataType scalarToArrayOid(DataType scalar) {
+        if (scalar == null) return null;
+        switch (scalar) {
+            case BOOLEAN: return DataType.BOOL_ARRAY;
+            case SMALLINT: return DataType.INT2_ARRAY;
+            case INTEGER: case SERIAL: return DataType.INT4_ARRAY;
+            case BIGINT: case BIGSERIAL: return DataType.INT8_ARRAY;
+            case REAL: return DataType.FLOAT4_ARRAY;
+            case DOUBLE_PRECISION: return DataType.FLOAT8_ARRAY;
+            case NUMERIC: return DataType.NUMERIC_ARRAY;
+            case TEXT: case NAME: return DataType.TEXT_ARRAY;
+            case VARCHAR: return DataType.VARCHAR_ARRAY;
+            case CHAR: return DataType.CHAR_ARRAY;
+            case DATE: return DataType.DATE_ARRAY;
+            case TIMESTAMP: return DataType.TIMESTAMP_ARRAY;
+            case TIMESTAMPTZ: return DataType.TIMESTAMPTZ_ARRAY;
+            case TIME: return DataType.TIME_ARRAY;
+            case TIMETZ: return DataType.TIMETZ_ARRAY;
+            case UUID: return DataType.UUID_ARRAY;
+            case BYTEA: return DataType.BYTEA_ARRAY;
+            case INTERVAL: return DataType.INTERVAL_ARRAY;
+            case JSON: return DataType.JSON_ARRAY;
+            case JSONB: return DataType.JSONB_ARRAY;
+            case INET: return DataType.INET_ARRAY;
+            default: return null;
+        }
     }
 
     static void writeCString(ByteBuf buf, String s) {

@@ -94,10 +94,32 @@ public enum DataType {
     TSTZMULTIRANGE(4536, "tstzmultirange"),
 
     // Array types (used for system catalog columns and array expressions)
-    TEXT_ARRAY(1009, "_text"),
+    BOOL_ARRAY(1000, "_bool"),
+    INT2_ARRAY(1005, "_int2"),
     INT4_ARRAY(1007, "_int4"),
+    INT8_ARRAY(1016, "_int8"),
+    FLOAT4_ARRAY(1021, "_float4"),
+    FLOAT8_ARRAY(1022, "_float8"),
+    NUMERIC_ARRAY(1231, "_numeric"),
+    TEXT_ARRAY(1009, "_text"),
+    VARCHAR_ARRAY(1015, "_varchar"),
+    CHAR_ARRAY(1014, "_bpchar"),
     NAME_ARRAY(1003, "_name"),
+    DATE_ARRAY(1182, "_date"),
+    TIMESTAMP_ARRAY(1115, "_timestamp"),
+    TIMESTAMPTZ_ARRAY(1185, "_timestamptz"),
+    TIME_ARRAY(1183, "_time"),
+    TIMETZ_ARRAY(1270, "_timetz"),
+    UUID_ARRAY(2951, "_uuid"),
+    BYTEA_ARRAY(1001, "_bytea"),
+    INTERVAL_ARRAY(1187, "_interval"),
+    JSON_ARRAY(199, "_json"),
+    JSONB_ARRAY(3807, "_jsonb"),
+    INET_ARRAY(1041, "_inet"),
     ACLITEM_ARRAY(1034, "_aclitem"),
+
+    // OID type
+    OID(26, "oid"),
 
     // Transaction ID type
     XID(28, "xid"),
@@ -161,6 +183,7 @@ public enum DataType {
             case "name":
                 return NAME;
             case "oid":
+                return OID;
             case "regclass":
             case "regtype":
             case "regproc":
