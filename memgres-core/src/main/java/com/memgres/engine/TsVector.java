@@ -13,6 +13,9 @@ import java.util.stream.Collectors;
  */
 public class TsVector {
 
+    /** Max position value per lexeme (PG caps at 16383, we use 256 for position list length cap). */
+    static final int MAX_POSITION = 16383;
+
     static final Set<String> STOP_WORDS_SET = Cols.setOf(
             "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
             "have", "has", "had", "do", "does", "did", "will", "would", "could",
@@ -27,18 +30,10 @@ public class TsVector {
         return STOP_WORDS_SET.contains(word.toLowerCase());
     }
 
-    private static final Set<String> STOP_WORDS = Cols.setOf(
-            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-            "have", "has", "had", "do", "does", "did", "will", "would", "could",
-            "should", "may", "might", "can", "shall", "to", "of", "in", "for",
-            "on", "with", "at", "by", "from", "as", "into", "about", "between",
-            "through", "during", "before", "after", "above", "below",
-            "and", "but", "or", "nor", "not", "so", "yet",
-            "it", "its", "this", "that", "these", "those"
-    );
+    private static final Set<String> STOP_WORDS = STOP_WORDS_SET;
 
     /** A position entry: position number + weight character (D is default/lowest). */
-        public static final class PosEntry {
+    public static final class PosEntry {
         public final int position;
         public final char weight;
 
@@ -86,56 +81,122 @@ public class TsVector {
         return new TsVector(new TreeMap<>());
     }
 
-    /** Build a tsvector from plain text (tokenize, stem, remove stop words). */
+    /** Build a tsvector from plain text using english config (tokenize, stem, remove stop words). */
     public static TsVector fromText(String text) {
+        return fromText(text, "english");
+    }
+
+    /** Build a tsvector from plain text with specified config. */
+    public static TsVector fromText(String text, String config) {
         Map<String, List<PosEntry>> lexemes = new TreeMap<>();
         if (text == null || text.isEmpty()) return new TsVector(lexemes);
 
-        // Check if it looks like a tsvector literal: 'word':1A,2B 'word2':3
-        if (text.contains("'") && text.contains(":")) {
-            TsVector parsed = parseLiteral(text);
-            if (parsed != null) return parsed;
-        }
+        boolean isSimple = "simple".equalsIgnoreCase(config);
 
         String[] words = text.toLowerCase().split("[^a-zA-Z0-9]+");
         int position = 0;
         for (String word : words) {
             if (word.isEmpty()) continue;
             position++;  // count position for every word including stop words
-            if (STOP_WORDS.contains(word)) continue;
-            String stem = simpleStem(word);
-            lexemes.computeIfAbsent(stem, k -> new ArrayList<>()).add(new PosEntry(position));
+            if (isSimple) {
+                // simple config: no stemming, no stopword removal, just lowercase
+                addPosition(lexemes, word, position);
+            } else {
+                // english config: stem and remove stop words
+                if (STOP_WORDS.contains(word)) continue;
+                String stem = simpleStem(word);
+                addPosition(lexemes, stem, position);
+            }
         }
         return new TsVector(lexemes);
     }
 
-    /** Parse a tsvector literal like: 'cat':1A,2B 'dog':3 'fat':4C */
-    private static final Pattern LEXEME_PAT = Pattern.compile("'([^']*)'(?::([\\d,A-Da-d]+))?");
+    private static void addPosition(Map<String, List<PosEntry>> lexemes, String lexeme, int position) {
+        if (position > MAX_POSITION) position = MAX_POSITION;
+        List<PosEntry> entries = lexemes.computeIfAbsent(lexeme, k -> new ArrayList<>());
+        // PG caps at 256 positions per lexeme
+        if (entries.size() < 256) {
+            entries.add(new PosEntry(position));
+        }
+    }
 
+    /** Parse a tsvector literal. Supports both quoted and unquoted lexemes:
+     *  'cat':1A,2B 'dog':3 fat:4C word
+     *  PG preserves case of quoted lexemes. Position 0 is rejected (42601). */
     public static TsVector parseLiteral(String input) {
+        if (input == null || input.isEmpty()) return null;
         Map<String, List<PosEntry>> lexemes = new TreeMap<>();
-        Matcher m = LEXEME_PAT.matcher(input);
-        while (m.find()) {
-            String lexeme = m.group(1).toLowerCase();
-            String posStr = m.group(2);
-            List<PosEntry> entries = new ArrayList<>();
-            if (posStr != null) {
-                for (String part : posStr.split(",")) {
-                    part = part.trim();
-                    if (part.isEmpty()) continue;
-                    char weight = 'D';
-                    String numStr = part;
-                    char last = part.charAt(part.length() - 1);
-                    if (Character.isLetter(last)) {
-                        weight = Character.toUpperCase(last);
-                        numStr = part.substring(0, part.length() - 1);
+        int i = 0;
+        int len = input.length();
+        while (i < len) {
+            // Skip whitespace
+            while (i < len && Character.isWhitespace(input.charAt(i))) i++;
+            if (i >= len) break;
+
+            String lexeme;
+            if (input.charAt(i) == '\'') {
+                // Quoted lexeme: 'word' or 'word''s'
+                i++; // skip opening quote
+                StringBuilder sb = new StringBuilder();
+                while (i < len) {
+                    char c = input.charAt(i);
+                    if (c == '\'' && i + 1 < len && input.charAt(i + 1) == '\'') {
+                        sb.append('\'');
+                        i += 2;
+                    } else if (c == '\'') {
+                        i++; // skip closing quote
+                        break;
+                    } else if (c == '\\' && i + 1 < len) {
+                        sb.append(input.charAt(i + 1));
+                        i += 2;
+                    } else {
+                        sb.append(c);
+                        i++;
                     }
-                    if (!numStr.isEmpty()) {
-                        try {
-                            entries.add(new PosEntry(Integer.parseInt(numStr), weight));
-                        } catch (NumberFormatException e) {
-                            // skip
+                }
+                lexeme = sb.toString(); // preserve case for quoted
+            } else {
+                // Unquoted lexeme: read until whitespace or colon
+                StringBuilder sb = new StringBuilder();
+                while (i < len && !Character.isWhitespace(input.charAt(i)) && input.charAt(i) != ':') {
+                    sb.append(input.charAt(i));
+                    i++;
+                }
+                if (sb.length() == 0) { i++; continue; }
+                lexeme = sb.toString(); // unquoted: keep as-is (PG lowercases but we match behavior)
+            }
+
+            // Parse optional positions: :1A,2B,3
+            List<PosEntry> entries = new ArrayList<>();
+            if (i < len && input.charAt(i) == ':') {
+                i++; // skip ':'
+                while (i < len && !Character.isWhitespace(input.charAt(i))) {
+                    // Parse one position entry
+                    StringBuilder numSb = new StringBuilder();
+                    while (i < len && Character.isDigit(input.charAt(i))) {
+                        numSb.append(input.charAt(i));
+                        i++;
+                    }
+                    char weight = 'D';
+                    if (i < len && Character.isLetter(input.charAt(i)) && "AaBbCcDd".indexOf(input.charAt(i)) >= 0) {
+                        weight = Character.toUpperCase(input.charAt(i));
+                        i++;
+                    }
+                    if (numSb.length() > 0) {
+                        int pos = Integer.parseInt(numSb.toString());
+                        if (pos == 0) {
+                            throw new MemgresException("wrong position info in tsvector: \"" + input + "\"", "42601");
                         }
+                        if (pos > MAX_POSITION) pos = MAX_POSITION;
+                        if (entries.size() < 256) {
+                            entries.add(new PosEntry(pos, weight));
+                        }
+                    }
+                    // Skip comma separator
+                    if (i < len && input.charAt(i) == ',') {
+                        i++;
+                    } else {
+                        break;
                     }
                 }
             }
@@ -148,8 +209,17 @@ public class TsVector {
         return query.matches(this);
     }
 
+    /** Check if lexeme exists. For tsvector produced via parseLiteral, exact match; for stemmed, stem first. */
     public boolean containsLexeme(String lexeme) {
+        // Try exact match first (for literal tsvectors)
+        if (lexemes.containsKey(lexeme)) return true;
+        // Then try stemmed match
         return lexemes.containsKey(simpleStem(lexeme.toLowerCase()));
+    }
+
+    /** Check if lexeme exists (exact match only, no stemming). */
+    public boolean containsLexemeExact(String lexeme) {
+        return lexemes.containsKey(lexeme);
     }
 
     public Set<String> getLexemes() {
@@ -162,14 +232,20 @@ public class TsVector {
 
     /** Get all positions for a lexeme. */
     public List<Integer> getPositions(String lexeme) {
-        List<PosEntry> entries = lexemes.get(simpleStem(lexeme.toLowerCase()));
+        List<PosEntry> entries = lexemes.get(lexeme);
+        if (entries == null) {
+            entries = lexemes.get(simpleStem(lexeme.toLowerCase()));
+        }
         if (entries == null) return Cols.listOf();
         return entries.stream().map(PosEntry::position).collect(Collectors.toList());
     }
 
     /** Check if a lexeme exists with any of the given weights. */
     public boolean containsLexemeWithWeight(String lexeme, Set<Character> weights) {
-        List<PosEntry> entries = lexemes.get(simpleStem(lexeme.toLowerCase()));
+        List<PosEntry> entries = lexemes.get(lexeme);
+        if (entries == null) {
+            entries = lexemes.get(simpleStem(lexeme.toLowerCase()));
+        }
         if (entries == null) return false;
         if (weights == null || weights.isEmpty()) return true;
         return entries.stream().anyMatch(e -> weights.contains(e.weight()));
@@ -208,7 +284,8 @@ public class TsVector {
     /** Set weight only for specified lexemes. */
     public TsVector setWeight(char weight, List<String> filterLexemes) {
         Map<String, List<PosEntry>> result = new TreeMap<>();
-        Set<String> filterSet = new HashSet<>();
+        Set<String> filterSet = new HashSet<>(filterLexemes);
+        // Also add stemmed forms
         for (String l : filterLexemes) filterSet.add(simpleStem(l.toLowerCase()));
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             if (filterSet.contains(entry.getKey())) {
@@ -227,19 +304,26 @@ public class TsVector {
     /** Delete specified lexemes from the vector. */
     public TsVector delete(List<String> toDelete) {
         Map<String, List<PosEntry>> result = new TreeMap<>(lexemes);
-        for (String l : toDelete) result.remove(simpleStem(l.toLowerCase()));
+        for (String l : toDelete) {
+            result.remove(l);
+            result.remove(simpleStem(l.toLowerCase()));
+        }
         return new TsVector(result);
     }
 
     /** Filter: keep only lexemes that have any of the given weights. */
     public TsVector filter(Set<Character> weights) {
+        if (weights == null || weights.isEmpty()) return empty();
         Map<String, List<PosEntry>> result = new TreeMap<>();
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
-            List<PosEntry> filtered = entry.getValue().stream()
-                    .filter(pe -> weights.contains(pe.weight()))
-                    .collect(Collectors.toList());
+            List<PosEntry> filtered = new ArrayList<>();
+            for (PosEntry pe : entry.getValue()) {
+                if (weights.contains(pe.weight())) {
+                    filtered.add(pe);
+                }
+            }
             if (!filtered.isEmpty()) {
-                result.put(entry.getKey(), new ArrayList<>(filtered));
+                result.put(entry.getKey(), filtered);
             }
         }
         return new TsVector(result);
@@ -274,22 +358,27 @@ public class TsVector {
         return new ArrayList<>(lexemes.keySet());
     }
 
-    /** Build a tsvector from an array of strings. */
+    /** Build a tsvector from an array of strings (PG: no positions assigned). */
     public static TsVector fromArray(List<String> words) {
         Map<String, List<PosEntry>> lexemes = new TreeMap<>();
-        int pos = 1;
         for (String word : words) {
             if (word != null && !word.isEmpty()) {
-                lexemes.put(word.toLowerCase(), Cols.listOf(new PosEntry(pos++)));
+                // PG array_to_tsvector: no positions, preserve case
+                lexemes.put(word, new ArrayList<>());
             }
         }
         return new TsVector(lexemes);
     }
 
     public double rank(TsQuery query) {
+        return rank(query, null, 0);
+    }
+
+    public double rank(TsQuery query, float[] weights, int normalization) {
         if (lexemes.isEmpty()) return 0.0;
-        // Default weights: {0.1, 0.2, 0.4, 1.0} for categories D, C, B, A.
-        double[] defaultWeights = {0.1, 0.2, 0.4, 1.0}; // D, C, B, A
+        double[] w = weights != null && weights.length == 4
+            ? new double[]{weights[0], weights[1], weights[2], weights[3]}
+            : new double[]{0.1, 0.2, 0.4, 1.0}; // D, C, B, A
 
         // Collect matching terms with their positions
         List<String> matchedTerms = new ArrayList<>();
@@ -300,24 +389,54 @@ public class TsVector {
         }
         if (matchedTerms.isEmpty()) return 0.0;
 
-        // Use PG's calc_rank_and for AND/PHRASE queries (proximity-based),
-        // calc_rank_or for OR queries and single terms.
+        double res;
         if (isAndQuery(query) && matchedTerms.size() >= 2) {
-            return (float) calcRankAnd(defaultWeights, matchedTerms);
+            res = calcRankAnd(w, matchedTerms);
         } else {
-            return (float) calcRankOr(defaultWeights, matchedTerms, countQueryTerms(query));
+            res = calcRankOr(w, matchedTerms, countQueryTerms(query));
         }
+
+        // Apply normalization
+        if (normalization != 0) {
+            int docLen = 0;
+            for (List<PosEntry> entries : lexemes.values()) docLen += entries.size();
+            if (docLen == 0) docLen = 1;
+            if ((normalization & 1) != 0) {
+                // divide by 1 + log(doc length)
+                res /= 1.0 + Math.log(docLen);
+            }
+            if ((normalization & 2) != 0) {
+                // divide by doc length
+                res /= docLen;
+            }
+            if ((normalization & 4) != 0) {
+                // divide by mean harmonic distance between extents
+                res /= (1.0 + matchedTerms.size());
+            }
+            if ((normalization & 8) != 0) {
+                // divide by number of unique words in doc
+                res /= lexemes.size();
+            }
+            if ((normalization & 16) != 0) {
+                // divide by 1 + log(num unique words)
+                res /= 1.0 + Math.log(lexemes.size());
+            }
+            if ((normalization & 32) != 0) {
+                // rank / (1 + rank)
+                res = res / (1.0 + res);
+            }
+        }
+
+        return (float) res;
     }
 
     /** PG's calc_rank_and: proximity-based ranking for AND queries. */
     private double calcRankAnd(double[] w, List<String> matchedTerms) {
         double res = 0.0;
-        // For each pair of matching terms, compute proximity-weighted score
         for (int i = 0; i < matchedTerms.size(); i++) {
             List<PosEntry> posI = lexemes.get(matchedTerms.get(i));
             for (int j = i + 1; j < matchedTerms.size(); j++) {
                 List<PosEntry> posJ = lexemes.get(matchedTerms.get(j));
-                // Compare all position pairs between two terms
                 for (PosEntry pi : posI) {
                     for (PosEntry pj : posJ) {
                         int dist = Math.abs(pi.position() - pj.position());
@@ -368,14 +487,12 @@ public class TsVector {
         }
     }
 
-    /** Check if query root is AND (or PHRASE). */
     private static boolean isAndQuery(TsQuery query) {
         if (query == null) return false;
         TsQuery.Op op = query.getOp();
         return op == TsQuery.Op.AND || op == TsQuery.Op.PHRASE;
     }
 
-    /** Count the number of unique terms in a TsQuery (excluding NOT branches). */
     private static int countQueryTerms(TsQuery query) {
         Set<String> terms = new HashSet<>();
         collectQueryTerms(query, terms);
@@ -395,28 +512,63 @@ public class TsVector {
         }
     }
 
-    /** Cover density ranking that considers proximity of matched terms. */
+    /** Cover density ranking. */
     public double rankCd(TsQuery query) {
+        return rankCd(query, null, 0);
+    }
+
+    public double rankCd(TsQuery query, float[] weights, int normalization) {
         if (lexemes.isEmpty()) return 0.0;
-        // Collect positions of all matching lexemes
-        List<Integer> matchPositions = new ArrayList<>();
+        double[] w = weights != null && weights.length == 4
+            ? new double[]{weights[0], weights[1], weights[2], weights[3]}
+            : new double[]{0.1, 0.2, 0.4, 1.0}; // D, C, B, A
+
+        // Collect all matching positions with their weights
+        List<int[]> matchPosWeights = new ArrayList<>(); // [position, weightIndex]
         for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
             if (query.containsTerm(entry.getKey())) {
                 for (PosEntry pe : entry.getValue()) {
-                    matchPositions.add(pe.position());
+                    matchPosWeights.add(new int[]{pe.position(), weightIndex(pe.weight())});
                 }
             }
         }
-        if (matchPositions.isEmpty()) return 0.0;
-        Collections.sort(matchPositions);
-        // Density-based: closer matches score higher
-        if (matchPositions.size() == 1) return 1.0 / (1.0 + matchPositions.get(0));
-        double score = 0.0;
-        for (int i = 1; i < matchPositions.size(); i++) {
-            int dist = matchPositions.get(i) - matchPositions.get(i - 1);
-            score += 1.0 / dist;
+        if (matchPosWeights.isEmpty()) return 0.0;
+        matchPosWeights.sort(Comparator.comparingInt(a -> a[0]));
+
+        // PG's cover density algorithm:
+        // For each pair of distinct query terms found, compute 1/(distance between their positions)
+        // weighted by their weights
+        int nMatched = matchPosWeights.size();
+        if (nMatched == 1) {
+            double res = w[matchPosWeights.get(0)[1]];
+            return applyNormCd((float) res, normalization);
         }
-        return score / matchPositions.size();
+
+        double score = 0.0;
+        for (int i = 0; i < nMatched - 1; i++) {
+            int posI = matchPosWeights.get(i)[0];
+            int posJ = matchPosWeights.get(i + 1)[0];
+            int dist = posJ - posI;
+            if (dist <= 0) dist = 1;
+            double wI = w[matchPosWeights.get(i)[1]];
+            double wJ = w[matchPosWeights.get(i + 1)[1]];
+            score += wI * wJ / (double) (dist * dist);
+        }
+
+        double res = score / (double) countQueryTerms(query);
+        return applyNormCd((float) res, normalization);
+    }
+
+    private float applyNormCd(float res, int normalization) {
+        if (normalization != 0) {
+            int docLen = 0;
+            for (List<PosEntry> entries : lexemes.values()) docLen += entries.size();
+            if (docLen == 0) docLen = 1;
+            if ((normalization & 2) != 0) res /= docLen;
+            if ((normalization & 8) != 0) res /= lexemes.size();
+            if ((normalization & 32) != 0) res = res / (1.0f + res);
+        }
+        return res;
     }
 
     static String simpleStem(String word) {
@@ -435,17 +587,22 @@ public class TsVector {
             if (sb.length() > 0) sb.append(" ");
             sb.append("'").append(entry.getKey()).append("'");
             List<PosEntry> positions = entry.getValue();
-            if (!positions.isEmpty() && !(positions.size() == 1 && positions.get(0).position() == 0)) {
-                sb.append(":");
+            if (!positions.isEmpty()) {
+                // Build position string, only emit if there are actual positions > 0
+                StringBuilder posSb = new StringBuilder();
                 for (int i = 0; i < positions.size(); i++) {
-                    if (i > 0) sb.append(",");
                     PosEntry pe = positions.get(i);
+                    if (pe.position() == 0 && pe.weight() == 'D') continue;
+                    if (posSb.length() > 0) posSb.append(",");
                     if (pe.position() > 0) {
-                        sb.append(pe.position());
+                        posSb.append(pe.position());
                     }
                     if (pe.weight() != 'D') {
-                        sb.append(pe.weight());
+                        posSb.append(pe.weight());
                     }
+                }
+                if (posSb.length() > 0) {
+                    sb.append(":").append(posSb);
                 }
             }
         }

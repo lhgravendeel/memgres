@@ -11,6 +11,12 @@ import java.util.*;
 class TextSearchFunctions {
     private static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
+    /** Parse a string as tsvector literal first; fall back to prose tokenization. */
+    private static TsVector toTsVector(String s) {
+        TsVector parsed = TsVector.parseLiteral(s);
+        return parsed != null ? parsed : TsVector.fromText(s);
+    }
+
     private final AstExecutor executor;
 
     TextSearchFunctions(AstExecutor executor) {
@@ -20,7 +26,6 @@ class TextSearchFunctions {
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
             case "__tsquery_not__": {
-                // !! tsquery — NOT prefix operator
                 Object operand = executor.evalExpr(fn.args().get(0), ctx);
                 if (operand == null) return null;
                 TsQuery q = operand instanceof TsQuery ? (TsQuery) operand : TsQuery.parse(operand.toString());
@@ -38,86 +43,118 @@ class TextSearchFunctions {
                         throw new MemgresException("text search configuration \"" + configName + "\" does not exist", "42704");
                     }
                     Object text = executor.evalExpr(fn.args().get(1), ctx);
-                    return text == null ? null : TsVector.fromText(text.toString());
+                    return text == null ? null : TsVector.fromText(text.toString(), configName);
                 }
                 Object text = executor.evalExpr(fn.args().get(0), ctx);
                 return text == null ? null : TsVector.fromText(text.toString());
             }
             case "to_tsquery": {
+                String config = "english";
                 Object tsqText;
                 if (fn.args().size() == 2) {
+                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
                     tsqText = executor.evalExpr(fn.args().get(1), ctx);
                 } else {
                     tsqText = executor.evalExpr(fn.args().get(0), ctx);
                 }
                 if (tsqText == null) return null;
-                String tsqStr = tsqText.toString();
+                String tsqStr = tsqText.toString().trim();
+                if (tsqStr.isEmpty()) return TsQuery.emptyQuery();
+                // Validate: to_tsquery requires operators between words
+                // Check for adjacent words without operators (PG rejects with 42601)
                 if (tsqStr.matches("(?s).*[&|]\\s*[&|].*")) {
                     throw new MemgresException("syntax error in tsquery: \"" + tsqStr + "\"", "42601");
                 }
                 return TsQuery.parse(tsqStr);
             }
             case "plainto_tsquery": {
+                String config = "english";
                 String input;
                 if (fn.args().size() == 2) {
+                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
                     input = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 } else {
                     input = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
                 }
-                String[] words = input.split("\\s+");
-                return TsQuery.parse(String.join(" & ", words));
+                return TextSearchOperations.plainToTsQuery(input, config);
             }
             case "phraseto_tsquery": {
+                String config = "english";
                 String input;
                 if (fn.args().size() == 2) {
+                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
                     input = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 } else {
                     input = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
                 }
-                return TextSearchOperations.phraseToTsQuery(input);
+                return TextSearchOperations.phraseToTsQuery(input, config);
             }
             case "websearch_to_tsquery": {
+                String config = "english";
                 String input;
                 if (fn.args().size() == 2) {
+                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
                     input = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 } else {
                     input = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
                 }
-                return TextSearchOperations.websearchToTsQuery(input);
+                return TextSearchOperations.websearchToTsQuery(input, config);
             }
             case "ts_rank": {
                 // ts_rank([weights,] tsvector, tsquery [, normalization])
-                int argStart = 0;
+                int argIdx = 0;
+                float[] weights = null;
+                // Check if first arg is a weights array
                 if (fn.args().size() >= 3) {
                     Object first = executor.evalExpr(fn.args().get(0), ctx);
-                    if (first instanceof String && ((String) first).startsWith("{")) argStart = 1;
+                    if (first != null) {
+                        float[] parsed = parseWeightsArray(first);
+                        if (parsed != null) {
+                            weights = parsed;
+                            argIdx = 1;
+                        }
+                    }
                 }
-                Object vecObj = executor.evalExpr(fn.args().get(argStart), ctx);
-                Object queryObj = executor.evalExpr(fn.args().get(argStart + 1), ctx);
+                Object vecObj = executor.evalExpr(fn.args().get(argIdx), ctx);
+                Object queryObj = executor.evalExpr(fn.args().get(argIdx + 1), ctx);
                 if (vecObj == null || queryObj == null) return 0.0f;
-                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : TsVector.fromText(vecObj.toString());
+                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
-                float rankVal = (float) vec.rank(query);
-                // Round to 6 significant digits to match PG float4 display
+                int norm = 0;
+                if (argIdx + 2 < fn.args().size()) {
+                    Object normObj = executor.evalExpr(fn.args().get(argIdx + 2), ctx);
+                    if (normObj != null) norm = executor.toInt(normObj);
+                }
+                float rankVal = (float) vec.rank(query, weights, norm);
                 return Float.parseFloat(String.format(java.util.Locale.US, "%.6g", rankVal));
             }
             case "ts_rank_cd": {
-                int argStart = 0;
+                int argIdx = 0;
+                float[] weights = null;
                 if (fn.args().size() >= 3) {
                     Object first = executor.evalExpr(fn.args().get(0), ctx);
-                    if (first instanceof String && ((String) first).startsWith("{")) argStart = 1;
+                    if (first != null) {
+                        float[] parsed = parseWeightsArray(first);
+                        if (parsed != null) {
+                            weights = parsed;
+                            argIdx = 1;
+                        }
+                    }
                 }
-                Object vecObj = executor.evalExpr(fn.args().get(argStart), ctx);
-                Object queryObj = executor.evalExpr(fn.args().get(argStart + 1), ctx);
+                Object vecObj = executor.evalExpr(fn.args().get(argIdx), ctx);
+                Object queryObj = executor.evalExpr(fn.args().get(argIdx + 1), ctx);
                 if (vecObj == null || queryObj == null) return 0.0f;
-                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : TsVector.fromText(vecObj.toString());
+                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
-                float rankCdVal = (float) vec.rankCd(query);
-                // Round to 6 significant digits to match PG float4 display
+                int norm = 0;
+                if (argIdx + 2 < fn.args().size()) {
+                    Object normObj = executor.evalExpr(fn.args().get(argIdx + 2), ctx);
+                    if (normObj != null) norm = executor.toInt(normObj);
+                }
+                float rankCdVal = (float) vec.rankCd(query, weights, norm);
                 return Float.parseFloat(String.format(java.util.Locale.US, "%.6g", rankCdVal));
             }
             case "ts_headline": {
-                // ts_headline([config,] document, tsquery [, options])
                 String config = null;
                 String document;
                 TsQuery query;
@@ -165,17 +202,15 @@ class TextSearchFunctions {
             case "setweight": {
                 Object vecObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object weightObj = executor.evalExpr(fn.args().get(1), ctx);
-                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : TsVector.fromText(vecObj.toString());
+                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 char weight = weightObj.toString().charAt(0);
                 if (fn.args().size() >= 3) {
-                    // setweight(tsvector, weight, lexemes[])
                     Object lexArr = executor.evalExpr(fn.args().get(2), ctx);
                     List<String> filterLexemes = new ArrayList<>();
                     if (lexArr instanceof List<?>) {
                         for (Object o : (List<?>) lexArr) filterLexemes.add(o.toString());
                     } else if (lexArr instanceof String) {
                         String s = (String) lexArr;
-                        // Parse array literal {word1,word2}
                         if (s.startsWith("{") && s.endsWith("}")) {
                             for (String w : s.substring(1, s.length() - 1).split(",")) {
                                 filterLexemes.add(w.trim());
@@ -189,7 +224,7 @@ class TextSearchFunctions {
             case "ts_delete": {
                 Object vecObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object toDelete = executor.evalExpr(fn.args().get(1), ctx);
-                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : TsVector.fromText(vecObj.toString());
+                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 List<String> deleteList = new ArrayList<>();
                 if (toDelete instanceof List<?>) {
                     for (Object o : (List<?>) toDelete) deleteList.add(o.toString());
@@ -208,13 +243,20 @@ class TextSearchFunctions {
             case "ts_filter": {
                 Object vecObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object weightsObj = executor.evalExpr(fn.args().get(1), ctx);
-                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : TsVector.fromText(vecObj.toString());
+                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 Set<Character> filterWeights = new HashSet<>();
-                String ws = weightsObj.toString();
-                if (ws.startsWith("{") && ws.endsWith("}")) ws = ws.substring(1, ws.length() - 1);
-                for (String w : ws.split(",")) {
-                    w = w.trim().replace("\"", "");
-                    if (!w.isEmpty()) filterWeights.add(w.charAt(0));
+                if (weightsObj instanceof List<?>) {
+                    for (Object o : (List<?>) weightsObj) {
+                        String ws = o.toString().trim().replace("\"", "");
+                        if (!ws.isEmpty()) filterWeights.add(Character.toUpperCase(ws.charAt(0)));
+                    }
+                } else {
+                    String ws = weightsObj.toString();
+                    if (ws.startsWith("{") && ws.endsWith("}")) ws = ws.substring(1, ws.length() - 1);
+                    for (String w : ws.split(",")) {
+                        w = w.trim().replace("\"", "");
+                        if (!w.isEmpty()) filterWeights.add(Character.toUpperCase(w.charAt(0)));
+                    }
                 }
                 return vec.filter(filterWeights);
             }
@@ -246,7 +288,6 @@ class TextSearchFunctions {
                     input = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
                 }
                 List<Object[]> debug = TextSearchOperations.tsDebug(input);
-                // Return first result as a string representation
                 if (debug.isEmpty()) return "";
                 Object[] first = debug.get(0);
                 return "(" + first[0] + ",\"" + first[1] + "\"," + first[2] + "," + first[3] + ",{" + first[5] + "})";
@@ -279,7 +320,7 @@ class TextSearchFunctions {
                 return "(" + sb + ")";
             }
             case "ts_stat": {
-                return null; // Cannot execute sub-queries
+                return null;
             }
             case "get_current_ts_config": {
                 return TextSearchOperations.getCurrentTsConfig();
@@ -289,7 +330,12 @@ class TextSearchFunctions {
                 List<String> words = new ArrayList<>();
                 if (arrObj instanceof List<?>) {
                     List<?> list = (List<?>) arrObj;
-                    for (Object o : list) words.add(o.toString());
+                    for (Object o : list) {
+                        if (o == null) {
+                            throw new MemgresException("null value not allowed for array_to_tsvector", "22004");
+                        }
+                        words.add(o.toString());
+                    }
                 } else if (arrObj instanceof String && ((String) arrObj).startsWith("{") && ((String) arrObj).endsWith("}")) {
                     String s = (String) arrObj;
                     for (String w : s.substring(1, s.length() - 1).split(",")) {
@@ -300,12 +346,48 @@ class TextSearchFunctions {
             }
             case "tsvector_to_array": {
                 Object vecObj = executor.evalExpr(fn.args().get(0), ctx);
-                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : TsVector.fromText(vecObj.toString());
+                TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 List<String> arr = vec.toArray();
                 return "{" + String.join(",", arr) + "}";
             }
             default:
                 return NOT_HANDLED;
         }
+    }
+
+    /** Parse a float4 weights array like '{0.1, 0.2, 0.4, 1.0}' or a List/array. */
+    private float[] parseWeightsArray(Object obj) {
+        if (obj instanceof float[]) return (float[]) obj;
+        String s = obj.toString().trim();
+        if (s.startsWith("{") && s.endsWith("}")) {
+            String inner = s.substring(1, s.length() - 1);
+            String[] parts = inner.split(",");
+            if (parts.length == 4) {
+                try {
+                    float[] w = new float[4];
+                    for (int i = 0; i < 4; i++) {
+                        w[i] = Float.parseFloat(parts[i].trim());
+                    }
+                    return w;
+                } catch (NumberFormatException e) {
+                    return null;
+                }
+            }
+        }
+        if (obj instanceof List<?>) {
+            List<?> list = (List<?>) obj;
+            if (list.size() == 4) {
+                try {
+                    float[] w = new float[4];
+                    for (int i = 0; i < 4; i++) {
+                        w[i] = ((Number) list.get(i)).floatValue();
+                    }
+                    return w;
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+        }
+        return null;
     }
 }

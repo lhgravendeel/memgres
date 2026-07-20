@@ -832,14 +832,19 @@ class BinaryOpEvaluator {
                 return JsonOperations.jsonValueToText(executor.functionEvaluator.extractJsonKey(json2, key2));
             }
             case TS_MATCH: {
-                if (left == null || right == null) return false;
                 // JSONB @@ jsonpath
-                String ls = left.toString().trim();
-                if (ls.startsWith("{") || ls.startsWith("[")) {
-                    String path = right.toString().trim();
-                    return executor.functionEvaluator.evaluateJsonPathPredicate(ls, path);
+                if (left != null && right != null) {
+                    String ls = left.toString().trim();
+                    if (ls.startsWith("{") || ls.startsWith("[")) {
+                        String path = right.toString().trim();
+                        return executor.functionEvaluator.evaluateJsonPathPredicate(ls, path);
+                    }
                 }
-                TsVector vec = left instanceof TsVector ? (TsVector) left : TsVector.fromText(left.toString());
+                // NULL @@ tsquery or tsvector @@ NULL → NULL (not false)
+                if (left == null || right == null) return null;
+                TsVector vec;
+                if (left instanceof TsVector) { vec = (TsVector) left; }
+                else { String s = left.toString(); TsVector p = TsVector.parseLiteral(s); vec = p != null ? p : TsVector.fromText(s); }
                 TsQuery query = right instanceof TsQuery ? (TsQuery) right : TsQuery.parse(right.toString());
                 return vec.matches(query);
             }
@@ -1721,14 +1726,19 @@ class BinaryOpEvaluator {
                 return TypeCoercion.areEqual(left, right);
             }
             case TS_MATCH: {
-                if (left == null || right == null) return false;
                 // JSONB @@ jsonpath
-                String ls = left.toString().trim();
-                if (ls.startsWith("{") || ls.startsWith("[")) {
-                    String path = right.toString().trim();
-                    return executor.functionEvaluator.evaluateJsonPathPredicate(ls, path);
+                if (left != null && right != null) {
+                    String ls = left.toString().trim();
+                    if (ls.startsWith("{") || ls.startsWith("[")) {
+                        String path = right.toString().trim();
+                        return executor.functionEvaluator.evaluateJsonPathPredicate(ls, path);
+                    }
                 }
-                TsVector vec = left instanceof TsVector ? (TsVector) left : TsVector.fromText(left.toString());
+                // NULL @@ tsquery or tsvector @@ NULL → NULL (not false)
+                if (left == null || right == null) return null;
+                TsVector vec;
+                if (left instanceof TsVector) { vec = (TsVector) left; }
+                else { String s = left.toString(); TsVector p = TsVector.parseLiteral(s); vec = p != null ? p : TsVector.fromText(s); }
                 TsQuery query = right instanceof TsQuery ? (TsQuery) right : TsQuery.parse(right.toString());
                 return vec.matches(query);
             }
