@@ -342,7 +342,27 @@ class DdlTableExecutor {
         }
 
         executor.database.setObjectOwner("table:" + schemaName + "." + stmt.name(), executor.currentRole());
+        // M11: Apply ALTER DEFAULT PRIVILEGES to newly created table
+        applyDefaultPrivileges(schemaName, stmt.name(), executor.currentRole());
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /** M11: Apply default privileges from ALTER DEFAULT PRIVILEGES to a newly created table. */
+    private void applyDefaultPrivileges(String schemaName, String tableName, String creator) {
+        for (Database.DefaultAclEntry entry : executor.database.getDefaultAcls()) {
+            if (!entry.isGrant) continue;
+            // Must be for TABLES
+            if (!"TABLES".equalsIgnoreCase(entry.objectType)) continue;
+            // Grantor must match the creating role
+            if (entry.grantor != null && !entry.grantor.equalsIgnoreCase(creator)) continue;
+            // Schema must match (null = all schemas)
+            if (entry.schema != null && !entry.schema.equalsIgnoreCase(schemaName)) continue;
+            for (String grantee : entry.grantees) {
+                for (String priv : entry.privileges) {
+                    executor.database.addRolePrivilege(grantee, priv, "TABLE", tableName);
+                }
+            }
+        }
     }
 
     private QueryResult createPartitionOfTable(CreateTableStmt stmt, Schema schema, String schemaName) {
@@ -888,6 +908,8 @@ class DdlTableExecutor {
                     Table table = schema.getTable(bareName);
                     if (table != null) {
                         found = true;
+                        // C6: Enforce TRUNCATE privilege
+                        executor.checkTablePrivilege("TRUNCATE", schemaName, bareName);
                         // PG rejects TRUNCATE ONLY on a partitioned table: rows live in the
                         // partitions, so ONLY (which excludes them) can never be honored
                         if (truncateOnly && table.getPartitionStrategy() != null) {

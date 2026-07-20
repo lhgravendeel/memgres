@@ -452,6 +452,11 @@ class CatalogSystemFunctions {
                     pgHasRolePriv = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toUpperCase();
                 }
                 if (pgHasRoleUser.equals(pgHasRoleRole)) { return true; }
+                // M12: Superusers can always SET ROLE (USAGE) to any role
+                if (pgHasRolePriv.contains("USAGE") || pgHasRolePriv.contains("SET")) {
+                    Map<String, String> suAttrs = executor.database.getRoles().get(pgHasRoleUser);
+                    if (suAttrs != null && "true".equalsIgnoreCase(suAttrs.get("SUPERUSER"))) return true;
+                }
                 if (pgHasRolePriv.contains("ADMIN")) { return false; }
                 Map<String, Set<String>> memberships = executor.database.getRoleMemberships();
                 Set<String> visited = new HashSet<>();
@@ -867,7 +872,9 @@ class CatalogSystemFunctions {
             objectName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
             priv = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toUpperCase().trim();
         }
+        boolean checkGrantOption = false;
         if (priv.endsWith(" WITH GRANT OPTION")) {
+            checkGrantOption = true;
             priv = priv.substring(0, priv.length() - " WITH GRANT OPTION".length()).trim();
         }
         // Strip argument types for FUNCTION: "funcname(int, text)" -> "funcname"
@@ -877,6 +884,18 @@ class CatalogSystemFunctions {
         // Strip schema prefix for TABLE and FUNCTION
         if (("TABLE".equals(objectType) || "FUNCTION".equals(objectType)) && objectName.contains(".")) {
             objectName = objectName.substring(objectName.lastIndexOf('.') + 1);
+        }
+        if (checkGrantOption) {
+            // For WITH GRANT OPTION, superusers and owners always have it
+            Map<String, String> roleAttrs = executor.database.getRoles().get(user);
+            if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return true;
+            // Check ownership
+            String ownerKey = objectType.equalsIgnoreCase("TABLE")
+                    ? "table:public." + objectName : objectType.toLowerCase() + ":" + objectName;
+            String owner = executor.database.getObjectOwner(ownerKey);
+            if (owner != null && owner.equalsIgnoreCase(user)) return true;
+            // Check explicit grant option
+            return checkPrivilegeDirectOrInherited(user, priv + "_GRANT_OPTION", objectType, objectName, new HashSet<>());
         }
         return checkPrivilege(user, priv, objectType, objectName);
     }
@@ -890,6 +909,12 @@ class CatalogSystemFunctions {
         // 1. Superusers have all privileges
         Map<String, String> roleAttrs = executor.database.getRoles().get(roleNameLower);
         if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) {
+            return true;
+        }
+
+        // M12: PUBLIC pseudo-role has implicit USAGE+CREATE on schema "public"
+        if (objectType.equalsIgnoreCase("SCHEMA") && "public".equals(objectNameLower)
+                && ("USAGE".equalsIgnoreCase(privilege) || "CREATE".equalsIgnoreCase(privilege))) {
             return true;
         }
 

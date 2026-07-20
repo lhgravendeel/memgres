@@ -415,6 +415,12 @@ class DdlAdminExecutor {
             throw new MemgresException("role \"" + stmt.name() + "\" already exists", "42710");
         }
         executor.database.createRole(stmt.name(), stmt.options());
+        // M12: Process IN ROLE clause — add this role as member of specified roles
+        if (stmt.inRoles() != null) {
+            for (String parentRole : stmt.inRoles()) {
+                executor.database.addRoleMembership(parentRole, stmt.name(), false);
+            }
+        }
         return QueryResult.message(QueryResult.Type.SET, stmt.isUser() ? "CREATE ROLE" : "CREATE ROLE");
     }
 
