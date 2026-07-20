@@ -49,39 +49,36 @@ class GeometricOpsCompatTest {
     }
 
     @Test
-    @DisplayName("center(lseg) should not exist as a function (matching PG)")
-    void testCenterLsegDoesNotExist() {
-        assertThrows(SQLException.class, () -> {
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(
-                         "SELECT center(lseg '((0,0),(3,4))') AS c")) {
-                rs.next();
-            }
-        });
+    @DisplayName("center(lseg) returns midpoint (PG supports this)")
+    void testCenterLseg() throws SQLException {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT center(lseg '((0,0),(4,4))') AS c")) {
+            assertTrue(rs.next());
+            assertEquals("(2,2)", rs.getString("c"));
+        }
     }
 
     @Test
-    @DisplayName("area(polygon) should not exist as a function (matching PG)")
-    void testAreaPolygonDoesNotExist() {
-        assertThrows(SQLException.class, () -> {
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(
-                         "SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')::integer AS a")) {
-                rs.next();
-            }
-        });
+    @DisplayName("area(polygon) returns area (PG supports this)")
+    void testAreaPolygon() throws SQLException {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')::integer AS a")) {
+            assertTrue(rs.next());
+            assertEquals(12, rs.getInt("a"));
+        }
     }
 
     @Test
-    @DisplayName("center(polygon) should not exist as a function (matching PG)")
-    void testCenterPolygonDoesNotExist() {
-        assertThrows(SQLException.class, () -> {
-            try (Statement stmt = conn.createStatement();
-                 ResultSet rs = stmt.executeQuery(
-                         "SELECT center(polygon '((0,0),(4,0),(4,3),(0,3))') AS c")) {
-                rs.next();
-            }
-        });
+    @DisplayName("center(polygon) returns centroid (PG supports this)")
+    void testCenterPolygon() throws SQLException {
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(
+                     "SELECT center(polygon '((0,0),(4,0),(4,3),(0,3))') AS c")) {
+            assertTrue(rs.next());
+            assertNotNull(rs.getString("c"));
+        }
     }
 
     @Test

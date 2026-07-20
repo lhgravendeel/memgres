@@ -291,10 +291,11 @@ public final class GeometricOperations {
 
     /**
      * Extract all doubles from a string. Used as fallback for lenient parsing.
+     * Handles NaN, Infinity, -Infinity, scientific notation, and negative zero.
      */
     private static List<Double> extractDoubles(String s) {
         List<Double> result = new ArrayList<>();
-        Matcher m = Pattern.compile("-?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?").matcher(s);
+        Matcher m = Pattern.compile("-?(?:NaN|Infinity|\\d+(?:\\.\\d*)?(?:[eE][+-]?\\d+)?)").matcher(s);
         while (m.find()) {
             result.add(Double.parseDouble(m.group()));
         }
@@ -306,7 +307,7 @@ public final class GeometricOperations {
      */
     private static List<PgPoint> parsePointList(String s) {
         List<PgPoint> points = new ArrayList<>();
-        Matcher m = Pattern.compile("\\(\\s*(-?[\\d.eE+-]+)\\s*,\\s*(-?[\\d.eE+-]+)\\s*\\)").matcher(s);
+        Matcher m = Pattern.compile("\\(\\s*(-?(?:NaN|Infinity|[\\d.eE+-]+))\\s*,\\s*(-?(?:NaN|Infinity|[\\d.eE+-]+))\\s*\\)").matcher(s);
         while (m.find()) {
             points.add(new PgPoint(Double.parseDouble(m.group(1)), Double.parseDouble(m.group(2))));
         }
@@ -506,14 +507,26 @@ public final class GeometricOperations {
         return "<" + formatPoint(c.center) + "," + fmtD(c.radius) + ">";
     }
 
-    private static String fmtD(double d) {
-        if (d == Math.floor(d) && !Double.isInfinite(d)) {
+    /**
+     * Format a double in PG style: integral values without decimal point,
+     * fractional values with trailing zeros stripped, NaN/Infinity propagated.
+     */
+    static String fmtD(double d) {
+        if (Double.isNaN(d)) return "NaN";
+        if (Double.isInfinite(d)) return d > 0 ? "Infinity" : "-Infinity";
+        // Normalize -0 to 0 (PG treats them the same in output)
+        if (d == 0.0) d = 0.0;
+        // Integral value that fits in long range
+        if (d == Math.floor(d) && Math.abs(d) < 1e18) {
             return String.valueOf((long) d);
         }
-        // Remove trailing zeros
-        String s = String.valueOf(d);
-        if (s.contains(".") && !s.contains("E") && !s.contains("e")) {
-            s = s.replaceAll("0+$", "").replaceAll("\\.$", "");
+        // Use Double.toString() for shortest representation (matches PG's Ryu algorithm)
+        String s = Double.toString(d);
+        // Convert Java E-notation (uppercase E) to PG lowercase e
+        if (s.contains("E")) {
+            s = s.replace('E', 'e');
+            // Remove unnecessary ".0" before e: "1.0e+300" → "1e+300"
+            s = s.replace(".0e", "e");
         }
         return s;
     }
@@ -733,6 +746,66 @@ public final class GeometricOperations {
         return minDist;
     }
 
+    public static double distancePointPath(PgPoint p, PgPath path) {
+        if (path.closed) {
+            // For closed path, check containment first
+            if (pathContainsPoint(path, p)) return 0;
+        }
+        double minDist = Double.MAX_VALUE;
+        int n = path.points.size();
+        int limit = path.closed ? n : n - 1;
+        for (int i = 0; i < limit; i++) {
+            PgLseg edge = new PgLseg(path.points.get(i), path.points.get((i + 1) % n));
+            minDist = Math.min(minDist, distancePointLseg(p, edge));
+        }
+        return minDist;
+    }
+
+    public static double distancePointPolygon(PgPoint p, PgPolygon poly) {
+        if (polygonContainsPoint(poly, p)) return 0;
+        double minDist = Double.MAX_VALUE;
+        int n = poly.points.size();
+        for (int i = 0; i < n; i++) {
+            PgLseg edge = new PgLseg(poly.points.get(i), poly.points.get((i + 1) % n));
+            minDist = Math.min(minDist, distancePointLseg(p, edge));
+        }
+        return minDist;
+    }
+
+    public static double distanceLsegBox(PgLseg seg, PgBox box) {
+        // If segment intersects or is contained by box, distance is 0
+        if (boxContainsPoint(box, seg.p1) || boxContainsPoint(box, seg.p2)) return 0;
+        PgLseg[] edges = boxEdges(box);
+        double minDist = Double.MAX_VALUE;
+        for (PgLseg edge : edges) {
+            if (lsegIntersects(seg, edge)) return 0;
+            minDist = Math.min(minDist, distanceLsegLseg(seg, edge));
+        }
+        return minDist;
+    }
+
+    public static double distancePathPath(PgPath a, PgPath b) {
+        double minDist = Double.MAX_VALUE;
+        int na = a.points.size(), nb = b.points.size();
+        int limA = a.closed ? na : na - 1;
+        int limB = b.closed ? nb : nb - 1;
+        for (int i = 0; i < limA; i++) {
+            PgLseg ea = new PgLseg(a.points.get(i), a.points.get((i + 1) % na));
+            for (int j = 0; j < limB; j++) {
+                PgLseg eb = new PgLseg(b.points.get(j), b.points.get((j + 1) % nb));
+                double d = distanceLsegLseg(ea, eb);
+                if (d == 0) return 0;
+                minDist = Math.min(minDist, d);
+            }
+        }
+        return minDist;
+    }
+
+    public static double distanceCirclePolygon(PgCircle c, PgPolygon poly) {
+        double d = distancePointPolygon(c.center, poly);
+        return Math.max(0, d - c.radius);
+    }
+
     /**
      * General distance dispatch.
      */
@@ -744,21 +817,29 @@ public final class GeometricOperations {
         if (a instanceof PgLseg && b instanceof PgPoint) return distancePointLseg(((PgPoint) b), ((PgLseg) a));
         if (a instanceof PgPoint && b instanceof PgBox) return distancePointBox(((PgPoint) a), ((PgBox) b));
         if (a instanceof PgBox && b instanceof PgPoint) return distancePointBox(((PgPoint) b), ((PgBox) a));
+        if (a instanceof PgPoint && b instanceof PgPath) return distancePointPath(((PgPoint) a), ((PgPath) b));
+        if (a instanceof PgPath && b instanceof PgPoint) return distancePointPath(((PgPoint) b), ((PgPath) a));
+        if (a instanceof PgPoint && b instanceof PgPolygon) return distancePointPolygon(((PgPoint) a), ((PgPolygon) b));
+        if (a instanceof PgPolygon && b instanceof PgPoint) return distancePointPolygon(((PgPoint) b), ((PgPolygon) a));
+        if (a instanceof PgPoint && b instanceof PgCircle) return Math.max(0, distancePointPoint(((PgPoint) a), ((PgCircle) b).center) - ((PgCircle) b).radius);
+        if (a instanceof PgCircle && b instanceof PgPoint) return Math.max(0, distancePointPoint(((PgPoint) b), ((PgCircle) a).center) - ((PgCircle) a).radius);
         if (a instanceof PgLseg && b instanceof PgLseg) return distanceLsegLseg(((PgLseg) a), ((PgLseg) b));
         if (a instanceof PgLseg && b instanceof PgLine) return distanceLsegLine(((PgLseg) a), ((PgLine) b));
         if (a instanceof PgLine && b instanceof PgLseg) return distanceLsegLine(((PgLseg) b), ((PgLine) a));
+        if (a instanceof PgLseg && b instanceof PgBox) return distanceLsegBox(((PgLseg) a), ((PgBox) b));
+        if (a instanceof PgBox && b instanceof PgLseg) return distanceLsegBox(((PgLseg) b), ((PgBox) a));
         if (a instanceof PgLine && b instanceof PgLine) return distanceLineLine(((PgLine) a), ((PgLine) b));
         if (a instanceof PgCircle && b instanceof PgCircle) return distanceCircleCircle(((PgCircle) a), ((PgCircle) b));
         if (a instanceof PgPolygon && b instanceof PgPolygon) return distancePolygonPolygon(((PgPolygon) a), ((PgPolygon) b));
-        if (a instanceof PgPoint && b instanceof PgCircle) return Math.max(0, distancePointPoint(((PgPoint) a), ((PgCircle) b).center) - ((PgCircle) b).radius);
-        if (a instanceof PgCircle && b instanceof PgPoint) return Math.max(0, distancePointPoint(((PgPoint) b), ((PgCircle) a).center) - ((PgCircle) a).radius);
+        if (a instanceof PgCircle && b instanceof PgPolygon) return distanceCirclePolygon(((PgCircle) a), ((PgPolygon) b));
+        if (a instanceof PgPolygon && b instanceof PgCircle) return distanceCirclePolygon(((PgCircle) b), ((PgPolygon) a));
+        if (a instanceof PgPath && b instanceof PgPath) return distancePathPath(((PgPath) a), ((PgPath) b));
         if (a instanceof PgBox && b instanceof PgBox) {
-            // PG: box <-> box computes distance between the centers of the boxes
             PgPoint ca = center((PgBox) a);
             PgPoint cb = center((PgBox) b);
             return distancePointPoint(ca, cb);
         }
-        throw new MemgresException("distance not supported between " + a.getClass().getSimpleName() + " and " + b.getClass().getSimpleName(), "42883");
+        throw new MemgresException("operator does not exist: " + pgTypeName(a) + " <-> " + pgTypeName(b), "42883");
     }
 
     private static PgLseg[] boxEdges(PgBox b) {
@@ -828,7 +909,10 @@ public final class GeometricOperations {
         throw new MemgresException("npoints not supported for " + geom.getClass().getSimpleName(), "42883");
     }
 
-    public static double area(Object geom) {
+    /**
+     * Compute area. Returns null for open paths (PG returns NULL).
+     */
+    public static Double area(Object geom) {
         if (geom instanceof PgBox) {
             PgBox b = (PgBox) geom;
             return (b.high.x - b.low.x) * (b.high.y - b.low.y);
@@ -843,7 +927,7 @@ public final class GeometricOperations {
         }
         if (geom instanceof PgPath) {
             PgPath path = (PgPath) geom;
-            if (!path.closed) return 0;
+            if (!path.closed) return null; // PG: area(open path) = NULL
             return shoelaceArea(path.points);
         }
         throw new MemgresException("area not supported for " + geom.getClass().getSimpleName(), "42883");
@@ -957,10 +1041,29 @@ public final class GeometricOperations {
     }
 
     /**
-     * Ray-casting algorithm for polygon contains point.
+     * Test if point lies on a line segment (within EPSILON tolerance).
+     */
+    private static boolean pointOnLseg(PgPoint p, PgPoint a, PgPoint b) {
+        // Check collinearity
+        double cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if (Math.abs(cross) > EPSILON) return false;
+        // Check within bounding box
+        return p.x >= Math.min(a.x, b.x) - EPSILON && p.x <= Math.max(a.x, b.x) + EPSILON
+            && p.y >= Math.min(a.y, b.y) - EPSILON && p.y <= Math.max(a.y, b.y) + EPSILON;
+    }
+
+    /**
+     * Polygon contains point. Uses ray-casting with boundary inclusion (PG behavior).
      */
     public static boolean polygonContainsPoint(PgPolygon poly, PgPoint p) {
         int n = poly.points.size();
+        // Check if point is on any edge (boundary → contained in PG)
+        for (int i = 0; i < n; i++) {
+            PgPoint pi = poly.points.get(i);
+            PgPoint pj = poly.points.get((i + 1) % n);
+            if (pointOnLseg(p, pi, pj)) return true;
+        }
+        // Standard ray-casting for interior
         boolean inside = false;
         for (int i = 0, j = n - 1; i < n; j = i++) {
             PgPoint pi = poly.points.get(i);
@@ -973,25 +1076,79 @@ public final class GeometricOperations {
         return inside;
     }
 
+    /** lseg contained in line (collinear check). */
+    public static boolean lineContainsLseg(PgLine line, PgLseg seg) {
+        double v1 = Math.abs(line.a * seg.p1.x + line.b * seg.p1.y + line.c);
+        double v2 = Math.abs(line.a * seg.p2.x + line.b * seg.p2.y + line.c);
+        double norm = Math.sqrt(line.a * line.a + line.b * line.b);
+        if (norm < EPSILON) return false;
+        return v1 / norm < EPSILON && v2 / norm < EPSILON;
+    }
+
+    /** lseg contained in box. */
+    public static boolean boxContainsLseg(PgBox box, PgLseg seg) {
+        return boxContainsPoint(box, seg.p1) && boxContainsPoint(box, seg.p2);
+    }
+
+    /** point contained in lseg. */
+    public static boolean lsegContainsPoint(PgLseg seg, PgPoint p) {
+        return pointOnLseg(p, seg.p1, seg.p2);
+    }
+
+    /** point contained in line. */
+    public static boolean lineContainsPoint(PgLine line, PgPoint p) {
+        double v = Math.abs(line.a * p.x + line.b * p.y + line.c);
+        double norm = Math.sqrt(line.a * line.a + line.b * line.b);
+        if (norm < EPSILON) return false;
+        return v / norm < EPSILON;
+    }
+
+    /** point contained in path. */
+    public static boolean pathContainsPoint(PgPath path, PgPoint p) {
+        if (path.closed) {
+            return polygonContainsPoint(new PgPolygon(path.points), p);
+        }
+        // Open path: point on any segment
+        for (int i = 0; i < path.points.size() - 1; i++) {
+            if (pointOnLseg(p, path.points.get(i), path.points.get(i + 1))) return true;
+        }
+        return false;
+    }
+
     /**
      * General contains dispatch (@>).
      */
     public static boolean contains(Object a, Object b) {
         if (a instanceof PgBox && b instanceof PgPoint) return boxContainsPoint(((PgBox) a), ((PgPoint) b));
         if (a instanceof PgBox && b instanceof PgBox) return boxContainsBox(((PgBox) a), ((PgBox) b));
+        if (a instanceof PgBox && b instanceof PgLseg) return boxContainsLseg(((PgBox) a), ((PgLseg) b));
         if (a instanceof PgCircle && b instanceof PgPoint) return circleContainsPoint(((PgCircle) a), ((PgPoint) b));
         if (a instanceof PgCircle && b instanceof PgCircle) return circleContainsCircle(((PgCircle) a), ((PgCircle) b));
         if (a instanceof PgPolygon && b instanceof PgPoint) return polygonContainsPoint(((PgPolygon) a), ((PgPoint) b));
         if (a instanceof PgPolygon && b instanceof PgPolygon) {
             PgPolygon pb = (PgPolygon) b;
             PgPolygon pa = (PgPolygon) a;
-            // All points of b inside a
             for (PgPoint p : pb.points) {
                 if (!polygonContainsPoint(pa, p)) return false;
             }
             return true;
         }
-        throw new MemgresException("contains not supported between " + a.getClass().getSimpleName() + " and " + b.getClass().getSimpleName(), "42883");
+        if (a instanceof PgLine && b instanceof PgLseg) return lineContainsLseg(((PgLine) a), ((PgLseg) b));
+        if (a instanceof PgLine && b instanceof PgPoint) return lineContainsPoint(((PgLine) a), ((PgPoint) b));
+        if (a instanceof PgLseg && b instanceof PgPoint) return lsegContainsPoint(((PgLseg) a), ((PgPoint) b));
+        if (a instanceof PgPath && b instanceof PgPoint) return pathContainsPoint(((PgPath) a), ((PgPoint) b));
+        throw new MemgresException("operator does not exist: " + pgTypeName(a) + " @> " + pgTypeName(b), "42883");
+    }
+
+    private static String pgTypeName(Object geom) {
+        if (geom instanceof PgPoint) return "point";
+        if (geom instanceof PgLine) return "line";
+        if (geom instanceof PgLseg) return "lseg";
+        if (geom instanceof PgBox) return "box";
+        if (geom instanceof PgPath) return "path";
+        if (geom instanceof PgPolygon) return "polygon";
+        if (geom instanceof PgCircle) return "circle";
+        return "unknown";
     }
 
     // ========================================================================
@@ -1158,6 +1315,28 @@ public final class GeometricOperations {
             || lineIntersectsLseg(line, new PgLseg(tl, bl));
     }
 
+    public static boolean lsegIntersectsBox(PgLseg seg, PgBox box) {
+        if (boxContainsPoint(box, seg.p1) || boxContainsPoint(box, seg.p2)) return true;
+        for (PgLseg edge : boxEdges(box)) {
+            if (lsegIntersects(seg, edge)) return true;
+        }
+        return false;
+    }
+
+    public static boolean pathIntersectsPath(PgPath a, PgPath b) {
+        int na = a.points.size(), nb = b.points.size();
+        int limA = a.closed ? na : na - 1;
+        int limB = b.closed ? nb : nb - 1;
+        for (int i = 0; i < limA; i++) {
+            PgLseg ea = new PgLseg(a.points.get(i), a.points.get((i + 1) % na));
+            for (int j = 0; j < limB; j++) {
+                PgLseg eb = new PgLseg(b.points.get(j), b.points.get((j + 1) % nb));
+                if (lsegIntersects(ea, eb)) return true;
+            }
+        }
+        return false;
+    }
+
     public static boolean intersects(Object a, Object b) {
         if (a instanceof PgLseg && b instanceof PgLseg) return lsegIntersects(((PgLseg) a), ((PgLseg) b));
         if (a instanceof PgLine && b instanceof PgLseg) return lineIntersectsLseg(((PgLine) a), ((PgLseg) b));
@@ -1165,7 +1344,10 @@ public final class GeometricOperations {
         if (a instanceof PgBox && b instanceof PgBox) return boxIntersectsBox(((PgBox) a), ((PgBox) b));
         if (a instanceof PgLine && b instanceof PgBox) return lineIntersectsBox(((PgLine) a), ((PgBox) b));
         if (a instanceof PgBox && b instanceof PgLine) return lineIntersectsBox(((PgLine) b), ((PgBox) a));
-        throw new MemgresException("intersects not supported between " + a.getClass().getSimpleName() + " and " + b.getClass().getSimpleName(), "42883");
+        if (a instanceof PgLseg && b instanceof PgBox) return lsegIntersectsBox(((PgLseg) a), ((PgBox) b));
+        if (a instanceof PgBox && b instanceof PgLseg) return lsegIntersectsBox(((PgLseg) b), ((PgBox) a));
+        if (a instanceof PgPath && b instanceof PgPath) return pathIntersectsPath(((PgPath) a), ((PgPath) b));
+        throw new MemgresException("operator does not exist: " + pgTypeName(a) + " ?# " + pgTypeName(b), "42883");
     }
 
     // ========================================================================
@@ -1209,7 +1391,6 @@ public final class GeometricOperations {
             PgLseg la = (PgLseg) a;
             PgPoint ip = lsegIntersectionPoint(la, lb);
             if (ip != null) return ip;
-            // Find the closest endpoint pair
             double d1 = distancePointLseg(la.p1, lb);
             double d2 = distancePointLseg(la.p2, lb);
             double d3 = distancePointLseg(lb.p1, la);
@@ -1220,7 +1401,24 @@ public final class GeometricOperations {
             if (min == d3) return closestPointOnLseg(lb.p1, la);
             return closestPointOnLseg(lb.p2, la);
         }
-        throw new MemgresException("closest_point not supported between " + a.getClass().getSimpleName() + " and " + b.getClass().getSimpleName(), "42883");
+        if (a instanceof PgLseg && b instanceof PgBox) {
+            PgLseg seg = (PgLseg) a;
+            PgBox box = (PgBox) b;
+            PgPoint best = null; double bestDist = Double.MAX_VALUE;
+            for (PgLseg edge : boxEdges(box)) {
+                PgPoint ip = lsegIntersectionPoint(seg, edge);
+                if (ip != null) return ip;
+                PgPoint cp = closestPointOnLseg(seg.p1, edge);
+                double d = distancePointPoint(seg.p1, cp);
+                if (d < bestDist) { bestDist = d; best = cp; }
+                cp = closestPointOnLseg(seg.p2, edge);
+                d = distancePointPoint(seg.p2, cp);
+                if (d < bestDist) { bestDist = d; best = cp; }
+            }
+            return best;
+        }
+        if (a instanceof PgBox && b instanceof PgLseg) return closestPoint(b, a);
+        throw new MemgresException("operator does not exist: " + pgTypeName(a) + " ## " + pgTypeName(b), "42883");
     }
 
     // ========================================================================
@@ -1366,6 +1564,11 @@ public final class GeometricOperations {
         return Math.abs(dx1 * dy2 - dy1 * dx2) < EPSILON;
     }
 
+    public static boolean isParallel(PgLine a, PgLine b) {
+        // Lines {a1,b1,c1} and {a2,b2,c2} are parallel if a1*b2 - a2*b1 == 0
+        return Math.abs(a.a * b.b - b.a * a.b) < EPSILON;
+    }
+
     // ========================================================================
     // Type conversion functions
     // ========================================================================
@@ -1403,10 +1606,10 @@ public final class GeometricOperations {
         return new PgCircle(center, radius);
     }
 
-    /** Inscribed circle of a box (fits inside). */
+    /** Circumscribed circle of a box (PG behavior: half-diagonal). */
     public static PgCircle toCircle(PgBox b) {
         PgPoint c = center(b);
-        double r = Math.min(width(b), height(b)) / 2;
+        double r = distancePointPoint(b.high, b.low) / 2;
         return new PgCircle(c, r);
     }
 
@@ -1642,7 +1845,7 @@ public final class GeometricOperations {
         Object geom = autoDetect(s);
         return npoints(geom);
     }
-    public static double area(String s) {
+    public static Double area(String s) {
         Object geom = autoDetect(s);
         return area(geom);
     }

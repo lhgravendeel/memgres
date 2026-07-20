@@ -29,12 +29,6 @@ class GeometricFunctions {
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
             case "area": {
-                // PG: area() only works on box, circle, path. NOT polygon.
-                String argTypeName = getArgCastType(fn.args().get(0));
-                if ("polygon".equals(argTypeName)) {
-                    throw new MemgresException(
-                        "function area(polygon) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
-                }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 requireGeometric(arg, "area");
@@ -43,16 +37,6 @@ class GeometricFunctions {
             case "center": {
                 if (fn.args().size() != 1) {
                     throw new MemgresException("function center() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
-                }
-                // PG: center() only works on box, circle. NOT lseg, polygon, path.
-                String argTypeName = getArgCastType(fn.args().get(0));
-                if ("lseg".equals(argTypeName)) {
-                    throw new MemgresException(
-                        "function center(lseg) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
-                }
-                if ("polygon".equals(argTypeName)) {
-                    throw new MemgresException(
-                        "function center(polygon) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
                 }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -166,6 +150,12 @@ class GeometricFunctions {
                 }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
+                // box(point) — zero-area box at that point (PG behavior)
+                String argTypeName = getArgCastType(fn.args().get(0));
+                if ("point".equals(argTypeName)) {
+                    GeometricOperations.PgPoint pt = GeometricOperations.parsePoint(arg.toString());
+                    return GeometricOperations.format(new GeometricOperations.PgBox(pt, pt));
+                }
                 requireGeometric(arg, "box");
                 return GeometricOperations.format(GeometricOperations.toBox(arg.toString(), null));
             }

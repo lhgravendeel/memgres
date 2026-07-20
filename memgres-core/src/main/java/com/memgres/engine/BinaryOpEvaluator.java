@@ -878,6 +878,14 @@ class BinaryOpEvaluator {
                     HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
                     return lh.containsAll(rh);
                 }
+                // Geometric containment check BEFORE range/array to avoid misrouting
+                {
+                    String ls0 = left.toString().trim();
+                    String rs0 = right.toString().trim();
+                    if (GeometricOperations.isGeometricString(ls0) && GeometricOperations.isGeometricString(rs0)) {
+                        return GeometricOperations.contains(ls0, rs0);
+                    }
+                }
                 // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
                 // (which stringify as "[1, 5]") are never mistaken for range literals
                 boolean lIsList = left instanceof List;
@@ -966,6 +974,14 @@ class BinaryOpEvaluator {
                     HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
                     HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
                     return lh.containedBy(rh);
+                }
+                // Geometric containment check BEFORE range/array to avoid misrouting
+                {
+                    String ls0 = left.toString().trim();
+                    String rs0 = right.toString().trim();
+                    if (GeometricOperations.isGeometricString(ls0) && GeometricOperations.isGeometricString(rs0)) {
+                        return GeometricOperations.contains(rs0, ls0); // <@ reverses: b @> a
+                    }
                 }
                 // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
                 // (which stringify as "[1, 5]") are never mistaken for range literals
@@ -1177,6 +1193,9 @@ class BinaryOpEvaluator {
                 Object rObj = GeometricOperations.autoDetectPublic(right.toString());
                 if (lObj instanceof GeometricOperations.PgLseg && rObj instanceof GeometricOperations.PgLseg) {
                     return GeometricOperations.isParallel((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
+                }
+                if (lObj instanceof GeometricOperations.PgLine && rObj instanceof GeometricOperations.PgLine) {
+                    return GeometricOperations.isParallel((GeometricOperations.PgLine) lObj, (GeometricOperations.PgLine) rObj);
                 }
                 throw new MemgresException("operator ?|| not supported for these types", "42883");
             }
@@ -1760,6 +1779,14 @@ class BinaryOpEvaluator {
                     HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
                     return lh.containsAll(rh);
                 }
+                // Geometric containment check BEFORE range/array to avoid misrouting
+                {
+                    String ls0 = left.toString().trim();
+                    String rs0 = right.toString().trim();
+                    if (GeometricOperations.isGeometricString(ls0) && GeometricOperations.isGeometricString(rs0)) {
+                        return GeometricOperations.contains(ls0, rs0);
+                    }
+                }
                 // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
                 // (which stringify as "[1, 5]") are never mistaken for range literals
                 boolean lIsList = left instanceof List;
@@ -1816,6 +1843,14 @@ class BinaryOpEvaluator {
                     HstoreValue lh = left instanceof HstoreValue ? (HstoreValue) left : HstoreValue.parse(left.toString());
                     HstoreValue rh = right instanceof HstoreValue ? (HstoreValue) right : HstoreValue.parse(right.toString());
                     return lh.containedBy(rh);
+                }
+                // Geometric containment check BEFORE range/array to avoid misrouting
+                {
+                    String ls0 = left.toString().trim();
+                    String rs0 = right.toString().trim();
+                    if (GeometricOperations.isGeometricString(ls0) && GeometricOperations.isGeometricString(rs0)) {
+                        return GeometricOperations.contains(rs0, ls0);
+                    }
                 }
                 // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
                 // (which stringify as "[1, 5]") are never mistaken for range literals
@@ -2011,6 +2046,9 @@ class BinaryOpEvaluator {
                 Object rObj = GeometricOperations.autoDetectPublic(right.toString());
                 if (lObj instanceof GeometricOperations.PgLseg && rObj instanceof GeometricOperations.PgLseg) {
                     return GeometricOperations.isParallel((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
+                }
+                if (lObj instanceof GeometricOperations.PgLine && rObj instanceof GeometricOperations.PgLine) {
+                    return GeometricOperations.isParallel((GeometricOperations.PgLine) lObj, (GeometricOperations.PgLine) rObj);
                 }
                 throw new MemgresException("operator ?|| not supported for these types", "42883");
             }
