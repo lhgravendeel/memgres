@@ -198,6 +198,41 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, "SET");
         }
 
+        if (name.equals("session_authorization")) {
+            String user = stmt.value();
+            if (user != null && !user.equalsIgnoreCase("DEFAULT")) {
+                // Validate that the role/user exists (PG 22023 for nonexistent)
+                if (!executor.database.getRoles().containsKey(user.toLowerCase())
+                        && !user.equalsIgnoreCase("test") && !user.equalsIgnoreCase("postgres")
+                        && !user.equalsIgnoreCase("memgres")) {
+                    String connectingUser = executor.session != null ? executor.session.getConnectingUser() : null;
+                    if (connectingUser == null || !user.equalsIgnoreCase(connectingUser)) {
+                        throw new MemgresException("invalid value for parameter \"session_authorization\": \"" + user + "\"", "22023");
+                    }
+                }
+                if (guc != null) {
+                    guc.set("session_authorization", user);
+                    // SET SESSION AUTHORIZATION also resets ROLE to the new session user
+                    guc.set("role", user);
+                }
+                // Update the session's connecting user so current_user/session_user reflect it
+                if (executor.session != null) {
+                    executor.session.setConnectingUser(user);
+                }
+            } else {
+                // DEFAULT: reset to boot default
+                if (guc != null) {
+                    guc.reset("session_authorization");
+                    guc.reset("role");
+                }
+                if (executor.session != null) {
+                    String bootUser = guc != null ? guc.get("session_authorization") : "test";
+                    executor.session.setConnectingUser(bootUser);
+                }
+            }
+            return QueryResult.message(QueryResult.Type.SET, "SET");
+        }
+
         if (name.equals("role")) {
             String role = stmt.value();
             if (role != null && !role.equalsIgnoreCase("NONE") && !role.equalsIgnoreCase("DEFAULT")
@@ -358,6 +393,25 @@ class SessionExecutor {
                 }
                 if (tblName != null) {
                     executor.resolveTable(executor.defaultSchema(), tblName);
+                    // L8: CLUSTER table without specifying an index requires a previously clustered index
+                    if (idxName == null) {
+                        boolean hasClustered = false;
+                        // Scan all known indexes for this table to see if any are clustered
+                        for (Map.Entry<String, String> e : executor.database.getIndexTableNames().entrySet()) {
+                            String idxTable = e.getValue();
+                            if (idxTable != null && (idxTable.equalsIgnoreCase(tblName)
+                                    || idxTable.endsWith("." + tblName))) {
+                                if (executor.database.isClusteredIndex(e.getKey())) {
+                                    hasClustered = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!hasClustered) {
+                            throw new MemgresException(
+                                "there is no previously clustered index for table \"" + tblName + "\"", "42704");
+                        }
+                    }
                 }
                 if (idxName != null) {
                     executor.database.setClusteredIndex(idxName);
@@ -748,12 +802,19 @@ class SessionExecutor {
             if (value != null && !value.isEmpty()) {
                 validateGucValue(name, value);
             }
+            // H37: Normalize DateStyle to canonical PG form before storing
+            if (name.equals("datestyle") && value != null) {
+                value = normalizeDateStyle(value);
+            }
             if (stmt.isLocal()) {
                 if (executor.session != null && !executor.session.isInTransaction()) {
+                    // M13: SET LOCAL outside transaction is a warning + no-op (PG behavior)
                     executor.session.addNotice("WARNING", "25P01",
                             "SET LOCAL can only be used in transaction blocks", null);
+                    // Don't apply the value — it's a no-op outside transactions
+                } else {
+                    guc.setLocal(name, value);
                 }
-                guc.setLocal(name, value);
             } else {
                 guc.set(name, value);
             }
@@ -767,14 +828,58 @@ class SessionExecutor {
     private void validateGucValue(String name, String value) {
         if (value == null || Strs.isBlank(value)) return;
         String lname = name.toLowerCase();
-        // Boolean parameters
+        // Boolean parameters — includes row_security, jit, synchronize_seqscans, etc.
         if (lname.equals("enable_seqscan") || lname.equals("enable_hashjoin") || lname.equals("enable_indexscan")
                 || lname.startsWith("enable_") || lname.equals("fsync") || lname.equals("log_checkpoints")
-                || lname.equals("log_connections") || lname.equals("log_disconnections")) {
+                || lname.equals("log_connections") || lname.equals("log_disconnections")
+                || lname.equals("row_security") || lname.equals("jit")
+                || lname.equals("synchronize_seqscans") || lname.equals("check_function_bodies")
+                || lname.equals("synchronous_commit") || lname.equals("ssl")
+                || lname.equals("parallel_leader_participation")) {
             String lv = value.toLowerCase().trim();
             if (!lv.equals("on") && !lv.equals("off") && !lv.equals("true") && !lv.equals("false")
                     && !lv.equals("yes") && !lv.equals("no") && !lv.equals("1") && !lv.equals("0")) {
                 throw new MemgresException("parameter \"" + name + "\" requires a Boolean value", "22023");
+            }
+            return;
+        }
+        // DateStyle: validate format (PG 22023 for invalid)
+        if (lname.equals("datestyle")) {
+            String trimmed = value.trim();
+            // Remove surrounding quotes
+            if ((trimmed.startsWith("'") && trimmed.endsWith("'"))
+                    || (trimmed.startsWith("\"") && trimmed.endsWith("\""))) {
+                trimmed = trimmed.substring(1, trimmed.length() - 1);
+            }
+            // Parse comma-separated parts and validate each
+            String[] parts = trimmed.split("[,\\s]+");
+            boolean validStyle = false;
+            boolean validOrder = false;
+            for (String part : parts) {
+                String p = part.trim().toLowerCase();
+                if (p.isEmpty()) continue;
+                if (p.equals("iso") || p.equals("sql") || p.equals("postgres") || p.equals("german")) {
+                    validStyle = true;
+                } else if (p.equals("dmy") || p.equals("mdy") || p.equals("ymd")
+                        || p.equals("euro") || p.equals("us")) {
+                    validOrder = true;
+                } else {
+                    throw new MemgresException("invalid value for parameter \"DateStyle\": \"" + value + "\"", "22023");
+                }
+            }
+            if (!validStyle && !validOrder) {
+                throw new MemgresException("invalid value for parameter \"DateStyle\": \"" + value + "\"", "22023");
+            }
+            // Normalize to PG canonical form (e.g. "ISO, DMY")
+            // This prevents bad ParameterStatus values from killing pgjdbc (H37)
+            return;
+        }
+        // statement_timeout / lock_timeout / timeout params: must be numeric or have valid unit
+        if (lname.equals("statement_timeout") || lname.equals("lock_timeout")
+                || lname.equals("idle_in_transaction_session_timeout") || lname.equals("transaction_timeout")) {
+            long ms = GucSettings.parseTimeoutMillis(value);
+            if (ms < 0) {
+                throw new MemgresException("invalid value for parameter \"" + name + "\": \"" + value + "\"", "22023");
             }
             return;
         }
@@ -811,6 +916,28 @@ class SessionExecutor {
         }
     }
 
+    /** Normalize a DateStyle value to PG canonical form (e.g. "ISO, DMY"). */
+    private static String normalizeDateStyle(String value) {
+        String trimmed = value.trim();
+        if ((trimmed.startsWith("'") && trimmed.endsWith("'"))
+                || (trimmed.startsWith("\"") && trimmed.endsWith("\""))) {
+            trimmed = trimmed.substring(1, trimmed.length() - 1);
+        }
+        String lower = trimmed.toLowerCase();
+        // Determine output style
+        String style = "ISO"; // default
+        if (lower.contains("sql")) style = "SQL";
+        else if (lower.contains("postgres")) style = "Postgres";
+        else if (lower.contains("german")) style = "German";
+        else if (lower.contains("iso")) style = "ISO";
+        // Determine date order
+        String order = "MDY"; // default
+        if (lower.contains("dmy") || lower.contains("euro")) order = "DMY";
+        else if (lower.contains("ymd")) order = "YMD";
+        else if (lower.contains("us")) order = "MDY";
+        return style + ", " + order;
+    }
+
     private void executePlpgsqlBlock(String body) {
         PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
         plExec.executeDoBlock(body);
@@ -828,6 +955,8 @@ class SessionExecutor {
                         "DISCARD ALL cannot run inside a transaction block", "25001");
                 }
                 executor.session.getGucSettings().resetAll();
+                // L7: PG resets application_name to '' on DISCARD ALL
+                executor.session.getGucSettings().setBootDefault("application_name", "");
                 executor.session.removeAllPreparedStatements();
                 executor.session.removeAllCursors();
                 // Drop all temp tables for this session

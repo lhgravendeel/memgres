@@ -240,6 +240,17 @@ public class GucSettings {
         return ms + "ms";
     }
 
+    /** Take a snapshot of session overrides for transactional rollback (M13). */
+    public Map<String, String> snapshotSessionOverrides() {
+        return new LinkedHashMap<>(sessionOverrides);
+    }
+
+    /** Restore session overrides from a snapshot (M13 — plain SET rollback). */
+    public void restoreSessionOverrides(Map<String, String> snapshot) {
+        sessionOverrides.clear();
+        sessionOverrides.putAll(snapshot);
+    }
+
     /** Check if a parameter has been explicitly set at the session level (not just the default). */
     public boolean hasSessionOverride(String name) {
         return sessionOverrides.containsKey(name.toLowerCase()) || transactionOverrides.containsKey(name.toLowerCase());
