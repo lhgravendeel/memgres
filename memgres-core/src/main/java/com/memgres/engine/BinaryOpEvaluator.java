@@ -2113,8 +2113,50 @@ class BinaryOpEvaluator {
      * PG (?i) = case insensitive → Java (?i)
      */
     static String pgRegexToJava(String pattern) {
-        // Replace (?n) with (?m) — PG newline-sensitive maps to Java MULTILINE
+        // PG embedded flags: (?n) → Java (?m) (MULTILINE)
         pattern = pattern.replace("(?n)", "(?m)");
+        // Convert POSIX bracket classes [[:digit:]] → \\p{Digit} etc.
+        pattern = pattern.replace("[:alpha:]", "\\p{Alpha}");
+        pattern = pattern.replace("[:digit:]", "\\p{Digit}");
+        pattern = pattern.replace("[:alnum:]", "\\p{Alnum}");
+        pattern = pattern.replace("[:upper:]", "\\p{Upper}");
+        pattern = pattern.replace("[:lower:]", "\\p{Lower}");
+        pattern = pattern.replace("[:space:]", "\\p{Space}");
+        pattern = pattern.replace("[:print:]", "\\p{Print}");
+        pattern = pattern.replace("[:punct:]", "\\p{Punct}");
+        pattern = pattern.replace("[:cntrl:]", "\\p{Cntrl}");
+        pattern = pattern.replace("[:xdigit:]", "\\p{XDigit}");
+        pattern = pattern.replace("[:graph:]", "\\p{Graph}");
+        pattern = pattern.replace("[:blank:]", "\\p{Blank}");
+        // PG word boundaries: \m (begin), \M (end), \y (either) → Java \b
+        pattern = pattern.replace("\\m", "\\b");
+        pattern = pattern.replace("\\M", "\\b");
+        pattern = pattern.replace("\\y", "\\b");
+        // Fix $ anchor: Java $ matches before trailing \n even without MULTILINE.
+        // PG $ matches only at end of string (unless (?n) is set, already converted to (?m)).
+        // Replace bare $ with \z (absolute end) — skip $ inside [...] or preceded by \.
+        if (pattern.contains("$") && !pattern.contains("(?m)")) {
+            StringBuilder sb = new StringBuilder();
+            boolean inCharClass = false;
+            for (int i = 0; i < pattern.length(); i++) {
+                char c = pattern.charAt(i);
+                if (c == '\\' && i + 1 < pattern.length()) {
+                    sb.append(c).append(pattern.charAt(i + 1));
+                    i++;
+                } else if (c == '[' && !inCharClass) {
+                    inCharClass = true;
+                    sb.append(c);
+                } else if (c == ']' && inCharClass) {
+                    inCharClass = false;
+                    sb.append(c);
+                } else if (c == '$' && !inCharClass) {
+                    sb.append("\\z");
+                } else {
+                    sb.append(c);
+                }
+            }
+            pattern = sb.toString();
+        }
         return pattern;
     }
 
@@ -2143,6 +2185,16 @@ class BinaryOpEvaluator {
             } else if (ch == '|' || ch == '(' || ch == ')' || ch == '+' || ch == '*' || ch == '?') {
                 sb.append(ch);
                 i++;
+            } else if (ch == '{') {
+                // Pass through bounded quantifier like {2}, {1,3} as-is
+                int end = pattern.indexOf('}', i);
+                if (end >= 0) {
+                    sb.append(pattern, i, end + 1);
+                    i = end + 1;
+                } else {
+                    sb.append(java.util.regex.Pattern.quote(chStr));
+                    i++;
+                }
             } else if (ch == '[') {
                 // Pass character class through, converting POSIX classes to Java equivalents
                 // Find closing ']' that isn't part of a POSIX class like [:alpha:]
