@@ -720,12 +720,15 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             // execute the query to infer columns, and pg_stat_activity should show 'active'.
             if (session != null) session.setQueryState(portal.sql());
             PgWireDescribeHelper.DescribePortalResult result;
+            // H7: Register executing thread so Statement.cancel() can interrupt Describe execution
+            cancelRegistry.setExecutingThread(backendPid, backendSecretKey, Thread.currentThread());
             try {
                 result = describeHelper.describePortal(ctx, portal.sql(), portal.paramValues());
             } catch (PgWireDescribeHelper.DescribeExecutionFailedException dfe) {
                 sendExtendedError(ctx, dfe.sqlState, dfe.getMessage());
                 return;
             } finally {
+                cancelRegistry.setExecutingThread(backendPid, backendSecretKey, null);
                 if (session != null) session.setIdleState();
             }
             if (result.rowDescSent()) {
