@@ -1831,6 +1831,27 @@ class DdlObjectExecutor {
             }
             executor.database.setObjectOwner("sequence:" + stmt.name(), newOwner);
         }
+        // M20: OWNED BY table.column
+        if (stmt.ownedByTable() != null) {
+            if ("NONE".equalsIgnoreCase(stmt.ownedByTable())) {
+                seq.setOwnedByTable(null);
+                seq.setOwnedByColumn(null);
+            } else {
+                String tblName = stmt.ownedByTable();
+                Table tbl = null;
+                for (Schema s : executor.database.getSchemas().values()) {
+                    tbl = s.getTable(tblName);
+                    if (tbl != null) break;
+                }
+                if (tbl == null) throw new MemgresException("relation \"" + tblName + "\" does not exist", "42P01");
+                String colName = stmt.ownedByColumn();
+                if (colName != null && tbl.getColumnIndex(colName) < 0) {
+                    throw new MemgresException("column \"" + colName + "\" of relation \"" + tblName + "\" does not exist", "42703");
+                }
+                seq.setOwnedByTable(tblName);
+                seq.setOwnedByColumn(colName);
+            }
+        }
         return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
     }
 

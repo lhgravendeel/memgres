@@ -1061,7 +1061,8 @@ class DdlParser {
     }
 
     private void parseSequenceOptions(Long[] startWith, Long[] incrementBy, Long[] minValue,
-                                      Long[] maxValue, Boolean[] cycle, Integer[] cache, String[] asType) {
+                                      Long[] maxValue, Boolean[] cycle, Integer[] cache, String[] asType,
+                                      String[] ownedByTable, String[] ownedByColumn) {
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeywords("START", "WITH")) { startWith[0] = readSeqLong(); continue; }
             if (parser.matchKeyword("START")) { startWith[0] = readSeqLong(); continue; }
@@ -1075,8 +1076,18 @@ class DdlParser {
             if (parser.matchKeyword("CYCLE")) { cycle[0] = true; continue; }
             if (parser.matchKeywords("NO", "CYCLE")) { cycle[0] = false; continue; }
             if (parser.matchKeywords("OWNED", "BY")) {
-                if (parser.matchKeyword("NONE")) { continue; }
-                parser.readIdentifier(); if (parser.match(TokenType.DOT)) { parser.readIdentifier(); if (parser.match(TokenType.DOT)) parser.readIdentifier(); }
+                if (parser.matchKeyword("NONE")) {
+                    if (ownedByTable != null) { ownedByTable[0] = "NONE"; ownedByColumn[0] = "NONE"; }
+                    continue;
+                }
+                String part1 = parser.readIdentifier();
+                String part2 = null, part3 = null;
+                if (parser.match(TokenType.DOT)) { part2 = parser.readIdentifier(); if (parser.match(TokenType.DOT)) part3 = parser.readIdentifier(); }
+                if (ownedByTable != null) {
+                    if (part3 != null) { ownedByTable[0] = part2; ownedByColumn[0] = part3; }
+                    else if (part2 != null) { ownedByTable[0] = part1; ownedByColumn[0] = part2; }
+                    else { ownedByTable[0] = part1; }
+                }
                 continue;
             }
             if (parser.matchKeyword("AS")) { if (asType != null) asType[0] = parser.readIdentifier(); else parser.readIdentifier(); continue; }
@@ -1092,7 +1103,7 @@ class DdlParser {
         Boolean[] cycle = {null};
         Integer[] cache = {null};
         String[] asType = {null};
-        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType);
+        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, null, null);
         CreateSequenceStmt stmt = new CreateSequenceStmt(name, ifNotExists, startWith[0], incrementBy[0], minValue[0], maxValue[0], cycle[0], temporary);
         stmt.setCache(cache[0]);
         stmt.setAsType(asType[0]);
@@ -1109,6 +1120,7 @@ class DdlParser {
         Long restartWith = null;
         Long[] startWith = {null}, incrementBy = {null}, minValue = {null}, maxValue = {null};
         Boolean[] cycle = {null};
+        String[] ownedByTable = {null}, ownedByColumn = {null};
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeyword("RESTART")) {
                 restart = true;
@@ -1121,10 +1133,10 @@ class DdlParser {
             }
             int saved = parser.pos;
             Integer[] cache = {null};
-            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, null);
+            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, null, ownedByTable, ownedByColumn);
             if (parser.pos == saved) break;
         }
-        return new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0], maxValue[0], startWith[0], cycle[0]);
+        return new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0], maxValue[0], startWith[0], cycle[0], null, null, ownedByTable[0], ownedByColumn[0]);
     }
 
     // ---- TRUNCATE ----

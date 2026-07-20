@@ -172,7 +172,7 @@ class CatalogCoreBuilder {
                         2,               // relam (heap=2)
                         tblOid,          // relfilenode
                         0,               // reltablespace
-                        0, database.getAnalyzedTables().contains("public." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, 0, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
+                        0, database.getAnalyzedTables().contains(schemaEntry.getKey() + "." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, 0, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
                         hasIdx, false, t.isUnlogged() ? "u" : "p", relkind,          // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
                         false, hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
