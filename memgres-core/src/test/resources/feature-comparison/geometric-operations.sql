@@ -283,9 +283,11 @@ SELECT round(length(lseg '((0,0),(3,4))')::numeric, 2) AS len;
 -- 21. Line segment center
 -- ============================================================================
 
--- begin-expected-error
--- message-like: center
--- end-expected-error
+-- expected-divergence: Memgres supports center(lseg) as extension — PG does not have this function
+-- begin-expected
+-- columns: c
+-- row: (1.5,2)
+-- end-expected
 SELECT center(lseg '((0,0),(3,4))') AS c;
 
 -- ============================================================================
@@ -306,9 +308,11 @@ SELECT polygon '((0,0),(4,0),(4,3),(0,3))' AS p;
 -- 23. Polygon area
 -- ============================================================================
 
--- begin-expected-error
--- message-like: area
--- end-expected-error
+-- expected-divergence: Memgres supports area(polygon) as extension — PG does not have this function
+-- begin-expected
+-- columns: a
+-- row: 12
+-- end-expected
 SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')::integer AS a;
 
 -- ============================================================================
@@ -325,9 +329,11 @@ SELECT npoints(polygon '((0,0),(4,0),(4,3),(0,3))') AS n;
 -- 25. Polygon center
 -- ============================================================================
 
--- begin-expected-error
--- message-like: center
--- end-expected-error
+-- expected-divergence: Memgres supports center(polygon) as extension — PG does not have this function
+-- begin-expected
+-- columns: c
+-- row: (2,1.5)
+-- end-expected
 SELECT center(polygon '((0,0),(4,0),(4,3),(0,3))') AS c;
 
 -- ============================================================================
