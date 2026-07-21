@@ -87,15 +87,35 @@ public class TsQuery {
         return false;
     }
 
+    /** Internal signal used while parsing a tsquery string; converted to a
+     *  MemgresException (SQLSTATE 42601) carrying the original input at the top level. */
+    private static class TsqParseError extends RuntimeException {
+        final boolean noOperand;
+        TsqParseError(boolean noOperand) { this.noOperand = noOperand; }
+    }
+
     /**
      * Parse a tsquery string like 'word1 & word2 | !word3' or 'fat <-> cat' or 'pre:*A'.
+     * Invalid input raises SQLSTATE 42601 the way PostgreSQL does: two adjacent
+     * operands with no operator is a "syntax error in tsquery", and an operator
+     * missing an operand is "no operand in tsquery".
      */
     public static TsQuery parse(String input) {
         if (input == null || input.trim().isEmpty()) return emptyQuery();
         List<String> tokens = tokenize(input);
         if (tokens.isEmpty()) return emptyQuery();
-        int[] pos = {0};
-        return parseOr(tokens, pos);
+        try {
+            int[] pos = {0};
+            TsQuery result = parseOr(tokens, pos);
+            // Leftover tokens mean two operands with no operator between them.
+            if (pos[0] < tokens.size()) throw new TsqParseError(false);
+            return result;
+        } catch (TsqParseError e) {
+            if (e.noOperand) {
+                throw new MemgresException("no operand in tsquery: \"" + input + "\"", "42601");
+            }
+            throw new MemgresException("syntax error in tsquery: \"" + input + "\"", "42601");
+        }
     }
 
     private static TsQuery parseOr(List<String> tokens, int[] pos) {
@@ -143,13 +163,15 @@ public class TsQuery {
     }
 
     private static TsQuery parsePrimary(List<String> tokens, int[] pos) {
-        if (pos[0] >= tokens.size()) return emptyQuery();
+        // A primary (operand) is required here; running out of tokens or hitting a
+        // binary operator / close-paren means the preceding operator has no operand.
+        if (pos[0] >= tokens.size()) throw new TsqParseError(true);
         String t = tokens.get(pos[0]);
-        if (t.equals("!")) {
-            pos[0]++;
-            return not(parsePrimary(tokens, pos));
+        if (t.equals("&") || t.equals("|") || t.equals(")")
+                || t.equals("<->") || (t.startsWith("<") && t.endsWith(">"))) {
+            throw new TsqParseError(true);
         }
-        if (t.equals("!!")) {
+        if (t.equals("!")) {
             pos[0]++;
             return not(parsePrimary(tokens, pos));
         }
@@ -157,6 +179,7 @@ public class TsQuery {
             pos[0]++;
             TsQuery result = parseOr(tokens, pos);
             if (pos[0] < tokens.size() && tokens.get(pos[0]).equals(")")) pos[0]++;
+            else throw new TsqParseError(false); // missing ')'
             return result;
         }
         pos[0]++;
@@ -207,13 +230,10 @@ public class TsQuery {
                 continue;
             }
             if (c == '!') {
-                if (i + 1 < input.length() && input.charAt(i + 1) == '!') {
-                    tokens.add("!!");
-                    i += 2;
-                } else {
-                    tokens.add("!");
-                    i++;
-                }
+                // Each '!' is a separate negation: '!!cat' parses as !(!'cat'),
+                // matching PG (which prints it as !!'cat').
+                tokens.add("!");
+                i++;
                 continue;
             }
             if (c == '\'') {

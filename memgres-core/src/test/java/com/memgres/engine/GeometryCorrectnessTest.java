@@ -55,10 +55,10 @@ class GeometryCorrectnessTest {
 
     @Test
     void h32_negativeZero() throws SQLException {
-        // PG normalizes -0 to 0 in geometry output
+        // PG 18 preserves an explicit -0 in point coordinate output (verified: (-0,3))
         String result = q("SELECT point '(-0,3)'");
         assertNotNull(result);
-        assertEquals("(0,3)", result);
+        assertEquals("(-0,3)", result); // PG 18 preserves -0 in point coordinate output
     }
 
     @Test

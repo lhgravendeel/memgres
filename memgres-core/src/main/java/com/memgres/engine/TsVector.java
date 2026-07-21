@@ -114,8 +114,8 @@ public class TsVector {
     private static void addPosition(Map<String, List<PosEntry>> lexemes, String lexeme, int position) {
         if (position > MAX_POSITION) position = MAX_POSITION;
         List<PosEntry> entries = lexemes.computeIfAbsent(lexeme, k -> new ArrayList<>());
-        // PG caps at 256 positions per lexeme
-        if (entries.size() < 256) {
+        // PG caps at 255 positions per lexeme (MAXNUMPOS)
+        if (entries.size() < 255) {
             entries.add(new PosEntry(position));
         }
     }

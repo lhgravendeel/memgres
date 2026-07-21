@@ -733,6 +733,9 @@ public class ExpressionParser {
         if (match(TokenType.GEO_CLOSEST_POINT)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_CLOSEST_POINT, parseOtherOps());
         if (match(TokenType.GEO_PARALLEL)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_PARALLEL, parseOtherOps());
         if (match(TokenType.GEO_PERPENDICULAR)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_PERPENDICULAR, parseOtherOps());
+        // Binary point alignment: point ?- point (horizontally aligned) -> boolean.
+        // (?| shares its token with JSONB_EXISTS_ANY and is disambiguated at eval time.)
+        if (match(TokenType.GEO_IS_HORIZONTAL)) return new BinaryExpr(left, BinaryExpr.BinOp.GEO_HORIZONTAL, parseOtherOps());
 
         // Range adjacency operator: -|-
         if (match(TokenType.RANGE_ADJACENT)) return new BinaryExpr(left, BinaryExpr.BinOp.RANGE_ADJACENT, parseOtherOps());
@@ -880,6 +883,15 @@ public class ExpressionParser {
         if (match(TokenType.GEO_IS_HORIZONTAL)) {
             return new UnaryExpr(UnaryExpr.UnaryOp.GEO_IS_HORIZONTAL, parseUnary());
         }
+        // @@ (geometric center prefix operator) — shares token with binary TS_MATCH,
+        // but a leading @@ can only be the unary center-of-object operator.
+        if (match(TokenType.TS_MATCH)) {
+            return new UnaryExpr(UnaryExpr.UnaryOp.GEO_CENTER, parseUnary());
+        }
+        // # (geometric npoints prefix operator) — shares token with binary HASH.
+        if (match(TokenType.HASH)) {
+            return new UnaryExpr(UnaryExpr.UnaryOp.GEO_NPOINTS, parseUnary());
+        }
         // ?| (geometric is-vertical prefix operator) — shares token with JSONB_EXISTS_ANY
         if (check(TokenType.JSONB_EXISTS_ANY)) {
             // In prefix position (no left operand), treat as geometric is-vertical
@@ -905,6 +917,11 @@ public class ExpressionParser {
             if (opSymbol.equals("|/")) {
                 advance();
                 return new UnaryExpr(UnaryExpr.UnaryOp.SQRT, parseUnary());
+            }
+            // @-@ (geometric length/perimeter) prefix operator
+            if (opSymbol.equals("@-@")) {
+                advance();
+                return new UnaryExpr(UnaryExpr.UnaryOp.GEO_LENGTH, parseUnary());
             }
             // %% (hstore to array) and %# (hstore to matrix) prefix operators
             if (opSymbol.equals("%%")) {

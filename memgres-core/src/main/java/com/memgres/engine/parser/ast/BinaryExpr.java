@@ -48,6 +48,8 @@ public final class BinaryExpr implements Expression {
         DISTANCE, APPROX_EQUAL, GEO_BELOW, GEO_ABOVE,
         GEO_NOT_EXTEND_RIGHT, GEO_NOT_EXTEND_LEFT, GEO_NOT_EXTEND_ABOVE, GEO_NOT_EXTEND_BELOW,
         GEO_INTERSECTS, GEO_CLOSEST_POINT, GEO_PARALLEL, GEO_PERPENDICULAR,
+        // Point alignment: point ?- point (horizontal), point ?| point (vertical)
+        GEO_HORIZONTAL, GEO_VERTICAL,
         // Distinct comparison (NULL-safe)
         IS_DISTINCT_FROM, IS_NOT_DISTINCT_FROM,
         // Range

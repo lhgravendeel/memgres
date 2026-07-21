@@ -87,6 +87,7 @@ class FromFunctionResolver {
         if (fname.equals("pg_partition_tree")) return resolvePgPartitionTree(alias, colAliases, evalArgs);
         if (fname.equals("pg_partition_ancestors")) return resolvePgPartitionAncestors(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_path_query_tz")) return resolveJsonbPathQuery(alias, colAliases, evalArgs);
+        if (fname.equals("ts_stat")) return resolveTsStat(alias, colAliases, evalArgs);
         if (fname.equals("ts_debug")) return resolveTsDebug(alias, colAliases, evalArgs);
         if (fname.equals("ts_parse")) return resolveTsParse(alias, colAliases, evalArgs);
         if (fname.equals("ts_token_type")) return resolveTsTokenType(alias, colAliases, evalArgs);
@@ -1626,6 +1627,57 @@ class FromFunctionResolver {
     }
 
     // ---- ts_debug ----
+
+    // ---- ts_stat ----
+
+    private List<RowContext> resolveTsStat(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.isEmpty() || evalArgs.get(0) == null) {
+            throw new MemgresException("function ts_stat(text) requires a text query argument", "42883");
+        }
+        String sql = evalArgs.get(0).toString();
+        // Optional weights filter (2nd arg): only count entries with these weights.
+        String weightFilter = evalArgs.size() > 1 && evalArgs.get(1) != null
+                ? evalArgs.get(1).toString().toUpperCase() : null;
+        QueryResult qr = executor.execute(sql);
+        // word -> [ndoc, nentry]
+        Map<String, long[]> stats = new TreeMap<>();
+        if (qr != null && qr.getRows() != null) {
+            for (Object[] row : qr.getRows()) {
+                if (row.length == 0 || row[0] == null) continue;
+                TsVector vec = row[0] instanceof TsVector
+                        ? (TsVector) row[0] : TsVector.parseLiteral(row[0].toString());
+                if (vec == null) continue;
+                for (Map.Entry<String, List<TsVector.PosEntry>> e : vec.getLexemeMap().entrySet()) {
+                    int entries = 0;
+                    for (TsVector.PosEntry pe : e.getValue()) {
+                        if (weightFilter == null || weightFilter.indexOf(pe.weight()) >= 0) entries++;
+                    }
+                    // A position-less lexeme counts as a single occurrence.
+                    if (e.getValue().isEmpty() && weightFilter == null) entries = 1;
+                    if (entries == 0) continue;
+                    long[] s = stats.computeIfAbsent(e.getKey(), k -> new long[2]);
+                    s[0] += 1;          // ndoc
+                    s[1] += entries;    // nentry
+                }
+            }
+        }
+        String wordCol = (colAliases != null && colAliases.size() > 0) ? colAliases.get(0) : "word";
+        String ndocCol = (colAliases != null && colAliases.size() > 1) ? colAliases.get(1) : "ndoc";
+        String nentryCol = (colAliases != null && colAliases.size() > 2) ? colAliases.get(2) : "nentry";
+        List<Column> cols = Cols.listOf(
+                new Column(wordCol, DataType.TEXT, true, false, null),
+                new Column(ndocCol, DataType.INTEGER, true, false, null),
+                new Column(nentryCol, DataType.INTEGER, true, false, null)
+        );
+        Table virtualTable = new Table(alias, cols);
+        List<RowContext> contexts = new ArrayList<>();
+        for (Map.Entry<String, long[]> e : stats.entrySet()) {
+            Object[] row = new Object[]{e.getKey(), (int) e.getValue()[0], (int) e.getValue()[1]};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
+        }
+        return contexts;
+    }
 
     private List<RowContext> resolveTsDebug(String alias, List<String> colAliases, List<Object> evalArgs) {
         String config = "english";

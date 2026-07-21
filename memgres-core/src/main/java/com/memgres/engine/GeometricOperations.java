@@ -463,7 +463,7 @@ public final class GeometricOperations {
         if (geom instanceof PgPath) return formatPath(((PgPath) geom));
         if (geom instanceof PgPolygon) return formatPolygon(((PgPolygon) geom));
         if (geom instanceof PgCircle) return formatCircle(((PgCircle) geom));
-        throw new MemgresException("Not a geometric type: " + geom.getClass().getSimpleName(), "42883");
+        throw new MemgresException("Not a geometric type: " + pgTypeName(geom), "42883");
     }
 
     public static String formatPoint(PgPoint p) {
@@ -508,27 +508,54 @@ public final class GeometricOperations {
     }
 
     /**
-     * Format a double in PG style: integral values without decimal point,
-     * fractional values with trailing zeros stripped, NaN/Infinity propagated.
+     * Format a double the way PostgreSQL's float8out does: shortest round-trip
+     * decimal (as produced by {@link Double#toString}), reformatted with PG's
+     * notation rules. Scientific notation ({@code e+NN}/{@code e-NN}, signed,
+     * exponent zero-padded to at least two digits) is used when the decimal
+     * exponent of the leading digit is &lt; -4 or &gt;= 15; otherwise plain
+     * decimal. NaN/Infinity and the sign of -0 are preserved.
      */
     static String fmtD(double d) {
         if (Double.isNaN(d)) return "NaN";
         if (Double.isInfinite(d)) return d > 0 ? "Infinity" : "-Infinity";
-        // Normalize -0 to 0 (PG treats them the same in output)
-        if (d == 0.0) d = 0.0;
-        // Integral value that fits in long range
-        if (d == Math.floor(d) && Math.abs(d) < 1e18) {
-            return String.valueOf((long) d);
+        // Detect sign separately so -0.0 keeps its sign (BigDecimal drops it).
+        boolean negative = (Double.doubleToRawLongBits(d) & 0x8000000000000000L) != 0;
+        if (d == 0.0) {
+            return negative ? "-0" : "0";
         }
-        // Use Double.toString() for shortest representation (matches PG's Ryu algorithm)
-        String s = Double.toString(d);
-        // Convert Java E-notation (uppercase E) to PG lowercase e
-        if (s.contains("E")) {
-            s = s.replace('E', 'e');
-            // Remove unnecessary ".0" before e: "1.0e+300" → "1e+300"
-            s = s.replace(".0e", "e");
+        // Shortest round-trip decimal digits + exponent, via Double.toString/BigDecimal.
+        java.math.BigDecimal bd = new java.math.BigDecimal(Double.toString(Math.abs(d))).stripTrailingZeros();
+        String digits = bd.unscaledValue().toString(); // no sign, no trailing zeros
+        int k = digits.length();
+        // Decimal exponent of the leading significant digit.
+        int e = (k - 1) - bd.scale();
+        StringBuilder sb = new StringBuilder();
+        if (negative) sb.append('-');
+        if (e < -4 || e >= 15) {
+            // Scientific notation: d[.ddd]e{+|-}NN
+            sb.append(digits.charAt(0));
+            if (k > 1) {
+                sb.append('.').append(digits.substring(1));
+            }
+            sb.append('e');
+            sb.append(e < 0 ? '-' : '+');
+            String exp = Integer.toString(Math.abs(e));
+            if (exp.length() < 2) sb.append('0');
+            sb.append(exp);
+        } else if (e >= k - 1) {
+            // Integer value: digits followed by trailing zeros.
+            sb.append(digits);
+            for (int i = 0; i < e - (k - 1); i++) sb.append('0');
+        } else if (e >= 0) {
+            // Point falls inside the digit string.
+            sb.append(digits, 0, e + 1).append('.').append(digits.substring(e + 1));
+        } else {
+            // Leading zeros: 0.00ddd
+            sb.append("0.");
+            for (int i = 0; i < -e - 1; i++) sb.append('0');
+            sb.append(digits);
         }
-        return s;
+        return sb.toString();
     }
 
     // ========================================================================
@@ -560,6 +587,11 @@ public final class GeometricOperations {
             b = -b;
             c = -c;
         }
+        // Negating a positive zero yields -0.0; PG prints line coefficients as a clean 0
+        // (e.g. line '[(0,0),(1,1)]' -> {1,-1,0}), so collapse negative zero back to +0.0.
+        if (a == 0.0) a = 0.0;
+        if (b == 0.0) b = 0.0;
+        if (c == 0.0) c = 0.0;
         return new PgLine(a, b, c);
     }
 
@@ -874,7 +906,7 @@ public final class GeometricOperations {
             }
             return total;
         }
-        throw new MemgresException("length not supported for " + geom.getClass().getSimpleName(), "42883");
+        throw new MemgresException("length not supported for " + pgTypeName(geom), "42883");
     }
 
     /** @@ operator: center */
@@ -900,13 +932,13 @@ public final class GeometricOperations {
             for (PgPoint p : path.points) { sx += p.x; sy += p.y; }
             return new PgPoint(sx / path.points.size(), sy / path.points.size());
         }
-        throw new MemgresException("center not supported for " + geom.getClass().getSimpleName(), "42883");
+        throw new MemgresException("center not supported for " + pgTypeName(geom), "42883");
     }
 
     public static int npoints(Object geom) {
         if (geom instanceof PgPath) return ((PgPath) geom).points.size();
         if (geom instanceof PgPolygon) return ((PgPolygon) geom).points.size();
-        throw new MemgresException("npoints not supported for " + geom.getClass().getSimpleName(), "42883");
+        throw new MemgresException("npoints not supported for " + pgTypeName(geom), "42883");
     }
 
     /**
@@ -930,7 +962,7 @@ public final class GeometricOperations {
             if (!path.closed) return null; // PG: area(open path) = NULL
             return shoelaceArea(path.points);
         }
-        throw new MemgresException("area not supported for " + geom.getClass().getSimpleName(), "42883");
+        throw new MemgresException("area not supported for " + pgTypeName(geom), "42883");
     }
 
     private static double shoelaceArea(List<PgPoint> points) {
@@ -997,7 +1029,7 @@ public final class GeometricOperations {
                 new PgPoint(c.center.x - c.radius, c.center.y - c.radius)
             );
         } else {
-            throw new MemgresException("bound_box not supported for " + geom.getClass().getSimpleName(), "42883");
+            throw new MemgresException("bound_box not supported for " + pgTypeName(geom), "42883");
         }
         double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
         double maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
@@ -1119,9 +1151,10 @@ public final class GeometricOperations {
      * General contains dispatch (@>).
      */
     public static boolean contains(Object a, Object b) {
+        // PG's geometric @> operator set: box@>box, box@>point, circle@>circle,
+        // circle@>point, path@>point, polygon@>point, polygon@>polygon.
         if (a instanceof PgBox && b instanceof PgPoint) return boxContainsPoint(((PgBox) a), ((PgPoint) b));
         if (a instanceof PgBox && b instanceof PgBox) return boxContainsBox(((PgBox) a), ((PgBox) b));
-        if (a instanceof PgBox && b instanceof PgLseg) return boxContainsLseg(((PgBox) a), ((PgLseg) b));
         if (a instanceof PgCircle && b instanceof PgPoint) return circleContainsPoint(((PgCircle) a), ((PgPoint) b));
         if (a instanceof PgCircle && b instanceof PgCircle) return circleContainsCircle(((PgCircle) a), ((PgCircle) b));
         if (a instanceof PgPolygon && b instanceof PgPoint) return polygonContainsPoint(((PgPolygon) a), ((PgPoint) b));
@@ -1133,14 +1166,45 @@ public final class GeometricOperations {
             }
             return true;
         }
-        if (a instanceof PgLine && b instanceof PgLseg) return lineContainsLseg(((PgLine) a), ((PgLseg) b));
-        if (a instanceof PgLine && b instanceof PgPoint) return lineContainsPoint(((PgLine) a), ((PgPoint) b));
-        if (a instanceof PgLseg && b instanceof PgPoint) return lsegContainsPoint(((PgLseg) a), ((PgPoint) b));
         if (a instanceof PgPath && b instanceof PgPoint) return pathContainsPoint(((PgPath) a), ((PgPoint) b));
         throw new MemgresException("operator does not exist: " + pgTypeName(a) + " @> " + pgTypeName(b), "42883");
     }
 
-    private static String pgTypeName(Object geom) {
+    /**
+     * General contained-by dispatch (a &lt;@ b). PG's &lt;@ operator set is NOT simply the reverse
+     * of @>: point&lt;@line, point&lt;@lseg, lseg&lt;@box and lseg&lt;@line are valid &lt;@ operators
+     * with no @> counterpart (so they must not route through {@link #contains}, which correctly
+     * rejects those pairs as phantom @> operators).
+     */
+    public static boolean containedBy(Object a, Object b) {
+        if (a instanceof PgPoint) {
+            PgPoint p = (PgPoint) a;
+            if (b instanceof PgBox) return boxContainsPoint(((PgBox) b), p);
+            if (b instanceof PgCircle) return circleContainsPoint(((PgCircle) b), p);
+            if (b instanceof PgPolygon) return polygonContainsPoint(((PgPolygon) b), p);
+            if (b instanceof PgPath) return pathContainsPoint(((PgPath) b), p);
+            if (b instanceof PgLine) return distancePointLine(p, ((PgLine) b)) < EPSILON;
+            if (b instanceof PgLseg) return distancePointLseg(p, ((PgLseg) b)) < EPSILON;
+        }
+        if (a instanceof PgLseg) {
+            PgLseg s = (PgLseg) a;
+            if (b instanceof PgBox) return boxContainsPoint(((PgBox) b), s.p1) && boxContainsPoint(((PgBox) b), s.p2);
+            if (b instanceof PgLine) {
+                PgLine ln = (PgLine) b;
+                return distancePointLine(s.p1, ln) < EPSILON && distancePointLine(s.p2, ln) < EPSILON;
+            }
+        }
+        if (a instanceof PgBox && b instanceof PgBox) return boxContainsBox(((PgBox) b), ((PgBox) a));
+        if (a instanceof PgCircle && b instanceof PgCircle) return circleContainsCircle(((PgCircle) b), ((PgCircle) a));
+        if (a instanceof PgPolygon && b instanceof PgPolygon) return contains(b, a);
+        throw new MemgresException("operator does not exist: " + pgTypeName(a) + " <@ " + pgTypeName(b), "42883");
+    }
+
+    public static boolean containedBy(String a, String b) {
+        return containedBy((Object) autoDetect(a), (Object) autoDetect(b));
+    }
+
+    public static String pgTypeName(Object geom) {
         if (geom instanceof PgPoint) return "point";
         if (geom instanceof PgLine) return "line";
         if (geom instanceof PgLseg) return "lseg";
@@ -1187,7 +1251,7 @@ public final class GeometricOperations {
         if (a instanceof PgBox && b instanceof PgBox) return overlapsBoxBox(((PgBox) a), ((PgBox) b));
         if (a instanceof PgCircle && b instanceof PgCircle) return overlapsCircleCircle(((PgCircle) a), ((PgCircle) b));
         if (a instanceof PgPolygon && b instanceof PgPolygon) return overlapsPolygonPolygon(((PgPolygon) a), ((PgPolygon) b));
-        throw new MemgresException("overlap not supported between " + a.getClass().getSimpleName() + " and " + b.getClass().getSimpleName(), "42883");
+        throw new MemgresException("overlap not supported between " + pgTypeName(a) + " and " + pgTypeName(b), "42883");
     }
 
     // ========================================================================
@@ -1339,7 +1403,7 @@ public final class GeometricOperations {
 
     public static boolean intersects(Object a, Object b) {
         if (a instanceof PgLseg && b instanceof PgLseg) return lsegIntersects(((PgLseg) a), ((PgLseg) b));
-        if (a instanceof PgLine && b instanceof PgLseg) return lineIntersectsLseg(((PgLine) a), ((PgLseg) b));
+        // PG has lseg ?# line but NOT line ?# lseg.
         if (a instanceof PgLseg && b instanceof PgLine) return lineIntersectsLseg(((PgLine) b), ((PgLseg) a));
         if (a instanceof PgBox && b instanceof PgBox) return boxIntersectsBox(((PgBox) a), ((PgBox) b));
         if (a instanceof PgLine && b instanceof PgBox) return lineIntersectsBox(((PgLine) a), ((PgBox) b));
@@ -1380,12 +1444,11 @@ public final class GeometricOperations {
     }
 
     public static PgPoint closestPoint(Object a, Object b) {
+        // PG's ## operator never accepts a point as the second operand: the
+        // result is the closest point that lies ON the second object.
         if (a instanceof PgPoint && b instanceof PgLseg) return closestPointOnLseg(((PgPoint) a), ((PgLseg) b));
-        if (a instanceof PgLseg && b instanceof PgPoint) return closestPointOnLseg(((PgPoint) b), ((PgLseg) a));
         if (a instanceof PgPoint && b instanceof PgLine) return closestPointOnLine(((PgPoint) a), ((PgLine) b));
-        if (a instanceof PgLine && b instanceof PgPoint) return closestPointOnLine(((PgPoint) b), ((PgLine) a));
         if (a instanceof PgPoint && b instanceof PgBox) return closestPointOnBox(((PgPoint) a), ((PgBox) b));
-        if (a instanceof PgBox && b instanceof PgPoint) return closestPointOnBox(((PgPoint) b), ((PgBox) a));
         if (a instanceof PgLseg && b instanceof PgLseg) {
             PgLseg lb = (PgLseg) b;
             PgLseg la = (PgLseg) a;
@@ -1462,7 +1525,7 @@ public final class GeometricOperations {
             return null;
         }
         if (a instanceof PgLseg && b instanceof PgLine) return intersection(b, a);
-        throw new MemgresException("intersection not supported between " + a.getClass().getSimpleName() + " and " + b.getClass().getSimpleName(), "42883");
+        throw new MemgresException("intersection not supported between " + pgTypeName(a) + " and " + pgTypeName(b), "42883");
     }
 
     private static boolean onSegment(PgPoint p, PgLseg seg) {
@@ -1550,6 +1613,28 @@ public final class GeometricOperations {
 
     public static boolean isVertical(PgPoint a, PgPoint b) {
         return Math.abs(a.x - b.x) < EPSILON;
+    }
+
+    /** Does the string look like a point literal, e.g. "(1,2)"? */
+    public static boolean isPointString(String s) {
+        if (s == null) return false;
+        s = s.trim();
+        if (!s.startsWith("(")) return false;
+        try { return autoDetectPublic(s) instanceof PgPoint; } catch (RuntimeException e) { return false; }
+    }
+
+    /** point ?- point : true if the two points are horizontally aligned (same y). */
+    public static boolean pointsHorizontallyAligned(String a, String b) {
+        Object oa = autoDetectPublic(a), ob = autoDetectPublic(b);
+        if (oa instanceof PgPoint && ob instanceof PgPoint) return isHorizontal((PgPoint) oa, (PgPoint) ob);
+        throw new MemgresException("operator does not exist: " + pgTypeName(oa) + " ?- " + pgTypeName(ob), "42883");
+    }
+
+    /** point ?| point : true if the two points are vertically aligned (same x). */
+    public static boolean pointsVerticallyAligned(String a, String b) {
+        Object oa = autoDetectPublic(a), ob = autoDetectPublic(b);
+        if (oa instanceof PgPoint && ob instanceof PgPoint) return isVertical((PgPoint) oa, (PgPoint) ob);
+        throw new MemgresException("operator does not exist: " + pgTypeName(oa) + " ?| " + pgTypeName(ob), "42883");
     }
 
     public static boolean isPerpendicular(PgLseg a, PgLseg b) {
@@ -1651,12 +1736,15 @@ public final class GeometricOperations {
     }
 
     public static PgPolygon toPolygon(PgCircle c, int npts) {
+        // Match PG's circle_poly: first vertex at (cx - r, cy), winding as
+        // x = cx - cos(i*step)*r, y = cy + sin(i*step)*r.
         List<PgPoint> pts = new ArrayList<>();
+        double anglestep = (2.0 * Math.PI) / npts;
         for (int i = 0; i < npts; i++) {
-            double angle = 2 * Math.PI * i / npts;
+            double angle = i * anglestep;
             pts.add(new PgPoint(
-                c.center.x + c.radius * Math.cos(angle),
-                c.center.y + c.radius * Math.sin(angle)
+                c.center.x - Math.cos(angle) * c.radius,
+                c.center.y + Math.sin(angle) * c.radius
             ));
         }
         return new PgPolygon(Cols.listCopyOf(pts));

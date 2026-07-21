@@ -665,18 +665,25 @@ public class PlpgsqlParser {
         boolean strict = false;
         List<String> usingExprs = new ArrayList<>();
 
-        if (matchKw("INTO")) {
-            if (matchKw("STRICT")) strict = true;
-            intoVars = new ArrayList<>();
-            intoVars.add(readIdent());
-            while (match(TokenType.COMMA)) {
+        // PG accepts the INTO and USING clauses in either order:
+        //   EXECUTE sql INTO target USING args
+        //   EXECUTE sql USING args INTO target
+        for (int guard = 0; guard < 2; guard++) {
+            if (intoVars == null && matchKw("INTO")) {
+                if (matchKw("STRICT")) strict = true;
+                intoVars = new ArrayList<>();
                 intoVars.add(readIdent());
+                while (match(TokenType.COMMA)) {
+                    intoVars.add(readIdent());
+                }
+            } else if (usingExprs.isEmpty() && matchKw("USING")) {
+                // Stop each USING expression at a following INTO so the reversed order works.
+                do {
+                    usingExprs.add(collectUntilMulti(",", ";", "INTO"));
+                } while (match(TokenType.COMMA));
+            } else {
+                break;
             }
-        }
-        if (matchKw("USING")) {
-            do {
-                usingExprs.add(collectUntilMulti(",", ";"));
-            } while (match(TokenType.COMMA));
         }
 
         match(TokenType.SEMICOLON);

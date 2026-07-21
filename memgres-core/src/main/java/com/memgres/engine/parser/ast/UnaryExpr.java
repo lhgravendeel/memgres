@@ -14,6 +14,7 @@ public final class UnaryExpr implements Expression {
 
     public enum UnaryOp {
         NOT, NEGATE, POSITIVE, BIT_NOT, ABS, SQRT, CBRT, GEO_IS_HORIZONTAL, GEO_IS_VERTICAL,
+        GEO_CENTER, GEO_LENGTH, GEO_NPOINTS,
         HSTORE_TO_ARRAY, HSTORE_TO_MATRIX
     }
 

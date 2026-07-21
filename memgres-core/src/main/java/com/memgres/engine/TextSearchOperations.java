@@ -245,8 +245,9 @@ public class TextSearchOperations {
             }
         }
 
-        // Strip HTML tags from the document for matching
-        String stripped = document.replaceAll("<[^>]+>", "");
+        // Strip HTML tags from the document for matching. PG replaces each tag
+        // with a space so adjacent words don't run together (e.g. big<br>cat).
+        String stripped = document.replaceAll("<[^>]+>", " ");
 
         // Collect terms from query
         List<String> terms = query.collectTerms();
