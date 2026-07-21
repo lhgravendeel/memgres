@@ -163,15 +163,17 @@ public class Macaddr8Value implements Comparable<Macaddr8Value> {
         return new Macaddr8Value(result);
     }
 
-    /** Convert to macaddr (6-byte) by removing ff:fe if present, else take first 6 bytes. */
+    /**
+     * Convert to macaddr (6-byte). PG only converts EUI-64 addresses whose middle two
+     * bytes are ff:fe (the standard EUI-48 embedding); anything else is out of range.
+     */
     public MacaddrValue toMacaddr() {
-        byte[] result = new byte[6];
-        if (bytes[3] == (byte) 0xFF && bytes[4] == (byte) 0xFE) {
-            System.arraycopy(bytes, 0, result, 0, 3);
-            System.arraycopy(bytes, 5, result, 3, 3);
-        } else {
-            System.arraycopy(bytes, 0, result, 0, 6);
+        if (bytes[3] != (byte) 0xFF || bytes[4] != (byte) 0xFE) {
+            throw new MemgresException("macaddr8 data out of range to convert to macaddr", "22003");
         }
+        byte[] result = new byte[6];
+        System.arraycopy(bytes, 0, result, 0, 3);
+        System.arraycopy(bytes, 5, result, 3, 3);
         return new MacaddrValue(result);
     }
 

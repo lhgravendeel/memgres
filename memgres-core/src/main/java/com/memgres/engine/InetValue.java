@@ -63,27 +63,17 @@ public class InetValue implements Comparable<InetValue> {
         return new InetValue(bytes, prefix);
     }
 
-    /** Parse with strict validation: also reject PG-invalid short forms like "10" (for inet). */
+    /** Parse with strict validation: rejects PG-invalid abbreviated IPv4 forms like "10" (cidr-only). */
     public static InetValue parseStrict(String input) {
-        return parse(input); // InetAddress.getByName handles "10" -> 0.0.0.10 which is fine for inet
+        return parse(input);
     }
 
     private static void validateIPv4Octets(String addrPart, String original) {
         String[] octets = addrPart.split("\\.");
         if (octets.length != 4) {
-            // PG accepts 1, 2, 3-octet forms for inet; InetAddress handles this
-            // but we should validate each part is 0-255
-            for (String o : octets) {
-                try {
-                    int val = Integer.parseInt(o);
-                    if (val < 0 || val > 255) {
-                        throw new MemgresException("invalid input syntax for type inet: \"" + original + "\"", "22P02");
-                    }
-                } catch (NumberFormatException e) {
-                    throw new MemgresException("invalid input syntax for type inet: \"" + original + "\"", "22P02");
-                }
-            }
-            return;
+            // Unlike cidr, PG's inet input requires a full 4-octet IPv4 address;
+            // abbreviated forms such as '10', '10.1' or '10.1.2' are rejected (22P02).
+            throw new MemgresException("invalid input syntax for type inet: \"" + original + "\"", "22P02");
         }
         for (String o : octets) {
             try {
@@ -254,7 +244,7 @@ public class InetValue implements Comparable<InetValue> {
     /** inet_merge: smallest network containing both. */
     public InetValue merge(InetValue other) {
         if (address.length != other.address.length) {
-            throw new MemgresException("cannot merge addresses of different families", "42883");
+            throw new MemgresException("cannot merge addresses from different families", "22023");
         }
         // Find the first differing bit
         int commonBits = 0;

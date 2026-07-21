@@ -213,7 +213,9 @@ class SelectExecutor {
         // Validate array subscript type errors for empty tables
         if (contexts.isEmpty() && simpleFrom && !baseBindings.isEmpty()) {
             for (SelectStmt.SelectTarget target : stmt.targets()) {
-                if (target.expr() instanceof BinaryExpr && ((BinaryExpr) target.expr()).op() == BinaryExpr.BinOp.JSON_ARROW) {
+                if (target.expr() instanceof BinaryExpr
+                        && (((BinaryExpr) target.expr()).op() == BinaryExpr.BinOp.JSON_ARROW
+                            || ((BinaryExpr) target.expr()).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)) {
                     BinaryExpr bin = (BinaryExpr) target.expr();
                     if (bin.left() instanceof ColumnRef && bin.right() instanceof Literal
                             && ((Literal) bin.right()).literalType() == Literal.LiteralType.STRING) {

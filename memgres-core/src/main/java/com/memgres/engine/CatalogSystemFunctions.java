@@ -66,8 +66,9 @@ class CatalogSystemFunctions {
                     }
                 }
 
-                if (rawExpr instanceof BinaryExpr && ((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_ARROW) {
-                    BinaryExpr binExpr = (BinaryExpr) rawExpr;
+                if (rawExpr instanceof BinaryExpr
+                        && (((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_ARROW
+                            || ((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)) {
                     return "jsonb";
                 }
 

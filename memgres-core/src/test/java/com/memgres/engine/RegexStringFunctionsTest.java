@@ -165,8 +165,8 @@ class RegexStringFunctionsTest {
 
     @Test @Order(26)
     void concatWsZeroValueArgs() throws SQLException {
-        // concat_ws with zero value args returns empty string
-        assertEquals("", query("SELECT concat_ws(',')"));
+        // concat_ws with only the separator (no value args) does not match any function (PG 42883).
+        assertEquals("42883", getSqlState("SELECT concat_ws(',')"));
     }
 
     @Test @Order(27)

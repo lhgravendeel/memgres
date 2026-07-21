@@ -291,6 +291,7 @@ public class SqlUnparser {
             case ILIKE:
                 return "~~*";
             case JSON_ARROW:
+            case JSON_SUBSCRIPT:
                 return "->";
             case JSON_ARROW_TEXT:
                 return "->>";
