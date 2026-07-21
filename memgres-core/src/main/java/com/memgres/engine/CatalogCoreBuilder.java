@@ -146,6 +146,19 @@ class CatalogCoreBuilder {
             });
         }
 
+        // M22: tables on either side of a FK carry internal RI triggers in PG,
+        // so pg_class.relhastriggers is true for them. Collect FK-referenced tables.
+        java.util.Set<String> fkReferencedTables = new java.util.HashSet<>();
+        for (Schema sch : database.getSchemas().values()) {
+            for (Table tt : sch.getTables().values()) {
+                for (StoredConstraint sc : tt.getConstraints()) {
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
+                        fkReferencedTables.add(sc.getReferencesTable().toLowerCase());
+                    }
+                }
+            }
+        }
+
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             int nsOid = oids.oid("ns:" + schemaEntry.getKey());
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
@@ -155,10 +168,14 @@ class CatalogCoreBuilder {
                 // Count CHECK constraints
                 short checkCount = 0;
                 boolean hasTriggers = false;
+                boolean hasForeignKey = false;
                 for (StoredConstraint sc : t.getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.CHECK) checkCount++;
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) hasForeignKey = true;
                 }
                 if (database.getAllTriggers().containsKey(t.getName())) hasTriggers = true;
+                // M22: FK endpoints have internal RI triggers
+                if (hasForeignKey || fkReferencedTables.contains(t.getName().toLowerCase())) hasTriggers = true;
                 boolean hasIdx = !t.getConstraints().isEmpty() || database.getIndexColumns().keySet().stream()
                         .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.endsWith("." + t.getName()); });
                 // Partition metadata for pg_class
@@ -489,10 +506,12 @@ class CatalogCoreBuilder {
                         }
                     }
                     DataType colType = c.getType();
-                    boolean hasDefault = c.getDefaultValue() != null
-                            || colType == DataType.SERIAL || colType == DataType.BIGSERIAL || colType == DataType.SMALLSERIAL
-                            || !identity.isEmpty()
-                            || c.isGenerated();
+                    // M14: identity columns have atthasdef=f (no pg_attrdef row);
+                    // their sequence is exposed via pg_depend, not a column default.
+                    boolean isIdentityCol = !identity.isEmpty();
+                    boolean hasDefault = c.isGenerated()
+                            || (!isIdentityCol && (c.getDefaultValue() != null
+                                || colType == DataType.SERIAL || colType == DataType.BIGSERIAL || colType == DataType.SMALLSERIAL));
                     // Determine attlen from the type's typlen
                     short attlen;
                     switch (colType) {

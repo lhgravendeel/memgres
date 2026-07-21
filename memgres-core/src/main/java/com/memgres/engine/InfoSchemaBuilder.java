@@ -223,11 +223,13 @@ public class InfoSchemaBuilder {
             DataType dt = col.getType();
             boolean isArrayType = dt == DataType.TEXT_ARRAY || dt == DataType.INT4_ARRAY
                     || dt == DataType.ACLITEM_ARRAY || dt == DataType.NAME_ARRAY;
-            // H14: data_type — arrays report "ARRAY", domains report "USER-DEFINED"
+            // H14: data_type — arrays report "ARRAY", composite types report
+            // "USER-DEFINED", but DOMAIN columns report their BASE type (PG puts
+            // the domain name in domain_name and the base type in data_type).
             String dataType;
             if (isArrayType) {
                 dataType = "ARRAY";
-            } else if (col.getDomainTypeName() != null) {
+            } else if (isUserTable && col.getCompositeTypeName() != null) {
                 dataType = "USER-DEFINED";
             } else {
                 dataType = CatalogHelper.pgTypeName(dt);
@@ -275,10 +277,13 @@ public class InfoSchemaBuilder {
                 if (dt == DataType.ENUM && col.getEnumTypeName() != null) {
                     udtSchema = schemaName;
                     udtName = col.getEnumTypeName();
-                } else if (col.getDomainTypeName() != null) {
+                } else if (col.getCompositeTypeName() != null) {
+                    // H14: composite column — udt_name is the composite type name
                     udtSchema = schemaName;
-                    udtName = col.getDomainTypeName();
+                    udtName = col.getCompositeTypeName();
                 }
+                // H14: DOMAIN columns keep the BASE type udt_name (e.g. int4);
+                // the domain identity is carried by the domain_* fields below.
             }
 
             // H14: is_identity — detect __identity__ marker in default value
@@ -377,6 +382,9 @@ public class InfoSchemaBuilder {
                 for (StoredConstraint sc : t.getConstraints()) {
                     // UNIQUE constraints from CREATE UNIQUE INDEX (not ADD CONSTRAINT) are not in information_schema.table_constraints
                     if (sc.getType() == StoredConstraint.Type.UNIQUE && sc.isFromIndex()) continue;
+                    // M21: EXCLUDE constraints are not exposed in the SQL-standard
+                    // information_schema.table_constraints (PG omits them).
+                    if (sc.getType() == StoredConstraint.Type.EXCLUDE) continue;
                     String type;
                     switch (sc.getType()) {
                         case PRIMARY_KEY:
@@ -415,7 +423,7 @@ public class InfoSchemaBuilder {
                     // Emit NOT NULL for all NOT NULL columns (including PK columns),
                     // but skip columns covered by UNIQUE constraints promoted from index
                     if (!col.isNullable() && !isPromotedUnique) {
-                        String conname = t.getName() + "_" + col.getName() + "_not_null";
+                        String conname = notNullConstraintName(t, col);
                         table.insertRow(new Object[]{
                                 catalogName(), schemaEntry.getKey(), conname,
                                 catalogName(), schemaEntry.getKey(), t.getName(),
@@ -637,7 +645,7 @@ public class InfoSchemaBuilder {
                     routineBody,         // routine_body
                     routineDefinition,   // routine_definition
                     null,                // external_name
-                    language,            // external_language
+                    language.toUpperCase(), // external_language (M21: PG uppercases: SQL/PLPGSQL)
                     "GENERAL",           // parameter_style
                     "NO",                // is_deterministic
                     "MODIFIES",          // sql_data_access
@@ -751,7 +759,9 @@ public class InfoSchemaBuilder {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             String viewDef = "";
             if (vd.query() != null) {
-                viewDef = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
+                String raw = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
+                // M19: information_schema.views.view_definition uses the pretty form (with trailing ;).
+                viewDef = SqlUnparser.prettyViewDef(raw) + ";";
             }
             String isUpdatable = isSimpleUpdatableView(vd) ? "YES" : "NO";
             table.insertRow(new Object[]{
@@ -808,7 +818,8 @@ public class InfoSchemaBuilder {
         Table table = new Table("check_constraints", cols);
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
-                for (StoredConstraint sc : tableEntry.getValue().getConstraints()) {
+                Table t = tableEntry.getValue();
+                for (StoredConstraint sc : t.getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.CHECK && sc.getName() != null) {
                         table.insertRow(new Object[]{
                                 catalogName(), schemaEntry.getKey(), sc.getName(),
@@ -816,9 +827,69 @@ public class InfoSchemaBuilder {
                         });
                     }
                 }
+                // H15: PG 18 lists NOT NULL constraints in check_constraints too,
+                // with a "<col> IS NOT NULL" clause.
+                for (Column col : t.getColumns()) {
+                    if (col.isNullable()) continue;
+                    String conname = notNullConstraintName(t, col);
+                    table.insertRow(new Object[]{
+                            catalogName(), schemaEntry.getKey(), conname,
+                            col.getName() + " IS NOT NULL"
+                    });
+                }
+            }
+        }
+        // H15: domain CHECK constraints also appear in check_constraints.
+        for (Map.Entry<String, DomainType> entry : database.getDomains().entrySet()) {
+            DomainType d = entry.getValue();
+            if (d.getParsedCheck() != null) {
+                table.insertRow(new Object[]{
+                        catalogName(), "public", d.getName() + "_check",
+                        "(" + stripOuterParensLocal(CatalogHelper.renderDomainCheck(d.getParsedCheck())) + ")"
+                });
+            }
+            for (DomainType.NamedConstraint nc : d.getNamedConstraints()) {
+                table.insertRow(new Object[]{
+                        catalogName(), "public", nc.name(),
+                        "(" + stripOuterParensLocal(CatalogHelper.renderDomainCheck(nc.parsedCheck)) + ")"
+                });
             }
         }
         return table;
+    }
+
+    /**
+     * Constraint name for a column's NOT NULL. Partition children inherit the
+     * name from the partition parent that first declared the column NOT NULL (L13).
+     */
+    private static String notNullConstraintName(Table t, Column col) {
+        Table owner = t;
+        Table parent = t.getPartitionParent();
+        while (parent != null) {
+            int idx = parent.getColumnIndex(col.getName());
+            if (idx < 0 || parent.getColumns().get(idx).isNullable()) break;
+            owner = parent;
+            parent = parent.getPartitionParent();
+        }
+        return owner.getName() + "_" + col.getName() + "_not_null";
+    }
+
+    /** Strip a single pair of balanced outer parentheses, if present. */
+    private static String stripOuterParensLocal(String s) {
+        if (s == null) return "";
+        String str = s.trim();
+        while (str.startsWith("(") && str.endsWith(")")) {
+            int depth = 0;
+            boolean wraps = true;
+            for (int i = 0; i < str.length(); i++) {
+                char ch = str.charAt(i);
+                if (ch == '(') depth++;
+                else if (ch == ')') { depth--; if (depth == 0 && i < str.length() - 1) { wraps = false; break; } }
+            }
+            if (wraps) str = str.substring(1, str.length() - 1).trim();
+            else break;
+        }
+        return str;
     }
 
     private Table buildIsConstraintColumnUsage() {

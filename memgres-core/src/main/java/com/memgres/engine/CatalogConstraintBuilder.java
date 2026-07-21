@@ -180,18 +180,22 @@ class CatalogConstraintBuilder {
                     // Emit NOT NULL for all NOT NULL columns (including PK columns),
                     // but skip columns covered by UNIQUE constraints promoted from index
                     if (!c.isNullable() && !isPromotedUnique) {
-                        String conname = t.getName() + "_" + c.getName() + "_not_null";
                         List<Object> nnConkey = columnNamesToAttnums(t, Cols.listOf(c.getName()));
-                        // L13: partition children inherit NOT NULL from parent — PG sets coninhcount=1, conparentid=0
+                        // L13: partition children inherit the NOT NULL constraint (and its
+                        // name) from the partition parent that first declared it NOT NULL;
+                        // PG also sets coninhcount=1.
                         int coninhcount = 0;
+                        Table owner = t;
                         Table parent = t.getPartitionParent();
-                        if (parent != null) {
+                        while (parent != null) {
                             int parentColIdx = parent.getColumnIndex(c.getName());
                             Column parentCol = parentColIdx >= 0 ? parent.getColumns().get(parentColIdx) : null;
-                            if (parentCol != null && !parentCol.isNullable()) {
-                                coninhcount = 1;
-                            }
+                            if (parentCol == null || parentCol.isNullable()) break;
+                            coninhcount = 1;
+                            owner = parent;
+                            parent = parent.getPartitionParent();
                         }
+                        String conname = owner.getName() + "_" + c.getName() + "_not_null";
                         table.insertRow(new Object[]{
                                 oids.oid("con:" + t.getName() + "." + conname),
                                 conname,
@@ -480,6 +484,12 @@ class CatalogConstraintBuilder {
                 int relOid = oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName());
                 for (int i = 0; i < t.getColumns().size(); i++) {
                     Column c = t.getColumns().get(i);
+                    // M14: GENERATED ... AS IDENTITY columns have no pg_attrdef row
+                    // (atthasdef=f). The backing sequence is exposed via pg_depend /
+                    // pg_get_serial_sequence, not as a column default.
+                    if (c.getDefaultValue() != null && c.getDefaultValue().startsWith("__identity__")) {
+                        continue;
+                    }
                     if (c.isGenerated()) {
                         // Generated columns: store the generation expression in pg_attrdef
                         // pg_dump reads this to emit GENERATED ALWAYS AS (...) STORED/VIRTUAL

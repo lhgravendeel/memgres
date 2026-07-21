@@ -770,10 +770,10 @@ class CastEvaluator {
                     displayName = formatRegclassDisplay(schemaPrefix.toLowerCase() + "." + relName);
                 } else if (lowerName.startsWith("pg_")) {
                     regOid = executor.systemCatalog.getOid("rel:pg_catalog." + lowerName);
-                    displayName = relName;
+                    displayName = quoteIdentIfNeeded(relName);
                 } else {
                     regOid = executor.systemCatalog.getOid("rel:" + executor.defaultSchema() + "." + lowerName);
-                    displayName = relName;
+                    displayName = quoteIdentIfNeeded(relName);
                 }
                 return new RegclassValue(regOid, displayName);
             }
@@ -790,9 +790,12 @@ class CastEvaluator {
                 if ("regproc".equals(typeName)) {
                     String lowerProc = procName.toLowerCase();
                     // Built-in aggregates that exist for multiple types (ambiguous via regproc)
+                    // M15: these built-ins have several type variants in PG, so a
+                    // bare-name ::regproc reference is ambiguous (42725).
                     java.util.Set<String> ambiguousBuiltins = Cols.setOf(
                             "min", "max", "sum", "avg", "count",
-                            "array_agg", "string_agg", "every", "bool_and", "bool_or");
+                            "array_agg", "string_agg", "every", "bool_and", "bool_or",
+                            "lower", "upper", "abs", "round");
                     if (ambiguousBuiltins.contains(lowerProc)) {
                         throw new MemgresException("more than one function named \"" + procName + "\"", "42725");
                     }
@@ -828,6 +831,16 @@ class CastEvaluator {
                 if (val instanceof Number) {
                     int oid = ((Number) val).intValue();
                     String name = OID_TO_TYPE.get(oid);
+                    if (name == null) {
+                        // M15: user types (enum/domain/composite) — resolve the type NAME
+                        // from the catalog OID map rather than printing the raw OID.
+                        for (Map.Entry<String, Integer> e : executor.systemCatalog.getOidMap().entrySet()) {
+                            if (e.getValue() == oid && e.getKey().startsWith("type:")) {
+                                name = e.getKey().substring(5);
+                                break;
+                            }
+                        }
+                    }
                     return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
                 String rtName = val.toString().trim().toLowerCase();
@@ -1047,20 +1060,35 @@ class CastEvaluator {
      * Input can be "schema.table" or just "table".
      */
     private String formatRegclassDisplay(String qualifiedName) {
-        if (!qualifiedName.contains(".")) return qualifiedName;
+        if (!qualifiedName.contains(".")) return quoteIdentIfNeeded(qualifiedName);
         int dotIdx = qualifiedName.indexOf('.');
         String schema = qualifiedName.substring(0, dotIdx);
         String table = qualifiedName.substring(dotIdx + 1);
         // pg_catalog tables are never prefixed
-        if ("pg_catalog".equals(schema)) return table;
+        if ("pg_catalog".equals(schema)) return quoteIdentIfNeeded(table);
         // Check if schema is in the current search_path
         if (executor.session != null) {
             List<String> searchPath = executor.session.getEffectiveSearchPath(false);
-            if (searchPath.contains(schema)) return table;
+            if (searchPath.contains(schema)) return quoteIdentIfNeeded(table);
         } else if ("public".equals(schema)) {
-            return table;
+            return quoteIdentIfNeeded(table);
         }
-        return qualifiedName;
+        return quoteIdentIfNeeded(schema) + "." + quoteIdentIfNeeded(table);
+    }
+
+    /**
+     * Double-quote an identifier for display when it is not a plain lowercase
+     * identifier (M15: regclass/regtype output quotes mixed-case names).
+     */
+    private static String quoteIdentIfNeeded(String ident) {
+        if (ident == null || ident.isEmpty()) return ident;
+        if (ident.startsWith("\"")) return ident; // already quoted
+        boolean needsQuote = !Character.isLowerCase(ident.charAt(0)) && ident.charAt(0) != '_';
+        for (int i = 0; i < ident.length() && !needsQuote; i++) {
+            char c = ident.charAt(i);
+            if (!(Character.isLowerCase(c) || Character.isDigit(c) || c == '_')) needsQuote = true;
+        }
+        return needsQuote ? "\"" + ident.replace("\"", "\"\"") + "\"" : ident;
     }
 
     /** Check if a trimmed string is an infinity literal accepted by PostgreSQL. */

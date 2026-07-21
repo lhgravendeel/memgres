@@ -60,6 +60,17 @@ class CatalogStubBuilder {
                 col("hastriggers", DataType.BOOLEAN)
         );
         Table table = new Table("pg_tables", cols);
+        // M22: tables on either side of a FK carry internal RI triggers in PG.
+        java.util.Set<String> fkReferencedTables = new java.util.HashSet<>();
+        for (Schema sch : database.getSchemas().values()) {
+            for (Table tt : sch.getTables().values()) {
+                for (StoredConstraint sc : tt.getConstraints()) {
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
+                        fkReferencedTables.add(sc.getReferencesTable().toLowerCase());
+                    }
+                }
+            }
+        }
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
                 String tableName = tableEntry.getKey();
@@ -67,7 +78,12 @@ class CatalogStubBuilder {
                 // M22: compute hasindexes/hastriggers from actual state
                 boolean hasIdx = !t.getConstraints().isEmpty() || database.getIndexColumns().keySet().stream()
                         .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.endsWith("." + tableName); });
-                boolean hasTrig = database.getAllTriggers().containsKey(tableName);
+                boolean hasFk = false;
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) { hasFk = true; break; }
+                }
+                boolean hasTrig = database.getAllTriggers().containsKey(tableName)
+                        || hasFk || fkReferencedTables.contains(tableName.toLowerCase());
                 table.insertRow(new Object[]{
                         schemaEntry.getKey(), tableName, "memgres", null, hasIdx, false, hasTrig
                 });
@@ -88,7 +104,9 @@ class CatalogStubBuilder {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             String viewDef = null;
             if (vd.query() != null) {
-                viewDef = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
+                String raw = vd.sourceSQL() != null ? vd.sourceSQL() : SqlUnparser.toSql(vd.query());
+                // M19: pg_views.definition uses PG's pretty multi-line form (with trailing ;).
+                viewDef = SqlUnparser.prettyViewDef(raw) + ";";
             }
             table.insertRow(new Object[]{vSchema, vd.name(), "memgres", viewDef});
         }

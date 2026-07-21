@@ -338,7 +338,8 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testPgSettingsTimezone() throws SQLException {
-        String tz = query1("SELECT setting FROM pg_settings WHERE name = 'timezone'");
+        // PG exposes the canonical mixed-case name "TimeZone" in pg_settings (L12).
+        String tz = query1("SELECT setting FROM pg_settings WHERE name = 'TimeZone'");
         assertEquals("UTC", tz);
     }
 
