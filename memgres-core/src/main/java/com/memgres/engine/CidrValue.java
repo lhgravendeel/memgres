@@ -32,22 +32,50 @@ public class CidrValue extends InetValue {
         }
         byte[] bytes;
         boolean isIPv6Syntax = addrPart.contains(":");
-        try {
-            bytes = InetAddress.getByName(addrPart).getAddress();
-            // Java maps IPv4-compatible/mapped IPv6 addresses to 4-byte arrays;
-            // if the user wrote IPv6 syntax (colons), force 16-byte representation
-            if (isIPv6Syntax && bytes.length == 4) {
-                byte[] ipv6 = new byte[16];
-                ipv6[10] = (byte) 0xFF;
-                ipv6[11] = (byte) 0xFF;
-                System.arraycopy(bytes, 0, ipv6, 12, 4);
-                bytes = ipv6;
+        if (!isIPv6Syntax) {
+            // IPv4 (possibly abbreviated). Unlike inet, cidr accepts 1-4 decimal octets
+            // which are left-aligned and zero-padded on the right (e.g. '10' -> 10.0.0.0,
+            // '10.1' -> 10.1.0.0). When no explicit prefix is given, it defaults to
+            // (number of octets) * 8 (e.g. '10' -> /8, '10.1' -> /16, '192.168.1' -> /24).
+            String[] octets = addrPart.split("\\.", -1);
+            if (octets.length < 1 || octets.length > 4) {
+                throw new MemgresException("invalid input syntax for type cidr: \"" + input + "\"", "22P02");
             }
-        } catch (UnknownHostException e) {
-            throw new MemgresException("invalid input syntax for type cidr: \"" + input + "\"", "22P02");
+            bytes = new byte[4];
+            for (int i = 0; i < octets.length; i++) {
+                if (octets[i].isEmpty()) {
+                    throw new MemgresException("invalid input syntax for type cidr: \"" + input + "\"", "22P02");
+                }
+                int v;
+                try {
+                    v = Integer.parseInt(octets[i]);
+                } catch (NumberFormatException e) {
+                    throw new MemgresException("invalid input syntax for type cidr: \"" + input + "\"", "22P02");
+                }
+                if (v < 0 || v > 255) {
+                    throw new MemgresException("invalid input syntax for type cidr: \"" + input + "\"", "22P02");
+                }
+                bytes[i] = (byte) v;
+            }
+            if (prefix == -1) prefix = octets.length * 8;
+        } else {
+            try {
+                bytes = InetAddress.getByName(addrPart).getAddress();
+                // Java maps IPv4-compatible/mapped IPv6 addresses to 4-byte arrays;
+                // if the user wrote IPv6 syntax (colons), force 16-byte representation
+                if (bytes.length == 4) {
+                    byte[] ipv6 = new byte[16];
+                    ipv6[10] = (byte) 0xFF;
+                    ipv6[11] = (byte) 0xFF;
+                    System.arraycopy(bytes, 0, ipv6, 12, 4);
+                    bytes = ipv6;
+                }
+            } catch (UnknownHostException e) {
+                throw new MemgresException("invalid input syntax for type cidr: \"" + input + "\"", "22P02");
+            }
+            if (prefix == -1) prefix = bytes.length * 8;
         }
         int maxPrefix = bytes.length * 8;
-        if (prefix == -1) prefix = maxPrefix;
         if (prefix < 0 || prefix > maxPrefix) {
             throw new MemgresException("invalid input syntax for type cidr: \"" + input + "\"", "22P02");
         }
@@ -77,7 +105,62 @@ public class CidrValue extends InetValue {
         if (isIPv4()) {
             return abbrevIPv4();
         }
-        return formatAddress(getAddressRef()) + "/" + getPrefixLength();
+        return abbrevIPv6(getAddressRef(), getPrefixLength());
+    }
+
+    /**
+     * Abbreviated IPv6 cidr display, ported from PostgreSQL's inet_cidr_ntop_ipv6.
+     * Only the words covered by the netmask are displayed (with trailing zero words
+     * dropped), e.g. '2001:db8::/32' -> "2001:db8/32", '2001:db8::ff00:0/104' ->
+     * "2001:db8::ff00/104".
+     */
+    static String abbrevIPv6(byte[] src, int bits) {
+        if (bits < 0) bits = 0;
+        if (bits > 128) bits = 128;
+        StringBuilder out = new StringBuilder();
+        if (bits == 0) {
+            out.append("::");
+        } else {
+            // Copy address and zero the host part.
+            byte[] in = new byte[16];
+            int p = (bits + 7) / 8;
+            System.arraycopy(src, 0, in, 0, Math.min(p, 16));
+            int b = bits % 8;
+            if (b != 0 && p >= 1) {
+                in[p - 1] &= (byte) (((~0) << (8 - b)) & 0xFF);
+            }
+            // Number of 16-bit words to display.
+            int words = (bits + 15) / 16;
+            if (words == 1) words = 2;
+            int[] w = new int[words];
+            for (int i = 0; i < words; i++) {
+                w[i] = ((in[i * 2] & 0xFF) << 8) | (in[i * 2 + 1] & 0xFF);
+            }
+            // Find the longest run of zero words for :: compression.
+            int zeroStart = -1, zeroLen = 0, curStart = -1, curLen = 0;
+            for (int i = 0; i < words; i++) {
+                if (w[i] == 0) {
+                    if (curLen == 0) curStart = i;
+                    curLen++;
+                    if (curLen > zeroLen) { zeroStart = curStart; zeroLen = curLen; }
+                } else {
+                    curLen = 0;
+                }
+            }
+            for (int i = 0; i < words; i++) {
+                if (zeroLen != 0 && i >= zeroStart && i < zeroStart + zeroLen) {
+                    if (i == zeroStart) out.append(':');
+                    if (i == words - 1) out.append(':');
+                    continue;
+                }
+                // Mirror PG: a non-zero word is always preceded by ':' when output is
+                // non-empty; after a zero run this second ':' completes the '::' marker.
+                if (out.length() != 0) out.append(':');
+                out.append(Integer.toHexString(w[i]));
+            }
+        }
+        out.append('/').append(bits);
+        return out.toString();
     }
 
     private String abbrevIPv4() {

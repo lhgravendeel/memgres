@@ -1079,11 +1079,14 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 if (resultFormatCodes != null && resultFormatCodes.length > 0) {
                     format = resultFormatCodes.length == 1 ? resultFormatCodes[0] : (i < resultFormatCodes.length ? resultFormatCodes[i] : 0);
                 }
-                if (format == 1 && columns != null && i < columns.size()) {
-                    PgWireBinaryCodec.writeBinaryValue(buf, val, columns.get(i).getType());
+                Column col = (columns != null && i < columns.size()) ? columns.get(i) : null;
+                if (format == 1 && col != null) {
+                    PgWireBinaryCodec.writeBinaryValue(buf, val, col);
                 } else {
-                    String text = PgWireValueFormatter.formatValue(val,
-                            session != null ? session.getGucSettings() : null);
+                    GucSettings guc = session != null ? session.getGucSettings() : null;
+                    String text = (col != null && col.getArrayElementType() != null)
+                            ? PgWireValueFormatter.formatArray(val, col.getArrayElementType(), guc)
+                            : PgWireValueFormatter.formatValue(val, guc);
                     byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
                     buf.writeInt(bytes.length);
                     buf.writeBytes(bytes);

@@ -27,6 +27,9 @@ public final class BinaryExpr implements Expression {
         CONCAT, LIKE, ILIKE, SIMILAR_TO,
         // JSON
         JSON_ARROW, JSON_ARROW_TEXT, JSON_HASH_ARROW, JSON_HASH_ARROW_TEXT,
+        // Container subscript a[i] (distinct from the -> operator: for a jsonb scalar,
+        // a -> 0 echoes the scalar while a[0] is NULL)
+        JSON_SUBSCRIPT,
         // Array
         CONTAINS, CONTAINED_BY, OVERLAP,
         // Full-text search

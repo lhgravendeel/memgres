@@ -2029,7 +2029,8 @@ class ExprEvaluator {
         }
         if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
-            if (bin.op() == BinaryExpr.BinOp.JSON_ARROW && bin.left() instanceof ColumnRef) {
+            if ((bin.op() == BinaryExpr.BinOp.JSON_ARROW || bin.op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)
+                    && bin.left() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) bin.left();
                 return cr.column();
             }

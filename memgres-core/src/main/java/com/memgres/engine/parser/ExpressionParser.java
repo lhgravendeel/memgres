@@ -956,7 +956,7 @@ public class ExpressionParser {
         return expr;
     }
 
-    private Expression parsePostfix() {
+    Expression parsePostfix() {
         Expression expr = parsePrimary();
 
         // Handle postfix operators: ::cast, JSON arrows, array subscript
@@ -1007,7 +1007,7 @@ public class ExpressionParser {
                 if (isSlice) {
                     expr = new ArraySliceExpr(expr, lower, upper);
                 } else {
-                    expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_ARROW, lower); // array subscript
+                    expr = new BinaryExpr(expr, BinaryExpr.BinOp.JSON_SUBSCRIPT, lower); // array/container subscript
                 }
             } else if (matchKeywords("AT", "TIME", "ZONE")) {
                 Expression zone = parsePrimary();

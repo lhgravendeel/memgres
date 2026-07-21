@@ -80,13 +80,49 @@ class CatalogMetadataFunctions {
                     Object oidVal = executor.evalExpr(fn.args().get(0), ctx);
                     if (oidVal != null) {
                         int coid = executor.toInt(oidVal);
-                        for (Schema schema : executor.database.getSchemas().values()) {
-                            for (Table tbl : schema.getTables().values()) {
+                        for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
+                            String schemaName = schemaEntry.getKey();
+                            for (Table tbl : schemaEntry.getValue().getTables().values()) {
                                 for (StoredConstraint sc : tbl.getConstraints()) {
                                     int scOid = executor.systemCatalog.getOid("con:" + tbl.getName() + "." + sc.getName());
                                     if (scOid == coid) {
-                                        return formatConstraintDef(sc);
+                                        return formatConstraintDef(sc, schemaName);
                                     }
+                                }
+                                // H16: NOT NULL constraints (contype 'n') — "NOT NULL <col>"
+                                for (Column c : tbl.getColumns()) {
+                                    if (c.isNullable()) continue;
+                                    String conname = notNullConstraintName(tbl, c);
+                                    int nnOid = executor.systemCatalog.getOid("con:" + tbl.getName() + "." + conname);
+                                    if (nnOid == coid) {
+                                        return "NOT NULL " + c.getName();
+                                    }
+                                }
+                            }
+                        }
+                        // H16: domain constraints (CHECK and NOT NULL)
+                        for (DomainType dom : executor.database.getDomains().values()) {
+                            if (dom.getParsedCheck() != null) {
+                                int dcOid = executor.systemCatalog.getOid(
+                                        "con:domain:" + dom.getName() + "." + dom.getName() + "_check");
+                                if (dcOid == coid) {
+                                    return "CHECK ((" + stripOuterParens(
+                                            CatalogHelper.renderDomainCheck(dom.getParsedCheck())) + "))";
+                                }
+                            }
+                            for (DomainType.NamedConstraint nc : dom.getNamedConstraints()) {
+                                int ncOid = executor.systemCatalog.getOid(
+                                        "con:domain:" + dom.getName() + "." + nc.name());
+                                if (ncOid == coid) {
+                                    return "CHECK ((" + stripOuterParens(
+                                            CatalogHelper.renderDomainCheck(nc.parsedCheck)) + "))";
+                                }
+                            }
+                            if (dom.isNotNull()) {
+                                int dnOid = executor.systemCatalog.getOid(
+                                        "con:domain:" + dom.getName() + "." + dom.getName() + "_not_null");
+                                if (dnOid == coid) {
+                                    return "NOT NULL";
                                 }
                             }
                         }
@@ -107,8 +143,23 @@ class CatalogMetadataFunctions {
             case "pg_get_triggerdef":
                 return evalPgGetTriggerdef(fn, ctx);
             case "pg_get_ruledef": {
-                if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
+                if (fn.args().isEmpty()) return "";
+                Object ruleOidVal = executor.evalExpr(fn.args().get(0), ctx);
                 if (fn.args().size() > 1) executor.evalExpr(fn.args().get(1), ctx);
+                if (ruleOidVal == null) return "";
+                int ruleOid = executor.toInt(ruleOidVal);
+                // M19: a view's implicit "_RETURN" rule reproduces the view query.
+                for (Database.ViewDef vd : executor.database.getViews().values()) {
+                    int rOid = executor.systemCatalog.getOid("rule:_RETURN_" + vd.name());
+                    if (rOid == ruleOid && vd.query() != null) {
+                        String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
+                        String sql = vd.sourceSQL() != null ? vd.sourceSQL()
+                                : SqlUnparser.toSql(vd.query());
+                        String pretty = SqlUnparser.prettyViewDef(sql);
+                        return "CREATE RULE \"_RETURN\" AS\n    ON SELECT TO "
+                                + vSchema + "." + vd.name() + " DO INSTEAD " + pretty + ";";
+                    }
+                }
                 return "";
             }
             case "pg_get_function_sqlbody": {
@@ -532,7 +583,9 @@ class CatalogMetadataFunctions {
         } else if (arg != null) {
             viewName = arg.toString();
         }
-        boolean prettyPrint = false;
+        // M19: PG's one-argument pg_get_viewdef uses the pretty (multi-line) form.
+        // The two-argument form honours the explicit pretty flag.
+        boolean prettyPrint = fn.args().size() < 2;
         if (fn.args().size() >= 2) {
             Object prettyArg = executor.evalExpr(fn.args().get(1), ctx);
             if (prettyArg instanceof Boolean) prettyPrint = ((Boolean) prettyArg);
@@ -546,23 +599,7 @@ class CatalogMetadataFunctions {
             if (view != null && view.query() != null) {
                 String sql = view.sourceSQL() != null ? view.sourceSQL()
                         : SqlUnparser.toSql(view.query());
-                if (prettyPrint) {
-                    java.util.regex.Matcher selectMatcher = java.util.regex.Pattern
-                            .compile("(?i)^SELECT\\s+(.*?)\\s+FROM\\s+", java.util.regex.Pattern.DOTALL)
-                            .matcher(sql);
-                    if (selectMatcher.find()) {
-                        String columnList = selectMatcher.group(1);
-                        String[] columns = columnList.split("\\s*,\\s*");
-                        StringBuilder formattedCols = new StringBuilder(columns[0].trim());
-                        for (int ci = 1; ci < columns.length; ci++) {
-                            formattedCols.append(",\n    ").append(columns[ci].trim());
-                        }
-                        sql = " SELECT " + formattedCols.toString()
-                                + sql.substring(selectMatcher.end() - " FROM ".length());
-                    }
-                    sql = sql.replaceAll("(?i)\\s+FROM\\s+", "\n   FROM ")
-                             .replaceAll("(?i)\\s+WHERE\\s+", "\n  WHERE ");
-                }
+                if (prettyPrint) sql = SqlUnparser.prettyViewDef(sql);
                 return sql + ";";
             }
         }
@@ -962,7 +999,55 @@ class CatalogMetadataFunctions {
         }
     }
 
-    private String formatConstraintDef(StoredConstraint sc) {
+    /**
+     * NOT NULL constraint name for a column; partition children inherit the name
+     * from the ancestor that first declared the column NOT NULL (L13).
+     */
+    private static String notNullConstraintName(Table t, Column col) {
+        Table owner = t;
+        Table parent = t.getPartitionParent();
+        while (parent != null) {
+            int idx = parent.getColumnIndex(col.getName());
+            if (idx < 0 || parent.getColumns().get(idx).isNullable()) break;
+            owner = parent;
+            parent = parent.getPartitionParent();
+        }
+        return owner.getName() + "_" + col.getName() + "_not_null";
+    }
+
+    /** Strip a single pair of balanced outer parentheses, if present. */
+    private static String stripOuterParens(String s) {
+        if (s == null) return "";
+        String t = s.trim();
+        while (t.startsWith("(") && t.endsWith(")")) {
+            int depth = 0;
+            boolean wraps = true;
+            for (int i = 0; i < t.length(); i++) {
+                char ch = t.charAt(i);
+                if (ch == '(') depth++;
+                else if (ch == ')') { depth--; if (depth == 0 && i < t.length() - 1) { wraps = false; break; } }
+            }
+            if (wraps) t = t.substring(1, t.length() - 1).trim();
+            else break;
+        }
+        return t;
+    }
+
+    /** True if the referenced schema should be omitted (same schema or on search_path). */
+    private boolean schemaVisibleForRef(String refSchema, String ownSchema) {
+        if (refSchema == null) return true;
+        if (refSchema.equalsIgnoreCase(ownSchema)) return true;
+        if (executor.session != null) {
+            for (String p : executor.session.getEffectiveSearchPath(false)) {
+                if (refSchema.equalsIgnoreCase(p)) return true;
+            }
+        } else if ("public".equalsIgnoreCase(refSchema)) {
+            return true;
+        }
+        return false;
+    }
+
+    private String formatConstraintDef(StoredConstraint sc, String ownSchema) {
         switch (sc.getType()) {
             case PRIMARY_KEY:
                 return "PRIMARY KEY (" + String.join(", ", sc.getColumns()) + ")";
@@ -975,7 +1060,11 @@ class CatalogMetadataFunctions {
                 sb.append(String.join(", ", sc.getColumns()));
                 sb.append(") REFERENCES ");
                 if (sc.getReferencesTable() != null) {
-                    if (sc.getReferencesSchema() != null) sb.append(sc.getReferencesSchema()).append(".");
+                    // H16: only schema-qualify the referenced table when its schema is
+                    // NOT visible via the current search_path (matching PG).
+                    if (!schemaVisibleForRef(sc.getReferencesSchema(), ownSchema)) {
+                        sb.append(sc.getReferencesSchema()).append(".");
+                    }
                     sb.append(sc.getReferencesTable());
                 }
                 if (sc.getReferencesColumns() != null && !sc.getReferencesColumns().isEmpty()) {
@@ -990,7 +1079,11 @@ class CatalogMetadataFunctions {
                 return sb.toString();
             }
             case EXCLUDE: {
-                StringBuilder sb = new StringBuilder("EXCLUDE USING gist (");
+                // H16: reflect the actual backing index access method rather than
+                // always printing gist.
+                String am = executor.database.getIndexMethod(sc.getName());
+                if (am == null || am.isEmpty()) am = "btree";
+                StringBuilder sb = new StringBuilder("EXCLUDE USING ").append(am).append(" (");
                 if (sc.getExcludeElements() != null) {
                     for (int i = 0; i < sc.getExcludeElements().size(); i++) {
                         if (i > 0) sb.append(", ");

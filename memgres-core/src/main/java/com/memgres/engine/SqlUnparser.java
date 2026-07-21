@@ -12,6 +12,49 @@ import java.util.stream.Collectors;
 public class SqlUnparser {
 
     /**
+     * Reformat a single-line SELECT into PG's pg_get_viewdef "pretty" multi-line
+     * layout: leading space before SELECT, each column indented 4 spaces, and
+     * FROM/WHERE on their own indented lines. (M19)
+     */
+    public static String prettyViewDef(String sql) {
+        if (sql == null) return null;
+        String out = sql;
+        java.util.regex.Matcher selectMatcher = java.util.regex.Pattern
+                .compile("(?i)^SELECT\\s+(.*?)\\s+FROM\\s+", java.util.regex.Pattern.DOTALL)
+                .matcher(out);
+        if (selectMatcher.find()) {
+            String columnList = selectMatcher.group(1);
+            String[] columns = splitTopLevel(columnList);
+            StringBuilder formattedCols = new StringBuilder(columns[0].trim());
+            for (int ci = 1; ci < columns.length; ci++) {
+                formattedCols.append(",\n    ").append(columns[ci].trim());
+            }
+            out = " SELECT " + formattedCols
+                    + out.substring(selectMatcher.end() - " FROM ".length());
+        } else if (out.regionMatches(true, 0, "SELECT ", 0, 7)) {
+            // No FROM clause (e.g. SELECT constant): still indent the column list.
+            out = " " + out;
+        }
+        out = out.replaceAll("(?i)\\s+FROM\\s+", "\n   FROM ")
+                 .replaceAll("(?i)\\s+WHERE\\s+", "\n  WHERE ");
+        return out;
+    }
+
+    /** Split a comma-separated list on top-level commas only (ignoring parens). */
+    private static String[] splitTopLevel(String s) {
+        java.util.List<String> parts = new java.util.ArrayList<>();
+        int depth = 0, start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == ',' && depth == 0) { parts.add(s.substring(start, i)); start = i + 1; }
+        }
+        parts.add(s.substring(start));
+        return parts.toArray(new String[0]);
+    }
+
+    /**
      * Convert a Statement AST to SQL text.
      */
     public static String toSql(Statement stmt) {
@@ -248,6 +291,7 @@ public class SqlUnparser {
             case ILIKE:
                 return "~~*";
             case JSON_ARROW:
+            case JSON_SUBSCRIPT:
                 return "->";
             case JSON_ARROW_TEXT:
                 return "->>";

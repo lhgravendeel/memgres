@@ -69,8 +69,8 @@ class ByteaFunctions {
                 Object newByte = executor.evalExpr(fn.args().get(2), ctx);
                 if (data == null) return null;
                 byte[] bytes = data instanceof byte[] ? (byte[]) data : data.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                byte[] result = ByteaOperations.setByte(bytes, executor.toInt(offset), executor.toInt(newByte));
-                return new String(result, java.nio.charset.StandardCharsets.UTF_8);
+                // set_byte(bytea, int, int) returns bytea.
+                return ByteaOperations.setByte(bytes, executor.toInt(offset), executor.toInt(newByte));
             }
             case "convert_from": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);

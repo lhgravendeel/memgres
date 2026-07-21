@@ -146,6 +146,19 @@ class CatalogCoreBuilder {
             });
         }
 
+        // M22: tables on either side of a FK carry internal RI triggers in PG,
+        // so pg_class.relhastriggers is true for them. Collect FK-referenced tables.
+        java.util.Set<String> fkReferencedTables = new java.util.HashSet<>();
+        for (Schema sch : database.getSchemas().values()) {
+            for (Table tt : sch.getTables().values()) {
+                for (StoredConstraint sc : tt.getConstraints()) {
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
+                        fkReferencedTables.add(sc.getReferencesTable().toLowerCase());
+                    }
+                }
+            }
+        }
+
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
             int nsOid = oids.oid("ns:" + schemaEntry.getKey());
             for (Map.Entry<String, Table> tableEntry : schemaEntry.getValue().getTables().entrySet()) {
@@ -155,10 +168,14 @@ class CatalogCoreBuilder {
                 // Count CHECK constraints
                 short checkCount = 0;
                 boolean hasTriggers = false;
+                boolean hasForeignKey = false;
                 for (StoredConstraint sc : t.getConstraints()) {
                     if (sc.getType() == StoredConstraint.Type.CHECK) checkCount++;
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) hasForeignKey = true;
                 }
                 if (database.getAllTriggers().containsKey(t.getName())) hasTriggers = true;
+                // M22: FK endpoints have internal RI triggers
+                if (hasForeignKey || fkReferencedTables.contains(t.getName().toLowerCase())) hasTriggers = true;
                 boolean hasIdx = !t.getConstraints().isEmpty() || database.getIndexColumns().keySet().stream()
                         .anyMatch(idx -> { String ti = database.getIndexTable(idx); return ti != null && ti.endsWith("." + t.getName()); });
                 // Partition metadata for pg_class
@@ -489,10 +506,12 @@ class CatalogCoreBuilder {
                         }
                     }
                     DataType colType = c.getType();
-                    boolean hasDefault = c.getDefaultValue() != null
-                            || colType == DataType.SERIAL || colType == DataType.BIGSERIAL || colType == DataType.SMALLSERIAL
-                            || !identity.isEmpty()
-                            || c.isGenerated();
+                    // M14: identity columns have atthasdef=f (no pg_attrdef row);
+                    // their sequence is exposed via pg_depend, not a column default.
+                    boolean isIdentityCol = !identity.isEmpty();
+                    boolean hasDefault = c.isGenerated()
+                            || (!isIdentityCol && (c.getDefaultValue() != null
+                                || colType == DataType.SERIAL || colType == DataType.BIGSERIAL || colType == DataType.SMALLSERIAL));
                     // Determine attlen from the type's typlen
                     short attlen;
                     switch (colType) {
@@ -742,10 +761,12 @@ class CatalogCoreBuilder {
         int pgCatalogOid = oids.oid("ns:pg_catalog");
 
         for (DataType dt : DataType.values()) {
+            // Array types are emitted separately (correct typcategory='A'/typelem) below; emitting
+            // them here as "base types" would leave a duplicate row with typcategory='U'/typelem=0
+            // that pgjdbc may resolve first, mis-classifying the array column as Types.OTHER.
             if (dt == DataType.ENUM || dt == DataType.SERIAL || dt == DataType.BIGSERIAL
                     || dt == DataType.SMALLSERIAL
-                    || dt == DataType.TEXT_ARRAY || dt == DataType.INT4_ARRAY
-                    || dt == DataType.ACLITEM_ARRAY
+                    || dt.getPgName().startsWith("_")
                     || dt == DataType.RECORD) continue;
             String cat;
             switch (dt) {
@@ -947,6 +968,50 @@ class CatalogCoreBuilder {
                 "-", "-", "-", "i", "x",
                 false, 0, -1, 0, 0, null, null, null, 1
         });
+
+        // Remaining standard array types (typcategory='A', typelem -> element OID). Without a
+        // pg_type row pgjdbc can only classify an array column when it *hardcodes* the array OID;
+        // types it doesn't hardcode (notably _jsonb) otherwise resolve to Types.OTHER and come back
+        // as a single PGobject instead of a java.sql.Array. Rows here make the classification data-
+        // driven so those columns decode as arrays. (_text/_int4/_aclitem are added individually
+        // above; enum arrays are added per-enum below.)
+        int[][] stdArrays = {
+                {1000, 16},   // _bool
+                {1005, 21},   // _int2
+                {1016, 20},   // _int8
+                {1021, 700},  // _float4
+                {1022, 701},  // _float8
+                {1231, 1700}, // _numeric
+                {1015, 1043}, // _varchar
+                {1014, 1042}, // _bpchar
+                {1003, 19},   // _name
+                {1182, 1082}, // _date
+                {1115, 1114}, // _timestamp
+                {1185, 1184}, // _timestamptz
+                {1183, 1083}, // _time
+                {1270, 1266}, // _timetz
+                {2951, 2950}, // _uuid
+                {1001, 17},   // _bytea
+                {1187, 1186}, // _interval
+                {199, 114},   // _json
+                {3807, 3802}, // _jsonb
+                {1041, 869},  // _inet
+        };
+        for (int[] a : stdArrays) {
+            int arrOid = a[0];
+            int elemOid = a[1];
+            DataType arrDt = DataType.fromOid(arrOid);
+            String arrName = arrDt != null ? arrDt.getPgName() : "_" + elemOid;
+            int arrCollation = (elemOid == 25 || elemOid == 1043 || elemOid == 1042 || elemOid == 19) ? 100 : 0;
+            table.insertRow(new Object[]{
+                    arrOid, arrName, pgCatalogOid, 10,
+                    (short) -1, false, "b", "A", false, true, ",",
+                    0, "array_subscript_handler", elemOid, 0,
+                    "array_in", "array_out", "array_recv", "array_send",
+                    "-", "-", "-", "i", "x",
+                    false, 0, -1, 0, arrCollation, null, null, null, 1
+            });
+        }
 
         // Pseudo-types: trigger, event_trigger, void, record, etc.
         String[][] pseudoTypes = {

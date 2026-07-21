@@ -58,6 +58,10 @@ public class AstExecutor {
     String currentRawSql = null;
     // View column mapping: view_column_name -> base_table_column_name (set by resolveViewToBaseTable)
     Map<String, String> lastViewColumnMapping = null;
+    // Ordered base-table column names, one per view-column position (set by resolveViewToBaseTable).
+    // Used to map a positional INSERT through a reordered/renamed/subset view onto the base table.
+    // Null when the view target list has any non-simple-column expression (e.g. SELECT *).
+    List<String> lastViewColumnOrder = null;
     // When true, column references with no context throw instead of returning column name as string
     private boolean strictColumnRefs = false;
 
@@ -95,6 +99,9 @@ public class AstExecutor {
         currentStatementTimestamp = OffsetDateTime.now();
         String previousRawSql = this.currentRawSql;
         this.currentRawSql = sql;
+        // H37: publish the session DateStyle field order so date input parsing honors DMY/YMD/MDY
+        String previousDateOrder = TypeCoercion.getDateOrder();
+        TypeCoercion.setDateOrder(currentDateStyleOrder());
         try {
             Statement stmt = Parser.parse(sql);
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
@@ -103,7 +110,22 @@ public class AstExecutor {
             this.boundParameters = previousParams;
             this.currentRawSql = previousRawSql;
             currentStatementTimestamp = null;
+            TypeCoercion.setDateOrder(previousDateOrder);
         }
+    }
+
+    /**
+     * H37: extract the DateStyle field order ("MDY"/"DMY"/"YMD") from the session GUC.
+     * The stored value is normalized (e.g. "ISO, DMY"); default is "MDY".
+     */
+    private String currentDateStyleOrder() {
+        if (session == null) return "MDY";
+        String ds = session.getGucSettings().get("datestyle");
+        if (ds == null) return "MDY";
+        String lower = ds.toLowerCase();
+        if (lower.contains("dmy")) return "DMY";
+        if (lower.contains("ymd")) return "YMD";
+        return "MDY";
     }
 
     public QueryResult executeStatement(Statement stmt) {
@@ -605,6 +627,7 @@ public class AstExecutor {
      */
     Table resolveTable(String schemaName, String tableName, boolean userQualified) {
         lastViewColumnMapping = null; // reset before each resolution
+        lastViewColumnOrder = null;
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
         // Resolve pg_temp alias to the actual session temp schema
         if ("pg_temp".equalsIgnoreCase(schemaName)) {
@@ -720,14 +743,24 @@ public class AstExecutor {
         String refSchema = ref.schema() != null ? ref.schema() : defaultSchema();
         Table baseTable;
         try { baseTable = resolveTable(refSchema, ref.table()); } catch (MemgresException e) { return null; }
-        // Build column mapping: view alias → base column name
+        // Build column mapping: view alias → base column name, plus the ordered base-column
+        // list (one entry per view-column position) used for positional INSERT remapping.
         lastViewColumnMapping = null;
+        lastViewColumnOrder = null;
         if (sel.targets() != null) {
             Map<String, String> mapping = new LinkedHashMap<>();
+            List<String> order = new ArrayList<>();
+            boolean allSimpleColumns = true;
             for (SelectStmt.SelectTarget target : sel.targets()) {
                 String baseCol = null;
                 if (target.expr() instanceof ColumnRef) {
                     baseCol = ((ColumnRef) target.expr()).column();
+                }
+                if (baseCol == null) {
+                    // Non-column target (e.g. SELECT *, expression): positional remap not derivable.
+                    allSimpleColumns = false;
+                } else {
+                    order.add(baseCol);
                 }
                 String viewCol = target.alias() != null ? target.alias() : baseCol;
                 if (viewCol != null && baseCol != null && !viewCol.equalsIgnoreCase(baseCol)) {
@@ -735,19 +768,27 @@ public class AstExecutor {
                 }
             }
             if (!mapping.isEmpty()) lastViewColumnMapping = mapping;
+            if (allSimpleColumns && !order.isEmpty()) lastViewColumnOrder = order;
         }
         return baseTable;
     }
 
     private Table buildVirtualTableForView(Database.ViewDef view, String viewName) {
-        // Execute the view query to determine column structure
+        // Execute the view query to determine column structure AND materialize its current
+        // rows. INSTEAD OF INSERT ignores the rows (it builds them from VALUES), but INSTEAD OF
+        // UPDATE/DELETE need the view's rows so the WHERE clause can match and OLD is populated.
         try {
             QueryResult result = executeStatement(view.query());
             List<Column> cols = new ArrayList<>();
             for (Column c : result.getColumns()) {
                 cols.add(new Column(c.getName(), c.getType(), c.isNullable(), false, null));
             }
-            return new Table(viewName, cols);
+            Table t = new Table(viewName, cols);
+            t.setViewProjection(true);
+            for (Object[] row : result.getRows()) {
+                t.insertRow(row);
+            }
+            return t;
         } catch (Exception e) {
             throw new MemgresException("cannot insert into view \"" + viewName + "\"", "55000");
         }

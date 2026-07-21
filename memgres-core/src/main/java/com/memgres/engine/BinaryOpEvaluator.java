@@ -197,8 +197,9 @@ class BinaryOpEvaluator {
             return JsonOperations.concatenate(left.toString(), right.toString());
         }
 
-        // text -> int is not supported in PG; reject if left is explicitly text-typed
-        if ((bin.op() == BinaryExpr.BinOp.JSON_ARROW || bin.op() == BinaryExpr.BinOp.JSON_ARROW_TEXT)
+        // text -> int / text[i] is not supported in PG; reject if left is explicitly text-typed
+        if ((bin.op() == BinaryExpr.BinOp.JSON_ARROW || bin.op() == BinaryExpr.BinOp.JSON_ARROW_TEXT
+                || bin.op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)
                 && isCastToTextType(bin.left()) && left instanceof String) {
             throw new MemgresException("operator does not exist: text -> integer", "42883");
         }
@@ -714,8 +715,10 @@ class BinaryOpEvaluator {
                 String pattern = similarToRegexForBinaryOp(right.toString(), "\\");
                 return left.toString().matches("(?s)" + pattern);
             }
-            case JSON_ARROW: {
-                // json -> key or json -> index (returns JSON), also array subscript
+            case JSON_ARROW:
+            case JSON_SUBSCRIPT: {
+                // json -> key or json -> index (returns JSON), also array/container subscript a[i]
+                boolean isArrow = op == BinaryExpr.BinOp.JSON_ARROW;
                 if (left == null || right == null) return null;
                 // hstore -> text[]: extract multiple values by key array
                 if (left instanceof HstoreValue && right instanceof List) {
@@ -799,20 +802,23 @@ class BinaryOpEvaluator {
                         }
                         return null;
                     }
+                    // jsonb string scalar ("...") accessed with an integer: the -> operator
+                    // treats the scalar as a one-element array (index 0 echoes the scalar,
+                    // any other index is NULL); the [] subscript operator is always NULL.
+                    if (left instanceof String && ((String) left).trim().startsWith("\"")) {
+                        return (isArrow && n.intValue() == 0) ? ((String) left).trim() : null;
+                    }
                     // name-style subscript (pg_dump: typname[0] = '_'): PG's name type
                     // supports zero-based single-character access; out of range is NULL.
                     // Only plain strings land here — JSON/array containers were handled above.
-                    // Skip jsonb scalars (numbers, booleans, null, quoted strings) which
-                    // should return NULL for integer subscript, not charAt.
                     if (left instanceof String) {
                         String plain = (String) left;
                         String trimmed = plain.trim();
                         if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("\"")) {
-                            // Check if this looks like a JSON scalar — if so, return NULL
+                            // jsonb number/bool/null scalar: same one-element-array rule for ->.
                             if (trimmed.equals("null") || trimmed.equals("true") || trimmed.equals("false")
                                     || trimmed.matches("-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?")) {
-                                // jsonb scalar -> int = NULL (scalars are not subscriptable)
-                                return null;
+                                return (isArrow && n.intValue() == 0) ? trimmed : null;
                             }
                             int idx = n.intValue();
                             return (idx >= 0 && idx < plain.length()) ? String.valueOf(plain.charAt(idx)) : null;
@@ -2177,7 +2183,8 @@ class BinaryOpEvaluator {
                 String simPattern = similarToRegexForBinaryOp(right.toString(), "\\");
                 return left.toString().matches("(?s)" + simPattern);
             }
-            case JSON_ARROW: {
+            case JSON_ARROW:
+            case JSON_SUBSCRIPT: {
                 if (left == null || right == null) return null;
                 if (left instanceof HstoreValue && right instanceof List) {
                     HstoreValue h = (HstoreValue) left;
