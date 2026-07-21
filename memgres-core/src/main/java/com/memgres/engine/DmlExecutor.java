@@ -28,12 +28,26 @@ class DmlExecutor {
         this.triggerHelper = new DmlTriggerHelper(executor);
     }
 
-    /** Translate a view column name to the base table column name using the current mapping. */
+    // Captured view→base column mapping for the DML statement currently being executed.
+    // Captured immediately after resolveTable so that later resolveTable calls (FROM clauses,
+    // constraint validation) cannot clobber the shared AstExecutor.lastViewColumnMapping field.
+    private Map<String, String> activeViewColMap;
+    // Ordered base-column names, one per view-column position, for positional INSERT remapping.
+    private List<String> activeViewColOrder;
+
+    /** Translate a view column name to the base table column name using the active mapping. */
     private String mapViewColumn(String colName) {
-        Map<String, String> mapping = executor.lastViewColumnMapping;
+        Map<String, String> mapping = activeViewColMap;
         if (mapping == null || colName == null) return colName;
         String mapped = mapping.get(colName.toLowerCase());
         return mapped != null ? mapped : colName;
+    }
+
+    /** Build a single-table RowContext that also resolves renamed view column names (if any). */
+    private RowContext viewAwareCtx(Table table, String alias, Object[] row) {
+        RowContext ctx = new RowContext(table, alias, row);
+        if (activeViewColMap != null) ctx.setColumnAliases(activeViewColMap);
+        return ctx;
     }
 
     /** Returns true when session_replication_role suppresses user triggers. */
@@ -128,7 +142,11 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're inserting through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
-        Table table = executor.resolveTable(schemaName, stmt.table());
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // Capture view column mapping/order before any further resolveTable calls clobber them.
+        this.activeViewColMap = executor.lastViewColumnMapping;
+        this.activeViewColOrder = executor.lastViewColumnOrder;
         // C6: Enforce INSERT privilege
         executor.checkTablePrivilege("INSERT", schemaName, stmt.table());
         // Check table-level locks (blocks if ACCESS EXCLUSIVE held by another session)
@@ -227,19 +245,31 @@ class DmlExecutor {
         List<Object[]> insertedRows = new ArrayList<>(); // for transition tables in statement triggers
         List<Object[]> afterRowTriggerNewRows = new ArrayList<>(); // queue AFTER ROW triggers
         List<Table> afterRowTriggerTables = new ArrayList<>(); // corresponding target tables for AFTER ROW
+        // Positional INSERT through a reordered/renamed/subset view: the VALUES are supplied in
+        // VIEW-column order, so remap them onto the base table using the view's ordered base-column
+        // list. Named INSERT keeps stmt.columns() (mapViewColumn resolves any renamed view names).
+        List<String> insertColumns = stmt.columns();
+        if (insertColumns == null && activeViewColOrder != null) {
+            insertColumns = activeViewColOrder;
+        }
+        // When the table has row triggers, snapshot target rows so a trigger raising
+        // mid-statement rolls the whole INSERT back (PostgreSQL statement atomicity).
+        Map<Table, List<Object[]>> insSnapshot = triggers.isEmpty() ? null
+                : snapshotTargetTables(collectTargetTables(table));
+        try {
         for (List<Expression> valueRow : valueRows) {
             Object[] row = new Object[table.getColumns().size()];
 
             // Fill provided values FIRST (with type coercion); validates before consuming serials
             Set<Integer> filledCols = new HashSet<>();
-            if (stmt.columns() != null) {
-                for (int i = 0; i < stmt.columns().size(); i++) {
+            if (insertColumns != null) {
+                for (int i = 0; i < insertColumns.size() && i < valueRow.size(); i++) {
                     // Skip DEFAULT keyword; let the serial/default logic handle it
                     if (valueRow.get(i) instanceof Literal && ((Literal) valueRow.get(i)).literalType() == Literal.LiteralType.DEFAULT) continue;
-                    String colName = mapViewColumn(stmt.columns().get(i));
+                    String colName = mapViewColumn(insertColumns.get(i));
                     int colIdx = table.getColumnIndex(colName);
                     if (colIdx < 0) {
-                        throw new MemgresException("Column not found: " + stmt.columns().get(i));
+                        throw new MemgresException("Column not found: " + insertColumns.get(i));
                     }
                     // Reject explicit writes to GENERATED ALWAYS AS ... STORED columns
                     Column genCol = table.getColumns().get(colIdx);
@@ -556,6 +586,11 @@ class DmlExecutor {
 
         // Fire statement-level AFTER triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, table, insertedRows, null);
+        } catch (MemgresException e) {
+            // Statement is atomic: undo any rows already inserted/updated before the failure.
+            if (insSnapshot != null) restoreTargetTables(insSnapshot);
+            throw e;
+        }
 
         // Execute DO ALSO rule if present
         if (alsoRuleSql != null && stmt.values() != null) {
@@ -647,7 +682,8 @@ class DmlExecutor {
                 copySchema = copyTableName.substring(0, dot);
                 copyTableName = copyTableName.substring(dot + 1);
             }
-            Table table = executor.resolveTable(copySchema, copyTableName);
+            // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+            Table table = executor.resolveTable(copySchema, copyTableName, stmt.table().contains("."));
             List<Column> columns;
             List<Integer> colIndices = new ArrayList<>();
             if (stmt.columns() != null && !stmt.columns().isEmpty()) {
@@ -684,7 +720,8 @@ class DmlExecutor {
             fromSchema = fromTableName.substring(0, dot);
             fromTableName = fromTableName.substring(dot + 1);
         }
-        Table table = executor.resolveTable(fromSchema, fromTableName);
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(fromSchema, fromTableName, stmt.table().contains("."));
         if (stmt.columns() != null && !stmt.columns().isEmpty()) {
             Set<String> seen = new java.util.HashSet<>();
             for (String colName : stmt.columns()) {
@@ -753,7 +790,8 @@ class DmlExecutor {
             rowSchema = rowTableName.substring(0, dot);
             rowTableName = rowTableName.substring(dot + 1);
         }
-        Table table = executor.resolveTable(rowSchema, rowTableName);
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(rowSchema, rowTableName, stmt.table().contains("."));
         Object[] row = new Object[table.getColumns().size()];
         fillDefaults(table, row);
         List<Integer> colIndices = resolveColumnIndices(stmt, table);
@@ -970,7 +1008,11 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
-        Table table = executor.resolveTable(schemaName, stmt.table());
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
+        this.activeViewColMap = executor.lastViewColumnMapping;
+        this.activeViewColOrder = executor.lastViewColumnOrder;
         // C6: Enforce UPDATE privilege
         executor.checkTablePrivilege("UPDATE", schemaName, stmt.table());
         // Check for attempts to assign to system columns (PG error 0A000, before replica identity check)
@@ -985,6 +1027,10 @@ class DmlExecutor {
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);
         List<PgTrigger> triggers = triggersDisabled() ? Cols.listOf() : executor.database.getTriggersForTable(stmt.table());
+        // INSTEAD OF UPDATE triggers on a view: the trigger performs the actual work; the virtual
+        // view table's rows are only used to evaluate WHERE and populate OLD/NEW for the trigger.
+        boolean hasInsteadOfUpdate = triggers.stream().anyMatch(
+                t -> t.getTiming() == PgTrigger.Timing.INSTEAD_OF && t.getEvent() == PgTrigger.Event.UPDATE);
         List<Object[]> returningRows = new ArrayList<>();
 
         // Validate: FROM table alias must not conflict with target table alias
@@ -1056,6 +1102,11 @@ class DmlExecutor {
             }
         }
 
+        // When the table has row triggers, snapshot target rows so a trigger raising
+        // mid-statement rolls the whole UPDATE back (PostgreSQL statement atomicity).
+        Map<Table, List<Object[]>> updSnapshot = triggers.isEmpty() ? null
+                : snapshotTargetTables(collectTargetTables(table));
+        try {
         boolean fromUpdateHasVirtual = hasVirtualColumns(table);
         if (fromContexts != null) {
             // Multi-table UPDATE: join main table with FROM tables
@@ -1065,7 +1116,7 @@ class DmlExecutor {
             for (Object[] row : rows) {
                 for (RowContext fromCtx : fromContexts) {
                     Object[] evalRow = fromUpdateHasVirtual ? computeVirtualColumns(table, row) : row;
-                    RowContext mainCtx = new RowContext(table, stmt.alias(), evalRow);
+                    RowContext mainCtx = viewAwareCtx(table, stmt.alias(), evalRow);
                     RowContext combined = mainCtx.merge(fromCtx);
                     if (stmt.where() == null || executor.isTruthy(executor.evalExpr(stmt.where(), combined))) {
                         matchedRows.add(row);
@@ -1143,7 +1194,7 @@ class DmlExecutor {
             rows = rows.stream()
                     .filter(row -> {
                         Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
-                        return executor.isTruthy(executor.evalExpr(stmt.where(), new RowContext(table, updateAlias, evalRow)));
+                        return executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, updateAlias, evalRow)));
                     })
                     .collect(Collectors.toList());
         }
@@ -1166,7 +1217,20 @@ class DmlExecutor {
 
             // Apply SET clauses first, then fire BEFORE UPDATE triggers so they see NEW with proposed values
             Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
-            applySetClauses(stmt.setClauses(), table, newRow, new RowContext(table, updateAlias, evalRow));
+            applySetClauses(stmt.setClauses(), table, newRow, viewAwareCtx(table, updateAlias, evalRow));
+
+            // INSTEAD OF UPDATE trigger on a view: the trigger does the real work (against base
+            // tables), so fire it with OLD/NEW and skip the normal storage update entirely.
+            if (hasInsteadOfUpdate) {
+                Object[] res = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.INSTEAD_OF, PgTrigger.Event.UPDATE, newRow, oldRow, table, updatedColumnNames);
+                if (res != null) {
+                    updatedCount++;
+                    if (stmt.returning() != null && !stmt.returning().isEmpty()) {
+                        returningRows.add(evalReturning(stmt.returning(), table, updateAlias, res, oldRow, res));
+                    }
+                }
+                continue;
+            }
 
             // RLS WITH CHECK on the new row after SET clauses
             if (rlsUpdateActive) {
@@ -1242,6 +1306,11 @@ class DmlExecutor {
                     buildReturningColumns(stmt.returning(), table), returningRows, updatedCount);
         }
         return QueryResult.command(QueryResult.Type.UPDATE, updatedCount);
+        } catch (MemgresException e) {
+            // Statement is atomic: undo any rows already updated before the failure.
+            if (updSnapshot != null) restoreTargetTables(updSnapshot);
+            throw e;
+        }
     }
 
     /**
@@ -1472,13 +1541,54 @@ class DmlExecutor {
         // Check read-only transaction
         checkReadOnly("DELETE");
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
-        Table table = executor.resolveTable(schemaName, stmt.table());
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
+        this.activeViewColMap = executor.lastViewColumnMapping;
+        this.activeViewColOrder = executor.lastViewColumnOrder;
+        // INSTEAD OF DELETE triggers on a view: the trigger performs the actual work; the virtual
+        // view table's rows are only used to match WHERE and populate OLD for the trigger.
+        List<PgTrigger> deleteTriggersEarly = triggersDisabled() ? Cols.listOf()
+                : executor.database.getTriggersForTable(stmt.table());
+        boolean hasInsteadOfDelete = deleteTriggersEarly.stream().anyMatch(
+                t -> t.getTiming() == PgTrigger.Timing.INSTEAD_OF && t.getEvent() == PgTrigger.Event.DELETE);
         // C6: Enforce DELETE privilege
         executor.checkTablePrivilege("DELETE", schemaName, stmt.table());
         checkReplicaIdentity(table, stmt.table(), "delete");
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);
         boolean hasReturning = stmt.returning() != null && !stmt.returning().isEmpty();
+
+        // INSTEAD OF DELETE on a view: fire the trigger for each matching view row (the trigger
+        // performs the real deletion against base tables); the virtual table is never modified.
+        if (hasInsteadOfDelete) {
+            List<Object[]> matched = new ArrayList<>();
+            boolean idHasVirtual = hasVirtualColumns(table);
+            for (Object[] row : table.getRows()) {
+                Object[] evalRow = idHasVirtual ? computeVirtualColumns(table, row) : row;
+                if (stmt.where() == null
+                        || executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), evalRow)))) {
+                    matched.add(row);
+                }
+            }
+            int cnt = 0;
+            List<Object[]> insteadReturning = new ArrayList<>();
+            for (Object[] row : matched) {
+                Object[] res = triggerHelper.executeTriggers(deleteTriggersEarly,
+                        PgTrigger.Timing.INSTEAD_OF, PgTrigger.Event.DELETE, row, row, table);
+                if (res != null) {
+                    cnt++;
+                    if (hasReturning) {
+                        insteadReturning.add(evalReturning(stmt.returning(), table, stmt.alias(), row, row, null));
+                    }
+                }
+            }
+            if (hasReturning) {
+                return QueryResult.returning(QueryResult.Type.DELETE,
+                        buildReturningColumns(stmt.returning(), table), insteadReturning, cnt);
+            }
+            return QueryResult.command(QueryResult.Type.DELETE, cnt);
+        }
 
         // Validate: USING table alias must not conflict with target table alias
         if (stmt.using() != null && !stmt.using().isEmpty()) {
@@ -1569,7 +1679,7 @@ class DmlExecutor {
             List<RowContext> usingContexts = executor.fromResolver.resolveFromClause(stmt.using());
             for (Object[] row : allRows) {
                 Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
-                RowContext mainCtx = new RowContext(table, stmt.alias(), evalRow);
+                RowContext mainCtx = viewAwareCtx(table, stmt.alias(), evalRow);
                 for (RowContext usingCtx : usingContexts) {
                     RowContext merged = mainCtx.merge(usingCtx);
                     if (stmt.where() == null || executor.isTruthy(executor.evalExpr(stmt.where(), merged))) {
@@ -1604,7 +1714,7 @@ class DmlExecutor {
         } else {
             for (Object[] row : allRows) {
                 Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
-                if (executor.isTruthy(executor.evalExpr(stmt.where(), new RowContext(table, stmt.alias(), evalRow)))) {
+                if (executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), evalRow)))) {
                     toDelete.add(row);
                 }
             }
@@ -1664,12 +1774,20 @@ class DmlExecutor {
             oldRowsForTransition.add(Arrays.copyOf(row, row.length));
         }
         deletedRows.addAll(toDelete);
+        // Record undo (and run the RR write-write conflict check) before the physical
+        // delete, so an aborted statement leaves no unrecorded mutation behind.
+        recordDeleteUndo(stmt.schema(), stmt.table(), deletedRows);
+        // When the table has row triggers, snapshot target rows so an AFTER-trigger raising
+        // mid-statement rolls the whole DELETE back (PostgreSQL statement atomicity).
+        Map<Table, List<Object[]>> delSnapshot = triggers.isEmpty() ? null
+                : snapshotTargetTables(tablesToScan);
+        int deleted;
+        try {
         // Remove matching rows atomically from each owning table
         for (Table t : tablesToScan) {
             t.deleteRows(toDelete);
         }
-        int deleted = deletedRows.size();
-        recordDeleteUndo(stmt.schema(), stmt.table(), deletedRows);
+        deleted = deletedRows.size();
 
         // Fire queued AFTER DELETE row triggers
         if (!triggers.isEmpty()) {
@@ -1680,6 +1798,10 @@ class DmlExecutor {
 
         // Fire statement-level AFTER DELETE triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, table, null, oldRowsForTransition);
+        } catch (MemgresException e) {
+            if (delSnapshot != null) restoreTargetTables(delSnapshot);
+            throw e;
+        }
 
         // Track DML statistics
         if (deleted > 0) table.incrementTupDeleted(deleted);
@@ -1699,7 +1821,8 @@ class DmlExecutor {
 
     private QueryResult executeMergeInner(MergeStmt stmt) {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
-        Table targetTable = executor.resolveTable(schemaName, stmt.targetTable());
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
 
         // Validate: source cannot be the same unaliased table as target
@@ -1838,29 +1961,37 @@ class DmlExecutor {
                                 processedTargetRows.add(targetRow);
                                 mergeCount++;
                             } else if (wm.setClauses() != null && !wm.setClauses().isEmpty()) {
-                                // UPDATE — evaluate all SET RHS against original row snapshot, then assign
+                                // UPDATE — evaluate all SET RHS against original row snapshot onto a
+                                // working copy, then let BEFORE triggers see/modify it before committing.
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
-                                int[] setIndices = new int[wm.setClauses().size()];
-                                Object[] setValues = new Object[wm.setClauses().size()];
+                                Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
+                                Set<String> updCols = new HashSet<>();
                                 for (int si = 0; si < wm.setClauses().size(); si++) {
                                     InsertStmt.SetClause set = wm.setClauses().get(si);
                                     int colIdx = targetTable.getColumnIndex(set.column());
                                     if (colIdx < 0) {
                                         throw new MemgresException("Column not found: " + set.column());
                                     }
-                                    setIndices[si] = colIdx;
-                                    setValues[si] = TypeCoercion.coerceForStorage(
+                                    updCols.add(set.column().toLowerCase());
+                                    newRow[colIdx] = TypeCoercion.coerceForStorage(
                                             executor.evalExpr(set.value(), combined), targetTable.getColumns().get(colIdx));
                                 }
-                                for (int si = 0; si < setIndices.length; si++) {
-                                    targetRow[setIndices[si]] = setValues[si];
+                                // Fire BEFORE UPDATE row triggers: PG fires them per matched row.
+                                // They may modify NEW or return NULL to skip the row entirely.
+                                newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, targetTable, updCols);
+                                if (newRow == null) {
+                                    // BEFORE trigger suppressed this row: no update, not counted.
+                                    processedTargetRows.add(targetRow);
+                                    break;
                                 }
+                                // Commit the (possibly trigger-modified) new values onto the live row.
+                                System.arraycopy(newRow, 0, targetRow, 0, targetRow.length);
                                 computeGeneratedColumns(targetTable, targetRow);
                                 executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
                                 // Fire AFTER UPDATE triggers for MERGE
-                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable);
+                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
                                 // Collect RETURNING after update (uses new values)
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
@@ -1912,19 +2043,30 @@ class DmlExecutor {
                                 rowsToDelete.add(targetRow);
                             } else if (wnmbs.setClauses() != null && !wnmbs.setClauses().isEmpty()) {
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
+                                Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
+                                Set<String> updCols = new HashSet<>();
                                 for (InsertStmt.SetClause set : wnmbs.setClauses()) {
                                     int colIdx = targetTable.getColumnIndex(set.column());
                                     if (colIdx < 0) {
                                         throw new MemgresException("Column not found: " + set.column());
                                     }
+                                    updCols.add(set.column().toLowerCase());
                                     Object val = executor.evalExpr(set.value(), targetCtx);
-                                    targetRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
+                                    newRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
                                 }
+                                // Fire BEFORE UPDATE row triggers (may modify NEW or skip via NULL).
+                                newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, targetTable, updCols);
+                                if (newRow == null) {
+                                    // BEFORE trigger suppressed this row: no update, not counted.
+                                    processedTargetRows.add(targetRow);
+                                    break;
+                                }
+                                System.arraycopy(newRow, 0, targetRow, 0, targetRow.length);
                                 computeGeneratedColumns(targetTable, targetRow);
                                 executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
-                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable);
+                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
                                     returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow, nullSourceCtx));
@@ -1983,6 +2125,13 @@ class DmlExecutor {
                             }
                         }
                         computeGeneratedColumns(targetTable, newRow);
+                        // Fire BEFORE INSERT row triggers: PG fires them per inserted row.
+                        // They may modify NEW or return NULL to skip the row entirely.
+                        newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, newRow, null, targetTable);
+                        if (newRow == null) {
+                            // BEFORE trigger suppressed this row: not inserted, not counted.
+                            break;
+                        }
                         validationHelper.validateEnumValues(newRow, targetTable);
                         Table routedTable = partitionHelper.routeToPartition(targetTable, newRow);
                         routedTable.getWriteLock().lock();
@@ -2017,15 +2166,19 @@ class DmlExecutor {
                 try {
                     List<Object[]> allRows = new ArrayList<>(targetTable.getRows());
                     List<Object[]> deletedRows = new ArrayList<>();
-                    targetTable.deleteAll();
                     for (Object[] row : allRows) {
                         if (rowsToDelete.contains(row)) {
                             deletedRows.add(row);
-                        } else {
+                        }
+                    }
+                    // Record undo (and run the RR conflict check) before mutating.
+                    recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
+                    targetTable.deleteAll();
+                    for (Object[] row : allRows) {
+                        if (!rowsToDelete.contains(row)) {
                             targetTable.insertRow(row);
                         }
                     }
-                    recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
                 } finally {
                     targetTable.getWriteLock().unlock();
                 }
@@ -2065,6 +2218,54 @@ class DmlExecutor {
             return QueryResult.returning(QueryResult.Type.MERGE, retCols, returningRows, mergeCount);
         }
         return QueryResult.command(QueryResult.Type.MERGE, mergeCount);
+    }
+
+    // ---- Statement atomicity: snapshot / restore target-table rows ----
+    //
+    // PostgreSQL treats each INSERT/UPDATE/DELETE/MERGE as an atomic statement: if a row
+    // trigger (or constraint) raises partway through, every side effect the statement had
+    // already applied is rolled back. Autocommit statements have no transaction undo log to
+    // lean on (Session.recordUndo only records inside a transaction), so we snapshot the
+    // affected table(s) up front and, on failure, restore them. Mirrors the MERGE executor.
+
+    /** Collect the target table plus all of its leaf partitions (rows can live on either). */
+    private List<Table> collectTargetTables(Table table) {
+        List<Table> tables = new ArrayList<>();
+        if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
+            DmlPartitionHelper.collectAllPartitionTables(table, tables);
+        } else {
+            tables.add(table);
+        }
+        return tables;
+    }
+
+    /** Deep-copy every row of each given table so the statement can be rolled back. */
+    private Map<Table, List<Object[]>> snapshotTargetTables(List<Table> tables) {
+        Map<Table, List<Object[]>> snapshot = new IdentityHashMap<>();
+        for (Table t : tables) {
+            List<Object[]> copy = new ArrayList<>();
+            for (Object[] r : t.getRows()) {
+                copy.add(Arrays.copyOf(r, r.length));
+            }
+            snapshot.put(t, copy);
+        }
+        return snapshot;
+    }
+
+    /** Restore each snapshotted table to its captured state (used on mid-statement failure). */
+    private void restoreTargetTables(Map<Table, List<Object[]>> snapshot) {
+        for (Map.Entry<Table, List<Object[]>> e : snapshot.entrySet()) {
+            Table t = e.getKey();
+            t.getWriteLock().lock();
+            try {
+                t.deleteAll();
+                for (Object[] r : e.getValue()) {
+                    t.insertRow(r);
+                }
+            } finally {
+                t.getWriteLock().unlock();
+            }
+        }
     }
 
     // ---- Helper: compute generated columns ----
@@ -2238,6 +2439,10 @@ class DmlExecutor {
      * is explicitly listed in a publication.
      */
     private void checkReplicaIdentity(Table table, String tableName, String dmlVerb) {
+        // Views are never part of a publication's row-change stream (INSTEAD OF triggers do the
+        // real work against base tables). PG applies FOR ALL TABLES only to real tables, so a
+        // DML through a view must not be blocked by the publisher replica-identity requirement.
+        if (table.isViewProjection()) return;
         if (executor.database.getPublications().isEmpty()) return;
         boolean published = false;
         for (Database.PubDef pub : executor.database.getPublications().values()) {
@@ -2272,6 +2477,15 @@ class DmlExecutor {
     private void recordDeleteUndo(String schema, String table, List<Object[]> rows) {
         if (rows.isEmpty()) return;
         String schemaName = schema != null ? schema : executor.defaultSchema();
+        // M7: RR write-write conflict detection — if a row we're about to delete was
+        // modified by a concurrent committed transaction after our snapshot, raise 40001.
+        // Mirrors the check on the UPDATE path (recordUpdateUndo). Must run before the
+        // undo is recorded (callers invoke this before the physical delete).
+        if (executor.session != null) {
+            for (Object[] row : rows) {
+                executor.session.checkRRWriteConflict(schemaName + "." + table, row);
+            }
+        }
         executor.recordUndo(new Session.DeleteUndo(schemaName, table, rows));
         // Track for MVCC visibility
         if (executor.session != null) {
@@ -2370,6 +2584,8 @@ class DmlExecutor {
             }
         }
         RowContext ctx = new RowContext(bindings);
+        // Resolve renamed view column names in RETURNING against the base row.
+        if (activeViewColMap != null) ctx.setColumnAliases(activeViewColMap);
         // Merge source context (FROM/USING/MERGE source tables) so RETURNING can reference them
         if (sourceCtx != null) {
             ctx = ctx.merge(sourceCtx);

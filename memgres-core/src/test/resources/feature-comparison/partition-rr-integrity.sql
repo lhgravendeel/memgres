@@ -6,9 +6,9 @@
 -- C4a: Column mismatch detection
 CREATE TABLE parent_c4(id int, name text) PARTITION BY RANGE(id);
 CREATE TABLE bad_cols(id int, extra text, name text);
--- PG: ERROR 42P16 "table has column not found in parent"
+-- PG 18: ERROR 42804 "table ... contains column ... not found in parent"
 ALTER TABLE parent_c4 ATTACH PARTITION bad_cols FOR VALUES FROM (1) TO (10);
--- expect: error 42P16
+-- expect: error 42804
 
 -- C4b: Existing row bounds validation
 CREATE TABLE parent_c4b(id int) PARTITION BY RANGE(id);
