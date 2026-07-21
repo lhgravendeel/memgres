@@ -1,7 +1,9 @@
 package com.memgres.pgwire;
 
+import com.memgres.engine.Column;
 import com.memgres.engine.DataType;
 import com.memgres.engine.PgInterval;
+import com.memgres.engine.TypeCoercion;
 import com.memgres.engine.util.Strs;
 import io.netty.buffer.ByteBuf;
 
@@ -242,6 +244,37 @@ class PgWireBinaryCodec {
     // ---- Encoding: binary values for DataRow (writes to ByteBuf) ----
 
     /**
+     * Write a non-null column value in PG binary format to a ByteBuf (for DataRow messages).
+     *
+     * <p>Array-typed table columns carry their element type in {@link Column#getArrayElementType()}
+     * while {@link Column#getType()} is (for most element types) the scalar element type, not an
+     * array {@code DataType}. Routing on the element type here lets every array column — not just
+     * the two whose {@code getType()} happens to be {@code _int4}/{@code _text} — emit a proper
+     * binary array, which is what pgjdbc demands once it has requested binary for the field.
+     */
+    static void writeBinaryValue(ByteBuf buf, Object val, Column col) {
+        if (col != null) {
+            DataType elem = col.getArrayElementType();
+            if (elem != null && elem != DataType.ENUM) {
+                int savedWriterIndex = buf.writerIndex();
+                try {
+                    byte[] arr = encodeBinaryArrayTyped(val, elem.getOid(), elem);
+                    buf.writeInt(arr.length);
+                    buf.writeBytes(arr);
+                    return;
+                } catch (Exception e) {
+                    buf.writerIndex(savedWriterIndex);
+                    writeTextFallback(buf, val);
+                    return;
+                }
+            }
+            writeBinaryValue(buf, val, col.getType());
+            return;
+        }
+        writeBinaryValue(buf, val, (DataType) null);
+    }
+
+    /**
      * Write a non-null value in PG binary format to a ByteBuf (for DataRow messages).
      * Writes the 4-byte length prefix followed by the encoded value.
      */
@@ -292,9 +325,15 @@ class PgWireBinaryCodec {
                 case TIMESTAMP: {
                     String tsStr = val instanceof String ? ((String) val).trim()
                                  : val instanceof LocalDateTime ? null : val.toString().trim();
-                    if ("infinity".equalsIgnoreCase(tsStr)) {
+                    // PG 'infinity'/'-infinity' -> Long.MAX_VALUE / Long.MIN_VALUE sentinels.
+                    // Memgres may carry these as the "infinity" text form OR as the saturated
+                    // LocalDateTime sentinels (9999-12-31.. / 4713-01-01 BC); computing micros
+                    // from the latter overflows Duration.toNanos(), so intercept both.
+                    if ("infinity".equalsIgnoreCase(tsStr)
+                            || TypeCoercion.TIMESTAMP_INFINITY.equals(val)) {
                         buf.writeInt(8); buf.writeLong(Long.MAX_VALUE); break;
-                    } else if ("-infinity".equalsIgnoreCase(tsStr)) {
+                    } else if ("-infinity".equalsIgnoreCase(tsStr)
+                            || TypeCoercion.TIMESTAMP_NEG_INFINITY.equals(val)) {
                         buf.writeInt(8); buf.writeLong(Long.MIN_VALUE); break;
                     }
                     buf.writeInt(8);
@@ -309,9 +348,13 @@ class PgWireBinaryCodec {
                 case TIMESTAMPTZ: {
                     String tstzStr = val instanceof String ? ((String) val).trim()
                                    : val instanceof OffsetDateTime ? null : val.toString().trim();
-                    if ("infinity".equalsIgnoreCase(tstzStr)) {
+                    boolean sentinelPos = val instanceof OffsetDateTime
+                            && TypeCoercion.TIMESTAMP_INFINITY.equals(((OffsetDateTime) val).toLocalDateTime());
+                    boolean sentinelNeg = val instanceof OffsetDateTime
+                            && TypeCoercion.TIMESTAMP_NEG_INFINITY.equals(((OffsetDateTime) val).toLocalDateTime());
+                    if ("infinity".equalsIgnoreCase(tstzStr) || sentinelPos) {
                         buf.writeInt(8); buf.writeLong(Long.MAX_VALUE); break;
-                    } else if ("-infinity".equalsIgnoreCase(tstzStr)) {
+                    } else if ("-infinity".equalsIgnoreCase(tstzStr) || sentinelNeg) {
                         buf.writeInt(8); buf.writeLong(Long.MIN_VALUE); break;
                     }
                     buf.writeInt(8);
@@ -334,7 +377,7 @@ class PgWireBinaryCodec {
                     buf.writeInt(4);
                     LocalDate ld;
                     if (val instanceof LocalDate) ld = ((LocalDate) val);
-                    else ld = LocalDate.parse(dateStr);
+                    else ld = parseDateMaybeBc(dateStr);
                     int days = (int) java.time.temporal.ChronoUnit.DAYS.between(
                             LocalDate.of(2000, 1, 1), ld);
                     buf.writeInt(days);
@@ -469,25 +512,18 @@ class PgWireBinaryCodec {
                     }
                     break;
                 }
-                case TEXT_ARRAY: {
-                    // Mirror the COPY-path array encoder (encodeBinaryArray) so DataRow
-                    // and COPY produce byte-identical array wire formats.
-                    byte[] arr = encodeBinaryArray(val, 25);
-                    buf.writeInt(arr.length);
-                    buf.writeBytes(arr);
-                    break;
-                }
-                case INT4_ARRAY: {
-                    byte[] arr = encodeBinaryArray(val, 23);
-                    buf.writeInt(arr.length);
-                    buf.writeBytes(arr);
-                    break;
-                }
                 default: {
-                    String text = PgWireValueFormatter.formatValue(val, null);
-                    byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-                    buf.writeInt(bytes.length);
-                    buf.writeBytes(bytes);
+                    // Array DataTypes (used by array-typed expression columns, whose getType() is
+                    // the _xxx array type rather than the element type). Encode each element in
+                    // binary keyed off the element OID/type.
+                    DataType elemType = arrayElementDataType(type);
+                    if (elemType != null) {
+                        byte[] arr = encodeBinaryArrayTyped(val, elemType.getOid(), elemType);
+                        buf.writeInt(arr.length);
+                        buf.writeBytes(arr);
+                        break;
+                    }
+                    writeTextFallback(buf, val);
                     break;
                 }
             }
@@ -495,11 +531,63 @@ class PgWireBinaryCodec {
             // Reset to before the failed encoding attempt to avoid mis-framing
             buf.writerIndex(savedWriterIndex);
             // Fall back to text encoding
-            String text = PgWireValueFormatter.formatValue(val, null);
-            byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
-            buf.writeInt(bytes.length);
-            buf.writeBytes(bytes);
+            writeTextFallback(buf, val);
         }
+    }
+
+    /** Write a value's text form with its 4-byte length prefix (used as a binary-encoding fallback). */
+    private static void writeTextFallback(ByteBuf buf, Object val) {
+        String text = PgWireValueFormatter.formatValue(val, null);
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        buf.writeInt(bytes.length);
+        buf.writeBytes(bytes);
+    }
+
+    /** Element {@link DataType} for an array {@code DataType}, or null if the type is not an array. */
+    static DataType arrayElementDataType(DataType arrayType) {
+        if (arrayType == null) return null;
+        switch (arrayType) {
+            case BOOL_ARRAY: return DataType.BOOLEAN;
+            case INT2_ARRAY: return DataType.SMALLINT;
+            case INT4_ARRAY: return DataType.INTEGER;
+            case INT8_ARRAY: return DataType.BIGINT;
+            case FLOAT4_ARRAY: return DataType.REAL;
+            case FLOAT8_ARRAY: return DataType.DOUBLE_PRECISION;
+            case NUMERIC_ARRAY: return DataType.NUMERIC;
+            case TEXT_ARRAY: return DataType.TEXT;
+            case VARCHAR_ARRAY: return DataType.VARCHAR;
+            case CHAR_ARRAY: return DataType.CHAR;
+            case NAME_ARRAY: return DataType.NAME;
+            case DATE_ARRAY: return DataType.DATE;
+            case TIMESTAMP_ARRAY: return DataType.TIMESTAMP;
+            case TIMESTAMPTZ_ARRAY: return DataType.TIMESTAMPTZ;
+            case TIME_ARRAY: return DataType.TIME;
+            case TIMETZ_ARRAY: return DataType.TIMETZ;
+            case UUID_ARRAY: return DataType.UUID;
+            case BYTEA_ARRAY: return DataType.BYTEA;
+            case INTERVAL_ARRAY: return DataType.INTERVAL;
+            case JSON_ARRAY: return DataType.JSON;
+            case JSONB_ARRAY: return DataType.JSONB;
+            case INET_ARRAY: return DataType.INET;
+            default: return null;
+        }
+    }
+
+    /**
+     * Parse a date string that may carry a PG-style " BC" era suffix into a proleptic-Gregorian
+     * {@link LocalDate}. Memgres stores BC dates as "YYYY-MM-DD BC" with a positive year, whereas
+     * java.time uses proleptic years (1 BC == year 0, 2 BC == year -1, ...). Converting here lets
+     * BC dates encode as a normal 4-byte day count instead of falling back to unreadable text.
+     */
+    static LocalDate parseDateMaybeBc(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.toUpperCase().endsWith(" BC")) {
+            String datePart = t.substring(0, t.length() - 3).trim();
+            LocalDate d = LocalDate.parse(datePart);
+            return d.withYear(1 - d.getYear());
+        }
+        return LocalDate.parse(t);
     }
 
     // ---- Encoding: binary values for COPY (returns byte[]) ----
@@ -508,8 +596,11 @@ class PgWireBinaryCodec {
     static byte[] encodeBinaryValue(Object val, DataType type) {
         if (type == null) type = DataType.TEXT;
         switch (type) {
-            case BOOLEAN:
-                return new byte[]{Boolean.TRUE.equals(val) ? (byte) 1 : (byte) 0};
+            case BOOLEAN: {
+                boolean b = (val instanceof Boolean) ? ((Boolean) val)
+                        : ("t".equalsIgnoreCase(val.toString()) || "true".equalsIgnoreCase(val.toString()));
+                return new byte[]{b ? (byte) 1 : (byte) 0};
+            }
             case SMALLINT:
             case SMALLSERIAL: {
                 short s = (val instanceof Number) ? ((Number) val).shortValue() : Short.parseShort(val.toString());
@@ -607,6 +698,8 @@ class PgWireBinaryCodec {
         }
         else bd = new BigDecimal(val.toString());
 
+        // Materialize negative scale (numeric(p,-s)) into real trailing zeros; PG's dscale is >= 0.
+        if (bd.scale() < 0) bd = bd.setScale(0);
         String unscaled = bd.unscaledValue().abs().toString();
         int scale = bd.scale();
         boolean negative = bd.signum() < 0;
@@ -643,6 +736,10 @@ class PgWireBinaryCodec {
 
     /** Encode a BigDecimal in PG binary numeric format, writing to a ByteBuf with length prefix. */
     static void encodeBinaryNumericToBuf(ByteBuf buf, BigDecimal bd) {
+        // A negative scale (e.g. numeric(10,-2) holds 1234500 as unscaled 12345 × 10^2) must be
+        // materialized into real trailing zeros before encoding: PG stores the full value with a
+        // dscale of 0, never a negative dscale. setScale(0) is exact here (it only adds zeros).
+        if (bd.scale() < 0) bd = bd.setScale(0);
         if (bd.signum() == 0) {
             buf.writeInt(8);
             buf.writeShort(0);                    // ndigits
@@ -696,6 +793,91 @@ class PgWireBinaryCodec {
     }
 
     // ---- Encoding: binary arrays ----
+
+    /**
+     * Encode a one-dimensional PG array in binary format, encoding each element in the binary
+     * representation for {@code elementType}. Elements come straight from the engine's
+     * {@code List<Object>} representation when available (preserving typed values such as
+     * {@code LocalDateTime}/{@code UUID}/{@code BigDecimal}); otherwise the array's text form is
+     * parsed back into element strings, which {@link #encodeBinaryValue} then re-parses per type.
+     */
+    static byte[] encodeBinaryArrayTyped(Object val, int elementOid, DataType elementType) {
+        List<Object> elements = extractArrayElements(val);
+        boolean hasNull = false;
+        for (Object e : elements) if (e == null) { hasNull = true; break; }
+
+        ByteArrayOutputStream bufOs = new ByteArrayOutputStream();
+        // ndim: PG uses 0 for an empty array, 1 otherwise (multi-dim not emitted here).
+        writeInt32(bufOs, elements.isEmpty() ? 0 : 1);
+        writeInt32(bufOs, hasNull ? 1 : 0);
+        writeInt32(bufOs, elementOid);
+        if (!elements.isEmpty()) {
+            writeInt32(bufOs, elements.size());
+            writeInt32(bufOs, 1); // lower bound
+            for (Object e : elements) {
+                if (e == null) {
+                    writeInt32(bufOs, -1);
+                } else {
+                    byte[] encoded = encodeBinaryValue(e, elementType);
+                    writeInt32(bufOs, encoded.length);
+                    try { bufOs.write(encoded); } catch (IOException ex) { throw new RuntimeException(ex); }
+                }
+            }
+        }
+        return bufOs.toByteArray();
+    }
+
+    /**
+     * Normalize an array value into a flat {@code List<Object>} of elements (nulls preserved).
+     * Accepts the engine's native {@code List} form directly, or parses a PG array-literal string.
+     */
+    private static List<Object> extractArrayElements(Object val) {
+        if (val instanceof List<?>) {
+            return new ArrayList<>((List<?>) val);
+        }
+        List<Object> elements = new ArrayList<>();
+        String text = PgWireValueFormatter.formatValue(val, null);
+        if (text.length() > 2 && text.startsWith("{") && text.endsWith("}")) {
+            String inner = text.substring(1, text.length() - 1);
+            StringBuilder current = new StringBuilder();
+            boolean inQuotes = false;
+            boolean quotedElem = false;
+            for (int i = 0; i < inner.length(); i++) {
+                char c = inner.charAt(i);
+                if (inQuotes) {
+                    if (c == '\\' && i + 1 < inner.length()) {
+                        current.append(inner.charAt(++i));
+                    } else if (c == '"' && i + 1 < inner.length() && inner.charAt(i + 1) == '"') {
+                        current.append('"');
+                        i++;
+                    } else if (c == '"') {
+                        inQuotes = false;
+                    } else {
+                        current.append(c);
+                    }
+                } else if (c == '"') {
+                    inQuotes = true;
+                    quotedElem = true;
+                } else if (c == ',') {
+                    addParsedElement(elements, current.toString(), quotedElem);
+                    current.setLength(0);
+                    quotedElem = false;
+                } else {
+                    current.append(c);
+                }
+            }
+            addParsedElement(elements, current.toString(), quotedElem);
+        }
+        return elements;
+    }
+
+    private static void addParsedElement(List<Object> elements, String elem, boolean quoted) {
+        if (!quoted && elem.equalsIgnoreCase("NULL")) {
+            elements.add(null);
+        } else {
+            elements.add(elem);
+        }
+    }
 
     /** Encode a PG array value in binary format. */
     static byte[] encodeBinaryArray(Object val, int elementOid) {

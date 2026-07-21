@@ -870,16 +870,109 @@ class PgWireDescribeHelper {
 
     private void sendParameterDescription(ChannelHandlerContext ctx, String sql, int[] oids) {
         int numParams = countParameters(sql);
+        int[] inferred = inferParamOidsFromCasts(sql, numParams);
         ByteBuf buf = ctx.alloc().buffer();
         buf.writeByte('t');
         buf.writeInt(4 + 2 + numParams * 4);
         buf.writeShort(numParams);
         for (int i = 0; i < numParams; i++) {
-            // Use provided OID, or default to TEXT (25) instead of 0 to avoid pgjdbc crash
-            int oid = (oids != null && i < oids.length && oids[i] != 0) ? oids[i] : 25;
+            int oid;
+            if (oids != null && i < oids.length && oids[i] != 0) {
+                oid = oids[i];                       // client-specified type wins
+            } else if (inferred[i] != 0) {
+                oid = inferred[i];                   // inferred from an enclosing cast context
+            } else {
+                oid = 25;                            // default to TEXT (not 0, which crashes pgjdbc)
+            }
             buf.writeInt(oid);
         }
         ctx.write(buf);
+    }
+
+    /**
+     * Infer parameter type OIDs from an enclosing cast context, e.g. {@code $1::int8},
+     * {@code $2::timestamp}, or {@code CAST($3 AS numeric)}. PG reports the cast target type for
+     * such parameters; without this, an unspecified parameter falls back to TEXT and tools like
+     * pgjdbc's {@code ParameterMetaData.getParameterType} report the wrong type. Returns an array
+     * of length {@code numParams} (0 where nothing could be inferred).
+     */
+    static int[] inferParamOidsFromCasts(String sql, int numParams) {
+        int[] result = new int[numParams];
+        if (numParams == 0) return result;
+        boolean inString = false;
+        int len = sql.length();
+        for (int i = 0; i < len; i++) {
+            char c = sql.charAt(i);
+            if (inString) {
+                if (c == '\'' && i + 1 < len && sql.charAt(i + 1) == '\'') { i++; }
+                else if (c == '\'') { inString = false; }
+                continue;
+            }
+            if (c == '\'') { inString = true; continue; }
+            if (c == '$' && i + 1 < len && Character.isDigit(sql.charAt(i + 1))) {
+                int j = i + 1;
+                while (j < len && Character.isDigit(sql.charAt(j))) j++;
+                int paramNum = Integer.parseInt(sql.substring(i + 1, j));
+                int k = j;
+                while (k < len && Character.isWhitespace(sql.charAt(k))) k++;
+                String typeName = null;
+                if (k + 1 < len && sql.charAt(k) == ':' && sql.charAt(k + 1) == ':') {
+                    // $N::type
+                    k += 2;
+                    while (k < len && Character.isWhitespace(sql.charAt(k))) k++;
+                    typeName = readTypeName(sql, k);
+                } else if (k + 1 < len && (sql.charAt(k) == 'A' || sql.charAt(k) == 'a')
+                        && (sql.charAt(k + 1) == 'S' || sql.charAt(k + 1) == 's')
+                        && (k + 2 >= len || !Character.isLetterOrDigit(sql.charAt(k + 2)))) {
+                    // CAST($N AS type)
+                    k += 2;
+                    while (k < len && Character.isWhitespace(sql.charAt(k))) k++;
+                    typeName = readTypeName(sql, k);
+                }
+                if (typeName != null && paramNum >= 1 && paramNum <= numParams) {
+                    DataType dt = DataType.fromPgName(typeName);
+                    if (dt != null) result[paramNum - 1] = dt.getOid();
+                }
+                i = j - 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Read a SQL type name starting at {@code pos}: a (possibly multi-word) base name, an optional
+     * {@code (p[,s])} precision, and an optional {@code []} array marker. Returns a name suitable
+     * for {@link DataType#fromPgName} (precision/array markers stripped, since only the base OID is
+     * needed here), or null if no identifier is present.
+     */
+    private static String readTypeName(String sql, int pos) {
+        int len = sql.length();
+        int start = pos;
+        while (pos < len && (Character.isLetterOrDigit(sql.charAt(pos)) || sql.charAt(pos) == '_' || sql.charAt(pos) == '.')) {
+            pos++;
+        }
+        if (pos == start) return null;
+        String base = sql.substring(start, pos);
+        // Drop schema qualification (e.g. pg_catalog.int8 -> int8).
+        int dot = base.lastIndexOf('.');
+        if (dot >= 0) base = base.substring(dot + 1);
+        // Greedily absorb multi-word type spellings (double precision, timestamp with time zone, ...).
+        StringBuilder multi = new StringBuilder(base);
+        int p = pos;
+        String best = base;
+        for (int words = 0; words < 3; words++) {
+            int q = p;
+            while (q < len && Character.isWhitespace(sql.charAt(q))) q++;
+            int ws = q;
+            while (q < len && Character.isLetter(sql.charAt(q))) q++;
+            if (q == ws) break;
+            multi.append(' ').append(sql.substring(ws, q));
+            if (DataType.fromPgName(multi.toString()) != null) {
+                best = multi.toString();
+                p = q;
+            }
+        }
+        return best;
     }
 
     private void sendRowDescription(ChannelHandlerContext ctx, QueryResult result) {
