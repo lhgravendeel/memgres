@@ -1060,7 +1060,9 @@ class DdlAlterTableExecutor {
         table.addPartition(partition);
     }
 
-    /** C4a: Partition must have same columns (by name and compatible types) as parent. */
+    /** C4a: Partition must have the same columns (by name and type) as the parent.
+     * PG raises 42804 (ERRCODE_DATATYPE_MISMATCH) for every column mismatch — extra
+     * column, missing column, or a same-named column whose type differs. */
     private void validatePartitionColumns(Table parent, Table partition, String partName) {
         List<Column> parentCols = parent.getColumns();
         List<Column> partCols = partition.getColumns();
@@ -1076,23 +1078,54 @@ class DdlAlterTableExecutor {
             if (!found) {
                 throw new MemgresException("table \"" + partName
                         + "\" contains column \"" + pc.getName()
-                        + "\" not found in parent \"" + parent.getName() + "\"", "42P16");
+                        + "\" not found in parent \"" + parent.getName() + "\"", "42804");
             }
         }
-        // Check parent columns exist in partition
+        // Check parent columns exist in partition AND have a matching type
         for (Column pp : parentCols) {
-            boolean found = false;
+            Column match = null;
             for (Column pc : partCols) {
                 if (pc.getName().equalsIgnoreCase(pp.getName())) {
-                    found = true;
+                    match = pc;
                     break;
                 }
             }
-            if (!found) {
+            if (match == null) {
                 throw new MemgresException("child table is missing column \""
-                        + pp.getName() + "\"", "42P16");
+                        + pp.getName() + "\"", "42804");
+            }
+            if (!sameColumnType(pp, match)) {
+                throw new MemgresException("child table \"" + partName
+                        + "\" has different type for column \"" + pp.getName() + "\"", "42804");
             }
         }
+    }
+
+    /** Normalized type-identity comparison for ATTACH PARTITION. Uses the regtype
+     * display name (so serial/int, bigserial/bigint collapse to their real type and
+     * typmod is ignored — matching PG, which never rejects on length/precision here),
+     * plus enum identity, array element type, and domain identity. */
+    private boolean sameColumnType(Column a, Column b) {
+        if (!a.getType().toRegtypeDisplay().equalsIgnoreCase(b.getType().toRegtypeDisplay())) {
+            return false;
+        }
+        if (!equalsIgnoreCaseNullable(a.getEnumTypeName(), b.getEnumTypeName())) {
+            return false;
+        }
+        if (!equalsIgnoreCaseNullable(a.getDomainTypeName(), b.getDomainTypeName())) {
+            return false;
+        }
+        DataType ae = a.getArrayElementType();
+        DataType be = b.getArrayElementType();
+        if (ae == null ? be != null : (be == null || ae != be)) {
+            return false;
+        }
+        return true;
+    }
+
+    private static boolean equalsIgnoreCaseNullable(String a, String b) {
+        if (a == null) return b == null;
+        return a.equalsIgnoreCase(b);
     }
 
     /** C4b: All existing rows must satisfy the partition's bounds. */

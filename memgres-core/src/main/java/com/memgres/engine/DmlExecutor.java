@@ -1768,6 +1768,9 @@ class DmlExecutor {
             oldRowsForTransition.add(Arrays.copyOf(row, row.length));
         }
         deletedRows.addAll(toDelete);
+        // Record undo (and run the RR write-write conflict check) before the physical
+        // delete, so an aborted statement leaves no unrecorded mutation behind.
+        recordDeleteUndo(stmt.schema(), stmt.table(), deletedRows);
         // When the table has row triggers, snapshot target rows so an AFTER-trigger raising
         // mid-statement rolls the whole DELETE back (PostgreSQL statement atomicity).
         Map<Table, List<Object[]>> delSnapshot = triggers.isEmpty() ? null
@@ -1779,7 +1782,6 @@ class DmlExecutor {
             t.deleteRows(toDelete);
         }
         deleted = deletedRows.size();
-        recordDeleteUndo(stmt.schema(), stmt.table(), deletedRows);
 
         // Fire queued AFTER DELETE row triggers
         if (!triggers.isEmpty()) {
@@ -2157,15 +2159,19 @@ class DmlExecutor {
                 try {
                     List<Object[]> allRows = new ArrayList<>(targetTable.getRows());
                     List<Object[]> deletedRows = new ArrayList<>();
-                    targetTable.deleteAll();
                     for (Object[] row : allRows) {
                         if (rowsToDelete.contains(row)) {
                             deletedRows.add(row);
-                        } else {
+                        }
+                    }
+                    // Record undo (and run the RR conflict check) before mutating.
+                    recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
+                    targetTable.deleteAll();
+                    for (Object[] row : allRows) {
+                        if (!rowsToDelete.contains(row)) {
                             targetTable.insertRow(row);
                         }
                     }
-                    recordDeleteUndo(stmt.schema(), stmt.targetTable(), deletedRows);
                 } finally {
                     targetTable.getWriteLock().unlock();
                 }
@@ -2464,6 +2470,15 @@ class DmlExecutor {
     private void recordDeleteUndo(String schema, String table, List<Object[]> rows) {
         if (rows.isEmpty()) return;
         String schemaName = schema != null ? schema : executor.defaultSchema();
+        // M7: RR write-write conflict detection — if a row we're about to delete was
+        // modified by a concurrent committed transaction after our snapshot, raise 40001.
+        // Mirrors the check on the UPDATE path (recordUpdateUndo). Must run before the
+        // undo is recorded (callers invoke this before the physical delete).
+        if (executor.session != null) {
+            for (Object[] row : rows) {
+                executor.session.checkRRWriteConflict(schemaName + "." + table, row);
+            }
+        }
         executor.recordUndo(new Session.DeleteUndo(schemaName, table, rows));
         // Track for MVCC visibility
         if (executor.session != null) {
