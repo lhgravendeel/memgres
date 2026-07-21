@@ -435,10 +435,12 @@ public final class XmlOperations {
         for (int i = 0; i < results.size(); i++) {
             if (i > 0) sb.append(",");
             String val = results.get(i);
-            // Check if quoting is needed (contains comma, brace, quote, whitespace, backslash, or is empty)
+            // PG array quoting: quote only when the element is empty or contains a
+            // char special to array syntax (comma, brace, quote, backslash, whitespace).
+            // '<' and '>' are NOT special, so element nodes like <x>1</x> stay unquoted.
             boolean needsQuote = val.isEmpty() || val.contains(",") || val.contains("{") || val.contains("}")
-                    || val.contains("\"") || val.contains("\\") || val.contains(" ")
-                    || val.contains("<") || val.contains(">");
+                    || val.contains("\"") || val.contains("\\")
+                    || val.chars().anyMatch(Character::isWhitespace);
             if (needsQuote) {
                 sb.append("\"");
                 sb.append(val.replace("\\", "\\\\").replace("\"", "\\\""));

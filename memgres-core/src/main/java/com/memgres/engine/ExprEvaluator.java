@@ -1001,7 +1001,7 @@ class ExprEvaluator {
                 if (geom instanceof GeometricOperations.PgLseg) {
                     return GeometricOperations.isHorizontal((GeometricOperations.PgLseg) geom);
                 }
-                throw new MemgresException("operator ?- not supported for type " + val.getClass().getSimpleName(), "42883");
+                throw new MemgresException("operator does not exist: ?- " + GeometricOperations.pgTypeName(geom), "42883");
             }
             case GEO_IS_VERTICAL: {
                 if (val == null) return null;
@@ -1009,7 +1009,22 @@ class ExprEvaluator {
                 if (geom instanceof GeometricOperations.PgLseg) {
                     return GeometricOperations.isVertical((GeometricOperations.PgLseg) geom);
                 }
-                throw new MemgresException("operator ?| not supported for type " + val.getClass().getSimpleName(), "42883");
+                throw new MemgresException("operator does not exist: ?| " + GeometricOperations.pgTypeName(geom), "42883");
+            }
+            case GEO_CENTER: {
+                if (val == null) return null;
+                Object geom = GeometricOperations.autoDetectPublic(val.toString());
+                return GeometricOperations.formatPoint(GeometricOperations.center(geom));
+            }
+            case GEO_LENGTH: {
+                if (val == null) return null;
+                Object geom = GeometricOperations.autoDetectPublic(val.toString());
+                double len = GeometricOperations.length(geom);
+                return (len == Math.floor(len) && !Double.isInfinite(len)) ? (Object) (long) len : (Object) len;
+            }
+            case GEO_NPOINTS: {
+                if (val == null) return null;
+                return GeometricOperations.npoints(val.toString());
             }
             case HSTORE_TO_ARRAY: {
                 if (val == null) return null;

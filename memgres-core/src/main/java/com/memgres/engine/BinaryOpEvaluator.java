@@ -1088,6 +1088,12 @@ class BinaryOpEvaluator {
             }
             case JSONB_EXISTS_ANY: {
                 if (left == null || right == null) return null;
+                // ?| is also the geometric "vertically aligned" operator: point ?| point -> boolean
+                if (!(left instanceof List) && !(right instanceof List)
+                        && GeometricOperations.isPointString(left.toString())
+                        && GeometricOperations.isPointString(right.toString())) {
+                    return GeometricOperations.pointsVerticallyAligned(left.toString(), right.toString());
+                }
                 if (left instanceof HstoreValue) {
                     List<String> hkeys = right instanceof List ? ((List<?>) right).stream().map(Object::toString).collect(Collectors.toList()) : Cols.listOf(right.toString());
                     HstoreValue h = (HstoreValue) left;
@@ -1243,6 +1249,11 @@ class BinaryOpEvaluator {
                     return GeometricOperations.isPerpendicular((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
                 }
                 throw new MemgresException("operator ?-| not supported for these types", "42883");
+            }
+            case GEO_HORIZONTAL: {
+                // point ?- point : horizontally aligned (same y) -> boolean
+                if (left == null || right == null) return null;
+                return GeometricOperations.pointsHorizontallyAligned(left.toString(), right.toString());
             }
             case REGEX_MATCH: {
                 if (left == null || right == null) return null;
@@ -1941,6 +1952,12 @@ class BinaryOpEvaluator {
             }
             case JSONB_EXISTS_ANY: {
                 if (left == null || right == null) return null;
+                // ?| is also the geometric "vertically aligned" operator: point ?| point -> boolean
+                if (!(left instanceof List) && !(right instanceof List)
+                        && GeometricOperations.isPointString(left.toString())
+                        && GeometricOperations.isPointString(right.toString())) {
+                    return GeometricOperations.pointsVerticallyAligned(left.toString(), right.toString());
+                }
                 if (left instanceof HstoreValue) {
                     List<String> hkeys = right instanceof List ? ((List<?>) right).stream().map(Object::toString).collect(Collectors.toList()) : Cols.listOf(right.toString());
                     HstoreValue h = (HstoreValue) left;
@@ -2096,6 +2113,11 @@ class BinaryOpEvaluator {
                     return GeometricOperations.isPerpendicular((GeometricOperations.PgLseg) lObj, (GeometricOperations.PgLseg) rObj);
                 }
                 throw new MemgresException("operator ?-| not supported for these types", "42883");
+            }
+            case GEO_HORIZONTAL: {
+                // point ?- point : horizontally aligned (same y) -> boolean
+                if (left == null || right == null) return null;
+                return GeometricOperations.pointsHorizontallyAligned(left.toString(), right.toString());
             }
             case REGEX_MATCH: {
                 if (left == null || right == null) return null;

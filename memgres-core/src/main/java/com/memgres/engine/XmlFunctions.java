@@ -208,6 +208,25 @@ class XmlFunctions {
     /** Parse a PG namespace array like ARRAY[ARRAY['prefix','uri'], ...] into a Map. */
     private static Map<String, String> parseNamespaceArray(Object nsArrayObj) {
         if (nsArrayObj == null) return null;
+        // The namespace mapping usually arrives as an evaluated (nested) Java List
+        // from ARRAY[ARRAY['prefix','uri'], ...]; handle that before the string form.
+        if (nsArrayObj instanceof java.util.List) {
+            java.util.List<?> outer = (java.util.List<?>) nsArrayObj;
+            Map<String, String> nsMap = new LinkedHashMap<>();
+            boolean nested = !outer.isEmpty() && outer.get(0) instanceof java.util.List;
+            if (nested) {
+                for (Object rowObj : outer) {
+                    if (!(rowObj instanceof java.util.List)) continue;
+                    java.util.List<?> row = (java.util.List<?>) rowObj;
+                    if (row.size() >= 2 && row.get(0) != null) {
+                        nsMap.put(row.get(0).toString(), row.get(1) == null ? "" : row.get(1).toString());
+                    }
+                }
+            } else if (outer.size() >= 2 && outer.get(0) != null) {
+                nsMap.put(outer.get(0).toString(), outer.get(1) == null ? "" : outer.get(1).toString());
+            }
+            return nsMap.isEmpty() ? null : nsMap;
+        }
         String s = nsArrayObj.toString().trim();
         if (s.isEmpty() || s.equals("{}")) return null;
         Map<String, String> nsMap = new LinkedHashMap<>();
