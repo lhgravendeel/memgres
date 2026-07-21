@@ -172,6 +172,16 @@ class SessionExecutor {
             if (guc != null) {
                 if (param.equalsIgnoreCase("ALL")) {
                     guc.resetAll();
+                } else if (param.equalsIgnoreCase("session_authorization")) {
+                    // H36: RESET SESSION AUTHORIZATION restores identity like
+                    // SET SESSION AUTHORIZATION DEFAULT — current_user/session_user
+                    // must revert to the connection's boot-time user, not just SHOW.
+                    guc.reset("session_authorization");
+                    guc.reset("role");
+                    if (executor.session != null) {
+                        String bootUser = guc.get("session_authorization");
+                        executor.session.setConnectingUser(bootUser);
+                    }
                 } else {
                     // PG rejects RESET of unknown flat params with 42704
                     if (!param.contains(".") && !guc.isKnown(param)) {

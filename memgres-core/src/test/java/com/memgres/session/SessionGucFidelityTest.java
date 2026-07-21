@@ -244,8 +244,9 @@ class SessionGucFidelityTest {
             st.execute("RESET \"custom.test_var\"");
             try (ResultSet rs = st.executeQuery("SELECT current_setting('custom.test_var', true)")) {
                 assertTrue(rs.next());
-                // PG returns NULL for unset custom variables with missing_ok=true
-                assertNull(rs.getObject(1));
+                // L7: once a custom variable has been SET, PG keeps the placeholder defined
+                // with an empty value after RESET (verified against PG 18), not NULL.
+                assertEquals("", rs.getString(1));
             }
         }
     }
