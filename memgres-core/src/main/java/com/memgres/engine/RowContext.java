@@ -65,6 +65,24 @@ public class RowContext {
     /** Column names from USING clauses. These exist in multiple bindings but should not raise ambiguity. */
     private Set<String> usingColumns;
     /**
+     * View-column aliasing: maps a view column name (lower-case) to the underlying base-table
+     * column name. Set when a DML statement runs through an auto-updatable view that renames
+     * columns, so WHERE / RETURNING references to the view's names resolve against the base row.
+     */
+    private java.util.Map<String, String> columnAliases;
+
+    /** Register the view→base column-name aliasing for this context (see {@link #columnAliases}). */
+    public void setColumnAliases(java.util.Map<String, String> columnAliases) {
+        this.columnAliases = columnAliases;
+    }
+
+    /** Translate a view column name to its base-table name when an aliasing map is present. */
+    private String aliasColumn(String columnName) {
+        if (columnAliases == null || columnName == null) return columnName;
+        String mapped = columnAliases.get(columnName.toLowerCase());
+        return mapped != null ? mapped : columnName;
+    }
+    /**
      * Identity-keyed substitutions for set-returning function calls nested inside a larger
      * SELECT-list expression (e.g. {@code day_start + interval '1h' * generate_series(0,23,2)}).
      * The SRF is evaluated once per row to get its element list; the owning expression is then
@@ -159,6 +177,8 @@ public class RowContext {
                 || lcCol.equals("cmin") || lcCol.equals("cmax")) {
             return resolveSystemColumn(tableQualifier, lcCol);
         }
+        // Translate view column names to base-table names for renamed-column view DML.
+        columnName = aliasColumn(columnName);
 
         if (tableQualifier != null) {
             TableBinding b = getBinding(tableQualifier);
@@ -321,6 +341,7 @@ public class RowContext {
         if (lc.equals("ctid")) return new Column("ctid", DataType.TEXT, false, false, null);
         if (lc.equals("xmin") || lc.equals("xmax")) return new Column(lc, DataType.BIGINT, false, false, null);
         if (lc.equals("cmin") || lc.equals("cmax")) return new Column(lc, DataType.INTEGER, false, false, null);
+        columnName = aliasColumn(columnName);
 
         if (tableQualifier != null) {
             TableBinding b = getBinding(tableQualifier);
@@ -343,6 +364,7 @@ public class RowContext {
      */
     public boolean hasColumn(String columnName) {
         if ("tableoid".equalsIgnoreCase(columnName)) return true;
+        columnName = aliasColumn(columnName);
         for (TableBinding b : bindings) {
             if (b.table().getColumnIndex(columnName) >= 0) return true;
         }
@@ -355,7 +377,10 @@ public class RowContext {
     public RowContext merge(RowContext other) {
         List<TableBinding> merged = new ArrayList<>(this.bindings);
         merged.addAll(other.bindings);
-        return new RowContext(merged);
+        RowContext result = new RowContext(merged);
+        // Preserve view-column aliasing from either side (only the view side carries it).
+        result.columnAliases = this.columnAliases != null ? this.columnAliases : other.columnAliases;
+        return result;
     }
 
     /**
