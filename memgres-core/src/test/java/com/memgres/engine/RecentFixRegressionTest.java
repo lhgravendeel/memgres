@@ -93,19 +93,17 @@ class RecentFixRegressionTest {
 
     @Test
     void m1_jsonbScalarArrow() throws SQLException {
-        // '123'::jsonb -> 0 should return 123 (the whole scalar), not '1' (first char)
-        // Actually PG returns: ERROR for scalar -> int. Let me check...
-        // PG: select '123'::jsonb -> 0 → NULL (scalars don't support -> int)
-        // Actually PG returns NULL for scalar -> N
+        // Verified against real PG 18: a jsonb scalar is treated as a one-element array for
+        // `-> 0`, so '123'::jsonb -> 0 returns the scalar 123 (IS NULL is false).
         String result = q("SELECT '123'::jsonb -> 0");
-        assertNull(result, "'123'::jsonb -> 0 should be NULL (scalar, not array)");
+        assertEquals("123", result, "'123'::jsonb -> 0 should echo the scalar (PG one-element-array rule)");
     }
 
     @Test
     void m1_jsonbStringScalarArrow() throws SQLException {
-        // '"abc"'::jsonb -> 0 should be NULL (scalar, not array)
+        // PG 18: '"abc"'::jsonb -> 0 returns the jsonb string "abc" (with quotes).
         String result = q("SELECT '\"abc\"'::jsonb -> 0");
-        assertNull(result, "'\"abc\"'::jsonb -> 0 should be NULL");
+        assertEquals("\"abc\"", result, "'\"abc\"'::jsonb -> 0 should echo the scalar string");
     }
 
     @Test

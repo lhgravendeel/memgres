@@ -183,10 +183,10 @@ class StringFunctions {
                 return sb.toString();
             }
             case "concat_ws": {
-                // concat_ws needs at least the separator plus one value argument.
-                if (fn.args().size() < 2) {
-                    throw new MemgresException("function concat_ws(unknown) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
-                }
+                // Arity is validated pre-expansion in FunctionEvaluator (PG has no concat_ws(text)
+                // signature). A separator-only arg list reaching here means a VARIADIC empty array
+                // expanded to no values → return the empty string, matching PG.
+                if (fn.args().isEmpty()) return null;
                 Object sep = executor.evalExpr(fn.args().get(0), ctx);
                 if (sep == null) return null;
                 StringBuilder sb = new StringBuilder();

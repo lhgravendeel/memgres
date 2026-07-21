@@ -166,6 +166,12 @@ class FunctionEvaluator {
 
         // Expand VARIADIC args: NamedArgExpr("__variadic__", arrayExpr) → expand array to individual args
         boolean callUsedVariadic = fn.args().stream().anyMatch(a -> a instanceof NamedArgExpr && ((NamedArgExpr) a).name().equals("__variadic__"));
+        // PG has no concat_ws(text) signature: a separator alone with no value arguments and no
+        // VARIADIC part fails function resolution (42883). A VARIADIC argument satisfies the
+        // signature even when the array is empty, so gate on the pre-expansion argument shape.
+        if ("concat_ws".equals(name) && fn.args().size() < 2 && !callUsedVariadic) {
+            throw new MemgresException("function concat_ws(unknown) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
+        }
         if (callUsedVariadic) {
             List<Expression> expandedArgs = new ArrayList<>();
             for (Expression arg : fn.args()) {
