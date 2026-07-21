@@ -58,7 +58,9 @@ class PartitionRrIntegrityTest {
         try {
             SQLException ex = assertThrows(SQLException.class,
                 () -> exec("ALTER TABLE c4_parent ATTACH PARTITION c4_bad FOR VALUES FROM (1) TO (10)"));
-            assertEquals("42P16", ex.getSQLState());
+            // PG 18 reports column-set/type mismatches on ATTACH as 42804
+            // (ERRCODE_DATATYPE_MISMATCH), not 42P16.
+            assertEquals("42804", ex.getSQLState());
         } finally {
             exec("DROP TABLE IF EXISTS c4_parent, c4_bad");
         }

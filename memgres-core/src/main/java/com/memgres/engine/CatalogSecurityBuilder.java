@@ -115,7 +115,10 @@ class CatalogSecurityBuilder {
             String minVal = bound != null ? bound[0] : null;
             String maxVal = bound != null ? bound[1] : null;
             String enumval = enumvals.get(name);
-            table.insertRow(new Object[]{name, settingValue, unit, category, desc, null, ctx, vartype, source, minVal, maxVal, enumval, bootValue, bootValue, false, null, null});
+            // L12: PG exposes mixed-case canonical names (e.g. TimeZone, DateStyle)
+            // in pg_settings.name.
+            String displayName = defaults.getCanonicalName(name);
+            table.insertRow(new Object[]{displayName, settingValue, unit, category, desc, null, ctx, vartype, source, minVal, maxVal, enumval, bootValue, bootValue, false, null, null});
         }
         return table;
     }

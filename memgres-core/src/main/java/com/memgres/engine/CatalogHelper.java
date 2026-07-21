@@ -169,12 +169,26 @@ public final class CatalogHelper {
         }
     }
 
+    /**
+     * Render a domain CHECK expression to SQL text (H15/H16). The VALUE keyword is
+     * parsed as a lowercase column reference; PG prints it uppercase. Result is
+     * parenthesised like PG's exprToSql output, e.g. "(VALUE > 0)".
+     */
+    public static String renderDomainCheck(com.memgres.engine.parser.ast.Expression parsed) {
+        if (parsed == null) return "";
+        String sql = SqlUnparser.exprToSql(parsed);
+        return sql.replaceAll("(?i)\\bvalue\\b", "VALUE");
+    }
+
     /** Format a column default for information_schema / pg_attrdef, matching PG conventions. */
     public static String formatColumnDefault(Column col) {
         String def = col.getDefaultValue();
         if (def == null) return null;
         if (def.startsWith("__identity__")) return null;
-        if (def.equalsIgnoreCase("now()") || def.equalsIgnoreCase("current_timestamp()")
+        // H14: DEFAULT now() renders as now() (a plain function call); the
+        // CURRENT_TIMESTAMP keyword renders as CURRENT_TIMESTAMP (matching PG).
+        if (def.equalsIgnoreCase("now()")) return "now()";
+        if (def.equalsIgnoreCase("current_timestamp()")
                 || def.equalsIgnoreCase("current_timestamp")) return "CURRENT_TIMESTAMP";
         if (def.equalsIgnoreCase("current_date") || def.equalsIgnoreCase("current_date()")) return "CURRENT_DATE";
         if (def.toLowerCase().startsWith("nextval(")) return def;
