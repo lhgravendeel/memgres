@@ -227,6 +227,11 @@ class DmlExecutor {
         List<Object[]> insertedRows = new ArrayList<>(); // for transition tables in statement triggers
         List<Object[]> afterRowTriggerNewRows = new ArrayList<>(); // queue AFTER ROW triggers
         List<Table> afterRowTriggerTables = new ArrayList<>(); // corresponding target tables for AFTER ROW
+        // When the table has row triggers, snapshot target rows so a trigger raising
+        // mid-statement rolls the whole INSERT back (PostgreSQL statement atomicity).
+        Map<Table, List<Object[]>> insSnapshot = triggers.isEmpty() ? null
+                : snapshotTargetTables(collectTargetTables(table));
+        try {
         for (List<Expression> valueRow : valueRows) {
             Object[] row = new Object[table.getColumns().size()];
 
@@ -556,6 +561,11 @@ class DmlExecutor {
 
         // Fire statement-level AFTER triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, table, insertedRows, null);
+        } catch (MemgresException e) {
+            // Statement is atomic: undo any rows already inserted/updated before the failure.
+            if (insSnapshot != null) restoreTargetTables(insSnapshot);
+            throw e;
+        }
 
         // Execute DO ALSO rule if present
         if (alsoRuleSql != null && stmt.values() != null) {
@@ -1056,6 +1066,11 @@ class DmlExecutor {
             }
         }
 
+        // When the table has row triggers, snapshot target rows so a trigger raising
+        // mid-statement rolls the whole UPDATE back (PostgreSQL statement atomicity).
+        Map<Table, List<Object[]>> updSnapshot = triggers.isEmpty() ? null
+                : snapshotTargetTables(collectTargetTables(table));
+        try {
         boolean fromUpdateHasVirtual = hasVirtualColumns(table);
         if (fromContexts != null) {
             // Multi-table UPDATE: join main table with FROM tables
@@ -1242,6 +1257,11 @@ class DmlExecutor {
                     buildReturningColumns(stmt.returning(), table), returningRows, updatedCount);
         }
         return QueryResult.command(QueryResult.Type.UPDATE, updatedCount);
+        } catch (MemgresException e) {
+            // Statement is atomic: undo any rows already updated before the failure.
+            if (updSnapshot != null) restoreTargetTables(updSnapshot);
+            throw e;
+        }
     }
 
     /**
@@ -1664,11 +1684,17 @@ class DmlExecutor {
             oldRowsForTransition.add(Arrays.copyOf(row, row.length));
         }
         deletedRows.addAll(toDelete);
+        // When the table has row triggers, snapshot target rows so an AFTER-trigger raising
+        // mid-statement rolls the whole DELETE back (PostgreSQL statement atomicity).
+        Map<Table, List<Object[]>> delSnapshot = triggers.isEmpty() ? null
+                : snapshotTargetTables(tablesToScan);
+        int deleted;
+        try {
         // Remove matching rows atomically from each owning table
         for (Table t : tablesToScan) {
             t.deleteRows(toDelete);
         }
-        int deleted = deletedRows.size();
+        deleted = deletedRows.size();
         recordDeleteUndo(stmt.schema(), stmt.table(), deletedRows);
 
         // Fire queued AFTER DELETE row triggers
@@ -1680,6 +1706,10 @@ class DmlExecutor {
 
         // Fire statement-level AFTER DELETE triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, table, null, oldRowsForTransition);
+        } catch (MemgresException e) {
+            if (delSnapshot != null) restoreTargetTables(delSnapshot);
+            throw e;
+        }
 
         // Track DML statistics
         if (deleted > 0) table.incrementTupDeleted(deleted);
@@ -1838,29 +1868,37 @@ class DmlExecutor {
                                 processedTargetRows.add(targetRow);
                                 mergeCount++;
                             } else if (wm.setClauses() != null && !wm.setClauses().isEmpty()) {
-                                // UPDATE — evaluate all SET RHS against original row snapshot, then assign
+                                // UPDATE — evaluate all SET RHS against original row snapshot onto a
+                                // working copy, then let BEFORE triggers see/modify it before committing.
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
-                                int[] setIndices = new int[wm.setClauses().size()];
-                                Object[] setValues = new Object[wm.setClauses().size()];
+                                Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
+                                Set<String> updCols = new HashSet<>();
                                 for (int si = 0; si < wm.setClauses().size(); si++) {
                                     InsertStmt.SetClause set = wm.setClauses().get(si);
                                     int colIdx = targetTable.getColumnIndex(set.column());
                                     if (colIdx < 0) {
                                         throw new MemgresException("Column not found: " + set.column());
                                     }
-                                    setIndices[si] = colIdx;
-                                    setValues[si] = TypeCoercion.coerceForStorage(
+                                    updCols.add(set.column().toLowerCase());
+                                    newRow[colIdx] = TypeCoercion.coerceForStorage(
                                             executor.evalExpr(set.value(), combined), targetTable.getColumns().get(colIdx));
                                 }
-                                for (int si = 0; si < setIndices.length; si++) {
-                                    targetRow[setIndices[si]] = setValues[si];
+                                // Fire BEFORE UPDATE row triggers: PG fires them per matched row.
+                                // They may modify NEW or return NULL to skip the row entirely.
+                                newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, targetTable, updCols);
+                                if (newRow == null) {
+                                    // BEFORE trigger suppressed this row: no update, not counted.
+                                    processedTargetRows.add(targetRow);
+                                    break;
                                 }
+                                // Commit the (possibly trigger-modified) new values onto the live row.
+                                System.arraycopy(newRow, 0, targetRow, 0, targetRow.length);
                                 computeGeneratedColumns(targetTable, targetRow);
                                 executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
                                 // Fire AFTER UPDATE triggers for MERGE
-                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable);
+                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
                                 // Collect RETURNING after update (uses new values)
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
@@ -1912,19 +1950,30 @@ class DmlExecutor {
                                 rowsToDelete.add(targetRow);
                             } else if (wnmbs.setClauses() != null && !wnmbs.setClauses().isEmpty()) {
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
+                                Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
+                                Set<String> updCols = new HashSet<>();
                                 for (InsertStmt.SetClause set : wnmbs.setClauses()) {
                                     int colIdx = targetTable.getColumnIndex(set.column());
                                     if (colIdx < 0) {
                                         throw new MemgresException("Column not found: " + set.column());
                                     }
+                                    updCols.add(set.column().toLowerCase());
                                     Object val = executor.evalExpr(set.value(), targetCtx);
-                                    targetRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
+                                    newRow[colIdx] = TypeCoercion.coerceForStorage(val, targetTable.getColumns().get(colIdx));
                                 }
+                                // Fire BEFORE UPDATE row triggers (may modify NEW or skip via NULL).
+                                newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.UPDATE, newRow, oldRow, targetTable, updCols);
+                                if (newRow == null) {
+                                    // BEFORE trigger suppressed this row: no update, not counted.
+                                    processedTargetRows.add(targetRow);
+                                    break;
+                                }
+                                System.arraycopy(newRow, 0, targetRow, 0, targetRow.length);
                                 computeGeneratedColumns(targetTable, targetRow);
                                 executor.constraintValidator.validateConstraints(targetTable, targetRow, targetRow);
                                 recordUpdateUndo(stmt.schema(), stmt.targetTable(), targetRow, oldRow);
                                 executor.constraintValidator.handleFkOnUpdate(targetTable, oldRow, targetRow);
-                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable);
+                                triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.UPDATE, targetRow, oldRow, targetTable, updCols);
                                 if (hasReturning) {
                                     executor.currentMergeAction = "UPDATE";
                                     returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow, nullSourceCtx));
@@ -1983,6 +2032,13 @@ class DmlExecutor {
                             }
                         }
                         computeGeneratedColumns(targetTable, newRow);
+                        // Fire BEFORE INSERT row triggers: PG fires them per inserted row.
+                        // They may modify NEW or return NULL to skip the row entirely.
+                        newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, newRow, null, targetTable);
+                        if (newRow == null) {
+                            // BEFORE trigger suppressed this row: not inserted, not counted.
+                            break;
+                        }
                         validationHelper.validateEnumValues(newRow, targetTable);
                         Table routedTable = partitionHelper.routeToPartition(targetTable, newRow);
                         routedTable.getWriteLock().lock();
@@ -2065,6 +2121,54 @@ class DmlExecutor {
             return QueryResult.returning(QueryResult.Type.MERGE, retCols, returningRows, mergeCount);
         }
         return QueryResult.command(QueryResult.Type.MERGE, mergeCount);
+    }
+
+    // ---- Statement atomicity: snapshot / restore target-table rows ----
+    //
+    // PostgreSQL treats each INSERT/UPDATE/DELETE/MERGE as an atomic statement: if a row
+    // trigger (or constraint) raises partway through, every side effect the statement had
+    // already applied is rolled back. Autocommit statements have no transaction undo log to
+    // lean on (Session.recordUndo only records inside a transaction), so we snapshot the
+    // affected table(s) up front and, on failure, restore them. Mirrors the MERGE executor.
+
+    /** Collect the target table plus all of its leaf partitions (rows can live on either). */
+    private List<Table> collectTargetTables(Table table) {
+        List<Table> tables = new ArrayList<>();
+        if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
+            DmlPartitionHelper.collectAllPartitionTables(table, tables);
+        } else {
+            tables.add(table);
+        }
+        return tables;
+    }
+
+    /** Deep-copy every row of each given table so the statement can be rolled back. */
+    private Map<Table, List<Object[]>> snapshotTargetTables(List<Table> tables) {
+        Map<Table, List<Object[]>> snapshot = new IdentityHashMap<>();
+        for (Table t : tables) {
+            List<Object[]> copy = new ArrayList<>();
+            for (Object[] r : t.getRows()) {
+                copy.add(Arrays.copyOf(r, r.length));
+            }
+            snapshot.put(t, copy);
+        }
+        return snapshot;
+    }
+
+    /** Restore each snapshotted table to its captured state (used on mid-statement failure). */
+    private void restoreTargetTables(Map<Table, List<Object[]>> snapshot) {
+        for (Map.Entry<Table, List<Object[]>> e : snapshot.entrySet()) {
+            Table t = e.getKey();
+            t.getWriteLock().lock();
+            try {
+                t.deleteAll();
+                for (Object[] r : e.getValue()) {
+                    t.insertRow(r);
+                }
+            } finally {
+                t.getWriteLock().unlock();
+            }
+        }
     }
 
     // ---- Helper: compute generated columns ----
