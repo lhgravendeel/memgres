@@ -44,7 +44,10 @@ class PartitionNotNullTest {
                 // id NOT NULL
                 assertTrue(rs.next());
                 String childConname = rs.getString("conname");
-                assertTrue(childConname.contains("l13_child"), "Child conname should use child table name: " + childConname);
+                // PG names the inherited partition NOT NULL constraint after the PARENT table
+                // (verified: l13_parent_id_not_null), not the child (L13 fix).
+                assertEquals("l13_parent_id_not_null", childConname,
+                        "PG: inherited partition NOT NULL keeps the parent-derived name: " + childConname);
                 assertEquals(0, rs.getInt("conparentid"), "PG: conparentid=0 for partition NOT NULL");
                 assertEquals(1, rs.getInt("coninhcount"), "Inherited NOT NULL should have coninhcount=1");
 
