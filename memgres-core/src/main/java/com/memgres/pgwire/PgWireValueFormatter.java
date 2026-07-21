@@ -171,6 +171,97 @@ class PgWireValueFormatter {
         }
     }
 
+    /**
+     * Format an array column value as PG array text, formatting each element per its declared
+     * element type. This differs from {@link #formatValue} in that temporal element values stored
+     * as ISO strings (e.g. {@code "2020-01-02T03:04:05"}) are rendered in PG's canonical
+     * space-separated form and quoted, so pgjdbc's text-mode array parser (which is what it uses by
+     * default for {@code timestamp[]}/etc.) accepts them instead of choking on the {@code 'T'}.
+     */
+    static String formatArray(Object val, DataType elemType, GucSettings guc) {
+        java.util.List<?> list;
+        if (val instanceof java.util.List<?>) {
+            list = (java.util.List<?>) val;
+        } else if (val instanceof String && isTemporalArrayElem(elemType)
+                && ((String) val).startsWith("{") && ((String) val).endsWith("}")) {
+            // Raw array-literal string form for a temporal element type: parse it so each element
+            // can be re-rendered in PG's space-separated, quoted form (pgjdbc's text array parser
+            // silently drops the space of an unquoted "2020-01-02 03:04:05", so quoting is required).
+            list = parseArrayLiteralElements((String) val);
+        } else {
+            return formatValue(val, guc);
+        }
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append(',');
+            Object e = list.get(i);
+            if (e == null) { sb.append("NULL"); continue; }
+            if (e instanceof java.util.List<?>) { sb.append(formatArray(e, elemType, guc)); continue; }
+            String d = formatArrayElement(e, elemType, guc);
+            if (needsArrayQuote(d)) {
+                sb.append('"').append(d.replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
+            } else {
+                sb.append(d);
+            }
+        }
+        sb.append('}');
+        return sb.toString();
+    }
+
+    /** Parse a flat PG array literal ({@code {a,"b c",NULL}}) into element strings (null for NULL). */
+    private static java.util.List<Object> parseArrayLiteralElements(String text) {
+        java.util.List<Object> elements = new java.util.ArrayList<>();
+        String inner = text.substring(1, text.length() - 1);
+        if (inner.isEmpty()) return elements;
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        boolean quoted = false;
+        for (int i = 0; i < inner.length(); i++) {
+            char c = inner.charAt(i);
+            if (inQuotes) {
+                if (c == '\\' && i + 1 < inner.length()) current.append(inner.charAt(++i));
+                else if (c == '"') inQuotes = false;
+                else current.append(c);
+            } else if (c == '"') {
+                inQuotes = true; quoted = true;
+            } else if (c == ',') {
+                elements.add((!quoted && current.toString().equalsIgnoreCase("NULL")) ? null : current.toString());
+                current.setLength(0); quoted = false;
+            } else {
+                current.append(c);
+            }
+        }
+        elements.add((!quoted && current.toString().equalsIgnoreCase("NULL")) ? null : current.toString());
+        return elements;
+    }
+
+    private static String formatArrayElement(Object e, DataType elemType, GucSettings guc) {
+        if (e instanceof String) {
+            String s = (String) e;
+            if (isTemporalArrayElem(elemType)) {
+                return s.replaceFirst("^(\\d{4}-\\d{2}-\\d{2})T", "$1 ");
+            }
+            return s;
+        }
+        return formatValue(e, guc);
+    }
+
+    private static boolean isTemporalArrayElem(DataType t) {
+        return t == DataType.DATE || t == DataType.TIMESTAMP || t == DataType.TIMESTAMPTZ
+                || t == DataType.TIME || t == DataType.TIMETZ;
+    }
+
+    private static boolean needsArrayQuote(String s) {
+        if (s.isEmpty() || s.equalsIgnoreCase("NULL")) return true;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || Character.isWhitespace(c)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Strip trailing zeros from the fractional-seconds part of a formatted timestamp/time string. */
     private static String stripTrailingFracZeros(String s) {
         int dotIdx = s.lastIndexOf('.');
