@@ -764,6 +764,65 @@ public final class TypeCoercion {
 
     // ---- Date/Time conversions ----
 
+    /**
+     * H37: current DateStyle field order ("MDY", "DMY", or "YMD") for interpreting
+     * ambiguous numeric date input. Set per-statement from the session GUC by
+     * {@link AstExecutor#execute}. Defaults to PG's default of "MDY".
+     */
+    private static final ThreadLocal<String> DATE_ORDER = ThreadLocal.withInitial(() -> "MDY");
+
+    /** Set the DateStyle field order used for parsing ambiguous numeric date input. */
+    public static void setDateOrder(String order) {
+        DATE_ORDER.set((order == null || order.isEmpty()) ? "MDY" : order.toUpperCase());
+    }
+
+    /** Current DateStyle field order used for parsing ambiguous numeric date input. */
+    public static String getDateOrder() {
+        return DATE_ORDER.get();
+    }
+
+    // Three numeric fields separated by a single '/' or '-' (same separator), e.g. 01/02/2026.
+    private static final java.util.regex.Pattern NUMERIC_DATE =
+            java.util.regex.Pattern.compile("^(\\d{1,4})([-/])(\\d{1,2})\\2(\\d{1,4})$");
+
+    /**
+     * H37: interpret a 3-field slash/dash numeric date according to the DateStyle field
+     * order (DMY/YMD/MDY). Returns null if {@code s} isn't such a date or the fields are
+     * out of range (so callers fall through to the default formatters).
+     * A 4-digit leading field always means year-first (YMD), matching PG.
+     */
+    private static LocalDate tryOrderedNumericDate(String s, String order) {
+        java.util.regex.Matcher m = NUMERIC_DATE.matcher(s);
+        if (!m.matches()) return null;
+        int f1 = Integer.parseInt(m.group(1));
+        int f2 = Integer.parseInt(m.group(3));
+        int f3 = Integer.parseInt(m.group(4));
+        boolean f1IsYear = m.group(1).length() >= 3; // 3+ digit leading field is the year
+        int year, month, day, yearLen;
+        if (f1IsYear || "YMD".equals(order)) {
+            year = f1; month = f2; day = f3; yearLen = m.group(1).length();
+        } else if ("DMY".equals(order)) {
+            day = f1; month = f2; year = f3; yearLen = m.group(4).length();
+        } else { // MDY
+            month = f1; day = f2; year = f3; yearLen = m.group(4).length();
+        }
+        year = normalizeTwoDigitYear(year, yearLen);
+        if (year == 0) return null;
+        try {
+            return LocalDate.of(year, month, day);
+        } catch (java.time.DateTimeException e) {
+            return null;
+        }
+    }
+
+    /** PG two-digit year rule: 00-69 -> 2000-2069, 70-99 -> 1970-1999. */
+    private static int normalizeTwoDigitYear(int year, int digits) {
+        if (digits <= 2) {
+            return year < 70 ? 2000 + year : 1900 + year;
+        }
+        return year;
+    }
+
     private static final DateTimeFormatter[] DATE_FORMATS = {
             DateTimeFormatter.ISO_LOCAL_DATE,
             DateTimeFormatter.ofPattern("yyyy/MM/dd"),
@@ -914,6 +973,13 @@ public final class TypeCoercion {
             try {
                 return LocalDate.parse(s, DateTimeFormatter.BASIC_ISO_DATE);
             } catch (DateTimeParseException e) { /* fall through */ }
+        }
+        // H37: apply DateStyle field order (DMY/YMD) to ambiguous numeric date input.
+        // For the default MDY order we defer to DATE_FORMATS below to preserve existing behavior.
+        String dateOrder = DATE_ORDER.get();
+        if (dateOrder != null && !"MDY".equals(dateOrder)) {
+            LocalDate ordered = tryOrderedNumericDate(s, dateOrder);
+            if (ordered != null) return ordered;
         }
         for (DateTimeFormatter fmt : DATE_FORMATS) {
             try {
