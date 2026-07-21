@@ -587,6 +587,11 @@ public final class GeometricOperations {
             b = -b;
             c = -c;
         }
+        // Negating a positive zero yields -0.0; PG prints line coefficients as a clean 0
+        // (e.g. line '[(0,0),(1,1)]' -> {1,-1,0}), so collapse negative zero back to +0.0.
+        if (a == 0.0) a = 0.0;
+        if (b == 0.0) b = 0.0;
+        if (c == 0.0) c = 0.0;
         return new PgLine(a, b, c);
     }
 
@@ -1163,6 +1168,40 @@ public final class GeometricOperations {
         }
         if (a instanceof PgPath && b instanceof PgPoint) return pathContainsPoint(((PgPath) a), ((PgPoint) b));
         throw new MemgresException("operator does not exist: " + pgTypeName(a) + " @> " + pgTypeName(b), "42883");
+    }
+
+    /**
+     * General contained-by dispatch (a &lt;@ b). PG's &lt;@ operator set is NOT simply the reverse
+     * of @>: point&lt;@line, point&lt;@lseg, lseg&lt;@box and lseg&lt;@line are valid &lt;@ operators
+     * with no @> counterpart (so they must not route through {@link #contains}, which correctly
+     * rejects those pairs as phantom @> operators).
+     */
+    public static boolean containedBy(Object a, Object b) {
+        if (a instanceof PgPoint) {
+            PgPoint p = (PgPoint) a;
+            if (b instanceof PgBox) return boxContainsPoint(((PgBox) b), p);
+            if (b instanceof PgCircle) return circleContainsPoint(((PgCircle) b), p);
+            if (b instanceof PgPolygon) return polygonContainsPoint(((PgPolygon) b), p);
+            if (b instanceof PgPath) return pathContainsPoint(((PgPath) b), p);
+            if (b instanceof PgLine) return distancePointLine(p, ((PgLine) b)) < EPSILON;
+            if (b instanceof PgLseg) return distancePointLseg(p, ((PgLseg) b)) < EPSILON;
+        }
+        if (a instanceof PgLseg) {
+            PgLseg s = (PgLseg) a;
+            if (b instanceof PgBox) return boxContainsPoint(((PgBox) b), s.p1) && boxContainsPoint(((PgBox) b), s.p2);
+            if (b instanceof PgLine) {
+                PgLine ln = (PgLine) b;
+                return distancePointLine(s.p1, ln) < EPSILON && distancePointLine(s.p2, ln) < EPSILON;
+            }
+        }
+        if (a instanceof PgBox && b instanceof PgBox) return boxContainsBox(((PgBox) b), ((PgBox) a));
+        if (a instanceof PgCircle && b instanceof PgCircle) return circleContainsCircle(((PgCircle) b), ((PgCircle) a));
+        if (a instanceof PgPolygon && b instanceof PgPolygon) return contains(b, a);
+        throw new MemgresException("operator does not exist: " + pgTypeName(a) + " <@ " + pgTypeName(b), "42883");
+    }
+
+    public static boolean containedBy(String a, String b) {
+        return containedBy((Object) autoDetect(a), (Object) autoDetect(b));
     }
 
     public static String pgTypeName(Object geom) {

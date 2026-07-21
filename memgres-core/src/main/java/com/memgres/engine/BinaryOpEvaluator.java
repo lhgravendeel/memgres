@@ -1022,7 +1022,7 @@ class BinaryOpEvaluator {
                     String ls0 = left.toString().trim();
                     String rs0 = right.toString().trim();
                     if (GeometricOperations.isGeometricString(ls0) && GeometricOperations.isGeometricString(rs0)) {
-                        return GeometricOperations.contains(rs0, ls0); // <@ reverses: b @> a
+                        return GeometricOperations.containedBy(ls0, rs0); // a <@ b (not simply b @> a)
                     }
                 }
                 // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
@@ -1902,7 +1902,7 @@ class BinaryOpEvaluator {
                     String ls0 = left.toString().trim();
                     String rs0 = right.toString().trim();
                     if (GeometricOperations.isGeometricString(ls0) && GeometricOperations.isGeometricString(rs0)) {
-                        return GeometricOperations.contains(rs0, ls0);
+                        return GeometricOperations.containedBy(ls0, rs0);
                     }
                 }
                 // Convert Java Lists to PG array format FIRST so arrays like ARRAY[1,5]
