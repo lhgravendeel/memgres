@@ -62,6 +62,11 @@ public class Table {
     // subquery/VALUES/CTE result tables. Gates the attribute-notation fallback in ExprEvaluator.
     private boolean functionResult;
 
+    // Provenance marker: true for the transient virtual table built for a non-auto-updatable
+    // view that carries INSTEAD OF triggers. Its rows are a snapshot of the view's projection,
+    // so UPDATE/DELETE dispatch INSTEAD OF triggers per matching row rather than touching storage.
+    private boolean viewProjection;
+
     // Replica identity for logical replication (DEFAULT, FULL, NOTHING, or index name)
     // 'd' = DEFAULT (PK), 'f' = FULL, 'n' = NOTHING, 'i' = USING INDEX
     private volatile char replicaIdentity = 'd';
@@ -732,6 +737,9 @@ public class Table {
     // FROM-function (SRF) result provenance
     public boolean isFunctionResult() { return functionResult; }
     public void setFunctionResult(boolean functionResult) { this.functionResult = functionResult; }
+
+    public boolean isViewProjection() { return viewProjection; }
+    public void setViewProjection(boolean viewProjection) { this.viewProjection = viewProjection; }
     public Map<String, String> getReloptions() { return reloptions; }
     public void setReloptions(Map<String, String> reloptions) { this.reloptions = reloptions; }
 
