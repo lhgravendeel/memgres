@@ -229,7 +229,9 @@ class ExprSpecialFormParser {
     Expression parsePosition() {
         ep.advance(); // consume POSITION
         ep.expect(TokenType.LEFT_PAREN);
-        Expression substring = ep.parsePrimary();
+        // Parse the search operand up to (but not including) IN. parsePostfix absorbs
+        // ::type casts (e.g. '\x34'::bytea) while stopping before the IN keyword.
+        Expression substring = ep.parsePostfix();
         ep.expectKeyword("IN");
         Expression string = ep.parseExpression();
         ep.expect(TokenType.RIGHT_PAREN);

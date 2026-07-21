@@ -183,6 +183,10 @@ class StringFunctions {
                 return sb.toString();
             }
             case "concat_ws": {
+                // concat_ws needs at least the separator plus one value argument.
+                if (fn.args().size() < 2) {
+                    throw new MemgresException("function concat_ws(unknown) does not exist\n  Hint: No function matches the given name and argument types. You might need to add explicit type casts.", "42883");
+                }
                 Object sep = executor.evalExpr(fn.args().get(0), ctx);
                 if (sep == null) return null;
                 StringBuilder sb = new StringBuilder();
@@ -217,8 +221,25 @@ class StringFunctions {
                 if (str instanceof byte[]) {
                     byte[] bytes = (byte[]) str;
                     int bStart = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
-                    int bLen = fn.args().size() > 2 ? executor.toInt(executor.evalExpr(fn.args().get(2), ctx)) : bytes.length;
-                    return ByteaOperations.substring(bytes, bStart, bLen);
+                    if (fn.args().size() > 2) {
+                        int bLen = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                        if (bLen < 0) {
+                            throw new MemgresException("negative substring length not allowed", "22011");
+                        }
+                        return ByteaOperations.substring(bytes, bStart, bLen);
+                    }
+                    return ByteaOperations.substring(bytes, bStart, bytes.length);
+                }
+                // SQL-standard substring(text FROM similar_pattern FOR escape_char): three args
+                // where the pattern is a (non-numeric) string, e.g.
+                //   substring('foobar' from '%#"o_b#"%' for '#') -> 'oob'.
+                if (fn.args().size() == 3) {
+                    Object patArg = executor.evalExpr(fn.args().get(1), ctx);
+                    if (patArg instanceof String && !((String) patArg).matches("\\s*[+-]?\\d+\\s*")) {
+                        Object escArg = executor.evalExpr(fn.args().get(2), ctx);
+                        return sqlSimilarSubstring(str.toString(), (String) patArg,
+                                escArg == null ? "\\" : escArg.toString());
+                    }
                 }
                 Object arg1 = executor.evalExpr(fn.args().get(1), ctx);
                 if (arg1 == null) return null;
@@ -265,31 +286,8 @@ class StringFunctions {
                 Object patObj = executor.evalExpr(fn.args().get(1), ctx);
                 Object escObj = executor.evalExpr(fn.args().get(2), ctx);
                 if (strObj == null || patObj == null) return null;
-                String str2 = strObj.toString();
-                String pat = patObj.toString();
-                String esc = escObj == null ? "\\" : escObj.toString();
-                if (esc.isEmpty()) esc = "\\";
-                // Convert SQL SIMILAR pattern to POSIX regex
-                // The escape char + '"' marks the start/end of the capture group
-                String delimiter = java.util.regex.Pattern.quote(esc) + "\"";
-                // Split pattern on delimiter to find the capture portion
-                String[] parts2 = pat.split(delimiter, -1);
-                if (parts2.length < 3) return null; // need two delimiters
-                String before = parts2[0];
-                String capture = parts2[1];
-                String after = parts2.length > 2 ? parts2[2] : "";
-                // Convert SIMILAR TO parts to regex
-                String regexBefore = similarToRegex(before, esc);
-                String regexCapture = similarToRegex(capture, esc);
-                String regexAfter = similarToRegex(after, esc);
-                String fullRegex = "(?s)" + regexBefore + "(" + regexCapture + ")" + regexAfter;
-                try {
-                    java.util.regex.Matcher m = java.util.regex.Pattern.compile(fullRegex).matcher(str2);
-                    if (m.matches()) return m.group(1);
-                    return null;
-                } catch (java.util.regex.PatternSyntaxException e) {
-                    throw new MemgresException("invalid regular expression: " + e.getMessage(), "2201B");
-                }
+                return sqlSimilarSubstring(strObj.toString(), patObj.toString(),
+                        escObj == null ? "\\" : escObj.toString());
             }
             case "ltrim": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
@@ -356,6 +354,14 @@ class StringFunctions {
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 Object arg2 = executor.evalExpr(fn.args().get(1), ctx);
                 if (arg1 == null || arg2 == null) return null;
+                // bytea variants: position(sub bytea IN str bytea) / strpos(str bytea, sub bytea)
+                if (arg1 instanceof byte[] || arg2 instanceof byte[]) {
+                    byte[] sub;
+                    byte[] hay;
+                    if (name.equals("position")) { sub = toBytea(arg1); hay = toBytea(arg2); }
+                    else { hay = toBytea(arg1); sub = toBytea(arg2); }
+                    return byteaIndexOf(hay, sub) + 1;
+                }
                 if (name.equals("position")) {
                     // POSITION: arg1=substring, arg2=string
                     return arg2.toString().indexOf(arg1.toString()) + 1;
@@ -418,9 +424,10 @@ class StringFunctions {
                 if (str == null) return null;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 String replacement = String.valueOf(executor.evalExpr(fn.args().get(2), ctx));
-                // Convert PG-style \& (whole match) to Java $0, and \N backrefs to $N
+                // Convert PG-style \& (whole match) to Java $0. Numbered \N backrefs are
+                // converted below, once the pattern's group count is known (a backref to a
+                // group that does not exist substitutes the empty string, per PG).
                 replacement = replacement.replace("\\&", "$0");
-                replacement = replacement.replaceAll("\\\\(\\d)", "\\$$1");
                 String flags = "";
                 int startPos = 1;
                 int nth = 1; // PG15+ form default: replace first match only (0 = all)
@@ -445,6 +452,10 @@ class StringFunctions {
                 try {
                     String s = str.toString();
                     java.util.regex.Pattern p = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags);
+                    // Convert \N backrefs now that the group count is known: a valid group
+                    // becomes $N, a reference to a non-existent group substitutes empty (PG).
+                    int groupCount = p.matcher("").groupCount();
+                    replacement = convertRegexpReplaceBackrefs(replacement, groupCount);
                     if (pg15Form) {
                         if (startPos < 1) {
                             throw new MemgresException("invalid value for parameter \"start\": " + startPos, "22023");
@@ -1106,6 +1117,53 @@ class StringFunctions {
         return jflags;
     }
 
+    /**
+     * Convert PG {@code \N} numbered backrefs in a regexp_replace replacement string into
+     * Java {@code $N} group references. A reference to a group that does not exist is
+     * dropped (PG substitutes the empty string). Non-backref characters pass through
+     * unchanged (matching the previous behaviour for {@code $0}, literal {@code $}, etc.).
+     */
+    private static String convertRegexpReplaceBackrefs(String repl, int groupCount) {
+        StringBuilder sb = new StringBuilder(repl.length());
+        for (int i = 0; i < repl.length(); i++) {
+            char c = repl.charAt(i);
+            if (c == '\\' && i + 1 < repl.length() && Character.isDigit(repl.charAt(i + 1))) {
+                int g = repl.charAt(i + 1) - '0';
+                if (g <= groupCount) {
+                    sb.append('$').append((char) ('0' + g));
+                }
+                // else: backref to a non-existent group -> empty substitution
+                i++; // consume the digit
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * SQL-standard {@code substring(text FROM pattern FOR escape)}: the substring bracketed
+     * by the two {@code <escape>"} markers in the SIMILAR-style pattern is returned.
+     */
+    static Object sqlSimilarSubstring(String str, String pat, String escArg) {
+        String esc = (escArg == null || escArg.isEmpty()) ? "\\" : escArg;
+        // The escape char + '"' marks the start/end of the capture group.
+        String delimiter = java.util.regex.Pattern.quote(esc) + "\"";
+        String[] parts = pat.split(delimiter, -1);
+        if (parts.length < 3) return null; // need exactly two delimiters
+        String regexBefore = similarToRegex(parts[0], esc);
+        String regexCapture = similarToRegex(parts[1], esc);
+        String regexAfter = similarToRegex(parts[2], esc);
+        String fullRegex = "(?s)" + regexBefore + "(" + regexCapture + ")" + regexAfter;
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(fullRegex).matcher(str);
+            if (m.matches()) return m.group(1);
+            return null;
+        } catch (java.util.regex.PatternSyntaxException e) {
+            throw new MemgresException("invalid regular expression: " + e.getMessage(), "2201B");
+        }
+    }
+
     private static String similarToRegex(String pattern, String escapeChar) {
         StringBuilder sb = new StringBuilder();
         String esc = escapeChar != null && !escapeChar.isEmpty() ? escapeChar : "\\";
@@ -1239,6 +1297,19 @@ class StringFunctions {
     private static byte[] toBytea(Object val) {
         if (val instanceof byte[]) return (byte[]) val;
         return val.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** 0-based index of the first occurrence of {@code sub} in {@code hay}, or -1 (PG position semantics). */
+    private static int byteaIndexOf(byte[] hay, byte[] sub) {
+        if (sub.length == 0) return 0; // PG: empty substring matches at position 1
+        outer:
+        for (int i = 0; i + sub.length <= hay.length; i++) {
+            for (int j = 0; j < sub.length; j++) {
+                if (hay[i + j] != sub[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
     }
 
     /** Trim bytes from bytea: remove leading/trailing bytes that appear in trimBytes set. */

@@ -450,11 +450,10 @@ public final class TypeCoercion {
         if (type == DataType.BIT && value instanceof AstExecutor.PgBitString && column.getPrecision() != null) {
             String bits = ((AstExecutor.PgBitString) value).bits();
             int n = column.getPrecision();
-            if (bits.length() < n) {
-                StringBuilder sb = new StringBuilder(bits);
-                while (sb.length() < n) sb.append('0');
-                return new AstExecutor.PgBitString(sb.toString());
-            } else if (bits.length() > n) {
+            // On column assignment PG requires an exact length match for bit(n): a value that
+            // is too short or too long is an error (22026). Padding only happens for an
+            // explicit CAST (handled in CastEvaluator), not here.
+            if (bits.length() != n) {
                 throw new MemgresException("bit string length " + bits.length() + " does not match type bit(" + n + ")", "22026");
             }
         }

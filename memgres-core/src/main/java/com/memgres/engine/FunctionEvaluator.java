@@ -1606,6 +1606,11 @@ class FunctionEvaluator {
                 Expression argExpr = fn.args().get(0);
                 Object val = executor.evalExpr(argExpr, ctx);
                 if (val == null) return null;
+                // text(inet)/text(cidr) uses the network_show representation, which always
+                // includes the prefix length (e.g. text('1.2.3.4'::inet) -> '1.2.3.4/32').
+                if (val instanceof InetValue) {
+                    return ((InetValue) val).text();
+                }
                 // Check if the argument comes from an inet/cidr column and use network text representation
                 if (argExpr instanceof ColumnRef && ctx != null) {
                     ColumnRef ref = (ColumnRef) argExpr;
