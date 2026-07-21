@@ -99,6 +99,9 @@ public class AstExecutor {
         currentStatementTimestamp = OffsetDateTime.now();
         String previousRawSql = this.currentRawSql;
         this.currentRawSql = sql;
+        // H37: publish the session DateStyle field order so date input parsing honors DMY/YMD/MDY
+        String previousDateOrder = TypeCoercion.getDateOrder();
+        TypeCoercion.setDateOrder(currentDateStyleOrder());
         try {
             Statement stmt = Parser.parse(sql);
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
@@ -107,7 +110,22 @@ public class AstExecutor {
             this.boundParameters = previousParams;
             this.currentRawSql = previousRawSql;
             currentStatementTimestamp = null;
+            TypeCoercion.setDateOrder(previousDateOrder);
         }
+    }
+
+    /**
+     * H37: extract the DateStyle field order ("MDY"/"DMY"/"YMD") from the session GUC.
+     * The stored value is normalized (e.g. "ISO, DMY"); default is "MDY".
+     */
+    private String currentDateStyleOrder() {
+        if (session == null) return "MDY";
+        String ds = session.getGucSettings().get("datestyle");
+        if (ds == null) return "MDY";
+        String lower = ds.toLowerCase();
+        if (lower.contains("dmy")) return "DMY";
+        if (lower.contains("ymd")) return "YMD";
+        return "MDY";
     }
 
     public QueryResult executeStatement(Statement stmt) {

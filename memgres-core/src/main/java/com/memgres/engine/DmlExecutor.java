@@ -142,7 +142,8 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're inserting through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
-        Table table = executor.resolveTable(schemaName, stmt.table());
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // Capture view column mapping/order before any further resolveTable calls clobber them.
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -681,7 +682,8 @@ class DmlExecutor {
                 copySchema = copyTableName.substring(0, dot);
                 copyTableName = copyTableName.substring(dot + 1);
             }
-            Table table = executor.resolveTable(copySchema, copyTableName);
+            // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+            Table table = executor.resolveTable(copySchema, copyTableName, stmt.table().contains("."));
             List<Column> columns;
             List<Integer> colIndices = new ArrayList<>();
             if (stmt.columns() != null && !stmt.columns().isEmpty()) {
@@ -718,7 +720,8 @@ class DmlExecutor {
             fromSchema = fromTableName.substring(0, dot);
             fromTableName = fromTableName.substring(dot + 1);
         }
-        Table table = executor.resolveTable(fromSchema, fromTableName);
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(fromSchema, fromTableName, stmt.table().contains("."));
         if (stmt.columns() != null && !stmt.columns().isEmpty()) {
             Set<String> seen = new java.util.HashSet<>();
             for (String colName : stmt.columns()) {
@@ -787,7 +790,8 @@ class DmlExecutor {
             rowSchema = rowTableName.substring(0, dot);
             rowTableName = rowTableName.substring(dot + 1);
         }
-        Table table = executor.resolveTable(rowSchema, rowTableName);
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(rowSchema, rowTableName, stmt.table().contains("."));
         Object[] row = new Object[table.getColumns().size()];
         fillDefaults(table, row);
         List<Integer> colIndices = resolveColumnIndices(stmt, table);
@@ -1004,7 +1008,8 @@ class DmlExecutor {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
-        Table table = executor.resolveTable(schemaName, stmt.table());
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -1536,7 +1541,8 @@ class DmlExecutor {
         // Check read-only transaction
         checkReadOnly("DELETE");
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
-        Table table = executor.resolveTable(schemaName, stmt.table());
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -1815,7 +1821,8 @@ class DmlExecutor {
 
     private QueryResult executeMergeInner(MergeStmt stmt) {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
-        Table targetTable = executor.resolveTable(schemaName, stmt.targetTable());
+        // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
 
         // Validate: source cannot be the same unaliased table as target

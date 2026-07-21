@@ -135,6 +135,10 @@ public class GucSettings {
     private final Map<String, String> sessionOverrides = new LinkedHashMap<>();
     private final Map<String, String> transactionOverrides = new LinkedHashMap<>();
     private final Map<String, String> bootDefaults = new LinkedHashMap<>();
+    // L7: custom (dotted) parameters referenced in the session become placeholders.
+    // PG keeps them defined with an empty-string value after RESET, so current_setting
+    // returns '' rather than raising an "unrecognized parameter" error.
+    private final Set<String> customPlaceholders = new HashSet<>();
 
     /** Set a session-level parameter. */
     public void set(String name, String value) {
@@ -150,7 +154,12 @@ public class GucSettings {
                 normalized = normalized.trim().toLowerCase();
             }
         }
-        sessionOverrides.put(name.toLowerCase(), normalized);
+        String key = name.toLowerCase();
+        // L7: remember custom (dotted) parameters so RESET keeps them as an empty placeholder.
+        if (key.indexOf('.') >= 0) {
+            customPlaceholders.add(key);
+        }
+        sessionOverrides.put(key, normalized);
     }
 
     /** Set a transaction-scoped (LOCAL) parameter that reverts on commit/rollback. */
@@ -165,12 +174,19 @@ public class GucSettings {
 
     /** Reset a single parameter to default. */
     public void reset(String name) {
-        sessionOverrides.remove(name.toLowerCase());
+        String key = name.toLowerCase();
+        // L7: a custom placeholder stays defined with an empty value after RESET (PG behavior).
+        if (customPlaceholders.contains(key)) {
+            sessionOverrides.put(key, "");
+        } else {
+            sessionOverrides.remove(key);
+        }
     }
 
     /** Reset all session parameters. */
     public void resetAll() {
         sessionOverrides.clear();
+        customPlaceholders.clear();
     }
 
     /** Set a boot-time default that overrides the static default (e.g., for session_authorization). */
