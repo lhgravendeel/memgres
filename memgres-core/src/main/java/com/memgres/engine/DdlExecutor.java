@@ -122,6 +122,24 @@ class DdlExecutor {
         return null;
     }
 
+    /**
+     * PostgreSQL backs every EXCLUDE constraint with a real index — that is what
+     * pg_class, pg_index, pg_indexes and pg_constraint.conindid all point at. Register the
+     * same index metadata so those catalogs agree with PG.
+     */
+    void registerExcludeIndex(String schemaName, String tableName, StoredConstraint sc) {
+        if (sc == null || sc.getType() != StoredConstraint.Type.EXCLUDE) return;
+        List<String> cols = new ArrayList<>();
+        if (sc.getExcludeElements() != null) {
+            for (StoredConstraint.ExcludeElement e : sc.getExcludeElements()) cols.add(e.column());
+        }
+        if (cols.isEmpty()) return;
+        String method = sc.getExcludeMethod() != null ? sc.getExcludeMethod() : "btree";
+        executor.database.addIndex(sc.getName(), cols);
+        executor.database.addIndexMeta(sc.getName(),
+                (schemaName != null ? schemaName : "public") + "." + tableName, false, method, null);
+    }
+
     /** Convert a TableConstraint AST node to a StoredConstraint. */
     StoredConstraint convertTableConstraint(String tableName, TableConstraint tc) {
         String name = tc.name();
@@ -211,9 +229,16 @@ class DdlExecutor {
                 return fk;
             }
             case EXCLUDE: {
-                if (name == null) name = tableName + "_excl";
+                if (name == null) {
+                    // PG names it <table>_<col>..._excl.
+                    List<String> exCols = tc.columns();
+                    name = exCols == null || exCols.isEmpty()
+                            ? tableName + "_excl"
+                            : tableName + "_" + String.join("_", exCols) + "_excl";
+                }
                 StoredConstraint excl = new StoredConstraint(name, StoredConstraint.Type.EXCLUDE,
                         tc.columns(), null, null, null, null, null);
+                excl.setExcludeMethod(tc.excludeMethod() != null ? tc.excludeMethod() : "btree");
                 if (tc.excludeElements() != null) {
                     excl.setExcludeElements(tc.excludeElements().stream()
                             .map(e -> new StoredConstraint.ExcludeElement(e.column(), e.operator()))

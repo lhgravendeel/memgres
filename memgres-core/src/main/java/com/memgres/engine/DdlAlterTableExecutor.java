@@ -917,6 +917,7 @@ class DdlAlterTableExecutor {
                 }
             }
             table.addConstraint(sc);
+            ddl.registerExcludeIndex(schemaName, stmt.table(), sc);
             if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
                 // PG: ADD PRIMARY KEY marks the key columns NOT NULL (attnotnull /
                 // information_schema.columns.is_nullable = 'NO'), on the table and its partitions.

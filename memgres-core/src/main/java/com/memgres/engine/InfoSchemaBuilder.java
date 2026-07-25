@@ -962,16 +962,83 @@ public class InfoSchemaBuilder {
 
     private Table buildIsParameters() {
         List<Column> cols = Cols.listOf(
-                new Column("specific_catalog", DataType.TEXT, true, false, null),
-                new Column("specific_schema", DataType.TEXT, true, false, null),
-                new Column("specific_name", DataType.TEXT, true, false, null),
+                new Column("specific_catalog", DataType.NAME, true, false, null),
+                new Column("specific_schema", DataType.NAME, true, false, null),
+                new Column("specific_name", DataType.NAME, true, false, null),
                 new Column("ordinal_position", DataType.INTEGER, true, false, null),
-                new Column("parameter_mode", DataType.TEXT, true, false, null),
-                new Column("parameter_name", DataType.TEXT, true, false, null),
-                new Column("data_type", DataType.TEXT, true, false, null),
-                new Column("parameter_default", DataType.TEXT, true, false, null)
+                new Column("parameter_mode", DataType.VARCHAR, true, false, null),
+                new Column("is_result", DataType.VARCHAR, true, false, null),
+                new Column("as_locator", DataType.VARCHAR, true, false, null),
+                new Column("parameter_name", DataType.NAME, true, false, null),
+                new Column("data_type", DataType.VARCHAR, true, false, null),
+                new Column("character_maximum_length", DataType.INTEGER, true, false, null),
+                new Column("character_octet_length", DataType.INTEGER, true, false, null),
+                new Column("character_set_catalog", DataType.NAME, true, false, null),
+                new Column("character_set_schema", DataType.NAME, true, false, null),
+                new Column("character_set_name", DataType.NAME, true, false, null),
+                new Column("collation_catalog", DataType.NAME, true, false, null),
+                new Column("collation_schema", DataType.NAME, true, false, null),
+                new Column("collation_name", DataType.NAME, true, false, null),
+                new Column("numeric_precision", DataType.INTEGER, true, false, null),
+                new Column("numeric_precision_radix", DataType.INTEGER, true, false, null),
+                new Column("numeric_scale", DataType.INTEGER, true, false, null),
+                new Column("datetime_precision", DataType.INTEGER, true, false, null),
+                new Column("interval_type", DataType.VARCHAR, true, false, null),
+                new Column("interval_precision", DataType.INTEGER, true, false, null),
+                new Column("udt_catalog", DataType.NAME, true, false, null),
+                new Column("udt_schema", DataType.NAME, true, false, null),
+                new Column("udt_name", DataType.NAME, true, false, null),
+                new Column("scope_catalog", DataType.NAME, true, false, null),
+                new Column("scope_schema", DataType.NAME, true, false, null),
+                new Column("scope_name", DataType.NAME, true, false, null),
+                new Column("maximum_cardinality", DataType.INTEGER, true, false, null),
+                new Column("dtd_identifier", DataType.NAME, true, false, null),
+                new Column("parameter_default", DataType.VARCHAR, true, false, null)
         );
-        return new Table("parameters", cols); // empty, function params not tracked in detail
+        Table table = new Table("parameters", cols);
+        // The specific_name sequence must line up with information_schema.routines, so the
+        // two views join; both walk database.getFunctions() in insertion order.
+        int specificSeq = 1;
+        for (Map.Entry<String, PgFunction> entry : database.getFunctions().entrySet()) {
+            PgFunction fn = entry.getValue();
+            String schema = fn.getSchemaName() != null ? fn.getSchemaName() : "public";
+            String specificName = fn.getName() + "_" + (specificSeq++);
+            List<PgFunction.Param> params = fn.getParams();
+            if (params == null) continue;
+            for (int i = 0; i < params.size(); i++) {
+                PgFunction.Param p = params.get(i);
+                String mode = p.mode() == null || p.mode().isEmpty() ? "IN" : p.mode().toUpperCase();
+                DataType dt = null;
+                String udtName = p.typeName();
+                if (udtName != null) {
+                    try {
+                        dt = DataType.fromPgName(udtName);
+                    } catch (RuntimeException ignored) {
+                        // A user-defined type: keep the written name as udt_name.
+                    }
+                }
+                table.insertRow(new Object[]{
+                        catalogName(),                                  // specific_catalog
+                        schema,                                         // specific_schema
+                        specificName,                                   // specific_name
+                        i + 1,                                          // ordinal_position
+                        mode,                                           // parameter_mode
+                        "NO",                                           // is_result
+                        "NO",                                           // as_locator
+                        p.name(),                                       // parameter_name
+                        dt != null ? CatalogHelper.pgTypeName(dt) : "USER-DEFINED", // data_type
+                        null, null, null, null, null, null, null, null, // length / charset / collation
+                        null, null, null, null, null, null,             // numeric / datetime / interval
+                        catalogName(),                                  // udt_catalog
+                        dt != null ? "pg_catalog" : schema,             // udt_schema
+                        dt != null ? dt.getPgName() : udtName,          // udt_name
+                        null, null, null, null,                         // scope / maximum_cardinality
+                        String.valueOf(i + 1),                          // dtd_identifier
+                        p.defaultExpr()                                 // parameter_default
+                });
+            }
+        }
+        return table;
     }
 
     private Table buildIsTriggers() {

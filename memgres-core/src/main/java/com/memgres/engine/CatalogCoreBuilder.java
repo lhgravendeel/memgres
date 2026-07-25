@@ -373,6 +373,27 @@ class CatalogCoreBuilder {
             }
         }
 
+        // Composite types (relkind='c'). pg_type.typrelid and the composite's pg_attribute
+        // rows already point at "rel:<schema>.<name>", so the same key links them up.
+        int compositeNsOid = oids.oid("ns:public");
+        for (Map.Entry<String, java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>> ctEntry
+                : database.getCompositeTypes().entrySet()) {
+            String ctName = ctEntry.getKey();
+            int ctOid = oids.oid("rel:public." + ctName);
+            short ctNatts = (short) (ctEntry.getValue() != null ? ctEntry.getValue().size() : 0);
+            table.insertRow(new Object[]{
+                    ctOid, ctName, compositeNsOid,
+                    oids.oid("type:" + ctName), 0, resolveOwnerOid(database, oids, "type:" + ctName), 0, 0, 0,
+                    0, 0.0, 0, 0, 0,
+                    false, false, "p", "c",
+                    ctNatts, (short) 0,
+                    false, false, false, false, false,
+                    false, // relhasoids
+                    true, "n", false, 0, 0, 0,
+                    null, null, null, 1
+            });
+        }
+
         // Foreign tables (relkind='f')
         int publicNsOid = oids.oid("ns:public");
         for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
@@ -600,8 +621,166 @@ class CatalogCoreBuilder {
         }
     }
 
+    /**
+     * Every sequence relation has the same three fixed columns in PG, and pg_class already
+     * advertises relnatts=3 for them, so pg_attribute has to back that up.
+     */
+    private void addSequenceAttributes(Table table) {
+        String[] names = {"last_value", "log_cnt", "is_called"};
+        DataType[] types = {DataType.BIGINT, DataType.BIGINT, DataType.BOOLEAN};
+        short[] lens = {8, 8, 1};
+        String[] aligns = {"d", "d", "c"};
+        for (String seqName : CatalogHelper.getSequenceNames(database)) {
+            String seqSchema = sequenceSchema(seqName);
+            int seqOid = oids.oid("rel:" + seqSchema + "." + seqName);
+            for (int i = 0; i < names.length; i++) {
+                table.insertRow(new Object[]{
+                        seqOid, names[i], types[i].getOid(), (short) (i + 1),
+                        true, -1, lens[i], false, false,
+                        "", "", 0, 1, true, 0, null, 0, null,
+                        null, (short) -1, "p", "", false, null, aligns[i]
+                });
+            }
+        }
+    }
+
+    private String sequenceSchema(String seqName) {
+        for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
+            if (database.getSchemaObjects(entry.getKey()).contains("sequence:" + seqName.toLowerCase())) {
+                return entry.getKey();
+            }
+        }
+        return "public";
+    }
+
+    /**
+     * Index relations have one pg_attribute row per key column, which is what pgjdbc's
+     * getIndexInfo and psql's \d read. PG names an expression column after the top-level
+     * function (lower), after the underlying column for a cast, and "expr" otherwise.
+     */
+    private void addIndexAttributes(Table table) {
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            for (Table t : schemaEntry.getValue().getTables().values()) {
+                java.util.Set<String> done = new java.util.HashSet<>();
+                for (Map.Entry<String, java.util.List<String>> idx : database.getIndexColumns().entrySet()) {
+                    String qualified = database.getIndexTable(idx.getKey());
+                    if (qualified == null || !qualified.equalsIgnoreCase(schemaName + "." + t.getName())) continue;
+                    addIndexAttributeRows(table, schemaName, idx.getKey(), t, idx.getValue());
+                    done.add(idx.getKey().toLowerCase());
+                }
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
+                            && sc.getType() != StoredConstraint.Type.UNIQUE) continue;
+                    if (done.contains(sc.getName().toLowerCase())) continue;
+                    addIndexAttributeRows(table, schemaName, sc.getName(), t, sc.getColumns());
+                }
+            }
+        }
+    }
+
+    private void addIndexAttributeRows(Table table, String schemaName, String indexName,
+                                       Table t, java.util.List<String> cols) {
+        if (cols == null) return;
+        int idxOid = oids.oid("rel:" + schemaName + "." + indexName);
+        for (int i = 0; i < cols.size(); i++) {
+            String col = cols.get(i);
+            String attname;
+            DataType type;
+            int colIdx = t.getColumnIndex(col);
+            if (colIdx >= 0) {
+                attname = t.getColumns().get(colIdx).getName();
+                type = t.getColumns().get(colIdx).getType();
+            } else {
+                attname = indexExprName(col);
+                type = indexExprType(col, t);
+            }
+            table.insertRow(new Object[]{
+                    idxOid, attname, type.getOid(), (short) (i + 1),
+                    false, -1, (short) typeLength(type), false, false,
+                    "", "", 0, 1, true, 0, null, 0, null,
+                    null, (short) -1, "p", "", false, null, "i"
+            });
+        }
+    }
+
+    private static short typeLength(DataType dt) {
+        switch (dt) {
+            case BOOLEAN: return 1;
+            case SMALLINT: return 2;
+            case INTEGER: case REAL: case DATE: case OID: return 4;
+            case BIGINT: case DOUBLE_PRECISION: case TIME: case TIMESTAMP: case TIMESTAMPTZ: return 8;
+            case UUID: return 16;
+            case INTERVAL: return 16;
+            default: return -1;
+        }
+    }
+
+    private static String indexExprName(String exprText) {
+        try {
+            com.memgres.engine.parser.ast.Expression e =
+                    com.memgres.engine.parser.Parser.parseExpression(exprText);
+            if (e instanceof com.memgres.engine.parser.ast.ColumnRef) {
+                return ((com.memgres.engine.parser.ast.ColumnRef) e).column().toLowerCase();
+            }
+            if (e instanceof com.memgres.engine.parser.ast.CastExpr) {
+                return indexExprName(SqlUnparser.exprToSql(
+                        ((com.memgres.engine.parser.ast.CastExpr) e).expr()));
+            }
+            if (e instanceof com.memgres.engine.parser.ast.FunctionCallExpr) {
+                return ((com.memgres.engine.parser.ast.FunctionCallExpr) e).name().toLowerCase();
+            }
+        } catch (Exception ignored) {
+            // Unparseable expression: PG's generic name applies.
+        }
+        return "expr";
+    }
+
+    private DataType indexExprType(String exprText, Table t) {
+        try {
+            com.memgres.engine.parser.ast.Expression e =
+                    com.memgres.engine.parser.Parser.parseExpression(exprText);
+            return indexExprType(e, t);
+        } catch (Exception ignored) {
+            return DataType.TEXT;
+        }
+    }
+
+    private DataType indexExprType(com.memgres.engine.parser.ast.Expression e, Table t) {
+        if (e instanceof com.memgres.engine.parser.ast.ColumnRef) {
+            int i = t.getColumnIndex(((com.memgres.engine.parser.ast.ColumnRef) e).column());
+            return i >= 0 ? t.getColumns().get(i).getType() : DataType.TEXT;
+        }
+        if (e instanceof com.memgres.engine.parser.ast.CastExpr) {
+            DataType dt = DataType.fromPgName(((com.memgres.engine.parser.ast.CastExpr) e).typeName());
+            return dt != null ? dt : DataType.TEXT;
+        }
+        if (e instanceof com.memgres.engine.parser.ast.FunctionCallExpr) {
+            com.memgres.engine.parser.ast.FunctionCallExpr fn =
+                    (com.memgres.engine.parser.ast.FunctionCallExpr) e;
+            String n = fn.name().toLowerCase();
+            if (INDEX_TEXT_FUNCS.contains(n)) return DataType.TEXT;
+            if (INDEX_INT_FUNCS.contains(n)) return DataType.INTEGER;
+            if (!fn.args().isEmpty()) return indexExprType(fn.args().get(0), t);
+            return DataType.TEXT;
+        }
+        if (e instanceof com.memgres.engine.parser.ast.BinaryExpr) {
+            return indexExprType(((com.memgres.engine.parser.ast.BinaryExpr) e).left(), t);
+        }
+        return DataType.TEXT;
+    }
+
+    private static final java.util.Set<String> INDEX_TEXT_FUNCS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "lower", "upper", "initcap", "btrim", "ltrim", "rtrim", "md5", "replace",
+            "substr", "substring", "concat", "concat_ws", "reverse", "translate"));
+
+    private static final java.util.Set<String> INDEX_INT_FUNCS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "length", "char_length", "character_length", "octet_length", "strpos", "ascii"));
+
     /** pg_attribute rows for foreign tables, composite types, and system catalogs. */
     private void addPgAttributeExtras(Table table) {
+        addSequenceAttributes(table);
+        addIndexAttributes(table);
         // Foreign table columns
         for (Database.FdwForeignTable ft : database.getForeignTables().values()) {
             int ftRelOid = oids.oid("rel:public." + ft.tableName);
@@ -620,6 +799,8 @@ class CatalogCoreBuilder {
                 }
             }
         }
+
+        // (sequence and index attributes are added by addSequenceAttributes/addIndexAttributes)
 
         // Composite type attributes
         for (Map.Entry<String, java.util.List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField>> ctEntry
@@ -644,13 +825,13 @@ class CatalogCoreBuilder {
         // pg_index attributes (indkey must be int2vector = OID 22)
         addCatalogTableAttributesTyped(table, "pg_index", new String[]{
                 "indexrelid", "indrelid", "indisunique", "indisprimary",
-                "indimmediate", "indkey", "indnkeyatts", "indnatts",
+                "indisexclusion", "indimmediate", "indkey", "indnkeyatts", "indnatts",
                 "indisvalid", "indisready", "indislive", "indexprs",
                 "indpred", "indisclustered", "indisreplident", "indoption",
                 "indnullsnotdistinct", "indclass", "indcollation"
         }, new int[]{
                 26, 26, 16, 16,    // oid, oid, bool, bool
-                16, 22, 21, 21,    // bool, int2vector, int2, int2
+                16, 16, 22, 21, 21, // bool, bool, int2vector, int2, int2
                 16, 16, 16, 25,    // bool, bool, bool, text
                 25, 16, 16, 22,    // text, bool, bool, int2vector
                 16, 30, 30         // bool, oidvector, oidvector

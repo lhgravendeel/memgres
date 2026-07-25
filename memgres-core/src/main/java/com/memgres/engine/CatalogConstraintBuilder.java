@@ -97,7 +97,9 @@ class CatalogConstraintBuilder {
                         }
                     }
                     int conindid = 0;
-                    if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
+                    if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                            || sc.getType() == StoredConstraint.Type.UNIQUE
+                            || sc.getType() == StoredConstraint.Type.EXCLUDE) {
                         conindid = oids.oid("rel:" + schemaEntry.getKey() + "." + sc.getName());
                     } else if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
                         // For FK constraints, conindid should reference the PK/UNIQUE index on the referenced table
@@ -290,6 +292,7 @@ class CatalogConstraintBuilder {
                 colNN("indrelid", DataType.INTEGER),
                 colNN("indisunique", DataType.BOOLEAN),
                 colNN("indisprimary", DataType.BOOLEAN),
+                colNN("indisexclusion", DataType.BOOLEAN),
                 col("indimmediate", DataType.BOOLEAN),
                 col("indkey", DataType.TEXT),
                 col("indnkeyatts", DataType.SMALLINT),
@@ -400,7 +403,11 @@ class CatalogConstraintBuilder {
                         int totalAtts = indkeyElems.size();
                         boolean nullsNotDistinct = database.isIndexNullsNotDistinct(indexName);
                         boolean isClustered = database.isClusteredIndex(indexName);
+                        boolean isExclusion = t.getConstraints().stream()
+                                .anyMatch(sc -> sc.getName().equalsIgnoreCase(indexName)
+                                        && sc.getType() == StoredConstraint.Type.EXCLUDE);
                         table.insertRow(new Object[]{indexOid, tableOid, isUnique, isPrimary,
+                                isExclusion,
                                 true, // indimmediate
                                 indkeyVec,
                                 (short) nKeyAtts, (short) totalAtts, true, true, true, indexprs, whereClause, isClustered,
@@ -452,6 +459,7 @@ class CatalogConstraintBuilder {
                                     indexOid, tableOid,
                                     true, // isUnique
                                     sc.getType() == StoredConstraint.Type.PRIMARY_KEY, // isPrimary
+                                    false, // indisexclusion
                                     true, // indimmediate
                                     indkeyVec,
                                     (short) indkeyList.size(), (short) indkeyList.size(),
