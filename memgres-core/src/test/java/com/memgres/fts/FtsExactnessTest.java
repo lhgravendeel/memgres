@@ -295,6 +295,43 @@ class FtsExactnessTest {
         assertEquals("4.2407352e+07", PgFloatFormat.float4out(4.240735306509258E7f));
     }
 
+    /**
+     * extra_float_digits above zero selects shortest round-trip output; zero or below
+     * selects a fixed FLT_DIG/DBL_DIG precision, which is how a session that sets it to 0
+     * sees 0.0607927 where the default shows 0.06079271.
+     */
+    @Test
+    void extraFloatDigitsMatchesPg() {
+        assertEquals("0.33333334", PgFloatFormat.float4out(1f / 3, 1));
+        assertEquals("0.333333", PgFloatFormat.float4out(1f / 3, 0));
+        assertEquals("0.3", PgFloatFormat.float4out(1f / 3, -5));
+        assertEquals("0.3333333333333333", PgFloatFormat.float8out(1.0 / 3, 1));
+        assertEquals("0.333333333333333", PgFloatFormat.float8out(1.0 / 3, 0));
+        assertEquals("0.3333333333", PgFloatFormat.float8out(1.0 / 3, -5));
+        // %g switches to exponent form once the exponent reaches the precision
+        assertEquals("1000000000000", PgFloatFormat.float8out(1e12, 1));
+        assertEquals("1e+12", PgFloatFormat.float8out(1e12, -5));
+        assertEquals("123456.789", PgFloatFormat.float8out(123456.789, -5));
+    }
+
+    @Test
+    void tsRankHonoursExtraFloatDigits() throws Exception {
+        try (Statement s = conn.createStatement()) {
+            s.execute("SET extra_float_digits = 0");
+        }
+        try {
+            assertEquals("0.0607927", q("SELECT ts_rank(to_tsvector('english','The quick brown fox'), "
+                    + "to_tsquery('english','quick'))::text"));
+            assertEquals("0.333333", q("SELECT ('0.33333334'::float4)::text"));
+        } finally {
+            try (Statement s = conn.createStatement()) {
+                s.execute("SET extra_float_digits = 1");
+            }
+        }
+        assertEquals("0.06079271", q("SELECT ts_rank(to_tsvector('english','The quick brown fox'), "
+                + "to_tsquery('english','quick'))::text"));
+    }
+
     @Test
     void floatTextCastMatchesPg() throws Exception {
         assertEquals("1e+20", q("SELECT (1e20::float8)::text"));

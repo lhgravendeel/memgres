@@ -7,12 +7,17 @@ import java.math.RoundingMode;
 /**
  * PostgreSQL's {@code float4out} / {@code float8out}.
  *
- * <p>With the default {@code extra_float_digits}, PG emits the <em>shortest</em> decimal
- * string that reads back as the same binary value (its bundled Ryū implementation), then
- * formats it with its own notation rules rather than C's {@code %g}: scientific notation
- * when the leading digit's decimal exponent is below -4 or at least the type's decimal
- * digit count (6 for {@code real}, 15 for {@code double precision}), and a signed
- * exponent padded to at least two digits.
+ * <p>With {@code extra_float_digits} above zero — PG's default of 1 — PG emits the
+ * <em>shortest</em> decimal string that reads back as the same binary value (its bundled
+ * Ryū implementation), then formats it with its own notation rules rather than C's
+ * {@code %g}: scientific notation when the leading digit's decimal exponent is below -4
+ * or at least the type's decimal digit count (6 for {@code real}, 15 for {@code double
+ * precision}), and a signed exponent padded to at least two digits.
+ *
+ * <p>At zero or below PG switches to a fixed precision of {@code FLT_DIG}/{@code DBL_DIG}
+ * plus the setting, rendered like {@code %g}. That is how a session that has done
+ * {@code SET extra_float_digits = 0} gets {@code 0.333333} where the default gives
+ * {@code 0.33333334}.
  *
  * <p>The digits are found by rounding the value's exact binary expansion to successively
  * more places until it reads back unchanged. Java's own conversions are no help here:
@@ -24,8 +29,13 @@ public final class PgFloatFormat {
     private PgFloatFormat() {
     }
 
-    /** PG's {@code float8out}. */
+    /** PG's {@code float8out} at the default {@code extra_float_digits}. */
     public static String float8out(double d) {
+        return float8out(d, 1);
+    }
+
+    /** PG's {@code float8out}, honouring {@code extra_float_digits}. */
+    public static String float8out(double d, int extraFloatDigits) {
         if (Double.isNaN(d)) return "NaN";
         if (Double.isInfinite(d)) return d > 0 ? "Infinity" : "-Infinity";
         boolean negative = (Double.doubleToRawLongBits(d) & 0x8000000000000000L) != 0;
@@ -33,6 +43,9 @@ public final class PgFloatFormat {
 
         double a = Math.abs(d);
         BigDecimal exact = new BigDecimal(a);
+        if (extraFloatDigits <= 0) {
+            return fixedPrecision(negative, exact, DBL_DIG + extraFloatDigits);
+        }
         BigDecimal low = midpoint(exact, Math.nextDown(a));
         BigDecimal high = midpoint(exact, Math.nextUp(a));
         for (int precision = 1; precision <= 17; precision++) {
@@ -45,8 +58,13 @@ public final class PgFloatFormat {
         return render(negative, exact, 15);
     }
 
-    /** PG's {@code float4out}. */
+    /** PG's {@code float4out} at the default {@code extra_float_digits}. */
     public static String float4out(float f) {
+        return float4out(f, 1);
+    }
+
+    /** PG's {@code float4out}, honouring {@code extra_float_digits}. */
+    public static String float4out(float f, int extraFloatDigits) {
         if (Float.isNaN(f)) return "NaN";
         if (Float.isInfinite(f)) return f > 0 ? "Infinity" : "-Infinity";
         boolean negative = (Float.floatToRawIntBits(f) & 0x80000000) != 0;
@@ -54,6 +72,9 @@ public final class PgFloatFormat {
 
         float a = Math.abs(f);
         BigDecimal exact = new BigDecimal((double) a);
+        if (extraFloatDigits <= 0) {
+            return fixedPrecision(negative, exact, FLT_DIG + extraFloatDigits);
+        }
         BigDecimal low = midpoint(exact, Math.nextDown(a));
         BigDecimal high = midpoint(exact, Math.nextUp(a));
         for (int precision = 1; precision <= 9; precision++) {
@@ -64,6 +85,20 @@ public final class PgFloatFormat {
             }
         }
         return render(negative, exact, 6);
+    }
+
+    private static final int FLT_DIG = 6;
+    private static final int DBL_DIG = 15;
+
+    /**
+     * PG's non-shortest path: {@code pg_strfromd} with {@code FLT_DIG}/{@code DBL_DIG}
+     * plus the setting, which formats like {@code %g} — trailing zeros dropped, and
+     * scientific notation once the exponent reaches the requested precision.
+     */
+    private static String fixedPrecision(boolean negative, BigDecimal exact, int ndig) {
+        if (ndig < 1) ndig = 1;
+        BigDecimal rounded = exact.round(new MathContext(ndig, RoundingMode.HALF_EVEN));
+        return render(negative, rounded, ndig);
     }
 
     private static BigDecimal midpoint(BigDecimal exact, double neighbour) {

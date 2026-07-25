@@ -237,6 +237,29 @@ SELECT (100000::float4)::text AS a, (1000000::float4)::text AS b,
 -- end-expected
 SELECT ('NaN'::float8)::text AS a, ('Infinity'::float8)::text AS b, ('-Infinity'::float8)::text AS c;
 
+-- extra_float_digits selects shortest output above zero, fixed precision at or below it
+SET extra_float_digits = 0;
+
+-- begin-expected
+-- columns: r | f4 | f8
+-- row: 0.0607927, 0.333333, 0.333333333333333
+-- end-expected
+SELECT ts_rank(to_tsvector('english','The quick brown fox'),
+               to_tsquery('english','quick'))::text AS r,
+       ('0.33333334'::float4)::text AS f4,
+       (0.3333333333333333::float8)::text AS f8;
+
+SET extra_float_digits = 1;
+
+-- begin-expected
+-- columns: r | f4 | f8
+-- row: 0.06079271, 0.33333334, 0.3333333333333333
+-- end-expected
+SELECT ts_rank(to_tsvector('english','The quick brown fox'),
+               to_tsquery('english','quick'))::text AS r,
+       ('0.33333334'::float4)::text AS f4,
+       (0.3333333333333333::float8)::text AS f8;
+
 -- The rank functions return real, not text
 -- begin-expected
 -- columns: t

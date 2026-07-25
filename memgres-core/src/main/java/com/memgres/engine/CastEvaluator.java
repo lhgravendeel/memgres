@@ -65,6 +65,16 @@ class CastEvaluator {
         return java.time.ZoneId.systemDefault();
     }
 
+    private int extraFloatDigits() {
+        if (executor.session == null) return 1;
+        try {
+            String v = executor.session.getGucSettings().get("extra_float_digits");
+            return v == null ? 1 : Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return 1;
+        }
+    }
+
     Object applyCast(Object val, String typeSpec) {
         if (val == null) return null;
         // JSON/JSONB null literal → SQL NULL when cast to any other type
@@ -306,12 +316,13 @@ class CastEvaluator {
                 if (val instanceof Boolean) {
                     return ((Boolean) val) ? "true" : "false";
                 }
-                // float4/float8 to text goes through PG's own output functions.
+                // float4/float8 to text goes through PG's own output functions,
+                // which honour extra_float_digits.
                 if (val instanceof Double) {
-                    return PgFloatFormat.float8out((Double) val);
+                    return PgFloatFormat.float8out((Double) val, extraFloatDigits());
                 }
                 if (val instanceof Float) {
-                    return PgFloatFormat.float4out((Float) val);
+                    return PgFloatFormat.float4out((Float) val, extraFloatDigits());
                 }
                 if (val instanceof byte[]) {
                     // PG bytea::text uses the bytea_output format (default: hex, "\x..").
