@@ -21,6 +21,12 @@ public final class TableConstraint {
     public final boolean noInherit;
     public final String matchType; // null, "FULL", "SIMPLE", "PARTIAL"
     public final List<ExcludeElement> excludeElements;
+    /** Index access method backing an EXCLUDE constraint; PG defaults to btree. */
+    private String excludeMethod;
+
+    public String excludeMethod() { return excludeMethod; }
+
+    public void setExcludeMethod(String excludeMethod) { this.excludeMethod = excludeMethod; }
 
     public TableConstraint(
             String name,

@@ -574,8 +574,9 @@ class DdlTableParser {
 
         if (parser.matchKeyword("EXCLUDE")) {
             parser.matchKeyword("USING");
+            String excludeMethod = "btree";  // PG's default index access method
             if (!parser.check(TokenType.LEFT_PAREN)) {
-                parser.readIdentifier();
+                excludeMethod = parser.readIdentifier();
             }
             List<TableConstraint.ExcludeElement> excludeElements = new ArrayList<>();
             List<String> excludeCols = new ArrayList<>();
@@ -624,8 +625,10 @@ class DdlTableParser {
                 throw new com.memgres.engine.MemgresException(
                         "EXCLUDE constraints cannot be marked NOT ENFORCED", "0A000");
             }
-            return new TableConstraint(constraintName, TableConstraint.ConstraintType.EXCLUDE,
+            TableConstraint excl = new TableConstraint(constraintName, TableConstraint.ConstraintType.EXCLUDE,
                     excludeCols, null, null, null, null, null, false, exDeferrable, exInitiallyDeferred, false, excludeElements);
+            excl.setExcludeMethod(excludeMethod);
+            return excl;
         }
 
         throw new ParseException("Expected constraint type", parser.peek());

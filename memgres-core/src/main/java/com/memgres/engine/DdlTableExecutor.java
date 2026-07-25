@@ -307,6 +307,7 @@ class DdlTableExecutor {
                         sc.setReferencesSchema(schemaName);
                     }
                     table.addConstraint(sc);
+                    ddl.registerExcludeIndex(schemaName, stmt.name(), sc);
                     if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
                         for (String colName : sc.getColumns()) {
                             table.alterColumnNullable(colName, false);

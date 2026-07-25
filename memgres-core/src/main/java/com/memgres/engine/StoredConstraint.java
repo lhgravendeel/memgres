@@ -47,6 +47,7 @@ public class StoredConstraint {
         }
     }
     private List<ExcludeElement> excludeElements;
+    private String excludeMethod; // index access method backing an EXCLUDE constraint
 
     private String name;
     private final Type type;
@@ -120,6 +121,8 @@ public class StoredConstraint {
     public void setNullsNotDistinct(boolean nullsNotDistinct) { this.nullsNotDistinct = nullsNotDistinct; }
     public List<ExcludeElement> getExcludeElements() { return excludeElements; }
     public void setExcludeElements(List<ExcludeElement> elements) { this.excludeElements = elements; }
+    public String getExcludeMethod() { return excludeMethod; }
+    public void setExcludeMethod(String excludeMethod) { this.excludeMethod = excludeMethod; }
     public Expression getWhereExpr() { return whereExpr; }
     public void setWhereExpr(Expression whereExpr) { this.whereExpr = whereExpr; }
     public List<Expression> getExpressionColumns() { return expressionColumns; }
@@ -303,6 +306,7 @@ public class StoredConstraint {
                 referencesTable, referencesColumns, onDelete, onUpdate);
         copy.referencesSchema = referencesSchema;
         copy.excludeElements = excludeElements;
+        copy.excludeMethod = excludeMethod;
         copy.nullsNotDistinct = nullsNotDistinct;
         copy.deferrable = deferrable;
         copy.initiallyDeferred = initiallyDeferred;
