@@ -117,18 +117,18 @@ class DmlValidationHelper {
             SelectStmt sel = (SelectStmt) view.query();
             exprs.add(sel.where());
         }
-        // Recurse into base views if this view is CASCADED (or a parent is cascading through)
+        // Always descend: a base view's own WITH CHECK OPTION applies to rows written
+        // through an outer view, whatever the outer view declares. The cascading flag only
+        // decides whether a base view WITHOUT its own check option contributes its WHERE.
         boolean shouldCascade = "CASCADED".equals(view.checkOption()) || cascading;
-        if (shouldCascade) {
-            if (view.query() instanceof SelectStmt && ((SelectStmt) view.query()).from() != null) {
-                SelectStmt sel = (SelectStmt) view.query();
-                for (SelectStmt.FromItem fromItem : sel.from()) {
-                    if (fromItem instanceof SelectStmt.TableRef) {
-                        SelectStmt.TableRef ref = (SelectStmt.TableRef) fromItem;
-                        Database.ViewDef baseView = executor.database.getView(ref.table());
-                        if (baseView != null) {
-                            collectViewCheckExprsRecursive(ref.table(), true, exprs, visited);
-                        }
+        if (view.query() instanceof SelectStmt && ((SelectStmt) view.query()).from() != null) {
+            SelectStmt sel = (SelectStmt) view.query();
+            for (SelectStmt.FromItem fromItem : sel.from()) {
+                if (fromItem instanceof SelectStmt.TableRef) {
+                    SelectStmt.TableRef ref = (SelectStmt.TableRef) fromItem;
+                    Database.ViewDef baseView = executor.database.getView(ref.table());
+                    if (baseView != null) {
+                        collectViewCheckExprsRecursive(ref.table(), shouldCascade, exprs, visited);
                     }
                 }
             }

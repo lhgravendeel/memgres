@@ -103,12 +103,13 @@ class DmlExecutor {
             pushed = true;
         }
         try {
-            T result = action.get();
-            // Force-execute any unreferenced DML CTEs (PG always executes data-modifying CTEs)
+            // PG evaluates every data-modifying CTE before the main statement acts, so a
+            // WITH d AS (DELETE ...) INSERT cannot have the delete wipe the inserted row.
+            // Referenced CTEs are cached, so this does not run them twice.
             if (withClauses != null) {
                 executePendingDmlCtes(withClauses);
             }
-            return result;
+            return action.get();
         } finally {
             if (pushed) executor.cteStack.pop();
         }
@@ -143,6 +144,7 @@ class DmlExecutor {
         // Collect WITH CHECK OPTION constraints from views we're inserting through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        executor.viewDmlVerb = "insert into";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // Capture view column mapping/order before any further resolveTable calls clobber them.
         this.activeViewColMap = executor.lastViewColumnMapping;
@@ -1009,10 +1011,21 @@ class DmlExecutor {
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        executor.viewDmlVerb = "update";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
+        // A view column computed from an expression has nothing to assign back to.
+        Set<String> viewExprCols = executor.lastViewExpressionColumns;
+        if (viewExprCols != null) {
+            for (InsertStmt.SetClause set : stmt.setClauses()) {
+                if (viewExprCols.contains(set.column().toLowerCase())) {
+                    throw new MemgresException("cannot update column \"" + set.column()
+                            + "\" of view \"" + stmt.table() + "\"", "0A000");
+                }
+            }
+        }
         // C6: Enforce UPDATE privilege
         executor.checkTablePrivilege("UPDATE", schemaName, stmt.table());
         // Check for attempts to assign to system columns (PG error 0A000, before replica identity check)
@@ -1542,6 +1555,7 @@ class DmlExecutor {
         checkReadOnly("DELETE");
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
+        executor.viewDmlVerb = "delete from";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
@@ -1907,7 +1921,11 @@ class DmlExecutor {
         // Track rows to delete (we must not modify the row list while iterating)
         Set<Object[]> rowsToDelete = Collections.newSetFromMap(new IdentityHashMap<>());
         // Track rows already processed (each target row should be updated/deleted at most once)
+        // Rows an arm has already acted on, so a later source row does not re-run it.
         Set<Object[]> processedTargetRows = Collections.newSetFromMap(new IdentityHashMap<>());
+        // Rows actually modified. Only these raise 21000: PG's "affect a row a second time"
+        // counts real UPDATE/DELETE actions, not DO NOTHING arms or non-firing conditions.
+        Set<Object[]> affectedTargetRows = Collections.newSetFromMap(new IdentityHashMap<>());
         // Collect new rows to insert
         List<Object[]> rowsToInsert = new ArrayList<>();
 
@@ -1926,8 +1944,8 @@ class DmlExecutor {
                 RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
                 RowContext combined = targetCtx.merge(sourceCtx);
                 if (executor.isTruthy(executor.evalExpr(stmt.onCondition(), combined))) {
-                    // PG 21000: if this target row was already affected by a previous source row, error
-                    if (processedTargetRows.contains(targetRow)) {
+                    // PG 21000: only a second real modification of the row is an error
+                    if (affectedTargetRows.contains(targetRow)) {
                         throw new MemgresException(
                                 "MERGE command cannot affect row a second time", "21000");
                     }
@@ -1959,6 +1977,7 @@ class DmlExecutor {
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
                                 processedTargetRows.add(targetRow);
+                                affectedTargetRows.add(targetRow);
                                 mergeCount++;
                             } else if (wm.setClauses() != null && !wm.setClauses().isEmpty()) {
                                 // UPDATE — evaluate all SET RHS against original row snapshot onto a
@@ -1998,10 +2017,11 @@ class DmlExecutor {
                                     returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow, sourceCtx));
                                 }
                                 processedTargetRows.add(targetRow);
+                                affectedTargetRows.add(targetRow);
                                 mergeCount++;
                             } else {
-                                // DO NOTHING — no action, no RETURNING, no count
-                                processedTargetRows.add(targetRow);
+                                // DO NOTHING — the row is untouched, so a later source row may
+                                // still act on it and it never counts towards the 21000 guard.
                             }
                             break; // first matching WHEN clause wins
                         }
