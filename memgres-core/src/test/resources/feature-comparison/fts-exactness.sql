@@ -102,6 +102,71 @@ SELECT to_tsvector('english', 'well-known state-of-the-art co-operate')::text AS
 -- end-expected
 SELECT to_tsvector('english', 'row-3')::text AS v;
 
+-- Markup: tag and entity tokens map to no dictionary
+-- begin-expected
+-- columns: v
+-- row: 'bold':2
+-- end-expected
+SELECT to_tsvector('english', 'before <b>bold</b> after')::text AS v;
+
+-- begin-expected
+-- columns: v
+-- row: 'b':2 'c':3
+-- end-expected
+SELECT to_tsvector('english', 'a &amp; b &#65; c')::text AS v;
+
+-- Script and style bodies are skipped entirely
+-- begin-expected
+-- columns: v
+-- row: 'visibl':1
+-- end-expected
+SELECT to_tsvector('english', '<script>var x=1;</script> visible')::text AS v;
+
+-- A dotted name with a :line suffix stays one host token
+-- begin-expected
+-- columns: v
+-- row: '-523':5 'foo.java:494':4 'infoschemabuilder.java:597':2 'see':1
+-- end-expected
+SELECT to_tsvector('english', 'see InfoSchemaBuilder.java:597 and Foo.java:494-523')::text AS v;
+
+-- begin-expected
+-- columns: v
+-- row: 'information_schema.table':1 'privileg':2
+-- end-expected
+SELECT to_tsvector('english', 'information_schema.table_privileges here')::text AS v;
+
+-- begin-expected
+-- columns: v
+-- row: 'in/out':4 'parser/ast':2 'path':1
+-- end-expected
+SELECT to_tsvector('english', 'path parser/ast/ and in/out/')::text AS v;
+
+-- File paths
+-- begin-expected
+-- columns: v
+-- row: '/etc/passwd':4 '/rel':2 '/up':3 '~/home/user':1
+-- end-expected
+SELECT to_tsvector('english', '~/home/user ./rel ../up /etc/passwd')::text AS v;
+
+-- ts_debug reports the parser's own token types. Spaces in blank tokens are masked
+-- so the row annotations can express them.
+-- begin-expected
+-- columns: alias | token
+-- row: tag, <b>
+-- row: asciiword, x
+-- row: tag, </b>
+-- row: blank, _
+-- row: entity, &amp;
+-- row: blank, _
+-- row: file, a.b/c
+-- row: blank, _~
+-- row: file, /f
+-- row: blank, _
+-- row: version, 1.2.3
+-- end-expected
+SELECT alias, replace(token, ' ', '_') AS token
+FROM ts_debug('english', '<b>x</b> &amp; a.b/c ~/f 1.2.3');
+
 -- ============================================================================
 -- 3. Ranking
 -- ============================================================================

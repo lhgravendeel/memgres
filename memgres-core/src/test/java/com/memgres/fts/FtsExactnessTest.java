@@ -154,6 +154,44 @@ class FtsExactnessTest {
                 q("SELECT to_tsvector('english', 'foo_bar baz_qux')::text"));
     }
 
+    /** Markup is typed as tag/entity, which the english configuration maps to no dictionary. */
+    @Test
+    void toTsvectorHandlesMarkup() throws Exception {
+        assertEquals("'bold':2", q("SELECT to_tsvector('english', 'before <b>bold</b> after')::text"));
+        assertEquals("'b':2 'c':3", q("SELECT to_tsvector('english', 'a &amp; b &#65; c')::text"));
+    }
+
+    /** Text inside script/style is skipped entirely, as PG's SpecialTags handler arranges. */
+    @Test
+    void toTsvectorSkipsScriptAndStyleBodies() throws Exception {
+        assertEquals("'visibl':1",
+                q("SELECT to_tsvector('english', '<script>var x=1;</script> visible')::text"));
+    }
+
+    /** A dotted name with a :line suffix is one host token, as in a stack trace. */
+    @Test
+    void toTsvectorKeepsQualifiedNamesWhole() throws Exception {
+        assertEquals("'-523':5 'foo.java:494':4 'infoschemabuilder.java:597':2 'see':1",
+                q("SELECT to_tsvector('english', 'see InfoSchemaBuilder.java:597 and Foo.java:494-523')::text"));
+        assertEquals("'information_schema.table':1 'privileg':2",
+                q("SELECT to_tsvector('english', 'information_schema.table_privileges here')::text"));
+        assertEquals("'in/out':4 'parser/ast':2 'path':1",
+                q("SELECT to_tsvector('english', 'path parser/ast/ and in/out/')::text"));
+    }
+
+    @Test
+    void toTsvectorTypesFilePaths() throws Exception {
+        assertEquals("'/etc/passwd':4 '/rel':2 '/up':3 '~/home/user':1",
+                q("SELECT to_tsvector('english', '~/home/user ./rel ../up /etc/passwd')::text"));
+    }
+
+    /** A numeric part after a hyphen is a signed integer, not a compound part. */
+    @Test
+    void toTsvectorTreatsHyphenBeforeDigitsAsSign() throws Exception {
+        assertEquals("'-01':5 '-15':6 '-3':2 '2024':4 'row':1",
+                q("SELECT to_tsvector('english', 'row-3 and 2024-01-15')::text"));
+    }
+
     /** Stop words consume a position but contribute no lexeme. */
     @Test
     void stopWordsStillTakePositions() throws Exception {
