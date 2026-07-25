@@ -86,7 +86,7 @@ class CatalogMetadataFunctions {
                                 for (StoredConstraint sc : tbl.getConstraints()) {
                                     int scOid = executor.systemCatalog.getOid("con:" + tbl.getName() + "." + sc.getName());
                                     if (scOid == coid) {
-                                        return formatConstraintDef(sc, schemaName);
+                                        return formatConstraintDef(sc, schemaName, tbl);
                                     }
                                 }
                                 // H16: NOT NULL constraints (contype 'n') — "NOT NULL <col>"
@@ -107,7 +107,7 @@ class CatalogMetadataFunctions {
                                         "con:domain:" + dom.getName() + "." + dom.getName() + "_check");
                                 if (dcOid == coid) {
                                     return "CHECK ((" + stripOuterParens(
-                                            CatalogHelper.renderDomainCheck(dom.getParsedCheck())) + "))";
+                                            CatalogHelper.renderDomainCheck(dom, dom.getParsedCheck())) + "))";
                                 }
                             }
                             for (DomainType.NamedConstraint nc : dom.getNamedConstraints()) {
@@ -115,7 +115,7 @@ class CatalogMetadataFunctions {
                                         "con:domain:" + dom.getName() + "." + nc.name());
                                 if (ncOid == coid) {
                                     return "CHECK ((" + stripOuterParens(
-                                            CatalogHelper.renderDomainCheck(nc.parsedCheck)) + "))";
+                                            CatalogHelper.renderDomainCheck(dom, nc.parsedCheck)) + "))";
                                 }
                             }
                             if (dom.isNotNull()) {
@@ -490,37 +490,9 @@ class CatalogMetadataFunctions {
         if (tableName == null) return "";
         String idxMethod = executor.database.getIndexMethod(indexName);
         if (idxMethod == null || idxMethod.isEmpty()) idxMethod = "btree";
-        String whereClause = executor.database.getIndexWhereClause(indexName);
-        List<String> normalizedCols = new java.util.ArrayList<>();
-        for (String col : cols) {
-            String nc = col.replaceAll("\\s+\\(", "(")
-                           .replaceAll("\\(\\s+", "(")
-                           .replaceAll("\\s+\\)", ")")
-                           .replaceAll("\\s+,", ",")
-                           .replaceAll(",\\s+", ", ");
-            nc = nc.replaceAll("('(?:[^']*(?:'')*[^']*)*')(?!::)", "$1::text");
-            java.util.regex.Matcher fnMatcher = java.util.regex.Pattern.compile("\\b([a-z_][a-z0-9_]*)\\(").matcher(nc);
-            StringBuffer fnBuf = new StringBuffer();
-            while (fnMatcher.find()) {
-                fnMatcher.appendReplacement(fnBuf, fnMatcher.group(1).toUpperCase() + "(");
-            }
-            fnMatcher.appendTail(fnBuf);
-            nc = fnBuf.toString();
-            if (nc.startsWith("(") && nc.endsWith(")")) {
-                int depth = 0;
-                boolean outerMatched = false;
-                for (int ci = 0; ci < nc.length(); ci++) {
-                    if (nc.charAt(ci) == '(') depth++;
-                    else if (nc.charAt(ci) == ')') depth--;
-                    if (depth == 0 && ci == nc.length() - 1) outerMatched = true;
-                    if (depth == 0 && ci < nc.length() - 1) break;
-                }
-                if (outerMatched) {
-                    nc = nc.substring(1, nc.length() - 1);
-                }
-            }
-            normalizedCols.add(nc);
-        }
+        String whereClause = CatalogHelper.deparseIndexPredicate(executor.database, tableName,
+                executor.database.getIndexWhereClause(indexName));
+        List<String> normalizedCols = CatalogHelper.deparseIndexColumns(executor.database, tableName, cols);
         List<String> columnOptions = executor.database.getIndexColumnOptions(indexName);
         List<String> includeColumns = executor.database.getIndexIncludeColumns(indexName);
         boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexName);
@@ -1047,14 +1019,14 @@ class CatalogMetadataFunctions {
         return false;
     }
 
-    private String formatConstraintDef(StoredConstraint sc, String ownSchema) {
+    private String formatConstraintDef(StoredConstraint sc, String ownSchema, Table owner) {
         switch (sc.getType()) {
             case PRIMARY_KEY:
                 return "PRIMARY KEY (" + String.join(", ", sc.getColumns()) + ")";
             case UNIQUE:
                 return "UNIQUE (" + String.join(", ", sc.getColumns()) + ")";
             case CHECK:
-                return "CHECK (" + (sc.getCheckExpr() != null ? SqlUnparser.exprToSql(sc.getCheckExpr()) : "true") + ")";
+                return "CHECK (" + RuleDeparser.deparse(sc.getCheckExpr(), RuleDeparser.forTable(owner)) + ")";
             case FOREIGN_KEY: {
                 StringBuilder sb = new StringBuilder("FOREIGN KEY (");
                 sb.append(String.join(", ", sc.getColumns()));

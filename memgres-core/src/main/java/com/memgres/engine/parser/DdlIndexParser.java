@@ -133,6 +133,8 @@ class DdlIndexParser {
                 String collation = parser.readIdentifierOrString();
                 if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifierOrString();
                 ExpressionParser.validateCollationStatic(collation, parser.peek());
+                // Kept so pg_get_indexdef can echo it, as PostgreSQL does.
+                opts.append("collate:").append(collation);
             }
             // Capture opclass name (e.g. text_pattern_ops)
             if (!parser.isAtEnd() && (parser.check(TokenType.IDENTIFIER) || parser.check(TokenType.KEYWORD))

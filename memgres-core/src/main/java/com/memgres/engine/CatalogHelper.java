@@ -170,14 +170,18 @@ public final class CatalogHelper {
     }
 
     /**
-     * Render a domain CHECK expression to SQL text (H15/H16). The VALUE keyword is
-     * parsed as a lowercase column reference; PG prints it uppercase. Result is
-     * parenthesised like PG's exprToSql output, e.g. "(VALUE > 0)".
+     * Render a domain CHECK expression the way PG's ruleutils deparser does, resolving
+     * VALUE against the domain's base type so the implicit casts PG inserted show up —
+     * e.g. a numeric domain's {@code CHECK (VALUE > 0)} renders "(VALUE > (0)::numeric)".
      */
-    public static String renderDomainCheck(com.memgres.engine.parser.ast.Expression parsed) {
+    public static String renderDomainCheck(DomainType domain,
+                                           com.memgres.engine.parser.ast.Expression parsed) {
         if (parsed == null) return "";
-        String sql = SqlUnparser.exprToSql(parsed);
-        return sql.replaceAll("(?i)\\bvalue\\b", "VALUE");
+        RuleDeparser.PgType valueType = domain == null ? null
+                : (domain.getBaseTypeName() != null && domain.getBaseType() == null
+                        ? RuleDeparser.PgType.custom(domain.getBaseTypeName())
+                        : RuleDeparser.PgType.of(domain.getBaseType()));
+        return RuleDeparser.deparse(parsed, RuleDeparser.forDomain(valueType));
     }
 
     /** Format a column default for information_schema / pg_attrdef, matching PG conventions. */
@@ -344,6 +348,71 @@ public final class CatalogHelper {
             }
         }
         return DataType.BIGINT;
+    }
+
+    /** Look up a table by a possibly schema-qualified name; null when it cannot be found. */
+    public static Table resolveTable(Database database, String qualifiedName) {
+        if (database == null || qualifiedName == null) return null;
+        String schema = null;
+        String name = qualifiedName;
+        int dot = qualifiedName.lastIndexOf('.');
+        if (dot > 0) {
+            schema = qualifiedName.substring(0, dot);
+            name = qualifiedName.substring(dot + 1);
+        }
+        if (schema != null) {
+            Schema s = database.getSchemas().get(schema);
+            return s == null ? null : s.getTables().get(name);
+        }
+        for (Schema s : database.getSchemas().values()) {
+            Table t = s.getTables().get(name);
+            if (t != null) return t;
+        }
+        return null;
+    }
+
+    /**
+     * Renders index key columns the way pg_get_indexdef does: a plain column prints as
+     * its (quoted-if-needed) name, while an expression is deparsed with the implicit
+     * casts PG's analyzer inserted and wrapped in parentheses unless it is a bare
+     * function call.
+     */
+    public static List<String> deparseIndexColumns(Database database, String qualifiedTable,
+                                                   List<String> cols) {
+        List<String> out = new java.util.ArrayList<>();
+        if (cols == null) return out;
+        Table t = resolveTable(database, qualifiedTable);
+        RuleDeparser.ColumnTypes types = RuleDeparser.forTable(t);
+        for (String col : cols) {
+            out.add(deparseIndexElement(t, types, col));
+        }
+        return out;
+    }
+
+    private static String deparseIndexElement(Table t, RuleDeparser.ColumnTypes types, String col) {
+        if (col == null) return null;
+        if (t != null) {
+            int idx = t.getColumnIndex(col);
+            if (idx >= 0) return RuleDeparser.quoteIdentifier(t.getColumns().get(idx).getName());
+        }
+        try {
+            return RuleDeparser.deparseIndexElement(
+                    com.memgres.engine.parser.Parser.parseExpression(col), types);
+        } catch (Exception e) {
+            return col;
+        }
+    }
+
+    /** Renders a partial-index predicate the way pg_get_indexdef does. */
+    public static String deparseIndexPredicate(Database database, String qualifiedTable, String where) {
+        if (where == null || where.isEmpty()) return where;
+        Table t = resolveTable(database, qualifiedTable);
+        try {
+            return RuleDeparser.deparse(
+                    com.memgres.engine.parser.Parser.parseExpression(where), RuleDeparser.forTable(t));
+        } catch (Exception e) {
+            return where;
+        }
     }
 
     /** Resolve the owner OID for an object key, defaulting to 10. */
