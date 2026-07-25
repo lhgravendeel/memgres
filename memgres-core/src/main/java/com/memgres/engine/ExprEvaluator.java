@@ -2241,6 +2241,8 @@ class ExprEvaluator {
                     || name.equals("radians") || name.equals("sin") || name.equals("cos")
                     || name.equals("tan") || name.equals("asin") || name.equals("acos")
                     || name.equals("atan") || name.equals("atan2")) return DataType.DOUBLE_PRECISION;
+            // ts_rank/ts_rank_cd return float4 (OID 700), not text.
+            if (name.equals("ts_rank") || name.equals("ts_rank_cd")) return DataType.REAL;
             if (name.equals("array_sample") || name.equals("array_shuffle")) {
                 // Returns an array of the same type as the input
                 if (!fn.args().isEmpty()) {

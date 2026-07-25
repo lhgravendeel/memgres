@@ -516,46 +516,7 @@ public final class GeometricOperations {
      * decimal. NaN/Infinity and the sign of -0 are preserved.
      */
     static String fmtD(double d) {
-        if (Double.isNaN(d)) return "NaN";
-        if (Double.isInfinite(d)) return d > 0 ? "Infinity" : "-Infinity";
-        // Detect sign separately so -0.0 keeps its sign (BigDecimal drops it).
-        boolean negative = (Double.doubleToRawLongBits(d) & 0x8000000000000000L) != 0;
-        if (d == 0.0) {
-            return negative ? "-0" : "0";
-        }
-        // Shortest round-trip decimal digits + exponent, via Double.toString/BigDecimal.
-        java.math.BigDecimal bd = new java.math.BigDecimal(Double.toString(Math.abs(d))).stripTrailingZeros();
-        String digits = bd.unscaledValue().toString(); // no sign, no trailing zeros
-        int k = digits.length();
-        // Decimal exponent of the leading significant digit.
-        int e = (k - 1) - bd.scale();
-        StringBuilder sb = new StringBuilder();
-        if (negative) sb.append('-');
-        if (e < -4 || e >= 15) {
-            // Scientific notation: d[.ddd]e{+|-}NN
-            sb.append(digits.charAt(0));
-            if (k > 1) {
-                sb.append('.').append(digits.substring(1));
-            }
-            sb.append('e');
-            sb.append(e < 0 ? '-' : '+');
-            String exp = Integer.toString(Math.abs(e));
-            if (exp.length() < 2) sb.append('0');
-            sb.append(exp);
-        } else if (e >= k - 1) {
-            // Integer value: digits followed by trailing zeros.
-            sb.append(digits);
-            for (int i = 0; i < e - (k - 1); i++) sb.append('0');
-        } else if (e >= 0) {
-            // Point falls inside the digit string.
-            sb.append(digits, 0, e + 1).append('.').append(digits.substring(e + 1));
-        } else {
-            // Leading zeros: 0.00ddd
-            sb.append("0.");
-            for (int i = 0; i < -e - 1; i++) sb.append('0');
-            sb.append(digits);
-        }
-        return sb.toString();
+        return PgFloatFormat.float8out(d);
     }
 
     // ========================================================================

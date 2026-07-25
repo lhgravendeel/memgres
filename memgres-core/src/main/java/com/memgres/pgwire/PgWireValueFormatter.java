@@ -15,6 +15,17 @@ import java.util.List;
  */
 class PgWireValueFormatter {
 
+    /** extra_float_digits governs how many digits float4/float8 output carries. */
+    static int extraFloatDigits(GucSettings guc) {
+        if (guc == null) return 1;
+        try {
+            String v = guc.get("extra_float_digits");
+            return v == null ? 1 : Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return 1;
+        }
+    }
+
     /** Format a value for text-mode PgWire transmission, respecting GUC settings. */
     static String formatValue(Object val, GucSettings guc) {
         if (val instanceof byte[]) {
@@ -105,17 +116,9 @@ class PgWireValueFormatter {
             BigDecimal bd = (BigDecimal) val;
             return bd.toPlainString();
         } else if (val instanceof Float) {
-            Float f = (Float) val;
-            if (f.isNaN()) return "NaN";
-            if (f.isInfinite()) return f > 0 ? "Infinity" : "-Infinity";
-            if (f == f.longValue()) return String.valueOf(f.longValue());
-            return Float.toString(f);
+            return com.memgres.engine.PgFloatFormat.float4out((Float) val, extraFloatDigits(guc));
         } else if (val instanceof Double) {
-            Double d = (Double) val;
-            if (d.isNaN()) return "NaN";
-            if (d.isInfinite()) return d > 0 ? "Infinity" : "-Infinity";
-            if (d == d.longValue()) return String.valueOf(d.longValue());
-            return Double.toString(d);
+            return com.memgres.engine.PgFloatFormat.float8out((Double) val, extraFloatDigits(guc));
         } else if (val instanceof com.memgres.engine.AstExecutor.PgEnum) {
             com.memgres.engine.AstExecutor.PgEnum enumVal = (com.memgres.engine.AstExecutor.PgEnum) val;
             return enumVal.label();
