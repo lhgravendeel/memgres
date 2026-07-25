@@ -635,6 +635,8 @@ public final class TypeCoercion {
     }
 
     private static String toString(Object val) {
+        if (val instanceof Double) return PgFloatFormat.float8out((Double) val);
+        if (val instanceof Float) return PgFloatFormat.float4out((Float) val);
         if (val instanceof LocalDate) return ((LocalDate) val).toString();
         if (val instanceof LocalDateTime) {
             LocalDateTime dt = (LocalDateTime) val;

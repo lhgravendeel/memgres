@@ -31,8 +31,9 @@ public class TsQuery {
     }
 
     public static TsQuery term(String t) {
-        String stemmed = TsVector.simpleStem(t.toLowerCase());
-        if (TsVector.isStopWord(stemmed)) stemmed = "";
+        // PG's snowball dictionary tests the stop list before stemming.
+        String lower = t.toLowerCase();
+        String stemmed = TsVector.isStopWord(lower) ? "" : TsVector.simpleStem(lower);
         return new TsQuery(Op.TERM, stemmed, false, null, null, null, 0);
     }
 
@@ -42,8 +43,8 @@ public class TsQuery {
     }
 
     public static TsQuery term(String t, boolean prefix, Set<Character> weights) {
-        String stemmed = TsVector.simpleStem(t.toLowerCase());
-        if (TsVector.isStopWord(stemmed)) stemmed = "";
+        String lower = t.toLowerCase();
+        String stemmed = TsVector.isStopWord(lower) ? "" : TsVector.simpleStem(lower);
         return new TsQuery(Op.TERM, stemmed, prefix, weights, null, null, 0);
     }
 

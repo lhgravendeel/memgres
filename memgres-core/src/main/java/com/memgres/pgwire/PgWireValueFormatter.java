@@ -105,17 +105,9 @@ class PgWireValueFormatter {
             BigDecimal bd = (BigDecimal) val;
             return bd.toPlainString();
         } else if (val instanceof Float) {
-            Float f = (Float) val;
-            if (f.isNaN()) return "NaN";
-            if (f.isInfinite()) return f > 0 ? "Infinity" : "-Infinity";
-            if (f == f.longValue()) return String.valueOf(f.longValue());
-            return Float.toString(f);
+            return com.memgres.engine.PgFloatFormat.float4out((Float) val);
         } else if (val instanceof Double) {
-            Double d = (Double) val;
-            if (d.isNaN()) return "NaN";
-            if (d.isInfinite()) return d > 0 ? "Infinity" : "-Infinity";
-            if (d == d.longValue()) return String.valueOf(d.longValue());
-            return Double.toString(d);
+            return com.memgres.engine.PgFloatFormat.float8out((Double) val);
         } else if (val instanceof com.memgres.engine.AstExecutor.PgEnum) {
             com.memgres.engine.AstExecutor.PgEnum enumVal = (com.memgres.engine.AstExecutor.PgEnum) val;
             return enumVal.label();

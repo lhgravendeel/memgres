@@ -306,6 +306,13 @@ class CastEvaluator {
                 if (val instanceof Boolean) {
                     return ((Boolean) val) ? "true" : "false";
                 }
+                // float4/float8 to text goes through PG's own output functions.
+                if (val instanceof Double) {
+                    return PgFloatFormat.float8out((Double) val);
+                }
+                if (val instanceof Float) {
+                    return PgFloatFormat.float4out((Float) val);
+                }
                 if (val instanceof byte[]) {
                     // PG bytea::text uses the bytea_output format (default: hex, "\x..").
                     byte[] b = (byte[]) val;
