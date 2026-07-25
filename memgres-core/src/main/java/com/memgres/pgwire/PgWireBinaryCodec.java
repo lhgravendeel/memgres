@@ -116,9 +116,9 @@ class PgWireBinaryCodec {
             case BIGSERIAL:
                 return Long.toString(readInt8(data, 0));
             case REAL:
-                return Float.toString(Float.intBitsToFloat(readInt4(data, 0)));
+                return com.memgres.engine.PgFloatFormat.float4out(Float.intBitsToFloat(readInt4(data, 0)));
             case DOUBLE_PRECISION:
-                return Double.toString(Double.longBitsToDouble(readInt8(data, 0)));
+                return com.memgres.engine.PgFloatFormat.float8out(Double.longBitsToDouble(readInt8(data, 0)));
             case UUID: {
                 long msb = readInt8(data, 0);
                 long lsb = readInt8(data, 8);

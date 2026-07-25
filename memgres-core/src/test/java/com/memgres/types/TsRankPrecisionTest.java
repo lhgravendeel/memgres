@@ -6,8 +6,9 @@ import java.sql.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Diff #18: ts_rank returns 0.06079271 instead of PG's 0.0607927.
- * Float display precision issue: PG truncates to 7 significant digits.
+ * ts_rank returns a float4 and PG prints the shortest decimal that reads back as the
+ * same value — 0.06079271 here, verified against PG 18. An earlier fix rounded the
+ * result to six significant digits, which dropped a digit PG keeps.
  */
 class TsRankPrecisionTest {
 
@@ -24,8 +25,7 @@ class TsRankPrecisionTest {
 
     @Test void ts_rank_display_precision() throws SQLException {
         String val = scalar("SELECT ts_rank(to_tsvector('english','The quick brown fox'), to_tsquery('english','fox'))");
-        // PG returns exactly "0.0607927" (7 significant digits for float4)
-        assertEquals("0.0607927", val,
-            "ts_rank should display as 0.0607927 (PG float4 precision), got " + val);
+        assertEquals("0.06079271", val,
+            "ts_rank should display as PG 18 does, got " + val);
     }
 }

@@ -326,20 +326,36 @@ public class TextSearchOperations {
         return true;
     }
 
-    /** ts_debug: returns debug info about text analysis. */
+    /** ts_debug: one row per parser token, with the dictionary that handled it. */
     public static List<Object[]> tsDebug(String text) {
         List<Object[]> result = new ArrayList<>();
         if (text == null) return result;
-        String[] words = text.split("\\s+");
-        for (String word : words) {
-            String clean = word.toLowerCase().replaceAll("[^a-zA-Z0-9]", "");
-            if (clean.isEmpty()) continue;
-            String token = clean;
-            String dictName = "english_stem";
-            String lexeme = TsVector.simpleStem(clean);
+        for (com.memgres.engine.fts.TsParser.Token token
+                : com.memgres.engine.fts.TsParser.parse(text)) {
+            com.memgres.engine.fts.TsParser.Dict dict =
+                    com.memgres.engine.fts.TsParser.dictionaryFor(token.type());
+            String dictName;
+            String lexemes;
+            String lower = token.text().toLowerCase();
+            switch (dict) {
+                case STEM:
+                    dictName = "english_stem";
+                    lexemes = TsVector.isStopWord(lower)
+                            ? "{}" : "{" + TsVector.simpleStem(lower) + "}";
+                    break;
+                case SIMPLE:
+                    dictName = "simple";
+                    lexemes = "{" + lower + "}";
+                    break;
+                default:
+                    // No dictionary is configured for this token type.
+                    dictName = null;
+                    lexemes = null;
+                    break;
+            }
             result.add(new Object[]{
-                    "asciiword", "Word, all ASCII", token, dictName,
-                    dictName, lexeme
+                    token.type().alias(), token.type().description(), token.text(),
+                    dictName == null ? "{}" : "{" + dictName + "}", dictName, lexemes
             });
         }
         return result;
@@ -352,46 +368,24 @@ public class TextSearchOperations {
         return Cols.listOf(stem);
     }
 
-    /** ts_parse: parse text into tokens. */
+    /** ts_parse: the parser's own token stream, as (tokid, token) pairs. */
     public static List<Object[]> tsParse(String parserName, String text) {
         List<Object[]> result = new ArrayList<>();
         if (text == null) return result;
-        String[] words = text.split("\\s+");
-        for (String word : words) {
-            if (!word.isEmpty()) {
-                result.add(new Object[]{1, word});
-            }
+        for (com.memgres.engine.fts.TsParser.Token token
+                : com.memgres.engine.fts.TsParser.parse(text)) {
+            result.add(new Object[]{token.type().id(), token.text()});
         }
         return result;
     }
 
-    /** ts_token_type: list token types for a parser. */
+    /** ts_token_type: the token types the default parser can emit. */
     public static List<Object[]> tsTokenType(String parserName) {
-        return Cols.listOf(
-                new Object[]{1, "asciiword", "Word, all ASCII"},
-                new Object[]{2, "word", "Word, all letters"},
-                new Object[]{3, "numword", "Word, letters and digits"},
-                new Object[]{4, "email", "Email address"},
-                new Object[]{5, "url", "URL"},
-                new Object[]{6, "host", "Host"},
-                new Object[]{7, "sfloat", "Scientific notation"},
-                new Object[]{8, "version", "Version number"},
-                new Object[]{9, "hyphword", "Hyphenated word"},
-                new Object[]{10, "numhword", "Hyphenated word, letters and digits"},
-                new Object[]{11, "asciihword", "Hyphenated word, all ASCII"},
-                new Object[]{12, "blank", "Space symbols"},
-                new Object[]{13, "tag", "XML Tag"},
-                new Object[]{14, "protocol", "Protocol head"},
-                new Object[]{15, "int", "Signed integer"},
-                new Object[]{16, "float", "Decimal notation"},
-                new Object[]{17, "uint", "Unsigned integer"},
-                new Object[]{18, "entity", "XML entity"},
-                new Object[]{19, "hword_asciipart", "Hyphenated word part, all ASCII"},
-                new Object[]{20, "hword_part", "Hyphenated word part, all letters"},
-                new Object[]{21, "hword_numpart", "Hyphenated word part, letters and digits"},
-                new Object[]{22, "url_path", "URL path"},
-                new Object[]{23, "file", "File or path name"}
-        );
+        List<Object[]> result = new ArrayList<>();
+        for (com.memgres.engine.fts.TsParser.Type t : com.memgres.engine.fts.TsParser.tokenTypes()) {
+            result.add(new Object[]{t.id(), t.alias(), t.description()});
+        }
+        return result;
     }
 
     /** ts_stat: statistics for a tsvector column query. */
