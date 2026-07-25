@@ -397,7 +397,20 @@ class FromResolver {
                 cols = view.cachedColumns();
                 rows = view.cachedRows();
             } else {
-                QueryResult viewResult = executor.executeStatement(view.query());
+                // The reader needs SELECT on the view; the body then runs with the view
+                // owner's rights, as PG does.
+                String viewSchema = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
+                executor.checkTablePrivilege("SELECT", viewSchema, tableRef.table());
+                String priorViewOwner = executor.viewOwnerRole;
+                String viewOwner = executor.database.getObjectOwner(
+                        "view:" + viewSchema.toLowerCase() + "." + tableRef.table().toLowerCase());
+                if (viewOwner != null) executor.viewOwnerRole = viewOwner;
+                QueryResult viewResult;
+                try {
+                    viewResult = executor.executeStatement(view.query());
+                } finally {
+                    executor.viewOwnerRole = priorViewOwner;
+                }
                 cols = viewResult.getColumns();
                 rows = viewResult.getRows();
             }
