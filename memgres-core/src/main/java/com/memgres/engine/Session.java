@@ -1917,17 +1917,26 @@ public class Session {
         public final String schema;
         public final String tableName;
         public final Table table;
+        /** Triggers the DROP removed; a rollback has to put them back with the table. */
+        public final java.util.List<PgTrigger> triggers;
 
         public DropTableUndo(String schema, String tableName, Table table) {
+            this(schema, tableName, table, null);
+        }
+
+        public DropTableUndo(String schema, String tableName, Table table,
+                             java.util.List<PgTrigger> triggers) {
             this.schema = schema;
             this.tableName = tableName;
             this.table = table;
+            this.triggers = triggers;
         }
 
         @Override
         public void undo(Database db) {
             Schema s = db.getSchema(schema);
             if (s != null) s.addTable(table);
+            db.restoreTriggersForTable(tableName, triggers);
             // If the dropped table was a partition, re-attach it to its parent's routing list
             Table parent = table.getPartitionParent();
             if (parent != null && !parent.getPartitions().contains(table)) {
