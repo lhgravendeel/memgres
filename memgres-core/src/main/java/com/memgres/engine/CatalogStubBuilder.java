@@ -139,11 +139,13 @@ class CatalogStubBuilder {
             }
             boolean isUnique = database.isUniqueIndex(indexName);
             String method = database.getIndexMethod(indexName);
-            String indexDef = buildIndexDef(indexName, tableName, isUnique, method,
-                    indexCols, database.getIndexColumnOptions(indexName),
+            String indexDef = buildIndexDef(indexName, storedTableQualified, isUnique, method,
+                    CatalogHelper.deparseIndexColumns(database, storedTableQualified, indexCols),
+                    database.getIndexColumnOptions(indexName),
                     database.getIndexIncludeColumns(indexName),
                     database.isIndexNullsNotDistinct(indexName),
-                    database.getIndexWhereClause(indexName));
+                    CatalogHelper.deparseIndexPredicate(database, storedTableQualified,
+                            database.getIndexWhereClause(indexName)));
             table.insertRow(new Object[]{schemaName, tableName, indexName, null, indexDef});
             addedIndexes.add(indexName.toLowerCase());
         }
@@ -159,7 +161,7 @@ class CatalogStubBuilder {
                         String indexName = sc.getName();
                         if (addedIndexes.contains(indexName.toLowerCase())) continue;
                         String indexDef = "CREATE UNIQUE INDEX " + indexName
-                                + " ON " + t.getName()
+                                + " ON " + schemaName + "." + t.getName()
                                 + " USING btree (" + String.join(", ", sc.getColumns()) + ")";
                         table.insertRow(new Object[]{schemaName, t.getName(), indexName, null, indexDef});
                         addedIndexes.add(indexName.toLowerCase());
@@ -189,7 +191,9 @@ class CatalogStubBuilder {
                 if (opts != null && !opts.isEmpty()) {
                     // Parse stored options: "opclass:xxx DESC NULLS FIRST"
                     for (String part : opts.split(" ")) {
-                        if (part.startsWith("opclass:")) {
+                        if (part.startsWith("collate:")) {
+                            sb.append(" COLLATE \"").append(part.substring(8).replace("\"", "")).append('"');
+                        } else if (part.startsWith("opclass:")) {
                             sb.append(' ').append(part.substring(8));
                         } else if ("DESC".equals(part)) {
                             sb.append(" DESC");

@@ -125,8 +125,8 @@ class TextSearchFunctions {
                     Object normObj = executor.evalExpr(fn.args().get(argIdx + 2), ctx);
                     if (normObj != null) norm = executor.toInt(normObj);
                 }
-                float rankVal = (float) vec.rank(query, weights, norm);
-                return Float.parseFloat(String.format(java.util.Locale.US, "%.6g", rankVal));
+                // PG returns the raw float4; rounding here would lose a significant digit.
+                return (float) vec.rank(query, weights, norm);
             }
             case "ts_rank_cd": {
                 int argIdx = 0;
@@ -151,8 +151,7 @@ class TextSearchFunctions {
                     Object normObj = executor.evalExpr(fn.args().get(argIdx + 2), ctx);
                     if (normObj != null) norm = executor.toInt(normObj);
                 }
-                float rankCdVal = (float) vec.rankCd(query, weights, norm);
-                return Float.parseFloat(String.format(java.util.Locale.US, "%.6g", rankCdVal));
+                return (float) vec.rankCd(query, weights, norm);
             }
             case "ts_headline": {
                 String config = null;

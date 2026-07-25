@@ -16,15 +16,7 @@ public class TsVector {
     /** Max position value per lexeme (PG caps at 16383, we use 256 for position list length cap). */
     static final int MAX_POSITION = 16383;
 
-    static final Set<String> STOP_WORDS_SET = Cols.setOf(
-            "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-            "have", "has", "had", "do", "does", "did", "will", "would", "could",
-            "should", "may", "might", "can", "shall", "to", "of", "in", "for",
-            "on", "with", "at", "by", "from", "as", "into", "about", "between",
-            "through", "during", "before", "after", "above", "below",
-            "and", "but", "or", "nor", "not", "so", "yet",
-            "it", "its", "this", "that", "these", "those"
-    );
+    static final Set<String> STOP_WORDS_SET = com.memgres.engine.fts.StopWords.ENGLISH;
 
     static boolean isStopWord(String word) {
         return STOP_WORDS_SET.contains(word.toLowerCase());
@@ -86,27 +78,34 @@ public class TsVector {
         return fromText(text, "english");
     }
 
-    /** Build a tsvector from plain text with specified config. */
+    /**
+     * Build a tsvector from plain text with the specified config.
+     *
+     * <p>Follows PG's pipeline: the default parser assigns each token a type, the
+     * configuration routes that type to a dictionary, and every token that reaches a
+     * dictionary consumes a position — including stop words, which take a position but
+     * contribute no lexeme.
+     */
     public static TsVector fromText(String text, String config) {
         Map<String, List<PosEntry>> lexemes = new TreeMap<>();
         if (text == null || text.isEmpty()) return new TsVector(lexemes);
 
         boolean isSimple = "simple".equalsIgnoreCase(config);
-
-        String[] words = text.toLowerCase().split("[^a-zA-Z0-9]+");
         int position = 0;
-        for (String word : words) {
-            if (word.isEmpty()) continue;
-            position++;  // count position for every word including stop words
-            if (isSimple) {
-                // simple config: no stemming, no stopword removal, just lowercase
-                addPosition(lexemes, word, position);
-            } else {
-                // english config: stem and remove stop words
-                if (STOP_WORDS.contains(word)) continue;
-                String stem = simpleStem(word);
-                addPosition(lexemes, stem, position);
+        for (com.memgres.engine.fts.TsParser.Token token
+                : com.memgres.engine.fts.TsParser.parse(text)) {
+            com.memgres.engine.fts.TsParser.Dict dict =
+                    com.memgres.engine.fts.TsParser.dictionaryFor(token.type());
+            if (dict == com.memgres.engine.fts.TsParser.Dict.NONE) continue;
+            position++;
+            String lower = token.text().toLowerCase();
+            if (isSimple || dict == com.memgres.engine.fts.TsParser.Dict.SIMPLE) {
+                addPosition(lexemes, lower, position);
+                continue;
             }
+            // The snowball dictionary drops stop words before stemming.
+            if (STOP_WORDS.contains(lower)) continue;
+            addPosition(lexemes, com.memgres.engine.fts.EnglishStemmer.stem(lower), position);
         }
         return new TsVector(lexemes);
     }
@@ -376,9 +375,11 @@ public class TsVector {
 
     public double rank(TsQuery query, float[] weights, int normalization) {
         if (lexemes.isEmpty()) return 0.0;
+        query = prune(query);
+        if (query == null) return 0.0;
         double[] w = weights != null && weights.length == 4
             ? new double[]{weights[0], weights[1], weights[2], weights[3]}
-            : new double[]{0.1, 0.2, 0.4, 1.0}; // D, C, B, A
+            : new double[]{0.1f, 0.2f, 0.4f, 1.0f}; // D, C, B, A (float4, as PG stores them)
 
         // Collect matching terms with their positions
         List<String> matchedTerms = new ArrayList<>();
@@ -387,52 +388,42 @@ public class TsVector {
                 matchedTerms.add(entry.getKey());
             }
         }
-        if (matchedTerms.isEmpty()) return 0.0;
-
-        double res;
-        if (isAndQuery(query) && matchedTerms.size() >= 2) {
+        // No early return on an empty match set: PG's calc_rank_and yields -1, which the
+        // clamp below turns into 1e-20 — an AND query that matches nothing is not 0.
+        float res;
+        // PG's calc_rank_and falls back to calc_rank_or when the query has fewer than two
+        // distinct operands, so "a & a" ranks like a single term rather than as no pair.
+        if (isAndQuery(query) && countQueryTerms(query) >= 2) {
             res = calcRankAnd(w, matchedTerms);
         } else {
             res = calcRankOr(w, matchedTerms, countQueryTerms(query));
         }
 
-        // Apply normalization
-        if (normalization != 0) {
-            int docLen = 0;
-            for (List<PosEntry> entries : lexemes.values()) docLen += entries.size();
-            if (docLen == 0) docLen = 1;
-            if ((normalization & 1) != 0) {
-                // divide by 1 + log(doc length)
-                res /= 1.0 + Math.log(docLen);
-            }
-            if ((normalization & 2) != 0) {
-                // divide by doc length
-                res /= docLen;
-            }
-            if ((normalization & 4) != 0) {
-                // divide by mean harmonic distance between extents
-                res /= (1.0 + matchedTerms.size());
-            }
-            if ((normalization & 8) != 0) {
-                // divide by number of unique words in doc
-                res /= lexemes.size();
-            }
-            if ((normalization & 16) != 0) {
-                // divide by 1 + log(num unique words)
-                res /= 1.0 + Math.log(lexemes.size());
-            }
-            if ((normalization & 32) != 0) {
-                // rank / (1 + rank)
-                res = res / (1.0 + res);
-            }
+        // PG's calc_rank normalisation. Note the base-2 logarithms, and that the
+        // cover-distance bit (4) is documented as "not applicable" to ts_rank and is a
+        // no-op there — only ts_rank_cd has covers to measure.
+        if (res < 0) res = 1e-20f;
+        int docLen = 0;
+        for (List<PosEntry> entries : lexemes.values()) {
+            docLen += entries.isEmpty() ? 1 : entries.size();
         }
+        int uniq = lexemes.size();
+        if ((normalization & 1) != 0 && uniq > 0) {
+            res = (float) (res / (Math.log((double) (docLen + 1)) / Math.log(2.0)));
+        }
+        if ((normalization & 2) != 0 && docLen > 0) res = res / (float) docLen;
+        if ((normalization & 8) != 0 && uniq > 0) res = res / (float) uniq;
+        if ((normalization & 16) != 0 && uniq > 0) {
+            res = (float) (res / (Math.log((double) (uniq + 1)) / Math.log(2.0)));
+        }
+        if ((normalization & 32) != 0) res = res / (res + 1);
 
-        return (float) res;
+        return res;
     }
 
     /** PG's calc_rank_and: proximity-based ranking for AND queries. */
-    private double calcRankAnd(double[] w, List<String> matchedTerms) {
-        double res = 0.0;
+    private float calcRankAnd(double[] w, List<String> matchedTerms) {
+        float res = -1.0f;
         for (int i = 0; i < matchedTerms.size(); i++) {
             List<PosEntry> posI = lexemes.get(matchedTerms.get(i));
             for (int j = i + 1; j < matchedTerms.size(); j++) {
@@ -440,11 +431,13 @@ public class TsVector {
                 for (PosEntry pi : posI) {
                     for (PosEntry pj : posJ) {
                         int dist = Math.abs(pi.position() - pj.position());
-                        double wd = wordDistance(dist);
-                        double wI = w[weightIndex(pi.weight())];
-                        double wJ = w[weightIndex(pj.weight())];
-                        double curw = Math.sqrt(wI * wJ * wd);
-                        res = 1.0 - (1.0 - res) * (1.0 - curw);
+                        // Two different operands at the same position contribute nothing.
+                        if (dist == 0) continue;
+                        float wd = wordDistance(dist);
+                        float wI = (float) w[weightIndex(pi.weight())];
+                        float wJ = (float) w[weightIndex(pj.weight())];
+                        float curw = (float) Math.sqrt(wI * wJ * wd);
+                        res = res < 0 ? curw : (float) (1.0 - (1.0 - res) * (1.0 - curw));
                     }
                 }
             }
@@ -452,29 +445,29 @@ public class TsVector {
         return res;
     }
 
-    /** PG's word_distance: exponential decay for term proximity. */
-    private static double wordDistance(int dist) {
-        if (dist > 100) return 1e-30;
-        return 1.0 / (1.005 + 0.05 * Math.exp(((double) dist) / 1.5 - 2));
+    /** PG's word_distance: exponential decay for term proximity, computed in float. */
+    private static float wordDistance(int dist) {
+        if (dist > 100) return 1e-30f;
+        return (float) (1.0 / (1.005 + 0.05 * Math.exp(((double) (float) dist) / 1.5 - 2)));
     }
 
     /** PG's calc_rank_or: sum-based ranking for OR queries and single terms. */
-    private double calcRankOr(double[] w, List<String> matchedTerms, int queryTermCount) {
+    private float calcRankOr(double[] w, List<String> matchedTerms, int queryTermCount) {
         final double PI_SQ_OVER_6 = 1.64493406685;
-        double res = 0.0;
+        float res = 0.0f;
         for (String term : matchedTerms) {
             List<PosEntry> positions = lexemes.get(term);
-            double resj = 0.0;
-            double wjm = -1.0;
+            float resj = 0.0f;
+            float wjm = -1.0f;
             int jm = 0;
             for (int j = 0; j < positions.size(); j++) {
-                double wt = w[weightIndex(positions.get(j).weight())];
-                resj += wt / ((double)(j + 1) * (j + 1));
+                float wt = (float) w[weightIndex(positions.get(j).weight())];
+                resj = resj + wt / ((j + 1) * (j + 1));
                 if (wt > wjm) { wjm = wt; jm = j; }
             }
-            res += (wjm + resj - wjm / ((double)(jm + 1) * (jm + 1))) / PI_SQ_OVER_6;
+            res = (float) (res + (wjm + resj - wjm / ((jm + 1) * (jm + 1))) / PI_SQ_OVER_6);
         }
-        if (queryTermCount > 1) res /= queryTermCount;
+        if (queryTermCount > 0) res = res / queryTermCount;
         return res;
     }
 
@@ -517,67 +510,169 @@ public class TsVector {
         return rankCd(query, null, 0);
     }
 
+    /**
+     * PG's {@code calc_rank_cd} from tsrank.c: cover density.
+     *
+     * <p>A "cover" is a minimal span of the document that satisfies the query. PG walks
+     * the document finding successive non-overlapping covers, scores each by its weighted
+     * density and the number of non-matching words it contains, and then applies the
+     * normalisation bits — including bit 4, which divides by the mean harmonic distance
+     * between covers and therefore only exists once covers do.
+     */
     public double rankCd(TsQuery query, float[] weights, int normalization) {
-        if (lexemes.isEmpty()) return 0.0;
+        if (lexemes.isEmpty() || query == null) return 0.0;
+        query = prune(query);
+        if (query == null) return 0.0;
         double[] w = weights != null && weights.length == 4
-            ? new double[]{weights[0], weights[1], weights[2], weights[3]}
-            : new double[]{0.1, 0.2, 0.4, 1.0}; // D, C, B, A
+                ? new double[]{weights[0], weights[1], weights[2], weights[3]}
+                : new double[]{0.1f, 0.2f, 0.4f, 1.0f}; // D, C, B, A (float4, as PG stores them)
+        double[] invws = new double[4];
+        for (int i = 0; i < 4; i++) invws[i] = 1.0 / w[i];
 
-        // Collect all matching positions with their weights
-        List<int[]> matchPosWeights = new ArrayList<>(); // [position, weightIndex]
-        for (Map.Entry<String, List<PosEntry>> entry : lexemes.entrySet()) {
-            if (query.containsTerm(entry.getKey())) {
-                for (PosEntry pe : entry.getValue()) {
-                    matchPosWeights.add(new int[]{pe.position(), weightIndex(pe.weight())});
-                }
+        List<String> terms = new ArrayList<>(new LinkedHashSet<>(query.collectTerms()));
+        if (terms.isEmpty()) return 0.0;
+
+        // Document representation: one entry per position of every lexeme the query
+        // mentions, ordered by position.
+        List<int[]> doc = new ArrayList<>(); // [position, weightIndex, termIndex]
+        for (int t = 0; t < terms.size(); t++) {
+            List<PosEntry> entries = lexemes.get(terms.get(t));
+            if (entries == null) continue;
+            for (PosEntry pe : entries) {
+                doc.add(new int[]{pe.position(), weightIndex(pe.weight()), t});
             }
         }
-        if (matchPosWeights.isEmpty()) return 0.0;
-        matchPosWeights.sort(Comparator.comparingInt(a -> a[0]));
+        if (doc.isEmpty()) return 0.0;
+        doc.sort((a, b) -> a[0] != b[0] ? Integer.compare(a[0], b[0]) : Integer.compare(a[2], b[2]));
 
-        // PG's cover density algorithm:
-        // For each pair of distinct query terms found, compute 1/(distance between their positions)
-        // weighted by their weights
-        int nMatched = matchPosWeights.size();
-        if (nMatched == 1) {
-            double res = w[matchPosWeights.get(0)[1]];
-            return applyNormCd((float) res, normalization);
+        double wdoc = 0.0;
+        double sumDist = 0.0;
+        double prevExtPos = 0.0;
+        int nExtent = 0;
+        int pos = 0;
+        int len = doc.size();
+
+        while (pos < len) {
+            int[] cover = nextCover(doc, len, query, terms, pos);
+            if (cover == null) break;
+            int begin = cover[0], end = cover[1], p = cover[2], q = cover[3];
+            pos = cover[4];
+
+            double invSum = 0.0;
+            for (int i = begin; i <= end; i++) invSum += invws[doc.get(i)[1]];
+            double cpos = ((double) (end - begin + 1)) / invSum;
+
+            int nNoise = (q - p) - (end - begin);
+            if (nNoise < 0) nNoise = (end - begin) / 2;
+            wdoc += cpos / ((double) (1 + nNoise));
+
+            double curExtPos = ((double) (q + p)) / 2.0;
+            if (nExtent > 0 && curExtPos > prevExtPos) sumDist += 1.0 / (curExtPos - prevExtPos);
+            prevExtPos = curExtPos;
+            nExtent++;
         }
 
-        double score = 0.0;
-        for (int i = 0; i < nMatched - 1; i++) {
-            int posI = matchPosWeights.get(i)[0];
-            int posJ = matchPosWeights.get(i + 1)[0];
-            int dist = posJ - posI;
-            if (dist <= 0) dist = 1;
-            double wI = w[matchPosWeights.get(i)[1]];
-            double wJ = w[matchPosWeights.get(i + 1)[1]];
-            score += wI * wJ / (double) (dist * dist);
+        int docLen = 0;
+        for (List<PosEntry> entries : lexemes.values()) {
+            docLen += entries.isEmpty() ? 1 : entries.size();
         }
+        int uniq = lexemes.size();
 
-        double res = score / (double) countQueryTerms(query);
-        return applyNormCd((float) res, normalization);
+        if ((normalization & 1) != 0 && uniq > 0) wdoc /= Math.log((double) (docLen + 1));
+        if ((normalization & 2) != 0 && docLen > 0) wdoc /= (double) docLen;
+        if ((normalization & 4) != 0 && nExtent > 0 && sumDist > 0) {
+            wdoc /= ((double) nExtent) / sumDist;
+        }
+        if ((normalization & 8) != 0 && uniq > 0) wdoc /= (double) uniq;
+        if ((normalization & 16) != 0 && uniq > 0) wdoc /= Math.log((double) (uniq + 1)) / Math.log(2.0);
+        if ((normalization & 32) != 0) wdoc /= (wdoc + 1);
+
+        return (float) wdoc;
     }
 
-    private float applyNormCd(float res, int normalization) {
-        if (normalization != 0) {
-            int docLen = 0;
-            for (List<PosEntry> entries : lexemes.values()) docLen += entries.size();
-            if (docLen == 0) docLen = 1;
-            if ((normalization & 2) != 0) res /= docLen;
-            if ((normalization & 8) != 0) res /= lexemes.size();
-            if ((normalization & 32) != 0) res = res / (1.0f + res);
+    /**
+     * PG's {@code Cover}: the next minimal extent [p,q] satisfying the query, starting at
+     * {@code from}. Returns {beginIndex, endIndex, p, q, nextFrom} or null when exhausted.
+     */
+    private static int[] nextCover(List<int[]> doc, int len, TsQuery query,
+                                   List<String> terms, int from) {
+        while (from < len) {
+            boolean[] seen = new boolean[terms.size()];
+            int end = -1, q = 0;
+            for (int ptr = from; ptr < len; ptr++) {
+                seen[doc.get(ptr)[2]] = true;
+                if (satisfied(query, terms, seen)) {
+                    q = doc.get(ptr)[0];
+                    end = ptr;
+                    break;
+                }
+            }
+            if (end < 0) return null;
+
+            // Now shrink from the right-hand end back down to the smallest span.
+            java.util.Arrays.fill(seen, false);
+            int begin = -1, p = Integer.MAX_VALUE;
+            for (int ptr = end; ptr >= from; ptr--) {
+                seen[doc.get(ptr)[2]] = true;
+                if (satisfied(query, terms, seen)) {
+                    begin = ptr;
+                    p = doc.get(ptr)[0];
+                    break;
+                }
+            }
+            if (begin >= 0 && p <= q) {
+                return new int[]{begin, end, p, q, begin + 1};
+            }
+            from++;
         }
-        return res;
+        return null;
     }
 
+    /**
+     * Drops stop-word operands, which PG removes from the query outright rather than
+     * leaving as empty terms — an AND with one of them is just the remaining branch.
+     */
+    private static TsQuery prune(TsQuery q) {
+        if (q == null) return null;
+        if (q.getOp() == TsQuery.Op.TERM) {
+            String t = q.getTerm();
+            return t == null || t.isEmpty() ? null : q;
+        }
+        if (q.getOp() == TsQuery.Op.NOT) {
+            TsQuery inner = prune(q.getLeft() != null ? q.getLeft() : q.getRight());
+            return inner == null ? null : q;
+        }
+        TsQuery l = prune(q.getLeft());
+        TsQuery r = prune(q.getRight());
+        if (l == null) return r;
+        if (r == null) return l;
+        if (l == q.getLeft() && r == q.getRight()) return q;
+        return q.getOp() == TsQuery.Op.OR ? TsQuery.or(l, r) : TsQuery.and(l, r);
+    }
+
+    /** Evaluates the query with each operand true iff it has been seen in the span. */
+    private static boolean satisfied(TsQuery query, List<String> terms, boolean[] seen) {
+        if (query == null) return false;
+        switch (query.getOp()) {
+            case TERM: {
+                int idx = terms.indexOf(query.getTerm());
+                return idx >= 0 && seen[idx];
+            }
+            case NOT:
+                return !satisfied(query.getLeft() != null ? query.getLeft() : query.getRight(),
+                        terms, seen);
+            case OR:
+                return satisfied(query.getLeft(), terms, seen)
+                        || satisfied(query.getRight(), terms, seen);
+            default: // AND and PHRASE both require every operand within the span
+                return satisfied(query.getLeft(), terms, seen)
+                        && satisfied(query.getRight(), terms, seen);
+        }
+    }
+
+    /** The english_stem dictionary: PG's bundled Snowball (Porter2) stemmer. */
     static String simpleStem(String word) {
-        if (word.length() > 4 && word.endsWith("ful")) return word.substring(0, word.length() - 3);
-        if (word.length() > 4 && word.endsWith("ing")) return word.substring(0, word.length() - 3);
-        if (word.length() > 3 && word.endsWith("ed")) return word.substring(0, word.length() - 2);
-        if (word.length() > 3 && word.endsWith("es")) return word.substring(0, word.length() - 2);
-        if (word.length() > 2 && word.endsWith("s") && !word.endsWith("ss")) return word.substring(0, word.length() - 1);
-        return word;
+        return com.memgres.engine.fts.EnglishStemmer.stem(word);
     }
 
     @Override

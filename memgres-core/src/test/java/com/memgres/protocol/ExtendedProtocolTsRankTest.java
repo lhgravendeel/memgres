@@ -27,8 +27,8 @@ class ExtendedProtocolTsRankTest {
                 "SELECT ts_rank(to_tsvector('english','The quick brown fox'), to_tsquery('english','fox'))")) {
             try (ResultSet rs = ps.executeQuery()) {
                 assertTrue(rs.next());
-                assertEquals("0.0607927", rs.getString(1),
-                    "ts_rank should display as 0.0607927 (PG float4 precision)");
+                assertEquals("0.06079271", rs.getString(1),
+                    "ts_rank should display the shortest float4 decimal, as PG 18 does");
             }
         }
     }

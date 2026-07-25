@@ -823,7 +823,8 @@ public class InfoSchemaBuilder {
                     if (sc.getType() == StoredConstraint.Type.CHECK && sc.getName() != null) {
                         table.insertRow(new Object[]{
                                 catalogName(), schemaEntry.getKey(), sc.getName(),
-                                sc.getCheckExpr() != null ? SqlUnparser.exprToSql(sc.getCheckExpr()) : ""
+                                sc.getCheckExpr() != null
+                                        ? RuleDeparser.deparse(sc.getCheckExpr(), RuleDeparser.forTable(t)) : ""
                         });
                     }
                 }
@@ -845,13 +846,13 @@ public class InfoSchemaBuilder {
             if (d.getParsedCheck() != null) {
                 table.insertRow(new Object[]{
                         catalogName(), "public", d.getName() + "_check",
-                        "(" + stripOuterParensLocal(CatalogHelper.renderDomainCheck(d.getParsedCheck())) + ")"
+                        "(" + stripOuterParensLocal(CatalogHelper.renderDomainCheck(d, d.getParsedCheck())) + ")"
                 });
             }
             for (DomainType.NamedConstraint nc : d.getNamedConstraints()) {
                 table.insertRow(new Object[]{
                         catalogName(), "public", nc.name(),
-                        "(" + stripOuterParensLocal(CatalogHelper.renderDomainCheck(nc.parsedCheck)) + ")"
+                        "(" + stripOuterParensLocal(CatalogHelper.renderDomainCheck(d, nc.parsedCheck)) + ")"
                 });
             }
         }
