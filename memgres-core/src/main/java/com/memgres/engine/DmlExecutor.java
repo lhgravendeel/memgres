@@ -548,17 +548,19 @@ class DmlExecutor {
             // Validate constraints and insert atomically under table write lock
             // to prevent concurrent INSERTs from both passing unique checks.
             Table targetTable = partitionHelper.routeToPartition(table, row);
+            // An ATTACHed partition may order its columns differently from the parent.
+            Object[] storedRow = targetTable == table ? row : targetTable.rowFromParent(row);
             targetTable.getWriteLock().lock();
             try {
                 executor.constraintValidator.validateConstraints(table, row, null);
                 if (targetTable != table) {
-                    executor.constraintValidator.validateConstraints(targetTable, row, null);
+                    executor.constraintValidator.validateConstraints(targetTable, storedRow, null);
                 }
-                targetTable.insertRow(row);
+                targetTable.insertRow(storedRow);
             } finally {
                 targetTable.getWriteLock().unlock();
             }
-            recordInsertUndo(stmt.schema(), targetTable.getName(), row);
+            recordInsertUndo(stmt.schema(), targetTable.getName(), storedRow);
             // C10: If routed to a child partition, also sync parent's RR snapshot
             if (targetTable != table && executor.session != null) {
                 String parentKey = (stmt.schema() != null ? stmt.schema() : executor.defaultSchema()) + "." + table.getName();
