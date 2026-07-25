@@ -54,6 +54,13 @@ class SelectSetOpExecutor {
         for (int ci = 0; ci < columns.size(); ci++) {
             DataType leftType = columns.get(ci).getType();
             DataType rightType = rightResult.getColumns().get(ci).getType();
+            // A bare NULL branch has no type of its own; PG takes the type of the branch
+            // that has one, so SELECT NULL UNION ALL SELECT 1 is integer, not unknown.
+            if (leftType == null && rightType != null) {
+                Column orig = columns.get(ci);
+                columns.set(ci, new Column(orig.getName(), rightType, true, false, orig.getDefaultValue()));
+                continue;
+            }
             if (leftType != null && rightType != null && leftType != rightType) {
                 TypeCoercion.TypeCategory leftCat = TypeCoercion.categoryOf(leftType);
                 TypeCoercion.TypeCategory rightCat = TypeCoercion.categoryOf(rightType);

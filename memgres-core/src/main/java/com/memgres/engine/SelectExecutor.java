@@ -150,13 +150,24 @@ class SelectExecutor {
                             throw new MemgresException("column reference \"" + cr.column() + "\" is ambiguous", "42702");
                         }
                         if (matchCount == 0) {
-                            MemgresException colEx = new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
-                            // Try to generate a hint by finding the closest matching column
+                            // A bare name matching a FROM item is a whole-row reference.
+                            boolean wholeRow = false;
                             for (RowContext.TableBinding b : baseBindings) {
-                                String hint = RowContext.suggestClosestColumn(cr.column(), b.table());
-                                if (hint != null) { colEx.setHint(hint); break; }
+                                if ((b.alias() != null && b.alias().equalsIgnoreCase(cr.column()))
+                                        || b.table().getName().equalsIgnoreCase(cr.column())) {
+                                    wholeRow = true;
+                                    break;
+                                }
                             }
-                            throw colEx;
+                            if (!wholeRow) {
+                                MemgresException colEx = new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
+                                // Try to generate a hint by finding the closest matching column
+                                for (RowContext.TableBinding b : baseBindings) {
+                                    String hint = RowContext.suggestClosestColumn(cr.column(), b.table());
+                                    if (hint != null) { colEx.setHint(hint); break; }
+                                }
+                                throw colEx;
+                            }
                         }
                     } else {
                         boolean tableFound = false;
@@ -407,12 +418,15 @@ class SelectExecutor {
 
         buildProjections(stmt.targets(), baseBindings, resultColumns, projections, usingColumnsLower);
 
-        List<SelectStmt.OrderByItem> resolvedOrderBy = resolveOrderBy(stmt.orderBy(), stmt.targets());
+        // An ordinal ORDER BY counts output columns, so a star target has to be expanded
+        // first: SELECT * FROM t ORDER BY 2 means the table's second column.
+        List<SelectStmt.SelectTarget> ordinalTargets = expandTargetsForOrdinals(stmt.targets(), baseBindings);
+        List<SelectStmt.OrderByItem> resolvedOrderBy = resolveOrderBy(stmt.orderBy(), ordinalTargets);
 
         // Validate: for SELECT DISTINCT, ORDER BY expressions must appear in select list
         if (stmt.distinct() && (stmt.distinctOn() == null || stmt.distinctOn().isEmpty()) && resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
             Set<String> targetExprs = new java.util.HashSet<>();
-            for (SelectStmt.SelectTarget t : stmt.targets()) {
+            for (SelectStmt.SelectTarget t : ordinalTargets) {
                 if (t.alias() != null) targetExprs.add(t.alias().toLowerCase());
                 targetExprs.add(t.expr().toString().toLowerCase());
                 if (t.expr() instanceof ColumnRef) targetExprs.add(((ColumnRef) t.expr()).column().toLowerCase());
@@ -778,6 +792,36 @@ class SelectExecutor {
 
     // ---- Shared SELECT helpers ----
 
+    /**
+     * Replaces star targets with one target per column the star stands for, so ORDER BY
+     * ordinals and DISTINCT validation see the real output column list. Returns the
+     * original list when there is no star to expand.
+     */
+    private List<SelectStmt.SelectTarget> expandTargetsForOrdinals(
+            List<SelectStmt.SelectTarget> targets, List<RowContext.TableBinding> bindings) {
+        if (targets == null || bindings == null || bindings.isEmpty()) return targets;
+        boolean hasStar = false;
+        for (SelectStmt.SelectTarget t : targets) {
+            if (t.expr() instanceof WildcardExpr) { hasStar = true; break; }
+        }
+        if (!hasStar) return targets;
+        List<SelectStmt.SelectTarget> out = new ArrayList<>();
+        for (SelectStmt.SelectTarget t : targets) {
+            if (!(t.expr() instanceof WildcardExpr)) { out.add(t); continue; }
+            WildcardExpr w = (WildcardExpr) t.expr();
+            for (RowContext.TableBinding b : bindings) {
+                if (w.table() != null && !b.alias().equalsIgnoreCase(w.table())
+                        && !b.table().getName().equalsIgnoreCase(w.table())) {
+                    continue;
+                }
+                for (Column c : b.table().getColumns()) {
+                    out.add(new SelectStmt.SelectTarget(new ColumnRef(b.alias(), c.getName()), null));
+                }
+            }
+        }
+        return out.isEmpty() ? targets : out;
+    }
+
     List<SelectStmt.OrderByItem> resolveOrderBy(List<SelectStmt.OrderByItem> orderBy,
                                                   List<SelectStmt.SelectTarget> targets) {
         if (orderBy == null || orderBy.isEmpty()) return orderBy;
@@ -1084,9 +1128,11 @@ class SelectExecutor {
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
             List<CustomEnum> enumLookups = new ArrayList<>();
             List<String> collationLookups = new ArrayList<>();
+            List<Boolean> arrayKeys = new ArrayList<>();
             for (SelectStmt.OrderByItem item : resolvedOrderBy) {
                 CustomEnum ce = resolveEnumForExpr(item.expr(), contexts);
                 enumLookups.add(ce);
+                arrayKeys.add(isArrayOrderKey(item.expr(), contexts));
                 // Extract explicit COLLATE collation name if present
                 collationLookups.add(item.expr() instanceof CollateExpr
                         ? ((CollateExpr) item.expr()).collation() : null);
@@ -1112,6 +1158,9 @@ class SelectExecutor {
                         String collation = collationLookups.get(idx);
                         if (collation != null && va instanceof String && vb instanceof String) {
                             cmp = TypeCoercion.compareStringsWithCollation((String) va, (String) vb, collation);
+                        } else if (arrayKeys.get(idx)) {
+                            cmp = executor.compareValues(
+                                    TypeCoercion.arrayForCompare(va), TypeCoercion.arrayForCompare(vb));
                         } else {
                             cmp = executor.compareValues(va, vb);
                         }
@@ -1122,6 +1171,20 @@ class SelectExecutor {
                 return 0;
             });
         }
+    }
+
+    /** True when the sort key is an array column, whose values are stored as literals. */
+    private boolean isArrayOrderKey(Expression expr, List<RowContext> contexts) {
+        if (!(expr instanceof ColumnRef) || contexts == null || contexts.isEmpty()) return false;
+        String col = ((ColumnRef) expr).column();
+        for (RowContext.TableBinding b : contexts.get(0).getBindings()) {
+            int i = b.table().getColumnIndex(col);
+            if (i >= 0) {
+                Column c = b.table().getColumns().get(i);
+                return c.getArrayElementType() != null || c.getType().getPgName().startsWith("_");
+            }
+        }
+        return false;
     }
 
     private CustomEnum resolveEnumForExpr(Expression expr, List<RowContext> contexts) {

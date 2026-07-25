@@ -459,11 +459,11 @@ class ExprEvaluator {
             }
             // Check if the column name matches a table alias (whole-row reference, e.g. ROW_TO_JSON(row))
             {
-                Object wholeRow = resolveWholeRowRef(ref.column(), ctx);
+                Object wholeRow = resolveWholeRowReference(ref.column(), ctx);
                 if (wholeRow != null) return wholeRow;
                 // Also check outer contexts
                 for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
-                    wholeRow = resolveWholeRowRef(ref.column(), it.next());
+                    wholeRow = resolveWholeRowReference(ref.column(), it.next());
                     if (wholeRow != null) return wholeRow;
                 }
             }
@@ -1051,6 +1051,28 @@ class ExprEvaluator {
             default:
                 throw new IllegalStateException("Unknown unary op: " + op);
         }
+    }
+
+    /**
+     * Whole-row reference: a bare identifier naming a FROM item rather than a column,
+     * as in SELECT t FROM t. Returns the row as a composite, or null when the name does
+     * not match any binding.
+     */
+    private Object resolveWholeRowReference(String name, RowContext ctx) {
+        if (name == null || ctx == null || ctx.getBindings() == null) return null;
+        for (RowContext.TableBinding b : ctx.getBindings()) {
+            boolean matches = (b.alias() != null && b.alias().equalsIgnoreCase(name))
+                    || (b.table() != null && b.table().getName().equalsIgnoreCase(name));
+            if (!matches) continue;
+            List<Object> values = new ArrayList<>();
+            Object[] row = b.row();
+            int n = b.table() != null ? b.table().getColumns().size() : (row == null ? 0 : row.length);
+            for (int i = 0; i < n; i++) {
+                values.add(row != null && i < row.length ? row[i] : null);
+            }
+            return new AstExecutor.PgRow(values);
+        }
+        return null;
     }
 
     private Object evalIsNull(IsNullExpr isn, RowContext ctx) {
@@ -1667,10 +1689,15 @@ class ExprEvaluator {
             }
         }
 
+        // A row-constructor left side compares against the whole subquery row, not just
+        // its first column: (1,2) = ANY (SELECT xi, yi FROM pts).
+        int leftWidth = leftVal instanceof AstExecutor.PgRow
+                ? ((AstExecutor.PgRow) leftVal).values().size() : 1;
+
         if (aa.isAll()) {
             boolean hasNull = false;
             for (Object[] row : subResult.getRows()) {
-                Object elem = row.length > 0 ? row[0] : null;
+                Object elem = subqueryElement(row, leftWidth);
                 if (elem == null) { hasNull = true; continue; }
                 if (!evalComparisonOp(aa.op(), leftVal, elem)) return false;
             }
@@ -1678,12 +1705,21 @@ class ExprEvaluator {
         } else {
             boolean hasNull = false;
             for (Object[] row : subResult.getRows()) {
-                Object elem = row.length > 0 ? row[0] : null;
+                Object elem = subqueryElement(row, leftWidth);
                 if (elem == null) { hasNull = true; continue; }
                 if (evalComparisonOp(aa.op(), leftVal, elem)) return true;
             }
             return hasNull ? null : false;
         }
+    }
+
+    /** One comparable value from a subquery row: a scalar, or a composite when the
+     *  left-hand side is a row constructor. */
+    private static Object subqueryElement(Object[] row, int width) {
+        if (width <= 1) return row.length > 0 ? row[0] : null;
+        List<Object> values = new ArrayList<>(width);
+        for (int i = 0; i < width; i++) values.add(i < row.length ? row[i] : null);
+        return new AstExecutor.PgRow(values);
     }
 
     private Object evalAnyAllArray(AnyAllArrayExpr aaa, RowContext ctx) {
