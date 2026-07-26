@@ -249,7 +249,10 @@ public class Table {
         }
         for (Table partition : partitions) {
             // Recurse so multi-level partitioning (partition of a partition) is included
-            allRows.addAll(partition.getAllRowsWithSource());
+            for (RowWithSource rws : partition.getAllRowsWithSource()) {
+                Object[] asParent = partition.rowToParent(rws.row());
+                allRows.add(asParent == rws.row() ? rws : new RowWithSource(rws.source(), asParent));
+            }
         }
         return allRows;
     }
@@ -757,6 +760,40 @@ public class Table {
     public void setPartitionColumn(String column) { this.partitionColumn = column; }
     public List<Table> getPartitions() { return partitions; }
     public void addPartition(Table partition) { partitions.add(partition); }
+    /**
+     * Maps this partition's column positions to the parent's, when ATTACH bound a table
+     * whose columns are in a different order. PostgreSQL matches partition columns by
+     * name and keeps each table's own attribute order, so rows have to be permuted as
+     * they cross the boundary in either direction. Null when the orders already agree.
+     */
+    private int[] parentColumnRemap;
+
+    public int[] getParentColumnRemap() { return parentColumnRemap; }
+
+    public void setParentColumnRemap(int[] remap) { this.parentColumnRemap = remap; }
+
+    /** Re-orders a row written through the parent into this partition's own column order. */
+    public Object[] rowFromParent(Object[] parentRow) {
+        if (parentColumnRemap == null) return parentRow;
+        Object[] out = new Object[columns.size()];
+        for (int i = 0; i < parentColumnRemap.length && i < parentRow.length; i++) {
+            int target = parentColumnRemap[i];
+            if (target >= 0 && target < out.length) out[target] = parentRow[i];
+        }
+        return out;
+    }
+
+    /** Re-orders one of this partition's rows into the parent's column order. */
+    public Object[] rowToParent(Object[] childRow) {
+        if (parentColumnRemap == null) return childRow;
+        Object[] out = new Object[parentColumnRemap.length];
+        for (int i = 0; i < parentColumnRemap.length; i++) {
+            int source = parentColumnRemap[i];
+            if (source >= 0 && source < childRow.length) out[i] = childRow[source];
+        }
+        return out;
+    }
+
     public Table getPartitionParent() { return partitionParent; }
     public void setPartitionParent(Table parent) { this.partitionParent = parent; }
     public Object getPartitionLower() { return partitionLower; }

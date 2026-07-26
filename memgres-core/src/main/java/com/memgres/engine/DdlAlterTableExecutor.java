@@ -1058,7 +1058,23 @@ class DdlAlterTableExecutor {
         // C4b: Validate existing rows satisfy partition bounds
         validateExistingRowBounds(partition, table, attach.partitionName());
         partition.setPartitionParent(table);
+        partition.setParentColumnRemap(buildParentColumnRemap(table, partition));
         table.addPartition(partition);
+    }
+
+    /**
+     * Position map from the parent's columns to the partition's, matched by name.
+     * Returns null when the orders already agree, which is the usual case.
+     */
+    private static int[] buildParentColumnRemap(Table parent, Table partition) {
+        List<Column> parentCols = parent.getColumns();
+        int[] remap = new int[parentCols.size()];
+        boolean identical = parentCols.size() == partition.getColumns().size();
+        for (int i = 0; i < parentCols.size(); i++) {
+            remap[i] = partition.getColumnIndex(parentCols.get(i).getName());
+            if (remap[i] != i) identical = false;
+        }
+        return identical ? null : remap;
     }
 
     /** C4a: Partition must have the same columns (by name and type) as the parent.

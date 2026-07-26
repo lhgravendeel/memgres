@@ -1309,6 +1309,48 @@ public class Database {
         }
     }
 
+    /**
+     * Removes the triggers belonging to one schema's table. The registry is keyed by bare
+     * name, so dropping s2.tt must not take the triggers on public.tt with it. Triggers
+     * with no recorded schema are treated as belonging to the table being dropped.
+     */
+    public void removeTriggersForTable(String schemaName, String tableName) {
+        String key = tableName.toLowerCase();
+        List<PgTrigger> list = triggers.get(key);
+        if (list == null) return;
+        List<PgTrigger> keep = new ArrayList<>();
+        for (PgTrigger t : list) {
+            if (schemaName != null && t.getSchemaName() != null
+                    && !t.getSchemaName().equalsIgnoreCase(schemaName)) {
+                keep.add(t);
+            }
+        }
+        if (keep.isEmpty()) triggers.remove(key);
+        else triggers.put(key, keep);
+    }
+
+    /** Triggers on the named table, restricted to one schema where that is recorded. */
+    public List<PgTrigger> getTriggersForTable(String schemaName, String tableName) {
+        List<PgTrigger> list = triggers.get(tableName.toLowerCase());
+        if (list == null) return new ArrayList<>();
+        if (schemaName == null) return new ArrayList<>(list);
+        List<PgTrigger> out = new ArrayList<>();
+        for (PgTrigger t : list) {
+            if (t.getSchemaName() == null || t.getSchemaName().equalsIgnoreCase(schemaName)) out.add(t);
+        }
+        return out;
+    }
+
+    /** Re-registers triggers removed by a DROP TABLE that a rollback has undone. */
+    public void restoreTriggersForTable(String tableName, List<PgTrigger> restored) {
+        if (restored == null || restored.isEmpty()) return;
+        String key = tableName.toLowerCase();
+        List<PgTrigger> list = triggers.computeIfAbsent(key, k -> new ArrayList<>());
+        for (PgTrigger t : restored) {
+            if (!list.contains(t)) list.add(t);
+        }
+    }
+
     public void removeTriggersForTable(String tableName) {
         triggers.remove(tableName.toLowerCase());
     }

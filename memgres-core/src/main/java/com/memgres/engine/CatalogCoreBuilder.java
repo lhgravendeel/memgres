@@ -196,7 +196,8 @@ class CatalogCoreBuilder {
                         false,              // relhasoids
                         true, String.valueOf(t.getReplicaIdentity()), relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid
-                        buildRelacl(t.getName()), buildTableReloptions(t), relpartbound, 1 // relacl, reloptions, relpartbound, xmin
+                        buildRelacl(AstExecutor.privilegeKey(schemaEntry.getKey(), t.getName())),
+                        buildTableReloptions(t), relpartbound, 1 // relacl, reloptions, relpartbound, xmin
                 });
             }
         }
@@ -1826,6 +1827,7 @@ class CatalogCoreBuilder {
      * Build an aclitem[] string for a table based on granted privileges.
      * Returns null if no privileges have been granted, or a PG-style aclitem array string.
      */
+    /** @param tableName the schema-qualified key privileges are recorded under */
     private String buildRelacl(String tableName) {
         Map<String, Set<String>> allPrivs = database.getAllRolePrivileges();
         // Collect grants: grantee -> set of privilege abbreviations
