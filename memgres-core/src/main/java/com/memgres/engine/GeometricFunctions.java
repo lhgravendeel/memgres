@@ -14,6 +14,47 @@ class GeometricFunctions {
         this.executor = executor;
     }
 
+    /**
+     * Reject a shape PG has no such function for. Geometric values are stored as text, so the
+     * shape is read back from the literal: a box is two points, a circle carries its radius.
+     * A three-point {@code ((..))} value is a polygon or a closed path, and PG defines neither
+     * center() nor a comparison for those.
+     */
+    private void requireBoxOrCircle(String text, String funcName) {
+        String shape = shapeName(text);
+        if ("circle".equals(shape) || "box".equals(shape)) return;
+        String t = text.trim();
+        throw new MemgresException("function " + funcName + "(" + shapeName(t) + ") does not exist"
+                + "\n  Hint: No function matches the given name and argument types.", "42883");
+    }
+
+    /** How many {@code (x,y)} pairs the literal holds. */
+    static int countPoints(String text) {
+        int n = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '(') n++;
+        }
+        return n;
+    }
+
+    /**
+     * The PG type a geometric value denotes, read back from its output form. PG's own rendering
+     * is the discriminator: a box prints its two points bare, {@code (1,1),(0,0)}, while a
+     * polygon or closed path wraps them, {@code ((0,0),(1,1))}.
+     */
+    static String shapeName(String text) {
+        String t = text.trim();
+        if (t.startsWith("<")) return "circle";
+        if (t.startsWith("{")) return "line";
+        if (t.startsWith("[")) return countPoints(t) == 2 ? "lseg" : "path";
+        if (t.startsWith("((")) return "polygon";
+        if (t.startsWith("(")) {
+            int pts = countPoints(t);
+            return pts <= 1 ? "point" : pts == 2 ? "box" : "polygon";
+        }
+        return "unknown";
+    }
+
     private void requireGeometric(Object arg, String funcName) {
         if (arg instanceof Number) {
             throw new MemgresException(
@@ -41,6 +82,8 @@ class GeometricFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 requireGeometric(arg, "center");
+                // PG only defines center() for box and circle; a polygon, path or lseg has none
+                requireBoxOrCircle(arg.toString(), "center");
                 return GeometricOperations.format(GeometricOperations.center(arg.toString()));
             }
             case "diameter": {

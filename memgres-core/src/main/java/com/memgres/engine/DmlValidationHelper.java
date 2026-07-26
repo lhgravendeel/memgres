@@ -64,8 +64,21 @@ class DmlValidationHelper {
             Column col = table.getColumns().get(i);
             String domainName = col.getDomainTypeName();
             if (domainName != null) {
-                DomainType domain = executor.database.getDomain(domainName);
-                if (domain != null) {
+                // Walk from the base domain outwards: a domain over a domain inherits its
+                // constraints, and PG reports the innermost one a value violates
+                java.util.List<DomainType> chain = new java.util.ArrayList<>();
+                DomainType d = executor.database.getDomain(domainName);
+                for (int guard = 0; d != null && guard < 64; guard++) {
+                    chain.add(0, d);
+                    String base = d.getBaseTypeName();
+                    d = base == null ? null : executor.database.getDomain(base);
+                }
+                for (DomainType domain : chain) {
+                    if (row[i] == null && domain.isNotNull()) {
+                        throw new MemgresException(
+                                "domain " + domain.getName() + " does not allow null values", "23502");
+                    }
+                    // A domain CHECK still runs for NULL: CHECK (VALUE IS NOT NULL) rejects it
                     Table tempTable = new Table("_domain_check",
                             Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
                     RowContext tempCtx = new RowContext(tempTable, null, new Object[]{row[i]});
@@ -75,7 +88,7 @@ class DmlValidationHelper {
                         Object result = executor.evalExpr(domain.getParsedCheck(), tempCtx);
                         if (result != null && !executor.isTruthy(result)) {
                             throw new MemgresException(
-                                    "value for domain " + domainName + " violates check constraint \"" + domainName + "_check\"",
+                                    "value for domain " + domainName + " violates check constraint \"" + domain.getName() + "_check\"",
                                     "23514");
                         }
                     }

@@ -35,6 +35,14 @@ class GeometryCorrectnessTest {
         }
     }
 
+    /** Run a statement expected to fail and return its SQLSTATE. */
+    private String errorState(String sql) {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) { s.execute(sql); }
+        });
+        return e.getSQLState();
+    }
+
     private boolean qBool(String sql) throws SQLException {
         return "t".equals(q(sql));
     }
@@ -233,12 +241,12 @@ class GeometryCorrectnessTest {
 
     @Test
     void centerLseg() throws SQLException {
-        assertEquals("(1,1)", q("SELECT center(lseg '[(0,0),(2,2)]')"));
+        assertEquals("42883", errorState("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     @Test
     void centerPolygon() throws SQLException {
-        assertEquals("(1,1)", q("SELECT center(polygon '((0,0),(2,0),(2,2),(0,2))')"));
+        assertEquals("42883", errorState("SELECT center(polygon '((0,0),(2,0),(2,2),(0,2))')"));
     }
 
     @Test

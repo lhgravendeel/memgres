@@ -283,11 +283,11 @@ SELECT round(length(lseg '((0,0),(3,4))')::numeric, 2) AS len;
 -- 21. Line segment center
 -- ============================================================================
 
--- expected-divergence: Memgres supports center(lseg) as extension — PG does not have this function
--- begin-expected
--- columns: c
--- row: (1.5,2)
--- end-expected
+-- PG defines center() for box and circle only
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: function center(lseg) does not exist
+-- end-expected-error
 SELECT center(lseg '((0,0),(3,4))') AS c;
 
 -- ============================================================================
@@ -329,11 +329,11 @@ SELECT npoints(polygon '((0,0),(4,0),(4,3),(0,3))') AS n;
 -- 25. Polygon center
 -- ============================================================================
 
--- expected-divergence: Memgres supports center(polygon) as extension — PG does not have this function
--- begin-expected
--- columns: c
--- row: (2,1.5)
--- end-expected
+-- PG defines center() for box and circle only
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: function center(polygon) does not exist
+-- end-expected-error
 SELECT center(polygon '((0,0),(4,0),(4,3),(0,3))') AS c;
 
 -- ============================================================================

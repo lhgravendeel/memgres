@@ -48,6 +48,14 @@ class GeometricTypesCoverageTest {
         }
     }
 
+    /** Run a statement expected to fail and return its SQLSTATE. */
+    private String errorState(String sql) {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) { s.execute(sql); }
+        });
+        return e.getSQLState();
+    }
+
     private double queryDouble(String sql) throws SQLException {
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
             assertTrue(rs.next());
@@ -199,8 +207,8 @@ class GeometricTypesCoverageTest {
 
     @Test
     void lseg_center() throws SQLException {
-        // PG: center(lseg) returns the midpoint
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+        // PG has center() for box and circle only
+        assertEquals("42883", errorState("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     @Test
@@ -264,8 +272,8 @@ class GeometricTypesCoverageTest {
 
     @Test
     void lseg_center_function_alt() throws SQLException {
-        // PG: center(lseg) returns the midpoint
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+        // PG has center() for box and circle only
+        assertEquals("42883", errorState("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     // ========================================================================
@@ -562,8 +570,8 @@ class GeometricTypesCoverageTest {
 
     @Test
     void polygon_center() throws SQLException {
-        // PG: center(polygon) returns the centroid
-        assertEquals("(1,1)", query1("SELECT center(polygon '((0,0),(2,0),(2,2),(0,2))')"));
+        // PG has center() for box and circle only
+        assertEquals("42883", errorState("SELECT center(polygon '((0,0),(2,0),(2,2),(0,2))')"));
     }
 
     @Test
@@ -856,8 +864,8 @@ class GeometricTypesCoverageTest {
 
     @Test
     void measurement_center_lseg_function() throws SQLException {
-        // PG: center(lseg) returns the midpoint
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+        // PG has center() for box and circle only
+        assertEquals("42883", errorState("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     @Test

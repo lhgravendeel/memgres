@@ -927,6 +927,7 @@ class BinaryOpEvaluator {
                     String ls0 = left.toString().trim();
                     String rs0 = right.toString().trim();
                     if (GeometricOperations.isGeometricString(ls0) && GeometricOperations.isGeometricString(rs0)) {
+                        requireContainmentPair(ls0, rs0);
                         return GeometricOperations.contains(ls0, rs0);
                     }
                 }
@@ -2370,6 +2371,26 @@ class BinaryOpEvaluator {
                 ? 1 : bd.abs().toBigInteger().toString().length();
         int scale = Math.max(0, 16 - (intDigits - 1));
         return bd.setScale(scale, java.math.RoundingMode.HALF_UP);
+    }
+
+
+    /**
+     * PG defines @> only for a container that can hold an area or a path: box, circle, polygon
+     * and path. A line is unbounded and an lseg has no interior, so neither is a container, and
+     * only a point or a like-shaped region can be the contained side.
+     */
+    private static void requireContainmentPair(String leftText, String rightText) {
+        String container = GeometricFunctions.shapeName(leftText);
+        String contained = GeometricFunctions.shapeName(rightText);
+        boolean containerOk = container.equals("box") || container.equals("circle")
+                || container.equals("polygon") || container.equals("path");
+        boolean containedOk = contained.equals("point") || contained.equals("box")
+                || contained.equals("circle") || contained.equals("polygon")
+                || contained.equals("path");
+        if (!containerOk || !containedOk) {
+            throw new MemgresException("operator does not exist: " + container + " @> " + contained
+                    + "\n  Hint: No operator matches the given name and argument types.", "42883");
+        }
     }
 
 }

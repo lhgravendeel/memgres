@@ -44,6 +44,17 @@ class CastEvaluator {
         this.executor = executor;
     }
 
+    /** True when this domain, or any domain it is built on, is declared NOT NULL. */
+    private boolean domainChainRejectsNull(DomainType domain) {
+        DomainType d = domain;
+        for (int guard = 0; d != null && guard < 64; guard++) {
+            if (d.isNotNull()) return true;
+            String base = d.getBaseTypeName();
+            d = base == null ? null : executor.database.getDomain(base);
+        }
+        return false;
+    }
+
     /**
      * Resolves the zone to use when interpreting a zoneless timestamptz literal.
      * Follows the session TimeZone GUC only when it has been explicitly SET for this session
@@ -76,7 +87,17 @@ class CastEvaluator {
     }
 
     Object applyCast(Object val, String typeSpec) {
-        if (val == null) return null;
+        if (val == null) {
+            // A NOT NULL domain rejects null even through a cast, and the constraint is
+            // inherited from every domain it is built on
+            DomainType nullDomain = executor.database.getDomain(
+                    typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim());
+            if (nullDomain != null && domainChainRejectsNull(nullDomain)) {
+                throw new MemgresException(
+                        "domain " + nullDomain.getName() + " does not allow null values", "23502");
+            }
+            return null;
+        }
         // JSON/JSONB null literal → SQL NULL when cast to any other type
         if (val instanceof String && ((String) val).trim().equals("null")) {
             String s = (String) val;
@@ -1024,7 +1045,13 @@ class CastEvaluator {
                 // Check if it's a domain type
                 DomainType domain = executor.database.getDomain(typeName);
                 if (domain != null) {
-                    Object coerced = applyCast(val, domain.getBaseType().getPgName());
+                    // A domain over a domain inherits its base's constraints, and PG reports
+                    // the innermost violation, so cast through the parent first
+                    DomainType parent = domain.getBaseTypeName() == null ? null
+                            : executor.database.getDomain(domain.getBaseTypeName());
+                    Object coerced = parent != null
+                            ? applyCast(val, domain.getBaseTypeName())
+                            : applyCast(val, domain.getBaseType().getPgName());
                     // Validate domain CHECK constraint if present
                     Expression checkExpr = domain.getParsedCheck();
                     if (checkExpr != null) {
