@@ -1204,6 +1204,10 @@ class DmlExecutor {
             rows = filterRowsByRlsUsing(table, rows, "UPDATE", updateAlias);
         }
 
+        // PG's UPDATE takes a FOR UPDATE lock on every row it touches; a concurrent
+        // FOR UPDATE NOWAIT must see it, or queue workers double-process the same row.
+        lockRowsForDml(table, rows);
+
         int updatedCount = 0;
         List<Object[]> simpleOldRows = new ArrayList<>();
         List<Object[]> simpleNewRows = new ArrayList<>();
@@ -1394,6 +1398,19 @@ class DmlExecutor {
             }
         }
         return filtered;
+    }
+
+    /**
+     * Take PG's implicit FOR UPDATE row locks for a plain UPDATE or DELETE, so that a
+     * concurrent FOR UPDATE / FOR UPDATE NOWAIT blocks or reports 55P03 the way it does
+     * against a real server. Waits (with deadlock detection) exactly like FOR UPDATE.
+     */
+    private void lockRowsForDml(Table table, List<Object[]> rows) {
+        if (executor.session == null || table == null || rows == null || rows.isEmpty()) return;
+        String tName = table.getName();
+        for (Object[] row : rows) {
+            executor.database.lockRowWaiting(tName, row, executor.session, "UPDATE");
+        }
     }
 
     /** Apply SET clauses to a row. DRYs the duplicate logic between multi-table and simple UPDATE paths. */
@@ -1728,6 +1745,9 @@ class DmlExecutor {
             toDelete.retainAll(rlsAllowedSet);
             deleteOrder.removeIf(r -> !rlsAllowedSet.contains(r));
         }
+
+        // DELETE takes the same FOR UPDATE lock on its target rows as PG does
+        lockRowsForDml(table, new ArrayList<>(toDelete));
 
         // Validate FK references before deleting (handle CASCADE/RESTRICT/SET NULL/SET DEFAULT)
         for (Object[] row : allRows) {

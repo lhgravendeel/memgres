@@ -212,14 +212,39 @@ public class Database {
     // Wait-for graph: maps a waiting session to the session it is waiting for (for deadlock detection)
     private final Map<Session, Session> waitingFor = new ConcurrentHashMap<>();
 
+    /** Monotonic acquisition counter so ROLLBACK TO SAVEPOINT can release only newer locks. */
+    private final AtomicLong rowLockSeq = new AtomicLong(0);
+
     /** A single row-lock entry recording the holding session and the requested lock mode. */
     public static class LockEntry {
         public final Session session;
         public final String mode; // "UPDATE", "NO KEY UPDATE", "SHARE", "KEY SHARE"
+        public final long seq;    // acquisition order, compared against savepoint marks
 
-        public LockEntry(Session session, String mode) {
+        public LockEntry(Session session, String mode, long seq) {
             this.session = session;
             this.mode = mode;
+            this.seq = seq;
+        }
+    }
+
+    /** The current acquisition mark; locks taken after it are released by ROLLBACK TO SAVEPOINT. */
+    public long currentRowLockMark() {
+        return rowLockSeq.get();
+    }
+
+    /**
+     * Release the session's row locks acquired after {@code mark}. PG rolls a subtransaction's
+     * row locks back with it, so a savepoint rollback frees whatever it took.
+     */
+    public void releaseRowLocksAfter(Session session, long mark) {
+        for (Map<Object[], List<LockEntry>> locks : rowLocks.values()) {
+            synchronized (locks) {
+                for (List<LockEntry> entries : locks.values()) {
+                    entries.removeIf(e -> e.session == session && e.seq > mark);
+                }
+                locks.entrySet().removeIf(e -> e.getValue().isEmpty());
+            }
         }
     }
 
@@ -261,24 +286,43 @@ public class Database {
      * Otherwise blocks until the lock can be acquired.
      */
     public void acquireTableLock(String tableKey, String mode, Session session, boolean nowait) {
+        long timeoutMs = session == null ? 5_000L
+                : GucSettings.parseTimeoutMillis(session.getGucSettings().get("lock_timeout"));
+        acquireTableLock(tableKey, mode, session, nowait, timeoutMs > 0 ? timeoutMs : 5_000L);
+    }
+
+    /**
+     * Acquire a table-level lock, waiting at most {@code timeoutMs} for a conflicting holder
+     * to go away. A session that already holds this mode on the relation keeps its single
+     * entry rather than stacking one per statement.
+     */
+    public void acquireTableLock(String tableKey, String mode, Session session, boolean nowait, long timeoutMs) {
+        final long deadline = System.currentTimeMillis() + timeoutMs;
         synchronized (tableLockMonitor) {
             while (true) {
                 List<TableLockEntry> entries = tableLevelLocks.computeIfAbsent(tableKey, k -> new java.util.concurrent.CopyOnWriteArrayList<>());
                 boolean conflict = false;
+                boolean alreadyHeld = false;
                 for (TableLockEntry e : entries) {
-                    if (e.session != session && !tableLockModesCompatible(e.mode, mode)) {
+                    if (e.session == session) {
+                        if (mode.equals(e.mode)) alreadyHeld = true;
+                    } else if (!tableLockModesCompatible(e.mode, mode)) {
                         conflict = true;
                         break;
                     }
                 }
                 if (!conflict) {
-                    entries.add(new TableLockEntry(session, mode));
+                    if (!alreadyHeld) entries.add(new TableLockEntry(session, mode));
                     return;
                 }
                 if (nowait) {
                     throw new MemgresException("could not obtain lock on relation", "55P03");
                 }
-                try { tableLockMonitor.wait(5000); } catch (InterruptedException e) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    throw new MemgresException("canceling statement due to lock timeout", "55P03");
+                }
+                try { tableLockMonitor.wait(Math.min(remaining, 50L)); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new MemgresException("lock wait interrupted", "57014");
                 }
@@ -1836,7 +1880,7 @@ public class Database {
                 entries = new ArrayList<>();
                 locks.put(row, entries);
             }
-            entries.add(new LockEntry(session, mode));
+            entries.add(new LockEntry(session, mode, rowLockSeq.incrementAndGet()));
             return true;
         }
     }
@@ -1913,7 +1957,7 @@ public class Database {
                         locks.put(row, entries);
                     }
                     entries.removeIf(e -> e.session == session);
-                    entries.add(new LockEntry(session, mode));
+                    entries.add(new LockEntry(session, mode, rowLockSeq.incrementAndGet()));
                     waitingFor.remove(session); // no longer waiting
                     return;
                 }
@@ -1977,6 +2021,31 @@ public class Database {
      * allowing two workers to claim the same logical job.  This method detects that
      * situation so the SKIP LOCKED loop can skip the row instead.
      */
+    /**
+     * When another session holds an uncommitted UPDATE on a row, this session's snapshot binds
+     * the old-values copy rather than the live array. Row locks are keyed by the live row's
+     * identity, so resolve the copy back before locking; otherwise a FOR UPDATE against a row
+     * someone else is updating locks a private copy and sees no conflict.
+     */
+    public Object[] liveRowForSnapshotCopy(Object[] row, Session currentSession) {
+        for (Session other : activeSessions) {
+            if (other == currentSession) continue;
+            if (!other.isInTransaction()) continue;
+            try {
+                for (Map<Object[], Object[]> tableUpdates : other.getAllUncommittedUpdates().values()) {
+                    synchronized (tableUpdates) {
+                        for (Map.Entry<Object[], Object[]> e : tableUpdates.entrySet()) {
+                            if (e.getValue() == row) return e.getKey();
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // A concurrent commit cleared the map; the caller's own row is then correct
+            }
+        }
+        return row;
+    }
+
     public boolean isRowBeingUpdatedByOtherSession(Object[] row, Session currentSession) {
         for (Session other : activeSessions) {
             if (other == currentSession) continue;

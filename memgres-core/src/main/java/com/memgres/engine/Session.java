@@ -171,7 +171,14 @@ public class Session {
     public void incrementCommandId() { commandId++; }
     /** Reset virtual transaction ID after autocommit statement completes. */
     public void resetAutocommitTxId() {
-        if (status == TransactionStatus.IDLE) { transactionId = 0; commandId = 0; }
+        if (status == TransactionStatus.IDLE) {
+            transactionId = 0;
+            commandId = 0;
+            // An autocommit statement's transaction ends here, so its locks end with it —
+            // PG never leaves a FOR UPDATE or relation lock behind after an implicit commit.
+            database.unlockAllRows(this);
+            database.releaseTableLocks(this);
+        }
     }
 
     /** Stored prepared statement. inferredParamCount is the max $N index found in body when no explicit types are given. */
@@ -658,6 +665,9 @@ public class Session {
         deferredNotifications.clear();
         savepointNotifCounts.clear();
         savepointMvccSnapshots.clear();
+        savepointLockMarks.clear();
+        savepointSessionGucs.clear();
+        savepointLocalGucs.clear();
         // Drop temp tables with ON COMMIT DROP
         for (String[] pair : onCommitDropTables) {
             Schema s = database.getSchema(pair[0]);
@@ -720,6 +730,9 @@ public class Session {
         deferredNotifications.clear();
         savepointNotifCounts.clear();
         savepointMvccSnapshots.clear();
+        savepointLockMarks.clear();
+        savepointSessionGucs.clear();
+        savepointLocalGucs.clear();
         onCommitDropTables.clear();
         // Release transaction-scoped advisory locks
         releaseXactAdvisoryLocks();
@@ -775,9 +788,13 @@ public class Session {
         deferredNotifications.clear();
         savepointNotifCounts.clear();
         savepointMvccSnapshots.clear();
+        savepointLockMarks.clear();
+        savepointSessionGucs.clear();
+        savepointLocalGucs.clear();
         onCommitDropTables.clear();
         releaseXactAdvisoryLocks();
         database.unlockAllRows(this);
+        releaseTableLocks();
         destroyNonHoldableCursors();
         transactionTimestamp = null;
         explicitTransactionBlock = false;
@@ -812,6 +829,12 @@ public class Session {
     // MVCC map snapshots per savepoint — used to restore MVCC state on ROLLBACK TO SAVEPOINT
     private final Map<String, MvccSnapshot> savepointMvccSnapshots = new LinkedHashMap<>();
 
+    // Row-lock acquisition marks and GUC snapshots per savepoint: PG rolls both back with
+    // the subtransaction, so locks taken and SETs issued after the savepoint must be undone.
+    private final Map<String, Long> savepointLockMarks = new LinkedHashMap<>();
+    private final Map<String, Map<String, String>> savepointSessionGucs = new LinkedHashMap<>();
+    private final Map<String, Map<String, String>> savepointLocalGucs = new LinkedHashMap<>();
+
     public void savepoint(String name) {
         if (status != TransactionStatus.IN_TRANSACTION) {
             // Implicit BEGIN
@@ -820,6 +843,9 @@ public class Session {
         String key = name.toLowerCase();
         savepoints.put(key, undoLog.size());
         savepointNotifCounts.put(key, deferredNotifications.size());
+        savepointLockMarks.put(key, database.currentRowLockMark());
+        savepointSessionGucs.put(key, getGucSettings().snapshotSessionOverrides());
+        savepointLocalGucs.put(key, getGucSettings().snapshotTransactionOverrides());
         // Snapshot current MVCC maps so we can restore on ROLLBACK TO SAVEPOINT.
         // Deep-copy the outer maps; inner collections are identity-based.
         savepointMvccSnapshots.put(key, MvccSnapshot.capture(uncommittedInserts, uncommittedUpdates, uncommittedDeletes));
@@ -876,6 +902,9 @@ public class Session {
             throw new MemgresException("savepoint \"" + name + "\" does not exist", "3B001");
         }
         savepoints.remove(key);
+        savepointLockMarks.remove(key);
+        savepointSessionGucs.remove(key);
+        savepointLocalGucs.remove(key);
     }
 
     public void rollbackToSavepoint(String name) {
@@ -901,6 +930,20 @@ public class Session {
 
         applyUndo(position);
 
+        // Row locks and GUC values set after the savepoint go away with the subtransaction
+        Long lockMark = savepointLockMarks.get(key);
+        if (lockMark != null) {
+            database.releaseRowLocksAfter(this, lockMark);
+        }
+        Map<String, String> sessionGucs = savepointSessionGucs.get(key);
+        if (sessionGucs != null) {
+            getGucSettings().restoreSessionOverrides(sessionGucs);
+        }
+        Map<String, String> localGucs = savepointLocalGucs.get(key);
+        if (localGucs != null) {
+            getGucSettings().restoreTransactionOverrides(localGucs);
+        }
+
         // Truncate deferred notifications to the savepoint's count
         Integer notifCount = savepointNotifCounts.get(key);
         if (notifCount != null && notifCount < deferredNotifications.size()) {
@@ -922,6 +965,9 @@ public class Session {
             savepoints.remove(sp);
             savepointNotifCounts.remove(sp);
             savepointMvccSnapshots.remove(sp);
+            savepointLockMarks.remove(sp);
+            savepointSessionGucs.remove(sp);
+            savepointLocalGucs.remove(sp);
         }
 
         // Transaction is no longer in FAILED state after rolling back to savepoint
@@ -1450,6 +1496,15 @@ public class Session {
     public void clearRRSnapshotForTable(String schemaTable) {
         List<Object[]> snapshot = rrSnapshots.get(schemaTable);
         if (snapshot != null) snapshot.clear();
+    }
+
+    /**
+     * Drop the RR snapshot for a table this session just reshaped with DDL. The snapshot rows
+     * still have the old column count, so reading them after ALTER TABLE would index past their
+     * end; PG simply shows the session its own DDL.
+     */
+    public void discardRRSnapshotForTable(String schemaTable) {
+        rrSnapshots.remove(schemaTable);
     }
 
     /**

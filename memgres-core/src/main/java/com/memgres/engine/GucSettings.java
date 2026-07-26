@@ -172,6 +172,17 @@ public class GucSettings {
         transactionOverrides.clear();
     }
 
+    /** Snapshot both override layers so ROLLBACK TO SAVEPOINT can undo SET / SET LOCAL. */
+    public Map<String, String> snapshotTransactionOverrides() {
+        return new LinkedHashMap<>(transactionOverrides);
+    }
+
+    /** Restore the transaction-scoped overrides captured by {@link #snapshotTransactionOverrides()}. */
+    public void restoreTransactionOverrides(Map<String, String> snapshot) {
+        transactionOverrides.clear();
+        transactionOverrides.putAll(snapshot);
+    }
+
     /** Reset a single parameter to default. */
     public void reset(String name) {
         String key = name.toLowerCase();

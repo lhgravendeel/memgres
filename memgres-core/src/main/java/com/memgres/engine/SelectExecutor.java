@@ -456,19 +456,20 @@ class SelectExecutor {
             contexts = deduped;
         }
 
-        // Row-level locking
-        String lockTableName = null;
+        // Row-level locking. Every base relation in the FROM tree is a lock target, or just
+        // the ones named by FOR UPDATE OF; a join is not an excuse to lock nothing.
+        Set<String> lockTargets = null;
         if (stmt.lockClause() != null && executor.session != null && stmt.from() != null) {
-            for (SelectStmt.FromItem fi : stmt.from()) {
-                if (fi instanceof SelectStmt.TableRef) {
-                    SelectStmt.TableRef tr = (SelectStmt.TableRef) fi;
-                    lockTableName = tr.table();
-                    break;
-                }
+            lockTargets = new LinkedHashSet<>();
+            if (!stmt.lockClause().ofTables().isEmpty()) {
+                for (String of : stmt.lockClause().ofTables()) lockTargets.add(of.toLowerCase());
+            } else {
+                for (SelectStmt.FromItem fi : stmt.from()) collectLockTargets(fi, lockTargets);
             }
+            if (lockTargets.isEmpty()) lockTargets = null;
         }
-        if (lockTableName != null && stmt.lockClause() != null && stmt.lockClause().skipLocked()) {
-            final String tName = lockTableName;
+        if (lockTargets != null && stmt.lockClause() != null && stmt.lockClause().skipLocked()) {
+            final Set<String> targets = lockTargets;
             int effectiveLimit = Integer.MAX_VALUE;
             int effectiveOffset = 0;
             if (stmt.offset() != null) {
@@ -486,7 +487,8 @@ class SelectExecutor {
                 boolean lockable = true;
                 RowContext.TableBinding lockedBinding = null;
                 for (RowContext.TableBinding b : ctx.getBindings()) {
-                    if (b.table().getName().equalsIgnoreCase(tName)) {
+                    if (isLockTarget(b, targets)) {
+                        String tName = b.table().getName();
                         if (executor.database.isRowBeingUpdatedByOtherSession(b.row(), executor.session)) {
                             lockable = false;
                             break;
@@ -507,7 +509,7 @@ class SelectExecutor {
                     RowContext freshCtx = new RowContext(lockedBinding.table(),
                             lockedBinding.alias(), lockedBinding.row());
                     if (!executor.isTruthy(executor.evalExpr(stmt.where(), freshCtx))) {
-                        executor.database.unlockRow(tName, lockedBinding.row());
+                        executor.database.unlockRow(lockedBinding.table().getName(), lockedBinding.row());
                         lockable = false;
                     }
                 }
@@ -519,26 +521,21 @@ class SelectExecutor {
             contexts = filtered;
         }
 
-        if (lockTableName != null && stmt.lockClause() != null && !stmt.lockClause().skipLocked()) {
-            final String tName = lockTableName;
+        if (lockTargets != null && stmt.lockClause() != null && !stmt.lockClause().skipLocked()) {
+            final Set<String> targets = lockTargets;
             SelectStmt.LockClause lc = stmt.lockClause();
             final String lockMode = lc.mode();
-            if (lc.nowait()) {
-                for (RowContext ctx : contexts) {
-                    for (RowContext.TableBinding b : ctx.getBindings()) {
-                        if (b.table().getName().equalsIgnoreCase(tName)) {
-                            if (!executor.database.tryLockRow(tName, b.row(), executor.session, lockMode)) {
-                                throw new MemgresException("could not obtain lock on row in relation \"" + tName + "\"", "55P03");
-                            }
+            for (RowContext ctx : contexts) {
+                for (RowContext.TableBinding b : ctx.getBindings()) {
+                    if (!isLockTarget(b, targets)) continue;
+                    String tName = b.table().getName();
+                    Object[] lockRow = executor.database.liveRowForSnapshotCopy(b.row(), executor.session);
+                    if (lc.nowait()) {
+                        if (!executor.database.tryLockRow(tName, lockRow, executor.session, lockMode)) {
+                            throw new MemgresException("could not obtain lock on row in relation \"" + tName + "\"", "55P03");
                         }
-                    }
-                }
-            } else {
-                for (RowContext ctx : contexts) {
-                    for (RowContext.TableBinding b : ctx.getBindings()) {
-                        if (b.table().getName().equalsIgnoreCase(tName)) {
-                            executor.database.lockRowWaiting(tName, b.row(), executor.session, lockMode);
-                        }
+                    } else {
+                        executor.database.lockRowWaiting(tName, lockRow, executor.session, lockMode);
                     }
                 }
             }
@@ -1501,4 +1498,28 @@ class SelectExecutor {
         if (val instanceof Number) return java.math.BigDecimal.valueOf(((Number) val).doubleValue());
         return new java.math.BigDecimal(val.toString());
     }
+
+    /**
+     * Collect every base relation name and alias reachable from a FROM item, so that a plain
+     * FOR UPDATE over a join locks both sides rather than nothing.
+     */
+    private static void collectLockTargets(SelectStmt.FromItem fi, Set<String> out) {
+        if (fi instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef tr = (SelectStmt.TableRef) fi;
+            out.add(tr.table().toLowerCase());
+            if (tr.alias() != null) out.add(tr.alias().toLowerCase());
+        } else if (fi instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) fi;
+            if (jf.left() != null) collectLockTargets(jf.left(), out);
+            if (jf.right() != null) collectLockTargets(jf.right(), out);
+        }
+        // Subqueries and set-returning functions have no lockable base rows of their own
+    }
+
+    /** True when this row binding belongs to one of the FOR UPDATE lock targets. */
+    private static boolean isLockTarget(RowContext.TableBinding b, Set<String> targets) {
+        if (b.alias() != null && targets.contains(b.alias().toLowerCase())) return true;
+        return b.table() != null && targets.contains(b.table().getName().toLowerCase());
+    }
+
 }

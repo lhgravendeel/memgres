@@ -114,16 +114,25 @@ public final class SelectStmt implements Statement {
         public final String mode;
         public final boolean nowait;
         public final boolean skipLocked;
+        /** FOR UPDATE OF a, b — the table names or aliases to lock; empty means every FROM relation. */
+        public final List<String> ofTables;
 
         public LockClause(String mode, boolean nowait, boolean skipLocked) {
+            this(mode, nowait, skipLocked, java.util.Collections.<String>emptyList());
+        }
+
+        public LockClause(String mode, boolean nowait, boolean skipLocked, List<String> ofTables) {
             this.mode = mode;
             this.nowait = nowait;
             this.skipLocked = skipLocked;
+            this.ofTables = ofTables == null ? java.util.Collections.<String>emptyList()
+                    : java.util.Collections.unmodifiableList(new java.util.ArrayList<>(ofTables));
         }
 
         public String mode() { return mode; }
         public boolean nowait() { return nowait; }
         public boolean skipLocked() { return skipLocked; }
+        public List<String> ofTables() { return ofTables; }
 
         @Override
         public boolean equals(Object o) {
@@ -132,17 +141,19 @@ public final class SelectStmt implements Statement {
             LockClause that = (LockClause) o;
             return java.util.Objects.equals(mode, that.mode)
                 && nowait == that.nowait
-                && skipLocked == that.skipLocked;
+                && skipLocked == that.skipLocked
+                && java.util.Objects.equals(ofTables, that.ofTables);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(mode, nowait, skipLocked);
+            return java.util.Objects.hash(mode, nowait, skipLocked, ofTables);
         }
 
         @Override
         public String toString() {
-            return "LockClause[mode=" + mode + ", " + "nowait=" + nowait + ", " + "skipLocked=" + skipLocked + "]";
+            return "LockClause[mode=" + mode + ", " + "nowait=" + nowait + ", " + "skipLocked=" + skipLocked
+                    + ", of=" + ofTables + "]";
         }
     }
 

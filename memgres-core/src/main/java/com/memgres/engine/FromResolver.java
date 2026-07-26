@@ -456,6 +456,12 @@ class FromResolver {
         Table table = executor.resolveTable(schemaName, tableRef.table(), userQualified);
         // C6: Enforce SELECT privilege on user tables
         executor.checkTablePrivilege("SELECT", schemaName, tableRef.table());
+        // A reader inside an explicit transaction holds ACCESS SHARE until it ends, which is
+        // what makes a concurrent TRUNCATE or ALTER wait instead of yanking the table away.
+        if (executor.session != null && executor.session.isInTransaction()) {
+            executor.database.acquireTableLock(schemaName + "." + tableRef.table(),
+                    "AccessShareLock", executor.session, false);
+        }
         String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
         lastResolvedRightTable = table;
         lastResolvedRightAlias = alias;
