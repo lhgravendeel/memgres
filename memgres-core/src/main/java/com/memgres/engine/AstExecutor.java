@@ -62,6 +62,19 @@ public class AstExecutor {
     // Used to map a positional INSERT through a reordered/renamed/subset view onto the base table.
     // Null when the view target list has any non-simple-column expression (e.g. SELECT *).
     List<String> lastViewColumnOrder = null;
+
+    /**
+     * View columns whose target is an expression rather than a plain column reference.
+     * PG allows such a view to be updatable but rejects assigning to those columns with
+     * 0A000 ("cannot update column ... of view ...").
+     */
+    Set<String> lastViewExpressionColumns = null;
+
+    /**
+     * The phrase PG uses when refusing DML on a non-updatable view: "insert into",
+     * "update" or "delete from". Set by the DML executor before it resolves the target.
+     */
+    String viewDmlVerb = "insert into";
     // When true, column references with no context throw instead of returning column name as string
     private boolean strictColumnRefs = false;
 
@@ -643,6 +656,7 @@ public class AstExecutor {
     Table resolveTable(String schemaName, String tableName, boolean userQualified) {
         lastViewColumnMapping = null; // reset before each resolution
         lastViewColumnOrder = null;
+        lastViewExpressionColumns = null;
         String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
         // Resolve pg_temp alias to the actual session temp schema
         if ("pg_temp".equalsIgnoreCase(schemaName)) {
@@ -707,7 +721,7 @@ public class AstExecutor {
                 // Create a virtual table from the view's column definitions
                 return buildVirtualTableForView(view, tableName);
             }
-            throw new MemgresException("cannot insert into view \"" + tableName + "\"", "55000");
+            throw new MemgresException("cannot " + viewDmlVerb + " view \"" + tableName + "\"", "55000");
         }
         // Sequences are queryable as relations in PG (columns: last_value, log_cnt, is_called)
         Table seqTable = resolveSequenceAsRelation(schemaName, tableName);
@@ -762,9 +776,11 @@ public class AstExecutor {
         // list (one entry per view-column position) used for positional INSERT remapping.
         lastViewColumnMapping = null;
         lastViewColumnOrder = null;
+        lastViewExpressionColumns = null;
         if (sel.targets() != null) {
             Map<String, String> mapping = new LinkedHashMap<>();
             List<String> order = new ArrayList<>();
+            Set<String> exprCols = new java.util.LinkedHashSet<>();
             boolean allSimpleColumns = true;
             for (SelectStmt.SelectTarget target : sel.targets()) {
                 String baseCol = null;
@@ -774,6 +790,7 @@ public class AstExecutor {
                 if (baseCol == null) {
                     // Non-column target (e.g. SELECT *, expression): positional remap not derivable.
                     allSimpleColumns = false;
+                    if (target.alias() != null) exprCols.add(target.alias().toLowerCase());
                 } else {
                     order.add(baseCol);
                 }
@@ -784,6 +801,7 @@ public class AstExecutor {
             }
             if (!mapping.isEmpty()) lastViewColumnMapping = mapping;
             if (allSimpleColumns && !order.isEmpty()) lastViewColumnOrder = order;
+            if (!exprCols.isEmpty()) lastViewExpressionColumns = exprCols;
         }
         return baseTable;
     }
@@ -805,18 +823,74 @@ public class AstExecutor {
             }
             return t;
         } catch (Exception e) {
-            throw new MemgresException("cannot insert into view \"" + viewName + "\"", "55000");
+            throw new MemgresException("cannot " + viewDmlVerb + " view \"" + viewName + "\"", "55000");
         }
     }
 
+    /**
+     * True if the expression contains an aggregate or window call anywhere inside it.
+     * PG's auto-updatability test looks at the whole target expression, not just a bare
+     * call: {@code sum(val)+1} and {@code row_number() OVER ()} both make a view
+     * read-only, so this has to walk every operand, not only function arguments.
+     */
     private boolean containsAggregate(Expression expr) {
+        if (expr == null) return false;
+        if (expr instanceof WindowFuncExpr) return true;
         if (expr instanceof FunctionCallExpr) {
-            String name = ((FunctionCallExpr) expr).name().toLowerCase();
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            String name = fn.name().toLowerCase();
             if (name.contains(".")) name = name.substring(name.lastIndexOf('.') + 1);
             if (SelectExecutor.AGGREGATE_FUNCTIONS.contains(name)) return true;
-            for (Expression arg : ((FunctionCallExpr) expr).args()) {
+            for (Expression arg : fn.args()) {
                 if (containsAggregate(arg)) return true;
             }
+            if (containsAggregate(fn.filter())) return true;
+            return false;
+        }
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr b = (BinaryExpr) expr;
+            return containsAggregate(b.left()) || containsAggregate(b.right());
+        }
+        if (expr instanceof UnaryExpr) return containsAggregate(((UnaryExpr) expr).operand());
+        if (expr instanceof CastExpr) return containsAggregate(((CastExpr) expr).expr());
+        if (expr instanceof CollateExpr) return containsAggregate(((CollateExpr) expr).expr());
+        if (expr instanceof IsNullExpr) return containsAggregate(((IsNullExpr) expr).expr());
+        if (expr instanceof IsBooleanExpr) return containsAggregate(((IsBooleanExpr) expr).expr());
+        if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr c = (CustomOperatorExpr) expr;
+            return containsAggregate(c.left()) || containsAggregate(c.right());
+        }
+        if (expr instanceof BetweenExpr) {
+            BetweenExpr b = (BetweenExpr) expr;
+            return containsAggregate(b.expr()) || containsAggregate(b.low()) || containsAggregate(b.high());
+        }
+        if (expr instanceof LikeExpr) {
+            LikeExpr l = (LikeExpr) expr;
+            return containsAggregate(l.left()) || containsAggregate(l.pattern());
+        }
+        if (expr instanceof InExpr) {
+            InExpr in = (InExpr) expr;
+            if (containsAggregate(in.expr())) return true;
+            if (in.values() != null) {
+                for (Expression v : in.values()) if (containsAggregate(v)) return true;
+            }
+            return false;
+        }
+        if (expr instanceof AnyAllArrayExpr) {
+            AnyAllArrayExpr a = (AnyAllArrayExpr) expr;
+            return containsAggregate(a.left()) || containsAggregate(a.array());
+        }
+        if (expr instanceof ArrayExpr) {
+            for (Expression e : ((ArrayExpr) expr).elements()) if (containsAggregate(e)) return true;
+            return false;
+        }
+        if (expr instanceof CaseExpr) {
+            CaseExpr c = (CaseExpr) expr;
+            if (containsAggregate(c.operand()) || containsAggregate(c.elseExpr())) return true;
+            for (CaseExpr.WhenClause w : c.whenClauses()) {
+                if (containsAggregate(w.condition()) || containsAggregate(w.result())) return true;
+            }
+            return false;
         }
         return false;
     }

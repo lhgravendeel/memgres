@@ -807,11 +807,12 @@ class DdlTableExecutor {
                 if (partitionParent != null) {
                     partitionParent.removePartition(droppedTable);
                 }
-                executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable));
+                executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable,
+                        executor.database.getTriggersForTable(schemaName, name)));
             }
             schema.removeTable(name);
-            // Remove triggers associated with this table
-            executor.database.removeTriggersForTable(name);
+            // Remove only this schema's triggers: a same-named table elsewhere keeps its own
+            executor.database.removeTriggersForTable(schemaName, name);
             // Drop implicit sequences owned by SERIAL/IDENTITY columns
             // Only drop sequences that were auto-created (SERIAL types or __identity__ defaults),
             // NOT independently-created sequences referenced via DEFAULT nextval(...)
