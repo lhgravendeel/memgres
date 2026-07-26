@@ -121,8 +121,8 @@ public class PgInterval implements Comparable<PgInterval> {
         // Try ISO 8601 duration format: P[nY][nM][nD][T[nH][nM][nS]]
         if (s.startsWith("P") || s.startsWith("p")) {
             Matcher iso = java.util.regex.Pattern.compile(
-                    "^[Pp](?:(\\d+)[Yy])?(?:(\\d+)[Mm])?(?:(\\d+)[Ww])?(?:(\\d+)[Dd])?" +
-                    "(?:[Tt](?:(\\d+)[Hh])?(?:(\\d+)[Mm])?(?:(\\d+(?:\\.\\d+)?)[Ss])?)?$"
+                    "^[Pp](?:(-?\\d+)[Yy])?(?:(-?\\d+)[Mm])?(?:(-?\\d+)[Ww])?(?:(-?\\d+)[Dd])?" +
+                    "(?:[Tt](?:(-?\\d+)[Hh])?(?:(-?\\d+)[Mm])?(?:(-?\\d+(?:\\.\\d+)?)[Ss])?)?$"
             ).matcher(s);
             if (iso.matches()) {
                 int years = iso.group(1) != null ? Integer.parseInt(iso.group(1)) : 0;
@@ -236,7 +236,108 @@ public class PgInterval implements Comparable<PgInterval> {
             // ignore
         }
 
+        PgInterval units = parseUnitList(s);
+        if (units != null) return units;
+
         throw new MemgresException("invalid input syntax for type interval: \"" + input + "\"", "22007");
+    }
+
+    /**
+     * PG's DecodeInterval reads a sequence of signed, possibly fractional quantities, each with
+     * its own unit, mixed freely with bare {@code HH:MM[:SS]} time fields. That grammar covers
+     * the shapes PG itself emits — {@code '-1 mons +3 days'}, {@code '1.5 years'} — as well as
+     * the extended unit names, so anything the earlier fixed-shape patterns miss lands here.
+     *
+     * @return the parsed interval, or null when the text is not a unit list at all
+     */
+    private static PgInterval parseUnitList(String s) {
+        Matcher tok = java.util.regex.Pattern.compile(
+                "\\G\\s*(?:([+-]?\\d+):(\\d+)(?::(\\d+(?:\\.\\d+)?))?"
+                + "|([+-]?\\d+(?:\\.\\d+)?)\\s*([A-Za-z]+)?"
+                + "|([A-Za-z]+))\\s*").matcher(s);
+        long months = 0;
+        long days = 0;
+        long micros = 0;
+        boolean matchedAny = false;
+        boolean ago = false;
+        int end = 0;
+        while (tok.find()) {
+            end = tok.end();
+            if (tok.group(1) != null) {
+                // A bare time field: the sign on the hours carries across the whole field
+                boolean neg = tok.group(1).startsWith("-");
+                long h = Math.abs(Long.parseLong(tok.group(1)));
+                long m = Long.parseLong(tok.group(2));
+                double sec = tok.group(3) != null ? Double.parseDouble(tok.group(3)) : 0;
+                long field = (h * 3600L + m * 60L) * 1_000_000L + Math.round(sec * 1_000_000L);
+                micros += neg ? -field : field;
+                matchedAny = true;
+                continue;
+            }
+            if (tok.group(6) != null) {
+                if (!"ago".equalsIgnoreCase(tok.group(6))) return null;
+                ago = true;
+                continue;
+            }
+            double value = Double.parseDouble(tok.group(4));
+            String unit = tok.group(5) == null ? "second" : normalizeUnit(tok.group(5));
+            if (unit == null) return null;
+            // Scale the larger units down to years first, so one fractional rule covers them all
+            if ("millennium".equals(unit)) { value *= 1000; unit = "year"; }
+            else if ("century".equals(unit)) { value *= 100; unit = "year"; }
+            else if ("decade".equals(unit)) { value *= 10; unit = "year"; }
+            long whole = (long) value;
+            double frac = value - whole;
+            switch (unit) {
+                case "year":
+                    // A fractional year spills into whole months, as PG does
+                    months += whole * 12 + Math.round(frac * 12);
+                    break;
+                case "month":
+                    months += whole;
+                    days += Math.round(frac * 30);
+                    break;
+                case "week":
+                    days += whole * 7;
+                    micros += Math.round(frac * 7 * 86_400_000_000L);
+                    break;
+                case "day":
+                    days += whole;
+                    micros += Math.round(frac * 86_400_000_000L);
+                    break;
+                case "hour":        micros += Math.round(value * 3_600_000_000L); break;
+                case "minute":      micros += Math.round(value * 60_000_000L); break;
+                case "second":      micros += Math.round(value * 1_000_000L); break;
+                case "millisecond": micros += Math.round(value * 1_000L); break;
+                case "microsecond": micros += Math.round(value); break;
+                default: return null;
+            }
+            matchedAny = true;
+        }
+        if (!matchedAny || end != s.length()) return null;
+        if (ago) return new PgInterval((int) -months, (int) -days, -micros);
+        return new PgInterval((int) months, (int) days, micros);
+    }
+
+    /** Map a PG interval unit word (any accepted abbreviation or plural) to its canonical name. */
+    private static String normalizeUnit(String raw) {
+        String u = raw.toLowerCase();
+        if (u.length() > 1 && u.endsWith("s")) u = u.substring(0, u.length() - 1);
+        switch (u) {
+            case "microsecond": case "usec": case "us": return "microsecond";
+            case "millisecond": case "msec": case "ms": return "millisecond";
+            case "second": case "sec": case "s": return "second";
+            case "minute": case "min": case "m": return "minute";
+            case "hour": case "hr": case "h": return "hour";
+            case "day": case "d": return "day";
+            case "week": case "w": return "week";
+            case "month": case "mon": return "month";
+            case "year": case "yr": case "y": return "year";
+            case "decade": case "dec": return "decade";
+            case "century": case "centurie": case "cent": return "century";
+            case "millennium": case "millennia": case "millenium": return "millennium";
+            default: return null;
+        }
     }
 
     @Override
@@ -301,9 +402,24 @@ public class PgInterval implements Comparable<PgInterval> {
         int years = months / 12;
         int mons = months % 12;
 
-        if (years != 0) sb.append(years).append(years == 1 ? " year " : " years ");
-        if (mons != 0) sb.append(mons).append(mons == 1 ? " mon " : " mons ");
-        if (days != 0) sb.append(days).append(days == 1 ? " day " : " days ");
+        // PG marks a positive field that follows a negative one with an explicit '+', which is
+        // what makes '-1 mons +3 days' the printed form -- and what has to read back in.
+        boolean sawNegative = false;
+        if (years != 0) {
+            if (sawNegative && years > 0) sb.append('+');
+            sb.append(years).append(years == 1 ? " year " : " years ");
+            sawNegative |= years < 0;
+        }
+        if (mons != 0) {
+            if (sawNegative && mons > 0) sb.append('+');
+            sb.append(mons).append(mons == 1 ? " mon " : " mons ");
+            sawNegative |= mons < 0;
+        }
+        if (days != 0) {
+            if (sawNegative && days > 0) sb.append('+');
+            sb.append(days).append(days == 1 ? " day " : " days ");
+            sawNegative |= days < 0;
+        }
 
         long absMicros = Math.abs(microseconds);
         if (absMicros > 0 || sb.length() == 0) {
@@ -313,6 +429,7 @@ public class PgInterval implements Comparable<PgInterval> {
             long mins = (totalSecs % 3600) / 60;
             long secs = totalSecs % 60;
             if (microseconds < 0) sb.append("-");
+            else if (sawNegative && microseconds > 0) sb.append("+");
             sb.append(String.format("%02d:%02d:%02d", hours, mins, secs));
             if (fracMicros > 0) {
                 sb.append(String.format(".%06d", fracMicros).replaceAll("0+$", ""));

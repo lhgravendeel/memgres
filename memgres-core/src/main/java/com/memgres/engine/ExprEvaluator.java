@@ -943,6 +943,9 @@ class ExprEvaluator {
                 if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val).negate();
                 if (val instanceof Double) return -((Double) val);
                 if (val instanceof Float) return -((Float) val);
+                // Negating an interval flips every field, not just the leading one
+                if (val instanceof PgInterval) return ((PgInterval) val).negate();
+                if (val instanceof PgMoney) return new PgMoney(((PgMoney) val).getValue().negate());
                 return val;
             }
             case POSITIVE:
