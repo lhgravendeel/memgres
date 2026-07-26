@@ -1561,12 +1561,12 @@ class SelectParser {
                 && !word.equals("OVER") && !word.equals("LATERAL");
     }
 
+    /**
+     * PG takes any value expression here, not only a literal, so a paginating query built with
+     * arithmetic ({@code LIMIT :size + 1}) parses the same way it does there.
+     */
     Expression parseLimitOffsetExpr() {
-        if (parser.match(TokenType.MINUS)) {
-            Expression inner = parser.parsePrimary();
-            return new UnaryExpr(UnaryExpr.UnaryOp.NEGATE, inner);
-        }
-        return parser.parsePrimary();
+        return parser.parseExpression();
     }
 
     SelectStmt parseTableCommand() {

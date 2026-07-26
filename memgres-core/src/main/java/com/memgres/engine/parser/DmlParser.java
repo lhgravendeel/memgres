@@ -228,19 +228,42 @@ class DmlParser {
             if (parser.match(TokenType.DOT)) {
                 subField = parser.readIdentifier();
             }
-            // Check for JSONB subscript update: col['key'] = value or col['k1']['k2'] = value
+            // Subscripted update: col['key'] = value, col[2] = value, or col[1:2] = value.
+            // A JSONB key and an array index look the same here; which one is meant depends on
+            // the column's declared type, which only the executor knows.
             List<String> subscriptKeys = null;
+            Expression sliceLower = null;
+            Expression sliceUpper = null;
+            boolean sawSlice = false;
             while (parser.check(TokenType.LEFT_BRACKET)) {
                 parser.advance(); // consume [
                 Token keyToken = parser.advance(); // consume key (string literal or integer)
                 String key = keyToken.value();
+                if (parser.check(TokenType.COLON)) {
+                    if (sawSlice) {
+                        throw new com.memgres.engine.MemgresException(
+                                "multi-dimensional slice assignment is not supported", "0A000");
+                    }
+                    parser.advance(); // consume :
+                    Token upperToken = parser.advance();
+                    sliceLower = Literal.ofInt(key);
+                    sliceUpper = Literal.ofInt(upperToken.value());
+                    sawSlice = true;
+                    parser.expect(TokenType.RIGHT_BRACKET);
+                    continue;
+                }
                 if (subscriptKeys == null) subscriptKeys = new ArrayList<>();
                 subscriptKeys.add(key);
                 parser.expect(TokenType.RIGHT_BRACKET);
             }
             parser.expect(TokenType.EQUALS);
             Expression val = parser.parseExpression();
-            if (subscriptKeys != null) {
+            if (sawSlice) {
+                Expression target = new ColumnRef(null, col);
+                Expression setExpr = new FunctionCallExpr("__array_assign_slice__",
+                        Cols.listOf(target, sliceLower, sliceUpper, val));
+                clauses.add(new InsertStmt.SetClause(col, setExpr, subField));
+            } else if (subscriptKeys != null) {
                 // Transform into jsonb_set call: jsonb_set(col, '{key}', value)
                 // Build the path array
                 StringBuilder pathArray = new StringBuilder("{");
@@ -264,7 +287,11 @@ class DmlParser {
                 } else {
                     jsonbVal = new FunctionCallExpr("to_jsonb", Cols.listOf(val));
                 }
-                Expression setExpr = new FunctionCallExpr("jsonb_set", Cols.listOf(colRef, pathExpr, jsonbVal));
+                // Which of the two this means is settled at run time, where the column's declared
+                // type is known: an array index assigns an element, anything else sets a JSON key.
+                Expression setExpr = new FunctionCallExpr("__subscript_assign__",
+                        Cols.listOf(colRef, pathExpr, jsonbVal, val,
+                                Literal.ofString(subscriptKeys.get(0))));
                 clauses.add(new InsertStmt.SetClause(col, setExpr, subField));
             } else {
                 clauses.add(new InsertStmt.SetClause(col, val, subField));
