@@ -346,6 +346,13 @@ class DdlAdminExecutor {
     }
 
     QueryResult executeNotify(NotifyStmt stmt) {
+        // The statement form is bounded the same way pg_notify is
+        if (stmt.channel() == null || stmt.channel().trim().isEmpty()) {
+            throw new MemgresException("channel name cannot be empty", "22023");
+        }
+        if (stmt.payload() != null && stmt.payload().length() >= 8000) {
+            throw new MemgresException("payload string too long", "22023");
+        }
         if (executor.session != null) {
             executor.session.queueNotification(stmt.channel(), stmt.payload());
         } else {
