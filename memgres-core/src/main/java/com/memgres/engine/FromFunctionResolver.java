@@ -75,6 +75,7 @@ class FromFunctionResolver {
         if (fname.equals("pg_available_extension_versions")) return resolvePgAvailableExtensionVersions(alias);
         if (fname.equals("pg_show_all_settings")) return resolvePgShowAllSettings(alias);
         if (fname.equals("unnest")) return resolveUnnest(alias, colAliases, evalArgs, funcFrom.withOrdinality());
+        if (fname.equals("_pg_expandarray")) return resolveExpandArray(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
             return resolveJsonEach(fname, alias, colAliases, evalArgs);
         if (fname.equals("jsonb_to_recordset") || fname.equals("json_to_recordset") || fname.equals("jsonb_to_record") || fname.equals("json_to_record"))
@@ -490,6 +491,30 @@ class FromFunctionResolver {
         meta.put("idle_in_transaction_session_timeout", new String[]{"Client Connection Defaults", "Sets idle-in-transaction timeout.", "user", "integer"});
         meta.put("is_superuser", new String[]{"Preset Options", "Shows whether the current user is a superuser.", "internal", "bool"});
         return meta;
+    }
+
+    /**
+     * information_schema._pg_expandarray(anyarray) pairs each element with its 1-based index.
+     * ORM-generated metadata SQL uses it to walk pg_index.indkey.
+     */
+    private List<RowContext> resolveExpandArray(String alias, List<String> colAliases, List<Object> evalArgs) {
+        if (evalArgs.isEmpty()) {
+            throw new MemgresException("function _pg_expandarray() does not exist"
+                    + "\n  Hint: No function matches the given name and argument types.", "42883");
+        }
+        String valueCol = (colAliases != null && !colAliases.isEmpty()) ? colAliases.get(0) : "x";
+        String indexCol = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "n";
+        Table virtualTable = new Table(alias, Cols.listOf(
+                new Column(valueCol, DataType.TEXT, true, false, null),
+                new Column(indexCol, DataType.INTEGER, true, false, null)));
+        List<RowContext> contexts = new ArrayList<>();
+        List<Object> elements = FunctionEvaluator.flattenArray(toElementList(evalArgs.get(0)));
+        for (int i = 0; i < elements.size(); i++) {
+            Object[] row = new Object[]{elements.get(i), i + 1};
+            virtualTable.insertRow(row);
+            contexts.add(new RowContext(virtualTable, alias, row));
+        }
+        return contexts;
     }
 
     // ---- unnest ----

@@ -292,8 +292,13 @@ class SelectWindowEvaluator {
         String winName = wf.windowName().toLowerCase();
         for (SelectStmt.WindowDef def : windowDefs) {
             if (def.name().equalsIgnoreCase(winName)) {
+                // OVER (w ROWS ...) refines the named window: whatever the call states wins,
+                // and the call's own FILTER / IGNORE NULLS must survive the substitution
                 return new WindowFuncExpr(wf.name(), wf.args(), wf.distinct(), wf.star(),
-                        def.partitionBy(), def.orderBy(), def.frame(), null);
+                        wf.partitionBy() != null ? wf.partitionBy() : def.partitionBy(),
+                        wf.orderBy() != null ? wf.orderBy() : def.orderBy(),
+                        wf.frame() != null ? wf.frame() : def.frame(),
+                        null, wf.ignoreNulls(), wf.fromLast(), wf.filter());
             }
         }
         throw new RuntimeException("Window \"" + wf.windowName() + "\" is not defined");

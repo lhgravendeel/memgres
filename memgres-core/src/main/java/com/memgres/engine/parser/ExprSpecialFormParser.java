@@ -339,6 +339,15 @@ class ExprSpecialFormParser {
         List<SelectStmt.OrderByItem> orderBy = null;
         WindowFuncExpr.FrameClause frame = null;
 
+        // OVER (w ...) refines an existing named window: the name comes first, and what
+        // follows adds to it -- most usefully a frame the named window did not specify
+        String baseWindow = null;
+        if (!ep.check(TokenType.RIGHT_PAREN)
+                && !ep.checkKeyword("PARTITION") && !ep.checkKeyword("ORDER")
+                && !ep.checkKeyword("ROWS") && !ep.checkKeyword("RANGE") && !ep.checkKeyword("GROUPS")) {
+            baseWindow = ep.readIdentifier();
+        }
+
         if (ep.matchKeywords("PARTITION", "BY")) {
             partitionBy = ep.parseExpressionList();
         }
@@ -350,7 +359,8 @@ class ExprSpecialFormParser {
         }
 
         ep.expect(TokenType.RIGHT_PAREN);
-        return new WindowFuncExpr(name, args, distinct, star, partitionBy, orderBy, frame, null, ignoreNulls, fromLast, filter);
+        return new WindowFuncExpr(name, args, distinct, star, partitionBy, orderBy, frame,
+                baseWindow, ignoreNulls, fromLast, filter);
     }
 
     WindowFuncExpr.FrameClause parseWindowFrame() {

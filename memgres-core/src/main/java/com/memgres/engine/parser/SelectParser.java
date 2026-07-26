@@ -72,6 +72,10 @@ class SelectParser {
             } else if (parser.check(TokenType.LEFT_PAREN)) {
                 parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
                 lastRightWasParenthesized = true;
+            } else if (parser.checkKeyword("VALUES")) {
+                // A bare VALUES list is a query in its own right, so it may be a set-op arm
+                right = parseValuesBody();
+                lastRightWasParenthesized = false;
             } else {
                 right = parser.parseSelect();
                 lastRightWasParenthesized = false;
@@ -129,6 +133,8 @@ class SelectParser {
                 parser.consumeTrailingParens(intersectExtraParens);
             } else if (parser.check(TokenType.LEFT_PAREN)) {
                 parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
+            } else if (parser.checkKeyword("VALUES")) {
+                right = parseValuesBody();
             } else {
                 right = parser.parseSelect();
             }
