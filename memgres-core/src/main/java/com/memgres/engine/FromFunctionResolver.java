@@ -852,6 +852,10 @@ class FromFunctionResolver {
         if (jsonVal != null && pathVal != null) {
             String json = jsonVal.toString().trim();
             String path = pathVal.toString().trim();
+            // The optional third argument binds $name references in the path
+            if (evalArgs.size() > 2 && evalArgs.get(2) != null) {
+                path = JsonFunctions.bindJsonPathVars(path, evalArgs.get(2).toString());
+            }
             List<String> stringResults = executor.functionEvaluator.evaluateJsonPathAll(json, path);
             for (String s : stringResults) {
                 String trimmed = s.trim();

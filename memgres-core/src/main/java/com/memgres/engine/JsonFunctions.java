@@ -116,8 +116,14 @@ class JsonFunctions {
                 Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
                 if (jsonVal == null || pathVal == null) return new ArrayList<>();
                 String path = pathVal.toString().trim();
-                if (!path.startsWith("$") && !path.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + path.substring(0, Math.min(3, path.length())) + "\" of jsonpath input", "42601");
+                if (fn.args().size() > 2) {
+                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
+                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                }
+                // The mode word is part of the path; check the shape after it
+                String bodyPath = stripJsonPathMode(path);
+                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
+                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
                 }
                 List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
                 return new ArrayList<>(results); // Return as List for SRF expansion
@@ -129,8 +135,14 @@ class JsonFunctions {
                 Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
                 if (jsonVal == null || pathVal == null) return null;
                 String path = pathVal.toString().trim();
-                if (!path.startsWith("$") && !path.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + path.substring(0, Math.min(3, path.length())) + "\" of jsonpath input", "42601");
+                if (fn.args().size() > 2) {
+                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
+                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                }
+                // The mode word is part of the path; check the shape after it
+                String bodyPath = stripJsonPathMode(path);
+                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
+                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
                 }
                 List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
                 StringBuilder sb = new StringBuilder("[");
@@ -147,8 +159,14 @@ class JsonFunctions {
                 Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
                 if (jsonVal == null || pathVal == null) return null;
                 String path = pathVal.toString().trim();
-                if (!path.startsWith("$") && !path.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + path.substring(0, Math.min(3, path.length())) + "\" of jsonpath input", "42601");
+                if (fn.args().size() > 2) {
+                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
+                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                }
+                // The mode word is part of the path; check the shape after it
+                String bodyPath = stripJsonPathMode(path);
+                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
+                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
                 }
                 List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
                 return results.isEmpty() ? null : results.get(0);
@@ -159,9 +177,15 @@ class JsonFunctions {
                 Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
                 if (jsonVal == null || pathVal == null) return null;
                 String path = pathVal.toString().trim();
+                if (fn.args().size() > 2) {
+                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
+                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                }
                 // Basic jsonpath validation: must start with $
-                if (!path.startsWith("$") && !path.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + path.substring(0, Math.min(3, path.length())) + "\" of jsonpath input", "42601");
+                // The mode word is part of the path; check the shape after it
+                String bodyPath = stripJsonPathMode(path);
+                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
+                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
                 }
                 return evaluateJsonPathExists(jsonVal.toString(), path);
             }
@@ -171,6 +195,10 @@ class JsonFunctions {
                 Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
                 if (jsonVal == null || pathVal == null) return null;
                 String path = pathVal.toString().trim();
+                if (fn.args().size() > 2) {
+                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
+                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                }
                 // Handle exists(...) syntax
                 if (path.startsWith("exists(") && path.endsWith(")")) {
                     String innerPath = path.substring(7, path.length() - 1).trim();
@@ -188,8 +216,10 @@ class JsonFunctions {
                     Boolean predResult = evaluateJsonPathPredicate(jsonVal.toString(), path);
                     return predResult;
                 }
-                if (!path.startsWith("$") && !path.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + path.substring(0, Math.min(3, path.length())) + "\" of jsonpath input", "42601");
+                // The mode word is part of the path; check the shape after it
+                String bodyPath = stripJsonPathMode(path);
+                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
+                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
                 }
                 Object result = evaluateJsonPath(jsonVal.toString(), path);
                 if (result == null) return null;
@@ -634,7 +664,104 @@ class JsonFunctions {
         return JsonOperations.extractKey(json, key);
     }
 
+    /**
+     * A jsonpath may open with a {@code strict} or {@code lax} mode word. lax is the default and
+     * the mode only changes how a missing step is reported, so the word is consumed here and the
+     * strictness recorded for the evaluator.
+     */
+    /**
+     * Bind {@code $name} references from the vars object PG takes as the third argument. The
+     * root {@code $} is never a variable, so only a {@code $} followed by an identifier binds.
+     */
+    static String bindJsonPathVars(String path, String varsJson) {
+        if (varsJson == null || varsJson.trim().isEmpty()) return path;
+        Map<String, String> vars = JsonOperations.parseObjectKeys(varsJson.trim());
+        if (vars.isEmpty()) return path;
+        StringBuilder sb = new StringBuilder(path.length());
+        for (int i = 0; i < path.length(); i++) {
+            char c = path.charAt(i);
+            if (c == '$' && i + 1 < path.length()
+                    && (Character.isLetter(path.charAt(i + 1)) || path.charAt(i + 1) == '_')) {
+                int j = i + 1;
+                while (j < path.length()
+                        && (Character.isLetterOrDigit(path.charAt(j)) || path.charAt(j) == '_')) j++;
+                String value = vars.get(path.substring(i + 1, j));
+                if (value != null) {
+                    sb.append(value.trim());
+                    i = j - 1;
+                    continue;
+                }
+            }
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    static String stripJsonPathMode(String path) {
+        String p = path.trim();
+        if (p.regionMatches(true, 0, "strict", 0, 6) && p.length() > 6
+                && Character.isWhitespace(p.charAt(6))) {
+            return p.substring(6).trim();
+        }
+        if (p.regionMatches(true, 0, "lax", 0, 3) && p.length() > 3
+                && Character.isWhitespace(p.charAt(3))) {
+            return p.substring(3).trim();
+        }
+        return p;
+    }
+
+    /** True when the path opens with the strict mode word. */
+    static boolean isStrictJsonPath(String path) {
+        String p = path.trim();
+        return p.regionMatches(true, 0, "strict", 0, 6) && p.length() > 6
+                && Character.isWhitespace(p.charAt(6));
+    }
+
+    /**
+     * Strict mode makes a step that finds nothing an error instead of an empty result, and
+     * refuses to auto-unwrap a scalar for an array accessor. Lax mode -- the default -- simply
+     * returns no rows, which is what the general evaluator does.
+     */
+    private List<String> evaluateStrictJsonPath(String json, String path) {
+        String rest = path.startsWith("$") ? path.substring(1) : path;
+        String node = json.trim();
+        int i = 0;
+        while (i < rest.length()) {
+            char c = rest.charAt(i);
+            if (c == '.') {
+                i++;
+                int start = i;
+                while (i < rest.length() && rest.charAt(i) != '.' && rest.charAt(i) != '[') i++;
+                String key = rest.substring(start, i);
+                if (key.isEmpty() || key.equals("*")) break;
+                String child = JsonOperations.extractKey(node, key);
+                if (child == null) {
+                    throw new MemgresException(
+                            "JSON object does not contain key \"" + key + "\"", "2203A");
+                }
+                node = child.trim();
+            } else if (c == '[') {
+                if (!node.startsWith("[")) {
+                    throw new MemgresException(
+                            "jsonpath wildcard array accessor can only be applied to an array", "2203A");
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+        // Everything the strict walk did not consume is handled by the general evaluator
+        return evaluateLaxJsonPath(json, path);
+    }
+
     List<String> evaluateJsonPathAll(String json, String path) {
+        boolean strict = isStrictJsonPath(path);
+        path = stripJsonPathMode(path);
+        if (strict) return evaluateStrictJsonPath(json, path);
+        return evaluateLaxJsonPath(json, path);
+    }
+
+    private List<String> evaluateLaxJsonPath(String json, String path) {
         // PG does not support recursive descent ($..key) — throw syntax error
         if (path.contains("..")) {
             throw new MemgresException("syntax error at or near \".\" of jsonpath input", "42601");
@@ -753,6 +880,9 @@ class JsonFunctions {
                         if (node.startsWith("[")) {
                             List<String> elems = JsonOperations.parseArrayElements(node);
                             for (String e : elems) next.add(e.trim());
+                        } else {
+                            // lax mode treats a non-array as a one-element array before indexing
+                            next.add(node);
                         }
                     }
                     current = next;
