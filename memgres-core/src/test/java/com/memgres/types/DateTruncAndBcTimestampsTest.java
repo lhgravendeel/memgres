@@ -166,6 +166,14 @@ class DateTruncAndBcTimestampsTest {
         assertEquals("infinity", expr("SELECT date_trunc('day', INTERVAL 'infinity')::text"));
     }
 
+    /** A BC date has to be a date, not text carrying a suffix, or it cannot be used. */
+    @Test
+    void aBcDateSupportsArithmeticAndOrdering() throws Exception {
+        assertEquals("366", expr("SELECT (DATE '0001-01-01' - DATE '0001-01-01 BC')::text"));
+        assertEquals("0044-03-16 BC", expr("SELECT (DATE '0044-03-15 BC' + 1)::text"));
+        assertEquals("t", expr("SELECT (DATE '0044-03-15 BC' < DATE '0043-01-01 BC')"));
+    }
+
     @Test
     void infinityComparesAsTheExtremeValueForDateAndTimestamp() throws Exception {
         assertEquals("t", expr("SELECT (TIMESTAMP 'infinity' > TIMESTAMP '2026-01-01')"));

@@ -204,3 +204,25 @@ SELECT (INTERVAL 'infinity' * 0);
 SELECT extract(epoch FROM INTERVAL 'infinity')::text AS a,
        justify_hours(INTERVAL 'infinity')::text AS b,
        date_trunc('day', INTERVAL 'infinity')::text AS c;
+
+-- ============================================================================
+-- 7. A BC date is a date, not text with a suffix
+-- ============================================================================
+
+-- begin-expected
+-- columns: a
+-- row: 366
+-- end-expected
+SELECT (DATE '0001-01-01' - DATE '0001-01-01 BC')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: 0044-03-16 BC
+-- end-expected
+SELECT (DATE '0044-03-15 BC' + 1)::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
+SELECT (DATE '0044-03-15 BC' < DATE '0043-01-01 BC') AS a;

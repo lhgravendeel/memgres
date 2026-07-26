@@ -955,12 +955,9 @@ public final class TypeCoercion {
             // Handle date infinity/negative infinity
             if (trimmed.equalsIgnoreCase("infinity")) return "infinity";
             if (trimmed.equalsIgnoreCase("-infinity")) return "-infinity";
-            if (trimmed.toUpperCase().endsWith(" BC")) {
-                // Parse the date part and return with BC suffix
-                String datePart = trimmed.substring(0, trimmed.length() - 3).trim();
-                LocalDate d = toLocalDate(datePart);
-                return d.toString() + " BC";
-            }
+            // A BC date is a real date with a proleptic year, not text carrying a suffix:
+            // keeping it typed is what lets it be compared and subtracted. The era marker
+            // comes back at render time, from formatIsoDate.
         }
         return toLocalDate(val);
     }
