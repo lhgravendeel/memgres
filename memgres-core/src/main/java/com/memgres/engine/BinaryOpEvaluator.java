@@ -275,6 +275,12 @@ class BinaryOpEvaluator {
                 }
                 return executor.numericOrIntervalMul(left, right);
             case DIVIDE: {
+                // interval / number scales every field; without this the interval coerces to 0
+                if (left instanceof PgInterval && right instanceof Number) {
+                    double divisor = ((Number) right).doubleValue();
+                    if (divisor == 0) throw new MemgresException("division by zero", "22012");
+                    return ((PgInterval) left).multiply(1.0 / divisor);
+                }
                 if (left instanceof String && right instanceof String
                         && GeometricOperations.isGeometricString(((String) left))) {
                     String rs = (String) right;
@@ -1470,6 +1476,12 @@ class BinaryOpEvaluator {
                 }
                 return executor.numericOrIntervalMul(left, right);
             case DIVIDE: {
+                // interval / number scales every field; without this the interval coerces to 0
+                if (left instanceof PgInterval && right instanceof Number) {
+                    double divisor = ((Number) right).doubleValue();
+                    if (divisor == 0) throw new MemgresException("division by zero", "22012");
+                    return ((PgInterval) left).multiply(1.0 / divisor);
+                }
                 if (left instanceof String && right instanceof String
                         && GeometricOperations.isGeometricString(((String) left))) {
                     String rs = (String) right;
