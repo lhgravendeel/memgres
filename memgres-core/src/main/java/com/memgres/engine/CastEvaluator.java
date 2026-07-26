@@ -777,6 +777,11 @@ class CastEvaluator {
                         if (!rcExists && executor.database.getSequence(lowerName) != null) rcExists = true;
                         if (!rcExists && executor.database.hasIndex(lowerName)) rcExists = true;
                         if (!rcExists && executor.database.hasView(lowerName)) rcExists = true;
+                        // pg_temp is implicitly on the search path ahead of public
+                        if (!rcExists && executor.session != null) {
+                            Schema tempSchema = executor.database.getSchema(executor.session.getTempSchemaName());
+                            if (tempSchema != null && tempSchema.getTable(lowerName) != null) rcExists = true;
+                        }
                     }
                 }
                 if (!rcExists) {

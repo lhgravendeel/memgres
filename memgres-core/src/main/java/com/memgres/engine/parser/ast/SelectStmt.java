@@ -240,10 +240,18 @@ public final class SelectStmt implements Statement {
      * A table reference: [ONLY] [schema.]table [AS alias]
      */
         public static final class TableRef implements FromItem {
-        public final String schema;
-        public final String table;
+        // schema/table are mutable so ALTER TABLE ... RENAME TO / SET SCHEMA can retarget the
+        // stored view ASTs that already reference this relation, the way PG's OIDs do.
+        public String schema;
+        public String table;
         public final String alias;
         public final boolean only;
+
+        /** Retarget this reference at the same relation under its new schema and name. */
+        public void retarget(String newSchema, String newTable) {
+            this.schema = newSchema;
+            this.table = newTable;
+        }
 
         public TableRef(String schema, String table, String alias, boolean only) {
             this.schema = schema;

@@ -78,7 +78,14 @@ class DdlObjectExecutor {
             }
             case RENAME_VALUE: {
                 int idx = existing.getLabels().indexOf(stmt.value());
-                if (idx >= 0) existing.getLabels().set(idx, stmt.newValue());
+                if (idx < 0) {
+                    throw new MemgresException("\"" + stmt.value() + "\" is not an existing enum label", "22023");
+                }
+                if (existing.getLabels().indexOf(stmt.newValue()) >= 0) {
+                    // Two labels with the same text would orphan every stored value of the old one
+                    throw new MemgresException("enum label \"" + stmt.newValue() + "\" already exists", "42710");
+                }
+                existing.getLabels().set(idx, stmt.newValue());
                 break;
             }
             case RENAME_TO: {

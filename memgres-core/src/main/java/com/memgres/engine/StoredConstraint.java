@@ -55,7 +55,7 @@ public class StoredConstraint {
     // they reference is renamed via ALTER TABLE ... RENAME COLUMN.
     private List<String> columns;
     private Expression checkExpr;
-    private final String referencesTable;
+    private String referencesTable;
     private String referencesSchema; // schema of the referenced table (null = resolve via search_path)
     private List<String> referencesColumns;
     private final FkAction onDelete;
@@ -112,6 +112,8 @@ public class StoredConstraint {
     public List<String> getColumns() { return columns; }
     public Expression getCheckExpr() { return checkExpr; }
     public String getReferencesTable() { return referencesTable; }
+    /** Follow the referenced relation through ALTER TABLE ... RENAME TO. */
+    public void setReferencesTable(String table) { this.referencesTable = table; }
     public String getReferencesSchema() { return referencesSchema; }
     public void setReferencesSchema(String schema) { this.referencesSchema = schema; }
     public List<String> getReferencesColumns() { return referencesColumns; }

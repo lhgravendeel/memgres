@@ -217,6 +217,28 @@ class CatalogSystemFunctions {
             }
             case "session_user":
                 return executor.sessionUser();
+            case "pg_my_temp_schema": {
+                // The OID of this session's temp namespace, or 0 when it has never made one
+                if (executor.session == null) return 0;
+                String tempSchema = executor.session.getTempSchemaName();
+                if (executor.database.getSchema(tempSchema) == null) return 0;
+                return executor.systemCatalog.getOid("ns:" + tempSchema);
+            }
+            case "pg_is_other_temp_schema": {
+                if (fn.args().isEmpty()) return false;
+                Object nsArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (nsArg == null) return null;
+                int nsOid = executor.toInt(nsArg);
+                if (nsOid == 0) return false;
+                String mine = executor.session != null ? executor.session.getTempSchemaName() : null;
+                for (Map.Entry<String, Integer> e : executor.systemCatalog.getOidMap().entrySet()) {
+                    if (e.getValue() == null || e.getValue() != nsOid) continue;
+                    if (!e.getKey().startsWith("ns:")) continue;
+                    String ns = e.getKey().substring(3);
+                    return ns.toLowerCase().startsWith("pg_temp") && !ns.equalsIgnoreCase(mine);
+                }
+                return false;
+            }
             case "pg_backend_pid":
                 if (executor.session != null) return executor.session.getPid();
                 try {

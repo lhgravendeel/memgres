@@ -1287,12 +1287,29 @@ class UtilityParser {
                 tokenValues.add(tok.value());
             }
         }
-        // Object type is everything except the last token, object name is the last
-        String objectType = tokenValues.size() > 1
-                ? String.join(" ", tokenValues.subList(0, tokenValues.size() - 1))
-                : "TABLE";
-        String objectName = !tokenValues.isEmpty()
-                ? tokenValues.get(tokenValues.size() - 1) : "";
+        // A function/aggregate argument list is not part of the name: COMMENT ON FUNCTION f(int)
+        int paren = tokenValues.indexOf("(");
+        if (paren > 0) tokenValues = new ArrayList<>(tokenValues.subList(0, paren));
+        String objectType;
+        String objectName;
+        // CONSTRAINT c ON t / TRIGGER t ON r / RULE r ON t / POLICY p ON t name the object
+        // relative to a relation, so key them as "<relation>.<object>"
+        int onIdx = -1;
+        for (int i = 0; i < tokenValues.size(); i++) {
+            if ("ON".equalsIgnoreCase(tokenValues.get(i))) { onIdx = i; break; }
+        }
+        if (onIdx == 2 && tokenValues.size() == 4) {
+            objectType = tokenValues.get(0);
+            String relation = tokenValues.get(3);
+            if (relation.contains(".")) relation = relation.substring(relation.lastIndexOf('.') + 1);
+            objectName = relation + "." + tokenValues.get(1);
+        } else {
+            objectType = tokenValues.size() > 1
+                    ? String.join(" ", tokenValues.subList(0, tokenValues.size() - 1))
+                    : "TABLE";
+            objectName = !tokenValues.isEmpty()
+                    ? tokenValues.get(tokenValues.size() - 1) : "";
+        }
         parser.expectKeyword("IS");
         String comment = null;
         if (parser.matchKeyword("NULL")) {

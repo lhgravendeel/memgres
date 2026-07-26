@@ -59,11 +59,18 @@ class DdlViewExecutor {
         String viewSchema = executor.defaultSchema();
 
         // PG expands SELECT * when the view is defined, freezing the column list.
+        // (A view over a temp table becomes temporary itself — see below.)
         // Adding a column to a base table later must not change the view's output.
         Statement query = expandWildcardTargets(stmt.query());
 
         // Apply the optional column alias list: CREATE [MATERIALIZED] VIEW v(a, b) AS ...
         query = applyColumnAliasList(stmt, query);
+
+        // "view will be a temporary view": a view whose query reads a temp table cannot outlive
+        // the session, so PG puts it in the temp namespace instead of leaving a dangling view.
+        if (referencesTempTable(query)) {
+            viewSchema = executor.session != null ? executor.session.getTempSchemaName() : viewSchema;
+        }
 
         int rowCount = 0;
         if (stmt.materialized()) {
@@ -260,6 +267,17 @@ class DdlViewExecutor {
     }
 
     // ---- Column alias list: CREATE VIEW v(a, b) AS ... ----
+
+    /** True when the view query reads a table that lives in this session's temp namespace. */
+    private boolean referencesTempTable(Statement query) {
+        if (executor.session == null) return false;
+        Schema temp = executor.database.getSchema(executor.session.getTempSchemaName());
+        if (temp == null || temp.getTables().isEmpty()) return false;
+        for (String tableName : temp.getTables().keySet()) {
+            if (AstRelationRenamer.referencesRelation(query, null, tableName)) return true;
+        }
+        return false;
+    }
 
     private Statement applyColumnAliasList(CreateViewStmt stmt, Statement query) {
         List<String> names = stmt.columnNames();

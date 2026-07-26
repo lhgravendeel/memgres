@@ -190,7 +190,7 @@ class CatalogCoreBuilder {
                         tblOid,          // relfilenode
                         0,               // reltablespace
                         0, database.getAnalyzedTables().contains(schemaEntry.getKey() + "." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, 0, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
-                        hasIdx, false, t.isUnlogged() ? "u" : "p", relkind,          // relhasindex, relisshared, relpersistence, relkind
+                        hasIdx, false, relPersistence(schemaEntry.getKey(), t.isUnlogged()), relkind, // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
                         false, hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
                         false,              // relhasoids
@@ -224,7 +224,7 @@ class CatalogCoreBuilder {
                     vOid, vd.name(), oids.oid("ns:" + vSchema),
                     0, 0, viewOwnerOid, 0, vOid, 0,
                     0, 0.0, 0, 0, 0,
-                    false, false, "p", vd.materialized() ? "m" : "v",
+                    false, false, relPersistence(vSchema, false), vd.materialized() ? "m" : "v",
                     (short) (vd.cachedColumns() != null ? vd.cachedColumns().size() : 0), (short) 0,
                     true, false, false, false, false,
                     false, // relhasoids
@@ -1943,4 +1943,11 @@ class CatalogCoreBuilder {
         }
         return 0;
     }
+
+    /** PG marks anything in a pg_temp namespace as temporary, ahead of unlogged. */
+    private static String relPersistence(String schemaName, boolean unlogged) {
+        if (schemaName != null && schemaName.toLowerCase().startsWith("pg_temp")) return "t";
+        return unlogged ? "u" : "p";
+    }
+
 }
