@@ -764,6 +764,15 @@ class CastEvaluator {
                     return val;
                 }
                 String relName = val.toString().trim();
+                // An all-digit string is an OID written out, which PG takes verbatim without
+                // looking anything up -- that is how a catalog dump round-trips a regclass
+                if (relName.matches("\\d+")) {
+                    try {
+                        return new RegclassValue(Integer.parseInt(relName), relName);
+                    } catch (NumberFormatException ignored) {
+                        // too large for an int: fall through to name resolution
+                    }
+                }
                 String schemaPrefix = null;
                 if (relName.contains(".")) {
                     int dotIdx = relName.lastIndexOf('.');
@@ -811,6 +820,9 @@ class CastEvaluator {
                         if (!rcExists && executor.database.getSequence(lowerName) != null) rcExists = true;
                         if (!rcExists && executor.database.hasIndex(lowerName)) rcExists = true;
                         if (!rcExists && executor.database.hasView(lowerName)) rcExists = true;
+                        // A primary-key or unique index is stored as a constraint, not an index,
+                        // but it is still a relation with a name
+                        if (!rcExists && isConstraintBackedIndex(lowerName)) rcExists = true;
                         // pg_temp is implicitly on the search path ahead of public
                         if (!rcExists && executor.session != null) {
                             Schema tempSchema = executor.database.getSchema(executor.session.getTempSchemaName());
@@ -1124,6 +1136,8 @@ class CastEvaluator {
      * Input can be "schema.table" or just "table".
      */
     private String formatRegclassDisplay(String qualifiedName) {
+        // An all-digit regclass is an OID rather than an identifier, and prints bare
+        if (qualifiedName.matches("\\d+")) return qualifiedName;
         if (!qualifiedName.contains(".")) return quoteIdentIfNeeded(qualifiedName);
         int dotIdx = qualifiedName.indexOf('.');
         String schema = qualifiedName.substring(0, dotIdx);
@@ -1281,4 +1295,17 @@ class CastEvaluator {
         }
         return sb.toString();
     }
+
+    /** True when the name belongs to an index PG materialises from a constraint. */
+    private boolean isConstraintBackedIndex(String lowerName) {
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table t : schema.getTables().values()) {
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getName() != null && sc.getName().equalsIgnoreCase(lowerName)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
 }
