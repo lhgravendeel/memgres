@@ -224,8 +224,11 @@ class CastEvaluator {
                         // Do not trim: quoted elements may carry significant leading/trailing
                         // whitespace (already normalized by the parser above for unquoted ones).
                         String elemStr = elem instanceof String ? (String) elem : elem.toString();
-                        // If the element is itself a sub-array literal (e.g., "{1,2}"), cast as elemType[]
-                        if (elemStr.startsWith("{") && elemStr.endsWith("}") && elem instanceof String) {
+                        // If the element is itself a sub-array literal (e.g., "{1,2}"), cast as
+                        // elemType[] -- but for json/jsonb, braces open an object, not an array
+                        boolean jsonElement = elemType.equals("json") || elemType.equals("jsonb");
+                        if (!jsonElement && elemStr.startsWith("{") && elemStr.endsWith("}")
+                                && elem instanceof String) {
                             castList.add(applyCast(elemStr, elemType + "[]"));
                         } else {
                             castList.add(applyCast(elem instanceof String ? elemStr : elem, elemType));
