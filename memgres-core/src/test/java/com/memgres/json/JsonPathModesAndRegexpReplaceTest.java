@@ -119,6 +119,17 @@ class JsonPathModesAndRegexpReplaceTest {
         assertEquals("a<b>c", expr("SELECT regexp_replace('abc','(b)','<\\&>')"));
     }
 
+    /** A trailing backslash has nothing to escape; Java would reject the replacement. */
+    @Test
+    void aTrailingBackslashComesThroughAsItself() throws Exception {
+        // SQL: regexp_replace('x','x','\')
+        assertEquals("\\", expr("SELECT regexp_replace('x','x','\\')"));
+        // SQL: regexp_replace('x','x','\\')
+        assertEquals("\\", expr("SELECT regexp_replace('x','x','\\\\')"));
+        // SQL: regexp_replace('x','x','a\')
+        assertEquals("a\\", expr("SELECT regexp_replace('x','x','a\\')"));
+    }
+
     /** PG substitutes the empty string for a group the pattern does not have. */
     @Test
     void aBackrefToAMissingGroupSubstitutesNothing() throws Exception {

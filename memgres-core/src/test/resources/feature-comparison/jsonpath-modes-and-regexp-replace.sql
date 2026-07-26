@@ -94,3 +94,22 @@ SELECT regexp_replace('abc','b','\1') AS a;
 -- row: a<b>c
 -- end-expected
 SELECT regexp_replace('abc','(b)','<\&>') AS a;
+
+-- A trailing backslash has nothing to escape and comes through as itself
+-- begin-expected
+-- columns: a
+-- row: \
+-- end-expected
+SELECT regexp_replace('x','x','\') AS a;
+
+-- begin-expected
+-- columns: a
+-- row: \
+-- end-expected
+SELECT regexp_replace('x','x','\\') AS a;
+
+-- begin-expected
+-- columns: a
+-- row: a\
+-- end-expected
+SELECT regexp_replace('x','x','a\') AS a;

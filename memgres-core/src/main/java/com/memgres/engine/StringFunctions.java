@@ -1149,6 +1149,12 @@ class StringFunctions {
                 sb.append("\\$");
                 continue;
             }
+            // A trailing backslash has nothing to escape; PG emits it as itself, while Java
+            // would reject a replacement string that ends mid-escape
+            if (c == '\\') {
+                sb.append("\\\\");
+                continue;
+            }
             sb.append(c);
         }
         return sb.toString();
