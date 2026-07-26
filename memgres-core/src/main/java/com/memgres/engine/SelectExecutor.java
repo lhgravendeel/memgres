@@ -102,6 +102,7 @@ class SelectExecutor {
     }
 
     private QueryResult executeSelectInner(SelectStmt stmt) {
+        rejectMisplacedSrfs(stmt);
         // SELECT without FROM
         if (stmt.from() == null || stmt.from().isEmpty()) {
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
@@ -379,6 +380,21 @@ class SelectExecutor {
                                         "column \"" + colName + "\" must appear in the GROUP BY clause or be used in an aggregate function",
                                         "42803");
                             }
+                        }
+                    }
+                    // HAVING is evaluated per group, so a bare column there needs grouping too
+                    if (stmt.having() != null) {
+                        for (ColumnRef cr : ungroupedColumnRefs(stmt.having())) {
+                            String col = cr.column().toLowerCase();
+                            String qualified = cr.table() != null
+                                    ? cr.table().toLowerCase() + "." + col : col;
+                            if (groupedExprs.contains(col) || groupedExprs.contains(qualified)) continue;
+                            // A name that is not a column at all is an undefined-column error,
+                            // which normal evaluation reports; do not pre-empt it here
+                            if (!resolvesToColumn(cr, baseBindings)) continue;
+                            throw new MemgresException("column \"" + qualifyColumn(cr, baseBindings)
+                                    + "\" must appear in the GROUP BY clause or be used in an aggregate function",
+                                    "42803");
                         }
                     }
                     if (stmt.orderBy() != null) {
@@ -1450,9 +1466,111 @@ class SelectExecutor {
         }
     }
 
+    /** Every column reference in the expression that is not already inside an aggregate call. */
+    private List<ColumnRef> ungroupedColumnRefs(Expression expr) {
+        List<ColumnRef> out = new ArrayList<>();
+        collectUngroupedColumnRefs(expr, out);
+        return out;
+    }
+
+    private void collectUngroupedColumnRefs(Object node, List<ColumnRef> out) {
+        if (node == null) return;
+        if (node instanceof ColumnRef) {
+            out.add((ColumnRef) node);
+            return;
+        }
+        if (node instanceof FunctionCallExpr) {
+            FunctionCallExpr fc = (FunctionCallExpr) node;
+            String name = FunctionEvaluator.stripSchemaPrefix(fc.name().toLowerCase());
+            // Built-in or user-defined, an aggregate consumes its arguments
+            if (AGGREGATE_FUNCTIONS.contains(name) || executor.database.getAggregate(name) != null) return;
+        }
+        // A nested query has its own FROM and its own grouping rules
+        if (node instanceof com.memgres.engine.parser.ast.Statement) return;
+        AstWalk.forEachChild(node, child -> collectUngroupedColumnRefs(child, out));
+    }
+
+    /** True when the reference names a real column of one of the query's relations. */
+    private static boolean resolvesToColumn(ColumnRef cr, List<RowContext.TableBinding> bindings) {
+        if (bindings == null) return false;
+        for (RowContext.TableBinding b : bindings) {
+            if (b.table() != null && b.table().getColumnIndex(cr.column()) >= 0) return true;
+        }
+        return false;
+    }
+
+    /** PG names the offending column as table.column when the reference resolves to one. */
+    private static String qualifyColumn(ColumnRef cr, List<RowContext.TableBinding> bindings) {
+        if (cr.table() != null) return cr.table() + "." + cr.column();
+        if (bindings != null) {
+            for (RowContext.TableBinding b : bindings) {
+                if (b.table() != null && b.table().getColumnIndex(cr.column()) >= 0) {
+                    return (b.alias() != null ? b.alias() : b.table().getName()) + "." + cr.column();
+                }
+            }
+        }
+        return cr.column();
+    }
+
     private boolean isSrfCall(Expression expr) {
         return findSrfCall(expr) != null;
     }
+
+    /**
+     * A set-returning function may only sit in the FROM clause or at the top of a select-list
+     * expression. PG rejects one buried in a conditional (which arm's rows would it produce?)
+     * or in a clause that filters rows rather than producing them.
+     */
+    private static void rejectMisplacedSrfs(SelectStmt stmt) {
+        if (stmt.where() != null && containsSrf(stmt.where())) throw misplacedSrf("WHERE");
+        if (stmt.having() != null && containsSrf(stmt.having())) throw misplacedSrf("HAVING");
+        if (stmt.groupBy() != null) {
+            for (Expression g : stmt.groupBy()) {
+                if (containsSrf(g)) throw misplacedSrf("GROUP BY");
+            }
+        }
+        if (stmt.targets() != null) {
+            for (SelectStmt.SelectTarget t : stmt.targets()) {
+                String construct = conditionalHidingSrf(t.expr());
+                if (construct != null) throw misplacedSrf(construct);
+            }
+        }
+    }
+
+    private static MemgresException misplacedSrf(String construct) {
+        return new MemgresException("set-returning functions are not allowed in " + construct, "0A000");
+    }
+
+    /** The name of the conditional construct hiding an SRF in this expression, or null. */
+    private static String conditionalHidingSrf(Expression expr) {
+        Object found = AstWalk.findFirst(expr, node -> {
+            if (node instanceof CaseExpr) return containsSrf(node);
+            if (node instanceof FunctionCallExpr) {
+                String n = FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) node).name().toLowerCase());
+                if (CONDITIONAL_CONSTRUCTS.contains(n)) {
+                    for (Expression arg : ((FunctionCallExpr) node).args()) {
+                        if (containsSrf(arg)) return true;
+                    }
+                }
+            }
+            return false;
+        });
+        if (found == null) return null;
+        if (found instanceof CaseExpr) return "CASE";
+        return FunctionEvaluator.stripSchemaPrefix(
+                ((FunctionCallExpr) found).name().toLowerCase()).toUpperCase();
+    }
+
+    /** True when a set-returning call appears anywhere under this node. */
+    static boolean containsSrf(Object node) {
+        return AstWalk.anyMatch(node, n -> n instanceof FunctionCallExpr
+                && SRF_FUNCTIONS.contains(
+                        FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) n).name().toLowerCase())));
+    }
+
+    /** Conditional constructs PG evaluates lazily, and so refuses to expand a set inside. */
+    private static final Set<String> CONDITIONAL_CONSTRUCTS =
+            new HashSet<>(Arrays.asList("coalesce", "nullif", "greatest", "least"));
 
     /**
      * Recursively searches an expression tree for a nested set-returning function call, e.g.
