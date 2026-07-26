@@ -124,3 +124,83 @@ SELECT ('infinity'::date > DATE '2026-01-01') AS a;
 -- row: true
 -- end-expected
 SELECT ('-infinity'::date < DATE '2026-01-01') AS a;
+
+-- ============================================================================
+-- 6. An interval can be infinite too
+-- ============================================================================
+
+-- begin-expected
+-- columns: a | b
+-- row: infinity, -infinity
+-- end-expected
+SELECT (INTERVAL 'infinity')::text AS a, (INTERVAL '-infinity')::text AS b;
+
+-- The difference of two timestamps is infinite when either endpoint is
+-- begin-expected
+-- columns: a
+-- row: infinity
+-- end-expected
+SELECT (TIMESTAMP 'infinity' - TIMESTAMP '-infinity')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: infinity
+-- end-expected
+SELECT (TIMESTAMP 'infinity' - TIMESTAMP '2026-01-01')::text AS a;
+
+-- The sign follows which side the infinity sits on
+-- begin-expected
+-- columns: a
+-- row: -infinity
+-- end-expected
+SELECT (TIMESTAMP '2026-01-01' - TIMESTAMP 'infinity')::text AS a;
+
+-- begin-expected
+-- columns: a | b | c
+-- row: infinity, -infinity, infinity
+-- end-expected
+SELECT (INTERVAL 'infinity' + INTERVAL '1 day')::text AS a,
+       (INTERVAL '-infinity' + INTERVAL '1 day')::text AS b,
+       (INTERVAL 'infinity' * 2)::text AS c;
+
+-- begin-expected
+-- columns: a | b
+-- row: false, true
+-- end-expected
+SELECT isfinite(INTERVAL 'infinity') AS a, isfinite(INTERVAL '1 day') AS b;
+
+-- An infinity sits outside every finite interval
+-- begin-expected
+-- columns: a | b | c
+-- row: true, true, true
+-- end-expected
+SELECT (INTERVAL 'infinity' > INTERVAL '1000 years') AS a,
+       (INTERVAL '-infinity' < INTERVAL '-1000 years') AS b,
+       (INTERVAL 'infinity' = INTERVAL 'infinity') AS c;
+
+-- begin-expected
+-- columns: a
+-- row: infinity
+-- end-expected
+SELECT (TIMESTAMP '2026-01-01' + INTERVAL 'infinity')::text AS a;
+
+-- An indeterminate result is an error, not a guess
+-- begin-expected-error
+-- sqlstate: 22008
+-- message-like: interval out of range
+-- end-expected-error
+SELECT (INTERVAL 'infinity' - INTERVAL 'infinity');
+
+-- begin-expected-error
+-- sqlstate: 22008
+-- message-like: interval out of range
+-- end-expected-error
+SELECT (INTERVAL 'infinity' * 0);
+
+-- begin-expected
+-- columns: a | b | c
+-- row: Infinity, infinity, infinity
+-- end-expected
+SELECT extract(epoch FROM INTERVAL 'infinity')::text AS a,
+       justify_hours(INTERVAL 'infinity')::text AS b,
+       date_trunc('day', INTERVAL 'infinity')::text AS c;

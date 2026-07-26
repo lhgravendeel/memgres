@@ -102,6 +102,7 @@ class DateTimeFunctions {
                     String si = (String) arg;
                     return false;
                 }
+                if (arg instanceof PgInterval) return !((PgInterval) arg).isInfinite();
                 if (arg instanceof java.time.LocalDateTime) {
                     java.time.LocalDateTime dt = (java.time.LocalDateTime) arg;
                     return !dt.equals(TypeCoercion.TIMESTAMP_INFINITY) && !dt.equals(TypeCoercion.TIMESTAMP_NEG_INFINITY);
@@ -228,6 +229,7 @@ class DateTimeFunctions {
             case "justify_hours": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 PgInterval iv = TypeCoercion.toInterval(arg);
+                if (iv.isInfinite()) return iv; // nothing to redistribute
                 long micros = iv.getMicroseconds();
                 int extraDays = (int) (micros / (24L * 3600 * 1_000_000));
                 long remainMicros = micros % (24L * 3600 * 1_000_000);
@@ -236,6 +238,7 @@ class DateTimeFunctions {
             case "justify_days": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 PgInterval iv = TypeCoercion.toInterval(arg);
+                if (iv.isInfinite()) return iv; // nothing to redistribute
                 int extraMonths = iv.getDays() / 30;
                 int remainDays = iv.getDays() % 30;
                 return new PgInterval(iv.getMonths() + extraMonths, remainDays, iv.getMicroseconds());
@@ -243,6 +246,7 @@ class DateTimeFunctions {
             case "justify_interval": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 PgInterval iv = TypeCoercion.toInterval(arg);
+                if (iv.isInfinite()) return iv; // nothing to redistribute
                 long microPerDay = 24L * 3600 * 1_000_000;
                 long micros = iv.getMicroseconds();
                 int extraDays = (int) (micros / microPerDay);
@@ -292,6 +296,13 @@ class DateTimeFunctions {
         if (source == null) return null;
         if (source instanceof PgInterval) {
             PgInterval iv = (PgInterval) source;
+            if (iv.isInfinite()) {
+                // Only epoch has a meaningful answer for an infinite interval
+                if (field.equals("epoch")) {
+                    return iv.isPositiveInfinity() ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY;
+                }
+                return java.math.BigDecimal.ZERO;
+            }
             switch (field) {
                 case "year":
                 case "years":
@@ -509,6 +520,7 @@ class DateTimeFunctions {
 
     /** Zero every interval field smaller than the requested unit. */
     private Object truncateInterval(String field, PgInterval iv) {
+        if (iv.isInfinite()) return iv;
         int months = iv.getMonths();
         int days = iv.getDays();
         long micros = iv.getMicroseconds();

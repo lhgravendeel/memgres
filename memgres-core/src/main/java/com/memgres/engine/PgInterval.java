@@ -19,10 +19,30 @@ public class PgInterval implements Comparable<PgInterval> {
     private final int days;
     private final long microseconds;
 
+    /**
+     * PG stores an infinite interval as a reserved field pattern rather than a magnitude, so
+     * the sentinels below are the whole value: days and microseconds carry no meaning for them.
+     */
+    public static final PgInterval INFINITY = new PgInterval(Integer.MAX_VALUE, 0, 0);
+    public static final PgInterval NEG_INFINITY = new PgInterval(Integer.MIN_VALUE, 0, 0);
+
     public PgInterval(int months, int days, long microseconds) {
         this.months = months;
         this.days = days;
         this.microseconds = microseconds;
+    }
+
+    public boolean isInfinite() {
+        return months == Integer.MAX_VALUE || months == Integer.MIN_VALUE;
+    }
+
+    public boolean isPositiveInfinity() { return months == Integer.MAX_VALUE; }
+
+    public boolean isNegativeInfinity() { return months == Integer.MIN_VALUE; }
+
+    /** PG rejects an operation whose result would be an indeterminate infinity. */
+    private static MemgresException intervalOutOfRange() {
+        return new MemgresException("interval out of range", "22008");
     }
 
     public int getMonths() { return months; }
@@ -30,18 +50,39 @@ public class PgInterval implements Comparable<PgInterval> {
     public long getMicroseconds() { return microseconds; }
 
     public PgInterval plus(PgInterval other) {
+        if (isInfinite() || other.isInfinite()) {
+            // infinity + -infinity has no value, so PG raises rather than picking one
+            if (isInfinite() && other.isInfinite() && isPositiveInfinity() != other.isPositiveInfinity()) {
+                throw intervalOutOfRange();
+            }
+            return isInfinite() ? this : other;
+        }
         return new PgInterval(months + other.months, days + other.days, microseconds + other.microseconds);
     }
 
     public PgInterval minus(PgInterval other) {
+        if (isInfinite() || other.isInfinite()) {
+            if (isInfinite() && other.isInfinite() && isPositiveInfinity() == other.isPositiveInfinity()) {
+                throw intervalOutOfRange();
+            }
+            return isInfinite() ? this : other.negate();
+        }
         return new PgInterval(months - other.months, days - other.days, microseconds - other.microseconds);
     }
 
     public PgInterval negate() {
+        if (isPositiveInfinity()) return NEG_INFINITY;
+        if (isNegativeInfinity()) return INFINITY;
         return new PgInterval(-months, -days, -microseconds);
     }
 
     public PgInterval multiply(double factor) {
+        if (isInfinite()) {
+            // infinity * 0 is indeterminate; any other factor keeps or flips the sign
+            if (factor == 0) throw intervalOutOfRange();
+            boolean positive = isPositiveInfinity() == (factor > 0);
+            return positive ? INFINITY : NEG_INFINITY;
+        }
         // PG cascades fractional parts: fractional months → days, fractional days → microseconds
         double totalMonths = months * factor;
         int newMonths = (int) totalMonths;
@@ -59,6 +100,10 @@ public class PgInterval implements Comparable<PgInterval> {
      * Add this interval to a LocalDate.
      */
     public LocalDate addTo(LocalDate date) {
+        if (isInfinite()) {
+            return isPositiveInfinity()
+                    ? TypeCoercion.DATE_INFINITY : TypeCoercion.DATE_NEG_INFINITY;
+        }
         LocalDate result = date;
         if (months != 0) result = result.plusMonths(months);
         if (days != 0) result = result.plusDays(days);
@@ -70,6 +115,10 @@ public class PgInterval implements Comparable<PgInterval> {
      * Add this interval to a LocalDateTime.
      */
     public LocalDateTime addTo(LocalDateTime dateTime) {
+        if (isInfinite()) {
+            return isPositiveInfinity()
+                    ? TypeCoercion.TIMESTAMP_INFINITY : TypeCoercion.TIMESTAMP_NEG_INFINITY;
+        }
         LocalDateTime result = dateTime;
         if (months != 0) result = result.plusMonths(months);
         if (days != 0) result = result.plusDays(days);
@@ -81,6 +130,11 @@ public class PgInterval implements Comparable<PgInterval> {
      * Add this interval to an OffsetDateTime.
      */
     public OffsetDateTime addTo(OffsetDateTime dateTime) {
+        if (isInfinite()) {
+            LocalDateTime bound = isPositiveInfinity()
+                    ? TypeCoercion.TIMESTAMP_INFINITY : TypeCoercion.TIMESTAMP_NEG_INFINITY;
+            return bound.atOffset(dateTime.getOffset());
+        }
         OffsetDateTime result = dateTime;
         if (months != 0) result = result.plusMonths(months);
         if (days != 0) result = result.plusDays(days);
@@ -117,6 +171,8 @@ public class PgInterval implements Comparable<PgInterval> {
             return new PgInterval(0, 0, 0);
         }
         String s = input.trim();
+        if (s.equalsIgnoreCase("infinity") || s.equalsIgnoreCase("+infinity")) return INFINITY;
+        if (s.equalsIgnoreCase("-infinity")) return NEG_INFINITY;
 
         // Try ISO 8601 duration format: P[nY][nM][nD][T[nH][nM][nS]]
         if (s.startsWith("P") || s.startsWith("p")) {
@@ -249,6 +305,8 @@ public class PgInterval implements Comparable<PgInterval> {
      * Supported styles: "postgres" (default), "iso_8601", "sql_standard".
      */
     public String toString(String intervalStyle) {
+        if (isPositiveInfinity()) return "infinity";
+        if (isNegativeInfinity()) return "-infinity";
         if (intervalStyle != null && intervalStyle.equalsIgnoreCase("iso_8601")) {
             return toIso8601();
         } else if (intervalStyle != null && intervalStyle.equalsIgnoreCase("sql_standard")) {
@@ -400,6 +458,11 @@ public class PgInterval implements Comparable<PgInterval> {
 
     @Override
     public int compareTo(PgInterval other) {
+        if (isInfinite() || other.isInfinite()) {
+            int mine = isPositiveInfinity() ? 1 : isNegativeInfinity() ? -1 : 0;
+            int theirs = other.isPositiveInfinity() ? 1 : other.isNegativeInfinity() ? -1 : 0;
+            return Integer.compare(mine, theirs);
+        }
         // Approximate comparison: 1 month = 30 days, 1 day = 24 hours
         long thisTotalMicros = months * 30L * 24 * 3600 * 1_000_000L + days * 24L * 3600 * 1_000_000L + microseconds;
         long otherTotalMicros = other.months * 30L * 24 * 3600 * 1_000_000L + other.days * 24L * 3600 * 1_000_000L + other.microseconds;

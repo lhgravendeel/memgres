@@ -39,6 +39,13 @@ class DateTruncAndBcTimestampsTest {
         if (memgres != null) memgres.close();
     }
 
+    private static String state(String sql) {
+        SQLException e = org.junit.jupiter.api.Assertions.assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) { s.execute(sql); }
+        });
+        return e.getSQLState();
+    }
+
     private static String expr(String sql) throws SQLException {
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
             rs.next();
@@ -108,6 +115,55 @@ class DateTruncAndBcTimestampsTest {
     @Test
     void bcDatesOrderBeforeChristianEraDates() throws Exception {
         assertEquals("t", expr("SELECT (DATE '0044-03-15 BC' < DATE '0001-01-01')"));
+    }
+
+    // ------------------------------------------------------------------
+    // N64 — an interval can be infinite too
+    // ------------------------------------------------------------------
+
+    @Test
+    void anIntervalLiteralMayBeInfinite() throws Exception {
+        assertEquals("infinity", expr("SELECT (INTERVAL 'infinity')::text"));
+        assertEquals("-infinity", expr("SELECT (INTERVAL '-infinity')::text"));
+    }
+
+    /** The difference of two timestamps is infinite when either endpoint is. */
+    @Test
+    void anInfiniteEndpointMakesTheDifferenceInfinite() throws Exception {
+        assertEquals("infinity", expr("SELECT (TIMESTAMP 'infinity' - TIMESTAMP '-infinity')::text"));
+        assertEquals("infinity", expr("SELECT (TIMESTAMP 'infinity' - TIMESTAMP '2026-01-01')::text"));
+        assertEquals("-infinity", expr("SELECT (TIMESTAMP '2026-01-01' - TIMESTAMP 'infinity')::text"));
+    }
+
+    @Test
+    void arithmeticKeepsAnInfiniteInterval() throws Exception {
+        assertEquals("infinity", expr("SELECT (INTERVAL 'infinity' + INTERVAL '1 day')::text"));
+        assertEquals("-infinity", expr("SELECT (INTERVAL '-infinity' + INTERVAL '1 day')::text"));
+        assertEquals("infinity", expr("SELECT (INTERVAL 'infinity' * 2)::text"));
+        assertEquals("infinity", expr("SELECT (TIMESTAMP '2026-01-01' + INTERVAL 'infinity')::text"));
+    }
+
+    /** An indeterminate result is an error, not a guess. */
+    @Test
+    void indeterminateInfiniteArithmeticIsRejected() {
+        assertEquals("22008", state("SELECT (INTERVAL 'infinity' - INTERVAL 'infinity')"));
+        assertEquals("22008", state("SELECT (INTERVAL 'infinity' * 0)"));
+    }
+
+    @Test
+    void anInfiniteIntervalOrdersOutsideEveryFiniteOne() throws Exception {
+        assertEquals("t", expr("SELECT (INTERVAL 'infinity' > INTERVAL '1000 years')"));
+        assertEquals("t", expr("SELECT (INTERVAL '-infinity' < INTERVAL '-1000 years')"));
+        assertEquals("t", expr("SELECT (INTERVAL 'infinity' = INTERVAL 'infinity')"));
+    }
+
+    @Test
+    void intervalFunctionsHandleAnInfiniteInterval() throws Exception {
+        assertEquals("f", expr("SELECT isfinite(INTERVAL 'infinity')"));
+        assertEquals("t", expr("SELECT isfinite(INTERVAL '1 day')"));
+        assertEquals("Infinity", expr("SELECT extract(epoch FROM INTERVAL 'infinity')::text"));
+        assertEquals("infinity", expr("SELECT justify_hours(INTERVAL 'infinity')::text"));
+        assertEquals("infinity", expr("SELECT date_trunc('day', INTERVAL 'infinity')::text"));
     }
 
     @Test
