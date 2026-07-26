@@ -424,10 +424,8 @@ class StringFunctions {
                 if (str == null) return null;
                 String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                 String replacement = String.valueOf(executor.evalExpr(fn.args().get(2), ctx));
-                // Convert PG-style \& (whole match) to Java $0. Numbered \N backrefs are
-                // converted below, once the pattern's group count is known (a backref to a
-                // group that does not exist substitutes the empty string, per PG).
-                replacement = replacement.replace("\\&", "$0");
+                // PG's replacement text only gives meaning to \N and \&; the conversion to
+                // Java's syntax happens below, once the pattern's group count is known.
                 String flags = "";
                 int startPos = 1;
                 int nth = 1; // PG15+ form default: replace first match only (0 = all)
@@ -1130,16 +1128,34 @@ class StringFunctions {
         StringBuilder sb = new StringBuilder(repl.length());
         for (int i = 0; i < repl.length(); i++) {
             char c = repl.charAt(i);
-            if (c == '\\' && i + 1 < repl.length() && Character.isDigit(repl.charAt(i + 1))) {
-                int g = repl.charAt(i + 1) - '0';
-                if (g <= groupCount) {
-                    sb.append('$').append((char) ('0' + g));
+            if (c == '\\' && i + 1 < repl.length()) {
+                char next = repl.charAt(i + 1);
+                i++;
+                if (Character.isDigit(next)) {
+                    int g = next - '0';
+                    if (g <= groupCount) sb.append('$').append(next);
+                    // else: backref to a non-existent group -> empty substitution
+                } else if (next == '&') {
+                    sb.append("$0"); // PG's whole-match reference
+                } else if (next == '\\') {
+                    sb.append("\\\\"); // a literal backslash, escaped for Java
+                } else {
+                    sb.append(java.util.regex.Matcher.quoteReplacement(String.valueOf(next)));
                 }
-                // else: backref to a non-existent group -> empty substitution
-                i++; // consume the digit
-            } else {
-                sb.append(c);
+                continue;
             }
+            // '$' carries no meaning in PG's replacement text, so Java must see it as a literal
+            if (c == '$') {
+                sb.append("\\$");
+                continue;
+            }
+            // A trailing backslash has nothing to escape; PG emits it as itself, while Java
+            // would reject a replacement string that ends mid-escape
+            if (c == '\\') {
+                sb.append("\\\\");
+                continue;
+            }
+            sb.append(c);
         }
         return sb.toString();
     }
