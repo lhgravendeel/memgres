@@ -106,26 +106,45 @@ class DmlTriggerHelper {
                 String newTransName = trigger.getNewTransitionTable();
                 String oldTransName = trigger.getOldTransitionTable();
                 String schemaName = executor.defaultSchema();
+                // A transition name may collide with a real table. PG scopes transition
+                // tables to the statement, so shadow the real one and put it back after —
+                // never destroy it.
+                Schema transScope = executor.database.getSchema(schemaName);
+                Table shadowedNew = null;
+                Table shadowedOld = null;
                 try {
                     if (newTransName != null && newRows != null) {
+                        if (transScope != null) shadowedNew = transScope.getTable(newTransName);
                         createTransitionTable(newTransName, schemaName, table, newRows);
                     }
                     if (oldTransName != null && oldRows != null) {
+                        if (transScope != null) shadowedOld = transScope.getTable(oldTransName);
                         createTransitionTable(oldTransName, schemaName, table, oldRows);
                     }
                     PlpgsqlExecutor plExec = new PlpgsqlExecutor(executor, executor.database, executor.session);
                     plExec.executeTriggerFunction(function, null, null, table, trigger);
                 } finally {
-                    // Clean up transition tables and their ownership records
+                    // Clean up transition tables and their ownership records, restoring any
+                    // real table the transition name shadowed.
                     if (newTransName != null) {
                         Schema schema = executor.database.getSchema(schemaName);
-                        if (schema != null) schema.removeTable(newTransName);
-                        executor.database.removeObjectOwner("table:" + schemaName.toLowerCase() + "." + newTransName.toLowerCase());
+                        if (schema != null) {
+                            schema.removeTable(newTransName);
+                            if (shadowedNew != null) schema.addTable(shadowedNew);
+                        }
+                        if (shadowedNew == null) {
+                            executor.database.removeObjectOwner("table:" + schemaName.toLowerCase() + "." + newTransName.toLowerCase());
+                        }
                     }
                     if (oldTransName != null) {
                         Schema schema = executor.database.getSchema(schemaName);
-                        if (schema != null) schema.removeTable(oldTransName);
-                        executor.database.removeObjectOwner("table:" + schemaName.toLowerCase() + "." + oldTransName.toLowerCase());
+                        if (schema != null) {
+                            schema.removeTable(oldTransName);
+                            if (shadowedOld != null) schema.addTable(shadowedOld);
+                        }
+                        if (shadowedOld == null) {
+                            executor.database.removeObjectOwner("table:" + schemaName.toLowerCase() + "." + oldTransName.toLowerCase());
+                        }
                     }
                 }
             }

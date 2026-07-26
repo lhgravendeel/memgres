@@ -416,11 +416,12 @@ class CatalogSystemFunctions {
                 if (colPrivPriv.endsWith(" WITH GRANT OPTION")) {
                     colPrivPriv = colPrivPriv.substring(0, colPrivPriv.length() - " WITH GRANT OPTION".length()).trim();
                 }
-                String colPrivTableBare = colPrivTable.contains(".") ? colPrivTable.substring(colPrivTable.lastIndexOf('.') + 1) : colPrivTable;
-                if (checkPrivilege(colPrivUser, colPrivPriv, "COLUMN", colPrivTableBare + "." + colPrivCol)) {
+                // Column and table privileges are keyed by schema-qualified table name.
+                String colPrivQual = AstExecutor.privilegeKey(executor.defaultSchema(), colPrivTable);
+                if (checkPrivilege(colPrivUser, colPrivPriv, "COLUMN", colPrivQual + "." + colPrivCol)) {
                     return true;
                 }
-                return checkPrivilege(colPrivUser, colPrivPriv, "TABLE", colPrivTableBare);
+                return checkPrivilege(colPrivUser, colPrivPriv, "TABLE", colPrivQual);
             }
             case "has_sequence_privilege":
                 return true;
@@ -891,9 +892,13 @@ class CatalogSystemFunctions {
         if ("FUNCTION".equals(objectType) && objectName.contains("(")) {
             objectName = objectName.substring(0, objectName.indexOf('(')).trim();
         }
-        // Strip schema prefix for TABLE and FUNCTION
-        if (("TABLE".equals(objectType) || "FUNCTION".equals(objectType)) && objectName.contains(".")) {
+        // FUNCTION privileges are keyed bare; TABLE privileges keep their schema so a
+        // grant on one schema's table is not reported for a same-named table elsewhere.
+        if ("FUNCTION".equals(objectType) && objectName.contains(".")) {
             objectName = objectName.substring(objectName.lastIndexOf('.') + 1);
+        }
+        if ("TABLE".equals(objectType)) {
+            objectName = AstExecutor.privilegeKey(executor.defaultSchema(), objectName);
         }
         if (checkGrantOption) {
             // For WITH GRANT OPTION, superusers and owners always have it
@@ -901,7 +906,7 @@ class CatalogSystemFunctions {
             if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return true;
             // Check ownership
             String ownerKey = objectType.equalsIgnoreCase("TABLE")
-                    ? "table:public." + objectName : objectType.toLowerCase() + ":" + objectName;
+                    ? "table:" + objectName : objectType.toLowerCase() + ":" + objectName;
             String owner = executor.database.getObjectOwner(ownerKey);
             if (owner != null && owner.equalsIgnoreCase(user)) return true;
             // Check explicit grant option
@@ -930,7 +935,7 @@ class CatalogSystemFunctions {
 
         // 2. Owner has all privileges on their own objects
         String ownerKey = objectType.equalsIgnoreCase("TABLE")
-                ? "table:public." + objectNameLower
+                ? "table:" + objectNameLower
                 : objectType.equalsIgnoreCase("FUNCTION")
                     ? "function:" + objectNameLower
                     : objectType.equalsIgnoreCase("SCHEMA")
