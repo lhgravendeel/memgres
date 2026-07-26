@@ -1755,9 +1755,21 @@ public class PlpgsqlExecutor {
             if (existing instanceof String) sql = (String) existing;
         }
         if (sql != null) {
+            // A refcursor variable holds its portal name; PG generates one when it has none
+            Object bound = scope.get(stmt.cursorName());
+            String portal = bound instanceof String && !((String) bound).trim().isEmpty()
+                    ? ((String) bound).trim() : stmt.cursorName();
             sql = substituteVariables(sql, scope);
             QueryResult result = astExecutor.execute(sql);
-            scope.set(stmt.cursorName(), new CursorState(result));
+            scope.set(stmt.cursorName(), new CursorState(result, portal));
+            // Register the portal with the session so the caller can FETCH from it after the
+            // function returns -- that is the whole point of returning a refcursor
+            if (session != null) {
+                session.addCursor(portal, new Session.CursorState(portal,
+                        new java.util.ArrayList<>(result.getColumns()),
+                        new java.util.ArrayList<>(result.getRows()),
+                        sql, false, false, false, false));
+            }
         }
     }
 
@@ -1796,8 +1808,16 @@ public class PlpgsqlExecutor {
 
     private static class CursorState {
         final QueryResult result;
+        /** The portal name this cursor is registered under, which is also its text value. */
+        final String portal;
         int position = 0;
-        CursorState(QueryResult result) { this.result = result; }
+        CursorState(QueryResult result, String portal) {
+            this.result = result;
+            this.portal = portal;
+        }
+
+        /** A refcursor renders as its portal name, so RETURN c hands back a usable name. */
+        @Override public String toString() { return portal; }
     }
 
     // ---- Expression evaluation ----

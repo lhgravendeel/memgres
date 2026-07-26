@@ -835,7 +835,8 @@ class UtilityParser {
         parser.expectKeyword("FOR");
         int cursorExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
         parser.consumeLeadingParens(cursorExtraParens);
-        Statement query = parser.tryParseSetOp(parser.parseSelect());
+        // A cursor may be declared for any query, VALUES included
+        Statement query = parser.parseSubqueryWithSetOpsPublic();
         parser.consumeTrailingParens(cursorExtraParens);
         return new DeclareCursorStmt(name, query, scroll, withHold, binary, explicitNoScroll);
     }
