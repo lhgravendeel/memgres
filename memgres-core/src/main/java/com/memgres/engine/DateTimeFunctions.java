@@ -219,9 +219,8 @@ class DateTimeFunctions {
             case "to_number": {
                 Object source = executor.evalExpr(fn.args().get(0), ctx);
                 if (source == null) return null;
-                String s = source.toString().replaceAll("[^0-9.\\-+eE]", "");
-                if (s.isEmpty()) return 0.0;
-                return Double.parseDouble(s);
+                return parseNumberWithFormat(source.toString(),
+                        fn.args().size() > 1 ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)) : null);
             }
             case "justify_hours": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -631,10 +630,23 @@ class DateTimeFunctions {
                 .replace("YYYY", "yyyy")
                 .replace("MM", "MM")
                 .replace("DD", "dd");
+        java.time.format.DateTimeFormatter strict = java.time.format.DateTimeFormatter
+                .ofPattern(javaPattern.replace("yyyy", "uuuu"))
+                .withResolverStyle(java.time.format.ResolverStyle.STRICT);
         try {
-            return java.time.LocalDate.parse(dateStr, java.time.format.DateTimeFormatter.ofPattern(javaPattern));
-        } catch (Exception e) {
-            return TypeCoercion.toLocalDate(dateStr);
+            return java.time.LocalDate.parse(dateStr, strict);
+        } catch (Exception strictFailed) {
+            // Either the text does not fit the pattern at all, or a field is out of range.
+            // A lenient parse tells the two apart: it clamps Feb 30 to Feb 28, and PG rejects
+            // exactly the inputs that a lenient parse has to clamp.
+            try {
+                java.time.LocalDate.parse(dateStr,
+                        java.time.format.DateTimeFormatter.ofPattern(javaPattern));
+            } catch (Exception notThisPattern) {
+                return TypeCoercion.toLocalDate(dateStr);
+            }
+            throw new MemgresException(
+                    "date/time field value out of range: \"" + dateStr + "\"", "22008");
         }
     }
 
@@ -652,6 +664,41 @@ class DateTimeFunctions {
         } catch (Exception e) {
             return TypeCoercion.toLocalDateTime(tsStr);
         }
+    }
+
+    /**
+     * PG's to_number reads the digits and separators the format describes and returns numeric.
+     * The sign may lead or trail (S/MI/PL) or be parenthesised (PR), which a plain numeric parse
+     * would drop — turning '123-' into 123 instead of -123.
+     */
+    private java.math.BigDecimal parseNumberWithFormat(String input, String fmt) {
+        String s = input.trim();
+        boolean negative = false;
+        if (s.startsWith("(") && s.endsWith(")")) {
+            negative = true;
+            s = s.substring(1, s.length() - 1).trim();
+        }
+        if (s.endsWith("-")) {
+            negative = true;
+            s = s.substring(0, s.length() - 1).trim();
+        } else if (s.startsWith("-")) {
+            negative = true;
+            s = s.substring(1).trim();
+        } else if (s.startsWith("+")) {
+            s = s.substring(1).trim();
+        } else if (s.endsWith("+")) {
+            s = s.substring(0, s.length() - 1).trim();
+        }
+        // Group separators are positional noise; only the decimal marker carries meaning
+        s = s.replaceAll("[^0-9.]", "");
+        if (s.isEmpty()) return java.math.BigDecimal.ZERO;
+        java.math.BigDecimal value;
+        try {
+            value = new java.math.BigDecimal(s);
+        } catch (NumberFormatException e) {
+            throw new MemgresException("invalid input syntax for type numeric: \"" + input + "\"", "22P02");
+        }
+        return negative ? value.negate() : value;
     }
 
     private String formatNumber(Number n, String fmt) {
