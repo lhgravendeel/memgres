@@ -308,11 +308,11 @@ SELECT polygon '((0,0),(4,0),(4,3),(0,3))' AS p;
 -- 23. Polygon area
 -- ============================================================================
 
--- expected-divergence: Memgres supports area(polygon) as extension — PG does not have this function
--- begin-expected
--- columns: a
--- row: 12
--- end-expected
+-- PG has area() for box, circle and path; a polygon has none
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: function area(polygon) does not exist
+-- end-expected-error
 SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')::integer AS a;
 
 -- ============================================================================

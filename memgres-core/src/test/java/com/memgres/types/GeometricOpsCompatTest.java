@@ -61,11 +61,17 @@ class GeometricOpsCompatTest {
     }
 
     @Test
-    @DisplayName("area(polygon) returns area (PG supports this)")
+    @DisplayName("area(polygon) does not exist; area(path) does")
     void testAreaPolygon() throws SQLException {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')::integer AS a");
+            }
+        });
+        assertEquals("42883", e.getSQLState());
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(
-                     "SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')::integer AS a")) {
+                     "SELECT area(path '((0,0),(4,0),(4,3),(0,3))')::integer AS a")) {
             assertTrue(rs.next());
             assertEquals(12, rs.getInt("a"));
         }

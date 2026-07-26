@@ -124,6 +124,30 @@ class DomainInheritanceAndGeometryTest {
         assertEquals("42883", error("SELECT (line '{1,0,0}' @> point '(0,0)')").getSQLState());
     }
 
+    /**
+     * A closed path and a polygon print identically, so only the declared type of the argument
+     * can pick the overload.
+     */
+    @Test
+    void areaExistsForBoxCircleAndPathButNotPolygon() throws Exception {
+        assertEquals("42883", error("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')").getSQLState());
+        assertEquals("42883", error("SELECT area(lseg '[(0,0),(1,1)]')").getSQLState());
+        assertEquals("12", expr("SELECT area(path '((0,0),(4,0),(4,3),(0,3))')::text"));
+        assertEquals("12", expr("SELECT area(box '((0,0),(4,3))')::text"));
+        assertEquals("12.566370614359172", expr("SELECT area(circle '<(0,0),2>')::text"));
+    }
+
+    @Test
+    void aColumnCarriesItsDeclaredGeometricType() throws Exception {
+        exec("CREATE TABLE dg_g (id int PRIMARY KEY, pg polygon, pa path, bx box)");
+        exec("INSERT INTO dg_g VALUES (1, '((0,0),(4,0),(4,3),(0,3))',"
+                + " '((0,0),(4,0),(4,3),(0,3))', '((0,0),(4,3))')");
+
+        assertEquals("42883", error("SELECT area(pg) FROM dg_g").getSQLState());
+        assertEquals("12", expr("SELECT area(pa)::text FROM dg_g"));
+        assertEquals("12", expr("SELECT area(bx)::text FROM dg_g"));
+    }
+
     @Test
     void theRealContainmentOperatorsStillWork() throws Exception {
         assertEquals("t", expr("SELECT (box '((0,0),(2,2))' @> point '(1,1)')"));

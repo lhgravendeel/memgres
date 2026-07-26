@@ -150,10 +150,9 @@ class GeometryCorrectnessTest {
 
     @Test
     void h33_areaPolygon() throws SQLException {
-        // area(polygon) should work
-        String result = q("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')");
-        assertNotNull(result);
-        assertEquals("12", result.trim());
+        // PG has area() for box, circle and path only; a polygon has none
+        assertEquals("42883", errorState("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')"));
+        assertEquals("12", q("SELECT area(path '((0,0),(4,0),(4,3),(0,3))')").trim());
     }
 
     @Test

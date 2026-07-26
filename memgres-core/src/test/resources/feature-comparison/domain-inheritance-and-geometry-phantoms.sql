@@ -107,6 +107,66 @@ SELECT (box '((0,0),(2,2))' @> point '(1,1)') AS a;
 -- end-expected
 SELECT (polygon '((0,0),(2,0),(2,2))' @> point '(1,0.5)') AS a;
 
+-- ============================================================================
+-- 5. area() exists for box, circle and path -- not for a polygon
+-- ============================================================================
+-- A closed path and a polygon print the same, so the declared type of the
+-- argument is what decides which overload applies.
+
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: function area(polygon) does not exist
+-- end-expected-error
+SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))');
+
+-- begin-expected
+-- columns: a
+-- row: 12
+-- end-expected
+SELECT area(path '((0,0),(4,0),(4,3),(0,3))') AS a;
+
+-- begin-expected
+-- columns: a
+-- row: 12
+-- end-expected
+SELECT area(box '((0,0),(4,3))') AS a;
+
+-- begin-expected
+-- columns: a
+-- row: 12.566370614359172
+-- end-expected
+SELECT area(circle '<(0,0),2>') AS a;
+
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: function area(lseg) does not exist
+-- end-expected-error
+SELECT area(lseg '[(0,0),(1,1)]');
+
+-- A column carries its declared type too
+DROP TABLE IF EXISTS dg_g CASCADE;
+CREATE TABLE dg_g (id int PRIMARY KEY, pg polygon, pa path, bx box);
+INSERT INTO dg_g VALUES (1, '((0,0),(4,0),(4,3),(0,3))', '((0,0),(4,0),(4,3),(0,3))', '((0,0),(4,3))');
+
+-- begin-expected-error
+-- sqlstate: 42883
+-- message-like: function area(polygon) does not exist
+-- end-expected-error
+SELECT area(pg) FROM dg_g;
+
+-- begin-expected
+-- columns: a
+-- row: 12
+-- end-expected
+SELECT area(pa) AS a FROM dg_g;
+
+-- begin-expected
+-- columns: a
+-- row: 12
+-- end-expected
+SELECT area(bx) AS a FROM dg_g;
+
+DROP TABLE dg_g;
 DROP DOMAIN dg_small;
 DROP DOMAIN dg_pos;
 DROP DOMAIN dg_nn;

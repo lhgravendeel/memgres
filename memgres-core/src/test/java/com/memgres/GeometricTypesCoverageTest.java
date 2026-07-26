@@ -558,14 +558,16 @@ class GeometricTypesCoverageTest {
 
     @Test
     void polygon_area() throws SQLException {
-        // PG: area(polygon) returns the area
-        assertEquals(12.0, queryDouble("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')"), 0.01);
+        // PG has area() for box, circle and path only
+        assertEquals("42883", errorState("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')"));
+        assertEquals(12.0, queryDouble("SELECT area(path '((0,0),(4,0),(4,3),(0,3))')"), 0.01);
     }
 
     @Test
     void polygon_area_triangle() throws SQLException {
-        // PG: area(polygon) returns the area
-        assertEquals(6.0, queryDouble("SELECT area(polygon '((0,0),(4,0),(0,3))')"), 0.01);
+        // PG has area() for box, circle and path only
+        assertEquals("42883", errorState("SELECT area(polygon '((0,0),(4,0),(0,3))')"));
+        assertEquals(6.0, queryDouble("SELECT area(path '((0,0),(4,0),(0,3))')"), 0.01);
     }
 
     @Test
@@ -1074,8 +1076,9 @@ class GeometricTypesCoverageTest {
 
     @Test
     void polygon_unit_square_area() throws SQLException {
-        // PG: area(polygon) returns the area
-        assertEquals(1.0, queryDouble("SELECT area(polygon '((0,0),(1,0),(1,1),(0,1))')"), 0.01);
+        // PG has area() for box, circle and path only
+        assertEquals("42883", errorState("SELECT area(polygon '((0,0),(1,0),(1,1),(0,1))')"));
+        assertEquals(1.0, queryDouble("SELECT area(path '((0,0),(1,0),(1,1),(0,1))')"), 0.01);
     }
 
     @Test
