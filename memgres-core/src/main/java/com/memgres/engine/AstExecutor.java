@@ -526,8 +526,22 @@ public class AstExecutor {
      * C6: Check that the current role has the given privilege on a table.
      * Superusers and object owners bypass the check. PUBLIC grants are inherited.
      */
+    /** The key privileges on a table are stored under: schema-qualified and lower-cased. */
+    static String privilegeKey(String schemaName, String tableName) {
+        String bare = tableName == null ? "" : tableName.toLowerCase();
+        if (bare.contains(".")) return bare;
+        return (schemaName == null ? "public" : schemaName.toLowerCase()) + "." + bare;
+    }
+
+    /**
+     * While a view's body runs, privilege checks use the view's owner. PG reads a view
+     * with the owner's rights, so granting on the view alone is enough — the querying
+     * role never needs a grant on the base tables.
+     */
+    String viewOwnerRole = null;
+
     void checkTablePrivilege(String privilege, String schemaName, String tableName) {
-        String role = currentRole();
+        String role = viewOwnerRole != null ? viewOwnerRole : currentRole();
         if (role == null) return; // no session / embedded mode
         // Superuser check (by role attribute, not hardcoded names)
         Map<String, String> roleAttrs = database.getRole(role);
@@ -544,10 +558,11 @@ public class AstExecutor {
         if (owner != null && owner.equalsIgnoreCase(role)) return;
         owner = database.getObjectOwner("view:" + qualName);
         if (owner != null && owner.equalsIgnoreCase(role)) return;
-        // Direct or inherited privilege check (including PUBLIC grants)
-        if (hasPrivilegeDirectOrInherited(role, privilege, "TABLE", tableName.toLowerCase())) return;
+        // Direct or inherited privilege check (including PUBLIC grants). Privileges are
+        // keyed by schema-qualified name so a grant on s1.t cannot open s2.t.
+        if (hasPrivilegeDirectOrInherited(role, privilege, "TABLE", qualName)) return;
         // Also check PUBLIC grants
-        if (hasPrivilegeDirectOrInherited("public", privilege, "TABLE", tableName.toLowerCase())) return;
+        if (hasPrivilegeDirectOrInherited("public", privilege, "TABLE", qualName)) return;
         throw new MemgresException("permission denied for table \"" + tableName + "\"", "42501");
     }
 

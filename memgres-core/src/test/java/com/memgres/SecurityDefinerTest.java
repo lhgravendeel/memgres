@@ -349,6 +349,8 @@ class SecurityDefinerTest {
             stmt.execute("CREATE VIEW whoami_view AS SELECT view_whoami() AS u");
 
             stmt.execute("CREATE ROLE view_caller");
+            // PG requires SELECT on the view itself; this test is about SECURITY DEFINER
+            stmt.execute("GRANT SELECT ON whoami_view TO view_caller");
             stmt.execute("SET ROLE view_caller");
 
             try (ResultSet rs = stmt.executeQuery("SELECT u FROM whoami_view")) {

@@ -366,7 +366,8 @@ class DdlTableExecutor {
             if (entry.schema != null && !entry.schema.equalsIgnoreCase(schemaName)) continue;
             for (String grantee : entry.grantees) {
                 for (String priv : entry.privileges) {
-                    executor.database.addRolePrivilege(grantee, priv, "TABLE", tableName);
+                    executor.database.addRolePrivilege(grantee, priv, "TABLE",
+                            AstExecutor.privilegeKey(schemaName, tableName));
                 }
             }
         }
@@ -839,7 +840,7 @@ class DdlTableExecutor {
                 }
             }
             executor.database.removeObjectOwner("table:" + schemaName + "." + name);
-            executor.database.removePrivilegesOnObject("TABLE", name);
+            executor.database.removePrivilegesOnObject("TABLE", AstExecutor.privilegeKey(schemaName, name));
         } else if (!ifExists) {
             if ("pg_catalog".equalsIgnoreCase(schemaName) || "information_schema".equalsIgnoreCase(schemaName)) {
                 throw new MemgresException("table \"" + name + "\" does not exist", "42P01");
