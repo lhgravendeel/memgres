@@ -79,6 +79,14 @@ class ParserAndCatalogResidualsTest {
         assertEquals(Arrays.asList("1"), rows("SELECT count(*) FROM (SELECT 1 EXCEPT VALUES (2)) s"));
     }
 
+    /** A VALUES list stands on either side of the operator. */
+    @Test
+    void aBareValuesListWorksAsTheLeftArmToo() throws Exception {
+        assertEquals(Arrays.asList("2"), rows("SELECT count(*) FROM (VALUES (1) UNION ALL SELECT 2) s"));
+        assertEquals(Arrays.asList("1"), rows("SELECT count(*) FROM (VALUES (1),(2) INTERSECT SELECT 1) s"));
+        assertEquals(Arrays.asList("1"), rows("SELECT count(*) FROM (VALUES (1),(2) EXCEPT SELECT 1) s"));
+    }
+
     @Test
     void bracesInAJsonbArrayElementOpenAnObject() throws Exception {
         assertEquals(Arrays.asList("{\"k\": 1}"),

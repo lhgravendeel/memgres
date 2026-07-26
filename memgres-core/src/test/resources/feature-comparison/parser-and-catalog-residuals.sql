@@ -24,6 +24,25 @@ SELECT count(*) AS n FROM (SELECT 1 UNION ALL VALUES (2)) s;
 -- end-expected
 SELECT count(*) AS n FROM (SELECT 1 INTERSECT VALUES (1)) s;
 
+-- ...and on the left as well as the right
+-- begin-expected
+-- columns: n
+-- row: 2
+-- end-expected
+SELECT count(*) AS n FROM (VALUES (1) UNION ALL SELECT 2) s;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*) AS n FROM (VALUES (1),(2) INTERSECT SELECT 1) s;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*) AS n FROM (VALUES (1),(2) EXCEPT SELECT 1) s;
+
 -- ============================================================================
 -- 2. Braces in a jsonb array element open an object
 -- ============================================================================
