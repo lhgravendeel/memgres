@@ -191,10 +191,15 @@ public class TsVector {
                             entries.add(new PosEntry(pos, weight));
                         }
                     }
-                    // Skip comma separator
+                    // A position entry ends at a comma or at the end of the token; anything
+                    // else (a stray letter, say) means the literal is malformed, and PG says so
                     if (i < len && input.charAt(i) == ',') {
                         i++;
                     } else {
+                        if (i < len && !Character.isWhitespace(input.charAt(i))) {
+                            throw new MemgresException(
+                                    "syntax error in tsvector: \"" + input + "\"", "42601");
+                        }
                         break;
                     }
                 }

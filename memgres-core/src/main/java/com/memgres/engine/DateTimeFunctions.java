@@ -9,6 +9,12 @@ import com.memgres.engine.util.Strs;
 class DateTimeFunctions {
     private static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
+    /** Units below a day, which a date value cannot answer. */
+    private static final java.util.Set<String> SUB_DAY_UNITS = new java.util.HashSet<>(
+            java.util.Arrays.asList("hour", "hours", "minute", "minutes", "second", "seconds",
+                    "millisecond", "milliseconds", "microsecond", "microseconds",
+                    "timezone", "timezone_hour", "timezone_minute"));
+
     private final AstExecutor executor;
 
     DateTimeFunctions(AstExecutor executor) {
@@ -342,6 +348,13 @@ class DateTimeFunctions {
         else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
         else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).withOffsetSameInstant(java.time.ZoneOffset.UTC).toLocalDateTime();
         else dt = TypeCoercion.toLocalDateTime(source);
+
+        // A date has no time of day, so PG refuses the sub-day units outright rather than
+        // reporting the zero that midnight would give
+        if (originalSource instanceof java.time.LocalDate && SUB_DAY_UNITS.contains(field)) {
+            throw new MemgresException(
+                    "unit \"" + field + "\" not supported for type date", "0A000");
+        }
 
         switch (field) {
             case "year":

@@ -501,6 +501,11 @@ public class AstExecutor {
         return session != null ? session.getEffectiveSchema() : "public";
     }
 
+    /** The schema a CREATE lands in; raises when search_path names no usable schema. */
+    String creationSchema() {
+        return session != null ? session.getCreationSchema() : "public";
+    }
+
     String sessionUser() {
         if (session != null && session.getConnectingUser() != null) {
             return session.getConnectingUser();

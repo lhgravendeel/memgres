@@ -22,7 +22,7 @@ class DdlTableExecutor {
     // ---- CREATE TABLE ----
 
     QueryResult executeCreateTable(CreateTableStmt stmt) {
-        String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        String schemaName = stmt.schema() != null ? stmt.schema() : executor.creationSchema();
         if (stmt.temporary()) {
             schemaName = executor.session != null ? executor.session.getTempSchemaName() : "pg_temp";
         }
@@ -1092,7 +1092,7 @@ class DdlTableExecutor {
     // ---- CREATE TABLE AS / SELECT INTO ----
 
     QueryResult executeCreateTableAs(CreateTableAsStmt stmt) {
-        String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        String schemaName = stmt.schema() != null ? stmt.schema() : executor.creationSchema();
         Schema schema = executor.database.getOrCreateSchema(schemaName);
 
         if (schema.getTable(stmt.name()) != null) {
