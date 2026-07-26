@@ -889,6 +889,55 @@ class DdlTableExecutor {
 
     // ---- TRUNCATE ----
 
+    /**
+     * Truncate every table with a foreign key onto {@code parentName}, then repeat for those
+     * tables' own dependents. Each cascaded truncation records undo, fires the child's
+     * statement-level TRUNCATE triggers and syncs the session's RR snapshot, exactly as if
+     * the child had been named in the TRUNCATE itself.
+     */
+    private void truncateCascade(String parentName, String parentSchema, Set<Table> done) {
+        for (Map.Entry<String, Schema> se : executor.database.getSchemas().entrySet()) {
+            for (Table child : new ArrayList<>(se.getValue().getTables().values())) {
+                if (done.contains(child)) continue;
+                boolean references = false;
+                for (StoredConstraint sc : child.getConstraints()) {
+                    if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                    if (!sc.getReferencesTable().equalsIgnoreCase(parentName)) continue;
+                    if (sc.getReferencesSchema() != null
+                            && !sc.getReferencesSchema().equalsIgnoreCase(parentSchema)) continue;
+                    references = true;
+                    break;
+                }
+                if (!references) continue;
+                done.add(child);
+                String childSchema = se.getKey();
+                executor.recordUndo(new Session.TruncateUndo(childSchema, child.getName(),
+                        new ArrayList<>(child.getRows()), child.getSerialCounter()));
+                List<PgTrigger> childTriggers = executor.database.getTriggersForTable(child.getName());
+                fireTruncateStatementTriggers(childTriggers, PgTrigger.Timing.BEFORE, child);
+                child.deleteAll();
+                if (executor.session != null) {
+                    executor.session.clearRRSnapshotForTable(childSchema + "." + child.getName());
+                }
+                fireTruncateStatementTriggers(childTriggers, PgTrigger.Timing.AFTER, child);
+                truncateCascade(child.getName(), childSchema, done);
+            }
+        }
+    }
+
+    /** Run the statement-level TRUNCATE triggers of one timing for a table. */
+    private void fireTruncateStatementTriggers(List<PgTrigger> triggers, PgTrigger.Timing timing, Table table) {
+        for (PgTrigger trig : triggers) {
+            if (trig.isDisabled() || trig.getEvent() != PgTrigger.Event.TRUNCATE
+                    || trig.getTiming() != timing || !trig.isForEachStatement()) continue;
+            PgFunction fn = executor.database.getFunction(trig.getFunctionName());
+            if (fn != null) {
+                new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session)
+                        .executeTriggerFunction(fn, null, null, table, trig);
+            }
+        }
+    }
+
     QueryResult executeTruncate(TruncateStmt stmt) {
         int totalCount = 0;
         for (int tableIdx = 0; tableIdx < stmt.tables().size(); tableIdx++) {
@@ -919,6 +968,11 @@ class DdlTableExecutor {
                         found = true;
                         // C6: Enforce TRUNCATE privilege
                         executor.checkTablePrivilege("TRUNCATE", schemaName, bareName);
+                        // TRUNCATE takes ACCESS EXCLUSIVE, so it waits behind any open reader
+                        if (executor.session != null) {
+                            executor.database.acquireTableLock(schemaName + "." + bareName,
+                                    "AccessExclusiveLock", executor.session, false);
+                        }
                         // PG rejects TRUNCATE ONLY on a partitioned table: rows live in the
                         // partitions, so ONLY (which excludes them) can never be honored
                         if (truncateOnly && table.getPartitionStrategy() != null) {
@@ -979,21 +1033,13 @@ class DdlTableExecutor {
                                 executor.session.clearRRSnapshotForTable(targetSchema + "." + target.getName());
                             }
                         }
-                        // CASCADE: truncate dependent tables
+                        // CASCADE: truncate dependent tables, recursively — PG treats each
+                        // cascaded child as a full TRUNCATE (undo, triggers, snapshot sync)
                         if (stmt.cascade()) {
-                            for (Schema s : executor.database.getSchemas().values()) {
-                                for (Table otherTable : s.getTables().values()) {
-                                    if (otherTable == table) continue;
-                                    for (StoredConstraint sc : otherTable.getConstraints()) {
-                                        if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
-                                        if (!sc.getReferencesTable().equalsIgnoreCase(bareName)) continue;
-                                        if (sc.getReferencesSchema() != null
-                                                && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
-                                        otherTable.deleteAll();
-                                        break; // one match is enough to truncate this table
-                                    }
-                                }
-                            }
+                            Set<Table> cascaded = Collections.newSetFromMap(new IdentityHashMap<Table, Boolean>());
+                            cascaded.add(table);
+                            for (Table target : truncateTargets) cascaded.add(target);
+                            truncateCascade(bareName, schemaName, cascaded);
                         }
                         if (stmt.restartIdentity()) {
                             for (Table target : truncateTargets) {

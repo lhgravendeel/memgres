@@ -445,6 +445,7 @@ class SelectParser {
         String lockMode = null;
         boolean nowait = false;
         boolean skipLocked = false;
+        List<String> forUpdateTables = new ArrayList<>();
         while (parser.checkKeyword("FOR")) {
             parser.advance(); // consume FOR
             if (parser.matchKeyword("NO")) {
@@ -461,7 +462,7 @@ class SelectParser {
             }
             // Optional: OF table_name [, ...]
             if (parser.matchKeyword("OF")) {
-                List<String> forUpdateTables = new ArrayList<>();
+                forUpdateTables = new ArrayList<>();
                 forUpdateTables.add(parser.readIdentifier());
                 while (parser.match(TokenType.COMMA)) forUpdateTables.add(parser.readIdentifier());
                 // Validate that the table names exist in the FROM clause
@@ -488,7 +489,9 @@ class SelectParser {
                     }
                     for (String fut : forUpdateTables) {
                         if (!fromNames.contains(fut.toLowerCase())) {
-                            throw new ParseException("relation \"" + fut + "\" in FOR UPDATE clause not found in FROM clause", parser.peek(), "42P01");
+                            // Not a syntax error: PG reports the missing relation by name
+                            throw new com.memgres.engine.MemgresException(
+                                    "relation \"" + fut + "\" in FOR UPDATE clause not found in FROM clause", "42P01");
                         }
                     }
                 }
@@ -501,7 +504,8 @@ class SelectParser {
                 skipLocked = true;
             }
         }
-        SelectStmt.LockClause lockClause = lockMode != null ? new SelectStmt.LockClause(lockMode, nowait, skipLocked) : null;
+        SelectStmt.LockClause lockClause = lockMode != null
+                ? new SelectStmt.LockClause(lockMode, nowait, skipLocked, forUpdateTables) : null;
 
         // PG allows LIMIT/OFFSET after FOR clauses
         if (limit == null && parser.matchKeyword("LIMIT")) {

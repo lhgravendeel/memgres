@@ -48,8 +48,19 @@ class DdlAlterTableExecutor {
             throw e;
         }
 
+        // ALTER TABLE takes ACCESS EXCLUSIVE, so it waits behind any open reader
+        if (executor.session != null) {
+            executor.database.acquireTableLock(schemaName + "." + stmt.table(),
+                    "AccessExclusiveLock", executor.session, false);
+        }
+
         for (AlterTableStmt.AlterAction action : stmt.actions()) {
             table = executeAction(action, table, stmt, schemaName);
+        }
+
+        // The session's own DDL is visible to it, so its snapshot of the old shape must go
+        if (executor.session != null) {
+            executor.session.discardRRSnapshotForTable(schemaName + "." + stmt.table());
         }
 
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
