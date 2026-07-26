@@ -151,6 +151,7 @@ class DdlAlterTableExecutor {
             Schema newSchema = executor.database.getOrCreateSchema(setSchema.newSchema());
             oldSchema.removeTable(stmt.table());
             newSchema.addTable(table);
+            retargetDependents(schemaName, stmt.table(), setSchema.newSchema(), stmt.table());
         } else if (action instanceof AlterTableStmt.Inherit) {
             AlterTableStmt.Inherit inherit = (AlterTableStmt.Inherit) action;
             Table parentTable = executor.resolveTable(schemaName, inherit.parentTable());
@@ -516,7 +517,47 @@ class DdlAlterTableExecutor {
         }
         renamed.setRlsEnabled(table.isRlsEnabled());
         schema.addTable(renamed);
+        retargetDependents(schemaName, stmt.table(), schemaName, rename.newName());
         return renamed;
+    }
+
+    /**
+     * Follow a renamed or moved relation from everything that names it. PG records these
+     * dependencies as OIDs, so a rename leaves foreign keys enforcing and views reading the
+     * same relation; memgres stores names, so they have to be rewritten here.
+     */
+    private void retargetDependents(String oldSchema, String oldName, String newSchema, String newName) {
+        boolean moved = newSchema != null && !newSchema.equalsIgnoreCase(oldSchema);
+        for (Map.Entry<String, Schema> se : executor.database.getSchemas().entrySet()) {
+            for (Table t : new ArrayList<>(se.getValue().getTables().values())) {
+                for (StoredConstraint sc : t.getConstraints()) {
+                    if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
+                    if (!oldName.equalsIgnoreCase(sc.getReferencesTable())) continue;
+                    String refSchema = sc.getReferencesSchema();
+                    if (refSchema != null && !refSchema.equalsIgnoreCase(oldSchema)) continue;
+                    sc.setReferencesTable(newName);
+                    if (moved) sc.setReferencesSchema(newSchema);
+                }
+            }
+        }
+        for (Database.ViewDef view : new ArrayList<>(executor.database.getViews().values())) {
+            if (AstRelationRenamer.retarget(view.query(), oldSchema, oldName, newSchema, newName)) {
+                view.sourceSQL = rewriteSourceSql(view.sourceSQL(), oldSchema, oldName, newSchema, newName);
+            }
+        }
+    }
+
+    /** Rewrite the relation name inside a stored view definition so pg_get_viewdef reads true. */
+    private static String rewriteSourceSql(String sql, String oldSchema, String oldName,
+                                           String newSchema, String newName) {
+        if (sql == null) return null;
+        boolean moved = newSchema != null && !newSchema.equalsIgnoreCase(oldSchema);
+        String replacement = moved ? newSchema + "." + newName : newName;
+        String qualified = "(?i)\\b" + java.util.regex.Pattern.quote(oldSchema) + "\\."
+                + java.util.regex.Pattern.quote(oldName) + "\\b";
+        String bare = "(?i)\\b" + java.util.regex.Pattern.quote(oldName) + "\\b";
+        return sql.replaceAll(qualified, java.util.regex.Matcher.quoteReplacement(replacement))
+                  .replaceAll(bare, java.util.regex.Matcher.quoteReplacement(replacement));
     }
 
     private void executeAlterColumn(AlterTableStmt.AlterColumn alterCol, Table table,

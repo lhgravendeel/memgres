@@ -35,7 +35,11 @@ class SessionExecutor {
                 // Strip schema prefix for resolution and storage (e.g., "public.customers" -> "customers")
                 String schemaName = executor.defaultSchema();
                 String bareName = objName;
-                if (objName.contains(".") && !objType.equals("COLUMN")) {
+                // CONSTRAINT/TRIGGER/RULE/POLICY names are qualified by their relation, not a
+                // schema, so the prefix must survive into the stored key
+                boolean relationScoped = objType.equals("CONSTRAINT") || objType.equals("TRIGGER")
+                        || objType.equals("RULE") || objType.equals("POLICY");
+                if (objName.contains(".") && !objType.equals("COLUMN") && !relationScoped) {
                     int dot = objName.indexOf('.');
                     schemaName = objName.substring(0, dot);
                     bareName = objName.substring(dot + 1);

@@ -268,6 +268,19 @@ class CatalogMetadataFunctions {
                                     }
                                 }
                             }
+                            // Views carry column comments too, and are not in getTables()
+                            for (Database.ViewDef view : executor.database.getViews().values()) {
+                                int viewOid = executor.systemCatalog.getOid(
+                                        "rel:" + view.schemaName() + "." + view.name());
+                                if (viewOid != targetOid) continue;
+                                List<Column> vcols = view.cachedColumns();
+                                if (vcols != null && colNum >= 1 && colNum <= vcols.size()) {
+                                    String colName = vcols.get(colNum - 1).getName();
+                                    return executor.database.getComment("column",
+                                            view.name().toLowerCase() + "." + colName.toLowerCase());
+                                }
+                                return null;
+                            }
                         }
                     }
                 }
@@ -642,6 +655,34 @@ class CatalogMetadataFunctions {
             Number n = (Number) oidArg;
             targetOid = n.intValue();
         }
+        // A non-pg_class catalog argument selects a different comment namespace; resolve the
+        // OID back to the object it names instead of assuming it is a relation.
+        if (targetOid >= 0 && catalog != null && !catalog.equalsIgnoreCase("pg_class")) {
+            String key = oidKeyFor(targetOid);
+            if (key != null) {
+                String bare = key.substring(key.indexOf(':') + 1);
+                if (catalog.equalsIgnoreCase("pg_constraint") && key.startsWith("con:")) {
+                    String c = executor.database.getComment("constraint", bare.toLowerCase());
+                    if (c == null && bare.contains(".")) {
+                        c = executor.database.getComment("constraint",
+                                bare.substring(bare.lastIndexOf('.') + 1).toLowerCase());
+                    }
+                    return c;
+                }
+                if (catalog.equalsIgnoreCase("pg_proc") && key.startsWith("proc:")) {
+                    String fname = bare;
+                    int lp = fname.indexOf('(');
+                    if (lp > 0) fname = fname.substring(0, lp);
+                    return executor.database.getComment("function", fname.toLowerCase());
+                }
+                if (catalog.equalsIgnoreCase("pg_type") && key.startsWith("type:")) {
+                    String c = executor.database.getComment("type", bare.toLowerCase());
+                    if (c == null) c = executor.database.getComment("domain", bare.toLowerCase());
+                    return c;
+                }
+            }
+            return null;
+        }
         if (targetOid >= 0) {
             for (Schema schema : executor.database.getSchemas().values()) {
                 for (Table tbl : schema.getTables().values()) {
@@ -678,6 +719,14 @@ class CatalogMetadataFunctions {
             }
         }
         return comment;
+    }
+
+    /** Reverse-lookup: the catalog key that was assigned this OID, or null. */
+    private String oidKeyFor(int oid) {
+        for (Map.Entry<String, Integer> e : executor.systemCatalog.getOidMap().entrySet()) {
+            if (e.getValue() != null && e.getValue() == oid) return e.getKey();
+        }
+        return null;
     }
 
     private Object evalToRegclass(FunctionCallExpr fn, RowContext ctx) {

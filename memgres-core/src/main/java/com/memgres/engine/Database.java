@@ -2016,7 +2016,8 @@ public class Database {
         public final boolean materialized;
         public final List<Column> cachedColumns;
         public final List<Object[]> cachedRows;
-        public final String sourceSQL;
+        // sourceSQL is what pg_get_viewdef echoes; a rename of a referenced relation rewrites it
+        public String sourceSQL;
         public final String checkOption;
         public final Map<String, String> reloptions;
         /**
