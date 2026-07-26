@@ -48,6 +48,14 @@ class GeometricTypesCoverageTest {
         }
     }
 
+    /** Run a statement expected to fail and return its SQLSTATE. */
+    private String errorState(String sql) {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            try (Statement s = conn.createStatement()) { s.execute(sql); }
+        });
+        return e.getSQLState();
+    }
+
     private double queryDouble(String sql) throws SQLException {
         try (Statement s = conn.createStatement(); ResultSet rs = s.executeQuery(sql)) {
             assertTrue(rs.next());
@@ -199,8 +207,8 @@ class GeometricTypesCoverageTest {
 
     @Test
     void lseg_center() throws SQLException {
-        // PG: center(lseg) returns the midpoint
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+        // PG has center() for box and circle only
+        assertEquals("42883", errorState("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     @Test
@@ -264,8 +272,8 @@ class GeometricTypesCoverageTest {
 
     @Test
     void lseg_center_function_alt() throws SQLException {
-        // PG: center(lseg) returns the midpoint
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+        // PG has center() for box and circle only
+        assertEquals("42883", errorState("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     // ========================================================================
@@ -550,20 +558,22 @@ class GeometricTypesCoverageTest {
 
     @Test
     void polygon_area() throws SQLException {
-        // PG: area(polygon) returns the area
-        assertEquals(12.0, queryDouble("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')"), 0.01);
+        // PG has area() for box, circle and path only
+        assertEquals("42883", errorState("SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))')"));
+        assertEquals(12.0, queryDouble("SELECT area(path '((0,0),(4,0),(4,3),(0,3))')"), 0.01);
     }
 
     @Test
     void polygon_area_triangle() throws SQLException {
-        // PG: area(polygon) returns the area
-        assertEquals(6.0, queryDouble("SELECT area(polygon '((0,0),(4,0),(0,3))')"), 0.01);
+        // PG has area() for box, circle and path only
+        assertEquals("42883", errorState("SELECT area(polygon '((0,0),(4,0),(0,3))')"));
+        assertEquals(6.0, queryDouble("SELECT area(path '((0,0),(4,0),(0,3))')"), 0.01);
     }
 
     @Test
     void polygon_center() throws SQLException {
-        // PG: center(polygon) returns the centroid
-        assertEquals("(1,1)", query1("SELECT center(polygon '((0,0),(2,0),(2,2),(0,2))')"));
+        // PG has center() for box and circle only
+        assertEquals("42883", errorState("SELECT center(polygon '((0,0),(2,0),(2,2),(0,2))')"));
     }
 
     @Test
@@ -856,8 +866,8 @@ class GeometricTypesCoverageTest {
 
     @Test
     void measurement_center_lseg_function() throws SQLException {
-        // PG: center(lseg) returns the midpoint
-        assertEquals("(1,1)", query1("SELECT center(lseg '[(0,0),(2,2)]')"));
+        // PG has center() for box and circle only
+        assertEquals("42883", errorState("SELECT center(lseg '[(0,0),(2,2)]')"));
     }
 
     @Test
@@ -1066,8 +1076,9 @@ class GeometricTypesCoverageTest {
 
     @Test
     void polygon_unit_square_area() throws SQLException {
-        // PG: area(polygon) returns the area
-        assertEquals(1.0, queryDouble("SELECT area(polygon '((0,0),(1,0),(1,1),(0,1))')"), 0.01);
+        // PG has area() for box, circle and path only
+        assertEquals("42883", errorState("SELECT area(polygon '((0,0),(1,0),(1,1),(0,1))')"));
+        assertEquals(1.0, queryDouble("SELECT area(path '((0,0),(1,0),(1,1),(0,1))')"), 0.01);
     }
 
     @Test

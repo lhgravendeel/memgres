@@ -933,6 +933,8 @@ class BinaryOpEvaluator {
                     String ls0 = left.toString().trim();
                     String rs0 = right.toString().trim();
                     if (GeometricOperations.isGeometricString(ls0) && GeometricOperations.isGeometricString(rs0)) {
+                        // GeometricOperations.contains encodes PG's @> operator set and rejects
+                        // the pairs PG has no operator for
                         return GeometricOperations.contains(ls0, rs0);
                     }
                 }
@@ -2383,5 +2385,7 @@ class BinaryOpEvaluator {
         int scale = Math.max(0, 16 - (intDigits - 1));
         return bd.setScale(scale, java.math.RoundingMode.HALF_UP);
     }
+
+
 
 }

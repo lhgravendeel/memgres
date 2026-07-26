@@ -14,6 +14,94 @@ class GeometricFunctions {
         this.executor = executor;
     }
 
+    /**
+     * Reject a shape PG has no such function for. Geometric values are stored as text, so the
+     * shape is read back from the literal: a box is two points, a circle carries its radius.
+     * A three-point {@code ((..))} value is a polygon or a closed path, and PG defines neither
+     * center() nor a comparison for those.
+     */
+    private void requireBoxOrCircle(String text, String funcName) {
+        String shape = shapeName(text);
+        if ("circle".equals(shape) || "box".equals(shape)) return;
+        String t = text.trim();
+        throw new MemgresException("function " + funcName + "(" + shapeName(t) + ") does not exist"
+                + "\n  Hint: No function matches the given name and argument types.", "42883");
+    }
+
+    /** PG has area() for box, circle and path; a polygon, lseg, line or point has none. */
+    private void requireAreaShape(String declaredType, String text) {
+        String shape = declaredType != null ? declaredType : shapeName(text);
+        if (shape.equals("box") || shape.equals("circle") || shape.equals("path")) return;
+        throw new MemgresException("function area(" + shape + ") does not exist"
+                + "\n  Hint: No function matches the given name and argument types.", "42883");
+    }
+
+    /**
+     * The geometric type an argument expression is declared to have, or null when it carries no
+     * declaration. A type-annotated literal and a cast both name their type outright; a column
+     * reference takes it from the column. Anything else is an untyped literal, which PG itself
+     * cannot resolve to an overload without a cast.
+     */
+    private String declaredGeometricType(Expression expr, RowContext ctx) {
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName();
+            return name == null ? null : geometricTypeName(name.toLowerCase().trim());
+        }
+        if (expr instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) expr;
+            for (RowContext.TableBinding b : ctx.getBindings()) {
+                if (b.table() == null) continue;
+                if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
+                        && !ref.table().equalsIgnoreCase(b.table().getName())) {
+                    continue;
+                }
+                int idx = b.table().getColumnIndex(ref.column());
+                if (idx < 0) continue;
+                DataType type = b.table().getColumns().get(idx).getType();
+                return type == null ? null : geometricTypeName(type.getPgName());
+            }
+        }
+        return null;
+    }
+
+    /** The given type name when it names a geometric type, else null. */
+    private static String geometricTypeName(String name) {
+        switch (name) {
+            case "point": case "line": case "lseg":
+            case "box": case "path": case "polygon": case "circle":
+                return name;
+            default:
+                return null;
+        }
+    }
+
+    /** How many {@code (x,y)} pairs the literal holds. */
+    static int countPoints(String text) {
+        int n = 0;
+        for (int i = 0; i < text.length(); i++) {
+            if (text.charAt(i) == '(') n++;
+        }
+        return n;
+    }
+
+    /**
+     * The PG type a geometric value denotes, read back from its output form. PG's own rendering
+     * is the discriminator: a box prints its two points bare, {@code (1,1),(0,0)}, while a
+     * polygon or closed path wraps them, {@code ((0,0),(1,1))}.
+     */
+    static String shapeName(String text) {
+        String t = text.trim();
+        if (t.startsWith("<")) return "circle";
+        if (t.startsWith("{")) return "line";
+        if (t.startsWith("[")) return countPoints(t) == 2 ? "lseg" : "path";
+        if (t.startsWith("((")) return "polygon";
+        if (t.startsWith("(")) {
+            int pts = countPoints(t);
+            return pts <= 1 ? "point" : pts == 2 ? "box" : "polygon";
+        }
+        return "unknown";
+    }
+
     private void requireGeometric(Object arg, String funcName) {
         if (arg instanceof Number) {
             throw new MemgresException(
@@ -32,6 +120,10 @@ class GeometricFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 requireGeometric(arg, "area");
+                // PG defines area() for box, circle and path only. A closed path and a polygon
+                // print identically, so the value's text cannot tell them apart -- the declared
+                // type of the argument expression is what decides.
+                requireAreaShape(declaredGeometricType(fn.args().get(0), ctx), arg.toString());
                 return GeometricOperations.area(arg.toString());
             }
             case "center": {
@@ -41,6 +133,8 @@ class GeometricFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 requireGeometric(arg, "center");
+                // PG only defines center() for box and circle; a polygon, path or lseg has none
+                requireBoxOrCircle(arg.toString(), "center");
                 return GeometricOperations.format(GeometricOperations.center(arg.toString()));
             }
             case "diameter": {

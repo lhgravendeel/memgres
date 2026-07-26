@@ -1128,6 +1128,14 @@ public final class GeometricOperations {
             return true;
         }
         if (a instanceof PgPath && b instanceof PgPoint) return pathContainsPoint(((PgPath) a), ((PgPoint) b));
+        // A bracketed two-point value reads back as an lseg, but an lseg has no @> operator at
+        // all -- the only reading under which this containment exists is an open path, which is
+        // what PG's path @> point does.
+        if (a instanceof PgLseg && b instanceof PgPoint) {
+            PgLseg seg = (PgLseg) a;
+            return pathContainsPoint(new PgPath(java.util.Arrays.asList(seg.p1, seg.p2), false),
+                    ((PgPoint) b));
+        }
         throw new MemgresException("operator does not exist: " + pgTypeName(a) + " @> " + pgTypeName(b), "42883");
     }
 
