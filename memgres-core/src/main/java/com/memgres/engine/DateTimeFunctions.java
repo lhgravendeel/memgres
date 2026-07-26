@@ -55,6 +55,8 @@ class DateTimeFunctions {
                 int year = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
                 int month = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                 int day = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                // A negative year names a BC year, which is one lower as a proleptic year
+                if (year < 0) year = year + 1;
                 try {
                     return java.time.LocalDate.of(year, month, day);
                 } catch (java.time.DateTimeException e) {
@@ -310,16 +312,15 @@ class DateTimeFunctions {
                 case "seconds":
                     return java.math.BigDecimal.valueOf((iv.getMicroseconds() % 60_000_000L)).divide(java.math.BigDecimal.valueOf(1_000_000), 6, java.math.RoundingMode.HALF_UP).stripTrailingZeros();
                 case "epoch": {
-                    // PG uses 2629800 seconds per month (= 365.25/12 * 86400), not 30*86400
-                    long totalSecs = (long) iv.getMonths() * 2629800L + (long) iv.getDays() * 86400L;
+                    // PG splits the months: whole years count 365.25 days each, the leftover
+                    // months 30 days each. Always reported with 6 fractional digits.
+                    long totalSecs = (long) (iv.getMonths() / 12) * 31557600L
+                            + (long) (iv.getMonths() % 12) * 2592000L
+                            + (long) iv.getDays() * 86400L;
                     java.math.BigDecimal secsPart = java.math.BigDecimal.valueOf(totalSecs);
                     java.math.BigDecimal microsPart = java.math.BigDecimal.valueOf(iv.getMicroseconds())
                             .divide(java.math.BigDecimal.valueOf(1_000_000), 6, java.math.RoundingMode.HALF_UP);
-                    java.math.BigDecimal result = secsPart.add(microsPart);
-                    // Use toPlainString-compatible representation: strip trailing fractional zeros but keep integer form
-                    result = result.stripTrailingZeros();
-                    if (result.scale() < 0) result = result.setScale(0);
-                    return result;
+                    return secsPart.add(microsPart).setScale(6, java.math.RoundingMode.HALF_UP);
                 }
                 default:
                     throw new MemgresException("unit \"" + field + "\" not recognized for type interval", "22023");
@@ -335,7 +336,9 @@ class DateTimeFunctions {
         switch (field) {
             case "year":
             case "years":
-                return java.math.BigDecimal.valueOf(dt.getYear());
+                // PG has no year zero, so a BC proleptic year reports one lower
+                return java.math.BigDecimal.valueOf(
+                        dt.getYear() > 0 ? dt.getYear() : dt.getYear() - 1);
             case "month":
             case "months":
                 return java.math.BigDecimal.valueOf(dt.getMonthValue());
@@ -432,6 +435,9 @@ class DateTimeFunctions {
 
     private Object truncateDate(String field, Object source) {
         if (source == null) return null;
+        // date_trunc(unit, interval) zeroes every field below the unit; there is no calendar
+        // involved, so it is a separate rule from the timestamp one
+        if (source instanceof PgInterval) return truncateInterval(field, (PgInterval) source);
         java.time.LocalDateTime dt;
         boolean isDate = source instanceof java.time.LocalDate;
         if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
@@ -443,6 +449,19 @@ class DateTimeFunctions {
         switch (field) {
             case "year":
                 result = java.time.LocalDateTime.of(dt.getYear(), 1, 1, 0, 0);
+                break;
+            case "decade":
+            case "decades":
+                result = java.time.LocalDateTime.of(Math.floorDiv(dt.getYear(), 10) * 10, 1, 1, 0, 0);
+                break;
+            case "century":
+            case "centuries":
+                // The first century runs 1..100, so 2026 truncates to 2001, not 2000
+                result = java.time.LocalDateTime.of(centuryStart(dt.getYear(), 100), 1, 1, 0, 0);
+                break;
+            case "millennium":
+            case "millennia":
+                result = java.time.LocalDateTime.of(centuryStart(dt.getYear(), 1000), 1, 1, 0, 0);
                 break;
             case "quarter": {
                 int q = (dt.getMonthValue() - 1) / 3;
@@ -481,6 +500,35 @@ class DateTimeFunctions {
         if (isDate) return result.toLocalDate();
         if (source instanceof java.time.OffsetDateTime) return result.atOffset(java.time.ZoneOffset.UTC);
         return result;
+    }
+
+    /** The first year of the century/millennium containing {@code year} (PG counts from 1). */
+    private static int centuryStart(int year, int width) {
+        return Math.floorDiv(year - 1, width) * width + 1;
+    }
+
+    /** Zero every interval field smaller than the requested unit. */
+    private Object truncateInterval(String field, PgInterval iv) {
+        int months = iv.getMonths();
+        int days = iv.getDays();
+        long micros = iv.getMicroseconds();
+        switch (field) {
+            case "millennium": case "millennia": months -= months % 12000; days = 0; micros = 0; break;
+            case "century": case "centuries":    months -= months % 1200;  days = 0; micros = 0; break;
+            case "decade": case "decades":       months -= months % 120;   days = 0; micros = 0; break;
+            case "year": case "years":           months -= months % 12;    days = 0; micros = 0; break;
+            case "quarter": case "quarters":     months -= months % 3;     days = 0; micros = 0; break;
+            case "month": case "months":         days = 0; micros = 0; break;
+            case "day": case "days":             micros = 0; break;
+            case "hour": case "hours":           micros -= micros % 3_600_000_000L; break;
+            case "minute": case "minutes":       micros -= micros % 60_000_000L; break;
+            case "second": case "seconds":       micros -= micros % 1_000_000L; break;
+            case "millisecond": case "milliseconds": micros -= micros % 1_000L; break;
+            case "microsecond": case "microseconds": break;
+            default:
+                throw new MemgresException("unit \"" + field + "\" not recognized for type interval", "22023");
+        }
+        return new PgInterval(months, days, micros);
     }
 
     private String formatToChar(Object source, String fmt) {

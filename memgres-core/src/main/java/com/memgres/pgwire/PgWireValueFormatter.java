@@ -68,7 +68,7 @@ class PgWireValueFormatter {
             } else if (datestyle != null && datestyle.toLowerCase().contains("sql")) {
                 return ld.format(DateTimeFormatter.ofPattern("MM/dd/yyyy"));
             }
-            return ld.toString();
+            return com.memgres.engine.TypeCoercion.formatIsoDate(ld);
         } else if (val instanceof LocalDateTime) {
             LocalDateTime dt = (LocalDateTime) val;
             String datestyle = guc != null ? guc.get("datestyle") : "ISO, MDY";
@@ -80,9 +80,13 @@ class PgWireValueFormatter {
             } else if (datestyle != null && datestyle.toLowerCase().contains("sql")) {
                 return dt.format(DateTimeFormatter.ofPattern("MM/dd/yyyy")) + " " + timePart;
             }
-            return dt.getNano() != 0
-                    ? stripTrailingFracZeros(dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS")))
-                    : dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            String datePart = String.format("%04d-%02d-%02d",
+                    com.memgres.engine.TypeCoercion.displayYear(dt.getYear()),
+                    dt.getMonthValue(), dt.getDayOfMonth());
+            String era = com.memgres.engine.TypeCoercion.eraSuffix(dt.getYear());
+            return (dt.getNano() != 0
+                    ? stripTrailingFracZeros(datePart + " " + dt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
+                    : datePart + " " + dt.format(DateTimeFormatter.ofPattern("HH:mm:ss"))) + era;
         } else if (val instanceof OffsetDateTime) {
             OffsetDateTime odt = (OffsetDateTime) val;
             if (guc != null) {
