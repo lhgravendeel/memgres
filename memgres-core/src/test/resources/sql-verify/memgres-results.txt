@@ -109,18 +109,18 @@ ROW: 7 | Returned | 7.77
 SQL: INSERT INTO configs (key, value) VALUES ('new_key', 'new_val') RETURNING *
 RESULT: 3 columns, 1 rows
 COLUMNS: key, value, updated_at
-ROW: new_key | new_val | 2026-07-20 18:39:15.164253+00
+ROW: new_key | new_val | 2026-04-10 10:05:26.782167+00
 --- STMT 36 ---
 SQL: -- === Basic SELECTs === SELECT * FROM items
 RESULT: 5 columns, 7 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 9.99 | t | 2026-07-20 18:39:14.849753
-ROW: 2 | Gadget | 19.99 | t | 2026-07-20 18:39:14.876931
-ROW: 3 | Doohickey | 4.50 | f | 2026-07-20 18:39:14.877762
-ROW: 4 | Thingamajig | 149.99 | t | 2026-07-20 18:39:14.878442
-ROW: 5 | Whatchamacallit | 0.99 | t | 2026-07-20 18:39:14.878992
-ROW: 6 | Default Item | 0.00 | t | 2026-07-20 18:39:15.065178
-ROW: 7 | Returned | 7.77 | t | 2026-07-20 18:39:15.163409
+ROW: 1 | Widget | 9.99 | t | 2026-04-10 10:05:26.417487
+ROW: 2 | Gadget | 19.99 | t | 2026-04-10 10:05:26.454569
+ROW: 3 | Doohickey | 4.50 | f | 2026-04-10 10:05:26.455375
+ROW: 4 | Thingamajig | 149.99 | t | 2026-04-10 10:05:26.456057
+ROW: 5 | Whatchamacallit | 0.99 | t | 2026-04-10 10:05:26.456637
+ROW: 6 | Default Item | 0.00 | t | 2026-04-10 10:05:26.672404
+ROW: 7 | Returned | 7.77 | t | 2026-04-10 10:05:26.781096
 --- STMT 37 ---
 SQL: SELECT id, name, price FROM items WHERE active = true
 RESULT: 3 columns, 6 rows
@@ -152,59 +152,59 @@ ROW: Widget
 SQL: SELECT * FROM items LIMIT 2
 RESULT: 5 columns, 2 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 9.99 | t | 2026-07-20 18:39:14.849753
-ROW: 2 | Gadget | 19.99 | t | 2026-07-20 18:39:14.876931
+ROW: 1 | Widget | 9.99 | t | 2026-04-10 10:05:26.417487
+ROW: 2 | Gadget | 19.99 | t | 2026-04-10 10:05:26.454569
 --- STMT 41 ---
 SQL: SELECT * FROM items LIMIT 2 OFFSET 2
 RESULT: 5 columns, 2 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 3 | Doohickey | 4.50 | f | 2026-07-20 18:39:14.877762
-ROW: 4 | Thingamajig | 149.99 | t | 2026-07-20 18:39:14.878442
+ROW: 3 | Doohickey | 4.50 | f | 2026-04-10 10:05:26.455375
+ROW: 4 | Thingamajig | 149.99 | t | 2026-04-10 10:05:26.456057
 --- STMT 42 ---
 SQL: SELECT * FROM items WHERE name LIKE '%get%'
 RESULT: 5 columns, 2 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 9.99 | t | 2026-07-20 18:39:14.849753
-ROW: 2 | Gadget | 19.99 | t | 2026-07-20 18:39:14.876931
+ROW: 1 | Widget | 9.99 | t | 2026-04-10 10:05:26.417487
+ROW: 2 | Gadget | 19.99 | t | 2026-04-10 10:05:26.454569
 --- STMT 43 ---
 SQL: SELECT * FROM items WHERE name ILIKE '%WIDGET%'
 RESULT: 5 columns, 1 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 9.99 | t | 2026-07-20 18:39:14.849753
+ROW: 1 | Widget | 9.99 | t | 2026-04-10 10:05:26.417487
 --- STMT 44 ---
 SQL: SELECT * FROM items WHERE price BETWEEN 5 AND 50
 RESULT: 5 columns, 3 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 9.99 | t | 2026-07-20 18:39:14.849753
-ROW: 2 | Gadget | 19.99 | t | 2026-07-20 18:39:14.876931
-ROW: 7 | Returned | 7.77 | t | 2026-07-20 18:39:15.163409
+ROW: 1 | Widget | 9.99 | t | 2026-04-10 10:05:26.417487
+ROW: 2 | Gadget | 19.99 | t | 2026-04-10 10:05:26.454569
+ROW: 7 | Returned | 7.77 | t | 2026-04-10 10:05:26.781096
 --- STMT 45 ---
 SQL: SELECT * FROM items WHERE id IN (1, 3, 5)
 RESULT: 5 columns, 3 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 9.99 | t | 2026-07-20 18:39:14.849753
-ROW: 3 | Doohickey | 4.50 | f | 2026-07-20 18:39:14.877762
-ROW: 5 | Whatchamacallit | 0.99 | t | 2026-07-20 18:39:14.878992
+ROW: 1 | Widget | 9.99 | t | 2026-04-10 10:05:26.417487
+ROW: 3 | Doohickey | 4.50 | f | 2026-04-10 10:05:26.455375
+ROW: 5 | Whatchamacallit | 0.99 | t | 2026-04-10 10:05:26.456637
 --- STMT 46 ---
 SQL: SELECT * FROM items WHERE active IS TRUE
 RESULT: 5 columns, 6 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 9.99 | t | 2026-07-20 18:39:14.849753
-ROW: 2 | Gadget | 19.99 | t | 2026-07-20 18:39:14.876931
-ROW: 4 | Thingamajig | 149.99 | t | 2026-07-20 18:39:14.878442
-ROW: 5 | Whatchamacallit | 0.99 | t | 2026-07-20 18:39:14.878992
-ROW: 6 | Default Item | 0.00 | t | 2026-07-20 18:39:15.065178
-ROW: 7 | Returned | 7.77 | t | 2026-07-20 18:39:15.163409
+ROW: 1 | Widget | 9.99 | t | 2026-04-10 10:05:26.417487
+ROW: 2 | Gadget | 19.99 | t | 2026-04-10 10:05:26.454569
+ROW: 4 | Thingamajig | 149.99 | t | 2026-04-10 10:05:26.456057
+ROW: 5 | Whatchamacallit | 0.99 | t | 2026-04-10 10:05:26.456637
+ROW: 6 | Default Item | 0.00 | t | 2026-04-10 10:05:26.672404
+ROW: 7 | Returned | 7.77 | t | 2026-04-10 10:05:26.781096
 --- STMT 47 ---
 SQL: SELECT * FROM items WHERE active IS NOT FALSE
 RESULT: 5 columns, 6 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 9.99 | t | 2026-07-20 18:39:14.849753
-ROW: 2 | Gadget | 19.99 | t | 2026-07-20 18:39:14.876931
-ROW: 4 | Thingamajig | 149.99 | t | 2026-07-20 18:39:14.878442
-ROW: 5 | Whatchamacallit | 0.99 | t | 2026-07-20 18:39:14.878992
-ROW: 6 | Default Item | 0.00 | t | 2026-07-20 18:39:15.065178
-ROW: 7 | Returned | 7.77 | t | 2026-07-20 18:39:15.163409
+ROW: 1 | Widget | 9.99 | t | 2026-04-10 10:05:26.417487
+ROW: 2 | Gadget | 19.99 | t | 2026-04-10 10:05:26.454569
+ROW: 4 | Thingamajig | 149.99 | t | 2026-04-10 10:05:26.456057
+ROW: 5 | Whatchamacallit | 0.99 | t | 2026-04-10 10:05:26.456637
+ROW: 6 | Default Item | 0.00 | t | 2026-04-10 10:05:26.672404
+ROW: 7 | Returned | 7.77 | t | 2026-04-10 10:05:26.781096
 --- STMT 48 ---
 SQL: SELECT COUNT(*) FROM items
 RESULT: 1 columns, 1 rows
@@ -239,7 +239,7 @@ OK: 6 rows affected
 SQL: UPDATE items SET active = true WHERE id = 3 RETURNING *
 RESULT: 5 columns, 1 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 3 | Doohickey | 4.50 | t | 2026-07-20 18:39:14.877762
+ROW: 3 | Doohickey | 4.50 | t | 2026-04-10 10:05:26.455375
 --- STMT 55 ---
 SQL: UPDATE configs SET value = '50', updated_at = now() WHERE key = 'page_size' RETURNING key, value
 RESULT: 2 columns, 1 rows
@@ -257,7 +257,7 @@ ROW: Whatchamacallit
 SQL: DELETE FROM configs WHERE key = 'new_key' RETURNING *
 RESULT: 3 columns, 1 rows
 COLUMNS: key, value, updated_at
-ROW: new_key | new_val | 2026-07-20 18:39:15.164253+00
+ROW: new_key | new_val | 2026-04-10 10:05:26.782167+00
 --- STMT 59 ---
 SQL: -- === Verify state === SELECT COUNT(*) FROM items
 RESULT: 1 columns, 1 rows
@@ -267,19 +267,19 @@ ROW: 6
 SQL: SELECT * FROM items ORDER BY id
 RESULT: 5 columns, 6 rows
 COLUMNS: id, name, price, active, created_at
-ROW: 1 | Widget | 10.99 | t | 2026-07-20 18:39:14.849753
-ROW: 2 | Gadget | 21.99 | t | 2026-07-20 18:39:14.876931
-ROW: 3 | Doohickey | 4.50 | t | 2026-07-20 18:39:14.877762
-ROW: 4 | Thingamajig | 164.99 | t | 2026-07-20 18:39:14.878442
-ROW: 6 | Default Item | 0.00 | t | 2026-07-20 18:39:15.065178
-ROW: 7 | Returned | 8.55 | t | 2026-07-20 18:39:15.163409
+ROW: 1 | Widget | 10.99 | t | 2026-04-10 10:05:26.417487
+ROW: 2 | Gadget | 21.99 | t | 2026-04-10 10:05:26.454569
+ROW: 3 | Doohickey | 4.50 | t | 2026-04-10 10:05:26.455375
+ROW: 4 | Thingamajig | 164.99 | t | 2026-04-10 10:05:26.456057
+ROW: 6 | Default Item | 0.00 | t | 2026-04-10 10:05:26.672404
+ROW: 7 | Returned | 8.55 | t | 2026-04-10 10:05:26.781096
 --- STMT 61 ---
 SQL: SELECT * FROM configs ORDER BY key
 RESULT: 3 columns, 3 rows
 COLUMNS: key, value, updated_at
-ROW: lang | en | 2026-07-20 18:39:14.883877+00
-ROW: page_size | 50 | 2026-07-20 18:39:15.431797+00
-ROW: theme | dark | 2026-07-20 18:39:14.883308+00
+ROW: lang | en | 2026-04-10 10:05:26.466554+00
+ROW: page_size | 50 | 2026-04-10 10:05:26.950172+00
+ROW: theme | dark | 2026-04-10 10:05:26.465638+00
 --- STMT 62 ---
 SQL: -- === DROP === DROP TABLE IF EXISTS nonexistent_table
 OK: 0 rows affected
@@ -422,55 +422,55 @@ ROW: beta
 ROW: alpha
 --- STMT 11 ---
 SQL: -- === Misspelled keywords === SLECT * FROM syn_test
-ERROR [42601]: ERROR: syntax error at or near "slect"
+ERROR [42601]: ERROR: Expected SQL statement at position 32 near 'slect'
 --- STMT 12 ---
 SQL: SELEC * FROM syn_test
-ERROR [42601]: ERROR: syntax error at or near "selec"
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'selec'
 --- STMT 13 ---
 SQL: SELECT * FORM syn_test
-ERROR [42601]: ERROR: syntax error at or near "form"
+ERROR [42601]: ERROR: syntax error at or near "form" at position 9 near 'form'
 --- STMT 14 ---
 SQL: SELECT * FROM syn_test WHER val > 1
-ERROR [42601]: ERROR: syntax error at or near "val"
+ERROR [42601]: ERROR: syntax error at or near "val" at position 28 near 'val'
 --- STMT 15 ---
 SQL: SELECT * FROM syn_test WEHRE val > 1
-ERROR [42601]: ERROR: syntax error at or near "val"
+ERROR [42601]: ERROR: syntax error at or near "val" at position 29 near 'val'
 --- STMT 16 ---
 SQL: CREAT TABLE bad1 (id int)
-ERROR [42601]: ERROR: syntax error at or near "creat"
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'creat'
 --- STMT 17 ---
 SQL: CRATE TABLE bad2 (id int)
-ERROR [42601]: ERROR: syntax error at or near "crate"
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'crate'
 --- STMT 18 ---
 SQL: INSRT INTO syn_test (name) VALUES ('x')
-ERROR [42601]: ERROR: syntax error at or near "insrt"
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'insrt'
 --- STMT 19 ---
 SQL: INSER INTO syn_test (name) VALUES ('x')
-ERROR [42601]: ERROR: syntax error at or near "inser"
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'inser'
 --- STMT 20 ---
 SQL: UPDAT syn_test SET val = 1
-ERROR [42601]: ERROR: syntax error at or near "updat"
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'updat'
 --- STMT 21 ---
 SQL: DELET FROM syn_test
-ERROR [42601]: ERROR: syntax error at or near "delet"
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'delet'
 --- STMT 22 ---
 SQL: DELTE FROM syn_test
-ERROR [42601]: ERROR: syntax error at or near "delte"
+ERROR [42601]: ERROR: Expected SQL statement at position 0 near 'delte'
 --- STMT 23 ---
 SQL: -- === Missing required clauses === SELECT * FROM
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected identifier at position 50 near ''
 --- STMT 24 ---
 SQL: SELECT * FROM syn_test WHERE
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 28 near ''
 --- STMT 25 ---
 SQL: SELECT * FROM syn_test ORDER BY
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 31 near ''
 --- STMT 26 ---
 SQL: SELECT * FROM syn_test GROUP BY
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 31 near ''
 --- STMT 27 ---
 SQL: SELECT * FROM syn_test HAVING
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 29 near ''
 --- STMT 28 ---
 SQL: SELECT FROM syn_test WHERE val > 1
 RESULT: 0 columns, 3 rows
@@ -480,103 +480,103 @@ ROW:
 ROW: 
 --- STMT 29 ---
 SQL: INSERT INTO
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected identifier at position 11 near ''
 --- STMT 30 ---
 SQL: INSERT INTO syn_test VALUES
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 27 near ''
 --- STMT 31 ---
 SQL: INSERT INTO syn_test (name) VALUES
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 34 near ''
 --- STMT 32 ---
 SQL: UPDATE SET val = 1
-ERROR [42601]: ERROR: syntax error at or near "="
+ERROR [42601]: ERROR: Expected keyword SET at position 15 near '='
 --- STMT 33 ---
 SQL: UPDATE syn_test SET
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected identifier at position 19 near ''
 --- STMT 34 ---
 SQL: DELETE FROM
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected identifier at position 11 near ''
 --- STMT 35 ---
 SQL: CREATE TABLE
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected identifier at position 12 near ''
 --- STMT 36 ---
 SQL: CREATE TABLE t1
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 15 near ''
 --- STMT 37 ---
 SQL: DROP TABLE
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected identifier at position 10 near ''
 --- STMT 38 ---
 SQL: ALTER TABLE
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected identifier at position 11 near ''
 --- STMT 39 ---
 SQL: -- === Duplicate clauses === SELECT * FROM syn_test WHERE val > 1 WHERE val < 100
-ERROR [42601]: ERROR: syntax error at or near "WHERE"
+ERROR [42601]: ERROR: Multiple WHERE clauses at position 67 near 'WHERE'
 --- STMT 40 ---
 SQL: SELECT * FROM syn_test ORDER BY val ORDER BY name
-ERROR [42601]: ERROR: syntax error at or near "ORDER"
+ERROR [42601]: ERROR: Multiple ORDER BY clauses at position 36 near 'ORDER'
 --- STMT 41 ---
 SQL: SELECT * FROM syn_test LIMIT 1 LIMIT 2
-ERROR [42601]: ERROR: syntax error at or near "LIMIT"
+ERROR [42601]: ERROR: Multiple LIMIT clauses at position 31 near 'LIMIT'
 --- STMT 42 ---
 SQL: -- === Unmatched parentheses === SELECT * FROM syn_test WHERE (val > 1
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 71 near ''
 --- STMT 43 ---
 SQL: SELECT * FROM syn_test WHERE val > 1)
-ERROR [42601]: ERROR: syntax error at or near ")"
+ERROR [42601]: ERROR: syntax error at or near ")" at position 36 near ')'
 --- STMT 44 ---
 SQL: INSERT INTO syn_test (name, val VALUES ('x', 1)
-ERROR [42601]: ERROR: syntax error at or near "VALUES"
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found KEYWORD at position 32 near 'VALUES'
 --- STMT 45 ---
 SQL: INSERT INTO syn_test (name, val) VALUES ('x', 1
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 47 near ''
 --- STMT 46 ---
 SQL: SELECT (1 + 2
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 13 near ''
 --- STMT 47 ---
 SQL: SELECT 1 + 2)
-ERROR [42601]: ERROR: syntax error at or near ")"
+ERROR [42601]: ERROR: syntax error at or near ")" at position 12 near ')'
 --- STMT 48 ---
 SQL: CREATE TABLE bad_parens (id int, name text
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected RIGHT_PAREN but found EOF at position 42 near ''
 --- STMT 49 ---
 SQL: -- === Incomplete expressions === SELECT 1 +
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 45 near ''
 --- STMT 50 ---
 SQL: SELECT 1 *
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 10 near ''
 --- STMT 51 ---
 SQL: SELECT * FROM syn_test WHERE val =
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 34 near ''
 --- STMT 52 ---
 SQL: SELECT * FROM syn_test WHERE val = AND name = 'alpha'
-ERROR [42601]: ERROR: syntax error at or near "AND"
+ERROR [42601]: ERROR: syntax error at or near "AND" at position 35 near 'AND'
 --- STMT 53 ---
 SQL: SELECT * FROM syn_test WHERE AND val > 1
-ERROR [42601]: ERROR: syntax error at or near "AND"
+ERROR [42601]: ERROR: syntax error at or near "AND" at position 29 near 'AND'
 --- STMT 54 ---
 SQL: SELECT * FROM syn_test WHERE val > 1 AND
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 40 near ''
 --- STMT 55 ---
 SQL: SELECT * FROM syn_test WHERE val BETWEEN
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 40 near ''
 --- STMT 56 ---
 SQL: SELECT * FROM syn_test WHERE val BETWEEN 1 AND
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 46 near ''
 --- STMT 57 ---
 SQL: SELECT * FROM syn_test WHERE val IN
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Expected LEFT_PAREN but found EOF at position 35 near ''
 --- STMT 58 ---
 SQL: SELECT * FROM syn_test WHERE val IN ()
-ERROR [42601]: ERROR: syntax error at or near ")"
+ERROR [42601]: ERROR: Unexpected token in expression at position 37 near ')'
 --- STMT 59 ---
 SQL: SELECT * FROM syn_test WHERE name LIKE
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: Unexpected token in expression at position 38 near ''
 --- STMT 60 ---
 SQL: -- === Invalid identifiers === SELECT 123abc FROM syn_test
-ERROR [42601]: ERROR: syntax error at or near "123"
+ERROR [42601]: ERROR: trailing junk after numeric literal at or near "123a" at position 39 near '123'
 --- STMT 61 ---
 SQL: CREATE TABLE 123table (id int)
-ERROR [42601]: ERROR: syntax error at or near "123"
+ERROR [42601]: ERROR: trailing junk after numeric literal at or near "123t" at position 13 near '123'
 --- STMT 62 ---
 SQL: -- === Trailing garbage === SELECT 1 BANANA
 RESULT: 1 columns, 1 rows
@@ -591,7 +591,7 @@ ROW: 2 | beta | 20 | t
 ROW: 3 | gamma | 30 | t
 --- STMT 64 ---
 SQL: INSERT INTO syn_test (name) VALUES ('x') GARBAGE
-ERROR [42601]: ERROR: syntax error at or near "garbage"
+ERROR [42601]: ERROR: syntax error at or near "garbage" at position 41 near 'garbage'
 --- STMT 65 ---
 SQL: -- === Multiple semicolons === SELECT 1
 RESULT: 1 columns, 1 rows
@@ -624,19 +624,19 @@ COLUMNS: 123numeric_start
 ROW: 1
 --- STMT 71 ---
 SQL: SELECT 1 AS ""
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: zero-length delimited identifier at position 12 near ''
 --- STMT 72 ---
 SQL: -- === Operator errors === SELECT 1 === 1
 ERROR [42883]: ERROR: operator does not exist: integer === integer
 --- STMT 73 ---
 SQL: SELECT 1 <> <> 1
-ERROR [42601]: ERROR: syntax error at or near "<>"
+ERROR [42601]: ERROR: Unexpected token in expression at position 12 near '<>'
 --- STMT 74 ---
 SQL: SELECT 1 !! 2
-ERROR [42883]: ERROR: syntax error at or near "!!"
+ERROR [42883]: ERROR: operator does not exist: !! at position 9 near '!!'
 --- STMT 75 ---
 SQL: SELECT * FROM syn_test WHERE val >> 1
-ERROR [42804]: ERROR: argument of WHERE must be type boolean, not type int8
+ERROR [42804]: ERROR: argument of WHERE must be type boolean, not type int4
 --- STMT 76 ---
 SQL: -- Cleanup DROP TABLE syn_test
 OK: 0 rows affected
@@ -959,17 +959,17 @@ ROW: 365
 SQL: SELECT now()::date
 RESULT: 1 columns, 1 rows
 COLUMNS: now
-ROW: 2026-07-20
+ROW: 2026-04-10
 --- STMT 65 ---
 SQL: SELECT now()::time
 RESULT: 1 columns, 1 rows
 COLUMNS: now
-ROW: 18:39:15.654721
+ROW: 10:05:27.168400
 --- STMT 66 ---
 SQL: SELECT now()::timestamp
 RESULT: 1 columns, 1 rows
 COLUMNS: now
-ROW: 2026-07-20 18:39:15.655132
+ROW: 2026-04-10 10:05:27.168696
 --- STMT 67 ---
 SQL: SELECT EXTRACT(year FROM '2024-06-15'::date)
 RESULT: 1 columns, 1 rows
@@ -1942,7 +1942,7 @@ SQL: -- === INVALID: JOIN errors === -- Ambiguous column SELECT id FROM authors 
 ERROR [42702]: ERROR: column reference "id" is ambiguous
 --- STMT 46 ---
 SQL: -- Missing ON clause for non-CROSS join SELECT * FROM authors JOIN books
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: JOIN requires ON or USING clause at position 73 near ''
 --- STMT 47 ---
 SQL: -- Reference to unknown table in ON SELECT * FROM authors a JOIN books b ON b.author_id = c.id
 ERROR [42P01]: ERROR: missing FROM-clause entry for table "c"
@@ -2282,7 +2282,7 @@ ROW: 3.141592653589793
 SQL: SELECT RANDOM()
 RESULT: 1 columns, 1 rows
 COLUMNS: random
-ROW: 0.11728710101708595
+ROW: 0.30993847313040446
 --- STMT 66 ---
 SQL: SELECT GREATEST(1, 5, 3, 9, 2)
 RESULT: 1 columns, 1 rows
@@ -2382,32 +2382,32 @@ ROW: 3
 SQL: -- === Date/time functions === SELECT CURRENT_DATE
 RESULT: 1 columns, 1 rows
 COLUMNS: current_date
-ROW: 2026-07-20
+ROW: 2026-04-10
 --- STMT 86 ---
 SQL: SELECT CURRENT_TIME
 RESULT: 1 columns, 1 rows
 COLUMNS: current_time
-ROW: 18:39:15.888529
+ROW: 10:05:27.398265
 --- STMT 87 ---
 SQL: SELECT CURRENT_TIMESTAMP
 RESULT: 1 columns, 1 rows
 COLUMNS: current_timestamp
-ROW: 2026-07-20 18:39:15.889061+00
+ROW: 2026-04-10 10:05:27.398626+00
 --- STMT 88 ---
 SQL: SELECT NOW()
 RESULT: 1 columns, 1 rows
 COLUMNS: now
-ROW: 2026-07-20 18:39:15.889597+00
+ROW: 2026-04-10 10:05:27.399251+00
 --- STMT 89 ---
 SQL: SELECT LOCALTIME
 RESULT: 1 columns, 1 rows
 COLUMNS: localtime
-ROW: 18:39:15.88996
+ROW: 10:05:27.399767
 --- STMT 90 ---
 SQL: SELECT LOCALTIMESTAMP
 RESULT: 1 columns, 1 rows
 COLUMNS: localtimestamp
-ROW: 2026-07-20 18:39:15.890213
+ROW: 2026-04-10 10:05:27.400210
 --- STMT 91 ---
 SQL: SELECT DATE_PART('year', TIMESTAMP '2024-06-15 10:30:00')
 RESULT: 1 columns, 1 rows
@@ -2834,7 +2834,7 @@ ROW: jsonb
 SQL: SELECT GEN_RANDOM_UUID()
 RESULT: 1 columns, 1 rows
 COLUMNS: gen_random_uuid
-ROW: f41a720c-5098-430a-b912-5f16ab4ac5c2
+ROW: edde715a-b141-47f8-8193-77b215b5ad13
 --- STMT 176 ---
 SQL: -- === INVALID: Function errors === SELECT NONEXISTENT_FUNCTION(1)
 ERROR [42883]: ERROR: function nonexistent_function(integer) does not exist
@@ -2899,16 +2899,16 @@ SQL: INSERT INTO child (parent_id, data) VALUES (NULL, 'no_parent')
 ERROR [23502]: ERROR: null value in column "parent_id" violates not-null constraint
 --- STMT 14 ---
 SQL: -- === CHECK violations === INSERT INTO checked (val) VALUES (0)
-ERROR [23514]: ERROR: new row violates check constraint "checked_val_check"
+ERROR [23514]: ERROR: new row violates check constraint "checked_check"
 --- STMT 15 ---
 SQL: INSERT INTO checked (val) VALUES (1000)
-ERROR [23514]: ERROR: new row violates check constraint "checked_val_check"
+ERROR [23514]: ERROR: new row violates check constraint "checked_check"
 --- STMT 16 ---
 SQL: INSERT INTO checked (val) VALUES (-5)
-ERROR [23514]: ERROR: new row violates check constraint "checked_val_check"
+ERROR [23514]: ERROR: new row violates check constraint "checked_check"
 --- STMT 17 ---
 SQL: INSERT INTO checked (val, label) VALUES (50, REPEAT('x', 51))
-ERROR [23514]: ERROR: new row violates check constraint "checked_label_check"
+ERROR [23514]: ERROR: new row violates check constraint "checked_check"
 --- STMT 18 ---
 SQL: INSERT INTO checked (val) VALUES (500)
 OK: 1 rows affected
@@ -3600,17 +3600,17 @@ ROW: 1!
 SQL: SELECT CURRENT_DATE
 RESULT: 1 columns, 1 rows
 COLUMNS: current_date
-ROW: 2026-07-20
+ROW: 2026-04-10
 --- STMT 10 ---
 SQL: SELECT CURRENT_TIMESTAMP
 RESULT: 1 columns, 1 rows
 COLUMNS: current_timestamp
-ROW: 2026-07-20 18:39:16.531968+00
+ROW: 2026-04-10 10:05:28.058502+00
 --- STMT 11 ---
 SQL: SELECT GEN_RANDOM_UUID()
 RESULT: 1 columns, 1 rows
 COLUMNS: gen_random_uuid
-ROW: 00311541-ad13-4c0f-8412-47fd84110693
+ROW: 757ab524-35b2-4ead-8372-adf6c63569d8
 --- STMT 12 ---
 SQL: SELECT ARRAY[1,2,3]
 RESULT: 1 columns, 1 rows
@@ -4419,349 +4419,4 @@ SQL: SELECT ROW(1, 'hello') = ROW(1, 'world')
 RESULT: 1 columns, 1 rows
 COLUMNS: ?column?
 ROW: f
-
-=== FILE: 12_bit_bytea_money.sql ===
---- STMT 1 ---
-SQL: -- ============================================================ -- 12: bit/varbit, bytea, money type fixes -- Tests for H22, H23, H24, L1, L2, L6 -- ===================================================...
-RESULT: 1 columns, 1 rows
-COLUMNS: bit
-ROW: 1010
---- STMT 2 ---
-SQL: -- expect: 1010 -- Bit shift left (binary, not decimal) SELECT B'1010' << 1
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: 0100
---- STMT 3 ---
-SQL: -- expect: 0100 -- Bit shift right SELECT B'1010' >> 1
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: 0101
---- STMT 4 ---
-SQL: -- expect: 0101 -- Integer to bit cast (two's complement) SELECT 5::bit(4)
-RESULT: 1 columns, 1 rows
-COLUMNS: bit
-ROW: 0101
---- STMT 5 ---
-SQL: -- expect: 0101 SELECT (-1)::bit(8)
-RESULT: 1 columns, 1 rows
-COLUMNS: bit
-ROW: 11111111
---- STMT 6 ---
-SQL: -- expect: 11111111 -- bit(n) length enforcement: truncation SELECT B'10101'::bit(3)
-RESULT: 1 columns, 1 rows
-COLUMNS: bit
-ROW: 101
---- STMT 7 ---
-SQL: -- expect: 101 -- bit(n) length enforcement: padding SELECT B'10'::bit(5)
-RESULT: 1 columns, 1 rows
-COLUMNS: bit
-ROW: 10000
---- STMT 8 ---
-SQL: -- expect: 10000 -- varbit(n) max length enforcement -- SELECT B'10101'::varbit(3); -- expect: ERROR 22001 (bit string too long) -- Invalid bit digit rejected -- SELECT '102'::bit(3); -- expect: ERROR...
-RESULT: 1 columns, 1 rows
-COLUMNS: octet_length
-ROW: 2
---- STMT 9 ---
-SQL: -- expect: 2 -- bit_length of bit string SELECT bit_length(B'1010')
-RESULT: 1 columns, 1 rows
-COLUMNS: bit_length
-ROW: 4
---- STMT 10 ---
-SQL: -- expect: 4 -- bit to integer cast SELECT B'0101'::integer
-RESULT: 1 columns, 1 rows
-COLUMNS: int4
-ROW: 5
---- STMT 11 ---
-SQL: -- expect: 5 -- === H23: bytea === -- Hex format parsing SELECT '\x48656c6c6f'::bytea
-RESULT: 1 columns, 1 rows
-COLUMNS: bytea
-ROW: \\x48656c6c6f
---- STMT 12 ---
-SQL: -- expect: \x48656c6c6f -- Escape format parsing SELECT '\000\047'::bytea
-RESULT: 1 columns, 1 rows
-COLUMNS: bytea
-ROW: \\x0027
---- STMT 13 ---
-SQL: -- expect: \x0027 -- md5 of bytea (hashes raw bytes, not text form) SELECT md5('\x00'::bytea)
-RESULT: 1 columns, 1 rows
-COLUMNS: md5
-ROW: 93b885adfe0da089cdf634904fd59f71
---- STMT 14 ---
-SQL: -- expect: 93b885adfe0da089cdf634904fd59f71 -- encode escape (single backslash for non-printable) SELECT encode('\x00\x01\x41'::bytea, 'escape')
-ERROR [22023]: ERROR: invalid hexadecimal digit: "\"
---- STMT 15 ---
-SQL: -- expect: \000\001A -- Hex with whitespace (PG allows it) SELECT '\xde ad'::bytea
-RESULT: 1 columns, 1 rows
-COLUMNS: bytea
-ROW: \\xdead
---- STMT 16 ---
-SQL: -- expect: \xdead -- ltrim/rtrim/btrim on bytea (should not return Java array garbage) SELECT ltrim('\x001234'::bytea, '\x00'::bytea)
-RESULT: 1 columns, 1 rows
-COLUMNS: ltrim
-ROW: \\x1234
---- STMT 17 ---
-SQL: -- expect: \x1234 -- === H24: money === -- Basic money literal SELECT '$1,234.56'::money
-RESULT: 1 columns, 1 rows
-COLUMNS: money
-ROW: $1,234.56
---- STMT 18 ---
-SQL: -- expect: $1,234.56 -- Parenthetical negation SELECT '($123.45)'::money
-RESULT: 1 columns, 1 rows
-COLUMNS: money
-ROW: -$123.45
---- STMT 19 ---
-SQL: -- expect: -$123.45 -- Money addition SELECT '$10.00'::money + '$20.00'::money
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: $30.00
---- STMT 20 ---
-SQL: -- expect: $30.00 -- Money / money = float8 SELECT '$100.00'::money / '$25.00'::money
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: 4
---- STMT 21 ---
-SQL: -- expect: 4.0 -- Money / numeric = money SELECT '$100.00'::money / 4
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: $25.00
---- STMT 22 ---
-SQL: -- expect: $25.00 -- Invalid money input -- SELECT 'abc'::money; -- expect: ERROR 22P02 -- Money range check -- SELECT '99999999999999999.99'::money; -- expect: ERROR 22003 -- sum(money) CREATE TABLE ...
-OK: 0 rows affected
---- STMT 23 ---
-SQL: INSERT INTO money_test VALUES ('$10.00'), ('$20.00'), ('$30.00')
-OK: 3 rows affected
---- STMT 24 ---
-SQL: SELECT sum(amount) FROM money_test
-RESULT: 1 columns, 1 rows
-COLUMNS: sum
-ROW: $60.00
---- STMT 25 ---
-SQL: -- expect: $60.00 DROP TABLE money_test
-OK: 0 rows affected
---- STMT 26 ---
-SQL: -- === L1: SQLSTATE fixes === -- get_byte out of range -> 2202E -- SELECT get_byte('\x01'::bytea, 5); -- expect: ERROR 2202E -- set_byte out of range -> 2202E -- SELECT set_byte('\x01'::bytea, 5, 0); ...
-RESULT: 1 columns, 1 rows
-COLUMNS: substring
-ROW: \\x12
---- STMT 27 ---
-SQL: -- expect: \x12 SELECT substring('\x0102030405'::bytea from 0 for 3)
-RESULT: 1 columns, 1 rows
-COLUMNS: substring
-ROW: \\x0102
---- STMT 28 ---
-SQL: -- expect: \x0102 -- === L6: multidim array casts === SELECT ARRAY[[1,2],[3,4]]::int8[]
-RESULT: 1 columns, 1 rows
-COLUMNS: array
-ROW: {{1,2},{3,4}}
---- STMT 29 ---
-SQL: -- expect: {{1,2},{3,4}} SELECT ARRAY[1.5,'NaN']::float8[]
-RESULT: 1 columns, 1 rows
-COLUMNS: array
-ROW: {1.5,NaN}
-
-=== FILE: 13_regex_string_functions.sql ===
---- STMT 1 ---
-SQL: -- ============================================================ -- 13: Regex fidelity and string function fixes -- Tests for H25, H26, M23 -- ==========================================================...
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: t
---- STMT 2 ---
-SQL: -- expect: true SELECT 'hello' ~ '[[:alpha:]]+'
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: t
---- STMT 3 ---
-SQL: -- expect: true -- Word boundaries SELECT 'hello world' ~ '\mworld'
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: t
---- STMT 4 ---
-SQL: -- expect: true SELECT 'helloworld' ~ '\mworld'
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: f
---- STMT 5 ---
-SQL: -- expect: false -- $ does NOT match before trailing newline (PG behavior) SELECT E'abc\n' ~ 'c$'
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: f
---- STMT 6 ---
-SQL: -- expect: false -- regexp_like with flags SELECT regexp_like('ABC', 'abc', 'i')
-RESULT: 1 columns, 1 rows
-COLUMNS: regexp_like
-ROW: t
---- STMT 7 ---
-SQL: -- expect: true -- === H26: regexp_* functions === -- regexp_replace with start position (first match only by default) SELECT regexp_replace('banana', 'a', 'X', 3)
-RESULT: 1 columns, 1 rows
-COLUMNS: regexp_replace
-ROW: banXna
---- STMT 8 ---
-SQL: -- expect: banXna -- regexp_replace start=0 error -- SELECT regexp_replace('banana', 'a', 'X', 0); -- expect: ERROR 22023 -- \& whole match in replacement SELECT regexp_replace('hello', '(ll)', '[\&]'...
-RESULT: 1 columns, 1 rows
-COLUMNS: regexp_replace
-ROW: he[ll]o
---- STMT 9 ---
-SQL: -- expect: he[ll]o -- substring with regex returns group 1 SELECT substring('foobar' from 'o(.)b')
-RESULT: 1 columns, 1 rows
-COLUMNS: substring
-ROW: o
---- STMT 10 ---
-SQL: -- expect: o -- SIMILAR TO bounded quantifiers SELECT 'aab' SIMILAR TO 'a{2}%'
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: t
---- STMT 11 ---
-SQL: -- expect: true SELECT 'ab' SIMILAR TO 'a{2}%'
-RESULT: 1 columns, 1 rows
-COLUMNS: ?column?
-ROW: f
---- STMT 12 ---
-SQL: -- expect: false -- === M23: format/quoting/string one-offs === -- format with width SELECT format('%10s', 'hello')
-RESULT: 1 columns, 1 rows
-COLUMNS: format
-ROW:      hello
---- STMT 13 ---
-SQL: -- expect: hello SELECT format('%-10s|', 'hello')
-RESULT: 1 columns, 1 rows
-COLUMNS: format
-ROW: hello     |
---- STMT 14 ---
-SQL: -- expect: hello | -- format missing arg error -- SELECT format('%s %s', 'only_one'); -- expect: ERROR 22023 -- quote_literal with backslash SELECT quote_literal(E'a\\b')
-RESULT: 1 columns, 1 rows
-COLUMNS: quote_literal
-ROW: E'a\\\\b'
---- STMT 15 ---
-SQL: -- expect: E'a\\b' -- concat(true) prints "t" SELECT concat(true)
-RESULT: 1 columns, 1 rows
-COLUMNS: concat
-ROW: t
---- STMT 16 ---
-SQL: -- expect: t SELECT concat(false)
-RESULT: 1 columns, 1 rows
-COLUMNS: concat
-ROW: f
---- STMT 17 ---
-SQL: -- expect: f -- concat_ws with zero value args -- SELECT concat_ws(','); -- expect: ERROR 42883 -- split_part empty delimiter SELECT split_part('abc', '', 1)
-RESULT: 1 columns, 1 rows
-COLUMNS: split_part
-ROW: abc
---- STMT 18 ---
-SQL: -- expect: abc -- lpad negative length SELECT lpad('hi', -1)
-RESULT: 1 columns, 1 rows
-COLUMNS: lpad
-ROW: 
---- STMT 19 ---
-SQL: -- expect: (empty string) -- unistr 6-digit SELECT unistr('\+01F600')
-RESULT: 1 columns, 1 rows
-COLUMNS: unistr
-ROW: 😀
---- STMT 20 ---
-SQL: -- expect: (grinning face emoji U+1F600) -- unistr 4-digit SELECT unistr('\00E9')
-RESULT: 1 columns, 1 rows
-COLUMNS: unistr
-ROW: é
-
-=== FILE: 14_text_search.sql ===
---- STMT 1 ---
-SQL: -- Text search correctness: H27, H28, H29, H30, M18, L14 -- H27: tsvector cast preserves case -- begin-expected -- columns: v -- row: 'Cat':3 'Fat':2 -- end-expected SELECT '''Fat'':2 ''Cat'':3'::tsve...
-RESULT: 1 columns, 1 rows
-COLUMNS: v
-ROW: 'Cat':3 'Fat':2
---- STMT 2 ---
-SQL: -- H27: empty tsvector -- begin-expected -- columns: v -- row: -- end-expected SELECT ''::tsvector AS v
-RESULT: 1 columns, 1 rows
-COLUMNS: v
-ROW: 
---- STMT 3 ---
-SQL: -- H28: simple config keeps all words, no stemming -- begin-expected -- columns: v -- row: 'dogs':3 'running':2 'the':1 -- end-expected SELECT to_tsvector('simple', 'the Running Dogs') AS v
-RESULT: 1 columns, 1 rows
-COLUMNS: v
-ROW: 'dogs':3 'running':2 'the':1
---- STMT 4 ---
-SQL: -- H30: phraseto_tsquery stopword distances -- begin-expected -- columns: q -- row: 'cat' <3> 'hat' -- end-expected SELECT phraseto_tsquery('english', 'the cats in the hat') AS q
-RESULT: 1 columns, 1 rows
-COLUMNS: q
-ROW: 'cat' <3> 'hat'
---- STMT 5 ---
-SQL: -- H30: plainto_tsquery strips punctuation -- begin-expected -- columns: q -- row: 'cat' & 'dog' -- end-expected SELECT plainto_tsquery('english', 'cats & dogs') AS q
-RESULT: 1 columns, 1 rows
-COLUMNS: q
-ROW: 'cat' & 'dog'
---- STMT 6 ---
-SQL: -- M18: querytree strips NOT -- begin-expected -- columns: qt -- row: T -- end-expected SELECT querytree('!cat'::tsquery) AS qt
-RESULT: 1 columns, 1 rows
-COLUMNS: qt
-ROW: T
---- STMT 7 ---
-SQL: -- M18: array_to_tsvector no positions -- begin-expected -- columns: v -- row: 'cat' 'dog' -- end-expected SELECT array_to_tsvector(ARRAY['cat','dog']) AS v
-RESULT: 1 columns, 1 rows
-COLUMNS: v
-ROW: 'cat' 'dog'
---- STMT 8 ---
-SQL: -- L14: empty tsquery display -- begin-expected -- columns: q -- row: -- end-expected SELECT ''::tsquery AS q
-RESULT: 1 columns, 1 rows
-COLUMNS: q
-ROW: 
---- STMT 9 ---
-SQL: -- M18: strip removes positions -- begin-expected -- columns: v -- row: 'cat' 'fat' -- end-expected SELECT strip('fat:1 cat:2'::tsvector) AS v
-RESULT: 1 columns, 1 rows
-COLUMNS: v
-ROW: 'cat' 'fat'
---- STMT 10 ---
-SQL: -- ts_rank returns non-zero for match -- begin-expected -- columns: positive -- row: t -- end-expected SELECT ts_rank('cat:1 dog:2'::tsvector, 'cat'::tsquery) > 0 AS positive
-RESULT: 1 columns, 1 rows
-COLUMNS: positive
-ROW: t
-
-=== FILE: 15_geometry.sql ===
---- STMT 1 ---
-SQL: -- Geometry correctness: H31, H32, H33, L14, L15 -- H32: formatting normal point -- begin-expected -- columns: p -- row: (1,2) -- end-expected SELECT point '(1,2)' AS p
-RESULT: 1 columns, 1 rows
-COLUMNS: p
-ROW: (1,2)
---- STMT 2 ---
-SQL: -- H32: NaN coordinates -- begin-expected -- columns: p -- row: (NaN,NaN) -- end-expected SELECT point '(NaN,NaN)' AS p
-RESULT: 1 columns, 1 rows
-COLUMNS: p
-ROW: (NaN,NaN)
---- STMT 3 ---
-SQL: -- H33: polygon contains boundary point -- begin-expected -- columns: c -- row: t -- end-expected SELECT polygon '((0,0),(4,0),(4,4),(0,4))' @> point '(2,0)' AS c
-RESULT: 1 columns, 1 rows
-COLUMNS: c
-ROW: t
---- STMT 4 ---
-SQL: -- H33: polygon contains itself -- begin-expected -- columns: c -- row: t -- end-expected SELECT polygon '((0,0),(1,0),(1,1),(0,1))' @> polygon '((0,0),(1,0),(1,1),(0,1))' AS c
-RESULT: 1 columns, 1 rows
-COLUMNS: c
-ROW: t
---- STMT 5 ---
-SQL: -- H33: lseg contained in box -- begin-expected -- columns: c -- row: t -- end-expected SELECT lseg '[(1,1),(2,2)]' <@ box '((0,0),(3,3))' AS c
-RESULT: 1 columns, 1 rows
-COLUMNS: c
-ROW: t
---- STMT 6 ---
-SQL: -- H33: area of open path is NULL -- begin-expected -- columns: a -- row: NULL -- end-expected SELECT area(path '[(0,0),(1,0),(1,1)]') AS a
-RESULT: 1 columns, 1 rows
-COLUMNS: a
-ROW: NULL
---- STMT 7 ---
-SQL: -- H33: area of polygon -- begin-expected -- columns: a -- row: 12 -- end-expected SELECT area(polygon '((0,0),(4,0),(4,3),(0,3))') AS a
-RESULT: 1 columns, 1 rows
-COLUMNS: a
-ROW: 12
---- STMT 8 ---
-SQL: -- H31: box contains point (not misrouted) -- begin-expected -- columns: c -- row: t -- end-expected SELECT box '((0,0),(2,2))' @> point '(1,1)' AS c
-RESULT: 1 columns, 1 rows
-COLUMNS: c
-ROW: t
---- STMT 9 ---
-SQL: -- H31: line parallel test -- begin-expected -- columns: p -- row: t -- end-expected SELECT line '{0,1,0}' ?|| line '{0,1,-1}' AS p
-RESULT: 1 columns, 1 rows
-COLUMNS: p
-ROW: t
---- STMT 10 ---
-SQL: -- H31: point distance to path -- begin-expected -- columns: d -- row: 3 -- end-expected SELECT point '(0,0)' <-> path '[(3,0),(3,4)]' AS d
-RESULT: 1 columns, 1 rows
-COLUMNS: d
-ROW: 3
 
