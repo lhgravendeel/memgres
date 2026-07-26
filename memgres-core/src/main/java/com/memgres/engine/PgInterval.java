@@ -67,7 +67,13 @@ public class PgInterval implements Comparable<PgInterval> {
             }
             return isInfinite() ? this : other;
         }
-        return new PgInterval(months + other.months, days + other.days, microseconds + other.microseconds);
+        try {
+            return checked(Math.addExact((long) months, other.months),
+                    Math.addExact((long) days, other.days),
+                    Math.addExact(microseconds, other.microseconds));
+        } catch (ArithmeticException e) {
+            throw intervalOutOfRange();
+        }
     }
 
     public PgInterval minus(PgInterval other) {
@@ -77,7 +83,13 @@ public class PgInterval implements Comparable<PgInterval> {
             }
             return isInfinite() ? this : other.negate();
         }
-        return new PgInterval(months - other.months, days - other.days, microseconds - other.microseconds);
+        try {
+            return checked(Math.subtractExact((long) months, other.months),
+                    Math.subtractExact((long) days, other.days),
+                    Math.subtractExact(microseconds, other.microseconds));
+        } catch (ArithmeticException e) {
+            throw intervalOutOfRange();
+        }
     }
 
     public PgInterval negate() {
@@ -102,8 +114,24 @@ public class PgInterval implements Comparable<PgInterval> {
         int newDays = (int) totalDays;
         double fracDays = totalDays - newDays;
         // 1 day = 24 hours = 86400000000 microseconds
-        long newMicros = Math.round(microseconds * factor + fracDays * 86400_000_000L);
-        return new PgInterval(newMonths, newDays, newMicros);
+        double newMicros = microseconds * factor + fracDays * 86400_000_000L;
+        if (!Double.isFinite(totalMonths) || !Double.isFinite(totalDays) || !Double.isFinite(newMicros)) {
+            throw intervalOutOfRange();
+        }
+        return checked((long) totalMonths, (long) totalDays, Math.round(newMicros));
+    }
+
+    /**
+     * Build an interval from widened fields, rejecting anything that no longer fits. The
+     * infinity sentinels occupy the extreme month values, so a finite result may not reach
+     * them either.
+     */
+    private static PgInterval checked(long months, long days, long micros) {
+        if (months >= Integer.MAX_VALUE || months <= Integer.MIN_VALUE
+                || days > Integer.MAX_VALUE || days < Integer.MIN_VALUE) {
+            throw intervalOutOfRange();
+        }
+        return new PgInterval((int) months, (int) days, micros);
     }
 
     /**
@@ -199,9 +227,9 @@ public class PgInterval implements Comparable<PgInterval> {
                 int minutes = iso.group(6) != null ? Integer.parseInt(iso.group(6)) : 0;
                 double seconds = iso.group(7) != null ? Double.parseDouble(iso.group(7)) : 0;
                 days += weeks * 7;
-                int totalMonths = years * 12 + mons;
+                long totalMonths = (long) years * 12 + mons;
                 long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(seconds * 1_000_000L);
-                return new PgInterval(totalMonths, days, totalMicros);
+                return checked(totalMonths, days, totalMicros);
             }
         }
 
@@ -217,14 +245,14 @@ public class PgInterval implements Comparable<PgInterval> {
             double seconds = vm.group(7) != null ? Double.parseDouble(vm.group(7)) : 0;
 
             days += weeks * 7;
-            int totalMonths = years * 12 + mons;
+            long totalMonths = (long) years * 12 + mons;
             long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(seconds * 1_000_000L);
 
             // Return if we actually matched something, or if any group was present (even if zero)
             if (years != 0 || mons != 0 || weeks != 0 || days != 0 || hours != 0 || minutes != 0 || seconds != 0
                     || vm.group(1) != null || vm.group(2) != null || vm.group(3) != null
                     || vm.group(4) != null || vm.group(5) != null || vm.group(6) != null || vm.group(7) != null) {
-                return new PgInterval(totalMonths, days, totalMicros);
+                return checked(totalMonths, days, totalMicros);
             }
         }
 
@@ -383,8 +411,8 @@ public class PgInterval implements Comparable<PgInterval> {
             matchedAny = true;
         }
         if (!matchedAny || end != s.length()) return null;
-        if (ago) return new PgInterval((int) -months, (int) -days, -micros);
-        return new PgInterval((int) months, (int) days, micros);
+        if (ago) return checked(-months, -days, -micros);
+        return checked(months, days, micros);
     }
 
     /** Map a PG interval unit word (any accepted abbreviation or plural) to its canonical name. */

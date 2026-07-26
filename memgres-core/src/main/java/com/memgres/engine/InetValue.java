@@ -162,6 +162,10 @@ public class InetValue implements Comparable<InetValue> {
     public InetValue add(long offset) {
         BigInteger addr = new BigInteger(1, address);
         BigInteger result = addr.add(BigInteger.valueOf(offset));
+        // The address space does not wrap: PG reports a result that leaves it
+        if (result.signum() < 0 || result.bitLength() > address.length * 8) {
+            throw new MemgresException("result is out of range", "22003");
+        }
         byte[] resultBytes = bigIntToBytes(result, address.length);
         return new InetValue(resultBytes, prefixLength);
     }

@@ -291,7 +291,7 @@ class BinaryOpEvaluator {
                 if (left instanceof PgMoney && right instanceof PgMoney) {
                     return ((PgMoney) left).divideByMoney((PgMoney) right);
                 }
-                return executor.numericOp(left, right, (a, b) -> a / b, (a, b) -> a / b,
+                return executor.numericOp(left, right, (a, b) -> a / b, BinaryOpEvaluator::divideExact,
                     (a, b) -> a.divide(b, 20, java.math.RoundingMode.HALF_UP));
             }
             case MODULO:
@@ -1494,7 +1494,7 @@ class BinaryOpEvaluator {
                 if (left instanceof PgMoney && right instanceof PgMoney) {
                     return ((PgMoney) left).divideByMoney((PgMoney) right);
                 }
-                return executor.numericOp(left, right, (a, b) -> a / b, (a, b) -> a / b,
+                return executor.numericOp(left, right, (a, b) -> a / b, BinaryOpEvaluator::divideExact,
                     (a, b) -> a.divide(b, 20, java.math.RoundingMode.HALF_UP));
             }
             case MODULO:
@@ -2387,5 +2387,17 @@ class BinaryOpEvaluator {
     }
 
 
+
+
+    /**
+     * Integer division has exactly one overflow: the most negative value divided by -1 has no
+     * positive counterpart. PG reports it rather than wrapping back to itself.
+     */
+    private static Long divideExact(Long a, Long b) {
+        if (a != null && b != null && a == Long.MIN_VALUE && b == -1L) {
+            throw new MemgresException("bigint out of range", "22003");
+        }
+        return a / b;
+    }
 
 }
