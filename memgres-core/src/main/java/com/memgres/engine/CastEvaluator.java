@@ -121,11 +121,13 @@ class CastEvaluator {
             java.math.BigDecimal bd = TypeCoercion.toBigDecimal(val);
             String params = lowerSpec.replaceAll(".*\\(([^)]+)\\).*", "$1");
             String[] parts = params.split(",");
-            if (parts.length >= 2) {
-                int scale = Integer.parseInt(parts[1].trim());
-                return bd.setScale(scale, java.math.RoundingMode.HALF_UP);
-            }
-            return bd;
+            int precision = Integer.parseInt(parts[0].trim());
+            int scale = parts.length >= 2 ? Integer.parseInt(parts[1].trim()) : 0;
+            java.math.BigDecimal rounded = bd.setScale(scale, java.math.RoundingMode.HALF_UP);
+            // PG checks the typmod after rounding: 99.995 rounds to 100.00, which no longer
+            // fits numeric(4,2), so it overflows rather than silently widening
+            TypeCoercion.checkNumericTypmod(rounded, precision, scale);
+            return rounded;
         }
         // Handle varchar(n) by truncating to length
         if (lowerSpec.startsWith("varchar(") || lowerSpec.startsWith("character varying(")) {

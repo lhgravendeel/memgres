@@ -444,7 +444,11 @@ public final class TypeCoercion {
         // NUMERIC(p,s)
         if (type == DataType.NUMERIC && column.getScale() != null && value instanceof BigDecimal) {
             BigDecimal bd = (BigDecimal) value;
-            return bd.setScale(column.getScale(), RoundingMode.HALF_UP);
+            BigDecimal rounded = bd.setScale(column.getScale(), RoundingMode.HALF_UP);
+            if (column.getPrecision() != null) {
+                checkNumericTypmod(rounded, column.getPrecision(), column.getScale());
+            }
+            return rounded;
         }
         // BIT(n) / VARBIT(n) length enforcement
         if (type == DataType.BIT && value instanceof AstExecutor.PgBitString && column.getPrecision() != null) {
@@ -615,6 +619,21 @@ public final class TypeCoercion {
         if (val instanceof BigDecimal) return new PgMoney((BigDecimal) val);
         if (val instanceof Number) return new PgMoney(BigDecimal.valueOf(((Number) val).doubleValue()));
         return PgMoney.parse(val.toString());
+    }
+
+    /**
+     * Reject a value that no longer fits its declared numeric(p,s) after rounding. PG states
+     * the bound it checked, so the message names the precision and scale.
+     */
+    public static void checkNumericTypmod(BigDecimal rounded, int precision, int scale) {
+        int intDigits = precision - scale;
+        if (intDigits < 0) return;
+        BigDecimal limit = BigDecimal.TEN.pow(intDigits);
+        if (rounded.abs().compareTo(limit) >= 0) {
+            throw new MemgresException("numeric field overflow"
+                    + "\n  Detail: A field with precision " + precision + ", scale " + scale
+                    + " must round to an absolute value less than 10^" + intDigits + ".", "22003");
+        }
     }
 
     public static BigDecimal toBigDecimal(Object val) {
