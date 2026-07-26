@@ -308,6 +308,11 @@ public class Parser extends ExpressionParser {
         return selectParser.tryParseSetOp(result);
     }
 
+    /** Parse any query form -- SELECT, WITH or VALUES -- including set operations. */
+    Statement parseSubqueryWithSetOpsPublic() {
+        return parseSubqueryWithSetOps();
+    }
+
     // ---- Forwarding methods for cross-delegate calls ----
 
     Statement tryParseSetOp(Statement left) {
