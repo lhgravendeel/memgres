@@ -475,7 +475,9 @@ class FunctionEvaluator {
                                 channel.toString(), payload != null ? payload.toString() : "", 0);
                     }
                 }
-                return null;
+                // pg_notify returns void, which renders as an empty string over the wire --
+                // so `pg_notify(...) IS NULL` is false, as it is in PG
+                return "";
             }
             case "generate_series": {
                 if (fn.args().size() < 2) {

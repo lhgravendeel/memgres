@@ -306,7 +306,27 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         keyData.writeInt(backendSecretKey);
         ctx.write(keyData);
 
+        // From here on the connection may sit idle waiting on the socket; a NOTIFY has to
+        // reach it then, not only when it next issues a statement.
+        installNotificationSink(ctx);
         sendReadyForQuery(ctx, session);
+    }
+
+    /**
+     * Push a NOTIFY straight to this connection. The notifying session runs on another thread,
+     * so the write is scheduled onto this channel's event loop; Netty serialises it against
+     * whatever this connection is writing.
+     */
+    private void installNotificationSink(ChannelHandlerContext ctx) {
+        final Session target = this.session;
+        target.setNotificationSink(notification -> {
+            if (!ctx.channel().isActive()) return;
+            ctx.channel().eventLoop().execute(() -> {
+                if (!ctx.channel().isActive()) return;
+                sendNotificationResponse(ctx, notification);
+                ctx.flush();
+            });
+        });
     }
 
     // ---- Query execution with cancel support ----

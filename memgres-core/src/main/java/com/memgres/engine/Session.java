@@ -491,6 +491,7 @@ public class Session {
             timeoutTask = TIMEOUT_SCHEDULER.schedule(t::interrupt, timeoutMs, TimeUnit.MILLISECONDS);
         }
 
+        executingStatement = true;
         try {
             QueryResult result = executor.execute(sql, parameters);
             // If thread was interrupted but returned normally, clear and ignore
@@ -527,6 +528,7 @@ public class Session {
             }
             throw e;
         } finally {
+            executingStatement = false;
             if (timeoutTask != null) {
                 timeoutTask.cancel(false);
             }
@@ -994,8 +996,32 @@ public class Session {
     }
 
     // Notification support
+
+    /** Installed by the wire handler so a notification can reach an idle listener at once. */
+    private volatile java.util.function.Consumer<Notification> notificationSink;
+    /** True while this session is running a statement, when a push would interleave messages. */
+    private volatile boolean executingStatement;
+
+    public void setNotificationSink(java.util.function.Consumer<Notification> sink) {
+        this.notificationSink = sink;
+    }
+
+    public boolean isExecutingStatement() {
+        return executingStatement;
+    }
+
     public void addNotification(Notification notification) {
         pendingNotifications.add(notification);
+        // PG delivers to a listener that is sitting idle on the socket, not only to one that
+        // happens to issue another statement. Push now unless a response is in flight, in
+        // which case the ReadyForQuery drain will carry it.
+        java.util.function.Consumer<Notification> sink = notificationSink;
+        if (sink != null && !executingStatement) {
+            Notification pending;
+            while ((pending = pendingNotifications.poll()) != null) {
+                sink.accept(pending);
+            }
+        }
     }
 
     public java.util.Queue<Notification> getPendingNotifications() {

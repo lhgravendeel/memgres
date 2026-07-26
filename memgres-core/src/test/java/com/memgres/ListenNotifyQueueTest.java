@@ -134,18 +134,18 @@ class ListenNotifyQueueTest {
     void pg_notify_basic() throws SQLException {
         // pg_notify(channel, payload) returns void (NULL in SQL)
         String result = querySingle("SELECT pg_notify('test_channel', 'test payload')");
-        assertNull(result, "pg_notify should return NULL (void)");
+        assertEquals("", result, "pg_notify returns void, an empty string over the wire");
     }
 
     @Test
     void pg_notify_empty_payload() throws SQLException {
-        assertNull(querySingle("SELECT pg_notify('ch', '')"));
+        assertEquals("", querySingle("SELECT pg_notify('ch', '')"));
     }
 
     @Test
     void pg_notify_null_payload() throws SQLException {
         // PG: pg_notify with NULL payload sends empty string notification
-        assertNull(querySingle("SELECT pg_notify('ch', NULL)"));
+        assertEquals("", querySingle("SELECT pg_notify('ch', NULL)"));
     }
 
     @Test
