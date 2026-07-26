@@ -58,6 +58,11 @@ final class RowKey {
                 if (da != null && db != null) return da.compareTo(db) == 0;
             } catch (Exception ignored) {}
         }
+        // bytea is stored as byte[], whose identity equals() would make every value its
+        // own group; PG groups equal byte sequences together.
+        if (a instanceof byte[] && b instanceof byte[]) {
+            return java.util.Arrays.equals((byte[]) a, (byte[]) b);
+        }
         // Array comparison
         if (a instanceof Object[] && b instanceof Object[]) {
             Object[] aa = (Object[]) a;
@@ -82,6 +87,7 @@ final class RowKey {
 
     private static int normalizedHashCode(Object v) {
         if (v == null) return 0;
+        if (v instanceof byte[]) return java.util.Arrays.hashCode((byte[]) v);
         if (v instanceof BigDecimal) {
             // stripTrailingZeros so 1.0 and 1.00 have the same hash
             return ((BigDecimal) v).stripTrailingZeros().hashCode();
@@ -111,6 +117,15 @@ final class RowKey {
 
     /** Compute a value-based key string for a single value (for GROUP BY). */
     static String valueKey(Object val) {
+        // bytea: identity toString() would give every value its own grouping key
+        if (val instanceof byte[]) {
+            byte[] b = (byte[]) val;
+            StringBuilder sb = new StringBuilder(b.length * 2 + 4).append("\0BYT");
+            for (byte x : b) {
+                sb.append(Character.forDigit((x >> 4) & 0xF, 16)).append(Character.forDigit(x & 0xF, 16));
+            }
+            return sb.toString();
+        }
         if (val == null) return "\0NULL";
         if (val instanceof BigDecimal) {
             return ((BigDecimal) val).stripTrailingZeros().toPlainString();

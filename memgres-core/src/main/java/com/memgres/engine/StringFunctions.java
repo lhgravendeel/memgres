@@ -1103,6 +1103,9 @@ class StringFunctions {
     /** Convert value to PG text output form. Booleans → "t"/"f". */
     private static String pgTextOutput(Object val) {
         if (val instanceof Boolean) return ((Boolean) val) ? "t" : "f";
+        // bytea and arrays have no useful toString(); render them as PG's output functions do
+        if (val instanceof byte[]) return TypeCoercion.byteaToText((byte[]) val);
+        if (val instanceof java.util.List) return TypeCoercion.formatPgArray((java.util.List<?>) val);
         return val.toString();
     }
 

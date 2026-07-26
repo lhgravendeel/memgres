@@ -78,7 +78,7 @@ class SelectAggregateEvaluator {
                     StringBuilder key = new StringBuilder();
                     for (Expression ge : effectiveGroupBy) {
                         Object val = executor.evalExpr(ge, ctx);
-                        key.append(val == null ? "\0NULL" : val.toString()).append('\1');
+                        key.append(val == null ? "\0NULL" : RowKey.valueKey(val)).append('\1');
                     }
                     groupMap.computeIfAbsent(key.toString(), k -> new ArrayList<>()).add(ctx);
                 }
@@ -842,6 +842,7 @@ class SelectAggregateEvaluator {
             case "avg": {
                 if (group.isEmpty()) return null;
                 Expression arg = fn.args().get(0);
+                requireAggregatableNumeric("avg", arg, group);
                 BigDecimal bdSum = BigDecimal.ZERO;
                 long count = 0;
                 if (fn.distinct()) {
@@ -892,22 +893,37 @@ class SelectAggregateEvaluator {
                 if (group.isEmpty()) return null;
                 Expression arg = fn.args().get(0);
                 Expression delimExpr = fn.args().get(1);
-                String delim = delimExpr != null ? String.valueOf(executor.evalExpr(delimExpr, group.isEmpty() ? null : group.get(0))) : ",";
+                Object delimVal = delimExpr != null ? executor.evalExpr(delimExpr, group.get(0)) : ",";
                 List<RowContext> orderedGroup = sortGroupForAggregate(group, fn);
-                StringBuilder sb = new StringBuilder();
-                boolean first = true;
                 Set<String> seen = fn.distinct() ? new LinkedHashSet<>() : null;
+                List<Object> parts = new ArrayList<>();
+                boolean allBytea = true;
                 for (RowContext ctx : orderedGroup) {
                     Object val = executor.evalExpr(arg, ctx);
-                    if (val != null) {
-                        String sv = val.toString();
-                        if (seen != null && !seen.add(distinctKey(val))) continue;
-                        if (!first) sb.append(delim);
-                        sb.append(sv);
-                        first = false;
-                    }
+                    if (val == null) continue;
+                    if (seen != null && !seen.add(distinctKey(val))) continue;
+                    if (!(val instanceof byte[])) allBytea = false;
+                    parts.add(val);
                 }
-                return first ? null : sb.toString();
+                if (parts.isEmpty()) return null;
+                if (allBytea) {
+                    // string_agg(bytea, bytea) is a distinct aggregate returning bytea
+                    byte[] sep = delimVal instanceof byte[] ? (byte[]) delimVal : new byte[0];
+                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                    for (int pi = 0; pi < parts.size(); pi++) {
+                        if (pi > 0) bos.write(sep, 0, sep.length);
+                        byte[] pb = (byte[]) parts.get(pi);
+                        bos.write(pb, 0, pb.length);
+                    }
+                    return bos.toByteArray();
+                }
+                String delim = delimVal != null ? String.valueOf(delimVal) : ",";
+                StringBuilder sb = new StringBuilder();
+                for (int pi = 0; pi < parts.size(); pi++) {
+                    if (pi > 0) sb.append(delim);
+                    sb.append(parts.get(pi));
+                }
+                return sb.toString();
             }
             case "array_agg": {
                 if (group.isEmpty()) return null;
@@ -1046,34 +1062,49 @@ class SelectAggregateEvaluator {
                 return hasValue ? result : null;
             }
             case "bit_and": {
-                Integer result = null;
+                Object result = null;
                 for (RowContext r : group) {
                     Object v = executor.evalExpr(fn.args().get(0), r);
-                    if (v != null) {
-                        int iv = ((Number) v).intValue();
-                        result = (result == null) ? iv : (result & iv);
+                    if (v == null) continue;
+                    if (v instanceof AstExecutor.PgBitString) {
+                        result = (result == null) ? v
+                                : combineBits("bit_and", (AstExecutor.PgBitString) result, (AstExecutor.PgBitString) v, '&');
+                    } else {
+                        long iv = ((Number) v).longValue();
+                        long acc = (result == null) ? iv : (((Number) result).longValue() & iv);
+                        result = numericBitResult(v, acc);
                     }
                 }
                 return result;
             }
             case "bit_or": {
-                Integer result = null;
+                Object result = null;
                 for (RowContext r : group) {
                     Object v = executor.evalExpr(fn.args().get(0), r);
-                    if (v != null) {
-                        int iv = ((Number) v).intValue();
-                        result = (result == null) ? iv : (result | iv);
+                    if (v == null) continue;
+                    if (v instanceof AstExecutor.PgBitString) {
+                        result = (result == null) ? v
+                                : combineBits("bit_or", (AstExecutor.PgBitString) result, (AstExecutor.PgBitString) v, '|');
+                    } else {
+                        long iv = ((Number) v).longValue();
+                        long acc = (result == null) ? iv : (((Number) result).longValue() | iv);
+                        result = numericBitResult(v, acc);
                     }
                 }
                 return result;
             }
             case "bit_xor": {
-                Integer result = null;
+                Object result = null;
                 for (RowContext r : group) {
                     Object v = executor.evalExpr(fn.args().get(0), r);
-                    if (v != null) {
-                        int iv = ((Number) v).intValue();
-                        result = (result == null) ? iv : (result ^ iv);
+                    if (v == null) continue;
+                    if (v instanceof AstExecutor.PgBitString) {
+                        result = (result == null) ? v
+                                : combineBits("bit_xor", (AstExecutor.PgBitString) result, (AstExecutor.PgBitString) v, '^');
+                    } else {
+                        long iv = ((Number) v).longValue();
+                        long acc = (result == null) ? iv : (((Number) result).longValue() ^ iv);
+                        result = numericBitResult(v, acc);
                     }
                 }
                 return result;
@@ -1439,6 +1470,8 @@ class SelectAggregateEvaluator {
      * or int 1 vs numeric 1.0), matching PostgreSQL's equality-based DISTINCT.
      */
     private static String distinctKey(Object val) {
+        // bytea dedups by byte sequence, not array identity
+        if (val instanceof byte[]) return RowKey.valueKey(val);
         if (val instanceof BigDecimal) {
             BigDecimal bd = (BigDecimal) val;
             if (bd.signum() == 0) return "0";
@@ -1453,6 +1486,49 @@ class SelectAggregateEvaluator {
             return String.valueOf(d);
         }
         return val.toString();
+    }
+
+    /**
+     * PG has no avg(money) or avg over other non-numeric types; reject rather than
+     * silently coercing the value through numeric.
+     */
+    private void requireAggregatableNumeric(String fname, Expression arg, List<RowContext> group) {
+        for (RowContext ctx : group) {
+            Object val = executor.evalExpr(arg, ctx);
+            if (val == null) continue;
+            if (val instanceof PgMoney) {
+                throw new MemgresException("function " + fname + "(money) does not exist"
+                        + "\n  Hint: No function matches the given name and argument types.", "42883");
+            }
+            return;
+        }
+    }
+
+    /** PG's bit-string bit_and/bit_or/bit_xor: bitwise, and only over equal-length operands. */
+    private static AstExecutor.PgBitString combineBits(String fname, AstExecutor.PgBitString a,
+                                                       AstExecutor.PgBitString b, char op) {
+        String x = a.bits();
+        String y = b.bits();
+        if (x.length() != y.length()) {
+            throw new MemgresException("cannot " + fname.substring(4).toUpperCase()
+                    + " bit strings of different sizes", "22026");
+        }
+        StringBuilder sb = new StringBuilder(x.length());
+        for (int i = 0; i < x.length(); i++) {
+            boolean p = x.charAt(i) == '1';
+            boolean q = y.charAt(i) == '1';
+            boolean res = op == '&' ? (p && q) : op == '|' ? (p || q) : (p ^ q);
+            sb.append(res ? '1' : '0');
+        }
+        return new AstExecutor.PgBitString(sb.toString());
+    }
+
+    /** Keep the input's integer width, as PG's smallint/int/bigint bit aggregates do. */
+    private static Object numericBitResult(Object sample, long acc) {
+        if (sample instanceof Long) return acc;
+        if (sample instanceof Short) return (short) acc;
+        if (sample instanceof Integer) return (int) acc;
+        return acc >= Integer.MIN_VALUE && acc <= Integer.MAX_VALUE ? (Object) (int) acc : (Object) acc;
     }
 
     /** Sort a group by the aggregate's ORDER BY clause (used by string_agg, array_agg, json_agg, etc.). */
@@ -1596,4 +1672,5 @@ class SelectAggregateEvaluator {
             sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
         }
     }
+
 }

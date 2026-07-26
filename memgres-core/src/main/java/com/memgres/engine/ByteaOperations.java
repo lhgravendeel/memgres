@@ -48,8 +48,8 @@ public final class ByteaOperations {
                     baos.write(val);
                     i += 4;
                 } else {
-                    baos.write(c);
-                    i++;
+                    // PG's escape format only knows \\ and \ooo; anything else is a syntax error
+                    throw new MemgresException("invalid input syntax for type bytea", "22P02");
                 }
             } else {
                 baos.write(c);

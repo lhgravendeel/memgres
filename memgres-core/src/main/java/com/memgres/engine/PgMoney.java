@@ -52,7 +52,8 @@ public class PgMoney implements Comparable<PgMoney> {
         if (s.startsWith("$")) s = s.substring(1).trim();
         // Strip thousands separators
         s = s.replace(",", "");
-        if (s.isEmpty()) {
+        // PG's cash_in reads digits and separators only — no exponent, no hex, no leading '+'
+        if (!s.matches("[0-9]+(\\.[0-9]*)?|\\.[0-9]+")) {
             throw new MemgresException("invalid input syntax for type money: \"" + input + "\"", "22P02");
         }
         try {

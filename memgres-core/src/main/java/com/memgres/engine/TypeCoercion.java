@@ -709,6 +709,15 @@ public final class TypeCoercion {
     }
 
     /** Format a Java List as a PG array string: {elem1,elem2,...} */
+    /** PG's bytea output in hex format. */
+    public static String byteaToText(byte[] b) {
+        StringBuilder sb = new StringBuilder(b.length * 2 + 2).append("\\x");
+        for (byte x : b) {
+            sb.append(Character.forDigit((x >> 4) & 0xF, 16)).append(Character.forDigit(x & 0xF, 16));
+        }
+        return sb.toString();
+    }
+
     public static String formatPgArray(java.util.List<?> list) {
         StringBuilder sb = new StringBuilder("{");
         for (int i = 0; i < list.size(); i++) {
@@ -1411,6 +1420,17 @@ public final class TypeCoercion {
         if (a == null) return -1;
         if (b == null) return 1;
 
+        // bytea orders by unsigned byte value, as PG's byteacmp does
+        if (a instanceof byte[] && b instanceof byte[]) {
+            byte[] ba = (byte[]) a, bb = (byte[]) b;
+            int n = Math.min(ba.length, bb.length);
+            for (int i = 0; i < n; i++) {
+                int cmp = Integer.compare(ba[i] & 0xFF, bb[i] & 0xFF);
+                if (cmp != 0) return cmp;
+            }
+            return Integer.compare(ba.length, bb.length);
+        }
+
         // PgRow (record) comparison: element-by-element
         if (a instanceof AstExecutor.PgRow && b instanceof AstExecutor.PgRow) {
             List<Object> la = ((AstExecutor.PgRow) a).values;
@@ -1661,6 +1681,10 @@ public final class TypeCoercion {
         if (a == null && b == null) return true;
         if (a == null || b == null) return false;
         if (a.equals(b) || b.equals(a)) return true;
+        // bytea: compare the bytes, not the array identity
+        if (a instanceof byte[] && b instanceof byte[]) {
+            return java.util.Arrays.equals((byte[]) a, (byte[]) b);
+        }
         // TimeTZ strings: compare by UTC-normalized time
         if (a instanceof String && b instanceof String && isTimeTzString((String) a) && isTimeTzString((String) b)) {
             return compareTimeTz((String) a, (String) b) == 0;

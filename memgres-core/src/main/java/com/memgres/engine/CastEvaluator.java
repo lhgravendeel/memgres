@@ -501,9 +501,10 @@ class CastEvaluator {
                             bitStr = bitStr.substring(0, n);
                         }
                     } else {
-                        // varbit(n): max n bits — error if too long
+                        // varbit(n): an explicit cast truncates to n bits (assignment errors instead,
+                        // which TypeCoercion handles)
                         if (bitStr.length() > n) {
-                            throw new MemgresException("bit string too long for type bit varying(" + n + ")", "22001");
+                            bitStr = bitStr.substring(0, n);
                         }
                     }
                 } else if (typeName.equals("bit") && bitStr.length() != 1) {
