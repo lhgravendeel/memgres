@@ -36,6 +36,86 @@ class BinaryOpEvaluator {
         return null;
     }
 
+    /**
+     * PG's operator set is narrower than the values suggest. A point has no {@code =} (it uses
+     * {@code ~=}), an lseg contains nothing, and money compares only with money. The operand
+     * *values* cannot decide this -- a geometric value is stored as text, so a value-level rule
+     * would break plain string comparison -- so the declared type of each operand decides.
+     */
+    private void rejectPhantomOperator(BinaryExpr bin, RowContext ctx, Object left, Object right) {
+        if (left == null || right == null) return;
+        BinaryExpr.BinOp op = bin.op();
+
+        // money compares only with money; PG has no cross-type comparison for it
+        boolean moneyLeft = left instanceof PgMoney;
+        boolean moneyRight = right instanceof PgMoney;
+        if ((moneyLeft ^ moneyRight) && isComparison(op)
+                && (left instanceof Number || right instanceof Number)) {
+            String other = AstExecutor.pgTypeNameOf(moneyLeft ? right : left);
+            throw new MemgresException("operator does not exist: "
+                    + (moneyLeft ? "money " + binOpToSymbol(op) + " " + other
+                                 : other + " " + binOpToSymbol(op) + " money"), "42883");
+        }
+
+        String lType = declaredGeometricType(bin.left(), ctx);
+        String rType = declaredGeometricType(bin.right(), ctx);
+        if (lType == null && rType == null) return;
+
+        // point equality is spelled ~=, never =
+        if ((op == BinaryExpr.BinOp.EQUAL || op == BinaryExpr.BinOp.NOT_EQUAL)
+                && "point".equals(lType) && "point".equals(rType)) {
+            throw new MemgresException("operator does not exist: point " + binOpToSymbol(op) + " point"
+                    + "\n  Hint: No operator matches the given name and argument types.", "42883");
+        }
+        // an lseg has no interior, so it contains nothing
+        if (op == BinaryExpr.BinOp.CONTAINS && "lseg".equals(lType)) {
+            throw new MemgresException("operator does not exist: lseg @> "
+                    + (rType != null ? rType : "unknown")
+                    + "\n  Hint: No operator matches the given name and argument types.", "42883");
+        }
+    }
+
+    private static boolean isComparison(BinaryExpr.BinOp op) {
+        switch (op) {
+            case EQUAL: case NOT_EQUAL: case LESS_THAN: case GREATER_THAN:
+            case LESS_EQUAL: case GREATER_EQUAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** The geometric type an operand is declared to have, or null when it carries no declaration. */
+    private String declaredGeometricType(Expression expr, RowContext ctx) {
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName();
+            return name == null ? null : geometricTypeName(name.toLowerCase().trim());
+        }
+        if (expr instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) expr;
+            for (RowContext.TableBinding b : ctx.getBindings()) {
+                if (b.table() == null) continue;
+                if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
+                        && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+                int idx = b.table().getColumnIndex(ref.column());
+                if (idx < 0) continue;
+                DataType t = b.table().getColumns().get(idx).getType();
+                return t == null ? null : geometricTypeName(t.getPgName());
+            }
+        }
+        return null;
+    }
+
+    private static String geometricTypeName(String name) {
+        switch (name) {
+            case "point": case "line": case "lseg":
+            case "box": case "path": case "polygon": case "circle":
+                return name;
+            default:
+                return null;
+        }
+    }
+
     static boolean isCastToType(Expression expr, String typeName) {
         if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
@@ -120,6 +200,8 @@ class BinaryOpEvaluator {
 
         Object left = executor.evalExpr(bin.left(), ctx);
         Object right = executor.evalExpr(bin.right(), ctx);
+
+        rejectPhantomOperator(bin, ctx, left, right);
 
         // Collation-aware string comparison for EQUAL/NOT_EQUAL
         if ((bin.op() == BinaryExpr.BinOp.EQUAL || bin.op() == BinaryExpr.BinOp.NOT_EQUAL)
