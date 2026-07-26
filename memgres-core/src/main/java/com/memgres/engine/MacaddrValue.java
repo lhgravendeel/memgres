@@ -74,11 +74,17 @@ public class MacaddrValue implements Comparable<MacaddrValue> {
             if (parts[i].length() > 2) {
                 throw new MemgresException("invalid input syntax for type macaddr: \"" + original + "\"", "22P02");
             }
+            int octet;
             try {
-                b[i] = (byte) Integer.parseInt(parts[i], 16);
+                octet = Integer.parseInt(parts[i], 16);
             } catch (NumberFormatException e) {
                 throw new MemgresException("invalid input syntax for type macaddr: \"" + original + "\"", "22P02");
             }
+            // PG's scanner accepts a signed hex field, then range-checks it separately
+            if (octet < 0 || octet > 255) {
+                throw new MemgresException("invalid octet value in \"macaddr\" value: \"" + original + "\"", "22003");
+            }
+            b[i] = (byte) octet;
         }
         return b;
     }

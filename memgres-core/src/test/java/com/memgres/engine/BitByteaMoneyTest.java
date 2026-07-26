@@ -87,9 +87,11 @@ class BitByteaMoneyTest {
         assertEquals("10000", query("SELECT B'10'::bit(5)"));
     }
 
+    /** An explicit cast truncates; only assignment to a varbit(n) column errors. */
     @Test @Order(7)
-    void varbitMaxLengthEnforcement() {
-        assertEquals("22001", getSqlState("SELECT B'10101'::varbit(3)"));
+    void varbitMaxLengthEnforcement() throws SQLException {
+        assertEquals("101", query("SELECT B'10101'::varbit(3)"));
+        assertEquals("22001", getSqlState("CREATE TABLE bbm_vb (v varbit(3)); INSERT INTO bbm_vb VALUES (B'10101')"));
     }
 
     @Test @Order(8)
