@@ -153,5 +153,7 @@ class DomainInheritanceAndGeometryTest {
         assertEquals("t", expr("SELECT (box '((0,0),(2,2))' @> point '(1,1)')"));
         assertEquals("t", expr("SELECT (polygon '((0,0),(2,0),(2,2))' @> point '(1,0.5)')"));
         assertEquals("t", expr("SELECT (circle '<(0,0),5>' @> point '(1,1)')"));
+        assertEquals("t", expr("SELECT (path '[(0,0),(1,1)]' @> point '(0,0)')"),
+                "an open path contains a point; only lseg has no such operator");
     }
 }

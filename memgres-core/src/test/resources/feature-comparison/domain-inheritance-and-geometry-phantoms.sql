@@ -94,6 +94,13 @@ SELECT (box '((0,0),(2,2))' @> lseg '((0,0),(1,1))');
 -- end-expected-error
 SELECT (line '{1,0,0}' @> point '(0,0)');
 
+-- An open path does contain a point, and a bracketed value reads as one
+-- begin-expected
+-- columns: a
+-- row: true
+-- end-expected
+SELECT (path '[(0,0),(1,1)]' @> point '(0,0)') AS a;
+
 -- The real containment operators still work
 -- begin-expected
 -- columns: a
