@@ -17,6 +17,10 @@ import java.util.*;
  */
 class FunctionEvaluator {
 
+    /** PG's NOTIFY payload must stay under 8000 bytes. */
+    private static final int NOTIFY_PAYLOAD_LIMIT = 8000;
+
+
     private static final Logger LOG = LoggerFactory.getLogger(FunctionEvaluator.class);
 
     // CRC-32C (Castagnoli) lookup table — bit-reversed polynomial 0x82F63B78
@@ -466,6 +470,14 @@ class FunctionEvaluator {
                 requireArgs(fn, 2);
                 Object channel = executor.evalExpr(fn.args().get(0), ctx);
                 Object payload = executor.evalExpr(fn.args().get(1), ctx);
+                // A notification travels through a fixed-size queue slot, so PG bounds both
+                // the channel name and the payload rather than truncating either
+                if (channel == null || channel.toString().trim().isEmpty()) {
+                    throw new MemgresException("channel name cannot be empty", "22023");
+                }
+                if (payload != null && payload.toString().length() >= NOTIFY_PAYLOAD_LIMIT) {
+                    throw new MemgresException("payload string too long", "22023");
+                }
                 if (channel != null) {
                     if (executor.session != null) {
                         executor.session.queueNotification(
