@@ -366,7 +366,8 @@ class DdlTableExecutor {
             if (entry.schema != null && !entry.schema.equalsIgnoreCase(schemaName)) continue;
             for (String grantee : entry.grantees) {
                 for (String priv : entry.privileges) {
-                    executor.database.addRolePrivilege(grantee, priv, "TABLE", tableName);
+                    executor.database.addRolePrivilege(grantee, priv, "TABLE",
+                            AstExecutor.privilegeKey(schemaName, tableName));
                 }
             }
         }
@@ -806,11 +807,12 @@ class DdlTableExecutor {
                 if (partitionParent != null) {
                     partitionParent.removePartition(droppedTable);
                 }
-                executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable));
+                executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable,
+                        executor.database.getTriggersForTable(schemaName, name)));
             }
             schema.removeTable(name);
-            // Remove triggers associated with this table
-            executor.database.removeTriggersForTable(name);
+            // Remove only this schema's triggers: a same-named table elsewhere keeps its own
+            executor.database.removeTriggersForTable(schemaName, name);
             // Drop implicit sequences owned by SERIAL/IDENTITY columns
             // Only drop sequences that were auto-created (SERIAL types or __identity__ defaults),
             // NOT independently-created sequences referenced via DEFAULT nextval(...)
@@ -838,7 +840,7 @@ class DdlTableExecutor {
                 }
             }
             executor.database.removeObjectOwner("table:" + schemaName + "." + name);
-            executor.database.removePrivilegesOnObject("TABLE", name);
+            executor.database.removePrivilegesOnObject("TABLE", AstExecutor.privilegeKey(schemaName, name));
         } else if (!ifExists) {
             if ("pg_catalog".equalsIgnoreCase(schemaName) || "information_schema".equalsIgnoreCase(schemaName)) {
                 throw new MemgresException("table \"" + name + "\" does not exist", "42P01");

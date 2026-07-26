@@ -1075,7 +1075,10 @@ class SessionExecutor {
             }
             try { executor.resolveTable(grantSchema, grantTable); }
             catch (MemgresException e) {
-                throw new MemgresException("relation \"" + s.objectName() + "\" does not exist", "42P01");
+                // A view is a valid GRANT target even when it is not auto-updatable.
+                if (executor.database.getView(grantTable) == null) {
+                    throw new MemgresException("relation \"" + s.objectName() + "\" does not exist", "42P01");
+                }
             }
         }
         // Validate object exists for FOREIGN SERVER grants
@@ -1155,7 +1158,7 @@ class SessionExecutor {
                 if (!isOwner) {
                     for (String priv : s.privileges()) {
                         // Must hold the privilege WITH GRANT OPTION
-                        if (!executor.hasPrivilegeDirectOrInherited(currentRole, priv + "_GRANT_OPTION", "TABLE", bareObj.toLowerCase())) {
+                        if (!executor.hasPrivilegeDirectOrInherited(currentRole, priv + "_GRANT_OPTION", "TABLE", AstExecutor.privilegeKey(schForOwner, bareObj))) {
                             throw new MemgresException(
                                 "permission denied for table \"" + bareObj + "\"", "42501");
                         }
@@ -1166,10 +1169,11 @@ class SessionExecutor {
 
         // Track granted privileges for role dependency checks (DROP ROLE)
         if (s.objectName() != null && s.grantees() != null && s.objectType() != null) {
-            // M10: Strip schema prefix from object name for privilege storage
+            // Privileges on tables are keyed by schema-qualified name, so a grant on
+            // s1.t cannot be matched by a lookup for s2.t.
             String bareObjectName = s.objectName();
-            if ("TABLE".equalsIgnoreCase(s.objectType()) && bareObjectName.contains(".")) {
-                bareObjectName = bareObjectName.substring(bareObjectName.indexOf('.') + 1);
+            if ("TABLE".equalsIgnoreCase(s.objectType())) {
+                bareObjectName = AstExecutor.privilegeKey(executor.defaultSchema(), bareObjectName);
             }
             // Expand "ALL TABLES IN SCHEMA" to individual table grants
             if (s.objectType().startsWith("ALL TABLES IN SCHEMA")) {
@@ -1178,7 +1182,8 @@ class SessionExecutor {
                     for (String grantee : s.grantees()) {
                         for (String priv : s.privileges()) {
                             for (String tableName : schema.getTables().keySet()) {
-                                executor.database.addRolePrivilege(grantee, priv, "TABLE", tableName);
+                                executor.database.addRolePrivilege(grantee, priv, "TABLE",
+                                        AstExecutor.privilegeKey(s.objectName(), tableName));
                             }
                         }
                     }
@@ -1251,10 +1256,10 @@ class SessionExecutor {
         }
         // Track privilege removal
         if (s.objectName() != null && s.grantees() != null && s.objectType() != null) {
-            // M10: Strip schema prefix from object name
+            // Match the schema-qualified key GRANT stored
             String bareObjName = s.objectName();
-            if ("TABLE".equalsIgnoreCase(s.objectType()) && bareObjName.contains(".")) {
-                bareObjName = bareObjName.substring(bareObjName.indexOf('.') + 1);
+            if ("TABLE".equalsIgnoreCase(s.objectType())) {
+                bareObjName = AstExecutor.privilegeKey(executor.defaultSchema(), bareObjName);
             }
             for (String grantee : s.grantees()) {
                 for (String priv : s.privileges()) {

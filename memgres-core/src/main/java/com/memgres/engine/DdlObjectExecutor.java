@@ -1670,8 +1670,8 @@ class DdlObjectExecutor {
                     executor.database.getAllTriggers().remove(tName.toLowerCase());
                 }
                 for (String tName : tableNames) {
-                    executor.database.removePrivilegesOnObject("TABLE", tName);
-                    executor.database.removePrivilegesOnObject("TABLE", stmt.name() + "." + tName);
+                    executor.database.removePrivilegesOnObject("TABLE",
+                            AstExecutor.privilegeKey(stmt.name(), tName));
                     executor.database.removeObjectOwner("table:" + stmt.name() + "." + tName);
                 }
                 executor.database.removePrivilegesOnObject("SCHEMA", stmt.name());
