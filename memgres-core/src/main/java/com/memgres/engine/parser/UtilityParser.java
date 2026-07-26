@@ -1239,6 +1239,10 @@ class UtilityParser {
             parser.advance(); // consume AUTHORIZATION
             param = "session_authorization";
         }
+        // RESET TIME ZONE undoes SET TIME ZONE, and names the same setting.
+        if (param.equalsIgnoreCase("TIME") && matchZone()) {
+            return new SetStmt("reset", "TimeZone");
+        }
         if (parser.match(TokenType.DOT)) {
             param = param + "." + parser.readIdentifier();
         }
@@ -1262,7 +1266,19 @@ class UtilityParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("show", "transaction_isolation");
         }
+        // SHOW TIME ZONE is how SET TIME ZONE is read back; the setting itself is TimeZone.
+        if (param.equalsIgnoreCase("TIME") && matchZone()) {
+            return new SetStmt("show", "TimeZone");
+        }
         return new SetStmt("show", param);
+    }
+
+    /** ZONE is not a reserved word everywhere, so match it on the word rather than the kind. */
+    private boolean matchZone() {
+        if (parser.isAtEnd()) return false;
+        if (!"ZONE".equalsIgnoreCase(parser.peek().value())) return false;
+        parser.advance();
+        return true;
     }
 
     // ---- COMMENT ON ----
