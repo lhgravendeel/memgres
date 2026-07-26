@@ -251,9 +251,11 @@ public class PgInterval implements Comparable<PgInterval> {
      * @return the parsed interval, or null when the text is not a unit list at all
      */
     private static PgInterval parseUnitList(String s) {
+        // PG's traditional output opened with '@'; it carries no meaning of its own
+        if (s.startsWith("@")) s = s.substring(1).trim();
         Matcher tok = java.util.regex.Pattern.compile(
                 "\\G\\s*(?:([+-]?\\d+):(\\d+)(?::(\\d+(?:\\.\\d+)?))?"
-                + "|([+-]?\\d+(?:\\.\\d+)?)\\s*([A-Za-z]+)?"
+                + "|([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))\\s*([A-Za-z]+)?"
                 + "|([A-Za-z]+))\\s*").matcher(s);
         long months = 0;
         long days = 0;

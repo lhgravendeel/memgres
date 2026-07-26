@@ -131,3 +131,31 @@ SELECT (INTERVAL '1-2')::text AS a;
 -- row: 2 days 04:05:06
 -- end-expected
 SELECT (INTERVAL '2 04:05:06')::text AS a;
+
+-- ============================================================================
+-- 8. PG's traditional forms: the @ prefix and a bare leading dot
+-- ============================================================================
+
+-- begin-expected
+-- columns: a
+-- row: 1 day
+-- end-expected
+SELECT (INTERVAL '@ 1 day')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: -1 days
+-- end-expected
+SELECT (INTERVAL '@ 1 day ago')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: 12:00:00
+-- end-expected
+SELECT (INTERVAL '.5 days')::text AS a;
+
+-- begin-expected
+-- columns: a
+-- row: 00:15:00
+-- end-expected
+SELECT (INTERVAL '.25 hours')::text AS a;

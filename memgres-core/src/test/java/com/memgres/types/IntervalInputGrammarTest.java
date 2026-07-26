@@ -105,6 +105,15 @@ class IntervalInputGrammarTest {
         assertEquals("2 days 04:05:06", iv("2 04:05:06"));
     }
 
+    /** PG's traditional output opened with '@', and a quantity may start with the dot. */
+    @Test
+    void theAtPrefixAndBareLeadingDotAreAccepted() throws Exception {
+        assertEquals("1 day", iv("@ 1 day"));
+        assertEquals("-1 days", iv("@ 1 day ago"));
+        assertEquals("12:00:00", iv(".5 days"));
+        assertEquals("00:15:00", iv(".25 hours"));
+    }
+
     /** A unit list is not a licence to accept nonsense. */
     @Test
     void nonIntervalTextIsStillRejected() {
