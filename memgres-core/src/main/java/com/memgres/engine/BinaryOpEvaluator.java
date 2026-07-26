@@ -298,8 +298,10 @@ class BinaryOpEvaluator {
                 if ((left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) && Double.isInfinite(result)) {
                     throw new MemgresException("value overflows numeric format", "22003");
                 }
-                if (result == Math.floor(result) && !Double.isInfinite(result) && Math.abs(result) < Long.MAX_VALUE) {
-                    return (long) result;
+                // PG has numeric^numeric and float8^float8 only: a numeric operand keeps the
+                // result numeric (padded to 17 significant digits), everything else is float8.
+                if (left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) {
+                    return numericPowerScale(result);
                 }
                 return result;
             }
@@ -1491,8 +1493,10 @@ class BinaryOpEvaluator {
                 if ((left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) && Double.isInfinite(result)) {
                     throw new MemgresException("value overflows numeric format", "22003");
                 }
-                if (result == Math.floor(result) && !Double.isInfinite(result) && Math.abs(result) < Long.MAX_VALUE) {
-                    return (long) result;
+                // PG has numeric^numeric and float8^float8 only: a numeric operand keeps the
+                // result numeric (padded to 17 significant digits), everything else is float8.
+                if (left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) {
+                    return numericPowerScale(result);
                 }
                 return result;
             }
@@ -2355,4 +2359,17 @@ class BinaryOpEvaluator {
         }
         return sb.toString();
     }
+
+    /**
+     * PG's numeric power pads the result to 17 significant digits, so 10.0^3 prints as
+     * 1000.0000000000000 rather than 1000.
+     */
+    private static java.math.BigDecimal numericPowerScale(double value) {
+        java.math.BigDecimal bd = new java.math.BigDecimal(Double.toString(value));
+        int intDigits = bd.abs().compareTo(java.math.BigDecimal.ONE) < 0
+                ? 1 : bd.abs().toBigInteger().toString().length();
+        int scale = Math.max(0, 16 - (intDigits - 1));
+        return bd.setScale(scale, java.math.RoundingMode.HALF_UP);
+    }
+
 }

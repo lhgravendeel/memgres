@@ -25,6 +25,16 @@ public class PgInterval implements Comparable<PgInterval> {
         this.microseconds = microseconds;
     }
 
+    /** True for an interval of exactly zero length in every field. */
+    public boolean isZero() { return months == 0 && days == 0 && microseconds == 0; }
+
+    /** True when the interval steps backwards; the most significant non-zero field decides. */
+    public boolean isNegative() {
+        if (months != 0) return months < 0;
+        if (days != 0) return days < 0;
+        return microseconds < 0;
+    }
+
     public int getMonths() { return months; }
     public int getDays() { return days; }
     public long getMicroseconds() { return microseconds; }

@@ -834,6 +834,8 @@ class SelectAggregateEvaluator {
                 }
                 if (!hasValue) return null;
                 if (isMoney) return new PgMoney(bdSum);
+                // sum(double precision) is float8 in PG, not numeric
+                if (isFloatArgument(arg, group)) return bdSum.doubleValue();
                 if (allInts) {
                     try { return bdSum.longValueExact(); } catch (ArithmeticException e) { /* fall through */ }
                 }
@@ -862,6 +864,7 @@ class SelectAggregateEvaluator {
                     }
                 }
                 if (count == 0) return null;
+                if (isFloatArgument(arg, group)) return bdSum.doubleValue() / count;
                 BigDecimal result = bdSum.divide(BigDecimal.valueOf(count), 16, RoundingMode.HALF_UP);
                 return result;
             }
@@ -1207,7 +1210,9 @@ class SelectAggregateEvaluator {
                 if (group.isEmpty()) return null;
                 List<BigDecimal> vals = collectBigDecimals(fn.args().get(0), group);
                 BigDecimal variance = computeVariance(vals, false);
-                return variance != null ? variance.setScale(16, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString() : null;
+                if (variance == null) return null;
+                if (isFloatArgument(fn.args().get(0), group)) return variance.doubleValue();
+                return variance.setScale(16, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString();
             }
             case "stddev_pop": {
                 if (group.isEmpty()) return null;
@@ -1230,7 +1235,9 @@ class SelectAggregateEvaluator {
                 if (vals.isEmpty() || vals.size() < 2) return null;
                 double mean = vals.stream().mapToDouble(d -> d).average().orElse(0);
                 double variance = vals.stream().mapToDouble(d -> (d - mean) * (d - mean)).sum() / (vals.size() - 1);
-                return BigDecimal.valueOf(Math.sqrt(variance)).stripTrailingZeros().toPlainString();
+                double sd = Math.sqrt(variance);
+                if (isFloatArgument(arg, group)) return sd;
+                return BigDecimal.valueOf(sd).stripTrailingZeros().toPlainString();
             }
             case "grouping": {
                 Set<String> currentGroupSet = currentGroupingSetColumns.get();
@@ -1253,8 +1260,8 @@ class SelectAggregateEvaluator {
                 if (rd == null) return null;
                 if (rd.sumXDiffSq.compareTo(BigDecimal.ZERO) == 0 || rd.sumYDiffSq.compareTo(BigDecimal.ZERO) == 0) return null;
                 BigDecimal denom = new BigDecimal(Math.sqrt(rd.sumXDiffSq.doubleValue()) * Math.sqrt(rd.sumYDiffSq.doubleValue()));
-                BigDecimal corrVal = rd.sumXYDiff.divide(denom, 16, RoundingMode.HALF_UP);
-                return corrVal.stripTrailingZeros().toPlainString();
+                // corr() is float8 whatever the inputs were
+                return rd.sumXYDiff.divide(denom, 16, RoundingMode.HALF_UP).doubleValue();
             }
             case "regr_slope": {
                 RegressionData rd = RegressionData.compute(group, fn.args(), executor);
@@ -1284,8 +1291,7 @@ class SelectAggregateEvaluator {
                 RegressionData rd = RegressionData.compute(group, fn.args(), executor);
                 if (rd == null) return null;
                 // covar_pop = sum((xi-xmean)*(yi-ymean)) / N
-                BigDecimal result = rd.sumXYDiff.divide(BigDecimal.valueOf(rd.n), 16, RoundingMode.HALF_UP);
-                return result.stripTrailingZeros().toPlainString();
+                return rd.sumXYDiff.divide(BigDecimal.valueOf(rd.n), 16, RoundingMode.HALF_UP).doubleValue();
             }
             case "covar_samp": {
                 RegressionData rd = RegressionData.compute(group, fn.args(), executor);
@@ -1457,12 +1463,20 @@ class SelectAggregateEvaluator {
 
     /** Sort a group by the aggregate's ORDER BY clause (used by string_agg, array_agg, json_agg, etc.). */
     private List<RowContext> sortGroupForAggregate(List<RowContext> group, FunctionCallExpr fn) {
+        checkDistinctOrderBy(fn);
         List<RowContext> orderedGroup = new ArrayList<>(group);
         if (fn.orderBy() != null && !fn.orderBy().isEmpty()) {
             orderedGroup.sort((a, b) -> {
                 for (SelectStmt.OrderByItem item : fn.orderBy()) {
                     Object va = executor.evalExpr(item.expr(), a);
                     Object vb = executor.evalExpr(item.expr(), b);
+                    // PG's default is NULLS LAST ascending, NULLS FIRST descending: nulls sort
+                    // as the largest value, and DESC flips that along with everything else.
+                    if (va == null || vb == null) {
+                        if (va == null && vb == null) continue;
+                        int nullCmp = va == null ? 1 : -1;
+                        return item.descending() ? -nullCmp : nullCmp;
+                    }
                     int cmp = executor.compareValues(va, vb);
                     if (item.descending()) cmp = -cmp;
                     if (cmp != 0) return cmp;
@@ -1471,6 +1485,36 @@ class SelectAggregateEvaluator {
             });
         }
         return orderedGroup;
+    }
+
+    /**
+     * DISTINCT collapses the group down to the aggregate's own arguments, so a sort key that
+     * is not one of them no longer exists by the time the ordering would be applied. PG rejects
+     * that combination rather than sorting by a value it has already discarded.
+     */
+    private static void checkDistinctOrderBy(FunctionCallExpr fn) {
+        if (!fn.distinct() || fn.orderBy() == null || fn.orderBy().isEmpty()) return;
+        Set<String> argTexts = new HashSet<>();
+        for (Expression arg : fn.args()) {
+            if (arg != null) argTexts.add(arg.toString());
+        }
+        for (SelectStmt.OrderByItem item : fn.orderBy()) {
+            if (item.expr() != null && !argTexts.contains(item.expr().toString())) {
+                throw new MemgresException(
+                        "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list",
+                        "42P10");
+            }
+        }
+    }
+
+    /** True when the aggregate's input is double precision, which keeps the result float8. */
+    private boolean isFloatArgument(Expression arg, List<RowContext> group) {
+        for (RowContext ctx : group) {
+            Object v = executor.evalExpr(arg, ctx);
+            if (v == null) continue;
+            return v instanceof Double || v instanceof Float;
+        }
+        return false;
     }
 
     /** Collect BigDecimal values from a group for a given expression, skipping nulls. */

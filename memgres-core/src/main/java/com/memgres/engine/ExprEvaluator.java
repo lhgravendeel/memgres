@@ -2039,6 +2039,10 @@ class ExprEvaluator {
         if (expr instanceof CustomOperatorExpr) {
             return "?column?";
         }
+        if (expr instanceof OrderedSetAggExpr) return ((OrderedSetAggExpr) expr).funcName().toLowerCase();
+        if (expr instanceof JsonValueExpr) return "json_value";
+        if (expr instanceof JsonQueryExpr) return "json_query";
+        if (expr instanceof JsonExistsExpr) return "json_exists";
         if (expr instanceof CaseExpr) return "case";
         if (expr instanceof ArrayExpr) return ((ArrayExpr) expr).isRow() ? "row" : "array";
         if (expr instanceof ExistsExpr) return "exists";

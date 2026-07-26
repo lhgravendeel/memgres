@@ -26,6 +26,7 @@ class FromFunctionResolver {
      */
     List<RowContext> resolveFunctionFrom(SelectStmt.FunctionFrom funcFrom) {
         List<RowContext> contexts = doResolveFunctionFrom(funcFrom);
+        checkColumnAliasCount(funcFrom, contexts);
         // TABLESAMPLE binds the real stored table; never flag persistent tables.
         if (!funcFrom.functionName().toLowerCase().startsWith("__tablesample__:")) {
             for (RowContext rc : contexts) {
@@ -35,6 +36,24 @@ class FromFunctionResolver {
             }
         }
         return contexts;
+    }
+
+    /**
+     * A column alias list cannot name more columns than the function produces. Extra aliases
+     * are silently ignorable only in the sense that PG refuses them outright, which matters
+     * for WITH ORDINALITY, where the ordinality column is easy to miscount.
+     */
+    private void checkColumnAliasCount(SelectStmt.FunctionFrom funcFrom, List<RowContext> contexts) {
+        List<String> aliases = funcFrom.columnAliases();
+        if (aliases == null || aliases.isEmpty() || contexts.isEmpty()) return;
+        List<RowContext.TableBinding> bindings = contexts.get(0).getBindings();
+        if (bindings.isEmpty()) return;
+        int available = bindings.get(0).table().getColumns().size();
+        if (aliases.size() > available) {
+            String rel = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
+            throw new MemgresException("table \"" + rel + "\" has " + available
+                    + " columns available but " + aliases.size() + " columns specified", "42P10");
+        }
     }
 
     private List<RowContext> doResolveFunctionFrom(SelectStmt.FunctionFrom funcFrom) {
@@ -55,7 +74,7 @@ class FromFunctionResolver {
         if (fname.equals("pg_indexam_has_property")) return resolvePgIndexamHasProperty(alias, evalArgs);
         if (fname.equals("pg_available_extension_versions")) return resolvePgAvailableExtensionVersions(alias);
         if (fname.equals("pg_show_all_settings")) return resolvePgShowAllSettings(alias);
-        if (fname.equals("unnest")) return resolveUnnest(alias, colAliases, evalArgs);
+        if (fname.equals("unnest")) return resolveUnnest(alias, colAliases, evalArgs, funcFrom.withOrdinality());
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
             return resolveJsonEach(fname, alias, colAliases, evalArgs);
         if (fname.equals("jsonb_to_recordset") || fname.equals("json_to_recordset") || fname.equals("jsonb_to_record") || fname.equals("json_to_record"))
@@ -112,13 +131,20 @@ class FromFunctionResolver {
         boolean hasOrdinality = withOrdinality || (colAliases != null && colAliases.size() >= 2);
         String ordColName = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "ordinality";
         Object stepObj = evalArgs.size() > 2 ? evalArgs.get(2) : null;
+        // A zero step can never reach the stop value, so PG rejects it rather than looping
+        if (stepObj instanceof Number && ((Number) stepObj).doubleValue() == 0.0) {
+            throw new MemgresException("step size cannot equal zero", "22023");
+        }
+        if (stepObj instanceof PgInterval && ((PgInterval) stepObj).isZero()) {
+            throw new MemgresException("step size cannot equal zero", "22023");
+        }
         // OffsetDateTime (timestamptz) overload
         if (evalArgs.get(0) instanceof java.time.OffsetDateTime) {
             java.time.OffsetDateTime tzStart = (java.time.OffsetDateTime) evalArgs.get(0);
             java.time.OffsetDateTime tzStop = evalArgs.get(1) instanceof java.time.OffsetDateTime
                     ? (java.time.OffsetDateTime) evalArgs.get(1) : TypeCoercion.toOffsetDateTime(evalArgs.get(1));
             PgInterval ivStep = stepObj != null ? TypeCoercion.toInterval(stepObj) : new PgInterval(0, 1, 0);
-            boolean ascending = !tzStart.isAfter(tzStop);
+            boolean ascending = !ivStep.isNegative();
             String colName = firstColAlias(colAliases, alias);
             List<Column> cols = new ArrayList<>();
             cols.add(new Column(colName, DataType.TIMESTAMPTZ, true, false, null));
@@ -147,7 +173,7 @@ class FromFunctionResolver {
             java.time.LocalDateTime dtStart = dateInput ? ((java.time.LocalDate) evalArgs.get(0)).atStartOfDay() : TypeCoercion.toLocalDateTime(evalArgs.get(0));
             java.time.LocalDateTime dtStop = evalArgs.get(1) instanceof java.time.LocalDate ? ((java.time.LocalDate) evalArgs.get(1)).atStartOfDay() : TypeCoercion.toLocalDateTime(evalArgs.get(1));
             PgInterval ivStep = stepObj != null ? TypeCoercion.toInterval(stepObj) : new PgInterval(0, 1, 0);
-            boolean ascending = !dtStart.isAfter(dtStop);
+            boolean ascending = !ivStep.isNegative();
             String colName = firstColAlias(colAliases, alias);
             // DATE input → timestamptz (PG promotes), TIMESTAMP input → timestamp
             List<Column> cols = new ArrayList<>();
@@ -170,6 +196,34 @@ class FromFunctionResolver {
                 cur = next;
             }
             return contexts;
+        }
+        // Numeric overload: a fractional bound or step must not be truncated to bigint
+        if (evalArgs.get(0) instanceof java.math.BigDecimal
+                || evalArgs.get(1) instanceof java.math.BigDecimal
+                || stepObj instanceof java.math.BigDecimal) {
+            java.math.BigDecimal nStart = TypeCoercion.toBigDecimal(evalArgs.get(0));
+            java.math.BigDecimal nStop = TypeCoercion.toBigDecimal(evalArgs.get(1));
+            java.math.BigDecimal nStep = stepObj != null
+                    ? TypeCoercion.toBigDecimal(stepObj) : java.math.BigDecimal.ONE;
+            String numColName = firstColAlias(colAliases, alias);
+            List<Column> numCols = new ArrayList<>();
+            numCols.add(new Column(numColName, DataType.NUMERIC, true, false, null));
+            if (hasOrdinality) {
+                numCols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
+            }
+            Table numTable = new Table(alias, numCols);
+            List<RowContext> numContexts = new ArrayList<>();
+            boolean up = nStep.signum() > 0;
+            long numOrd = 1;
+            // Accumulate with add() so each value keeps PG's growing scale (1.0, 1.25, 1.50, ...)
+            for (java.math.BigDecimal v = nStart;
+                 up ? v.compareTo(nStop) <= 0 : v.compareTo(nStop) >= 0;
+                 v = v.add(nStep)) {
+                Object[] row = hasOrdinality ? new Object[]{v, numOrd++} : new Object[]{v};
+                numTable.insertRow(row);
+                numContexts.add(new RowContext(numTable, alias, row));
+            }
+            return numContexts;
         }
         try {
             executor.toLong(evalArgs.get(0));
@@ -440,12 +494,13 @@ class FromFunctionResolver {
 
     // ---- unnest ----
 
-    private List<RowContext> resolveUnnest(String alias, List<String> colAliases, List<Object> evalArgs) {
+    private List<RowContext> resolveUnnest(String alias, List<String> colAliases, List<Object> evalArgs,
+                                           boolean withOrdinality) {
         if (evalArgs.isEmpty()) {
             throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
         }
         if (evalArgs.size() > 1) {
-            return resolveMultiUnnest(alias, colAliases, evalArgs);
+            return resolveMultiUnnest(alias, colAliases, evalArgs, withOrdinality);
         }
         // Single array/multirange unnest
         Object arr = evalArgs.get(0);
@@ -467,8 +522,10 @@ class FromFunctionResolver {
         String colName = firstColAlias(colAliases, alias);
         List<Column> cols = new ArrayList<>();
         cols.add(new Column(colName, DataType.TEXT, true, false, null));
-        boolean hasOrdinality = colAliases != null && colAliases.size() >= 2;
-        String ordColName = hasOrdinality ? colAliases.get(1) : "ordinality";
+        // The WITH ORDINALITY clause decides; a short alias list just leaves the extra
+        // column with its default name rather than dropping it
+        boolean hasOrdinality = withOrdinality || (colAliases != null && colAliases.size() >= 2);
+        String ordColName = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "ordinality";
         if (hasOrdinality) {
             cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
         }
@@ -483,7 +540,8 @@ class FromFunctionResolver {
         return contexts;
     }
 
-    private List<RowContext> resolveMultiUnnest(String alias, List<String> colAliases, List<Object> evalArgs) {
+    private List<RowContext> resolveMultiUnnest(String alias, List<String> colAliases, List<Object> evalArgs,
+                                                boolean withOrdinality) {
         List<List<Object>> allElements = new ArrayList<>();
         int maxLen = 0;
         for (Object arr : evalArgs) {
@@ -497,8 +555,10 @@ class FromFunctionResolver {
             String cname = (colAliases != null && i < colAliases.size()) ? colAliases.get(i) : ("col" + (i+1));
             cols.add(new Column(cname, DataType.TEXT, true, false, null));
         }
-        boolean hasOrdinality = colAliases != null && colAliases.size() > evalArgs.size();
-        String ordColName = hasOrdinality ? colAliases.get(evalArgs.size()) : "ordinality";
+        boolean hasOrdinality = withOrdinality
+                || (colAliases != null && colAliases.size() > evalArgs.size());
+        String ordColName = (colAliases != null && colAliases.size() > evalArgs.size())
+                ? colAliases.get(evalArgs.size()) : "ordinality";
         if (hasOrdinality) cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
 
         Table virtualTable = new Table(alias, cols);
