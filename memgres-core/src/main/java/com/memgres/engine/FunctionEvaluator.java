@@ -701,7 +701,8 @@ class FunctionEvaluator {
             }
             case "lastval": {
                 if (executor.lastSequenceValue == null) {
-                    throw new MemgresException("lastval is not yet defined in this session");
+                    throw new MemgresException(
+                            "lastval is not yet defined in this session", "55000");
                 }
                 return executor.lastSequenceValue;
             }

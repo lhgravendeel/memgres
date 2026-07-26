@@ -2370,7 +2370,12 @@ class DmlExecutor {
         Session.CursorState cursor = executor.session.getCursor(cof.cursorName());
         if (cursor == null) throw new MemgresException("cursor \"" + cof.cursorName() + "\" does not exist", "34000");
         int pos = cursor.getPosition();
-        if (pos < 0 || pos >= cursor.getRowCount()) return new ArrayList<>();
+        // A cursor that has not fetched yet, or has run past the end, is not on a row: PG says
+        // so rather than quietly matching nothing
+        if (pos < 0 || pos >= cursor.getRowCount()) {
+            throw new MemgresException(
+                    "cursor \"" + cof.cursorName() + "\" is not positioned on a row", "24000");
+        }
         Object[] cursorRow = cursor.getRow(pos);
         // Map cursor columns to table column indices
         List<Column> cursorCols = cursor.getColumns();
