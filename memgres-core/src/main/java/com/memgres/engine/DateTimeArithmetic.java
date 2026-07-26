@@ -23,6 +23,15 @@ class DateTimeArithmetic {
         // interval + interval
         if (left instanceof PgInterval && right instanceof PgInterval) return ((PgInterval) left).plus(((PgInterval) right));
 
+        // A temporal plus an infinite interval is that infinity, which memgres renders as the
+        // word rather than the sentinel date a LocalDateTime would print
+        if (left instanceof PgInterval && ((PgInterval) left).isInfinite() && isTemporal(right)) {
+            return ((PgInterval) left).isPositiveInfinity() ? "infinity" : "-infinity";
+        }
+        if (right instanceof PgInterval && ((PgInterval) right).isInfinite() && isTemporal(left)) {
+            return ((PgInterval) right).isPositiveInfinity() ? "infinity" : "-infinity";
+        }
+
         // date/timestamp + interval (PG: date + interval returns timestamp)
         if (left instanceof LocalDate && right instanceof PgInterval) return ((PgInterval) right).addTo(((LocalDate) left).atStartOfDay());
         if (left instanceof LocalDateTime && right instanceof PgInterval) return ((PgInterval) right).addTo(((LocalDateTime) left));
@@ -182,6 +191,23 @@ class DateTimeArithmetic {
         // infinity timestamp - interval = infinity
         if (left instanceof String && isTimestampInfinity((String) left) && right instanceof PgInterval) return left;
 
+        // An infinite endpoint makes the difference an infinite interval, signed by which side
+        // it sits on. Two like infinities have no difference at all, which PG rejects.
+        {
+            Integer li = timestampInfinitySign(left);
+            Integer ri = timestampInfinitySign(right);
+            if (li != null || ri != null) {
+                if (li != null && ri != null) {
+                    if (li.intValue() == ri.intValue()) {
+                        throw new MemgresException("interval out of range", "22008");
+                    }
+                    return li > 0 ? PgInterval.INFINITY : PgInterval.NEG_INFINITY;
+                }
+                if (li != null) return li > 0 ? PgInterval.INFINITY : PgInterval.NEG_INFINITY;
+                return ri > 0 ? PgInterval.NEG_INFINITY : PgInterval.INFINITY;
+            }
+        }
+
         // Multirange - Multirange → set difference
         if (left instanceof String && right instanceof String
                 && RangeOperations.isMultirangeOrEmpty(((String) left)) && RangeOperations.isMultirangeOrEmpty(((String) right))) {
@@ -320,6 +346,33 @@ class DateTimeArithmetic {
         if (left instanceof PgInterval && right instanceof Number) return ((PgInterval) left).multiply(((Number) right).doubleValue());
         if (left instanceof Number && right instanceof PgInterval) return ((PgInterval) right).multiply(((Number) left).doubleValue());
         return executor.numericOp(left, right, (a, b) -> a * b, Math::multiplyExact, java.math.BigDecimal::multiply);
+    }
+
+    /**
+     * +1 / -1 when the value is an infinite timestamp or date, null when it is finite or is not
+     * a temporal at all. Both the sentinel values and the literal words count.
+     */
+    private static Integer timestampInfinitySign(Object v) {
+        if (v instanceof String) {
+            String t = ((String) v).trim();
+            if (t.equalsIgnoreCase("infinity")) return 1;
+            if (t.equalsIgnoreCase("-infinity")) return -1;
+            return null;
+        }
+        if (v instanceof java.time.LocalDateTime) {
+            if (v.equals(TypeCoercion.TIMESTAMP_INFINITY)) return 1;
+            if (v.equals(TypeCoercion.TIMESTAMP_NEG_INFINITY)) return -1;
+        }
+        if (v instanceof java.time.LocalDate) {
+            if (v.equals(TypeCoercion.DATE_INFINITY)) return 1;
+            if (v.equals(TypeCoercion.DATE_NEG_INFINITY)) return -1;
+        }
+        return null;
+    }
+
+    /** True for the temporal values an interval can be added to. */
+    private static boolean isTemporal(Object v) {
+        return v instanceof LocalDate || v instanceof LocalDateTime || v instanceof OffsetDateTime;
     }
 
     /** Check if a string represents a PG infinity timestamp. */

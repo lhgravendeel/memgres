@@ -354,14 +354,22 @@ class CastEvaluator {
                     }
                     return bhex.toString();
                 }
-                // LocalDateTime to text: PG uses space separator, not 'T'
+                // LocalDateTime to text: PG uses a space separator, not 'T', and marks the era
                 if (val instanceof java.time.LocalDateTime) {
                     java.time.LocalDateTime dt = (java.time.LocalDateTime) val;
+                    String datePart = String.format("%04d-%02d-%02d",
+                            TypeCoercion.displayYear(dt.getYear()), dt.getMonthValue(), dt.getDayOfMonth());
+                    String era = TypeCoercion.eraSuffix(dt.getYear());
                     if (dt.getNano() != 0) {
-                        String s = dt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS"));
-                        return stripTrailingFracZeros(s);
+                        String s = datePart + " "
+                                + dt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS"));
+                        return stripTrailingFracZeros(s) + era;
                     }
-                    return dt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+                    return datePart + " "
+                            + dt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")) + era;
+                }
+                if (val instanceof java.time.LocalDate) {
+                    return TypeCoercion.formatIsoDate((java.time.LocalDate) val);
                 }
                 // PG formats float8/float4 without trailing ".0" when the value is integral
                 if (val instanceof Double) {

@@ -634,18 +634,41 @@ public final class TypeCoercion {
         }
     }
 
+    /**
+     * PG has no year zero: a proleptic year of 0 or less is written as its BC equivalent with
+     * an era suffix, so ISO year -43 prints as {@code 0044-... BC}.
+     */
+    public static String formatIsoDate(LocalDate d) {
+        int y = d.getYear();
+        return String.format("%04d-%02d-%02d%s", displayYear(y),
+                d.getMonthValue(), d.getDayOfMonth(), eraSuffix(y));
+    }
+
+    /** The BC suffix PG appends after the time part of a pre-Christian timestamp. */
+    public static String eraSuffix(int prolepticYear) {
+        return prolepticYear > 0 ? "" : " BC";
+    }
+
+    /** The year PG writes for a proleptic year, ignoring the era. */
+    public static int displayYear(int prolepticYear) {
+        return prolepticYear > 0 ? prolepticYear : 1 - prolepticYear;
+    }
+
     private static String toString(Object val) {
         if (val instanceof Double) return PgFloatFormat.float8out((Double) val);
         if (val instanceof Float) return PgFloatFormat.float4out((Float) val);
-        if (val instanceof LocalDate) return ((LocalDate) val).toString();
+        if (val instanceof LocalDate) return formatIsoDate((LocalDate) val);
         if (val instanceof LocalDateTime) {
             LocalDateTime dt = (LocalDateTime) val;
+            String datePart = String.format("%04d-%02d-%02d", displayYear(dt.getYear()),
+                    dt.getMonthValue(), dt.getDayOfMonth());
+            String era = eraSuffix(dt.getYear());
             if (dt.getNano() != 0) {
-                String s = dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS"));
+                String s = datePart + " " + dt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS"));
                 // Strip trailing zeros from fractional seconds
-                return s.replaceAll("0+$", "").replaceAll("\\.$", "");
+                return s.replaceAll("0+$", "").replaceAll("\\.$", "") + era;
             }
-            return dt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            return datePart + " " + dt.format(DateTimeFormatter.ofPattern("HH:mm:ss")) + era;
         }
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toString();
         if (val instanceof LocalTime) return ((LocalTime) val).toString();
@@ -941,14 +964,23 @@ public final class TypeCoercion {
             // Handle date infinity/negative infinity
             if (trimmed.equalsIgnoreCase("infinity")) return "infinity";
             if (trimmed.equalsIgnoreCase("-infinity")) return "-infinity";
-            if (trimmed.toUpperCase().endsWith(" BC")) {
-                // Parse the date part and return with BC suffix
-                String datePart = trimmed.substring(0, trimmed.length() - 3).trim();
-                LocalDate d = toLocalDate(datePart);
-                return d.toString() + " BC";
-            }
+            // A BC date is a real date with a proleptic year, not text carrying a suffix:
+            // keeping it typed is what lets it be compared and subtracted. The era marker
+            // comes back at render time, from formatIsoDate.
         }
         return toLocalDate(val);
+    }
+
+    /** True when the text carries a trailing BC era marker. */
+    private static boolean endsWithEra(String s) {
+        String t = s.trim();
+        return t.length() > 3 && t.toUpperCase().endsWith(" BC");
+    }
+
+    /** The date/time text with its trailing era marker removed. */
+    private static String stripEra(String s) {
+        String t = s.trim();
+        return t.substring(0, t.length() - 3).trim();
     }
 
     public static LocalDate toLocalDate(Object val) {
@@ -960,14 +992,18 @@ public final class TypeCoercion {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalDate();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toLocalDate();
         String s = val.toString().trim();
+        if (endsWithEra(s)) {
+            LocalDate bc = toLocalDate(stripEra(s));
+            return bc.withYear(1 - bc.getYear());
+        }
         // Handle special keywords
         switch (s.toLowerCase()) {
             case "epoch": return LocalDate.of(1970, 1, 1);
             case "today": return LocalDate.now();
             case "yesterday": return LocalDate.now().minusDays(1);
             case "tomorrow": return LocalDate.now().plusDays(1);
-            case "infinity": case "-infinity":
-                throw new MemgresException("date out of range", "22008");
+            case "infinity": return DATE_INFINITY;
+            case "-infinity": return DATE_NEG_INFINITY;
         }
         // Reject year 0000 - PostgreSQL has no year zero
         if (s.startsWith("0000-")) {
@@ -1230,6 +1266,9 @@ public final class TypeCoercion {
     // Sentinel values for PG 'infinity' / '-infinity' timestamps
     public static final LocalDateTime TIMESTAMP_INFINITY = LocalDateTime.of(9999, 12, 31, 23, 59, 59);
     public static final LocalDateTime TIMESTAMP_NEG_INFINITY = LocalDateTime.of(-4713, 1, 1, 0, 0, 0);
+    /** date also has infinities, sharing the timestamp sentinels' day so comparisons agree. */
+    public static final LocalDate DATE_INFINITY = TIMESTAMP_INFINITY.toLocalDate();
+    public static final LocalDate DATE_NEG_INFINITY = TIMESTAMP_NEG_INFINITY.toLocalDate();
 
     public static Object toLocalDateTimeOrInfinity(Object val) {
         if (val instanceof String) {
@@ -1246,6 +1285,12 @@ public final class TypeCoercion {
         if (val instanceof LocalDate) return ((LocalDate) val).atStartOfDay();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toLocalDateTime();
         String s = val.toString().trim();
+        // A BC era suffix means a proleptic year of 1 - the written year: 44 BC is ISO year -43
+        if (endsWithEra(s)) {
+            String body = stripEra(s);
+            LocalDateTime bc = toLocalDateTime(body);
+            return bc.withYear(1 - bc.getYear());
+        }
         // Handle PG 'infinity' / '-infinity' special values
         if (s.equalsIgnoreCase("infinity")) return TIMESTAMP_INFINITY;
         if (s.equalsIgnoreCase("-infinity")) return TIMESTAMP_NEG_INFINITY;

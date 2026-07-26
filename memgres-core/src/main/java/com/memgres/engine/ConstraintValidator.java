@@ -1000,8 +1000,12 @@ class ConstraintValidator {
         boolean leftIsGeometric = left instanceof String && GeometricOperations.isGeometricString(((String) left));
         boolean rightIsGeometric = right instanceof String && GeometricOperations.isGeometricString(((String) right));
 
-        // String - String: PG says "operator is not unique" (42725)
+        // String - String: PG says "operator is not unique" (42725). An infinity keeps its
+        // timestamp type through the literal, so subtracting one is a real timestamp operation.
+        boolean leftIsInfinity = left instanceof String && isInfinityWord((String) left);
+        boolean rightIsInfinity = right instanceof String && isInfinityWord((String) right);
         if (op == BinaryExpr.BinOp.SUBTRACT && left instanceof String && right instanceof String
+                && !leftIsInfinity && !rightIsInfinity
                 && !leftIsGeometric && !((String) left).trim().startsWith("{") && !((String) left).trim().startsWith("[")
                 && !RangeOperations.isRangeString(((String) left))
                 && !isLsnString(((String) left).trim())) {
@@ -1387,6 +1391,12 @@ class ConstraintValidator {
     }
 
     /** Check if a string matches the pg_lsn format: hex/hex (e.g., "0/4000000"). */
+    /** True for the timestamp infinity words, which carry a temporal type despite being text. */
+    private static boolean isInfinityWord(String s) {
+        String t = s.trim();
+        return t.equalsIgnoreCase("infinity") || t.equalsIgnoreCase("-infinity");
+    }
+
     private static boolean isLsnString(String s) {
         return s.matches("[0-9a-fA-F]+/[0-9a-fA-F]+");
     }
