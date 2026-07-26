@@ -1161,6 +1161,29 @@ public class Session {
     }
 
     /**
+     * The schema a CREATE lands in. Reading tolerates a search_path entry that names nothing --
+     * the entry is simply skipped -- but creating does not: with no usable entry there is
+     * nowhere to put the object, and PG says so rather than quietly using public.
+     */
+    public String getCreationSchema() {
+        String searchPath = gucSettings.get("search_path");
+        if (searchPath != null) {
+            boolean hasEntries = false;
+            for (String sp : searchPath.split(",")) {
+                String s = sp.trim().replace("\"", "").replace("'", "");
+                if (s.isEmpty() || s.equals("$user")) continue;
+                hasEntries = true;
+                if ("pg_catalog".equals(s) || "information_schema".equals(s)
+                        || database.getSchema(s) != null) return s;
+            }
+            if (hasEntries) {
+                throw new MemgresException("no schema has been selected to create in", "3F000");
+            }
+        }
+        return "public";
+    }
+
+    /**
      * Returns the full effective search path as an ordered list of schema names.
      * Matches PG's current_schemas() behavior.
      */
