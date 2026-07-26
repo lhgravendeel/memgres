@@ -509,14 +509,20 @@ class DmlExecutor {
                         }
                         Object[] oldRow = Arrays.copyOf(conflictRow, conflictRow.length);
                         Object[] newRow = Arrays.copyOf(conflictRow, conflictRow.length);
+                        Set<String> conflictUpdCols = new HashSet<>();
                         for (InsertStmt.SetClause set : stmt.onConflict().doUpdate()) {
                             int colIdx = conflictTable.getColumnIndex(set.column());
                             if (colIdx < 0) {
                                 throw new MemgresException("Column not found: " + set.column());
                             }
+                            conflictUpdCols.add(set.column().toLowerCase());
                             Object val = executor.evalExpr(set.value(), conflictCtx);
                             newRow[colIdx] = TypeCoercion.coerceForStorage(val, conflictTable.getColumns().get(colIdx));
                         }
+                        // The conflict path is an UPDATE, so it fires UPDATE row triggers.
+                        newRow = triggerHelper.executeTriggers(triggers, PgTrigger.Timing.BEFORE,
+                                PgTrigger.Event.UPDATE, newRow, oldRow, conflictTable, conflictUpdCols);
+                        if (newRow == null) continue;   // BEFORE trigger suppressed the row
                         computeGeneratedColumns(conflictTable, newRow);
                         // Validate constraints BEFORE mutating the row to avoid index corruption
                         executor.constraintValidator.validateConstraints(conflictTable, newRow, conflictRow);
@@ -527,6 +533,8 @@ class DmlExecutor {
                             throw e;
                         }
                         recordUpdateUndo(stmt.schema(), conflictTable.getName(), conflictRow, oldRow);
+                        triggerHelper.executeTriggers(triggers, PgTrigger.Timing.AFTER,
+                                PgTrigger.Event.UPDATE, conflictRow, oldRow, conflictTable, conflictUpdCols);
                         if (stmt.returning() != null && !stmt.returning().isEmpty()) {
                             returningRows.add(evalReturning(stmt.returning(), conflictTable, stmt.alias(), conflictRow, oldRow, conflictRow));
                         }
