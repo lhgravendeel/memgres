@@ -17,10 +17,50 @@ class TextSearchFunctions {
         return parsed != null ? parsed : TsVector.fromText(s);
     }
 
+    /** The configurations PG ships with, each backed by its own snowball stemmer. */
+    private static final Set<String> BUILTIN_TS_CONFIGS = Cols.setOf(
+            "simple", "english", "german", "french", "spanish", "italian",
+            "portuguese", "dutch", "finnish", "swedish", "danish", "norwegian",
+            "russian", "romanian", "hungarian", "turkish", "arabic", "nepali",
+            "irish", "indonesian", "lithuanian", "greek", "hindi", "basque");
+
     private final AstExecutor executor;
 
     TextSearchFunctions(AstExecutor executor) {
         this.executor = executor;
+    }
+
+    /**
+     * Resolve a text search configuration name to the built-in that does the actual work. A
+     * configuration created with COPY behaves as its source does, so following copyFrom lands on
+     * a stemmer; a name that names nothing at all is an error, not a silent fallback.
+     */
+    private String resolveTsConfig(String rawName) {
+        String name = rawName == null ? "" : rawName.toLowerCase();
+        // Strip any schema qualification: configurations live in one namespace here.
+        int dot = name.lastIndexOf('.');
+        if (dot >= 0) name = name.substring(dot + 1);
+        if (BUILTIN_TS_CONFIGS.contains(name)) return name;
+
+        Map<String, Database.TsConfigDef> defined = executor.database.getTsConfigs();
+        String current = name;
+        // A chain of copies has to end somewhere; stop if it loops back on itself.
+        for (int hops = 0; hops < 16; hops++) {
+            Database.TsConfigDef def = defined.get(current);
+            if (def == null) break;
+            String next = def.copyFrom != null ? def.copyFrom.toLowerCase() : null;
+            if (next == null) {
+                // Declared with a PARSER rather than COPY: tokenizes without stemming.
+                return "simple";
+            }
+            int nextDot = next.lastIndexOf('.');
+            if (nextDot >= 0) next = next.substring(nextDot + 1);
+            if (BUILTIN_TS_CONFIGS.contains(next)) return next;
+            if (next.equals(current)) break;
+            current = next;
+        }
+        throw new MemgresException(
+                "text search configuration \"" + rawName + "\" does not exist", "42704");
     }
 
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
@@ -33,15 +73,8 @@ class TextSearchFunctions {
             }
             case "to_tsvector": {
                 if (fn.args().size() == 2) {
-                    String configName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    java.util.Set<String> validConfigs = Cols.setOf(
-                            "simple", "english", "german", "french", "spanish", "italian",
-                            "portuguese", "dutch", "finnish", "swedish", "danish", "norwegian",
-                            "russian", "romanian", "hungarian", "turkish", "arabic", "nepali",
-                            "irish", "indonesian", "lithuanian", "greek", "hindi", "basque");
-                    if (!validConfigs.contains(configName)) {
-                        throw new MemgresException("text search configuration \"" + configName + "\" does not exist", "42704");
-                    }
+                    String configName = resolveTsConfig(
+                            String.valueOf(executor.evalExpr(fn.args().get(0), ctx)));
                     Object text = executor.evalExpr(fn.args().get(1), ctx);
                     return text == null ? null : TsVector.fromText(text.toString(), configName);
                 }
@@ -52,7 +85,7 @@ class TextSearchFunctions {
                 String config = "english";
                 Object tsqText;
                 if (fn.args().size() == 2) {
-                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
+                    config = resolveTsConfig(String.valueOf(executor.evalExpr(fn.args().get(0), ctx)));
                     tsqText = executor.evalExpr(fn.args().get(1), ctx);
                 } else {
                     tsqText = executor.evalExpr(fn.args().get(0), ctx);

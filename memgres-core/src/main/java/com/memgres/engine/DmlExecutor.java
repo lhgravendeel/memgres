@@ -1017,6 +1017,10 @@ class DmlExecutor {
     private QueryResult executeUpdateInner(UpdateStmt stmt) {
         // Check read-only transaction
         checkReadOnly("UPDATE");
+        // A rule rewrites the statement before anything else looks at the table, so an
+        // INSTEAD NOTHING rule means no update happens and none of the checks below apply.
+        QueryResult ruled = applyInsteadRule(stmt.table(), "UPDATE", QueryResult.Type.UPDATE);
+        if (ruled != null) return ruled;
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
@@ -1580,6 +1584,8 @@ class DmlExecutor {
     private QueryResult executeDeleteInner(DeleteStmt stmt) {
         // Check read-only transaction
         checkReadOnly("DELETE");
+        QueryResult ruledDelete = applyInsteadRule(stmt.table(), "DELETE", QueryResult.Type.DELETE);
+        if (ruledDelete != null) return ruledDelete;
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
@@ -2480,6 +2486,24 @@ class DmlExecutor {
     }
 
     // ---- Read-only transaction check ----
+
+    /**
+     * Apply an INSTEAD rule for an UPDATE or DELETE. INSTEAD NOTHING reports the command as having
+     * touched no rows; INSTEAD &lt;command&gt; runs that command in its place. Returns null when no
+     * such rule applies and the statement should run normally.
+     */
+    private QueryResult applyInsteadRule(String tableName, String event, QueryResult.Type type) {
+        String ruleVal = executor.database.getRule(tableName, event);
+        if (ruleVal == null) return null;
+        if ("INSTEAD_NOTHING".equals(ruleVal)) {
+            return QueryResult.command(type, 0);
+        }
+        if (ruleVal.startsWith("INSTEAD:")) {
+            executor.execute(ruleVal.substring("INSTEAD:".length()));
+            return QueryResult.command(type, 0);
+        }
+        return null;
+    }
 
     private void checkReadOnly(String command) {
         if (executor.session != null && executor.session.isReadOnly()) {
