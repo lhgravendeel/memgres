@@ -32,6 +32,10 @@ public class PgInterval implements Comparable<PgInterval> {
         this.microseconds = microseconds;
     }
 
+    public int getMonths() { return months; }
+    public int getDays() { return days; }
+    public long getMicroseconds() { return microseconds; }
+
     public boolean isInfinite() {
         return months == Integer.MAX_VALUE || months == Integer.MIN_VALUE;
     }
@@ -44,10 +48,6 @@ public class PgInterval implements Comparable<PgInterval> {
     private static MemgresException intervalOutOfRange() {
         return new MemgresException("interval out of range", "22008");
     }
-
-    public int getMonths() { return months; }
-    public int getDays() { return days; }
-    public long getMicroseconds() { return microseconds; }
 
     public PgInterval plus(PgInterval other) {
         if (isInfinite() || other.isInfinite()) {
