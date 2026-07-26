@@ -1406,6 +1406,34 @@ public final class TypeCoercion {
      * Handles cross-type numeric comparisons and date/time comparisons.
      */
     @SuppressWarnings("unchecked")
+    /**
+     * Array column values are held as PG array literals. Sorting has to compare them
+     * element-wise, as the array operators do, rather than lexicographically — otherwise
+     * {1,2,3} sorts before {1} because ',' precedes '}'.
+     */
+    public static Object arrayForCompare(Object value) {
+        if (!(value instanceof String)) return value;
+        String s = ((String) value).trim();
+        if (s.length() < 2 || s.charAt(0) != '{' || s.charAt(s.length() - 1) != '}') return value;
+        String inner = s.substring(1, s.length() - 1).trim();
+        List<Object> out = new ArrayList<>();
+        if (inner.isEmpty()) return out;
+        for (String raw : inner.split(",")) {
+            String elem = raw.trim();
+            if (elem.equalsIgnoreCase("NULL")) { out.add(null); continue; }
+            if (elem.length() > 1 && elem.charAt(0) == '"' && elem.charAt(elem.length() - 1) == '"') {
+                out.add(elem.substring(1, elem.length() - 1));
+                continue;
+            }
+            try {
+                out.add(new BigDecimal(elem));
+            } catch (NumberFormatException e) {
+                out.add(elem);
+            }
+        }
+        return out;
+    }
+
     public static int compare(Object a, Object b) {
         if (a == null && b == null) return 0;
         if (a == null) return -1;
