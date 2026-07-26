@@ -122,6 +122,99 @@ public class GucSettings {
 
         // Index settings (queried by JDBC driver for DatabaseMetaData)
         DEFAULTS.put("max_index_keys", "32");
+
+        // Settings a client or pool reads at startup to decide how to talk to the server. They
+        // describe how input is parsed and how much fits in a page, so an unrecognised name is
+        // not a missing feature to a driver — it is a server it does not know how to address.
+        DEFAULTS.put("array_nulls", "on");
+        DEFAULTS.put("backslash_quote", "safe_encoding");
+        DEFAULTS.put("block_size", "8192");
+        DEFAULTS.put("segment_size", "131072");
+        DEFAULTS.put("wal_block_size", "8192");
+        DEFAULTS.put("wal_segment_size", "16777216");
+        DEFAULTS.put("data_checksums", "off");
+        DEFAULTS.put("debug_assertions", "off");
+        DEFAULTS.put("escape_string_warning", "on");
+        DEFAULTS.put("quote_all_identifiers", "off");
+        DEFAULTS.put("lo_compat_privileges", "off");
+        DEFAULTS.put("operator_precedence_warning", "off");
+        DEFAULTS.put("exit_on_error", "off");
+        DEFAULTS.put("restart_after_crash", "on");
+
+        // Background activity. Nothing here runs in an in-memory server, but the names are read
+        // by monitoring tools and by anything that reports how a database is configured.
+        DEFAULTS.put("autovacuum", "on");
+        DEFAULTS.put("autovacuum_max_workers", "3");
+        DEFAULTS.put("autovacuum_naptime", "1min");
+        DEFAULTS.put("autovacuum_vacuum_threshold", "50");
+        DEFAULTS.put("autovacuum_vacuum_insert_threshold", "1000");
+        DEFAULTS.put("autovacuum_analyze_threshold", "50");
+        DEFAULTS.put("autovacuum_vacuum_scale_factor", "0.2");
+        DEFAULTS.put("autovacuum_vacuum_insert_scale_factor", "0.2");
+        DEFAULTS.put("autovacuum_analyze_scale_factor", "0.1");
+        DEFAULTS.put("autovacuum_freeze_max_age", "200000000");
+        DEFAULTS.put("autovacuum_multixact_freeze_max_age", "400000000");
+        DEFAULTS.put("autovacuum_vacuum_cost_delay", "2ms");
+        DEFAULTS.put("autovacuum_vacuum_cost_limit", "-1");
+        DEFAULTS.put("archive_mode", "off");
+        DEFAULTS.put("archive_command", "");
+        DEFAULTS.put("archive_library", "");
+        DEFAULTS.put("archive_timeout", "0");
+        DEFAULTS.put("bgwriter_delay", "200ms");
+        DEFAULTS.put("bgwriter_lru_maxpages", "100");
+        DEFAULTS.put("bgwriter_lru_multiplier", "2");
+        DEFAULTS.put("bgwriter_flush_after", "512kB");
+        DEFAULTS.put("checkpoint_timeout", "5min");
+        DEFAULTS.put("checkpoint_completion_target", "0.9");
+        DEFAULTS.put("checkpoint_flush_after", "256kB");
+        DEFAULTS.put("checkpoint_warning", "30s");
+        DEFAULTS.put("max_wal_size", "1GB");
+        DEFAULTS.put("min_wal_size", "80MB");
+        DEFAULTS.put("wal_level", "replica");
+        DEFAULTS.put("wal_compression", "off");
+        DEFAULTS.put("fsync", "on");
+        DEFAULTS.put("full_page_writes", "on");
+        DEFAULTS.put("synchronous_commit", "on");
+        DEFAULTS.put("effective_cache_size", "4GB");
+        DEFAULTS.put("shared_buffers", "128MB");
+        DEFAULTS.put("maintenance_work_mem", "64MB");
+        DEFAULTS.put("temp_buffers", "8MB");
+        DEFAULTS.put("max_worker_processes", "8");
+        DEFAULTS.put("max_parallel_workers", "8");
+        DEFAULTS.put("max_parallel_workers_per_gather", "2");
+        DEFAULTS.put("max_parallel_maintenance_workers", "2");
+        DEFAULTS.put("max_replication_slots", "10");
+        DEFAULTS.put("max_wal_senders", "10");
+        DEFAULTS.put("max_locks_per_transaction", "64");
+        DEFAULTS.put("max_pred_locks_per_transaction", "64");
+        DEFAULTS.put("deadlock_timeout", "1s");
+        DEFAULTS.put("effective_io_concurrency", "16");
+        DEFAULTS.put("random_page_cost", "4");
+        DEFAULTS.put("seq_page_cost", "1");
+        DEFAULTS.put("cpu_tuple_cost", "0.01");
+        DEFAULTS.put("cpu_index_tuple_cost", "0.005");
+        DEFAULTS.put("cpu_operator_cost", "0.0025");
+        DEFAULTS.put("jit", "on");
+        DEFAULTS.put("log_min_messages", "warning");
+        DEFAULTS.put("log_min_error_statement", "error");
+        DEFAULTS.put("log_statement", "none");
+        DEFAULTS.put("logging_collector", "off");
+        DEFAULTS.put("log_timezone", "UTC");
+        DEFAULTS.put("track_activities", "on");
+        DEFAULTS.put("track_counts", "on");
+        DEFAULTS.put("track_io_timing", "off");
+        DEFAULTS.put("track_functions", "none");
+        DEFAULTS.put("ssl", "off");
+        DEFAULTS.put("password_encryption", "scram-sha-256");
+        DEFAULTS.put("hot_standby", "on");
+        DEFAULTS.put("idle_in_transaction_session_timeout", "0");
+        DEFAULTS.put("idle_session_timeout", "0");
+        DEFAULTS.put("transaction_timeout", "0");
+        DEFAULTS.put("temp_file_limit", "-1");
+        DEFAULTS.put("vacuum_freeze_min_age", "50000000");
+        DEFAULTS.put("vacuum_freeze_table_age", "150000000");
+        DEFAULTS.put("vacuum_cost_delay", "0");
+        DEFAULTS.put("vacuum_cost_limit", "200");
     }
 
     /** Canonical display names for parameters that use mixed-case in PG (e.g. "TimeZone"). */

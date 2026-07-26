@@ -10,6 +10,32 @@ import java.util.*;
  */
 public class InfoSchemaBuilder {
 
+    /**
+     * The views information_schema itself is made of. PG lists these in information_schema.tables
+     * alongside the user's own relations, and a tool enumerating the schema reads that list to
+     * decide which standard views it can rely on.
+     */
+    private static final List<String> INFORMATION_SCHEMA_VIEWS = Cols.listOf(
+        "administrable_role_authorizations", "applicable_roles", "attributes",
+        "character_sets", "check_constraint_routine_usage", "check_constraints",
+        "collation_character_set_applicability", "collations", "column_column_usage",
+        "column_domain_usage", "column_options", "column_privileges", "column_udt_usage",
+        "columns", "constraint_column_usage", "constraint_table_usage", "data_type_privileges",
+        "domain_constraints", "domain_udt_usage", "domains", "element_types",
+        "enabled_roles", "foreign_data_wrapper_options", "foreign_data_wrappers",
+        "foreign_server_options", "foreign_servers", "foreign_table_options",
+        "foreign_tables", "information_schema_catalog_name", "key_column_usage", "parameters",
+        "referential_constraints", "role_column_grants", "role_routine_grants",
+        "role_table_grants", "role_udt_grants", "role_usage_grants",
+        "routine_column_usage", "routine_privileges", "routine_routine_usage",
+        "routine_sequence_usage", "routine_table_usage", "routines", "schemata", "sequences",
+        "sql_features", "sql_implementation_info", "sql_parts", "sql_sizing",
+        "table_constraints", "table_privileges", "tables", "transforms",
+        "triggered_update_columns", "triggers", "udt_privileges", "usage_privileges",
+        "user_defined_types", "user_mapping_options", "user_mappings", "view_column_usage",
+        "view_routine_usage", "view_table_usage", "views"
+    );
+
     /** pg_catalog tables whose columns should be listed in information_schema.columns. */
     private static final List<String> PG_CATALOG_TABLES_FOR_IS = Cols.listOf(
         "pg_stat_user_tables", "pg_stat_all_tables",
@@ -127,6 +153,15 @@ public class InfoSchemaBuilder {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             table.insertRow(new Object[]{
                     catalogName(), vSchema, vd.name(), "VIEW",
+                    null, null, null, null, null, "NO", "NO"
+            });
+        }
+
+        // information_schema describes itself in PG: its own views are listed here, and tools that
+        // enumerate the schema to see which standard views they can rely on read exactly this.
+        for (String isView : INFORMATION_SCHEMA_VIEWS) {
+            table.insertRow(new Object[]{
+                    catalogName(), "information_schema", isView, "VIEW",
                     null, null, null, null, null, "NO", "NO"
             });
         }

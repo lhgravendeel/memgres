@@ -124,10 +124,26 @@ class CatalogCoreBuilder {
             "pg_available_extension_versions", "pg_prepared_xacts",
             "pg_shmem_allocations", "pg_backend_memory_contexts",
             "pg_config", "pg_file_settings",
-            "pg_hba_file_rules", "pg_timezone_names"
+            "pg_hba_file_rules", "pg_timezone_names",
+            // Relations memgres already answers queries for but did not list here. A relation the
+            // server can read from and does not name in pg_class is one no tool will think to ask
+            // for; pg_indexes and pg_policies in particular are read directly by migration tools.
+            "pg_indexes", "pg_policies", "pg_rules", "pg_seclabels", "pg_user",
+            "pg_timezone_abbrevs", "pg_stat_gssapi", "pg_stat_ssl", "pg_stat_wal",
+            "pg_stat_checkpointer", "pg_stat_subscription",
+            "pg_stat_progress_vacuum", "pg_stat_progress_create_index",
+            // Views PG carries that applications and monitoring tools look for by name.
+            "pg_stats", "pg_stats_ext", "pg_shadow", "pg_group", "pg_db_role_setting",
+            "pg_user_mappings", "pg_publication_tables", "pg_replication_origin_status",
+            "pg_stat_io", "pg_stat_archiver", "pg_stat_user_functions",
+            "pg_stat_progress_analyze", "pg_stat_progress_cluster",
+            "pg_stat_progress_basebackup", "pg_stat_progress_copy"
         };
         for (String sysTable : systemTables) {
             int sysOid = oids.oid("rel:pg_catalog." + sysTable);
+            // An index is a relation, but not a table. Reporting one as 'r' puts it in the way of
+            // every tool that lists user tables by relkind.
+            String sysRelkind = sysTable.endsWith("_index") ? "i" : "r";
             table.insertRow(new Object[]{
                     sysOid, sysTable, pgCatalogNs,
                     0, 0,            // reltype, reloftype
@@ -136,7 +152,7 @@ class CatalogCoreBuilder {
                     sysOid,          // relfilenode (= oid for system tables)
                     0,               // reltablespace
                     0, 0.0, 0, 0, 0,   // relpages, reltuples, relallvisible, relallfrozen, reltoastrelid
-                    false, false, "p", "r", // relhasindex, relisshared, relpersistence, relkind
+                    false, false, "p", sysRelkind, // relhasindex, relisshared, relpersistence, relkind
                     (short) 0, (short) 0,   // relnatts, relchecks
                     false, false, false, false, false, // relhasrules..relforcerowsecurity
                     false,                  // relhasoids (removed in PG 12, always false)
@@ -506,7 +522,10 @@ class CatalogCoreBuilder {
             if (vd.cachedColumns() == null || vd.cachedColumns().isEmpty()) continue;
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             int vRelOid = oids.oid("rel:" + vSchema + "." + vd.name());
-            addUserRelationAttributes(table, vRelOid, vd.cachedColumns());
+            // A view column is a query result, not storage: PG reports it as nullable even
+            // when the base column it comes from is NOT NULL, and Hibernate's schema validator
+            // reads that flag.
+            addUserRelationAttributes(table, vRelOid, vd.cachedColumns(), true);
         }
         addPgAttributeExtras(table);
         return table;
@@ -514,6 +533,15 @@ class CatalogCoreBuilder {
 
     /** Insert one pg_attribute row per column for a user relation (table or view). */
     private void addUserRelationAttributes(Table table, int relOid, List<Column> columns) {
+        addUserRelationAttributes(table, relOid, columns, false);
+    }
+
+    /**
+     * @param forceNullable true for a view, whose columns carry no storage constraint of
+     *                      their own regardless of what the underlying column declares
+     */
+    private void addUserRelationAttributes(Table table, int relOid, List<Column> columns,
+                                           boolean forceNullable) {
         for (int i = 0; i < columns.size(); i++) {
                     Column c = columns.get(i);
                     // Determine identity type
@@ -602,7 +630,7 @@ class CatalogCoreBuilder {
                             c.getName(),
                             atttypid,
                             (short) (i + 1),
-                            !c.isNullable(),
+                            !forceNullable && !c.isNullable(),
                             typmod,
                             attlen,
                             false,

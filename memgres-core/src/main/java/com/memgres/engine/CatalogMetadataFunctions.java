@@ -46,7 +46,13 @@ class CatalogMetadataFunctions {
             "pg_stat_progress_create_index", "pg_stat_wal_receiver",
             "pg_publication", "pg_subscription", "pg_stat_ssl",
             "pg_matviews", "pg_rules", "pg_catalog", "pg_policies",
-            "pg_seclabels", "pg_default_acl"
+            "pg_seclabels", "pg_default_acl",
+            // Listed in pg_class, so they must resolve by name too.
+            "pg_stats", "pg_stats_ext", "pg_shadow", "pg_group", "pg_db_role_setting",
+            "pg_user_mappings", "pg_publication_tables", "pg_replication_origin_status",
+            "pg_stat_io", "pg_stat_archiver", "pg_stat_user_functions",
+            "pg_stat_progress_analyze", "pg_stat_progress_cluster",
+            "pg_stat_progress_basebackup", "pg_stat_progress_copy"
     );
 
     private static final Set<String> KNOWN_INFORMATION_SCHEMA_TABLES = Cols.setOf(
