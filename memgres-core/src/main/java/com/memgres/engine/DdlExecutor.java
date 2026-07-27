@@ -123,6 +123,40 @@ class DdlExecutor {
     }
 
     /**
+     * Resolve the relation a FOREIGN KEY points at, then run PostgreSQL's definition-time checks
+     * on the constraint. Shared by CREATE TABLE (column-level REFERENCES and table-level FOREIGN
+     * KEY) and ALTER TABLE ... ADD CONSTRAINT so that all three reject the same definitions.
+     *
+     * @param schemaName schema of the table carrying the constraint, used when the reference is
+     *                   written unqualified
+     */
+    void validateForeignKeyDefinition(StoredConstraint fk, Table table, String schemaName) {
+        String refTableName = fk.getReferencesTable();
+        if (refTableName == null) return;
+        String refSchemaName = fk.getReferencesSchema();
+        // A view resolves to its base table, which would silently point the key somewhere the
+        // user never named; PostgreSQL refuses instead.
+        Database.ViewDef view = executor.database.getView(refTableName);
+        if (view != null && (refSchemaName == null || refSchemaName.equalsIgnoreCase(view.schemaName))) {
+            throw PgErrors.wrongObjectType("referenced relation \"" + refTableName + "\" is not a table");
+        }
+        Table refTable = null;
+        if (refSchemaName != null) {
+            Schema s = executor.database.getSchema(refSchemaName);
+            if (s != null) refTable = s.getTable(refTableName);
+        }
+        if (refTable == null && schemaName != null) {
+            Schema s = executor.database.getSchema(schemaName);
+            if (s != null) refTable = s.getTable(refTableName);
+        }
+        if (refTable == null) refTable = resolveTableOrNull(refTableName);
+        if (refTable == null) {
+            throw new MemgresException("relation \"" + refTableName + "\" does not exist", "42P01");
+        }
+        ConstraintValidator.validateForeignKeyDefinition(table, refTable, refTableName, fk);
+    }
+
+    /**
      * PostgreSQL backs every EXCLUDE constraint with a real index — that is what
      * pg_class, pg_index, pg_indexes and pg_constraint.conindid all point at. Register the
      * same index metadata so those catalogs agree with PG.

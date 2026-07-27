@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -61,20 +62,7 @@ class DdlAlterActionParser {
             return new AlterTableStmt.AlterColumn(col, parseAlterColumnAction());
         }
         if (parser.matchKeywords("ALTER", "CONSTRAINT")) {
-            String constraintName = parser.readIdentifier();
-            // PG 18: ALTER CONSTRAINT ... [NOT] ENFORCED
-            if (parser.matchKeyword("ENFORCED")) {
-                return new AlterTableStmt.AlterConstraintEnforced(constraintName, false);
-            }
-            if (parser.matchKeywords("NOT", "ENFORCED")) {
-                return new AlterTableStmt.AlterConstraintEnforced(constraintName, true);
-            }
-            // PG also supports ALTER CONSTRAINT ... [NOT] DEFERRABLE [INITIALLY ...]
-            // Consume remaining tokens for forward compatibility
-            while (!parser.isAtEnd() && !parser.check(TokenType.COMMA) && !parser.check(TokenType.SEMICOLON)) {
-                parser.advance();
-            }
-            return new AlterTableStmt.AlterConstraintEnforced(constraintName, false);
+            return parseAlterConstraint();
         }
         // ALTER colname (without COLUMN keyword): shorthand for ALTER COLUMN colname
         if (parser.matchKeyword("ALTER")) {
@@ -236,6 +224,59 @@ class DdlAlterActionParser {
         throw new ParseException("Unsupported ALTER TABLE action", parser.peek());
     }
 
+    /**
+     * ALTER CONSTRAINT name followed by a constraint attribute list. The attributes are a set,
+     * not a sequence: PostgreSQL rejects a list that names the same property twice with
+     * different values, and rejects INITIALLY DEFERRED alongside NOT DEFERRABLE because the two
+     * contradict each other.
+     */
+    private AlterTableStmt.AlterAction parseAlterConstraint() {
+        String constraintName = parser.readIdentifier();
+        Boolean deferrable = null;
+        Boolean initiallyDeferred = null;
+        Boolean enforced = null;
+        boolean inheritability = false;
+        while (true) {
+            if (parser.matchKeyword("DEFERRABLE")) {
+                deferrable = conflictFree(deferrable, Boolean.TRUE);
+            } else if (parser.matchKeywords("NOT", "DEFERRABLE")) {
+                deferrable = conflictFree(deferrable, Boolean.FALSE);
+            } else if (parser.matchKeyword("INITIALLY")) {
+                Boolean next = parser.matchKeyword("DEFERRED") ? Boolean.TRUE : Boolean.FALSE;
+                if (!next) parser.matchKeyword("IMMEDIATE");
+                initiallyDeferred = conflictFree(initiallyDeferred, next);
+            } else if (parser.matchKeyword("ENFORCED")) {
+                enforced = conflictFree(enforced, Boolean.TRUE);
+            } else if (parser.matchKeywords("NOT", "ENFORCED")) {
+                enforced = conflictFree(enforced, Boolean.FALSE);
+            } else if (parser.matchKeywords("NO", "INHERIT") || parser.matchKeyword("INHERIT")) {
+                inheritability = true;
+            } else if (parser.matchKeywords("NOT", "VALID")) {
+                throw new MemgresException("constraints cannot be altered to be NOT VALID", "0A000");
+            } else {
+                break;
+            }
+        }
+        if (Boolean.TRUE.equals(initiallyDeferred)) {
+            if (Boolean.FALSE.equals(deferrable)) {
+                throw new MemgresException("constraint declared INITIALLY DEFERRED must be DEFERRABLE", "42601");
+            }
+            deferrable = Boolean.TRUE; // INITIALLY DEFERRED implies DEFERRABLE, as in PG's grammar
+        }
+        if (Boolean.FALSE.equals(deferrable)) {
+            initiallyDeferred = Boolean.FALSE;
+        }
+        return new AlterTableStmt.AlterConstraintAttrs(constraintName, deferrable,
+                initiallyDeferred, enforced, inheritability);
+    }
+
+    private static Boolean conflictFree(Boolean current, Boolean next) {
+        if (current != null && !current.equals(next)) {
+            throw new MemgresException("conflicting constraint properties", "42601");
+        }
+        return next;
+    }
+
     AlterTableStmt.AlterColumnAction parseAlterColumnAction() {
         if (parser.matchKeywords("SET", "NOT", "NULL")) return new AlterTableStmt.SetNotNull();
         if (parser.matchKeywords("DROP", "NOT", "NULL")) return new AlterTableStmt.DropNotNull();
@@ -392,6 +433,13 @@ class DdlAlterActionParser {
                 bounds.add(parser.advance().value());
                 parser.expect(TokenType.RIGHT_PAREN);
             }
+        }
+        if (bounds.isEmpty()) {
+            // PG's grammar requires a bound spec here; without one there is nothing to route on.
+            if (parser.isAtEnd() || parser.check(TokenType.SEMICOLON)) {
+                throw com.memgres.engine.PgErrors.syntax("syntax error at end of input");
+            }
+            throw new ParseException("Expected partition bound specification", parser.peek());
         }
         return new AlterTableStmt.AttachPartition(partSchema, partName, bounds);
     }

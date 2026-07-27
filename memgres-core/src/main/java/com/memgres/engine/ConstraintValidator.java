@@ -646,6 +646,191 @@ class ConstraintValidator {
         return new Object[]{lower, upper, lowerInc, upperInc};
     }
 
+    // ---- Definition-time validation of a FOREIGN KEY ----
+
+    /** Names PostgreSQL reserves for system columns; a key may not be built on any of them. */
+    private static final Set<String> SYSTEM_COLUMNS = new HashSet<>(Arrays.asList(
+            "tableoid", "ctid", "xmin", "cmin", "xmax", "cmax"));
+
+    /**
+     * Runs the checks PostgreSQL runs when a FOREIGN KEY is declared, in PostgreSQL's own order.
+     *
+     * <p>A key whose referenced columns are not unique, or whose two sides hold values that can
+     * never compare equal, cannot enforce anything. Storing it anyway is worse than refusing it:
+     * the constraint shows up in the catalog and a reader of the schema concludes the data is
+     * protected when nothing is checking it.
+     *
+     * @param refTable the referenced table, already resolved and known to be a table
+     */
+    static void validateForeignKeyDefinition(Table table, Table refTable, String refTableName,
+                                             StoredConstraint fk) {
+        List<String> fkCols = fk.getColumns();
+        for (String col : fkCols) {
+            requireKeyColumn(table, col);
+        }
+        // The ON DELETE SET NULL/SET DEFAULT column list is checked next, before the referenced
+        // side is looked at at all — matching PostgreSQL, which reports a bad list first.
+        List<String> setCols = fk.getOnDeleteSetNullColumns();
+        if (setCols != null) {
+            for (String col : setCols) {
+                requireKeyColumn(table, col);
+                if (!StoredConstraint.containsIgnoreCase(fkCols, col)) {
+                    throw new MemgresException("column \"" + col
+                            + "\" referenced in ON DELETE SET action must be part of foreign key", "42P10");
+                }
+            }
+        }
+
+        List<String> refCols = fk.getReferencesColumns();
+        if (refCols == null || refCols.isEmpty()) {
+            refCols = primaryKeyColumnsOf(refTable);
+            if (refCols.isEmpty()) {
+                throw new MemgresException("there is no primary key for referenced table \""
+                        + refTableName + "\"", "42704");
+            }
+        } else {
+            for (String col : refCols) {
+                requireKeyColumn(refTable, col);
+            }
+            for (int i = 0; i < refCols.size(); i++) {
+                for (int j = i + 1; j < refCols.size(); j++) {
+                    if (refCols.get(i).equalsIgnoreCase(refCols.get(j))) {
+                        throw new MemgresException(
+                                "foreign key referenced-columns list must not contain duplicates", "42830");
+                    }
+                }
+            }
+            if (!hasUniqueConstraintOn(refTable, refCols)) {
+                throw new MemgresException("there is no unique constraint matching given keys for referenced table \""
+                        + refTableName + "\"", "42830");
+            }
+        }
+        if (fkCols.size() != refCols.size()) {
+            throw new MemgresException(
+                    "number of referencing and referenced columns for foreign key disagree", "42830");
+        }
+        for (int i = 0; i < fkCols.size(); i++) {
+            Column fkCol = columnOf(table, fkCols.get(i));
+            Column refCol = columnOf(refTable, refCols.get(i));
+            if (fkCol == null || refCol == null || keyTypesComparable(fkCol, refCol)) continue;
+            MemgresException ex = new MemgresException("foreign key constraint \"" + fk.getName()
+                    + "\" cannot be implemented", "42804");
+            ex.setDetail("Key columns \"" + fkCols.get(i) + "\" of the referencing table and \""
+                    + refCols.get(i) + "\" of the referenced table are of incompatible types: "
+                    + fkCol.getType().toRegtypeDisplay() + " and " + refCol.getType().toRegtypeDisplay() + ".");
+            throw ex;
+        }
+    }
+
+    /** A key column must exist and must not be a system column. */
+    private static void requireKeyColumn(Table table, String column) {
+        if (table.getColumnIndex(column) >= 0) return;
+        if (SYSTEM_COLUMNS.contains(column.toLowerCase())) {
+            throw new MemgresException("system columns cannot be used in foreign keys", "0A000");
+        }
+        throw new MemgresException("column \"" + column
+                + "\" referenced in foreign key constraint does not exist", "42703");
+    }
+
+    private static Column columnOf(Table table, String name) {
+        int idx = table.getColumnIndex(name);
+        return idx < 0 ? null : table.getColumns().get(idx);
+    }
+
+    static List<String> primaryKeyColumnsOf(Table table) {
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) return sc.getColumns();
+        }
+        List<String> pkCols = new ArrayList<>();
+        for (Column col : table.getColumns()) {
+            if (col.isPrimaryKey()) pkCols.add(col.getName());
+        }
+        return pkCols;
+    }
+
+    /**
+     * True when the referenced table has a PRIMARY KEY or UNIQUE constraint over exactly these
+     * columns. PostgreSQL matches the index by column set, not by the order they were written in.
+     */
+    private static boolean hasUniqueConstraintOn(Table refTable, List<String> refCols) {
+        for (StoredConstraint sc : refTable.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
+                    && sc.getType() != StoredConstraint.Type.UNIQUE) continue;
+            if (sc.getWhereExpr() != null) continue; // a partial index cannot back a foreign key
+            List<String> cols = sc.getColumns();
+            if (cols == null || cols.size() != refCols.size()) continue;
+            boolean allPresent = true;
+            for (String want : refCols) {
+                if (!StoredConstraint.containsIgnoreCase(cols, want)) { allPresent = false; break; }
+            }
+            if (allPresent) return true;
+        }
+        // Column-level PRIMARY KEY that never became a stored constraint
+        if (refCols.size() == 1) {
+            Column col = columnOf(refTable, refCols.get(0));
+            if (col != null && col.isPrimaryKey()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * PostgreSQL builds a foreign key only when the two key columns have an equality operator it
+     * can use: either both types sit in the same btree operator family, or the referencing type
+     * casts implicitly to the referenced one. Types this engine does not classify — enums,
+     * domains, composites — are left to the existing lenient behaviour rather than guessed at.
+     */
+    private static boolean keyTypesComparable(Column fkCol, Column refCol) {
+        if (hasNamedType(fkCol) || hasNamedType(refCol)) return true;
+        DataType a = fkCol.getType();
+        DataType b = refCol.getType();
+        if (a == b) return true;
+        String fa = keyTypeFamily(a);
+        String fb = keyTypeFamily(b);
+        if (fa == null || fb == null) return true;
+        if (fa.equals(fb)) return true;
+        return castsImplicitly(fa, fb);
+    }
+
+    /** True for a column whose type carries an identity beyond its {@link DataType}. */
+    private static boolean hasNamedType(Column col) {
+        return col.getEnumTypeName() != null || col.getDomainTypeName() != null
+                || col.getCompositeTypeName() != null || col.getType() == DataType.ENUM;
+    }
+
+    /** The btree operator family a type's default operator class belongs to, or null if unknown. */
+    private static String keyTypeFamily(DataType type) {
+        switch (type) {
+            case SMALLINT: case INTEGER: case BIGINT:
+            case SMALLSERIAL: case SERIAL: case BIGSERIAL:
+                return "integer";
+            case NUMERIC: return "numeric";
+            case REAL: case DOUBLE_PRECISION: return "float";
+            case TEXT: case VARCHAR: case CHAR: case NAME: return "text";
+            case DATE: case TIMESTAMP: case TIMESTAMPTZ: return "datetime";
+            case TIME: return "time";
+            case TIMETZ: return "timetz";
+            case INTERVAL: return "interval";
+            case INET: case CIDR: return "network";
+            case OID: return "oid";
+            case BIT: case VARBIT: return "bit";
+            case BOOLEAN: case UUID: case BYTEA: case MACADDR: case MACADDR8:
+            case MONEY: case JSONB: case XID:
+                return type.name();
+            default:
+                return null;
+        }
+    }
+
+    /** The implicit casts between key-type families that PostgreSQL will fall back on. */
+    private static boolean castsImplicitly(String from, String to) {
+        if ("integer".equals(from)) {
+            return "numeric".equals(to) || "float".equals(to) || "oid".equals(to);
+        }
+        if ("numeric".equals(from)) return "float".equals(to);
+        if ("time".equals(from)) return "interval".equals(to);
+        return false;
+    }
+
     private List<String> findPrimaryKeyColumns(Table table) {
         // Check stored constraints for PK
         for (StoredConstraint sc : table.getConstraints()) {
@@ -661,6 +846,19 @@ class ConstraintValidator {
             }
         }
         return pkCols;
+    }
+
+    /**
+     * The columns an ON DELETE SET NULL / SET DEFAULT touches: the explicit column list when the
+     * constraint carries one (PG 15+), otherwise every referencing column.
+     */
+    private static int[] actionColumnIndices(Table childTable, List<String> actionCols, int[] fallback) {
+        if (actionCols == null || actionCols.isEmpty()) return fallback;
+        int[] indices = new int[actionCols.size()];
+        for (int i = 0; i < actionCols.size(); i++) {
+            indices[i] = childTable.getColumnIndex(actionCols.get(i));
+        }
+        return indices;
     }
 
     /**
@@ -742,17 +940,8 @@ class ConstraintValidator {
                             break;
                         }
                         case SET_NULL: {
-                            // Determine which child column indices to null
-                            int[] nullIndices;
-                            java.util.List<String> setNullCols = sc.getOnDeleteSetNullColumns();
-                            if (setNullCols != null && !setNullCols.isEmpty()) {
-                                nullIndices = new int[setNullCols.size()];
-                                for (int ni = 0; ni < setNullCols.size(); ni++) {
-                                    nullIndices[ni] = childTable.getColumnIndex(setNullCols.get(ni));
-                                }
-                            } else {
-                                nullIndices = childColIndices;
-                            }
+                            int[] nullIndices = actionColumnIndices(
+                                    childTable, sc.getOnDeleteSetNullColumns(), childColIndices);
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -776,6 +965,8 @@ class ConstraintValidator {
                             break;
                         }
                         case SET_DEFAULT: {
+                            int[] defaultIndices = actionColumnIndices(
+                                    childTable, sc.getOnDeleteSetNullColumns(), childColIndices);
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -787,12 +978,17 @@ class ConstraintValidator {
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
                                     Object[] newVals = Arrays.copyOf(childRow, childRow.length);
-                                    for (int i = 0; i < childColIndices.length; i++) {
-                                        Column col = childTable.getColumns().get(childColIndices[i]);
-                                        newVals[childColIndices[i]] = col.getDefaultValue() != null
+                                    for (int idx : defaultIndices) {
+                                        Column col = childTable.getColumns().get(idx);
+                                        newVals[idx] = col.getDefaultValue() != null
                                                 ? executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr())
                                                 : null;
                                     }
+                                    // The default is an ordinary value: nothing guarantees the
+                                    // referenced table holds it, so the key is checked against the
+                                    // new values before the row is rewritten, leaving the row as
+                                    // it was when the check fails.
+                                    validateForeignKey(childTable, newVals, sc);
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
                                     recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
                                     handleFkOnUpdate(childTable, oldVals, childRow);
