@@ -1102,6 +1102,19 @@ public class Database {
         return overloads != null ? overloads : Cols.listOf();
     }
 
+    /**
+     * A variadic parameter normally has to be given at least one value, but one declared with a
+     * default supplies its own, so the call may leave it out entirely.
+     */
+    private static boolean variadicMayBeOmitted(PgFunction f) {
+        for (PgFunction.Param p : f.getParams()) {
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) {
+                return p.defaultExpr() != null;
+            }
+        }
+        return false;
+    }
+
     /** Finds the best matching overload by argument count and types. */
     public PgFunction resolveFunction(String name, int argCount, List<String> argTypeHints) {
         List<PgFunction> overloads = getFunctionOverloads(name);
@@ -1121,7 +1134,7 @@ public class Database {
                 // For VARIADIC functions with unknown types, reject if no variadic args provided
                 PgFunction single = overloads.get(0);
                 boolean hasVariadic = single.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
-                if (hasVariadic) {
+                if (hasVariadic && !variadicMayBeOmitted(single)) {
                     long nonVariadicCount = single.getParams().stream()
                             .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
                             .count();
@@ -1135,7 +1148,7 @@ public class Database {
             List<PgFunction.Param> inputParams = f.getParams().stream()
                     .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
                     .collect(Collectors.toList());
-            if (fHasVariadic && argCount <= inputParams.size()) return null;
+            if (fHasVariadic && !variadicMayBeOmitted(f) && argCount <= inputParams.size()) return null;
             boolean hasIncompatible = false;
             for (int i = 0; i < argTypeHints.size() && i < inputParams.size(); i++) {
                 String hint = argTypeHints.get(i);
