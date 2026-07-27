@@ -329,6 +329,7 @@ class DdlParser {
         }
 
         String name;
+        String qualifier = null;
         if (objectType == DropStmt.ObjectType.OPERATOR) {
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.LEFT_PAREN) && !parser.check(TokenType.SEMICOLON)
@@ -338,8 +339,13 @@ class DdlParser {
             name = sb.toString().trim();
         } else {
             name = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) {
+                qualifier = name;
+                name = parser.readIdentifier();
+            }
         }
+        // Only routines carry the qualifier onward; the other object kinds still key by bare name.
+        String dropSchema = objectType == DropStmt.ObjectType.FUNCTION ? qualifier : null;
 
         java.util.List<String> funcParamTypes = null;
         if ((objectType == DropStmt.ObjectType.FUNCTION || objectType == DropStmt.ObjectType.AGGREGATE)
@@ -398,7 +404,7 @@ class DdlParser {
         boolean cascade = parser.matchKeyword("CASCADE");
         parser.matchKeyword("RESTRICT");
 
-        return new DropStmt(objectType, name, onTable, ifExists, cascade, funcParamTypes);
+        return new DropStmt(objectType, name, onTable, ifExists, cascade, funcParamTypes, dropSchema);
     }
 
     /**

@@ -482,6 +482,11 @@ class DdlObjectExecutor {
             }
         }
 
+        // A polymorphic result has to be determinable from a polymorphic argument of the same family.
+        PolymorphicTypes.validateSignature(stmt.returnType(), params.stream()
+                .map(PgFunction.Param::typeName)
+                .collect(Collectors.toList()));
+
         // Validate PL/pgSQL declared variable types (PG validates at CREATE time when check_function_bodies=on)
         boolean checkBodies = executor.session == null || !"off".equalsIgnoreCase(
                 executor.session.getGucSettings().get("check_function_bodies"));
@@ -535,12 +540,15 @@ class DdlObjectExecutor {
             }
         }
 
-        // Check for duplicate function
+        String funcSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+
+        // Check for duplicate function. Functions are a per-schema namespace, so a same-named
+        // function with the same argument types in another schema is a different function.
         List<String> newParamTypes = params.stream()
                 .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
                 .map(PgFunction.Param::typeName)
                 .collect(Collectors.toList());
-        List<PgFunction> existingOverloads = executor.database.getFunctionOverloads(stmt.name());
+        List<PgFunction> existingOverloads = executor.database.getFunctionOverloads(funcSchema, stmt.name());
         for (PgFunction existing : existingOverloads) {
             List<String> existingTypes = existing.getParams().stream()
                     .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
@@ -555,7 +563,7 @@ class DdlObjectExecutor {
                 }
                 if (sameTypes) {
                     if (stmt.orReplace()) {
-                        executor.database.removeFunction(stmt.name(), existingTypes);
+                        executor.database.removeFunction(funcSchema, stmt.name(), existingTypes);
                         break;
                     }
                     throw new MemgresException("function \"" + stmt.name() + "\" already exists with same argument types", "42723");
@@ -571,7 +579,6 @@ class DdlObjectExecutor {
 
         PgFunction pgFunc = new PgFunction(stmt.name(), stmt.returnType(), stmt.body(),
                 stmt.language(), params, stmt.isProcedure());
-        String funcSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         pgFunc.setSchemaName(funcSchema);
         pgFunc.setSecurityDefiner(stmt.securityDefiner());
         pgFunc.setStrict(stmt.strict());
@@ -1656,15 +1663,37 @@ class DdlObjectExecutor {
     }
 
     private void dropFunction(DropStmt stmt) {
-        if (executor.database.getFunction(stmt.name()) == null && !stmt.ifExists()) {
-            throw new MemgresException("function " + stmt.name() + "() does not exist", "42883");
+        // An unqualified DROP only reaches the schemas the search_path makes visible.
+        String schema = stmt.schema() != null ? stmt.schema() : visibleSchemaOfFunction(stmt.name());
+        List<PgFunction> candidates = schema != null
+                ? executor.database.getFunctionOverloads(schema, stmt.name())
+                : Cols.<PgFunction>listOf();
+        if (candidates.isEmpty()) {
+            if (!stmt.ifExists()) {
+                throw new MemgresException("function " + stmt.name() + "() does not exist", "42883");
+            }
+            return;
         }
         if (stmt.paramTypes() != null) {
-            executor.database.removeFunction(stmt.name(), stmt.paramTypes());
+            executor.database.removeFunction(schema, stmt.name(), stmt.paramTypes());
         } else {
-            executor.database.removeFunction(stmt.name());
+            executor.database.removeFunction(schema, stmt.name());
         }
-        executor.database.removeObjectOwner("function:" + stmt.name());
+        if (executor.database.getFunctionOverloads(stmt.name()).isEmpty()) {
+            executor.database.removeObjectOwner("function:" + stmt.name());
+        }
+    }
+
+    /** First schema on the search_path that holds a function of this name, or null if none does. */
+    private String visibleSchemaOfFunction(String name) {
+        List<PgFunction> all = executor.database.getFunctionOverloads(name);
+        if (all.isEmpty()) return null;
+        for (String schema : executor.searchPathSchemas()) {
+            for (PgFunction f : all) {
+                if (Database.schemaOf(f).equalsIgnoreCase(schema)) return schema;
+            }
+        }
+        return null;
     }
 
     private void dropTrigger(DropStmt stmt) {
@@ -1761,7 +1790,8 @@ class DdlObjectExecutor {
                             executor.database.removeIndex(objName);
                             break;
                         case "function":
-                            executor.database.removeFunction(objName);
+                            // Only this schema's copy goes; the same name may exist elsewhere.
+                            executor.database.removeFunction(schemaName, objName);
                             break;
                         case "view":
                             executor.database.removeView(objName);

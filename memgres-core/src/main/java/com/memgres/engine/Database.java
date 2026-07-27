@@ -1132,6 +1132,24 @@ public class Database {
     }
 
     /**
+     * Returns the overloads of this name that live in the given schema. Functions are a
+     * per-schema namespace in PG, so the same name may exist in several schemas at once and
+     * every by-name lookup has to say which one it means.
+     */
+    public List<PgFunction> getFunctionOverloads(String schema, String name) {
+        List<PgFunction> result = new ArrayList<>();
+        for (PgFunction f : getFunctionOverloads(name)) {
+            if (schemaOf(f).equalsIgnoreCase(schema)) result.add(f);
+        }
+        return result;
+    }
+
+    /** A function with no recorded schema is treated as living in public. */
+    public static String schemaOf(PgFunction f) {
+        return f.getSchemaName() != null ? f.getSchemaName() : "public";
+    }
+
+    /**
      * A variadic parameter normally has to be given at least one value, but one declared with a
      * default supplies its own, so the call may leave it out entirely.
      */
@@ -1146,8 +1164,15 @@ public class Database {
 
     /** Finds the best matching overload by argument count and types. */
     public PgFunction resolveFunction(String name, int argCount, List<String> argTypeHints) {
-        List<PgFunction> overloads = getFunctionOverloads(name);
-        if (overloads.isEmpty()) return null;
+        return resolveFunction(getFunctionOverloads(name), argCount, argTypeHints);
+    }
+
+    /**
+     * Finds the best matching overload among an already-narrowed candidate list. Callers that
+     * have applied schema visibility pass the surviving candidates in search_path order.
+     */
+    public PgFunction resolveFunction(List<PgFunction> overloads, int argCount, List<String> argTypeHints) {
+        if (overloads == null || overloads.isEmpty()) return null;
         // For a single overload, return it unless type hints indicate a clearly incompatible call.
         // This preserves correct behavior for functions with default params or INOUT params
         // where arg count may not match param count, while still rejecting calls like
@@ -1277,12 +1302,20 @@ public class Database {
         functionOverloads.remove(key);
     }
 
+    /** Remove every overload of this name that lives in the given schema. */
+    public void removeFunction(String schema, String name) {
+        removeMatchingOverloads(name, f -> schema == null || schemaOf(f).equalsIgnoreCase(schema));
+    }
+
     /** Remove a specific overload by name and param types. */
     public void removeFunction(String name, List<String> paramTypes) {
-        String key = name.toLowerCase();
-        List<PgFunction> overloads = functionOverloads.get(key);
-        if (overloads == null) return;
-        overloads.removeIf(f -> {
+        removeFunction(null, name, paramTypes);
+    }
+
+    /** Remove a specific overload by schema, name and param types. A null schema matches any. */
+    public void removeFunction(String schema, String name, List<String> paramTypes) {
+        removeMatchingOverloads(name, f -> {
+            if (schema != null && !schemaOf(f).equalsIgnoreCase(schema)) return false;
             List<String> fTypes = f.getParams().stream()
                     .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
                     .map(PgFunction.Param::typeName)
@@ -1293,6 +1326,13 @@ public class Database {
             }
             return true;
         });
+    }
+
+    private void removeMatchingOverloads(String name, java.util.function.Predicate<PgFunction> matches) {
+        String key = name.toLowerCase();
+        List<PgFunction> overloads = functionOverloads.get(key);
+        if (overloads == null) return;
+        overloads.removeIf(matches);
         if (overloads.isEmpty()) {
             functionOverloads.remove(key);
             functions.remove(key);

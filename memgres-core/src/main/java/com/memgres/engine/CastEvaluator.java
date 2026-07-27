@@ -64,6 +64,9 @@ class CastEvaluator {
         oids.put(1009, "text[]");
         oids.put(1016, "bigint[]");
         oids.put(1000, "boolean[]");
+        for (String polyName : PolymorphicTypes.names()) {
+            oids.put(PolymorphicTypes.oid(polyName), polyName);
+        }
         OID_TO_TYPE = Collections.unmodifiableMap(oids);
     }
 
@@ -230,6 +233,10 @@ class CastEvaluator {
             }
         }
         String lowerSpec = typeSpec.toLowerCase().trim();
+
+        // A polymorphic pseudo-type is a placeholder, not a target: the value keeps whatever
+        // concrete type the caller passed in.
+        if (PolymorphicTypes.isPolymorphic(lowerSpec)) return val;
 
         // Reject impossible casts (PG raises 42846 "cannot cast type X to Y")
         if (lowerSpec.equals("uuid")) {
@@ -1049,6 +1056,10 @@ class CastEvaluator {
                     return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
                 String rtName = val.toString().trim().toLowerCase();
+                // Polymorphic pseudo-types are real pg_type rows, so they cast like any other name
+                if (PolymorphicTypes.isPolymorphic(rtName)) {
+                    return new RegtypeValue(PolymorphicTypes.oid(rtName), rtName);
+                }
                 // Validate the type exists
                 DataType dt = DataType.fromPgName(rtName);
                 if (dt == null) {
