@@ -1079,11 +1079,31 @@ class DdlParser {
         } else {
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-                sb.append(parser.advance().value()).append(' ');
+                sb.append(ruleCommandToken(parser.advance())).append(' ');
             }
             command = sb.toString().trim();
         }
         return new CreateRuleStmt(name, event, table, action, command);
+    }
+
+    /**
+     * A rule's action is kept as text and re-parsed when the rule fires, so each token has to go
+     * back in the form it was written. A literal's token value carries only its content, and
+     * putting that back bare would turn it into an identifier.
+     */
+    private static String ruleCommandToken(Token token) {
+        switch (token.type()) {
+            case STRING_LITERAL:
+                return "'" + token.value().replace("'", "''") + "'";
+            case DOLLAR_STRING_LITERAL:
+                return "$$" + token.value() + "$$";
+            case BIT_STRING_LITERAL:
+                return "B'" + token.value() + "'";
+            case QUOTED_IDENTIFIER:
+                return "\"" + token.value().replace("\"", "\"\"") + "\"";
+            default:
+                return token.value();
+        }
     }
 
     Statement parseCreateSchema() {

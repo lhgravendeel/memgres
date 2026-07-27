@@ -390,6 +390,60 @@ public class AstExecutor {
 
         public List<Object> values() { return values; }
 
+        /**
+         * Render as PostgreSQL composite text: {@code (f1,f2)}. A field is quoted when it is
+         * empty or carries a character that would otherwise be read as structure, and a nested
+         * composite is always quoted because its own parentheses would be ambiguous.
+         */
+        public String toPgText() {
+            StringBuilder sb = new StringBuilder("(");
+            for (int i = 0; i < values.size(); i++) {
+                if (i > 0) sb.append(',');
+                Object elem = values.get(i);
+                if (elem == null) continue;
+                String text;
+                if (elem instanceof PgRow) {
+                    text = ((PgRow) elem).toPgText();
+                } else if (elem instanceof java.util.Map) {
+                    text = fromFieldMap((java.util.Map<?, ?>) elem).toPgText();
+                } else if (elem instanceof Boolean) {
+                    text = ((Boolean) elem) ? "t" : "f";
+                } else {
+                    text = elem.toString();
+                }
+                if (needsCompositeQuoting(text)) {
+                    sb.append('"').append(text.replace("\\", "\\\\").replace("\"", "\"\"")).append('"');
+                } else {
+                    sb.append(text);
+                }
+            }
+            return sb.append(')').toString();
+        }
+
+        private static boolean needsCompositeQuoting(String text) {
+            if (text.isEmpty()) return true;
+            for (int i = 0; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c == ',' || c == '(' || c == ')' || c == '"' || c == '\\'
+                        || Character.isWhitespace(c)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * Build a row from a composite held as a field map, as PL/pgSQL composite variables are.
+         * Nested composites are converted too, so the row keeps its structure.
+         */
+        public static PgRow fromFieldMap(java.util.Map<?, ?> fields) {
+            List<Object> vals = new java.util.ArrayList<>();
+            for (Object v : fields.values()) {
+                vals.add(v instanceof java.util.Map ? fromFieldMap((java.util.Map<?, ?>) v) : v);
+            }
+            return new PgRow(vals);
+        }
+
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;

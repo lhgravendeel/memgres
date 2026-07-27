@@ -299,6 +299,13 @@ class CastEvaluator {
                 if (val instanceof InetValue) {
                     return ((InetValue) val).text();
                 }
+                // Composites render as (f1,f2), whether held as a row or as a field map.
+                if (val instanceof AstExecutor.PgRow) {
+                    return ((AstExecutor.PgRow) val).toPgText();
+                }
+                if (val instanceof java.util.Map<?, ?>) {
+                    return AstExecutor.PgRow.fromFieldMap((java.util.Map<?, ?>) val).toPgText();
+                }
                 if (val instanceof RegclassValue) {
                     RegclassValue rc = (RegclassValue) val;
                     return formatRegclassDisplay(rc.name());
