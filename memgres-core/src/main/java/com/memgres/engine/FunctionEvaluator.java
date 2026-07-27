@@ -789,6 +789,7 @@ class FunctionEvaluator {
                     nv = seq.nextVal();
                 }
                 executor.lastSequenceValue = nv;
+                executor.sessionSequenceValues.put(seq.getName().toLowerCase(), nv);
                 return nv;
             }
             case "currval": {
@@ -796,7 +797,12 @@ class FunctionEvaluator {
                 if (seqName.contains(".")) seqName = seqName.substring(seqName.lastIndexOf('.') + 1);
                 Sequence seq = resolveSequence(seqName);
                 if (seq == null) throw new MemgresException("relation \"" + seqName + "\" does not exist", "42P01");
-                return seq.currVal();
+                Long drawn = executor.sessionSequenceValues.get(seq.getName().toLowerCase());
+                if (drawn == null) {
+                    throw new MemgresException("currval of sequence \"" + seq.getName()
+                            + "\" is not yet defined in this session", "55000");
+                }
+                return drawn;
             }
             case "lastval": {
                 if (executor.lastSequenceValue == null) {
@@ -837,11 +843,18 @@ class FunctionEvaluator {
                 if (rawVal == null) return null; // PG treats setval(seq, NULL) as a no-op returning NULL
                 long val = executor.toLong(rawVal);
                 long result;
+                boolean marksCurrval = true;
                 if (fn.args().size() > 2) {
                     boolean isCalled = executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
                     result = seq.setVal(val, isCalled);
+                    marksCurrval = isCalled;
                 } else {
                     result = seq.setVal(val);
+                }
+                // setval defines currval for the session that called it, but only when the
+                // value counts as already used.
+                if (marksCurrval) {
+                    executor.sessionSequenceValues.put(seq.getName().toLowerCase(), val);
                 }
                 // Also sync the table's serial counter if this sequence matches tableName_colName_seq
                 // This ensures GENERATED ALWAYS AS IDENTITY / SERIAL columns pick up the new value
