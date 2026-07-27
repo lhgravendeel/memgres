@@ -119,6 +119,36 @@ class CastEvaluator {
         return text;
     }
 
+    /** Bits a bit string may declare: one attribute's worth (PG's MaxAttrSize, in bits). */
+    private static final long MAX_BIT_LENGTH = 10485760L * 8;
+
+    /**
+     * A bit string is stored in a single attribute, so PostgreSQL bounds the length modifier as
+     * it reads it rather than when the value is built. memgres holds the bits in an ordinary
+     * string, so an unbounded modifier is an unbounded allocation.
+     */
+    private static void checkBitTypmod(String typeName, String lowerSpec) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\((-?\\d+)\\)").matcher(lowerSpec);
+        if (!m.find()) return;
+        // PG names the type by its internal spelling, whichever syntax was written
+        String reported = typeName.equals("bit") ? "bit" : "varbit";
+        java.math.BigInteger written = new java.math.BigInteger(m.group(1));
+        // A type modifier is an int4, so one too wide fails as a bad integer before it is a
+        // length at all
+        if (written.bitLength() > 31) {
+            throw new MemgresException("value \"" + m.group(1)
+                    + "\" is out of range for type integer", "22003");
+        }
+        long n = written.longValue();
+        if (n < 1) {
+            throw new MemgresException("length for type " + reported + " must be at least 1", "22023");
+        }
+        if (n > MAX_BIT_LENGTH) {
+            throw new MemgresException("length for type " + reported + " cannot exceed "
+                    + MAX_BIT_LENGTH, "22023");
+        }
+    }
+
     /**
      * An integer range's bounds must be whole numbers within the element type's span. Without
      * this the bound is narrowed on the way in, producing a finite range with completely
@@ -262,7 +292,7 @@ class CastEvaluator {
         }
         // Handle numeric(precision, scale) and apply scale for proper formatting
         if (lowerSpec.startsWith("numeric(") || lowerSpec.startsWith("decimal(")) {
-            java.math.BigDecimal bd = TypeCoercion.toBigDecimal(val);
+            java.math.BigDecimal bd = NumericLimits.check(TypeCoercion.toBigDecimal(val));
             String params = lowerSpec.replaceAll(".*\\(([^)]+)\\).*", "$1");
             String[] parts = params.split(",");
             int precision = Integer.parseInt(parts[0].trim());
@@ -405,7 +435,7 @@ class CastEvaluator {
             case "numeric":
             case "decimal": {
                 if (val instanceof String && ((String) val).trim().equalsIgnoreCase("NaN")) return Double.NaN;
-                return TypeCoercion.toBigDecimal(val);
+                return NumericLimits.check(TypeCoercion.toBigDecimal(val));
             }
             case "citext": {
                 // citext preserves original case but compares case-insensitively
@@ -616,6 +646,9 @@ class CastEvaluator {
             case "bit":
             case "bit varying":
             case "varbit": {
+                // A bit string lives in one attribute, so PG bounds the modifier before it builds
+                // anything; without this, bit(200000000) allocates two hundred million characters.
+                checkBitTypmod(typeName, lowerSpec);
                 String bitStr;
                 if (val instanceof AstExecutor.PgBitString) {
                     bitStr = ((AstExecutor.PgBitString) val).bits();
