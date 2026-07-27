@@ -806,6 +806,7 @@ class SelectAggregateEvaluator {
                 boolean hasValue = false;
                 boolean allInts = true;
                 boolean isMoney = false;
+                boolean sawNotANumber = false;
                 BigDecimal bdSum = BigDecimal.ZERO;
                 try {
                     if (fn.distinct()) {
@@ -814,6 +815,7 @@ class SelectAggregateEvaluator {
                             Object val = executor.evalExpr(arg, ctx);
                             if (val == null || !seenKeys.add(distinctKey(val))) continue;
                             hasValue = true;
+                            if (isNotANumber(val)) { sawNotANumber = true; continue; }
                             if (val instanceof PgMoney) isMoney = true;
                             bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                             if (!(val instanceof Integer || val instanceof Long)) allInts = false;
@@ -823,6 +825,7 @@ class SelectAggregateEvaluator {
                             Object val = executor.evalExpr(arg, ctx);
                             if (val != null) {
                                 hasValue = true;
+                                if (isNotANumber(val)) { sawNotANumber = true; continue; }
                                 if (val instanceof PgMoney) isMoney = true;
                                 bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                                 if (!(val instanceof Integer || val instanceof Long)) allInts = false;
@@ -833,6 +836,8 @@ class SelectAggregateEvaluator {
                     throw new MemgresException("function sum(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
                 }
                 if (!hasValue) return null;
+                // NaN is contagious through numeric aggregation, as it is in PG.
+                if (sawNotANumber) return Double.NaN;
                 if (isMoney) return new PgMoney(bdSum);
                 // sum(double precision) is float8 in PG, not numeric
                 if (isFloatArgument(arg, group)) return bdSum.doubleValue();
@@ -847,24 +852,29 @@ class SelectAggregateEvaluator {
                 requireAggregatableNumeric("avg", arg, group);
                 BigDecimal bdSum = BigDecimal.ZERO;
                 long count = 0;
+                boolean avgSawNotANumber = false;
                 if (fn.distinct()) {
                     Set<String> seenKeys = new HashSet<>();
                     for (RowContext ctx : group) {
                         Object val = executor.evalExpr(arg, ctx);
                         if (val == null || !seenKeys.add(distinctKey(val))) continue;
-                        bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                         count++;
+                        if (isNotANumber(val)) { avgSawNotANumber = true; continue; }
+                        bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                     }
                 } else {
                     for (RowContext ctx : group) {
                         Object val = executor.evalExpr(arg, ctx);
                         if (val != null) {
-                            bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                             count++;
+                            if (isNotANumber(val)) { avgSawNotANumber = true; continue; }
+                            bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                         }
                     }
                 }
                 if (count == 0) return null;
+                // NaN is contagious through numeric aggregation, as it is in PG.
+                if (avgSawNotANumber) return Double.NaN;
                 if (isFloatArgument(arg, group)) return bdSum.doubleValue() / count;
                 BigDecimal result = bdSum.divide(BigDecimal.valueOf(count), 16, RoundingMode.HALF_UP);
                 return result;
@@ -1475,6 +1485,13 @@ class SelectAggregateEvaluator {
      * equal map to the same key even when their representations differ (numeric 1.0 vs 1.00,
      * or int 1 vs numeric 1.0), matching PostgreSQL's equality-based DISTINCT.
      */
+    /** True for the float NaN value, which has no BigDecimal form and poisons any numeric sum. */
+    private static boolean isNotANumber(Object val) {
+        if (val instanceof Double) return ((Double) val).isNaN();
+        if (val instanceof Float) return ((Float) val).isNaN();
+        return false;
+    }
+
     private static String distinctKey(Object val) {
         // bytea dedups by byte sequence, not array identity
         if (val instanceof byte[]) return RowKey.valueKey(val);

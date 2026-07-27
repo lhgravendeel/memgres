@@ -459,6 +459,47 @@ public class RangeOperations {
         return false;
     }
 
+    /**
+     * {@code a << b}: every point of {@code a} is strictly below every point of {@code b}.
+     * An empty range is strictly left of nothing, and nothing is strictly left of it.
+     */
+    public static boolean strictlyLeftOf(PgRange a, PgRange b) {
+        if (a.isEmpty() || b.isEmpty()) return false;
+        Number aUpper = a.upper();
+        Number bLower = b.lower();
+        // An unbounded side reaches infinity, so it can never be strictly to one side.
+        if (aUpper == null || bLower == null) return false;
+        int cmp = new java.math.BigDecimal(aUpper.toString())
+                .compareTo(new java.math.BigDecimal(bLower.toString()));
+        if (cmp < 0) return true;
+        // Equal endpoints only stay disjoint when at least one of them is exclusive.
+        return cmp == 0 && !(a.upperInclusive() && b.lowerInclusive());
+    }
+
+    /** {@code a >> b}: every point of {@code a} is strictly above every point of {@code b}. */
+    public static boolean strictlyRightOf(PgRange a, PgRange b) {
+        return strictlyLeftOf(b, a);
+    }
+
+    /** {@code a << b} where either side may be a multirange; empty multiranges are never disjoint. */
+    public static boolean multirangeStrictlyLeftOf(java.util.List<PgRange> a, java.util.List<PgRange> b) {
+        java.util.List<PgRange> aParts = nonEmptyParts(a);
+        java.util.List<PgRange> bParts = nonEmptyParts(b);
+        if (aParts.isEmpty() || bParts.isEmpty()) return false;
+        // A multirange is stored in ascending order, so only the extreme parts matter.
+        return strictlyLeftOf(aParts.get(aParts.size() - 1), bParts.get(0));
+    }
+
+    private static java.util.List<PgRange> nonEmptyParts(java.util.List<PgRange> parts) {
+        java.util.List<PgRange> out = new java.util.ArrayList<>();
+        if (parts != null) {
+            for (PgRange r : parts) {
+                if (!r.isEmpty()) out.add(r);
+            }
+        }
+        return out;
+    }
+
     public static boolean isRangeString(String s) {
         if (s == null || s.length() < 3) return false;
         s = s.trim();

@@ -1179,6 +1179,8 @@ class FunctionEvaluator {
             case "array_to_string": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object delim = executor.evalExpr(fn.args().get(1), ctx);
+                // PG is strict on the delimiter: a NULL there makes the whole call NULL.
+                if (delim == null) return null;
                 // Handle string-formatted arrays like {a,b,c} (quote-aware, nested arrays flattened)
                 if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
                     String s = (String) arr;
@@ -1188,15 +1190,24 @@ class FunctionEvaluator {
                 }
                 if (arr instanceof List<?>) {
                     List<?> list = (List<?>) arr;
+                    Object nullStr = fn.args().size() > 2
+                            ? executor.evalExpr(fn.args().get(2), ctx) : null;
+                    // A NULL element is skipped entirely — separator included — unless a
+                    // replacement text was supplied.
                     StringBuilder sb = new StringBuilder();
-                    for (int i = 0; i < list.size(); i++) {
-                        if (i > 0) sb.append(delim);
-                        Object elem = list.get(i);
-                        if (elem != null) sb.append(elem.toString().trim());
-                        else if (fn.args().size() > 2) {
-                            Object nullStr = executor.evalExpr(fn.args().get(2), ctx);
-                            if (nullStr != null) sb.append(nullStr);
+                    boolean first = true;
+                    for (Object elem : list) {
+                        String rendered;
+                        if (elem != null) {
+                            rendered = elem.toString().trim();
+                        } else if (nullStr != null) {
+                            rendered = nullStr.toString();
+                        } else {
+                            continue;
                         }
+                        if (!first) sb.append(delim);
+                        first = false;
+                        sb.append(rendered);
                     }
                     return sb.toString();
                 }
@@ -1525,22 +1536,48 @@ class FunctionEvaluator {
                 Expression rightExpr = fn.args().get(1);
                 Object leftVal = executor.evalExpr(leftExpr, ctx);
                 Object rightVal = executor.evalExpr(rightExpr, ctx);
-                // Extract start/end from each side (PgRow or List)
-                java.time.temporal.Temporal s1, e1, s2, e2;
+                // Extract start/end from each side (PgRow or List). Any endpoint may be NULL,
+                // which makes that end of the period unknown rather than absent.
                 List<?> lv = extractRowValues(leftVal);
-                s1 = toTemporal(lv.get(0));
-                e1 = resolveOverlapEnd(s1, lv.get(1));
                 List<?> rv = extractRowValues(rightVal);
-                s2 = toTemporal(rv.get(0));
-                e2 = resolveOverlapEnd(s2, rv.get(1));
-                // SQL standard: two periods overlap iff (s1 < e2) AND (s2 < e1)
-                // With the normalization that if start > end, swap them
-                if (compareTemporal(s1, e1) > 0) { java.time.temporal.Temporal tmp = s1; s1 = e1; e1 = tmp; }
-                if (compareTemporal(s2, e2) > 0) { java.time.temporal.Temporal tmp = s2; s2 = e2; e2 = tmp; }
-                // Special case: zero-length period starting at same point as other period's start
-                if (compareTemporal(s1, e1) == 0 && compareTemporal(s1, s2) == 0) return true;
-                if (compareTemporal(s2, e2) == 0 && compareTemporal(s2, s1) == 0) return true;
-                return compareTemporal(s1, e2) < 0 && compareTemporal(s2, e1) < 0;
+                java.time.temporal.Temporal s1 = lv.get(0) == null ? null : toTemporal(lv.get(0));
+                java.time.temporal.Temporal e1 = resolveOverlapEnd(s1, lv.get(1));
+                java.time.temporal.Temporal s2 = rv.get(0) == null ? null : toTemporal(rv.get(0));
+                java.time.temporal.Temporal e2 = resolveOverlapEnd(s2, rv.get(1));
+
+                // Take the non-null endpoint as the start when only one is known; otherwise
+                // order the pair. A period with neither endpoint known says nothing at all.
+                if (s1 == null) {
+                    if (e1 == null) return null;
+                    s1 = e1;
+                    e1 = null;
+                } else if (e1 != null && compareTemporal(s1, e1) > 0) {
+                    java.time.temporal.Temporal tmp = s1; s1 = e1; e1 = tmp;
+                }
+                if (s2 == null) {
+                    if (e2 == null) return null;
+                    s2 = e2;
+                    e2 = null;
+                } else if (e2 != null && compareTemporal(s2, e2) > 0) {
+                    java.time.temporal.Temporal tmp = s2; s2 = e2; e2 = tmp;
+                }
+
+                // Both starts are now known, so they can be compared.
+                int startCmp = compareTemporal(s1, s2);
+                if (startCmp > 0) {
+                    // The later-starting period overlaps only if it begins before the other ends.
+                    if (e2 == null) return null;
+                    if (compareTemporal(s1, e2) < 0) return true;
+                    return e1 == null ? null : Boolean.FALSE;
+                } else if (startCmp < 0) {
+                    if (e1 == null) return null;
+                    if (compareTemporal(s2, e1) < 0) return true;
+                    return e2 == null ? null : Boolean.FALSE;
+                } else {
+                    // Equal starts overlap whenever both periods are fully known.
+                    if (e1 == null || e2 == null) return null;
+                    return true;
+                }
             }
             case "array_sample": {
                 // array_sample(arr, n) - returns n random elements from arr (PG 16+)
@@ -2931,11 +2968,18 @@ class FunctionEvaluator {
         throw new MemgresException("cannot convert value to temporal type for OVERLAPS: " + s, "42804");
     }
 
+    /**
+     * Resolve the second element of an OVERLAPS pair, which is either an endpoint or a length.
+     * Returns null when the endpoint is unknown — either because it is NULL, or because it is a
+     * length measured from a start that is itself unknown.
+     */
     private java.time.temporal.Temporal resolveOverlapEnd(java.time.temporal.Temporal start, Object endOrInterval) {
+        if (endOrInterval == null) return null;
         if (endOrInterval instanceof java.time.LocalDate || endOrInterval instanceof java.time.LocalDateTime
                 || endOrInterval instanceof java.time.OffsetDateTime) {
             return toTemporal(endOrInterval);
         }
+        if (start == null) return null;
         // Handle PgInterval: add interval to start date/timestamp
         if (endOrInterval instanceof PgInterval) {
             PgInterval iv = (PgInterval) endOrInterval;

@@ -839,12 +839,25 @@ class SelectWindowEvaluator {
                 return subtract ? dt.minusNanos(nanos) : dt.plusNanos(nanos);
             }
         }
-        // Numeric offset — preserve the type of currentVal so compareTo works
+        // Numeric offset — the boundary is compared against the ORDER BY values with
+        // Comparable.compareTo, so it must come back as the same class as currentVal.
+        if (!(currentVal instanceof Number) || !(offset instanceof Number)) {
+            throw PgErrors.datatypeMismatch("invalid RANGE frame offset for the ORDER BY column type");
+        }
+        if (currentVal instanceof java.math.BigDecimal) {
+            java.math.BigDecimal cur = (java.math.BigDecimal) currentVal;
+            java.math.BigDecimal off = offset instanceof java.math.BigDecimal
+                    ? (java.math.BigDecimal) offset
+                    : new java.math.BigDecimal(offset.toString());
+            return subtract ? cur.subtract(off) : cur.add(off);
+        }
         double numOffset = ((Number) offset).doubleValue();
         double currentNum = ((Number) currentVal).doubleValue();
         double result = subtract ? currentNum - numOffset : currentNum + numOffset;
         if (currentVal instanceof Integer) return (int) result;
         if (currentVal instanceof Long) return (long) result;
+        if (currentVal instanceof Short) return (short) result;
+        if (currentVal instanceof Byte) return (byte) result;
         if (currentVal instanceof Float) return (float) result;
         return result;
     }

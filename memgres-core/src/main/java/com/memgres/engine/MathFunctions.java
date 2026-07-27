@@ -53,6 +53,8 @@ class MathFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 double val = executor.toDouble(arg);
+                // NaN and the infinities have no BigDecimal form; PG returns them unchanged.
+                if (Double.isNaN(val) || Double.isInfinite(val)) return val;
                 if (fn.args().size() > 1) {
                     int scale = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                     java.math.BigDecimal bd = java.math.BigDecimal.valueOf(val)
@@ -96,13 +98,15 @@ class MathFunctions {
                 // macaddr/macaddr8 trunc
                 if (arg instanceof MacaddrValue) return ((MacaddrValue) arg).trunc();
                 if (arg instanceof Macaddr8Value) return ((Macaddr8Value) arg).trunc();
+                double truncVal = executor.toDouble(arg);
+                // NaN and the infinities have no BigDecimal form; PG returns them unchanged.
+                if (Double.isNaN(truncVal) || Double.isInfinite(truncVal)) return truncVal;
                 if (fn.args().size() > 1) {
                     int scale = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                     java.math.BigDecimal bd = new java.math.BigDecimal(arg.toString());
                     return bd.setScale(scale, java.math.RoundingMode.DOWN);
                 }
-                double val = executor.toDouble(arg);
-                return (long) val;
+                return (long) truncVal;
             }
             case "mod": {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);

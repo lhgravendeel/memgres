@@ -395,21 +395,22 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                         sendErrorSimple(ctx, "22003", errMsg);
                     }
                     batchFailed = true;
-                } catch (Exception e) {
-                    // Catch unexpected exceptions (NPE, ClassCast, etc.) during query
-                    // execution or result sending (e.g. COPY TO stdout value formatting).
+                } catch (Exception | StackOverflowError e) {
+                    // Catch unexpected throwables (NPE, ClassCast, blown stack, etc.) during
+                    // query execution or result sending (e.g. COPY TO stdout value formatting).
                     // Without this, the exception propagates to the outer catch which
                     // doesn't set batchFailed, or worse, to exceptionCaught() which
                     // previously killed the connection — causing pg_dump "worker died".
                     LOG.error("Unexpected error executing statement: {}", stmt, e);
-                    String errDetail = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                    sendErrorSimple(ctx, "XX000", "Internal error: " + errDetail);
+                    MemgresException translated = PgErrors.translate(e);
+                    sendErrorSimple(ctx, translated.getSqlState(), translated.getMessage());
                     batchFailed = true;
                 }
             }
-        } catch (Exception e) {
+        } catch (Exception | StackOverflowError e) {
             LOG.error("Error executing query: {}", sql, e);
-            sendErrorSimple(ctx, "XX000", "Internal error: " + e.getMessage());
+            MemgresException translated = PgErrors.translate(e);
+            sendErrorSimple(ctx, translated.getSqlState(), translated.getMessage());
         }
         if (!copyHandler.inCopyFromMode) {
             // In autocommit mode, reset failed transaction state (PG auto-rolls back)
@@ -898,9 +899,12 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
             } else {
                 sendExtendedError(ctx, "22003", errMsg);
             }
-        } catch (Exception e) {
+        } catch (Exception | StackOverflowError e) {
             LOG.error("[PROTO] Execute INTERNAL ERROR: {} | {}", e.getMessage(), sqlSnip, e);
-            sendExtendedError(ctx, "XX000", "Internal error: " + e.getMessage());
+            MemgresException translated = PgErrors.translate(e);
+            enrichErrorPosition(translated, portal.sql());
+            sendErrorWithDetails(ctx, translated, true);
+            errorPendingUntilSync = true;
         } finally {
             if (session != null) session.setIdleState();
         }
@@ -1613,8 +1617,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         // libpq report the real error and avoids the cascade.
         try {
             if (ctx.channel().isActive()) {
-                String msg = cause.getMessage() != null ? cause.getMessage() : cause.getClass().getSimpleName();
-                sendErrorSimple(ctx, "XX000", "Internal error: " + msg);
+                MemgresException translated = PgErrors.translate(cause);
+                sendErrorSimple(ctx, translated.getSqlState(), translated.getMessage());
                 sendReadyForQuery(ctx, session);
             }
         } catch (Exception e) {

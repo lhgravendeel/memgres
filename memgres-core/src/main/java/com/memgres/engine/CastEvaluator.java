@@ -680,7 +680,13 @@ class CastEvaluator {
                         if (inStr) { if (ch == '"' && (ci == 0 || trimmed.charAt(ci-1) != '\\')) inStr = false; }
                         else {
                             if (ch == '"') inStr = true;
-                            else if (ch == '{' || ch == '[') depth++;
+                            else if (ch == '{' || ch == '[') {
+                                // Nesting this deep cannot be walked recursively later on, and
+                                // both json and jsonb must refuse it at input time.
+                                if (++depth > PgErrors.MAX_RECURSION_DEPTH) {
+                                    throw PgErrors.stackDepthExceeded();
+                                }
+                            }
                             else if (ch == '}' || ch == ']') {
                                 // Trailing comma: ,} or ,]
                                 if (prevNonWs == ',') throw new MemgresException("invalid input syntax for type json", "22P02");

@@ -486,6 +486,8 @@ class BinaryOpEvaluator {
                 if (left instanceof InetValue && right instanceof InetValue) {
                     return ((InetValue) right).contains((InetValue) left);
                 }
+                { Boolean rangeCmp = rangeShift(left, right, true);
+                if (rangeCmp != null) return rangeCmp; }
                 { long r = executor.toLong(left) << executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
@@ -508,6 +510,8 @@ class BinaryOpEvaluator {
                 if (left instanceof InetValue && right instanceof InetValue) {
                     return ((InetValue) left).contains((InetValue) right);
                 }
+                { Boolean rangeCmp = rangeShift(left, right, false);
+                if (rangeCmp != null) return rangeCmp; }
                 { long r = executor.toLong(left) >> executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
@@ -1507,6 +1511,36 @@ class BinaryOpEvaluator {
     }
 
     /** Shift a bit string left or right, filling with zeros. Preserves length. */
+    /**
+     * Range and multirange "strictly left/right of". Both spellings arrive as text, so they are
+     * recognised here before the operands fall through to integer bit-shifting.
+     */
+    private static Boolean rangeShift(Object left, Object right, boolean leftward) {
+        if (!(left instanceof String) || !(right instanceof String)) return null;
+        String ls = ((String) left).trim(), rs = ((String) right).trim();
+        boolean lMulti = RangeOperations.isMultirangeString(ls);
+        boolean rMulti = RangeOperations.isMultirangeString(rs);
+        boolean lRange = lMulti || RangeOperations.isRangeString(ls);
+        boolean rRange = rMulti || RangeOperations.isRangeString(rs);
+        // "{}" on its own is ambiguous with an empty array, so it only counts as an empty
+        // multirange when the other operand is unambiguously a range.
+        boolean lEmptyMulti = !lRange && rRange && ls.equals("{}");
+        boolean rEmptyMulti = !rRange && lRange && rs.equals("{}");
+        if (!(lRange || lEmptyMulti) || !(rRange || rEmptyMulti)) return null;
+        java.util.List<RangeOperations.PgRange> a = rangeParts(ls, lMulti, lEmptyMulti);
+        java.util.List<RangeOperations.PgRange> b = rangeParts(rs, rMulti, rEmptyMulti);
+        return leftward
+                ? RangeOperations.multirangeStrictlyLeftOf(a, b)
+                : RangeOperations.multirangeStrictlyLeftOf(b, a);
+    }
+
+    private static java.util.List<RangeOperations.PgRange> rangeParts(
+            String s, boolean multi, boolean emptyMulti) {
+        if (emptyMulti) return java.util.Collections.emptyList();
+        if (multi) return RangeOperations.parseMultirange(s);
+        return java.util.Collections.singletonList(RangeOperations.parse(s));
+    }
+
     private static String shiftBitString(String bits, int shift, boolean leftShift) {
         int len = bits.length();
         if (shift >= len || shift <= -len) {
@@ -1663,6 +1697,8 @@ class BinaryOpEvaluator {
                 if (left instanceof InetValue && right instanceof InetValue) {
                     return ((InetValue) right).contains((InetValue) left);
                 }
+                { Boolean rangeCmp = rangeShift(left, right, true);
+                if (rangeCmp != null) return rangeCmp; }
                 { long r = executor.toLong(left) << executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
@@ -1672,6 +1708,8 @@ class BinaryOpEvaluator {
                 if (left instanceof InetValue && right instanceof InetValue) {
                     return ((InetValue) left).contains((InetValue) right);
                 }
+                { Boolean rangeCmp = rangeShift(left, right, false);
+                if (rangeCmp != null) return rangeCmp; }
                 { long r = executor.toLong(left) >> executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
