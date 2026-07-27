@@ -966,6 +966,23 @@ public class Database {
         return compositeTypes.get(name.toLowerCase());
     }
 
+    /**
+     * Fields of the composite type a name denotes. Every table implicitly defines one with its
+     * own name and columns, so a row can be cast to a table's type the way PG allows.
+     */
+    public List<CreateTypeStmt.CompositeField> getRowType(String name) {
+        List<CreateTypeStmt.CompositeField> explicit = getCompositeType(name);
+        if (explicit != null) return explicit;
+        Table table = getTable(name);
+        if (table == null) return null;
+        List<CreateTypeStmt.CompositeField> fields = new ArrayList<>();
+        for (Column col : table.getColumns()) {
+            fields.add(new CreateTypeStmt.CompositeField(col.getName(),
+                    col.getType() != null ? col.getType().name().toLowerCase() : "text"));
+        }
+        return fields;
+    }
+
     public void removeCompositeType(String name) {
         compositeTypes.remove(name.toLowerCase());
     }

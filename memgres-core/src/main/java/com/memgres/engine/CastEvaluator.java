@@ -1246,16 +1246,16 @@ class CastEvaluator {
                 if (typeName.equals("record")) {
                     return val;
                 }
-                // ROW cast to composite type; check arity
-                if (val instanceof AstExecutor.PgRow && executor.database.isCompositeType(typeName)) {
+                // ROW cast to a composite type, which a table also defines; check arity
+                List<CreateTypeStmt.CompositeField> rowFields = executor.database.getRowType(typeName);
+                if (val instanceof AstExecutor.PgRow && rowFields != null) {
                     AstExecutor.PgRow pr = (AstExecutor.PgRow) val;
-                    List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
-                    if (fields != null && pr.values().size() != fields.size()) {
+                    if (pr.values().size() != rowFields.size()) {
                         throw new MemgresException("cannot cast type record to " + typeName, "42846");
                     }
                 }
                 // If this type is not a known composite either, it doesn't exist
-                if (!executor.database.isCompositeType(typeName)) {
+                if (rowFields == null) {
                     // Check if it looks like a user-defined type name (not a built-in alias we missed)
                     // Known safe aliases that fall through: none should reach here after the switch above
                     // Only throw if the type name looks like an unknown identifier (not a PG built-in)
@@ -1382,8 +1382,17 @@ class CastEvaluator {
             } else if (elem instanceof java.util.List<?>) {
                 java.util.List<?> nested = (java.util.List<?>) elem;
                 sb.append(formatListAsPgArray(nested));
-            } else if (elem instanceof String) {
-                String s = (String) elem;
+            } else if (elem instanceof String || elem instanceof AstExecutor.PgRow
+                    || elem instanceof java.util.Map<?, ?>) {
+                // A composite element renders as (f1,f2), whose commas make it need quoting
+                String s;
+                if (elem instanceof AstExecutor.PgRow) {
+                    s = ((AstExecutor.PgRow) elem).toPgText();
+                } else if (elem instanceof java.util.Map<?, ?>) {
+                    s = AstExecutor.PgRow.fromFieldMap((java.util.Map<?, ?>) elem).toPgText();
+                } else {
+                    s = (String) elem;
+                }
                 // Quote strings that contain special chars
                 if (s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains(" ") || s.isEmpty()) {
                     sb.append("\"").append(s.replace("\"", "\\\"")).append("\"");

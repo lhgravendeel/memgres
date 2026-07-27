@@ -493,6 +493,9 @@ class DdlObjectExecutor {
         if (checkBodies && "plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
             validatePlpgsqlDeclarations(stmt.body());
             validatePlpgsqlRaiseArgs(stmt.body());
+            // PG compiles the body at CREATE time, so a body it cannot parse never becomes a
+            // function that only fails when someone calls it.
+            com.memgres.engine.plpgsql.PlpgsqlParser.parse(stmt.body());
         }
 
         // Validate SQL language function bodies (only when check_function_bodies=on)
