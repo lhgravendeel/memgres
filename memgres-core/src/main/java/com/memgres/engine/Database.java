@@ -1475,7 +1475,16 @@ public class Database {
     }
 
     public void addRuleByName(String ruleName, String table) {
-        rules.put("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase(), "exists");
+        addRuleByName(ruleName, table, null);
+    }
+
+    /**
+     * Remember which event a named rule was declared for, so dropping it by name can also retire
+     * the behaviour it installed rather than leaving the rule firing under a deleted name.
+     */
+    public void addRuleByName(String ruleName, String table, String event) {
+        rules.put("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase(),
+                event != null ? event.toUpperCase() : "exists");
     }
 
     public boolean hasRule(String ruleName, String table) {
@@ -1483,8 +1492,11 @@ public class Database {
     }
 
     public void removeRule(String ruleName, String table) {
-        rules.remove("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+        String event = rules.remove("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
         rules.remove("def:" + ruleName.toLowerCase());
+        if (event != null && !"exists".equals(event)) {
+            rules.remove(table.toLowerCase() + ":" + event);
+        }
     }
 
     public void addRuleDefinition(String ruleName, String table, String definition) {

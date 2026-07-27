@@ -555,7 +555,7 @@ class DdlAdminExecutor {
             executor.database.addRule(s.table(), s.event(), "ALSO:" + s.command());
         }
         // Track rule name with full definition for pg_rules
-        executor.database.addRuleByName(s.name(), s.table());
+        executor.database.addRuleByName(s.name(), s.table(), s.event());
         // Store rule definition for pg_rules view
         String definition = "CREATE RULE " + s.name() + " AS ON " + s.event() + " TO " + s.table()
                 + " DO " + s.action() + " " + (s.command() != null ? s.command() : "NOTHING") + ";";
