@@ -321,7 +321,9 @@ SELECT ee FROM dtc_chi;
 -- stmt: with ONLY the child keeps the column as its own
 ALTER TABLE ONLY dtc_par DROP COLUMN b;
 
--- setup: a table that lacks one of the parent's columns
+-- setup: a parent that still has both columns, and a table that lacks one of them
+-- (dtc_par lost b to the ONLY drop above, so this case needs its own parent)
+CREATE TABLE dtc_par2 (a int, b int);
 CREATE TABLE dtc_inh1 (a int);
 
 -- stmt
@@ -329,7 +331,7 @@ CREATE TABLE dtc_inh1 (a int);
 -- sqlstate: 42804
 -- message-like: child table is missing column "b"
 -- end-expected-error
-ALTER TABLE dtc_inh1 INHERIT dtc_par;
+ALTER TABLE dtc_inh1 INHERIT dtc_par2;
 
 -- setup: a table whose shared column has a different type
 CREATE TABLE dtc_inh2 (a text, b int);

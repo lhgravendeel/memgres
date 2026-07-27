@@ -5,6 +5,7 @@ import com.memgres.engine.parser.ast.CastExpr;
 import com.memgres.engine.parser.ast.ColumnRef;
 import com.memgres.engine.parser.ast.ExistsExpr;
 import com.memgres.engine.parser.ast.Expression;
+import com.memgres.engine.parser.ast.FunctionCallExpr;
 import com.memgres.engine.parser.ast.Literal;
 import com.memgres.engine.parser.ast.SelectStmt;
 import com.memgres.engine.parser.ast.SubqueryExpr;
@@ -86,6 +87,28 @@ public final class DdlDefinitionChecks {
         })) {
             throw PgErrors.notImplemented("cannot use column reference in DEFAULT expression");
         }
+    }
+
+    /** Functions that change something when called, so calling one to inspect it is not free. */
+    private static final Set<String> SIDE_EFFECTING_FUNCTIONS = Cols.setOf("nextval", "setval");
+
+    /**
+     * Whether a DEFAULT can be evaluated now purely to see what it produces. Most expressions can:
+     * running {@code now()} to find it is a timestamp costs nothing. {@code nextval} is different
+     * — evaluating it consumes a sequence value, so the first row inserted would come out with the
+     * second number. PostgreSQL type-checks a default without ever running it, and this is the one
+     * place where the difference between checking and running is visible.
+     */
+    public static boolean isEvaluableAtDefinitionTime(Expression expr) {
+        if (expr == null) return false;
+        return !AstWalk.anyMatch(expr, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                return n instanceof FunctionCallExpr
+                        && ((FunctionCallExpr) n).name != null
+                        && SIDE_EFFECTING_FUNCTIONS.contains(
+                                ((FunctionCallExpr) n).name.toLowerCase());
+            }
+        });
     }
 
     // ---- CHECK / POLICY predicates ----

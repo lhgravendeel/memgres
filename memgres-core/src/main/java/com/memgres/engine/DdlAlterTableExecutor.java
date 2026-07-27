@@ -1138,7 +1138,7 @@ class DdlAlterTableExecutor {
             DdlDefinitionChecks.validateDefaultExpression(setDefault.expr());
             // The default has to be a value the column can hold, or every insert that relies on
             // it fails on a statement that never mentions the column.
-            if (setDefault.expr() != null) {
+            if (DdlDefinitionChecks.isEvaluableAtDefinitionTime(setDefault.expr())) {
                 Object value = executor.evaluateDefault(defaultVal, col.getType());
                 if (value != null) checkDefaultFits(value, col, alterCol.column(), setDefault.expr());
             }
