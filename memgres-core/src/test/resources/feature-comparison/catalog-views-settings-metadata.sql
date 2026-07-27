@@ -16,6 +16,22 @@ SELECT count(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespa
   ('pg_indexes','pg_policies','pg_rules','pg_stats','pg_user','pg_shadow','pg_group',
    'pg_timezone_abbrevs','pg_user_mappings','pg_publication_tables','pg_stat_io','pg_stat_archiver');
 
+-- Every relation this listing claims has to be one PG actually carries: a name in pg_class that
+-- names nothing is the same defect as a missing one, seen from the other side.
+-- begin-expected
+-- columns: n
+-- row: 28
+-- end-expected
+SELECT count(*) AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE n.nspname = 'pg_catalog' AND c.relname IN
+  ('pg_db_role_setting','pg_group','pg_indexes','pg_policies','pg_publication_tables',
+   'pg_replication_origin_status','pg_rules','pg_seclabels','pg_shadow','pg_stat_archiver',
+   'pg_stat_checkpointer','pg_stat_gssapi','pg_stat_io','pg_stat_progress_analyze',
+   'pg_stat_progress_basebackup','pg_stat_progress_cluster','pg_stat_progress_copy',
+   'pg_stat_progress_create_index','pg_stat_progress_vacuum','pg_stat_ssl',
+   'pg_stat_subscription','pg_stat_user_functions','pg_stat_wal','pg_stats','pg_stats_ext',
+   'pg_timezone_abbrevs','pg_user','pg_user_mappings');
+
 -- An index is a relation, but not a table. (A handful of PG views are also named "..._index",
 -- so this asks about the indexes themselves rather than about the spelling.)
 -- begin-expected
