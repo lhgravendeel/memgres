@@ -10,6 +10,10 @@ import java.util.*;
  * String function evaluation, extracted from FunctionEvaluator to reduce class size.
  */
 class StringFunctions {
+
+    /** The four Unicode normalization forms the grammar accepts as bare keywords. */
+    private static final java.util.Set<String> NORMALIZATION_FORMS = new java.util.HashSet<>(
+            java.util.Arrays.asList("NFC", "NFD", "NFKC", "NFKD"));
     private static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
     /**
@@ -1146,7 +1150,23 @@ class StringFunctions {
             case "normalize": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                String form = fn.args().size() > 1 ? String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toUpperCase() : "NFC";
+                String form = "NFC";
+                if (fn.args().size() > 1) {
+                    // The form is a bare keyword in the grammar, so it arrives looking like a
+                    // column reference and must be read by name rather than evaluated.
+                    Expression formExpr = fn.args().get(1);
+                    String keyword = formExpr instanceof ColumnRef
+                            && ((ColumnRef) formExpr).table() == null
+                            ? ((ColumnRef) formExpr).column() : null;
+                    if (keyword != null && NORMALIZATION_FORMS.contains(keyword.toUpperCase())) {
+                        form = keyword.toUpperCase();
+                    } else {
+                        form = String.valueOf(executor.evalExpr(formExpr, ctx)).toUpperCase();
+                    }
+                }
+                if (!NORMALIZATION_FORMS.contains(form)) {
+                    throw new MemgresException("invalid normalization form: " + form.toLowerCase(), "22023");
+                }
                 return java.text.Normalizer.normalize(arg.toString(), java.text.Normalizer.Form.valueOf(form));
             }
             case "unicode": {

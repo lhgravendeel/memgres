@@ -1563,9 +1563,12 @@ class SelectParser {
         if (parser.peek().type() != TokenType.KEYWORD) return false;
         String word = parser.peek().value().toUpperCase();
         if (isClauseKeyword(word)) return false;
+        // FILTER cannot be a bare alias: it would swallow the aggregate filter clause that
+        // follows, leaving the expression before it silently unresolved.
         return !word.equals("USING") && !word.equals("TABLESAMPLE")
                 && !word.equals("WITH") && !word.equals("WINDOW")
-                && !word.equals("OVER") && !word.equals("LATERAL");
+                && !word.equals("OVER") && !word.equals("LATERAL")
+                && !word.equals("FILTER");
     }
 
     /**

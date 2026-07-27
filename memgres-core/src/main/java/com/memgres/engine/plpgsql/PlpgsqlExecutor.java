@@ -60,6 +60,7 @@ public class PlpgsqlExecutor {
     // Variable scope
     static class Scope {
         final Map<String, Object> variables = new LinkedHashMap<>();
+        final Map<String, String> declaredTypes = new LinkedHashMap<>();
         final java.util.Set<String> outputOnlyVars = new java.util.HashSet<>();
         final Scope parent;
         int lastRowCount = 0;
@@ -101,6 +102,24 @@ public class PlpgsqlExecutor {
 
         void declare(String name, Object value) {
             variables.put(name.toLowerCase(), value);
+        }
+
+        /** Record the type the variable was declared with, so assignments can be checked. */
+        void declareTyped(String name, Object value, String typeName) {
+            String key = name.toLowerCase();
+            variables.put(key, value);
+            if (typeName != null) declaredTypes.put(key, typeName.toLowerCase().trim());
+        }
+
+        String declaredType(String name) {
+            String key = name.toLowerCase();
+            Scope sc = this;
+            while (sc != null) {
+                if (sc.declaredTypes.containsKey(key)) return sc.declaredTypes.get(key);
+                if (sc.variables.containsKey(key)) return null;
+                sc = sc.parent;
+            }
+            return null;
         }
 
         void declareOutputOnly(String name, Object value) {
@@ -590,7 +609,7 @@ public class PlpgsqlExecutor {
             if (decl.defaultExpr() != null) {
                 defaultVal = evalExpr(decl.defaultExpr(), scope);
             }
-            scope.declare(decl.name(), defaultVal);
+            scope.declareTyped(decl.name(), defaultVal, decl.typeName());
         }
 
         if (block.exceptionHandlers().isEmpty()) {
@@ -1663,16 +1682,16 @@ public class PlpgsqlExecutor {
             String field = target.substring(dotIdx + 1);
             if (scope.has(qualifier)) {
                 Object qualObj = scope.get(qualifier);
+                if (qualObj == null) {
+                    // Initialize composite variable as a map on first field assignment
+                    Map<String, Object> map = new java.util.LinkedHashMap<>();
+                    scope.set(qualifier, map);
+                    qualObj = map;
+                }
                 if (qualObj instanceof Map) {
                     @SuppressWarnings("unchecked")
                     Map<String, Object> map = (Map<String, Object>) qualObj;
-                    map.put(field.toLowerCase(), value);
-                    return;
-                } else if (qualObj == null) {
-                    // Initialize composite variable as a map on first field assignment
-                    Map<String, Object> map = new java.util.LinkedHashMap<>();
-                    map.put(field.toLowerCase(), value);
-                    scope.set(qualifier, map);
+                    assignNestedField(map, field, value);
                     return;
                 }
             } else if (currentFunctionName != null && qualifier.equalsIgnoreCase(currentFunctionName)
@@ -1688,7 +1707,78 @@ public class PlpgsqlExecutor {
         if (!scope.has(target)) {
             throw new MemgresException("\"" + target + "\" is not a known variable", "42601");
         }
+        rejectCompositeIntoScalar(scope.declaredType(target), value);
         scope.set(target, value);
+    }
+
+    /**
+     * A composite assigned to a scalar variable goes through the scalar type's input function in
+     * PG, which rejects the row's text form. Silently storing the row would leave the variable
+     * holding something its declared type cannot represent.
+     */
+    private void rejectCompositeIntoScalar(String declaredType, Object value) {
+        if (declaredType == null) return;
+        if (!(value instanceof Map) && !(value instanceof AstExecutor.PgRow)) return;
+        if (!SCALAR_TARGET_TYPES.containsKey(declaredType)) return;
+        AstExecutor.PgRow row = value instanceof AstExecutor.PgRow
+                ? (AstExecutor.PgRow) value
+                : AstExecutor.PgRow.fromFieldMap((Map<?, ?>) value);
+        String canonical = SCALAR_TARGET_TYPES.get(declaredType);
+        throw new MemgresException("invalid input syntax for type " + canonical
+                + ": \"" + row.toPgText() + "\"", "22P02");
+    }
+
+    /**
+     * Declared types that hold a single value and so cannot accept a whole row, mapped to the
+     * spelling PostgreSQL reports them by.
+     */
+    private static final Map<String, String> SCALAR_TARGET_TYPES = new LinkedHashMap<>();
+    static {
+        SCALAR_TARGET_TYPES.put("int", "integer");
+        SCALAR_TARGET_TYPES.put("integer", "integer");
+        SCALAR_TARGET_TYPES.put("int4", "integer");
+        SCALAR_TARGET_TYPES.put("int2", "smallint");
+        SCALAR_TARGET_TYPES.put("smallint", "smallint");
+        SCALAR_TARGET_TYPES.put("int8", "bigint");
+        SCALAR_TARGET_TYPES.put("bigint", "bigint");
+        SCALAR_TARGET_TYPES.put("numeric", "numeric");
+        SCALAR_TARGET_TYPES.put("decimal", "numeric");
+        SCALAR_TARGET_TYPES.put("real", "real");
+        SCALAR_TARGET_TYPES.put("float4", "real");
+        SCALAR_TARGET_TYPES.put("float8", "double precision");
+        SCALAR_TARGET_TYPES.put("double precision", "double precision");
+        SCALAR_TARGET_TYPES.put("boolean", "boolean");
+        SCALAR_TARGET_TYPES.put("bool", "boolean");
+        SCALAR_TARGET_TYPES.put("date", "date");
+        SCALAR_TARGET_TYPES.put("time", "time");
+        SCALAR_TARGET_TYPES.put("timestamp", "timestamp");
+        SCALAR_TARGET_TYPES.put("timestamptz", "timestamp with time zone");
+        SCALAR_TARGET_TYPES.put("uuid", "uuid");
+    }
+
+    /**
+     * Assign through a dotted field path, creating intermediate composites as needed, so that
+     * {@code v.y.a := 2} nests inside {@code v.y} rather than storing a field literally named
+     * "y.a".
+     */
+    private void assignNestedField(Map<String, Object> map, String fieldPath, Object value) {
+        Map<String, Object> current = map;
+        String remaining = fieldPath;
+        int dot;
+        while ((dot = remaining.indexOf('.')) > 0) {
+            String head = remaining.substring(0, dot).toLowerCase();
+            remaining = remaining.substring(dot + 1);
+            Object child = current.get(head);
+            if (!(child instanceof Map)) {
+                Map<String, Object> created = new java.util.LinkedHashMap<>();
+                current.put(head, created);
+                child = created;
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Object> next = (Map<String, Object>) child;
+            current = next;
+        }
+        current.put(remaining.toLowerCase(), value);
     }
 
     // ---- GET DIAGNOSTICS ----
@@ -2049,8 +2139,27 @@ public class PlpgsqlExecutor {
                             }
                         }
                         Object val = map.get(field);
+                        int consumed = 2;
+                        // A nested composite is read as (v.y).a — the parentheses are required,
+                        // because v.y.a alone would be taken for a schema-qualified name.
+                        while (val instanceof Map
+                                && i + consumed + 3 < tokens.size()
+                                && tokens.get(i + consumed + 1).type() == TokenType.RIGHT_PAREN
+                                && tokens.get(i + consumed + 2).type() == TokenType.DOT) {
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> nested = (Map<String, Object>) val;
+                            String nestedField = tokens.get(i + consumed + 3).value().toLowerCase();
+                            if (!nested.containsKey(nestedField)) break;
+                            // Drop the opening paren already written for this group.
+                            int lastParen = sb.length() - 1;
+                            while (lastParen >= 0 && sb.charAt(lastParen) == ' ') lastParen--;
+                            if (lastParen < 0 || sb.charAt(lastParen) != '(') break;
+                            sb.setLength(lastParen);
+                            val = nested.get(nestedField);
+                            consumed += 3;
+                        }
                         appendValue(sb, val);
-                        i += 2;
+                        i += consumed;
                         continue;
                     }
                 }
@@ -2138,10 +2247,14 @@ public class PlpgsqlExecutor {
                             @SuppressWarnings("unchecked")
                             Map<String, Object> mapVal = (Map<String, Object>) val;
                             boolean followedByDot = i + 1 < tokens.size() && tokens.get(i + 1).type() == TokenType.DOT;
-                            if (!followedByDot && mapVal.size() == 1) {
+                            if (followedByDot) {
+                                appendTokenToSb(sb, t);
+                            } else if (mapVal.size() == 1) {
                                 appendValue(sb, mapVal.values().iterator().next());
                             } else {
-                                appendTokenToSb(sb, t);
+                                // Used as a whole value. Emitting the bare name would leave an
+                                // identifier that resolves to nothing, so build a row literal.
+                                appendValue(sb, val);
                             }
                         } else {
                             appendValue(sb, val);
@@ -2429,6 +2542,21 @@ public class PlpgsqlExecutor {
             sb.append("'").append(val.toString().replace("'", "''")).append("'::time");
         } else if (val instanceof com.memgres.engine.HstoreValue) {
             sb.append("'").append(val.toString().replace("'", "''")).append("'::hstore");
+        } else if (val instanceof Map) {
+            // A composite variable used as a whole value becomes a row constructor, so that
+            // nested composites keep their structure instead of flattening into text.
+            @SuppressWarnings("unchecked")
+            Map<String, Object> mapVal = (Map<String, Object>) val;
+            sb.append("ROW(");
+            boolean firstField = true;
+            for (Object field : mapVal.values()) {
+                if (!firstField) sb.append(",");
+                firstField = false;
+                StringBuilder fieldSb = new StringBuilder();
+                appendValue(fieldSb, field);
+                sb.append(fieldSb.toString().trim());
+            }
+            sb.append(")");
         } else {
             sb.append("'").append(val.toString().replace("'", "''")).append("'");
         }

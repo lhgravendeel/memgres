@@ -403,7 +403,10 @@ class ExprEvaluator {
                     if (ref.table() != null) {
                         throw new MemgresException("missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
                     }
-                    return ref.column(); // Return column name as string (for alias resolution)
+                    // Nothing resolves this name. Returning it as text would let a typo become a
+                    // plausible-looking value that defeats the column's declared type.
+                    throw new MemgresException(
+                            "column \"" + ref.column() + "\" does not exist", "42703");
                 }
             }
         }

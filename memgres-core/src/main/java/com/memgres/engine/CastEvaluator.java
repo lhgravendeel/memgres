@@ -16,29 +16,56 @@ class CastEvaluator {
     private final AstExecutor executor;
 
     /** Maps PG OIDs to their canonical type names (used by ::regtype casts). */
-    private static final Map<Integer, String> OID_TO_TYPE = Cols.mapOfEntries(
-        Cols.entry(16, "boolean"), Cols.entry(17, "bytea"),
-        Cols.entry(20, "bigint"), Cols.entry(21, "smallint"),
-        Cols.entry(23, "integer"), Cols.entry(25, "text"), Cols.entry(26, "oid"),
-        Cols.entry(114, "json"), Cols.entry(142, "xml"),
-        Cols.entry(700, "real"), Cols.entry(701, "double precision"),
-        Cols.entry(869, "inet"), Cols.entry(650, "cidr"),
-        Cols.entry(829, "macaddr"), Cols.entry(774, "macaddr8"), Cols.entry(790, "money"),
-        Cols.entry(1042, "character"), Cols.entry(1043, "character varying"),
-        Cols.entry(1082, "date"), Cols.entry(1083, "time without time zone"),
-        Cols.entry(1114, "timestamp without time zone"),
-        Cols.entry(1184, "timestamp with time zone"),
-        Cols.entry(1186, "interval"), Cols.entry(1560, "bit"),
-        Cols.entry(1562, "bit varying"), Cols.entry(1700, "numeric"),
-        Cols.entry(2950, "uuid"), Cols.entry(3802, "jsonb"),
-        Cols.entry(600, "point"), Cols.entry(601, "lseg"),
-        Cols.entry(602, "path"), Cols.entry(603, "box"),
-        Cols.entry(604, "polygon"), Cols.entry(628, "line"),
-        Cols.entry(718, "circle"),
-        Cols.entry(3614, "tsvector"), Cols.entry(3615, "tsquery"),
-        Cols.entry(1007, "integer[]"), Cols.entry(1009, "text[]"),
-        Cols.entry(1016, "bigint[]"), Cols.entry(1000, "boolean[]")
-    );
+    private static final Map<Integer, String> OID_TO_TYPE;
+
+    static {
+        // Filled in one entry at a time rather than through a long varargs call:
+        // inferring the key and value types across forty-odd nested generic calls
+        // is more than some compilers will do, and none of it is needed here.
+        Map<Integer, String> oids = new LinkedHashMap<>();
+        oids.put(16, "boolean");
+        oids.put(17, "bytea");
+        oids.put(20, "bigint");
+        oids.put(21, "smallint");
+        oids.put(23, "integer");
+        oids.put(25, "text");
+        oids.put(26, "oid");
+        oids.put(114, "json");
+        oids.put(142, "xml");
+        oids.put(700, "real");
+        oids.put(701, "double precision");
+        oids.put(869, "inet");
+        oids.put(650, "cidr");
+        oids.put(829, "macaddr");
+        oids.put(774, "macaddr8");
+        oids.put(790, "money");
+        oids.put(1042, "character");
+        oids.put(1043, "character varying");
+        oids.put(1082, "date");
+        oids.put(1083, "time without time zone");
+        oids.put(1114, "timestamp without time zone");
+        oids.put(1184, "timestamp with time zone");
+        oids.put(1186, "interval");
+        oids.put(1560, "bit");
+        oids.put(1562, "bit varying");
+        oids.put(1700, "numeric");
+        oids.put(2950, "uuid");
+        oids.put(3802, "jsonb");
+        oids.put(600, "point");
+        oids.put(601, "lseg");
+        oids.put(602, "path");
+        oids.put(603, "box");
+        oids.put(604, "polygon");
+        oids.put(628, "line");
+        oids.put(718, "circle");
+        oids.put(3614, "tsvector");
+        oids.put(3615, "tsquery");
+        oids.put(1007, "integer[]");
+        oids.put(1009, "text[]");
+        oids.put(1016, "bigint[]");
+        oids.put(1000, "boolean[]");
+        OID_TO_TYPE = Collections.unmodifiableMap(oids);
+    }
 
     CastEvaluator(AstExecutor executor) {
         this.executor = executor;
@@ -298,6 +325,13 @@ class CastEvaluator {
                 // PG inet::text uses network_show which always includes /prefix
                 if (val instanceof InetValue) {
                     return ((InetValue) val).text();
+                }
+                // Composites render as (f1,f2), whether held as a row or as a field map.
+                if (val instanceof AstExecutor.PgRow) {
+                    return ((AstExecutor.PgRow) val).toPgText();
+                }
+                if (val instanceof java.util.Map<?, ?>) {
+                    return AstExecutor.PgRow.fromFieldMap((java.util.Map<?, ?>) val).toPgText();
                 }
                 if (val instanceof RegclassValue) {
                     RegclassValue rc = (RegclassValue) val;

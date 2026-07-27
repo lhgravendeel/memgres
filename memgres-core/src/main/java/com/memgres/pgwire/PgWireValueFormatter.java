@@ -126,6 +126,10 @@ class PgWireValueFormatter {
         } else if (val instanceof com.memgres.engine.AstExecutor.PgEnum) {
             com.memgres.engine.AstExecutor.PgEnum enumVal = (com.memgres.engine.AstExecutor.PgEnum) val;
             return enumVal.label();
+        } else if (val instanceof java.util.Map<?, ?>) {
+            // A composite held as a field map (PL/pgSQL composite variables) renders as a row.
+            return formatValue(
+                    com.memgres.engine.AstExecutor.PgRow.fromFieldMap((java.util.Map<?, ?>) val), guc);
         } else if (val instanceof com.memgres.engine.AstExecutor.PgRow) {
             com.memgres.engine.AstExecutor.PgRow row = (com.memgres.engine.AstExecutor.PgRow) val;
             StringBuilder sb = new StringBuilder("(");
