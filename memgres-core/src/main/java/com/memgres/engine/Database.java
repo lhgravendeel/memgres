@@ -2015,6 +2015,47 @@ public class Database {
      * Checks whether following the wait-for chain starting at {@code blocker} eventually leads back to
      * {@code requester}, indicating a deadlock cycle.
      */
+    /**
+     * Wait for another session's in-flight write to settle, without holding any table lock.
+     *
+     * <p>A uniqueness check cannot decide anything about a row another session has inserted but
+     * not committed: whether it is really a duplicate depends on that transaction. Waiting is the
+     * only correct answer, and it has to happen with the table lock released, because rolling the
+     * other transaction back needs that same lock.
+     *
+     * @param stillBlocked re-evaluated on each poll; the wait ends when it becomes false
+     * @throws MemgresException {@code 40P01} if waiting would close a cycle,
+     *         {@code 55P03} if the lock timeout expires
+     */
+    public void awaitConcurrentWrite(Session waiter, Session blocker,
+                                      java.util.function.BooleanSupplier stillBlocked,
+                                      String relationName) {
+        if (waiter == null || blocker == null) return;
+        long configured = GucSettings.parseTimeoutMillis(waiter.getGucSettings().get("lock_timeout"));
+        long timeoutMs = configured > 0 ? configured : 5_000L;
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        waitingFor.put(waiter, blocker);
+        try {
+            while (stillBlocked.getAsBoolean()) {
+                if (hasDeadlock(waiter, blocker)) {
+                    throw new MemgresException("deadlock detected", "40P01");
+                }
+                if (System.currentTimeMillis() >= deadline) {
+                    throw new MemgresException("could not obtain lock on row in relation \""
+                            + relationName + "\"", "55P03");
+                }
+                try {
+                    Thread.sleep(5L);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new MemgresException("interrupted while waiting for row lock", "57014");
+                }
+            }
+        } finally {
+            waitingFor.remove(waiter);
+        }
+    }
+
     private boolean hasDeadlock(Session requester, Session blocker) {
         Session current = blocker;
         while (current != null) {

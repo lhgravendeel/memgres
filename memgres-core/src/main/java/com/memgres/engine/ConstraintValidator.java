@@ -18,6 +18,104 @@ class ConstraintValidator {
     }
 
     /** Find the schema name that contains the given table. */
+    /** A conflicting row that another session has inserted but has not yet committed. */
+    static final class PendingUniqueConflict {
+        final Session owner;
+        final Object[] row;
+        final String relation;
+
+        PendingUniqueConflict(Session owner, Object[] row, String relation) {
+            this.owner = owner;
+            this.row = row;
+            this.relation = relation;
+        }
+    }
+
+    /**
+     * Look for a row that would collide on a unique or primary key and that another session has
+     * inserted without committing. Whether such a row is really a duplicate is not yet decided —
+     * it depends on that transaction committing — so the caller waits rather than reporting.
+     *
+     * <p>Only plain column constraints are considered. A partial or expression constraint falls
+     * through to the ordinary check, which reports immediately as before; that is the older
+     * behaviour rather than a new failure.
+     *
+     * @return the pending conflict, or null if there is none to wait for
+     */
+    PendingUniqueConflict findUncommittedUniqueConflict(Table table, Object[] newRow, Object[] excludeRow) {
+        if (executor.session == null || executor.database == null) return null;
+        String schema = findSchemaName(table);
+        String key = (schema != null ? schema : "public") + "." + table.getName();
+        Map<Object[], Session> pending = new java.util.IdentityHashMap<>();
+        for (Session other : executor.database.getActiveSessions()) {
+            if (other == executor.session) continue;
+            java.util.Set<Object[]> theirs = other.getUncommittedInserts(key);
+            if (theirs == null) continue;
+            for (Object[] r : theirs) {
+                pending.put(r, other);
+            }
+        }
+        if (pending.isEmpty()) return null;
+
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.isNotEnforced()) continue;
+            if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
+                    && sc.getType() != StoredConstraint.Type.UNIQUE) {
+                continue;
+            }
+            if (sc.getWhereExpr() != null) continue; // partial: left to the ordinary check
+            List<String> columns = sc.getColumns();
+            if (columns == null || columns.isEmpty()) continue;
+            int[] indices = new int[columns.size()];
+            Object[] newVals = new Object[columns.size()];
+            boolean usable = true;
+            for (int i = 0; i < columns.size(); i++) {
+                indices[i] = table.getColumnIndex(columns.get(i));
+                if (indices[i] < 0) { usable = false; break; }
+                newVals[i] = newRow[indices[i]];
+            }
+            if (!usable) continue;
+            // NULLs are distinct unless the constraint says otherwise, so they never collide.
+            if (!sc.isNullsNotDistinct()) {
+                boolean anyNull = false;
+                for (Object v : newVals) { if (v == null) { anyNull = true; break; } }
+                if (anyNull) continue;
+            }
+            for (Map.Entry<Object[], Session> entry : pending.entrySet()) {
+                Object[] candidate = entry.getKey();
+                if (candidate == excludeRow) continue;
+                boolean allMatch = true;
+                for (int i = 0; i < indices.length; i++) {
+                    if (indices[i] >= candidate.length
+                            || !valuesEqual(newVals[i], candidate[indices[i]])) {
+                        allMatch = false;
+                        break;
+                    }
+                }
+                if (allMatch) {
+                    return new PendingUniqueConflict(entry.getValue(), candidate, table.getName());
+                }
+            }
+        }
+        return null;
+    }
+
+    /** True while the row is still an uncommitted insert belonging to that session. */
+    static boolean isStillPending(PendingUniqueConflict conflict, String schemaTable) {
+        java.util.Set<Object[]> theirs = conflict.owner.getUncommittedInserts(schemaTable);
+        if (theirs == null) return false;
+        for (Object[] candidate : theirs) {
+            if (candidate == conflict.row) return true;
+        }
+        return false;
+    }
+
+    /** The schema-qualified key under which a table's uncommitted rows are recorded. */
+    String uncommittedKey(Table table) {
+        String schema = findSchemaName(table);
+        return (schema != null ? schema : "public") + "." + table.getName();
+    }
+
     private String findSchemaName(Table table) {
         if (executor.database == null) return null;
         for (Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
