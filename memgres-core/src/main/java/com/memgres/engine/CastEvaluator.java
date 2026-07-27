@@ -179,24 +179,13 @@ class CastEvaluator {
     }
 
     /**
-     * Resolves the zone to use when interpreting a zoneless timestamptz literal.
-     * Follows the session TimeZone GUC only when it has been explicitly SET for this session
-     * (matching PG's "session TimeZone governs interpretation" semantics); otherwise falls back
-     * to the JVM's default zone, preserving memgres's historical default behavior.
+     * The zone a zoneless timestamptz literal is interpreted in: the session TimeZone, always.
+     * It has to be the same zone the value is later read back in, or a literal written as
+     * midnight comes back as the previous day — and the session is told over ParameterStatus
+     * which zone that is, so anything else would be a lie to the client.
      */
     private java.time.ZoneId sessionInterpretationZone() {
-        if (executor.session != null) {
-            GucSettings guc = executor.session.getGucSettings();
-            if (guc.hasSessionOverride("timezone")) {
-                String tz = guc.get("timezone");
-                if (tz != null) {
-                    try {
-                        return java.time.ZoneId.of(tz);
-                    } catch (Exception ignored) { /* fall back to JVM default below */ }
-                }
-            }
-        }
-        return java.time.ZoneId.systemDefault();
+        return TypeCoercion.sessionZone();
     }
 
     private int extraFloatDigits() {
