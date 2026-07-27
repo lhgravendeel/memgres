@@ -313,12 +313,15 @@ class FunctionEvaluator {
                 return executor.currentStatementTimestamp != null ? executor.currentStatementTimestamp : OffsetDateTime.now();
             }
             case "current_date":
-                return LocalDate.now();
+                return executor.currentInstant()
+                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDate();
             case "current_time":
             case "localtime":
-                return LocalTime.now();
+                return executor.currentInstant()
+                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalTime();
             case "localtimestamp":
-                return LocalDateTime.now();
+                return executor.currentInstant()
+                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDateTime();
             case "version":
                 return "PostgreSQL 18.0";
             case "gen_random_uuid":

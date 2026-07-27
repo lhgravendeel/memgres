@@ -58,6 +58,18 @@ public class AstExecutor {
     List<Object> boundParameters = new ArrayList<>();
     // Statement timestamp: frozen at statement start for now()/statement_timestamp()
     OffsetDateTime currentStatementTimestamp = null;
+
+    /**
+     * The instant every "current" date/time reads from. PG derives CURRENT_DATE, CURRENT_TIME,
+     * LOCALTIMESTAMP and now() from one transaction timestamp, so they cannot disagree with each
+     * other part-way through a transaction that spans midnight.
+     */
+    OffsetDateTime currentInstant() {
+        if (session != null && session.getTransactionTimestamp() != null) {
+            return session.getTransactionTimestamp();
+        }
+        return currentStatementTimestamp != null ? currentStatementTimestamp : OffsetDateTime.now();
+    }
     // Current MERGE action for merge_action() function in RETURNING clause (PG 17+)
     String currentMergeAction = null;
     // Raw SQL text of the current top-level statement (for pg_prepared_statements/pg_cursors verbatim display)
@@ -121,6 +133,11 @@ public class AstExecutor {
         // H37: publish the session DateStyle field order so date input parsing honors DMY/YMD/MDY
         String previousDateOrder = TypeCoercion.getDateOrder();
         TypeCoercion.setDateOrder(currentDateStyleOrder());
+        // ... and the session TimeZone, which decides what "today" and CURRENT_DATE mean
+        java.time.ZoneId previousZone = TypeCoercion.rawSessionZone();
+        TypeCoercion.setSessionZone(currentSessionZone());
+        OffsetDateTime previousInstant = TypeCoercion.rawSessionInstant();
+        TypeCoercion.setSessionInstant(currentInstant());
         try {
             Statement stmt = Parser.parse(sql);
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
@@ -130,6 +147,8 @@ public class AstExecutor {
             this.currentRawSql = previousRawSql;
             currentStatementTimestamp = null;
             TypeCoercion.setDateOrder(previousDateOrder);
+            TypeCoercion.setSessionZone(previousZone);
+            TypeCoercion.setSessionInstant(previousInstant);
         }
     }
 
@@ -145,6 +164,21 @@ public class AstExecutor {
         if (lower.contains("dmy")) return "DMY";
         if (lower.contains("ymd")) return "YMD";
         return "MDY";
+    }
+
+    /**
+     * The session TimeZone GUC as a zone. An unset or unrecognised value falls back to the JVM's
+     * zone, which is what the engine used before the setting was consulted at all.
+     */
+    private java.time.ZoneId currentSessionZone() {
+        if (session == null) return java.time.ZoneId.systemDefault();
+        String tz = session.getGucSettings().get("timezone");
+        if (tz == null || tz.isEmpty()) return java.time.ZoneId.systemDefault();
+        try {
+            return java.time.ZoneId.of(tz);
+        } catch (RuntimeException e) {
+            return java.time.ZoneId.systemDefault();
+        }
     }
 
     public QueryResult executeStatement(Statement stmt) {
@@ -1013,9 +1047,14 @@ public class AstExecutor {
                 return java.util.UUID.randomUUID();
             }
             if (lower.equals("now()") || lower.equals("current_timestamp")) {
-                if (type == DataType.DATE) return LocalDate.now();
-                if (type == DataType.TIMESTAMP) return LocalDateTime.now();
-                return OffsetDateTime.now();
+                OffsetDateTime instant = currentInstant();
+                if (type == DataType.DATE) {
+                    return instant.atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDate();
+                }
+                if (type == DataType.TIMESTAMP) {
+                    return instant.atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDateTime();
+                }
+                return instant;
             }
         }
         if (parsedExpr != null) {
