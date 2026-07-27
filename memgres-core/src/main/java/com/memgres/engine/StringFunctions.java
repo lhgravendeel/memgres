@@ -12,6 +12,62 @@ import java.util.*;
 class StringFunctions {
     private static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
+    /**
+     * Split a qualified name into its parts, taking the quoting off each. In strict mode anything
+     * left over after the last part is an error; otherwise the trailing text is simply ignored.
+     */
+    private static List<Object> parseIdent(String input, boolean strict) {
+        List<Object> parts = new ArrayList<Object>();
+        int i = 0;
+        int n = input.length();
+        boolean expectingPart = false;
+        while (true) {
+            while (i < n && Character.isWhitespace(input.charAt(i))) i++;
+            if (i >= n) break;
+            if (input.charAt(i) == '"') {
+                StringBuilder sb = new StringBuilder();
+                i++;
+                boolean closed = false;
+                while (i < n) {
+                    char c = input.charAt(i);
+                    if (c == '"') {
+                        // "" inside a quoted name is one literal quote
+                        if (i + 1 < n && input.charAt(i + 1) == '"') { sb.append('"'); i += 2; continue; }
+                        i++;
+                        closed = true;
+                        break;
+                    }
+                    sb.append(c);
+                    i++;
+                }
+                if (!closed) {
+                    throw new MemgresException("string is not a valid identifier: \"" + input + "\"",
+                            "22023");
+                }
+                parts.add(sb.toString());
+            } else {
+                int start = i;
+                while (i < n) {
+                    char c = input.charAt(i);
+                    if (Character.isLetterOrDigit(c) || c == '_' || c == '$') { i++; continue; }
+                    break;
+                }
+                if (i == start) break;
+                parts.add(input.substring(start, i).toLowerCase());
+            }
+            expectingPart = false;
+            while (i < n && Character.isWhitespace(input.charAt(i))) i++;
+            // A dot promises another part; if none follows, the name is unfinished.
+            if (i < n && input.charAt(i) == '.') { i++; expectingPart = true; continue; }
+            break;
+        }
+        while (i < n && Character.isWhitespace(input.charAt(i))) i++;
+        if (parts.isEmpty() || expectingPart || (strict && i < n)) {
+            throw new MemgresException("string is not a valid identifier: \"" + input + "\"", "22023");
+        }
+        return parts;
+    }
+
     private static final Set<String> RESERVED_WORDS = Cols.setOf(
             "select", "from", "where", "insert", "update", "delete", "create", "drop", "alter",
             "table", "index", "view", "and", "or", "not", "null", "true", "false", "in", "is",
@@ -112,6 +168,32 @@ class StringFunctions {
                     return arg.toString().toUpperCase(collLocale);
                 }
                 return arg.toString().toUpperCase();
+            }
+            // casefold is lower() done for comparison rather than for display: it folds the
+            // characters whose case-insensitive match differs from a simple lowercasing.
+            case "casefold": {
+                if (fn.args().isEmpty()) {
+                    throw new MemgresException("function casefold() does not exist"
+                            + "\n  Hint: No function matches the given name and argument types.", "42883");
+                }
+                Object cfArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (cfArg == null) return null;
+                return cfArg.toString().toLowerCase();
+            }
+            // parse_ident splits a qualified name into its parts, unquoting each one.
+            case "parse_ident": {
+                if (fn.args().isEmpty()) {
+                    throw new MemgresException("function parse_ident() does not exist"
+                            + "\n  Hint: No function matches the given name and argument types.", "42883");
+                }
+                Object piArg = executor.evalExpr(fn.args().get(0), ctx);
+                if (piArg == null) return null;
+                boolean strict = true;
+                if (fn.args().size() > 1) {
+                    Object strictArg = executor.evalExpr(fn.args().get(1), ctx);
+                    if (strictArg != null) strict = executor.isTruthy(strictArg);
+                }
+                return parseIdent(piArg.toString(), strict);
             }
             case "lower": {
                 if (fn.args().isEmpty()) {
