@@ -223,6 +223,14 @@ public class AstExecutor {
         if (stmt instanceof AlterPolicyStmt) return ddlExecutor.executeAlterPolicy(((AlterPolicyStmt) stmt));
         if (stmt instanceof AlterDefaultPrivilegesStmt) {
             AlterDefaultPrivilegesStmt s = (AlterDefaultPrivilegesStmt) stmt;
+            // The schema and role are resolved to OIDs before anything is recorded, so naming one
+            // that does not exist is an error rather than a default nothing will ever match.
+            if (s.forRole() != null && !database.hasRole(s.forRole().toLowerCase())) {
+                throw PgErrors.undefinedObject("role", s.forRole());
+            }
+            if (s.inSchema() != null && database.getSchema(s.inSchema()) == null) {
+                throw new MemgresException("schema \"" + s.inSchema() + "\" does not exist", "3F000");
+            }
             if (s.isGrant()) {
                 String grantor = s.forRole() != null ? s.forRole() : sessionUser();
                 database.addDefaultAcl(new Database.DefaultAclEntry(

@@ -824,7 +824,14 @@ class CatalogMetadataFunctions {
         if (fn.args().isEmpty()) return null;
         Object arg = executor.evalExpr(fn.args().get(0), ctx);
         if (arg == null) return null;
-        String typeName = arg.toString().trim().toLowerCase();
+        return canonicalTypeName(executor.database, arg.toString().trim().toLowerCase());
+    }
+
+    /**
+     * The name PostgreSQL prints for a type spelled {@code typeName}, or null when no such type
+     * exists. Shared with the privilege functions, which have to tell a real type from a typo.
+     */
+    static String canonicalTypeName(Database database, String typeName) {
         String canonical;
         switch (typeName) {
             case "int4":
@@ -979,8 +986,8 @@ class CatalogMetadataFunctions {
                 break;
         }
         if (canonical == null) {
-            if (executor.database.getCustomEnum(typeName) != null) canonical = typeName;
-            else if (executor.database.isDomain(typeName)) canonical = typeName;
+            if (database.getCustomEnum(typeName) != null) canonical = typeName;
+            else if (database.isDomain(typeName)) canonical = typeName;
         }
         return canonical;
     }
