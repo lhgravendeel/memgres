@@ -982,10 +982,21 @@ class DmlExecutor {
             String seqName = def.substring(q1 + 1, q2);
             Sequence seq = executor.database.getSequence(seqName);
             if (seq != null) {
-                return seq.nextVal();
+                return drawFromSequence(seq);
             }
         }
         return null;
+    }
+
+    /**
+     * Draw the next value and record it as this session's, so a serial or identity column read
+     * back with currval reports the key this connection generated rather than another's.
+     */
+    private long drawFromSequence(Sequence seq) {
+        long value = seq.nextVal();
+        executor.lastSequenceValue = value;
+        executor.sessionSequenceValues.put(seq.getName().toLowerCase(), value);
+        return value;
     }
 
     private Object resolveIdentityNextVal(Table table, Column col) {
@@ -994,7 +1005,7 @@ class DmlExecutor {
             String seqName = def.substring(def.indexOf(":seq:") + 5);
             Sequence seq = executor.database.getSequence(seqName);
             if (seq != null) {
-                return seq.nextVal();
+                return drawFromSequence(seq);
             }
         }
         return table.nextSerial();

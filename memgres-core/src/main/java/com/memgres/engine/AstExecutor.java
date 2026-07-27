@@ -37,6 +37,12 @@ public class AstExecutor {
     final DmlExecutor dmlExecutor = new DmlExecutor(this);
     final DdlExecutor ddlExecutor = new DdlExecutor(this);
     Long lastSequenceValue = null; // for lastval()
+    /**
+     * The value each sequence last produced <em>for this session</em>. currval reports what this
+     * connection drew, so it cannot be answered from state the sequence shares with every other
+     * connection — doing so hands one caller another caller's generated key.
+     */
+    final java.util.Map<String, Long> sessionSequenceValues = new java.util.HashMap<>();
     final FromResolver fromResolver = new FromResolver(this);
     final ExprEvaluator exprEvaluator = new ExprEvaluator(this);
     final SelectExecutor selectExecutor = new SelectExecutor(this);
