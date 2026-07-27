@@ -138,10 +138,13 @@ public class PlpgsqlExecutor {
         this.currentFunctionParams = null;
         Scope scope = new Scope(null);
         scope.declare("found", false);
+        if (session != null) session.enterNestedExecution();
         try {
             executeBlock(block, scope);
         } catch (ReturnSignal rs) {
             // DO blocks can RETURN but the value is discarded
+        } finally {
+            if (session != null) session.exitNestedExecution();
         }
     }
 
@@ -177,9 +180,11 @@ public class PlpgsqlExecutor {
             guc.set("role", function.getOwner());
         }
 
+        if (session != null) session.enterNestedExecution();
         try {
             return executeFunctionBody(function, args);
         } finally {
+            if (session != null) session.exitNestedExecution();
             // Exit function context
             if (enteredFunctionContext) {
                 session.exitFunctionCall();
@@ -563,7 +568,23 @@ public class PlpgsqlExecutor {
 
     // ---- Block and statement execution ----
 
+    /**
+     * A labelled block is a target for EXIT just as a labelled loop is: leaving it means resuming
+     * after its END, not unwinding the whole function.
+     */
     private void executeBlock(PlpgsqlStatement.Block block, Scope scope) {
+        if (block.label() != null) {
+            try {
+                executeBlockBody(block, scope);
+            } catch (ExitSignal e) {
+                if (e.label == null || !e.label.equalsIgnoreCase(block.label())) throw e;
+            }
+            return;
+        }
+        executeBlockBody(block, scope);
+    }
+
+    private void executeBlockBody(PlpgsqlStatement.Block block, Scope scope) {
         for (PlpgsqlStatement.VarDeclaration decl : block.declarations()) {
             Object defaultVal = null;
             if (decl.defaultExpr() != null) {

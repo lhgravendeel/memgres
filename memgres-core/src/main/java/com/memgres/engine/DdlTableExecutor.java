@@ -267,6 +267,10 @@ class DdlTableExecutor {
         if ("DROP".equals(stmt.onCommitAction()) && executor.session != null) {
             if (executor.session.isInTransaction()) {
                 executor.session.registerOnCommitDrop(schemaName, stmt.name());
+            } else if (executor.session.isInNestedExecution()) {
+                // A function body is part of one outer statement, so the table has to outlive the
+                // CREATE and die when that statement does — not the moment it is created.
+                executor.session.registerStatementEndDrop(schemaName, stmt.name());
             } else {
                 schema.removeTable(stmt.name());
             }
@@ -278,12 +282,19 @@ class DdlTableExecutor {
         // Store column-level constraints
         for (ColumnDef def : stmt.columns()) {
             if (def.primaryKey()) {
-                table.addConstraint(StoredConstraint.primaryKey(
-                        stmt.name() + "_pkey", Cols.listOf(def.name())));
+                StoredConstraint pk = StoredConstraint.primaryKey(
+                        stmt.name() + "_pkey", Cols.listOf(def.name()));
+                // A column-level key carries its own DEFERRABLE, exactly as a table-level one does.
+                pk.setDeferrable(def.deferrable());
+                pk.setInitiallyDeferred(def.initiallyDeferred());
+                table.addConstraint(pk);
             }
             if (def.unique()) {
-                table.addConstraint(StoredConstraint.unique(
-                        stmt.name() + "_" + def.name() + "_key", Cols.listOf(def.name())));
+                StoredConstraint uq = StoredConstraint.unique(
+                        stmt.name() + "_" + def.name() + "_key", Cols.listOf(def.name()));
+                uq.setDeferrable(def.deferrable());
+                uq.setInitiallyDeferred(def.initiallyDeferred());
+                table.addConstraint(uq);
             }
             if (def.referencesTable() != null) {
                 addColumnForeignKey(table, def, schemaName, stmt.name());

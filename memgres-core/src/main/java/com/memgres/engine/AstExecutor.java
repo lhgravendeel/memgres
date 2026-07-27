@@ -142,6 +142,7 @@ public class AstExecutor {
     }
 
     public QueryResult executeStatement(Statement stmt) {
+        checkReadOnlyTransaction(stmt);
         if (stmt instanceof SelectStmt) return selectExecutor.executeSelect(((SelectStmt) stmt));
         if (stmt instanceof SetOpStmt) return selectExecutor.executeSetOp(((SetOpStmt) stmt));
         if (stmt instanceof InsertStmt) return dmlExecutor.executeInsert(((InsertStmt) stmt));
@@ -1341,6 +1342,38 @@ public class AstExecutor {
     }
 
     // ---- Event Trigger Support ----
+
+    /**
+     * A read-only transaction refuses anything that would change the database. PG draws the line
+     * at the schema: every CREATE, ALTER and DROP is out, along with TRUNCATE, GRANT and REVOKE.
+     * DML is checked separately, closer to the table it writes.
+     */
+    private void checkReadOnlyTransaction(Statement stmt) {
+        if (session == null || !session.isReadOnly()) return;
+        String cls = stmt.getClass().getSimpleName();
+        String command;
+        if (stmt instanceof TruncateStmt) command = "TRUNCATE TABLE";
+        else if (stmt instanceof GrantStmt) command = "GRANT";
+        else if (stmt instanceof RevokeStmt) command = "REVOKE";
+        else if (cls.startsWith("Create") || cls.startsWith("Alter") || cls.startsWith("Drop")) {
+            command = commandTagOf(cls);
+        } else return;
+        throw new MemgresException(
+                "cannot execute " + command + " in a read-only transaction", "25006");
+    }
+
+    /** {@code CreateTableStmt} names the command {@code CREATE TABLE}, the way PG reports it. */
+    private String commandTagOf(String className) {
+        String name = className.endsWith("Stmt")
+                ? className.substring(0, className.length() - 4) : className;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (i > 0 && Character.isUpperCase(c)) sb.append(' ');
+            sb.append(Character.toUpperCase(c));
+        }
+        return sb.toString();
+    }
 
     /**
      * Determine the DDL command tag for a statement (e.g. "CREATE TABLE", "ALTER TABLE").
