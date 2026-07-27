@@ -11,6 +11,71 @@ import java.util.*;
  */
 class StringFunctions {
 
+    /**
+     * PostgreSQL declares these routines with an {@code integer} count and has no {@code bigint}
+     * overload, so a wider count is a function that does not exist rather than a value to narrow.
+     * Narrowing it silently turned a count of four billion into an empty string.
+     *
+     * @param index which argument carries the count
+     * @return the count once it is known to fit, or null when the argument itself is null
+     */
+    private Integer countArgument(FunctionCallExpr fn, RowContext ctx, int index, String name) {
+        Object raw = executor.evalExpr(fn.args().get(index), ctx);
+        if (raw == null) return null; // strict: the whole call is null
+        long value;
+        try {
+            value = executor.toLong(raw);
+        } catch (NumberFormatException e) {
+            // A count that is not a number at all is bad input, not a missing overload.
+            throw new MemgresException(
+                    "invalid input syntax for type integer: \"" + raw + "\"", "22P02");
+        }
+        if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
+            throw new MemgresException("function " + name + "("
+                    + argumentTypeList(fn, ctx, index) + ") does not exist", "42883");
+        }
+        return (int) value;
+    }
+
+    /**
+     * Render the argument types the way PostgreSQL reports them when no overload matches. An
+     * unadorned literal is still {@code unknown} at that point, which is what it calls it.
+     */
+    private String argumentTypeList(FunctionCallExpr fn, RowContext ctx, int wideIndex) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < fn.args().size(); i++) {
+            if (i > 0) sb.append(", ");
+            if (i == wideIndex) {
+                sb.append("bigint");
+                continue;
+            }
+            Expression arg = fn.args().get(i);
+            if (arg instanceof Literal
+                    && ((Literal) arg).literalType() == Literal.LiteralType.STRING) {
+                sb.append("unknown");
+                continue;
+            }
+            Object val;
+            try {
+                val = executor.evalExpr(arg, ctx);
+            } catch (RuntimeException e) {
+                val = null;
+            }
+            sb.append(runtimeTypeName(val));
+        }
+        return sb.toString();
+    }
+
+    private static String runtimeTypeName(Object val) {
+        if (val instanceof Integer || val instanceof Short) return "integer";
+        if (val instanceof Long) return "bigint";
+        if (val instanceof java.math.BigDecimal) return "numeric";
+        if (val instanceof Double || val instanceof Float) return "double precision";
+        if (val instanceof Boolean) return "boolean";
+        if (val instanceof byte[]) return "bytea";
+        return "text";
+    }
+
     /** The four Unicode normalization forms the grammar accepts as bare keywords. */
     private static final java.util.Set<String> NORMALIZATION_FORMS = new java.util.HashSet<>(
             java.util.Arrays.asList("NFC", "NFD", "NFKC", "NFKD"));
@@ -347,10 +412,14 @@ class StringFunctions {
                         }
                     }
                 }
-                int start = executor.toInt(arg1); // PG 1-based position
+                Integer startBox = countArgument(fn, ctx, 1, name); // PG 1-based position
+                if (startBox == null) return null;
+                int start = startBox;
                 String strVal = str.toString();
                 if (fn.args().size() > 2) {
-                    int count = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                    Integer countBox = countArgument(fn, ctx, 2, name);
+                    if (countBox == null) return null;
+                    int count = countBox;
                     if (count < 0) {
                         throw new MemgresException("negative substring length not allowed", "22011");
                     }
@@ -410,7 +479,9 @@ class StringFunctions {
             case "lpad": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
-                int len = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                Integer lenBox = countArgument(fn, ctx, 1, "lpad");
+                if (lenBox == null) return null;
+                int len = lenBox;
                 if (len < 0) return "";
                 String fill = " ";
                 if (fn.args().size() > 2) {
@@ -430,7 +501,9 @@ class StringFunctions {
             case "rpad": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
-                int len = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                Integer lenBox = countArgument(fn, ctx, 1, "rpad");
+                if (lenBox == null) return null;
+                int len = lenBox;
                 if (len < 0) return "";
                 String fill = " ";
                 if (fn.args().size() > 2) {
@@ -470,7 +543,9 @@ class StringFunctions {
             case "left": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
-                int n = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                Integer nBox = countArgument(fn, ctx, 1, "left");
+                if (nBox == null) return null;
+                int n = nBox;
                 String s = str.toString();
                 if (n >= 0) return s.substring(0, Math.min(n, s.length()));
                 return n + s.length() > 0 ? s.substring(0, s.length() + n) : "";
@@ -478,7 +553,9 @@ class StringFunctions {
             case "right": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
-                int n = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                Integer nBox = countArgument(fn, ctx, 1, "right");
+                if (nBox == null) return null;
+                int n = nBox;
                 String s = str.toString();
                 if (n >= 0) return s.substring(Math.max(0, s.length() - n));
                 return -n < s.length() ? s.substring(-n) : "";
@@ -486,9 +563,9 @@ class StringFunctions {
             case "repeat": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
-                Object countArg = executor.evalExpr(fn.args().get(1), ctx);
-                if (countArg == null) return null;
-                int n = executor.toInt(countArg);
+                Integer nBox = countArgument(fn, ctx, 1, "repeat");
+                if (nBox == null) return null;
+                int n = nBox;
                 return Strs.repeat(str.toString(), Math.max(0, n));
             }
             case "reverse": {
@@ -502,7 +579,9 @@ class StringFunctions {
                 // PG is strict here: a NULL in any argument makes the whole call NULL, and that
                 // is decided before the field position is range-checked.
                 if (str == null || delim == null || fieldVal == null) return null;
-                int field = executor.toInt(fieldVal);
+                Integer fieldBox = countArgument(fn, ctx, 2, "split_part");
+                if (fieldBox == null) return null;
+                int field = fieldBox;
                 if (field == 0) throw new MemgresException("field position must not be zero", "22023");
                 String ds = delim.toString();
                 // PG: empty delimiter → return whole string for any field position
