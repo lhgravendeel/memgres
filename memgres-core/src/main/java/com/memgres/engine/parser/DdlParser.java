@@ -1,6 +1,7 @@
 package com.memgres.engine.parser;
 
 import com.memgres.engine.MemgresException;
+import com.memgres.engine.PgErrors;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -902,6 +903,13 @@ class DdlParser {
     CreateTypeStmt parseCreateType() {
         String name = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        // CREATE TYPE name; with no definition is a shell type — the documented first step of
+        // defining a base type, and the name a base type's I/O functions refer to.
+        if (!parser.checkKeyword("AS")) {
+            CreateTypeStmt shell = new CreateTypeStmt(name, null, null);
+            shell.setShell(true);
+            return shell;
+        }
         parser.expectKeyword("AS");
         if (parser.matchKeyword("ENUM")) {
             parser.expect(TokenType.LEFT_PAREN);
@@ -925,6 +933,9 @@ class DdlParser {
                 }
             }
             parser.expect(TokenType.RIGHT_PAREN);
+            if (rangeSubtype == null) {
+                throw PgErrors.syntax("type attribute \"subtype\" is required");
+            }
             return new CreateTypeStmt(name, null, null, rangeSubtype);
         }
         parser.expect(TokenType.LEFT_PAREN);
@@ -1148,20 +1159,46 @@ class DdlParser {
         String baseType = parser.parseTypeName();
         Expression defaultExpr = null;
         boolean notNull = false;
+        boolean sawNotNull = false, sawNull = false, sawDefault = false;
         Expression checkExpr = null;
         String constraintName = null;
+        String collation = null;
+        if (parser.matchKeyword("COLLATE")) {
+            collation = parser.readIdentifierOrString();
+            ExpressionParser.validateCollationStatic(collation, parser.peek());
+        }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            if (parser.matchKeyword("DEFAULT")) { defaultExpr = parser.parseExpression(); }
-            else if (parser.matchKeywords("NOT", "NULL")) { notNull = true; }
-            else if (parser.matchKeyword("NULL")) { notNull = false; }
+            if (parser.matchKeyword("DEFAULT")) {
+                if (sawDefault) throw PgErrors.syntax("multiple default expressions");
+                sawDefault = true;
+                defaultExpr = parser.parseExpression();
+            }
+            else if (parser.matchKeywords("NOT", "NULL")) { notNull = true; sawNotNull = true; }
+            else if (parser.matchKeyword("NULL")) { notNull = false; sawNull = true; }
             else if (parser.matchKeyword("CHECK")) {
                 parser.expect(TokenType.LEFT_PAREN);
                 checkExpr = parser.parseExpression();
                 parser.expect(TokenType.RIGHT_PAREN);
             } else if (parser.matchKeyword("CONSTRAINT")) { constraintName = parser.readIdentifier(); }
+            // A domain has no rows, so the table-level constraint forms are meaningless on one.
+            else if (parser.checkKeyword("UNIQUE")) {
+                throw PgErrors.syntax("unique constraints not possible for domains");
+            }
+            else if (parser.checkKeyword("PRIMARY") && parser.checkKeywordAt(1, "KEY")) {
+                throw PgErrors.syntax("primary key constraints not possible for domains");
+            }
+            else if (parser.checkKeyword("REFERENCES")) {
+                throw PgErrors.syntax("foreign key constraints not possible for domains");
+            }
             else { break; }
+            if (sawNotNull && sawNull) {
+                throw PgErrors.syntax("conflicting NULL/NOT NULL constraints");
+            }
         }
-        return new CreateDomainStmt(name, baseType, defaultExpr, notNull, checkExpr, constraintName);
+        CreateDomainStmt domainStmt =
+                new CreateDomainStmt(name, baseType, defaultExpr, notNull, checkExpr, constraintName);
+        domainStmt.setCollation(collation);
+        return domainStmt;
     }
 
     // ---- SEQUENCE ----
@@ -1216,24 +1253,31 @@ class DdlParser {
         Boolean[] cycle = {null};
         Integer[] cache = {null};
         String[] asType = {null};
-        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, null, null);
+        String[] ownedByTable = {null}, ownedByColumn = {null};
+        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, ownedByTable, ownedByColumn);
         CreateSequenceStmt stmt = new CreateSequenceStmt(name, ifNotExists, startWith[0], incrementBy[0], minValue[0], maxValue[0], cycle[0], temporary);
         stmt.setCache(cache[0]);
         stmt.setAsType(asType[0]);
+        stmt.setOwnedBy(ownedByTable[0], ownedByColumn[0]);
         return stmt;
     }
 
     AlterSequenceStmt parseAlterSequence() {
+        boolean ifExists = parser.matchKeywords("IF", "EXISTS");
         String name = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
         if (parser.matchKeywords("RENAME", "TO")) {
-            return AlterSequenceStmt.renameTo(name, parser.readIdentifier());
+            AlterSequenceStmt renamed = AlterSequenceStmt.renameTo(name, parser.readIdentifier());
+            renamed.setIfExists(ifExists);
+            return renamed;
         }
         boolean restart = false;
         Long restartWith = null;
         Long[] startWith = {null}, incrementBy = {null}, minValue = {null}, maxValue = {null};
         Boolean[] cycle = {null};
         String[] ownedByTable = {null}, ownedByColumn = {null};
+        String[] asType = {null};
+        Integer[] cache = {null};
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeyword("RESTART")) {
                 restart = true;
@@ -1242,14 +1286,20 @@ class DdlParser {
                 continue;
             }
             if (parser.matchKeywords("OWNER", "TO")) {
-                return new AlterSequenceStmt(name, parser.readIdentifier());
+                AlterSequenceStmt owned = new AlterSequenceStmt(name, parser.readIdentifier());
+                owned.setIfExists(ifExists);
+                return owned;
             }
             int saved = parser.pos;
-            Integer[] cache = {null};
-            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, null, ownedByTable, ownedByColumn);
+            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, ownedByTable, ownedByColumn);
             if (parser.pos == saved) break;
         }
-        return new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0], maxValue[0], startWith[0], cycle[0], null, null, ownedByTable[0], ownedByColumn[0]);
+        AlterSequenceStmt stmt = new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0],
+                maxValue[0], startWith[0], cycle[0], null, null, ownedByTable[0], ownedByColumn[0]);
+        stmt.setIfExists(ifExists);
+        stmt.setCache(cache[0]);
+        stmt.setAsType(asType[0]);
+        return stmt;
     }
 
     // ---- TRUNCATE ----

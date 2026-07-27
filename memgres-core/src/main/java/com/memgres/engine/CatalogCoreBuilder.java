@@ -1352,6 +1352,18 @@ class CatalogCoreBuilder {
             });
         }
 
+        // Shell types: a name reserved but not yet defined, so typisdefined is false
+        for (String shellName : database.getShellTypes()) {
+            table.insertRow(new Object[]{
+                    oids.oid("type:" + shellName), shellName, oids.oid("ns:public"), 10,
+                    (short) 4, false, "p", "P", false, false, ",",
+                    0, null, 0, 0,
+                    "shell_in", "shell_out", "-", "-",
+                    "-", "-", "-", "i", "p",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+        }
+
         // Every table is also a row type, and PG registers that composite type alongside it.
         // DatabaseMetaData.getUDTs reads exactly these rows, so without them a tool asking what
         // user-defined types the database has is told there are none.

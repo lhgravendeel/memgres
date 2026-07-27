@@ -25,25 +25,62 @@ class DdlObjectExecutor {
 
     QueryResult executeCreateType(CreateTypeStmt stmt) {
         ddl.checkPgCatalogWriteProtection();
+        String name = stmt.name();
+        boolean wasShell = executor.database.isShellType(name);
+        if (typeNameTaken(name)) {
+            throw PgErrors.duplicateObject("type", name);
+        }
+        if (stmt.shell()) {
+            if (wasShell) throw PgErrors.duplicateObject("type", name);
+            executor.database.addShellType(name);
+            executor.database.registerSchemaObject(executor.defaultSchema(), "shell", name);
+            return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
+        }
         if (stmt.enumLabels() != null) {
-            if (executor.database.getCustomEnum(stmt.name()) != null) {
-                throw new MemgresException("type \"" + stmt.name() + "\" already exists", "42710");
+            Set<String> seen = new HashSet<>();
+            for (String label : stmt.enumLabels()) {
+                if (!seen.add(label)) {
+                    // PostgreSQL surfaces this as the pg_enum index it violates, not as a DDL error
+                    throw new MemgresException("duplicate key value violates unique constraint "
+                            + "\"pg_enum_typid_label_index\"", "23505");
+                }
             }
-            executor.database.addCustomEnum(new CustomEnum(stmt.name(), stmt.enumLabels()));
-            executor.database.registerSchemaObject(executor.defaultSchema(), "enum", stmt.name());
-        }
-        if (stmt.rangeSubtype() != null) {
-            executor.database.addRangeType(stmt.name(), stmt.rangeSubtype());
-            executor.database.registerSchemaObject(executor.defaultSchema(), "range", stmt.name());
-        }
-        if (stmt.compositeFields() != null) {
-            if (executor.database.isCompositeType(stmt.name())) {
-                throw new MemgresException("type \"" + stmt.name() + "\" already exists", "42710");
+            executor.database.addCustomEnum(new CustomEnum(name, stmt.enumLabels()));
+            executor.database.registerSchemaObject(executor.defaultSchema(), "enum", name);
+        } else if (stmt.rangeSubtype() != null) {
+            ddl.resolveColumnType(stmt.rangeSubtype(), null);
+            executor.database.addRangeType(name, stmt.rangeSubtype());
+            executor.database.registerSchemaObject(executor.defaultSchema(), "range", name);
+        } else if (stmt.compositeFields() != null) {
+            // Attribute names are checked before their types, as PostgreSQL does: a duplicate name
+            // is reported even when the second attribute also names a type that does not exist.
+            // Compared as written: the parser has already folded unquoted names to lower case, so
+            // ("A" int, a text) is two attributes while (a int, A text) is one name twice.
+            Set<String> seen = new HashSet<>();
+            for (CreateTypeStmt.CompositeField f : stmt.compositeFields()) {
+                if (!seen.add(f.name())) {
+                    throw PgErrors.duplicateColumn(f.name());
+                }
             }
-            executor.database.addCompositeType(stmt.name(), stmt.compositeFields());
-            executor.database.registerSchemaObject(executor.defaultSchema(), "composite", stmt.name());
+            for (CreateTypeStmt.CompositeField f : stmt.compositeFields()) {
+                ddl.resolveColumnType(f.typeName(), null);
+            }
+            executor.database.addCompositeType(name, stmt.compositeFields());
+            executor.database.registerSchemaObject(executor.defaultSchema(), "composite", name);
         }
+        if (wasShell) executor.database.removeShellType(name);
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
+    }
+
+    /**
+     * True when the name already denotes a type of any kind. A shell does not count: filling in a
+     * shell is exactly what the second half of a base-type definition does.
+     */
+    private boolean typeNameTaken(String name) {
+        return executor.database.getCustomEnum(name) != null
+                || executor.database.isCompositeType(name)
+                || executor.database.getRangeTypes().containsKey(name.toLowerCase())
+                || executor.database.getDomain(name) != null;
     }
 
     // ---- ALTER TYPE ----
@@ -115,12 +152,21 @@ class DdlObjectExecutor {
 
         switch (stmt.action()) {
             case ADD_ATTRIBUTE: {
+                if (hasAttribute(fields, stmt.value())) {
+                    throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
+                            + stmt.typeName() + "\" already exists", "42701");
+                }
+                ddl.resolveColumnType(stmt.newValue(), null);
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>(fields);
                 newFields.add(new CreateTypeStmt.CompositeField(stmt.value(), stmt.newValue()));
                 executor.database.addCompositeType(stmt.typeName(), newFields);
                 break;
             }
             case DROP_ATTRIBUTE: {
+                if (!hasAttribute(fields, stmt.value())) {
+                    throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
+                            + stmt.typeName() + "\" does not exist", "42703");
+                }
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
                 for (CreateTypeStmt.CompositeField f : fields) {
                     if (!f.name().equalsIgnoreCase(stmt.value())) {
@@ -131,6 +177,10 @@ class DdlObjectExecutor {
                 break;
             }
             case ALTER_ATTRIBUTE_TYPE: {
+                if (!hasAttribute(fields, stmt.value())) {
+                    throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
+                            + stmt.typeName() + "\" does not exist", "42703");
+                }
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
                 for (CreateTypeStmt.CompositeField f : fields) {
                     if (f.name().equalsIgnoreCase(stmt.value())) {
@@ -143,6 +193,13 @@ class DdlObjectExecutor {
                 break;
             }
             case RENAME_ATTRIBUTE: {
+                if (!hasAttribute(fields, stmt.value())) {
+                    throw new MemgresException("column \"" + stmt.value() + "\" does not exist", "42703");
+                }
+                if (hasAttribute(fields, stmt.newValue())) {
+                    throw new MemgresException("column \"" + stmt.newValue() + "\" of relation \""
+                            + stmt.typeName() + "\" already exists", "42701");
+                }
                 List<CreateTypeStmt.CompositeField> newFields = new ArrayList<>();
                 for (CreateTypeStmt.CompositeField f : fields) {
                     if (f.name().equalsIgnoreCase(stmt.value())) {
@@ -169,6 +226,14 @@ class DdlObjectExecutor {
                 break;
         }
         return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
+    }
+
+    private static boolean hasAttribute(List<CreateTypeStmt.CompositeField> fields, String name) {
+        if (name == null) return false;
+        for (CreateTypeStmt.CompositeField f : fields) {
+            if (f.name().equalsIgnoreCase(name)) return true;
+        }
+        return false;
     }
 
     // ---- CREATE FUNCTION ----
@@ -1685,12 +1750,45 @@ class DdlObjectExecutor {
         CustomEnum existing = executor.database.getCustomEnum(stmt.name());
         boolean isComposite = executor.database.isCompositeType(stmt.name());
         boolean isRange = executor.database.getRangeTypes().containsKey(stmt.name().toLowerCase());
-        if (existing == null && !isComposite && !isRange && !stmt.ifExists()) {
-            throw new MemgresException("type \"" + stmt.name() + "\" does not exist", "42704");
+        boolean isShell = executor.database.isShellType(stmt.name());
+        if (existing == null && !isComposite && !isRange && !isShell) {
+            if (!stmt.ifExists()) {
+                throw new MemgresException("type \"" + stmt.name() + "\" does not exist", "42704");
+            }
+            return;
+        }
+        if (!stmt.cascade()) {
+            // Dropping a type a column is declared as would leave that column pointing at nothing
+            List<String> dependents = columnsDeclaredAsType(stmt.name());
+            if (!dependents.isEmpty()) {
+                StringBuilder detail = new StringBuilder();
+                for (String d : dependents) {
+                    detail.append("\n  Detail: column ").append(d).append(" depends on type ").append(stmt.name());
+                }
+                throw new MemgresException("cannot drop type " + stmt.name()
+                        + " because other objects depend on it" + detail, "2BP01");
+            }
         }
         if (existing != null) executor.database.removeCustomEnum(stmt.name());
         if (isComposite) executor.database.removeCompositeType(stmt.name());
         if (isRange) executor.database.getRangeTypes().remove(stmt.name().toLowerCase());
+        if (isShell) executor.database.removeShellType(stmt.name());
+    }
+
+    /** Every table column whose declared type is {@code typeName}, as "table.column". */
+    private List<String> columnsDeclaredAsType(String typeName) {
+        List<String> found = new ArrayList<>();
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table t : schema.getTables().values()) {
+                for (Column c : t.getColumns()) {
+                    if (typeName.equalsIgnoreCase(c.getEnumTypeName())
+                            || typeName.equalsIgnoreCase(c.getCompositeTypeName())) {
+                        found.add(t.getName() + "." + c.getName());
+                    }
+                }
+            }
+        }
+        return found;
     }
 
     private void dropSchema(DropStmt stmt) {
@@ -1816,19 +1914,12 @@ class DdlObjectExecutor {
             if (stmt.ifNotExists()) return QueryResult.message(QueryResult.Type.SET, "CREATE SEQUENCE");
             throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
         }
-        long incr = stmt.incrementBy() != null ? stmt.incrementBy() : 1L;
-        if (incr == 0) {
-            throw new MemgresException("INCREMENT must not be zero", "22023");
-        }
-        long minVal = stmt.minValue() != null ? stmt.minValue() : (incr > 0 ? 1L : Long.MIN_VALUE);
-        long maxVal = stmt.maxValue() != null ? stmt.maxValue() : (incr > 0 ? Long.MAX_VALUE : -1L);
-        if (minVal > maxVal) {
-            throw new MemgresException("MINVALUE (" + minVal + ") must be less than MAXVALUE (" + maxVal + ")", "22023");
-        }
-        Sequence seq = new Sequence(seqName, stmt.startWith(), incr, minVal, maxVal);
+        DdlSequenceValidator.Params p = DdlSequenceValidator.forCreate(stmt.getAsType(),
+                stmt.incrementBy(), stmt.minValue(), stmt.maxValue(), stmt.startWith(), stmt.getCache());
+        Sequence seq = new Sequence(seqName, p.startWith, p.incrementBy, p.minValue, p.maxValue);
+        DdlSequenceValidator.apply(seq, p);
         if (stmt.cycle() != null) seq.setCycle(stmt.cycle());
-        if (stmt.getAsType() != null) seq.setDataType(stmt.getAsType().toLowerCase());
-        if (stmt.getCache() != null) seq.setCache(stmt.getCache());
+        if (stmt.ownedByTable() != null) applySequenceOwnedBy(seq, stmt.ownedByTable(), stmt.ownedByColumn());
         executor.database.addSequence(seq);
         executor.database.registerSchemaObject(executor.defaultSchema(), "sequence", seqName);
         executor.recordUndo(new Session.CreateSequenceUndo(seqName));
@@ -1840,7 +1931,10 @@ class DdlObjectExecutor {
 
     QueryResult executeAlterSequence(AlterSequenceStmt stmt) {
         Sequence seq = executor.database.getSequence(stmt.name());
-        if (seq == null) throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
+        if (seq == null) {
+            if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
+            throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
+        }
         if (stmt.renameTo() != null) {
             if (executor.database.hasSequence(stmt.renameTo())) {
                 throw new MemgresException("relation \"" + stmt.renameTo() + "\" already exists", "42P07");
@@ -1850,15 +1944,11 @@ class DdlObjectExecutor {
             executor.database.addSequence(seq);
             return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
         }
-        if (stmt.incrementBy() != null) seq.setIncrementBy(stmt.incrementBy());
-        if (stmt.minValue() != null) seq.setMinValue(stmt.minValue());
-        if (stmt.maxValue() != null) seq.setMaxValue(stmt.maxValue());
-        if (stmt.startWith() != null) seq.setStartWith(stmt.startWith());
+        DdlSequenceValidator.Params p = DdlSequenceValidator.forAlter(seq, stmt.getAsType(),
+                stmt.incrementBy(), stmt.minValue(), stmt.maxValue(), stmt.startWith(),
+                stmt.restart(), stmt.restartWith(), stmt.getCache());
+        DdlSequenceValidator.apply(seq, p);
         if (stmt.cycle() != null) seq.setCycle(stmt.cycle());
-        if (stmt.restart()) {
-            if (stmt.restartWith() != null) seq.restart(stmt.restartWith());
-            else seq.restart();
-        }
         if (stmt.ownerTo() != null) {
             String newOwner = ddl.resolveOwnerName(stmt.ownerTo());
             if (!executor.database.hasRole(newOwner)) {
@@ -1868,26 +1958,30 @@ class DdlObjectExecutor {
         }
         // M20: OWNED BY table.column
         if (stmt.ownedByTable() != null) {
-            if ("NONE".equalsIgnoreCase(stmt.ownedByTable())) {
-                seq.setOwnedByTable(null);
-                seq.setOwnedByColumn(null);
-            } else {
-                String tblName = stmt.ownedByTable();
-                Table tbl = null;
-                for (Schema s : executor.database.getSchemas().values()) {
-                    tbl = s.getTable(tblName);
-                    if (tbl != null) break;
-                }
-                if (tbl == null) throw new MemgresException("relation \"" + tblName + "\" does not exist", "42P01");
-                String colName = stmt.ownedByColumn();
-                if (colName != null && tbl.getColumnIndex(colName) < 0) {
-                    throw new MemgresException("column \"" + colName + "\" of relation \"" + tblName + "\" does not exist", "42703");
-                }
-                seq.setOwnedByTable(tblName);
-                seq.setOwnedByColumn(colName);
-            }
+            applySequenceOwnedBy(seq, stmt.ownedByTable(), stmt.ownedByColumn());
         }
         return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
+    }
+
+    /** Attach a sequence to a table column, or detach it for OWNED BY NONE. */
+    private void applySequenceOwnedBy(Sequence seq, String tblName, String colName) {
+        if ("NONE".equalsIgnoreCase(tblName)) {
+            seq.setOwnedByTable(null);
+            seq.setOwnedByColumn(null);
+            return;
+        }
+        Table tbl = null;
+        for (Schema s : executor.database.getSchemas().values()) {
+            tbl = s.getTable(tblName);
+            if (tbl != null) break;
+        }
+        if (tbl == null) throw new MemgresException("relation \"" + tblName + "\" does not exist", "42P01");
+        if (colName != null && tbl.getColumnIndex(colName) < 0) {
+            throw new MemgresException(
+                    "column \"" + colName + "\" of relation \"" + tblName + "\" does not exist", "42703");
+        }
+        seq.setOwnedByTable(tblName);
+        seq.setOwnedByColumn(colName);
     }
 
     // ---- CREATE DOMAIN ----
@@ -1901,8 +1995,13 @@ class DdlObjectExecutor {
         if (baseType == null) {
             DomainType parent = executor.database.getDomain(baseTypeName);
             if (parent != null) baseType = parent.getBaseType();
-            else throw new MemgresException("type \"" + baseTypeName + "\" does not exist");
+            else throw PgErrors.undefinedObject("type", baseTypeName);
         }
+        if (stmt.collation() != null && !isCollatable(baseType)) {
+            throw PgErrors.datatypeMismatch(
+                    "collations are not supported by type " + CatalogHelper.pgTypeName(baseType));
+        }
+        checkDomainConstraintExpr(stmt.checkExpr());
 
         String checkExprStr = stmt.checkExpr() != null ? stmt.checkExpr().toString() : null;
         // If constraint has explicit name, store as named constraint; otherwise store as inline
@@ -1924,6 +2023,27 @@ class DdlObjectExecutor {
         }
         executor.database.registerSchemaObject(executor.defaultSchema(), "domain", stmt.name());
         return QueryResult.message(QueryResult.Type.SET, "CREATE DOMAIN");
+    }
+
+    /**
+     * A domain constraint has one thing in scope, the pseudo-column VALUE. Any other name is a
+     * column reference that cannot resolve, and PostgreSQL rejects it rather than letting the
+     * domain be created with a constraint that can never be evaluated.
+     */
+    /** Only the string types carry a collation. */
+    private static boolean isCollatable(DataType type) {
+        return type == DataType.TEXT || type == DataType.VARCHAR
+                || type == DataType.CHAR || type == DataType.NAME;
+    }
+
+    private void checkDomainConstraintExpr(Expression checkExpr) {
+        if (checkExpr == null) return;
+        Object bad = AstWalk.findFirst(checkExpr, n -> n instanceof ColumnRef
+                && !"value".equalsIgnoreCase(((ColumnRef) n).column()));
+        if (bad != null) {
+            throw new MemgresException(
+                    "column \"" + ((ColumnRef) bad).column() + "\" does not exist", "42703");
+        }
     }
 
     // ---- ALTER DOMAIN ----
@@ -2021,10 +2141,131 @@ class DdlObjectExecutor {
 
     // ---- CREATE INDEX ----
 
+    /**
+     * The relation an index is being built on, or null when it cannot be resolved here (a schema
+     * this executor cannot reach, or a materialized view, which is a valid target held elsewhere).
+     * Relations that can never carry an index are rejected before the access method is looked at.
+     */
+    private Table resolveIndexTarget(CreateIndexStmt s) {
+        if (s.table() == null) return null;
+        Database.ViewDef view = executor.database.getView(s.table());
+        if (view != null && !view.materialized()) {
+            throw PgErrors.wrongObjectType("cannot create index on relation \"" + s.table() + "\"");
+        }
+        if (executor.database.hasIndex(s.table())) {
+            throw PgErrors.wrongObjectType("cannot open relation \"" + s.table() + "\"");
+        }
+        if (executor.database.hasSequence(s.table())) {
+            throw PgErrors.wrongObjectType("cannot open relation \"" + s.table() + "\"");
+        }
+        try {
+            return executor.resolveTable(s.schema() != null ? s.schema() : executor.defaultSchema(), s.table());
+        } catch (MemgresException e) {
+            if ("42P01".equals(e.getSqlState()) && view == null) throw e;
+            return null;
+        }
+    }
+
+    /**
+     * Parse-analysis rules for an index definition: an index key is evaluated one row at a time,
+     * so it can be neither an aggregate nor a query, and the same goes for a partial index's
+     * predicate. An accepted non-immutable predicate is worse than a rejection — the index then
+     * omits rows whose predicate changed since they were written, and a query answered from it
+     * silently returns fewer rows than the same query answered from the heap.
+     */
+    private void checkIndexExpressionsAndPredicate(CreateIndexStmt s) {
+        if (s.columns() != null) {
+            for (String col : s.columns()) {
+                if (!col.contains("(")) continue;
+                Expression expr;
+                try {
+                    expr = com.memgres.engine.parser.Parser.parseExpression(col);
+                } catch (Exception ignored) {
+                    continue;
+                }
+                if (executor.selectExecutor.containsAggregate(expr)) {
+                    throw new MemgresException(
+                            "aggregate functions are not allowed in index expressions", "42803");
+                }
+            }
+        }
+        if (s.whereClause() != null) {
+            Expression pred;
+            try {
+                pred = com.memgres.engine.parser.Parser.parseExpression(s.whereClause());
+            } catch (Exception ignored) {
+                return;
+            }
+            if (AstWalk.anyMatch(pred, n -> n instanceof SubqueryExpr || n instanceof ExistsExpr
+                    || n instanceof AnyAllExpr || n instanceof ArraySubqueryExpr)) {
+                throw PgErrors.notImplemented("cannot use subquery in index predicate");
+            }
+            if (executor.selectExecutor.containsAggregate(pred)) {
+                throw new MemgresException(
+                        "aggregate functions are not allowed in index predicates", "42803");
+            }
+        }
+    }
+
+    /**
+     * Evaluate a partial index's predicate once against a row of placeholder values, so that an
+     * operator or function that does not exist for the column types is reported now.
+     */
+    private void checkPredicateTypes(Table table, String whereClause) {
+        if (table == null) return;
+        try {
+            Expression pred = com.memgres.engine.parser.Parser.parseExpression(whereClause);
+            Object[] dummyRow = new Object[table.getColumns().size()];
+            for (int i = 0; i < dummyRow.length; i++) {
+                dummyRow[i] = placeholderValue(table.getColumns().get(i).getType());
+            }
+            executor.evalExpr(pred, new RowContext(table, table.getName(), dummyRow));
+        } catch (MemgresException e) {
+            if ("42883".equals(e.getSqlState()) || "42804".equals(e.getSqlState())
+                    || "42P18".equals(e.getSqlState())) throw e;
+        } catch (Exception ignored) {
+            // Anything else here is not a definition error; the predicate is stored as written
+        }
+    }
+
+    /** A non-null value of the right shape for evaluating an expression at definition time. */
+    private static Object placeholderValue(DataType type) {
+        switch (type) {
+            case INTEGER:
+            case BIGINT:
+            case SMALLINT:
+                return 0L;
+            case NUMERIC:
+            case DOUBLE_PRECISION:
+            case REAL:
+                return 0.0;
+            case BOOLEAN:
+                return false;
+            case JSON:
+            case JSONB:
+                return "{}";
+            default:
+                return "dummy";
+        }
+    }
+
     QueryResult executeCreateIndex(CreateIndexStmt s) {
-        if (s.name() != null && executor.database.hasIndex(s.name())) {
-            if (s.ifNotExists()) return QueryResult.message(QueryResult.Type.SET, "CREATE INDEX");
-            throw new MemgresException("relation \"" + s.name() + "\" already exists", "42P07");
+        boolean nameTaken = s.name() != null && executor.database.hasIndex(s.name());
+        if (nameTaken && s.ifNotExists()) return QueryResult.message(QueryResult.Type.SET, "CREATE INDEX");
+        // PostgreSQL analyses the statement before it opens anything, so an aggregate or a
+        // subquery is reported even when the access method or the index name is also wrong.
+        checkIndexExpressionsAndPredicate(s);
+        Table indexTarget = resolveIndexTarget(s);
+        if (indexTarget != null) {
+            DdlIndexValidator.validate(indexTarget, s.method(), s.unique(), s.columns(),
+                    s.columnOptions(), s.includeColumns());
+        }
+        if (s.whereClause() != null) {
+            // Type resolution happens while the statement is analysed, so a predicate that does
+            // not type-check is reported as that rather than as a mutable-function predicate.
+            checkPredicateTypes(indexTarget, s.whereClause());
+            DdlExecutor.checkBuiltinVolatileInExpression(s.whereClause(), executor.database,
+                    "functions in index predicate must be marked IMMUTABLE");
         }
         // Validate index columns exist on the target table
         if (s.table() != null && s.columns() != null) {
@@ -2153,6 +2394,7 @@ class DdlObjectExecutor {
                         // Other errors ignored
                     } catch (Exception ignored) {}
                 }
+                DdlIndexValidator.validateIncludeColumns(idxTable, s.includeColumns());
             } catch (MemgresException e) {
                 if ("42703".equals(e.getSqlState()) || "42883".equals(e.getSqlState())
                         || "0A000".equals(e.getSqlState()) || "42804".equals(e.getSqlState())
@@ -2264,6 +2506,11 @@ class DdlObjectExecutor {
                 if ("23505".equals(e.getSqlState())) throw e;
                 // Other errors (table not found, etc.); skip validation
             }
+        }
+        // The name clash is reported last: PostgreSQL only picks the index name once the
+        // definition itself is known to be sound.
+        if (nameTaken) {
+            throw new MemgresException("relation \"" + s.name() + "\" already exists", "42P07");
         }
         if (s.name() != null && s.columns() != null) {
             executor.database.addIndex(s.name(), s.columns());
