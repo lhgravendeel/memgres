@@ -1019,7 +1019,8 @@ class DmlExecutor {
         checkReadOnly("UPDATE");
         // A rule rewrites the statement before anything else looks at the table, so an
         // INSTEAD NOTHING rule means no update happens and none of the checks below apply.
-        QueryResult ruled = applyInsteadRule(stmt.table(), "UPDATE", QueryResult.Type.UPDATE);
+        QueryResult ruled = applyInsteadRule(stmt.table(), "UPDATE", QueryResult.Type.UPDATE,
+                stmt.where(), stmt.setClauses());
         if (ruled != null) return ruled;
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're updating through
@@ -1584,7 +1585,8 @@ class DmlExecutor {
     private QueryResult executeDeleteInner(DeleteStmt stmt) {
         // Check read-only transaction
         checkReadOnly("DELETE");
-        QueryResult ruledDelete = applyInsteadRule(stmt.table(), "DELETE", QueryResult.Type.DELETE);
+        QueryResult ruledDelete = applyInsteadRule(stmt.table(), "DELETE", QueryResult.Type.DELETE,
+                stmt.where(), null);
         if (ruledDelete != null) return ruledDelete;
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
@@ -2492,17 +2494,70 @@ class DmlExecutor {
      * touched no rows; INSTEAD &lt;command&gt; runs that command in its place. Returns null when no
      * such rule applies and the statement should run normally.
      */
-    private QueryResult applyInsteadRule(String tableName, String event, QueryResult.Type type) {
+    private QueryResult applyInsteadRule(String tableName, String event, QueryResult.Type type,
+                                         Expression where, List<InsertStmt.SetClause> setClauses) {
         String ruleVal = executor.database.getRule(tableName, event);
         if (ruleVal == null) return null;
         if ("INSTEAD_NOTHING".equals(ruleVal)) {
             return QueryResult.command(type, 0);
         }
-        if (ruleVal.startsWith("INSTEAD:")) {
-            executor.execute(ruleVal.substring("INSTEAD:".length()));
-            return QueryResult.command(type, 0);
+        if (!ruleVal.startsWith("INSTEAD:")) return null;
+
+        // The rule's command speaks of OLD and NEW, which only mean something against a row the
+        // statement would have touched. PG rewrites the query to say the same thing; here the
+        // rows are read back through the relation and the command runs once per row.
+        String ruleSql = ruleVal.substring("INSTEAD:".length());
+        QueryResult affected = selectAffectedRows(tableName, where);
+        List<Column> cols = affected.getColumns();
+        Table rowShape = new Table(tableName, cols);
+        int count = 0;
+        for (Object[] row : affected.getRows()) {
+            String sql = ruleSql;
+            RowContext rowCtx = new RowContext(rowShape, null, row);
+            for (int i = 0; i < cols.size(); i++) {
+                String colName = cols.get(i).getName();
+                Object oldVal = row[i];
+                Object newVal = oldVal;
+                if (setClauses != null) {
+                    for (InsertStmt.SetClause set : setClauses) {
+                        if (set.column().equalsIgnoreCase(colName)) {
+                            newVal = executor.evalExpr(set.value(), rowCtx);
+                            break;
+                        }
+                    }
+                }
+                sql = substituteRowAlias(sql, "NEW", colName, newVal);
+                sql = substituteRowAlias(sql, "OLD", colName, oldVal);
+            }
+            executor.execute(sql, Cols.listOf());
+            count++;
         }
-        return null;
+        return QueryResult.command(type, count);
+    }
+
+    /** The rows the statement would have acted on, read through the relation it names. */
+    private QueryResult selectAffectedRows(String tableName, Expression where) {
+        List<SelectStmt.SelectTarget> targets = Cols.listOf(
+                new SelectStmt.SelectTarget(new WildcardExpr(), null));
+        List<SelectStmt.FromItem> from = Cols.listOf(
+                new SelectStmt.TableRef(null, tableName, null));
+        SelectStmt sel = new SelectStmt(false, null, targets, from, where,
+                null, null, null, null, null, null, null, null, null, false);
+        return executor.executeStatement(sel);
+    }
+
+    /** Replace one {@code OLD.col} or {@code NEW.col} reference with the value it stands for. */
+    private String substituteRowAlias(String sql, String alias, String column, Object value) {
+        String replacement = java.util.regex.Matcher.quoteReplacement(sqlLiteral(value));
+        return sql.replaceAll("(?i)\\b" + alias + "\\s*\\.\\s*" + java.util.regex.Pattern.quote(column)
+                + "\\b", replacement);
+    }
+
+    private String sqlLiteral(Object value) {
+        if (value == null) return "NULL";
+        if (value instanceof Number) return value.toString();
+        if (value instanceof Boolean) return ((Boolean) value) ? "TRUE" : "FALSE";
+        return "'" + value.toString().replace("'", "''") + "'";
     }
 
     private void checkReadOnly(String command) {

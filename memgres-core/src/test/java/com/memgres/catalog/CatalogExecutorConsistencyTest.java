@@ -102,6 +102,65 @@ class CatalogExecutorConsistencyTest {
         exec("DROP TABLE cec_r3");
     }
 
+    /**
+     * A DO INSTEAD rule that rewrites the statement speaks of OLD and NEW, which only mean
+     * something against a row the statement would have touched.
+     */
+    @Test
+    void anInsteadRuleResolvesOldAndNew() throws Exception {
+        exec("DROP VIEW IF EXISTS cec_rv CASCADE");
+        exec("DROP TABLE IF EXISTS cec_rt CASCADE");
+        exec("CREATE TABLE cec_rt (id int PRIMARY KEY, a int, b text)");
+        exec("INSERT INTO cec_rt VALUES (1, 11, 'ABC'), (2, 22, 'DEF')");
+        exec("CREATE VIEW cec_rv AS SELECT id, a, b FROM cec_rt");
+        exec("CREATE RULE cec_rv_upd AS ON UPDATE TO cec_rv DO INSTEAD"
+                + " UPDATE cec_rt SET a = NEW.a, b = NEW.b WHERE id = OLD.id");
+        exec("UPDATE cec_rv SET a = 99, b = 'rule_upd' WHERE id = 1");
+        assertEquals("99", one("SELECT a FROM cec_rt WHERE id = 1"));
+        assertEquals("rule_upd", one("SELECT b FROM cec_rt WHERE id = 1"));
+        // The row the statement did not name is untouched.
+        assertEquals("22", one("SELECT a FROM cec_rt WHERE id = 2"));
+        exec("DROP RULE cec_rv_upd ON cec_rv");
+        exec("DROP VIEW cec_rv");
+        exec("DROP TABLE cec_rt");
+    }
+
+    /** A rule that names no row still runs for none, rather than once with nothing bound. */
+    @Test
+    void anInsteadRuleMatchingNoRowsChangesNothing() throws Exception {
+        exec("DROP VIEW IF EXISTS cec_rv2 CASCADE");
+        exec("DROP TABLE IF EXISTS cec_rt2 CASCADE");
+        exec("CREATE TABLE cec_rt2 (id int PRIMARY KEY, a int)");
+        exec("INSERT INTO cec_rt2 VALUES (1, 11)");
+        exec("CREATE VIEW cec_rv2 AS SELECT id, a FROM cec_rt2");
+        exec("CREATE RULE cec_rv2_upd AS ON UPDATE TO cec_rv2 DO INSTEAD"
+                + " UPDATE cec_rt2 SET a = NEW.a WHERE id = OLD.id");
+        exec("UPDATE cec_rv2 SET a = 99 WHERE id = 42");
+        assertEquals("11", one("SELECT a FROM cec_rt2 WHERE id = 1"));
+        exec("DROP RULE cec_rv2_upd ON cec_rv2");
+        exec("DROP VIEW cec_rv2");
+        exec("DROP TABLE cec_rt2");
+    }
+
+    /** An INSTEAD rule on DELETE resolves OLD the same way. */
+    @Test
+    void anInsteadDeleteRuleResolvesOld() throws Exception {
+        exec("DROP VIEW IF EXISTS cec_rv3 CASCADE");
+        exec("DROP TABLE IF EXISTS cec_rt3 CASCADE");
+        exec("CREATE TABLE cec_rt3 (id int PRIMARY KEY, archived boolean DEFAULT false)");
+        exec("INSERT INTO cec_rt3 VALUES (1, false), (2, false)");
+        exec("CREATE VIEW cec_rv3 AS SELECT id, archived FROM cec_rt3");
+        exec("CREATE RULE cec_rv3_del AS ON DELETE TO cec_rv3 DO INSTEAD"
+                + " UPDATE cec_rt3 SET archived = true WHERE id = OLD.id");
+        exec("DELETE FROM cec_rv3 WHERE id = 1");
+        assertEquals("true", one("SELECT archived::text FROM cec_rt3 WHERE id = 1"));
+        assertEquals("false", one("SELECT archived::text FROM cec_rt3 WHERE id = 2"));
+        assertEquals("2", one("SELECT count(*) FROM cec_rt3"));
+        exec("DROP RULE cec_rv3_del ON cec_rv3");
+        exec("DROP VIEW cec_rv3");
+        exec("DROP TABLE cec_rt3");
+    }
+
     /** A table that really is published, and has no replica identity, is still refused. */
     @Test
     void aPublishedTableWithoutAReplicaIdentityIsStillRefused() throws Exception {
