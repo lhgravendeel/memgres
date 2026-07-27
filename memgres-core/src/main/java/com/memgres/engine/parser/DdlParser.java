@@ -65,6 +65,9 @@ class DdlParser {
         if (parser.matchKeyword("EXTENSION")) return parseCreateExtension();
         if (parser.matchKeyword("INDEX")) return indexParser.parseCreateIndex(unique, false);
         if (parser.matchKeyword("VIEW")) return parseCreateView(orReplace, false);
+        // CREATE RECURSIVE VIEW v (cols) AS q is shorthand for a view whose body is
+        // WITH RECURSIVE v (cols) AS (q) SELECT cols FROM v.
+        if (parser.matchKeywords("RECURSIVE", "VIEW")) return parseCreateRecursiveView(orReplace);
         if (parser.matchKeyword("MATERIALIZED")) {
             parser.expectKeyword("VIEW");
             return parseCreateView(orReplace, true);
@@ -718,6 +721,69 @@ class DdlParser {
     }
 
     // ---- CREATE VIEW ----
+
+    /**
+     * Point a recursive view's self-references at the CTE that stands in for it. PG allows the
+     * self-reference only in a FROM clause of the recursive term, so the FROM lists of the body
+     * and of each half of a set operation are where it can appear.
+     */
+    private void retargetSelfReference(Statement stmt, String viewName, String cteName) {
+        if (stmt instanceof SetOpStmt) {
+            SetOpStmt setOp = (SetOpStmt) stmt;
+            retargetSelfReference(setOp.left(), viewName, cteName);
+            retargetSelfReference(setOp.right(), viewName, cteName);
+            return;
+        }
+        if (!(stmt instanceof SelectStmt)) return;
+        SelectStmt sel = (SelectStmt) stmt;
+        if (sel.from() == null) return;
+        for (int i = 0; i < sel.from().size(); i++) {
+            SelectStmt.FromItem item = sel.from().get(i);
+            if (!(item instanceof SelectStmt.TableRef)) continue;
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+            if (ref.schema() != null || !viewName.equalsIgnoreCase(ref.table())) continue;
+            String alias = ref.alias() != null ? ref.alias() : viewName;
+            sel.from().set(i, new SelectStmt.TableRef(null, cteName, alias));
+        }
+    }
+
+    /**
+     * A recursive view names itself in its own body. PG defines it as exactly the view whose
+     * query is a WITH RECURSIVE CTE of the same name selected from, so that is what we build.
+     */
+    private CreateViewStmt parseCreateRecursiveView(boolean orReplace) {
+        if (parser.matchKeywords("IF", "NOT", "EXISTS")) orReplace = true;
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+
+        parser.expect(TokenType.LEFT_PAREN);
+        List<String> columnNames = parser.parseIdentifierList();
+        parser.expect(TokenType.RIGHT_PAREN);
+
+        parser.expectKeyword("AS");
+        int viewParens = Math.max(0, parser.countLeadingParensBeforeQuery());
+        parser.consumeLeadingParens(viewParens);
+        Statement body = parser.tryParseSetOp(parser.parseSelect());
+        parser.consumeTrailingParens(viewParens);
+
+        // The body names the view to refer to itself. Point those references at the CTE instead,
+        // keeping the view's name as the alias so qualified column references still read the same
+        // — otherwise resolving the name would expand the view again, without end.
+        String cteName = "__recursive_view_" + name.toLowerCase() + "__";
+        retargetSelfReference(body, name, cteName);
+
+        SelectStmt.CommonTableExpr cte = new SelectStmt.CommonTableExpr(
+                cteName, columnNames, body, true, null, false, null, null, null, null);
+        List<SelectStmt.SelectTarget> targets = new ArrayList<>();
+        for (String col : columnNames) {
+            targets.add(new SelectStmt.SelectTarget(new ColumnRef(null, col), null));
+        }
+        List<SelectStmt.FromItem> from = new ArrayList<>();
+        from.add(new SelectStmt.TableRef(null, cteName, name));
+        SelectStmt query = new SelectStmt(false, null, targets, from, null, null, null, null,
+                null, null, null, Cols.listOf(cte), null, null, false);
+        return new CreateViewStmt(name, query, orReplace, false, columnNames, true);
+    }
 
     CreateViewStmt parseCreateView(boolean orReplace, boolean materialized) {
         if (parser.matchKeywords("IF", "NOT", "EXISTS")) orReplace = true;

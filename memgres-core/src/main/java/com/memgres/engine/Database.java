@@ -1102,6 +1102,19 @@ public class Database {
         return overloads != null ? overloads : Cols.listOf();
     }
 
+    /**
+     * A variadic parameter normally has to be given at least one value, but one declared with a
+     * default supplies its own, so the call may leave it out entirely.
+     */
+    private static boolean variadicMayBeOmitted(PgFunction f) {
+        for (PgFunction.Param p : f.getParams()) {
+            if ("VARIADIC".equalsIgnoreCase(p.mode())) {
+                return p.defaultExpr() != null;
+            }
+        }
+        return false;
+    }
+
     /** Finds the best matching overload by argument count and types. */
     public PgFunction resolveFunction(String name, int argCount, List<String> argTypeHints) {
         List<PgFunction> overloads = getFunctionOverloads(name);
@@ -1121,7 +1134,7 @@ public class Database {
                 // For VARIADIC functions with unknown types, reject if no variadic args provided
                 PgFunction single = overloads.get(0);
                 boolean hasVariadic = single.getParams().stream().anyMatch(p -> "VARIADIC".equalsIgnoreCase(p.mode()));
-                if (hasVariadic) {
+                if (hasVariadic && !variadicMayBeOmitted(single)) {
                     long nonVariadicCount = single.getParams().stream()
                             .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
                             .count();
@@ -1135,7 +1148,7 @@ public class Database {
             List<PgFunction.Param> inputParams = f.getParams().stream()
                     .filter(p -> !"OUT".equalsIgnoreCase(p.mode()) && !"VARIADIC".equalsIgnoreCase(p.mode()))
                     .collect(Collectors.toList());
-            if (fHasVariadic && argCount <= inputParams.size()) return null;
+            if (fHasVariadic && !variadicMayBeOmitted(f) && argCount <= inputParams.size()) return null;
             boolean hasIncompatible = false;
             for (int i = 0; i < argTypeHints.size() && i < inputParams.size(); i++) {
                 String hint = argTypeHints.get(i);
@@ -1462,7 +1475,16 @@ public class Database {
     }
 
     public void addRuleByName(String ruleName, String table) {
-        rules.put("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase(), "exists");
+        addRuleByName(ruleName, table, null);
+    }
+
+    /**
+     * Remember which event a named rule was declared for, so dropping it by name can also retire
+     * the behaviour it installed rather than leaving the rule firing under a deleted name.
+     */
+    public void addRuleByName(String ruleName, String table, String event) {
+        rules.put("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase(),
+                event != null ? event.toUpperCase() : "exists");
     }
 
     public boolean hasRule(String ruleName, String table) {
@@ -1470,8 +1492,11 @@ public class Database {
     }
 
     public void removeRule(String ruleName, String table) {
-        rules.remove("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+        String event = rules.remove("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
         rules.remove("def:" + ruleName.toLowerCase());
+        if (event != null && !"exists".equals(event)) {
+            rules.remove(table.toLowerCase() + ":" + event);
+        }
     }
 
     public void addRuleDefinition(String ruleName, String table, String definition) {

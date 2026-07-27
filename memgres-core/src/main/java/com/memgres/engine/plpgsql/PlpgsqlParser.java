@@ -62,6 +62,17 @@ public class PlpgsqlParser {
         return false;
     }
 
+    /**
+     * A loop or block label is an ordinary name, so it may be spelled with a word the lexer also
+     * treats as a keyword — {@code outer} and {@code end} are common choices. Anything that reads
+     * as a name is a label here; EXIT and CONTINUE have already ruled out WHEN and the semicolon.
+     */
+    private boolean isLabelToken(Token t) {
+        return t.type() == TokenType.IDENTIFIER
+                || t.type() == TokenType.QUOTED_IDENTIFIER
+                || t.type() == TokenType.KEYWORD;
+    }
+
     private String readIdent() {
         Token t = peek();
         if (t.type() == TokenType.IDENTIFIER || t.type() == TokenType.QUOTED_IDENTIFIER
@@ -75,14 +86,23 @@ public class PlpgsqlParser {
     // ---- Block parsing ----
 
     public PlpgsqlStatement.Block parseBlock() {
+        return parseBlock(null);
+    }
+
+    /**
+     * @param outerLabel label already consumed by the caller, when the {@code <<label>>} was read
+     *                   before we knew a block rather than a loop followed it
+     */
+    public PlpgsqlStatement.Block parseBlock(String outerLabel) {
         List<PlpgsqlStatement.VarDeclaration> declarations = new ArrayList<>();
         List<PlpgsqlStatement> body = new ArrayList<>();
         List<PlpgsqlStatement.ExceptionHandler> handlers = new ArrayList<>();
 
-        // Skip optional label: <<label_name>>
+        String label = outerLabel;
+        // Optional label: <<label_name>>
         if (check(TokenType.SHIFT_LEFT)) {
             advance(); // consume <<
-            readIdent(); // consume label name
+            label = readIdent();
             if (check(TokenType.SHIFT_RIGHT)) advance(); // consume >>
         }
 
@@ -93,7 +113,7 @@ public class PlpgsqlParser {
         if (!matchKw("BEGIN")) {
             // If no BEGIN, try to parse statements until END or EOF
             body = parseStatements("END");
-            return new PlpgsqlStatement.Block(declarations, body, handlers);
+            return new PlpgsqlStatement.Block(label, declarations, body, handlers);
         }
 
         body = parseStatements("END", "EXCEPTION");
@@ -109,7 +129,7 @@ public class PlpgsqlParser {
         }
         match(TokenType.SEMICOLON);
 
-        return new PlpgsqlStatement.Block(declarations, body, handlers);
+        return new PlpgsqlStatement.Block(label, declarations, body, handlers);
     }
 
     private List<PlpgsqlStatement.VarDeclaration> parseDeclarations() {
@@ -230,7 +250,7 @@ public class PlpgsqlParser {
                         return parseForeach(label);
                     case "DECLARE":
                     case "BEGIN":
-                        return parseBlock();
+                        return parseBlock(label);
                     default:
                         return parseAssignmentOrSql();
                 }
@@ -506,7 +526,7 @@ public class PlpgsqlParser {
         String label = null;
         String whenCond = null;
         if (!check(TokenType.SEMICOLON) && !checkKw("WHEN") && !isAtEnd()) {
-            if (peek().type() == TokenType.IDENTIFIER) label = readIdent();
+            if (isLabelToken(peek())) label = readIdent();
         }
         if (matchKw("WHEN")) {
             whenCond = collectUntilSemicolon();
@@ -520,7 +540,7 @@ public class PlpgsqlParser {
         String label = null;
         String whenCond = null;
         if (!check(TokenType.SEMICOLON) && !checkKw("WHEN") && !isAtEnd()) {
-            if (peek().type() == TokenType.IDENTIFIER) label = readIdent();
+            if (isLabelToken(peek())) label = readIdent();
         }
         if (matchKw("WHEN")) {
             whenCond = collectUntilSemicolon();

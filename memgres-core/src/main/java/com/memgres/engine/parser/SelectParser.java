@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -434,6 +435,12 @@ class SelectParser {
             parser.matchKeyword("ROWS");
             if (parser.matchKeyword("WITH")) {
                 parser.expectKeyword("TIES");
+                // WITH TIES keeps every row equal to the last one returned, which only means
+                // something once the query has said what "equal" is.
+                if (orderBy == null || orderBy.isEmpty()) {
+                    throw new MemgresException(
+                            "WITH TIES cannot be specified without ORDER BY clause", "42601");
+                }
                 withTies = true;
             } else {
                 parser.matchKeyword("ONLY");
@@ -1561,12 +1568,12 @@ class SelectParser {
                 && !word.equals("OVER") && !word.equals("LATERAL");
     }
 
+    /**
+     * PG takes any value expression here, not only a literal, so a paginating query built with
+     * arithmetic ({@code LIMIT :size + 1}) parses the same way it does there.
+     */
     Expression parseLimitOffsetExpr() {
-        if (parser.match(TokenType.MINUS)) {
-            Expression inner = parser.parsePrimary();
-            return new UnaryExpr(UnaryExpr.UnaryOp.NEGATE, inner);
-        }
-        return parser.parsePrimary();
+        return parser.parseExpression();
     }
 
     SelectStmt parseTableCommand() {

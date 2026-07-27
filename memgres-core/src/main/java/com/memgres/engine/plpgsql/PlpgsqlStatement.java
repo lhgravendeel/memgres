@@ -171,13 +171,21 @@ public interface PlpgsqlStatement {
         public final List<VarDeclaration> declarations;
         public final List<PlpgsqlStatement> body;
         public final List<ExceptionHandler> exceptionHandlers;
+        /** Name given by a {@code <<label>>} before BEGIN, so EXIT can name this block. */
+        public final String label;
 
         public Block(List<VarDeclaration> declarations, List<PlpgsqlStatement> body, List<ExceptionHandler> exceptionHandlers) {
+            this(null, declarations, body, exceptionHandlers);
+        }
+
+        public Block(String label, List<VarDeclaration> declarations, List<PlpgsqlStatement> body, List<ExceptionHandler> exceptionHandlers) {
+            this.label = label;
             this.declarations = declarations;
             this.body = body;
             this.exceptionHandlers = exceptionHandlers;
         }
 
+        public String label() { return label; }
         public List<VarDeclaration> declarations() { return declarations; }
         public List<PlpgsqlStatement> body() { return body; }
         public List<ExceptionHandler> exceptionHandlers() { return exceptionHandlers; }
@@ -187,14 +195,15 @@ public interface PlpgsqlStatement {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             Block that = (Block) o;
-            return java.util.Objects.equals(declarations, that.declarations)
+            return java.util.Objects.equals(label, that.label)
+                && java.util.Objects.equals(declarations, that.declarations)
                 && java.util.Objects.equals(body, that.body)
                 && java.util.Objects.equals(exceptionHandlers, that.exceptionHandlers);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(declarations, body, exceptionHandlers);
+            return java.util.Objects.hash(label, declarations, body, exceptionHandlers);
         }
 
         @Override

@@ -56,6 +56,12 @@ class DdlObjectExecutor {
                 || stmt.action() == AlterTypeStmt.Action.RENAME_ATTRIBUTE) {
             return executeAlterCompositeType(stmt);
         }
+        // RENAME TO applies to any type; only an enum is looked up below, so a composite has to
+        // be handled here or it would be reported as a type that does not exist.
+        if (stmt.action() == AlterTypeStmt.Action.RENAME_TO
+                && executor.database.isCompositeType(stmt.typeName())) {
+            return executeAlterCompositeType(stmt);
+        }
 
         CustomEnum existing = executor.database.getCustomEnum(stmt.typeName());
         if (existing == null) throw new MemgresException("type \"" + stmt.typeName() + "\" does not exist", "42704");
@@ -146,6 +152,17 @@ class DdlObjectExecutor {
                     }
                 }
                 executor.database.addCompositeType(stmt.typeName(), newFields);
+                break;
+            }
+            case RENAME_TO: {
+                if (executor.database.isCompositeType(stmt.value())) {
+                    throw new MemgresException(
+                            "type \"" + stmt.value() + "\" already exists", "42710");
+                }
+                executor.database.removeCompositeType(stmt.typeName());
+                executor.database.addCompositeType(stmt.value(), fields);
+                executor.database.registerSchemaObject(
+                        executor.defaultSchema(), "composite", stmt.value());
                 break;
             }
             default:

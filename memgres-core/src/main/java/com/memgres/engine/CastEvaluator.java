@@ -965,7 +965,11 @@ class CastEvaluator {
                             break;
                     }
                 }
-                if (dt == null && executor.database.getDomain(rtName) == null && !executor.database.isCustomEnum(rtName)) {
+                // A composite or range type created by the user is as much a type as an enum is.
+                if (dt == null && executor.database.getDomain(rtName) == null
+                        && !executor.database.isCustomEnum(rtName)
+                        && !executor.database.isCompositeType(rtName)
+                        && !executor.database.getRangeTypes().containsKey(rtName)) {
                     throw new MemgresException("type \"" + val + "\" does not exist", "42704");
                 }
                 // Return RegtypeValue with canonical type name and OID

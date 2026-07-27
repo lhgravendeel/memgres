@@ -1124,10 +1124,20 @@ class CatalogCoreBuilder {
                     break;
             }
             String pgName = dt.getPgName();
+            // A range and a multirange are their own kinds of type, not base types, and tools
+            // that bucket types by typtype rely on the distinction.
+            String typtype = "b";
+            if (pgName.endsWith("multirange")) {
+                typtype = "m";
+                cat = "R";
+            } else if (pgName.endsWith("range")) {
+                typtype = "r";
+                cat = "R";
+            }
             table.insertRow(new Object[]{
                     dt.getOid(), pgName, pgCatalogOid,
                     10,          // typowner
-                    typlen, typbyval, "b", cat, isPreferred, true, ",",
+                    typlen, typbyval, typtype, cat, isPreferred, true, ",",
                     0,           // typrelid
                     null,        // typsubscript
                     0,           // typelem
@@ -1206,12 +1216,53 @@ class CatalogCoreBuilder {
                 {199, 114},   // _json
                 {3807, 3802}, // _jsonb
                 {1041, 869},  // _inet
+                {1028, 26},   // _oid
+                {1008, 24},   // _regproc
+                {2210, 2205}, // _regclass
+                {2211, 2206}, // _regtype
+                {1002, 18},   // _char
+                {791, 790},   // _money
+                {1561, 1560}, // _bit
+                {1563, 1562}, // _varbit
+                {651, 650},   // _cidr
+                {1040, 829},  // _macaddr
+                {775, 774},   // _macaddr8
+                {3643, 3614}, // _tsvector
+                {3645, 3615}, // _tsquery
+                {143, 142},   // _xml
+                {1017, 600},  // _point
+                {1018, 601},  // _lseg
+                {1019, 602},  // _path
+                {1020, 603},  // _box
+                {1027, 604},  // _polygon
+                {719, 718},   // _circle
+                {629, 628},   // _line
+                {3905, 3904}, // _int4range
+                {3907, 3906}, // _numrange
+                {3909, 3908}, // _tsrange
+                {3911, 3910}, // _tstzrange
+                {3913, 3912}, // _daterange
+                {3927, 3926}, // _int8range
+                {6150, 4451}, // _int4multirange
+                {6151, 4532}, // _int8multirange
+                {6152, 4533}, // _nummultirange
+                {6153, 4534}, // _datemultirange
+                {6155, 4535}, // _tsmultirange
+                {6157, 4536}, // _tstzmultirange
         };
         for (int[] a : stdArrays) {
             int arrOid = a[0];
             int elemOid = a[1];
             DataType arrDt = DataType.fromOid(arrOid);
-            String arrName = arrDt != null ? arrDt.getPgName() : "_" + elemOid;
+            // An array type is named for what it holds, so fall back to the element's name rather
+            // than to its OID — a tool looking for _bit would not find a type called _1560.
+            String arrName;
+            if (arrDt != null) {
+                arrName = arrDt.getPgName();
+            } else {
+                DataType elemDt = DataType.fromOid(elemOid);
+                arrName = elemDt != null ? "_" + elemDt.getPgName() : "_" + elemOid;
+            }
             int arrCollation = (elemOid == 25 || elemOid == 1043 || elemOid == 1042 || elemOid == 19) ? 100 : 0;
             table.insertRow(new Object[]{
                     arrOid, arrName, pgCatalogOid, 10,
@@ -1299,6 +1350,28 @@ class CatalogCoreBuilder {
                     "-", "-", "-", "d", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
+        }
+
+        // Every table is also a row type, and PG registers that composite type alongside it.
+        // DatabaseMetaData.getUDTs reads exactly these rows, so without them a tool asking what
+        // user-defined types the database has is told there are none.
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            String schemaName = schemaEntry.getKey();
+            if ("pg_catalog".equalsIgnoreCase(schemaName)
+                    || "information_schema".equalsIgnoreCase(schemaName)) continue;
+            int relNsOid = oids.oid("ns:" + schemaName);
+            for (Table rel : schemaEntry.getValue().getTables().values()) {
+                String relName = rel.getName();
+                if (database.getCompositeTypes().containsKey(relName)) continue;
+                table.insertRow(new Object[]{
+                        oids.oid("type:" + schemaName + "." + relName), relName, relNsOid, 10,
+                        (short) -1, false, "c", "C", false, true, ",",
+                        oids.oid("rel:" + schemaName + "." + relName), null, 0, 0,
+                        "record_in", "record_out", "record_recv", "record_send",
+                        "-", "-", "-", "d", "x",
+                        false, 0, -1, 0, 0, null, null, null, 1
+                });
+            }
         }
 
         // Add domain types
@@ -1845,6 +1918,28 @@ class CatalogCoreBuilder {
                     aggNargs, (short) 0, 0,
                     null, null, null, null, null, null,
                     null, null, null, null, null, 1
+            });
+        }
+
+        // The rest of what memgres evaluates. Without a row here a function works when called but
+        // is invisible to anything that asks the catalog first — the JDBC driver's getFunctions,
+        // ::regproc, and psql's \df all read pg_proc. Runs last, and skips a name already
+        // registered above with a fuller signature, so no function is listed twice.
+        Set<String> alreadyListed = new HashSet<>();
+        for (Object[] existing : table.getRows()) {
+            if (existing.length > 1 && existing[1] != null) {
+                alreadyListed.add(existing[1].toString().toLowerCase());
+            }
+        }
+        for (String builtin : BuiltinFunctionNames.NAMES) {
+            if (!alreadyListed.add(builtin.toLowerCase())) continue;
+            table.insertRow(new Object[]{
+                    oids.oid("proc:" + builtin), builtin, pgCatalogNs, 10,
+                    internalLangOid, 1.0, 0.0, 0, "-", "f",
+                    false, false, false, false, "i", "u",
+                    (short) 0, (short) 0, 0,
+                    null, null, null, null, null, null,
+                    builtin, null, null, null, null, 1
             });
         }
 

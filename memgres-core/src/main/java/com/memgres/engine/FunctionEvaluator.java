@@ -155,6 +155,62 @@ class FunctionEvaluator {
         }
     }
 
+    /** True when the expression is jsonb, which stores a parsed value rather than its text. */
+    private boolean isJsonbTyped(Expression expr, RowContext ctx) {
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName();
+            return name != null && "jsonb".equalsIgnoreCase(name.trim());
+        }
+        if (expr instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) expr;
+            for (RowContext.TableBinding b : ctx.getBindings()) {
+                if (b.table() == null) continue;
+                if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
+                        && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+                int idx = b.table().getColumnIndex(ref.column());
+                if (idx < 0) continue;
+                DataType t = b.table().getColumns().get(idx).getType();
+                return t != null && "jsonb".equalsIgnoreCase(t.getPgName());
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The declared array type of a column, or null when the expression does not name one. PG
+     * spells array types with a leading underscore in the catalog, so that is what identifies one.
+     */
+    private DataType arrayColumnType(Expression expr, RowContext ctx) {
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName();
+            if (name == null) return null;
+            String trimmed = name.trim();
+            if (!trimmed.endsWith("[]")) return null;
+            return DataType.fromPgName("_" + trimmed.substring(0, trimmed.length() - 2).trim());
+        }
+        if (!(expr instanceof ColumnRef) || ctx == null) return null;
+        ColumnRef ref = (ColumnRef) expr;
+        for (RowContext.TableBinding b : ctx.getBindings()) {
+            if (b.table() == null) continue;
+            if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
+                    && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+            int idx = b.table().getColumnIndex(ref.column());
+            if (idx < 0) continue;
+            DataType t = b.table().getColumns().get(idx).getType();
+            if (t != null && t.getPgName() != null && t.getPgName().startsWith("_")) return t;
+            return null;
+        }
+        return null;
+    }
+
+    /** {@code _int4} holds int4 elements; drop the underscore to name what goes in it. */
+    private DataType elementTypeOf(DataType arrayType) {
+        if (arrayType == null || arrayType.getPgName() == null) return null;
+        String name = arrayType.getPgName();
+        if (!name.startsWith("_")) return null;
+        return DataType.fromPgName(name.substring(1));
+    }
+
     Object evalFunction(FunctionCallExpr fn, RowContext ctx) {
         String name = fn.name().toLowerCase();
         // Strip schema prefixes for built-in function resolution
@@ -331,6 +387,37 @@ class FunctionEvaluator {
                 long msb = (timestamp << 16) | 0x7000L | (long)(Math.random() * 0x0FFF);
                 long lsb = 0x8000000000000000L | (long)(Math.random() * 0x3FFFFFFFFFFFFFFFL);
                 return new java.util.UUID(msb, lsb);
+            }
+            // The version is the four bits after the third dash; v7 additionally carries the
+            // millisecond timestamp it was minted from in its leading 48 bits.
+            case "uuid_extract_version": {
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String uuid = arg.toString();
+                java.util.UUID parsed = java.util.UUID.fromString(uuid);
+                return parsed.version();
+            }
+            case "uuid_extract_timestamp": {
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                java.util.UUID parsed = java.util.UUID.fromString(arg.toString());
+                if (parsed.version() != 7) return null;
+                long millis = parsed.getMostSignificantBits() >>> 16;
+                return java.time.OffsetDateTime.ofInstant(
+                        java.time.Instant.ofEpochMilli(millis), java.time.ZoneOffset.UTC);
+            }
+            // json(text) is the constructor behind JSON '...'; it validates and yields a json value.
+            case "json": {
+                requireArgs(fn, 1);
+                Object arg = executor.evalExpr(fn.args().get(0), ctx);
+                if (arg == null) return null;
+                String text = arg.toString();
+                if (!ExprEvaluator.isValidJson(text)) {
+                    throw new MemgresException("invalid input syntax for type json", "22P02");
+                }
+                return text;
             }
             case "crc32": {
                 requireArgs(fn, 1);
@@ -1270,6 +1357,32 @@ class FunctionEvaluator {
                 }
                 return rows;
             }
+            // UPDATE t SET a[lo:hi] = value — a slice only ever names part of an array.
+            case "__array_assign_slice__": {
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                int lo = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                int hi = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                Object value = executor.evalExpr(fn.args().get(3), ctx);
+                return executor.arrayOperationHandler.assignSlice(arr, lo, hi, value);
+            }
+            // UPDATE t SET a[k] = value — an array index or a JSON key, told apart by the
+            // column's declared type rather than by how the subscript happens to be written.
+            case "__subscript_assign__": {
+                Expression target = fn.args().get(0);
+                DataType arrayType = arrayColumnType(target, ctx);
+                if (arrayType != null) {
+                    Object arr = executor.evalExpr(target, ctx);
+                    Object value = executor.evalExpr(fn.args().get(3), ctx);
+                    Object keyVal = executor.evalExpr(fn.args().get(4), ctx);
+                    // The element still has to fit the array's element type, as it would on insert.
+                    DataType elemType = elementTypeOf(arrayType);
+                    if (elemType != null) value = TypeCoercion.coerce(value, elemType);
+                    return executor.arrayOperationHandler.assignElement(
+                            arr, executor.toInt(keyVal), value);
+                }
+                return evalFunction(new FunctionCallExpr("jsonb_set",
+                        Cols.listOf(target, fn.args().get(1), fn.args().get(2))), ctx);
+            }
             case "array_cat": {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
@@ -1519,15 +1632,14 @@ class FunctionEvaluator {
                 Object val = executor.evalExpr(arg, ctx);
                 if (val == null) return null;
                 String jsonStr = val.toString();
-                // JSON_SERIALIZE without RETURNING returns text (SQL standard default)
+                // JSON_SERIALIZE without RETURNING returns text (SQL standard default).
+                // jsonb has already thrown the original spelling away, so it prints in its own
+                // normalized form; json keeps the text it was given and must be handed back as is.
                 String trimmed = jsonStr.trim();
-                String normalized;
-                if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-                    normalized = JsonOperations.normalizeJsonb(trimmed);
-                } else {
-                    normalized = jsonStr;
+                if (isJsonbTyped(arg, ctx) && (trimmed.startsWith("{") || trimmed.startsWith("["))) {
+                    return JsonOperations.normalizeJsonb(trimmed);
                 }
-                return normalized;
+                return jsonStr;
             }
             case "json_array_subquery": {
                 // JSON_ARRAY(SELECT ...) — execute subquery and build JSON array from results

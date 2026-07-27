@@ -253,7 +253,21 @@ class DdlTableParser {
         while (true) {
             if (parser.matchKeywords("NOT", "NULL")) { notNull = true; continue; }
             if (parser.matchKeyword("NULL")) { notNull = false; continue; }
-            if (parser.matchKeywords("PRIMARY", "KEY")) { pk = true; notNull = true; continue; }
+            if (parser.matchKeywords("PRIMARY", "KEY")) {
+                pk = true;
+                notNull = true;
+                // A column-level key may say when it is checked, just as a table-level one can.
+                if (parser.matchKeyword("DEFERRABLE")) {
+                    deferrable = true;
+                    if (parser.matchKeyword("INITIALLY")) {
+                        if (parser.matchKeyword("DEFERRED")) initiallyDeferred = true;
+                        else parser.matchKeyword("IMMEDIATE");
+                    }
+                } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
+                    parser.advance(); parser.advance();
+                }
+                continue;
+            }
             if (parser.matchKeyword("UNIQUE")) {
                 unique = true;
                 if (parser.checkKeyword("NULLS")) {
@@ -268,9 +282,10 @@ class DdlTableParser {
                     }
                 }
                 if (parser.matchKeyword("DEFERRABLE")) {
+                    deferrable = true;
                     if (parser.matchKeyword("INITIALLY")) {
-                        parser.matchKeyword("DEFERRED");
-                        parser.matchKeyword("IMMEDIATE");
+                        if (parser.matchKeyword("DEFERRED")) initiallyDeferred = true;
+                        else parser.matchKeyword("IMMEDIATE");
                     }
                 } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
                     parser.advance(); parser.advance();
@@ -438,6 +453,20 @@ class DdlTableParser {
         return new long[]{startWith, incrementBy};
     }
 
+    /**
+     * Match {@code WITHOUT OVERLAPS}. OVERLAPS is not a reserved word, so it arrives as a plain
+     * identifier and has to be matched on the word rather than on the token's kind.
+     */
+    private boolean matchWithoutOverlaps() {
+        if (!parser.checkKeyword("WITHOUT")) return false;
+        int idx = parser.pos + 1;
+        if (idx >= parser.tokens.size()) return false;
+        if (!"OVERLAPS".equalsIgnoreCase(parser.tokens.get(idx).value())) return false;
+        parser.advance();
+        parser.advance();
+        return true;
+    }
+
     TableConstraint parseTableConstraint() {
         String constraintName = null;
         if (parser.matchKeyword("CONSTRAINT")) {
@@ -458,8 +487,34 @@ class DdlTableParser {
                         Cols.listOf("__using_index__:" + indexName), null, null, null, null, null);
             }
             parser.expect(TokenType.LEFT_PAREN);
-            List<String> cols = parser.parseIdentifierList();
+            List<String> cols = new ArrayList<String>();
+            String withoutOverlapsCol = null;
+            do {
+                String c = parser.readIdentifier();
+                // PRIMARY KEY (id, valid WITHOUT OVERLAPS): the key is unique per period rather
+                // than outright, which is an exclusion constraint by another name.
+                if (matchWithoutOverlaps()) {
+                    withoutOverlapsCol = c;
+                } else {
+                    cols.add(c);
+                }
+            } while (parser.match(TokenType.COMMA));
             parser.expect(TokenType.RIGHT_PAREN);
+            if (withoutOverlapsCol != null) {
+                List<TableConstraint.ExcludeElement> elems = new ArrayList<TableConstraint.ExcludeElement>();
+                for (String c : cols) {
+                    elems.add(new TableConstraint.ExcludeElement(c, "="));
+                }
+                elems.add(new TableConstraint.ExcludeElement(withoutOverlapsCol, "&&"));
+                List<String> allCols = new ArrayList<String>(cols);
+                allCols.add(withoutOverlapsCol);
+                TableConstraint temporal = new TableConstraint(
+                        constraintName != null ? constraintName : null,
+                        TableConstraint.ConstraintType.EXCLUDE,
+                        allCols, null, null, null, null, null, false, false, false, false, elems);
+                temporal.setExcludeMethod("gist");
+                return temporal;
+            }
             boolean pkDeferrable = false, pkInitiallyDeferred = false;
             if (parser.matchKeyword("DEFERRABLE")) {
                 pkDeferrable = true;
