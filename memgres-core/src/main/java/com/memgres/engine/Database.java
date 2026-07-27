@@ -1499,6 +1499,19 @@ public class Database {
     }
 
     // Rules
+
+    /**
+     * Joins the actions of a multi-action rule inside the single stored string. A NUL cannot
+     * appear in SQL text, so splitting on it cannot cut a statement in half the way a semicolon
+     * would.
+     */
+    public static final String RULE_ACTION_SEPARATOR = "\0";
+
+    /** The actions of a stored rule body, in the order they were written. */
+    public static String[] ruleActions(String storedBody) {
+        return storedBody.split(RULE_ACTION_SEPARATOR, -1);
+    }
+
     public void addRule(String table, String event, String ruleType) {
         rules.put(table.toLowerCase() + ":" + event.toUpperCase(), ruleType);
     }
@@ -1525,7 +1538,25 @@ public class Database {
         rules.remove("def:" + ruleName.toLowerCase());
         if (event != null && !"exists".equals(event)) {
             rules.remove(table.toLowerCase() + ":" + event);
+            rules.remove("off:" + table.toLowerCase() + ":" + event);
         }
+    }
+
+    /**
+     * Park or restore a named rule's behaviour for ALTER TABLE ... DISABLE/ENABLE RULE. The rule
+     * itself stays registered so it keeps its place in the catalogs and can be switched back on.
+     *
+     * @return false when no rule of that name is defined on the relation
+     */
+    public boolean setRuleEnabled(String ruleName, String table, boolean enabled) {
+        String event = rules.get("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+        if (event == null) return false;
+        if ("exists".equals(event)) return true;
+        String live = table.toLowerCase() + ":" + event;
+        String parked = "off:" + live;
+        String spec = rules.remove(enabled ? parked : live);
+        if (spec != null) rules.put(enabled ? live : parked, spec);
+        return true;
     }
 
     public void addRuleDefinition(String ruleName, String table, String definition) {

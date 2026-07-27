@@ -1443,6 +1443,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         // caseDepth counts nested CASE expressions whose END should not close the block.
         boolean inBeginAtomic = false;
         int caseDepth = 0;
+        // A multi-action rule body — DO ALSO ( a; b; ) — puts semicolons inside parentheses,
+        // where they separate the rule's actions rather than one statement from the next.
+        int parenDepth = 0;
 
         for (int i = 0; i < sql.length(); i++) {
             char c = sql.charAt(i);
@@ -1539,7 +1542,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 current.append(sql, i, eol);
                 i = eol - 1;
             } else if (c == ';') {
-                if (inBeginAtomic) {
+                if (inBeginAtomic || parenDepth > 0) {
                     // Inside BEGIN ATOMIC block — semicolons are part of the body, not statement separators
                     current.append(c);
                 } else {
@@ -1550,6 +1553,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     caseDepth = 0;
                 }
             } else {
+                if (c == '(') parenDepth++;
+                else if (c == ')' && parenDepth > 0) parenDepth--;
                 // Detect BEGIN ATOMIC, CASE, and END keywords to track block nesting
                 if (!inString && Character.isLetter(c)) {
                     if (inBeginAtomic) {

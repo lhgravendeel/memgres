@@ -565,6 +565,18 @@ public final class AlterTableStmt implements Statement {
         public String triggerName() { return triggerName; }
     }
 
+    /** ENABLE RULE name (enabled=true) or DISABLE RULE name (enabled=false). */
+        public static final class SetRuleEnabled implements AlterAction {
+        public final String ruleName;
+        public final boolean enabled;
+        public SetRuleEnabled(String ruleName, boolean enabled) {
+            this.ruleName = ruleName;
+            this.enabled = enabled;
+        }
+        public String ruleName() { return ruleName; }
+        public boolean enabled() { return enabled; }
+    }
+
     /** SET LOGGED (logged=true) or SET UNLOGGED (logged=false). */
         public static final class SetLogged implements AlterAction {
         public final boolean logged;

@@ -132,6 +132,14 @@ class DdlAlterActionParser {
                 parser.readIdentifier(); // access method name
                 return new AlterTableStmt.SetStorageParams();
             }
+            // SET WITHOUT CLUSTER / SET WITHOUT OIDS: nothing is clustered here, so accepting
+            // them costs nothing and rejecting them turns a working dump into a syntax error.
+            if (parser.matchKeyword("WITHOUT")) {
+                if (!parser.matchKeyword("CLUSTER") && !parser.matchIdentifier("OIDS")) {
+                    throw new ParseException("Unsupported ALTER TABLE SET WITHOUT action", parser.peek());
+                }
+                return new AlterTableStmt.SetStorageParams();
+            }
             // Fall through; could be other SET variants, but for now error
             throw new ParseException("Unsupported ALTER TABLE SET action", parser.peek());
         }
@@ -165,9 +173,12 @@ class DdlAlterActionParser {
                 parser.expectKeyword("SECURITY");
                 return new AlterTableStmt.EnableRls();
             }
-            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER
+            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER / ENABLE RULE
             parser.matchKeyword("REPLICA");
             parser.matchKeyword("ALWAYS");
+            if (parser.matchKeyword("RULE")) {
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), true);
+            }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL
             return new AlterTableStmt.EnableTrigger(trigName);
@@ -178,7 +189,10 @@ class DdlAlterActionParser {
                 parser.expectKeyword("SECURITY");
                 return new AlterTableStmt.DisableRls();
             }
-            // DISABLE TRIGGER
+            // DISABLE RULE suspends a rule; without it the only way to stop one is to drop it.
+            if (parser.matchKeyword("RULE")) {
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), false);
+            }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL
             return new AlterTableStmt.DisableTrigger(trigName);

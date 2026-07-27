@@ -350,6 +350,12 @@ class DdlAlterTableExecutor {
         } else if (action instanceof AlterTableStmt.EnableTrigger) {
             AlterTableStmt.EnableTrigger et = (AlterTableStmt.EnableTrigger) action;
             setTriggerEnabled(table, et.triggerName(), false);
+        } else if (action instanceof AlterTableStmt.SetRuleEnabled) {
+            AlterTableStmt.SetRuleEnabled sr = (AlterTableStmt.SetRuleEnabled) action;
+            if (!executor.database.setRuleEnabled(sr.ruleName(), stmt.table(), sr.enabled())) {
+                throw new MemgresException("rule \"" + sr.ruleName() + "\" for relation \""
+                        + stmt.table() + "\" does not exist", "42704");
+            }
         } else if (action instanceof AlterTableStmt.SetStorageParams) {
             // no-op
         } else if (action instanceof AlterTableStmt.SetLogged) {
@@ -1429,16 +1435,24 @@ class DdlAlterTableExecutor {
 
     private void setTriggerEnabled(Table table, String triggerName, boolean disabled) {
         List<PgTrigger> triggers = executor.database.getTriggersForTable(table.getName());
-        if ("ALL".equalsIgnoreCase(triggerName)) {
+        // ALL and USER are group selectors, not names, and match nothing without complaint.
+        if ("ALL".equalsIgnoreCase(triggerName) || "USER".equalsIgnoreCase(triggerName)) {
             for (PgTrigger t : triggers) {
                 t.setDisabled(disabled);
             }
-        } else {
-            for (PgTrigger t : triggers) {
-                if (t.getName().equalsIgnoreCase(triggerName)) {
-                    t.setDisabled(disabled);
-                }
+            return;
+        }
+        boolean found = false;
+        for (PgTrigger t : triggers) {
+            if (t.getName().equalsIgnoreCase(triggerName)) {
+                t.setDisabled(disabled);
+                found = true;
             }
+        }
+        // Quietly doing nothing here reads as success to the caller who asked for the trigger off.
+        if (!found) {
+            throw new MemgresException("trigger \"" + triggerName + "\" for table \""
+                    + table.getName() + "\" does not exist", "42704");
         }
     }
 

@@ -1328,7 +1328,8 @@ class DdlObjectExecutor {
         }
         boolean isView = stmt.table() != null && executor.database.hasView(stmt.table());
         if (timing == PgTrigger.Timing.INSTEAD_OF && !isView) {
-            throw new MemgresException("INSTEAD OF triggers are only for views", "42P17");
+            throw PgErrors.wrongObjectType("\"" + stmt.table() + "\" is a table"
+                    + "\n  Detail: Tables cannot have INSTEAD OF triggers.");
         }
         if ((timing == PgTrigger.Timing.BEFORE || timing == PgTrigger.Timing.AFTER) && isView) {
             throw new MemgresException("\"" + stmt.table() + "\" is a view\n  Detail: Views cannot have BEFORE or AFTER row-level triggers.", "42809");
@@ -1345,6 +1346,7 @@ class DdlObjectExecutor {
                 throw new MemgresException("syntax error at or near \"" + event.toLowerCase() + "\"", "42601");
             }
         }
+        checkTriggerShape(stmt, timing, trigEvents, triggerTableSchema, isView);
         if (stmt.functionName() != null) {
             PgFunction trigFunc = executor.database.getFunction(stmt.functionName());
             if (trigFunc == null) {
@@ -1356,14 +1358,9 @@ class DdlObjectExecutor {
                 throw new MemgresException("function " + stmt.functionName() + " must return type trigger", "42P17");
             }
         }
-        if (stmt.whenClause() != null && stmt.table() != null) {
-            try {
-                Table trigTable = executor.resolveTable(triggerTableSchema, stmt.table());
-                Expression whenExpr = com.memgres.engine.parser.Parser.parseExpression(stmt.whenClause());
-                ddl.validateExprColumnRefs(whenExpr, trigTable, null);
-            } catch (MemgresException me) {
-                if ("42703".equals(me.getSqlState())) throw me;
-            } catch (Exception ignored) {}
+        checkTriggerWhen(stmt, trigEvents, triggerTableSchema, isView);
+        if (stmt.orReplace()) {
+            executor.database.removeTrigger(stmt.name(), stmt.table());
         }
         for (PgTrigger.Event trigEvent : trigEvents) {
             PgTrigger trigger = new PgTrigger(
@@ -1375,6 +1372,100 @@ class DdlObjectExecutor {
             executor.database.addTrigger(trigger);
         }
         return QueryResult.command(QueryResult.Type.CREATE_TRIGGER, 0);
+    }
+
+    /**
+     * Reject trigger definitions that describe something the engine could never fire correctly:
+     * a row-level view trigger with no row to substitute for, a transition table built from a
+     * statement that has not run yet, a column list naming a column that is not there.
+     */
+    private void checkTriggerShape(CreateTriggerStmt stmt, PgTrigger.Timing timing,
+                                   List<PgTrigger.Event> events, String schema, boolean isView) {
+        if (timing == PgTrigger.Timing.INSTEAD_OF) {
+            if (stmt.forEachStatement()) {
+                throw PgErrors.notImplemented("INSTEAD OF triggers must be FOR EACH ROW");
+            }
+            if (stmt.whenClause() != null) {
+                throw PgErrors.notImplemented("INSTEAD OF triggers cannot have WHEN conditions");
+            }
+        }
+        if (!stmt.forEachStatement() && events.contains(PgTrigger.Event.TRUNCATE)) {
+            throw PgErrors.notImplemented("TRUNCATE FOR EACH ROW triggers are not supported");
+        }
+        if (stmt.updateOfColumns() != null && !stmt.updateOfColumns().isEmpty() && !isView) {
+            Table target = executor.resolveTable(schema, stmt.table());
+            for (String col : stmt.updateOfColumns()) {
+                if (target.getColumnIndex(col) < 0) {
+                    throw new MemgresException("column \"" + col + "\" of relation \""
+                            + stmt.table() + "\" does not exist", "42703");
+                }
+            }
+        }
+        if (stmt.newTransitionTable() != null || stmt.oldTransitionTable() != null) {
+            if (timing != PgTrigger.Timing.AFTER) {
+                throw PgErrors.invalidObjectState(
+                        "transition table name can only be specified for an AFTER trigger");
+            }
+            if (stmt.oldTransitionTable() != null
+                    && !events.contains(PgTrigger.Event.DELETE) && !events.contains(PgTrigger.Event.UPDATE)) {
+                throw PgErrors.invalidObjectState(
+                        "OLD TABLE can only be specified for a DELETE or UPDATE trigger");
+            }
+            if (stmt.newTransitionTable() != null
+                    && !events.contains(PgTrigger.Event.INSERT) && !events.contains(PgTrigger.Event.UPDATE)) {
+                throw PgErrors.invalidObjectState(
+                        "NEW TABLE can only be specified for an INSERT or UPDATE trigger");
+            }
+        }
+        if (!stmt.orReplace()) {
+            for (PgTrigger existing : executor.database.getTriggersForTable(schema, stmt.table())) {
+                if (existing.getName().equalsIgnoreCase(stmt.name())) {
+                    throw new MemgresException("trigger \"" + stmt.name() + "\" for relation \""
+                            + stmt.table() + "\" already exists", "42710");
+                }
+            }
+        }
+    }
+
+    /**
+     * A WHEN condition is resolved against the trigger's own OLD/NEW rows, so which of those two
+     * exists depends on the events the trigger fires for, and a statement-level trigger has
+     * neither.
+     */
+    private void checkTriggerWhen(CreateTriggerStmt stmt, List<PgTrigger.Event> events,
+                                  String schema, boolean isView) {
+        if (stmt.whenClause() == null || stmt.table() == null || isView) return;
+        Table target = executor.resolveTable(schema, stmt.table());
+        Expression whenExpr;
+        try {
+            whenExpr = com.memgres.engine.parser.Parser.parseExpression(stmt.whenClause());
+        } catch (RuntimeException e) {
+            return; // an unparsable WHEN clause is reported when the trigger fires, as before
+        }
+        boolean usesOld = referencesRow(whenExpr, "old");
+        boolean usesNew = referencesRow(whenExpr, "new");
+        if (stmt.forEachStatement()) {
+            if (usesOld || usesNew || AstWalk.anyMatch(whenExpr, n -> n instanceof ColumnRef)) {
+                throw PgErrors.invalidObjectState(
+                        "statement trigger's WHEN condition cannot reference column values");
+            }
+            return;
+        }
+        if (usesOld && events.contains(PgTrigger.Event.INSERT)) {
+            throw PgErrors.invalidObjectState(
+                    "INSERT trigger's WHEN condition cannot reference OLD values");
+        }
+        if (usesNew && events.contains(PgTrigger.Event.DELETE)) {
+            throw PgErrors.invalidObjectState(
+                    "DELETE trigger's WHEN condition cannot reference NEW values");
+        }
+        StoredExprCheck.forTriggerWhen(target).check(whenExpr);
+    }
+
+    private static boolean referencesRow(Expression expr, String alias) {
+        return AstWalk.anyMatch(expr, n -> n instanceof ColumnRef
+                && ((ColumnRef) n).table() != null
+                && ((ColumnRef) n).table().equalsIgnoreCase(alias));
     }
 
     // ---- CREATE EVENT TRIGGER ----

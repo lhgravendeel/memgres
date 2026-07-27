@@ -66,6 +66,12 @@ class DdlViewExecutor {
         // Apply the optional column alias list: CREATE [MATERIALIZED] VIEW v(a, b) AS ...
         query = applyColumnAliasList(stmt, query);
 
+        // A CHECK OPTION on a view no INSERT can reach is a promise that can never be kept.
+        if (stmt.checkOption() != null && !isAutoUpdatable(query)) {
+            throw PgErrors.notImplemented(
+                    "WITH CHECK OPTION is supported only on automatically updatable views");
+        }
+
         // "view will be a temporary view": a view whose query reads a temp table cannot outlive
         // the session, so PG puts it in the temp namespace instead of leaving a dangling view.
         if (referencesTempTable(query)) {
@@ -79,6 +85,7 @@ class DdlViewExecutor {
                 List<Column> cols = new ArrayList<>(result.getColumns());
                 List<Object[]> rows = new ArrayList<>(result.getRows());
                 rowCount = rows.size();
+                rejectDuplicateColumnNames(cols);
                 executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
                         true, cols, rows, null, null, stmt.withOptions(), true));
             } else {
@@ -91,6 +98,7 @@ class DdlViewExecutor {
                 } catch (Exception ignored) {
                     // Column metadata unavailable; the view is still created (matches lenient CREATE VIEW path)
                 }
+                rejectDuplicateColumnNames(cols);
                 executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
                         true, cols, Cols.listOf(), null, null, stmt.withOptions(), false));
             }
@@ -110,6 +118,7 @@ class DdlViewExecutor {
             } catch (Exception e) {
                 // Silently ignore execution errors during view validation
             }
+            rejectDuplicateColumnNames(resolvedColumns);
             executor.database.addView(new Database.ViewDef(stmt.name(), viewSchema, query, stmt.orReplace(),
                     false, resolvedColumns, null, null, stmt.checkOption(), stmt.withOptions(), true));
         }
@@ -124,6 +133,41 @@ class DdlViewExecutor {
             return QueryResult.command(QueryResult.Type.SELECT_INTO, rowCount);
         }
         return QueryResult.message(QueryResult.Type.SET, "CREATE VIEW");
+    }
+
+    /**
+     * A view whose output repeats a column name cannot be selected from unambiguously, so the
+     * name clash has to be caught while the view is being defined rather than at every read.
+     */
+    private static void rejectDuplicateColumnNames(List<Column> columns) {
+        if (columns == null) return;
+        Set<String> seen = new HashSet<>();
+        for (Column c : columns) {
+            if (!seen.add(c.getName().toLowerCase())) {
+                throw PgErrors.duplicateColumn(c.getName());
+            }
+        }
+    }
+
+    /**
+     * Whether a view over this query is automatically updatable — the same test the DML path
+     * makes when it resolves a view back to its base table.
+     */
+    private boolean isAutoUpdatable(Statement query) {
+        if (!(query instanceof SelectStmt)) return false;
+        SelectStmt sel = (SelectStmt) query;
+        if (sel.distinct()) return false;
+        if (sel.from() == null || sel.from().size() != 1) return false;
+        if (!(sel.from().get(0) instanceof SelectStmt.TableRef)) return false;
+        if (sel.groupBy() != null && !sel.groupBy().isEmpty()) return false;
+        if (sel.having() != null) return false;
+        if (sel.limit() != null || sel.offset() != null) return false;
+        if (sel.targets() != null) {
+            for (SelectStmt.SelectTarget target : sel.targets()) {
+                if (StoredExprCheck.hasAggregate(target.expr())) return false;
+            }
+        }
+        return true;
     }
 
     // ---- SELECT * freeze (star expansion at CREATE VIEW time) ----
