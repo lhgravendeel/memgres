@@ -12,6 +12,18 @@ import java.util.stream.Collectors;
  * Extracted from FromResolver to separate concerns.
  */
 class FromFunctionResolver {
+
+    /**
+     * How many rows a temporal generate_series will build. Stopping short of the requested range
+     * would return a shorter answer than was asked for with nothing to say so; past this point the
+     * request is refused instead.
+     */
+    private static final long MAX_SERIES_ROWS = 10_000_000L;
+
+    private static MemgresException seriesTooLarge() {
+        return new MemgresException(
+                "generate_series would produce more than " + MAX_SERIES_ROWS + " rows", "54000");
+    }
     private final AstExecutor executor;
 
     FromFunctionResolver(AstExecutor executor) {
@@ -156,7 +168,7 @@ class FromFunctionResolver {
             List<RowContext> contexts = new ArrayList<>();
             java.time.OffsetDateTime cur = tzStart;
             long ord = 1;
-            for (int guard = 0; guard < 10000; guard++) {
+            for (long guard = 0; guard < MAX_SERIES_ROWS; guard++) {
                 if (ascending ? cur.isAfter(tzStop) : cur.isBefore(tzStop)) break;
                 Object[] row = hasOrdinality ? new Object[]{cur, ord++} : new Object[]{cur};
                 virtualTable.insertRow(row);
@@ -164,6 +176,7 @@ class FromFunctionResolver {
                 java.time.OffsetDateTime next = ivStep.addTo(cur);
                 if (next.isEqual(cur)) break;
                 cur = next;
+                if (guard == MAX_SERIES_ROWS - 1) throw seriesTooLarge();
             }
             return contexts;
         }
@@ -186,7 +199,7 @@ class FromFunctionResolver {
             List<RowContext> contexts = new ArrayList<>();
             java.time.LocalDateTime cur = dtStart;
             long ord = 1;
-            for (int guard = 0; guard < 10000; guard++) {
+            for (long guard = 0; guard < MAX_SERIES_ROWS; guard++) {
                 if (ascending ? cur.isAfter(dtStop) : cur.isBefore(dtStop)) break;
                 Object val = dateInput ? cur.atZone(java.time.ZoneOffset.UTC).toOffsetDateTime() : cur;
                 Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
@@ -195,6 +208,7 @@ class FromFunctionResolver {
                 java.time.LocalDateTime next = ivStep.addTo(cur);
                 if (next.isEqual(cur)) break;
                 cur = next;
+                if (guard == MAX_SERIES_ROWS - 1) throw seriesTooLarge();
             }
             return contexts;
         }

@@ -67,6 +67,102 @@ class CastEvaluator {
         OID_TO_TYPE = Collections.unmodifiableMap(oids);
     }
 
+    /**
+     * Parse a UUID the way PostgreSQL does: exactly 32 hex digits, optionally wrapped in braces
+     * and with hyphens anywhere between digits. Java's own parser is looser in one direction and
+     * stricter in the other — it pads a short group instead of rejecting it, which turns a
+     * mistyped identifier into a different valid one, and it refuses the undashed form PG takes.
+     */
+    private static java.util.UUID parseUuid(String raw) {
+        String text = raw.trim();
+        String body = text;
+        if (body.length() >= 2 && body.charAt(0) == '{' && body.charAt(body.length() - 1) == '}') {
+            body = body.substring(1, body.length() - 1);
+        }
+        StringBuilder digits = new StringBuilder(32);
+        for (int i = 0; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '-') continue;
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) throw invalidUuid(raw);
+            digits.append(c);
+        }
+        if (digits.length() != 32) throw invalidUuid(raw);
+        String d = digits.toString();
+        return java.util.UUID.fromString(d.substring(0, 8) + "-" + d.substring(8, 12) + "-"
+                + d.substring(12, 16) + "-" + d.substring(16, 20) + "-" + d.substring(20));
+    }
+
+    /**
+     * Bit-string input may carry a radix prefix: {@code b} for binary and {@code x} for
+     * hexadecimal, either case. Without expanding it the prefix letter reaches the digit check
+     * and the whole literal is refused.
+     */
+    private static String expandBitRadixPrefix(String text) {
+        if (text.length() < 1) return text;
+        char prefix = text.charAt(0);
+        String rest = text.substring(1);
+        if (prefix == 'b' || prefix == 'B') {
+            return rest;
+        }
+        if (prefix == 'x' || prefix == 'X') {
+            StringBuilder bits = new StringBuilder(rest.length() * 4);
+            for (int i = 0; i < rest.length(); i++) {
+                int digit = Character.digit(rest.charAt(i), 16);
+                if (digit < 0) return text; // let the digit check report it
+                for (int bit = 3; bit >= 0; bit--) {
+                    bits.append((digit >> bit) & 1);
+                }
+            }
+            return bits.toString();
+        }
+        return text;
+    }
+
+    /**
+     * An integer range's bounds must be whole numbers within the element type's span. Without
+     * this the bound is narrowed on the way in, producing a finite range with completely
+     * different endpoints and nothing to say the input was not representable.
+     */
+    private static void checkRangeBoundsFitElementType(String literal, String rangeType) {
+        String element;
+        if ("int4range".equals(rangeType)) element = "integer";
+        else if ("int8range".equals(rangeType)) element = "bigint";
+        else return;
+        String text = literal.trim();
+        if (text.length() < 3 || text.equalsIgnoreCase("empty")) return;
+        String inner = text.substring(1, text.length() - 1);
+        String[] parts = inner.split(",", 2);
+        for (String part : parts) {
+            String bound = part.trim();
+            if (bound.isEmpty()) continue;
+            if (bound.length() >= 2 && bound.startsWith("\"") && bound.endsWith("\"")) {
+                bound = bound.substring(1, bound.length() - 1);
+            }
+            java.math.BigInteger value;
+            try {
+                value = new java.math.BigInteger(bound);
+            } catch (NumberFormatException e) {
+                throw new MemgresException(
+                        "invalid input syntax for type " + element + ": \"" + bound + "\"", "22P02");
+            }
+            java.math.BigInteger min = "integer".equals(element)
+                    ? java.math.BigInteger.valueOf(Integer.MIN_VALUE)
+                    : java.math.BigInteger.valueOf(Long.MIN_VALUE);
+            java.math.BigInteger max = "integer".equals(element)
+                    ? java.math.BigInteger.valueOf(Integer.MAX_VALUE)
+                    : java.math.BigInteger.valueOf(Long.MAX_VALUE);
+            if (value.compareTo(min) < 0 || value.compareTo(max) > 0) {
+                throw new MemgresException("value \"" + bound + "\" is out of range for type "
+                        + element, "22003");
+            }
+        }
+    }
+
+    private static MemgresException invalidUuid(String raw) {
+        return new MemgresException("invalid input syntax for type uuid: \"" + raw + "\"", "22P02");
+    }
+
     CastEvaluator(AstExecutor executor) {
         this.executor = executor;
     }
@@ -548,7 +644,7 @@ class CastEvaluator {
                     }
                     return new AstExecutor.PgBitString(bitStr);
                 } else {
-                    bitStr = val.toString();
+                    bitStr = expandBitRadixPrefix(val.toString());
                 }
                 // Validate: only '0' and '1' allowed
                 for (int i = 0; i < bitStr.length(); i++) {
@@ -622,6 +718,9 @@ class CastEvaluator {
                     String multirangeType = typeName.replace("range", "multirange");
                     throw new MemgresException("cannot cast type " + multirangeType + " to " + typeName, "42846");
                 }
+                // The bounds have to fit the range's element type. Narrowing them silently would
+                // leave a plausible range whose bounds are not the ones written.
+                checkRangeBoundsFitElementType(rangeStr, typeName);
                 return RangeOperations.parse(rangeStr).toString();
             }
             case "int4multirange":
@@ -671,11 +770,7 @@ class CastEvaluator {
             }
             case "uuid": {
                 if (val instanceof java.util.UUID) return val;
-                try {
-                    return java.util.UUID.fromString(val.toString().trim());
-                } catch (IllegalArgumentException e) {
-                    throw new MemgresException("invalid input syntax for type uuid: \"" + val + "\"", "22P02");
-                }
+                return parseUuid(val.toString());
             }
             case "json":
             case "jsonb": {

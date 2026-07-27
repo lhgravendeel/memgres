@@ -566,7 +566,24 @@ public final class TypeCoercion {
             // 64-bit: parse as unsigned then reinterpret as signed (two's complement)
             return Long.parseUnsignedLong(bits.substring(bits.length() - 64), 2);
         }
-        if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val).setScale(0, java.math.RoundingMode.HALF_UP).longValue();
+        if (val instanceof java.math.BigDecimal) {
+            // longValue() would wrap modulo 2^64, turning an out-of-range numeric into a
+            // plausible number of the wrong sign rather than reporting it.
+            java.math.BigDecimal rounded =
+                    ((java.math.BigDecimal) val).setScale(0, java.math.RoundingMode.HALF_UP);
+            try {
+                return rounded.longValueExact();
+            } catch (ArithmeticException e) {
+                throw bigintOutOfRange();
+            }
+        }
+        if (val instanceof java.math.BigInteger) {
+            try {
+                return ((java.math.BigInteger) val).longValueExact();
+            } catch (ArithmeticException e) {
+                throw bigintOutOfRange();
+            }
+        }
         if (val instanceof Number) return ((Number) val).longValue();
         if (val instanceof Boolean) return ((Boolean) val) ? 1L : 0L;
         String s = val.toString().trim();
