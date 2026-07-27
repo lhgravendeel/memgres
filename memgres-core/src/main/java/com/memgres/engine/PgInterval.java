@@ -205,6 +205,15 @@ public class PgInterval implements Comparable<PgInterval> {
      * Parse a PostgreSQL interval string like '1 year 2 months 3 days 04:05:06'.
      */
     public static PgInterval parse(String input) {
+        try {
+            return parseInternal(input);
+        } catch (NumberFormatException | ArithmeticException e) {
+            // A field wider than its Java type is a value-range problem, not an engine defect.
+            throw PgErrors.intervalFieldOutOfRange(input == null ? "" : input.trim());
+        }
+    }
+
+    private static PgInterval parseInternal(String input) {
         if (input == null || Strs.isBlank(input)) {
             return new PgInterval(0, 0, 0);
         }

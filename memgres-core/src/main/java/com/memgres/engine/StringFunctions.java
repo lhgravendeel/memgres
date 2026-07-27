@@ -287,7 +287,9 @@ class StringFunctions {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 Object from = executor.evalExpr(fn.args().get(1), ctx);
                 Object to = executor.evalExpr(fn.args().get(2), ctx);
-                return str == null ? null : str.toString().replace(from.toString(), to.toString());
+                // PG is strict here: a NULL in any argument makes the whole call NULL.
+                if (str == null || from == null || to == null) return null;
+                return str.toString().replace(from.toString(), to.toString());
             }
             case "substring":
             case "substr": {
@@ -406,7 +408,12 @@ class StringFunctions {
                 if (str == null) return null;
                 int len = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                 if (len < 0) return "";
-                String fill = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : " ";
+                String fill = " ";
+                if (fn.args().size() > 2) {
+                    Object fillVal = executor.evalExpr(fn.args().get(2), ctx);
+                    if (fillVal == null) return null;
+                    fill = fillVal.toString();
+                }
                 String s = str.toString();
                 if (s.length() >= len) return s.substring(0, len);
                 if (fill.isEmpty()) return s; // avoid infinite loop
@@ -421,7 +428,12 @@ class StringFunctions {
                 if (str == null) return null;
                 int len = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
                 if (len < 0) return "";
-                String fill = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : " ";
+                String fill = " ";
+                if (fn.args().size() > 2) {
+                    Object fillVal = executor.evalExpr(fn.args().get(2), ctx);
+                    if (fillVal == null) return null;
+                    fill = fillVal.toString();
+                }
                 String s = str.toString();
                 if (s.length() >= len) return s.substring(0, len);
                 StringBuilder sb = new StringBuilder(s);
@@ -482,9 +494,12 @@ class StringFunctions {
             case "split_part": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 Object delim = executor.evalExpr(fn.args().get(1), ctx);
-                int field = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                Object fieldVal = executor.evalExpr(fn.args().get(2), ctx);
+                // PG is strict here: a NULL in any argument makes the whole call NULL, and that
+                // is decided before the field position is range-checked.
+                if (str == null || delim == null || fieldVal == null) return null;
+                int field = executor.toInt(fieldVal);
                 if (field == 0) throw new MemgresException("field position must not be zero", "22023");
-                if (str == null) return null;
                 String ds = delim.toString();
                 // PG: empty delimiter → return whole string for any field position
                 if (ds.isEmpty()) {
@@ -877,7 +892,8 @@ class StringFunctions {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 Object from = executor.evalExpr(fn.args().get(1), ctx);
                 Object to = executor.evalExpr(fn.args().get(2), ctx);
-                if (str == null) return null;
+                // PG is strict here: a NULL in any argument makes the whole call NULL.
+                if (str == null || from == null || to == null) return null;
                 String s = str.toString(), f = from.toString(), t = to.toString();
                 StringBuilder sb = new StringBuilder();
                 for (char c : s.toCharArray()) {
@@ -1029,12 +1045,18 @@ class StringFunctions {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
                 Object replacementObj = executor.evalExpr(fn.args().get(1), ctx);
+                // PG is strict here: a NULL replacement makes the whole call NULL.
+                if (replacementObj == null) return null;
                 if (str instanceof byte[] || replacementObj instanceof byte[]) {
                     // bytea overlay
                     byte[] bStr = (str instanceof byte[]) ? (byte[]) str : str.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
                     byte[] bReplacement = (replacementObj instanceof byte[]) ? (byte[]) replacementObj : replacementObj.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                    int startPos = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
-                    int count = fn.args().size() > 3 ? executor.toInt(executor.evalExpr(fn.args().get(3), ctx)) : bReplacement.length;
+                    Object startObj = executor.evalExpr(fn.args().get(2), ctx);
+                    Object countObj = fn.args().size() > 3
+                            ? executor.evalExpr(fn.args().get(3), ctx) : null;
+                    if (startObj == null || (fn.args().size() > 3 && countObj == null)) return null;
+                    int startPos = executor.toInt(startObj);
+                    int count = countObj != null ? executor.toInt(countObj) : bReplacement.length;
                     if (count < 0 || startPos <= 0) {
                         throw new MemgresException("negative substring length not allowed", "22011");
                     }
@@ -1051,8 +1073,12 @@ class StringFunctions {
                     return result;
                 }
                 String replacement = String.valueOf(replacementObj);
-                int startPos = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
-                int count = fn.args().size() > 3 ? executor.toInt(executor.evalExpr(fn.args().get(3), ctx)) : replacement.length();
+                Object startObj = executor.evalExpr(fn.args().get(2), ctx);
+                Object countObj = fn.args().size() > 3
+                        ? executor.evalExpr(fn.args().get(3), ctx) : null;
+                if (startObj == null || (fn.args().size() > 3 && countObj == null)) return null;
+                int startPos = executor.toInt(startObj);
+                int count = countObj != null ? executor.toInt(countObj) : replacement.length();
                 if (count < 0 || startPos <= 0) {
                     throw new MemgresException("negative substring length not allowed", "22011");
                 }
