@@ -148,6 +148,44 @@ class DmlExecutor {
         }
     }
 
+    /**
+     * Validate and insert with the table lock held, so two concurrent inserts of the same key
+     * cannot both pass. When the only thing standing in the way is another session's uncommitted
+     * insert, release the lock and wait for that transaction to settle, then start again — the
+     * wait cannot happen under the lock, because rolling the other transaction back needs it.
+     *
+     * @param checkTable the relation whose constraints describe the row as written
+     * @param targetTable where the row is actually stored, which differs for a partition
+     */
+    private void validateAndInsertWaiting(Table checkTable, Object[] row,
+                                          Table targetTable, Object[] storedRow) {
+        while (true) {
+            ConstraintValidator.PendingUniqueConflict pending;
+            targetTable.getWriteLock().lock();
+            try {
+                pending = executor.constraintValidator
+                        .findUncommittedUniqueConflict(targetTable, storedRow, null);
+                if (pending == null) {
+                    executor.constraintValidator.validateConstraints(checkTable, row, null);
+                    if (targetTable != checkTable) {
+                        executor.constraintValidator.validateConstraints(targetTable, storedRow, null);
+                    }
+                    targetTable.insertRow(storedRow);
+                    return;
+                }
+            } finally {
+                targetTable.getWriteLock().unlock();
+            }
+            awaitPendingInsert(targetTable, pending);
+        }
+    }
+
+    private void awaitPendingInsert(Table table, ConstraintValidator.PendingUniqueConflict pending) {
+        final String key = executor.constraintValidator.uncommittedKey(table);
+        executor.database.awaitConcurrentWrite(executor.session, pending.owner,
+                () -> ConstraintValidator.isStillPending(pending, key), pending.relation);
+    }
+
     QueryResult executeInsert(InsertStmt stmt) {
         return withCteScope(stmt.withClauses(), () -> executeInsertInner(stmt));
     }
@@ -576,16 +614,7 @@ class DmlExecutor {
             Table targetTable = partitionHelper.routeToPartition(table, row);
             // An ATTACHed partition may order its columns differently from the parent.
             Object[] storedRow = targetTable == table ? row : targetTable.rowFromParent(row);
-            targetTable.getWriteLock().lock();
-            try {
-                executor.constraintValidator.validateConstraints(table, row, null);
-                if (targetTable != table) {
-                    executor.constraintValidator.validateConstraints(targetTable, storedRow, null);
-                }
-                targetTable.insertRow(storedRow);
-            } finally {
-                targetTable.getWriteLock().unlock();
-            }
+            validateAndInsertWaiting(table, row, targetTable, storedRow);
             recordInsertUndo(stmt.schema(), targetTable.getName(), storedRow);
             // C10: If routed to a child partition, also sync parent's RR snapshot
             if (targetTable != table && executor.session != null) {
@@ -789,14 +818,7 @@ class DmlExecutor {
                         continue; // Row does not match WHERE clause; skip it
                     }
                 }
-                // Validate + insert atomically under write lock (same as regular INSERT)
-                table.getWriteLock().lock();
-                try {
-                    executor.constraintValidator.validateConstraints(table, row, null);
-                    table.insertRow(row);
-                } finally {
-                    table.getWriteLock().unlock();
-                }
+                validateAndInsertWaiting(table, row, table, row);
                 recordInsertUndo(null, stmt.table(), row);
                 recordRowMeta(null, table, row);
                 inserted++;
@@ -908,14 +930,7 @@ class DmlExecutor {
             row = modified;
         }
 
-        // Validate + insert atomically under write lock (same as regular INSERT)
-        table.getWriteLock().lock();
-        try {
-            executor.constraintValidator.validateConstraints(table, row, null);
-            table.insertRow(row);
-        } finally {
-            table.getWriteLock().unlock();
-        }
+        validateAndInsertWaiting(table, row, table, row);
         recordInsertUndo(null, stmt.table(), row);
         recordRowMeta(null, table, row);
 

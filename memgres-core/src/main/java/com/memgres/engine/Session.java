@@ -701,6 +701,10 @@ public class Session {
     public void rollback() {
         // Clear SSI tracking
         clearSsiState();
+        // Undo the writes before forgetting which rows they were. Clearing the MVCC maps first
+        // leaves a window in which the rows are still in the table but no longer marked as this
+        // session's uncommitted work, so another session would briefly read them as committed.
+        applyUndo(0);
         // Swap MVCC maps to new empty instances (atomic from cross-session readers' perspective)
         uncommittedInserts = new ConcurrentHashMap<>();
         uncommittedUpdates = new ConcurrentHashMap<>();
@@ -718,8 +722,6 @@ public class Session {
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
-        // Apply undo log in reverse
-        applyUndo(0);
         undoLog.clear();
         savepoints.clear();
         deferredFkChecks.clear();
