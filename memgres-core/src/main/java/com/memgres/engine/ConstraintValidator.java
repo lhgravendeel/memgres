@@ -386,9 +386,26 @@ class ConstraintValidator {
             fkVals[i] = row[fkColIndices[i]];
         }
 
-        // NULL FK values are always valid
+        // A NULL means "references nothing". Under the default MATCH SIMPLE one NULL is enough to
+        // excuse the whole key; MATCH FULL wants all of them or none, since half a key cannot
+        // identify a referenced row.
+        int nullCount = 0;
         for (Object val : fkVals) {
-            if (val == null) return;
+            if (val == null) nullCount++;
+        }
+        if (nullCount == fkVals.length && nullCount > 0) return;
+        if (nullCount > 0) {
+            if (!"FULL".equalsIgnoreCase(sc.getMatchType())) return;
+            MemgresException ex = new MemgresException(
+                    "insert or update on table \"" + table.getName() +
+                            "\" violates foreign key constraint \"" + sc.getName() + "\"",
+                    "23503");
+            ex.setConstraint(sc.getName());
+            ex.setTable(table.getName());
+            String schemaName = findSchemaName(table);
+            if (schemaName != null) ex.setSchema(schemaName);
+            ex.setDetail("MATCH FULL does not allow mixing of null and nonnull key values.");
+            throw ex;
         }
 
         // Collect all tables to search (include partitions for partitioned tables)

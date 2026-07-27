@@ -18,6 +18,21 @@ class JsonFunctions {
         this.executor = executor;
     }
 
+    /**
+     * The base argument says which row type to build. Bare {@code record} names no columns, so
+     * there is nothing to populate and PG refuses rather than inventing a shape.
+     */
+    private void requireConcreteRowType(FunctionCallExpr fn, String name) {
+        if (fn.args().isEmpty()) return;
+        com.memgres.engine.parser.ast.Expression base = fn.args().get(0);
+        if (!(base instanceof com.memgres.engine.parser.ast.CastExpr)) return;
+        String typeName = ((com.memgres.engine.parser.ast.CastExpr) base).typeName();
+        if (typeName != null && "record".equalsIgnoreCase(typeName.trim())) {
+            throw new MemgresException(
+                    "could not determine row type for result of " + name, "0A000");
+        }
+    }
+
     private void requireArgs(FunctionCallExpr fn, int min) {
         if (fn.args().size() < min) {
             throw new MemgresException(
@@ -522,6 +537,7 @@ class JsonFunctions {
                 // json_populate_record(base record, json) → record with fields filled from JSON
                 // In our engine, we return the JSON object as a map
                 requireArgs(fn, 2);
+                requireConcreteRowType(fn, name);
                 Object baseArg = executor.evalExpr(fn.args().get(0), ctx);
                 Object jsonArg = executor.evalExpr(fn.args().get(1), ctx);
                 if (jsonArg == null) return baseArg;
