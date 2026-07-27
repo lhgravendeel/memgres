@@ -186,6 +186,85 @@ class DmlExecutor {
                 () -> ConstraintValidator.isStillPending(pending, key), pending.relation);
     }
 
+    /**
+     * Check the ON CONFLICT clause against the target relation before any row is processed.
+     * PostgreSQL settles all of this while planning, so a bad column or constraint name is
+     * reported even when the clause would never have fired.
+     */
+    private void validateOnConflictTarget(InsertStmt stmt, Table table) {
+        InsertStmt.OnConflict oc = stmt.onConflict();
+        if (oc == null) return;
+        if (oc.constraint() != null) {
+            StoredConstraint named = null;
+            for (StoredConstraint sc : table.getConstraints()) {
+                if (sc.getName() != null && sc.getName().equalsIgnoreCase(oc.constraint())) {
+                    named = sc;
+                    break;
+                }
+            }
+            if (named == null) {
+                throw new MemgresException("constraint \"" + oc.constraint()
+                        + "\" for table \"" + table.getName() + "\" does not exist", "42704");
+            }
+            // Arbitration needs a unique index to decide which row was hit; a CHECK or foreign
+            // key has none, so there is nothing to conflict against.
+            if (named.getType() != StoredConstraint.Type.PRIMARY_KEY
+                    && named.getType() != StoredConstraint.Type.UNIQUE) {
+                throw new MemgresException(
+                        "constraint in ON CONFLICT clause has no associated index", "42809");
+            }
+        }
+        if (oc.doUpdate() != null) {
+            for (InsertStmt.SetClause set : oc.doUpdate()) {
+                if (table.getColumnIndex(set.column()) < 0) {
+                    throw new MemgresException("column \"" + set.column() + "\" of relation \""
+                            + table.getName() + "\" does not exist", "42703");
+                }
+            }
+        }
+    }
+
+    /**
+     * The columns the ON CONFLICT clause arbitrates on, or null when they cannot be determined
+     * from the statement alone (an expression target, for instance).
+     */
+    private List<String> conflictArbiterColumns(InsertStmt.OnConflict oc, Table table) {
+        if (oc.columns() != null && !oc.columns().isEmpty()) return oc.columns();
+        if (oc.constraint() != null) {
+            for (StoredConstraint sc : table.getConstraints()) {
+                if (sc.getName() != null && sc.getName().equalsIgnoreCase(oc.constraint())) {
+                    return sc.getColumns();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A key already acted on by DO UPDATE within this statement cannot be acted on again: the
+     * second update would overwrite what the first just wrote, so the result would depend on the
+     * order the rows happened to be processed.
+     */
+    private void rejectSecondUpdateOfSameKey(InsertStmt.OnConflict oc, Table table,
+                                             Object[] row, java.util.Set<String> seenKeys) {
+        if (oc.doUpdate() == null) return; // DO NOTHING may skip the same key repeatedly
+        List<String> cols = conflictArbiterColumns(oc, table);
+        if (cols == null || cols.isEmpty()) return;
+        StringBuilder key = new StringBuilder();
+        for (String col : cols) {
+            int idx = table.getColumnIndex(col);
+            if (idx < 0 || idx >= row.length) return;
+            Object v = row[idx];
+            if (v == null) return; // a null arbiter value never matches anything
+            // Length-prefixed so two values cannot run together into one key.
+            key.append(v.toString().length()).append(':').append(v).append(';');
+        }
+        if (!seenKeys.add(key.toString())) {
+            throw new MemgresException(
+                    "ON CONFLICT DO UPDATE command cannot affect row a second time", "21000");
+        }
+    }
+
     QueryResult executeInsert(InsertStmt stmt) {
         return withCteScope(stmt.withClauses(), () -> executeInsertInner(stmt));
     }
@@ -255,6 +334,9 @@ class DmlExecutor {
                 t -> t.getTiming() == PgTrigger.Timing.INSTEAD_OF && t.getEvent() == PgTrigger.Event.INSERT);
         int inserted = 0;
         List<Object[]> returningRows = new ArrayList<>();
+        // The ON CONFLICT clause describes the relation, not any one row, so it is checked once.
+        validateOnConflictTarget(stmt, table);
+        java.util.Set<String> conflictKeysActedOn = new java.util.HashSet<>();
 
         // Determine source rows: VALUES list or SELECT subquery
         List<List<Expression>> valueRows;
@@ -535,6 +617,7 @@ class DmlExecutor {
                 // validation above intentionally stays against the parent's declared
                 // constraints; the partition carries its own copy (see createPartitionOfTable).
                 Table conflictTable = partitionHelper.routeToPartition(table, row);
+                rejectSecondUpdateOfSameKey(stmt.onConflict(), conflictTable, row, conflictKeysActedOn);
                 Object[] conflictRow = conflictHelper.findConflictingRow(conflictTable, row, stmt.onConflict());
                 if (conflictRow != null) {
                     if (stmt.onConflict().doNothing()) {
