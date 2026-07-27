@@ -450,6 +450,11 @@ class DdlAlterTableExecutor {
             evaluatedDefault = null;
         } else {
             evaluatedDefault = defaultVal != null ? executor.evaluateDefault(defaultVal, dt) : null;
+            // The default has to be storable in the column being created. Accepting one that is
+            // not leaves the table holding a value its own declaration says is impossible.
+            if (evaluatedDefault != null) {
+                TypeCoercion.coerceForStorage(evaluatedDefault, col);
+            }
         }
 
         // Validate default type compatibility

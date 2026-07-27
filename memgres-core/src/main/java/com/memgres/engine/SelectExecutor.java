@@ -504,11 +504,15 @@ class SelectExecutor {
             int effectiveOffset = 0;
             if (stmt.offset() != null) {
                 Object offVal = executor.evalExpr(stmt.offset(), contexts.isEmpty() ? null : contexts.get(0));
-                if (offVal instanceof Number) effectiveOffset = ((Number) offVal).intValue();
+                if (offVal instanceof Number) {
+                    effectiveOffset = clampToSize(((Number) offVal).longValue(), Integer.MAX_VALUE);
+                }
             }
             if (stmt.limit() != null) {
                 Object limVal = executor.evalExpr(stmt.limit(), contexts.isEmpty() ? null : contexts.get(0));
-                if (limVal instanceof Number) effectiveLimit = ((Number) limVal).intValue();
+                if (limVal instanceof Number) {
+                    effectiveLimit = clampToSize(((Number) limVal).longValue(), Integer.MAX_VALUE);
+                }
             }
             int needed = effectiveOffset + effectiveLimit;
             List<RowContext> filtered = new ArrayList<>();
@@ -576,8 +580,8 @@ class SelectExecutor {
                 && stmt.limit() != null && !hasSrf) {
             // Apply OFFSET on contexts
             if (stmt.offset() != null) {
-                int off = executor.toInt(executor.evalExpr(stmt.offset(), null));
-                if (off < 0) throw new MemgresException("OFFSET must not be negative", "2201X");
+                long offRaw = limitOffsetValue(stmt.offset(), false);
+                int off = clampToSize(offRaw < 0 ? 0 : offRaw, contexts.size());
                 if (off > 0 && off < contexts.size()) {
                     contexts = new ArrayList<>(contexts.subList(off, contexts.size()));
                 } else if (off >= contexts.size()) {
@@ -585,9 +589,9 @@ class SelectExecutor {
                 }
             }
             // Apply LIMIT WITH TIES on contexts
-            int lim = executor.toInt(executor.evalExpr(stmt.limit(), null));
-            if (lim < 0) throw new MemgresException("LIMIT must not be negative", "2201W");
-            if (lim < contexts.size() && !contexts.isEmpty()) {
+            long limRaw = limitOffsetValue(stmt.limit(), true);
+            int lim = clampToSize(limRaw < 0 ? Integer.MAX_VALUE : limRaw, contexts.size());
+            if (limRaw >= 0 && lim < contexts.size() && !contexts.isEmpty()) {
                 RowContext lastCtx = contexts.get(lim - 1);
                 int end = lim;
                 while (end < contexts.size()) {
@@ -914,20 +918,51 @@ class SelectExecutor {
         return resultRows;
     }
 
+
+    /**
+     * LIMIT and OFFSET are bigint in PostgreSQL. Narrowing them to int made any value above
+     * 2^31 wrap negative and then fail its own sign check, reporting a negative limit for a
+     * number the caller wrote as positive.
+     */
+    private long limitOffsetValue(Expression expr, boolean isLimit) {
+        Object raw = executor.evalExpr(expr, null);
+        if (raw == null) return -1; // NULL means "no limit", as in PG
+        long value;
+        try {
+            value = executor.toLong(raw);
+        } catch (NumberFormatException e) {
+            throw new MemgresException(
+                    "invalid input syntax for type bigint: \"" + raw + "\"", "22P02");
+        }
+        if (value < 0) {
+            throw new MemgresException((isLimit ? "LIMIT" : "OFFSET") + " must not be negative",
+                    isLimit ? "2201W" : "2201X");
+        }
+        return value;
+    }
+
+    /** Clamp a bigint row count down to something a list index can hold. */
+    private static int clampToSize(long value, int size) {
+        if (value >= size) return size;
+        return (int) value;
+    }
+
     List<Object[]> applyOffsetAndLimit(SelectStmt stmt, List<Object[]> resultRows) {
         if (stmt.offset() != null) {
-            int off = executor.toInt(executor.evalExpr(stmt.offset(), null));
-            if (off < 0) throw new MemgresException("OFFSET must not be negative", "2201X");
-            if (off > 0 && off < resultRows.size()) {
-                resultRows = new ArrayList<>(resultRows.subList(off, resultRows.size()));
-            } else if (off >= resultRows.size()) {
-                resultRows = Cols.listOf();
+            long offRaw = limitOffsetValue(stmt.offset(), false);
+            int off = clampToSize(offRaw, resultRows.size());
+            if (offRaw >= 0) {
+                if (off > 0 && off < resultRows.size()) {
+                    resultRows = new ArrayList<>(resultRows.subList(off, resultRows.size()));
+                } else if (off >= resultRows.size()) {
+                    resultRows = Cols.listOf();
+                }
             }
         }
         if (stmt.limit() != null) {
-            int lim = executor.toInt(executor.evalExpr(stmt.limit(), null));
-            if (lim < 0) throw new MemgresException("LIMIT must not be negative", "2201W");
-            if (lim < resultRows.size()) {
+            long limRaw = limitOffsetValue(stmt.limit(), true);
+            int lim = clampToSize(limRaw < 0 ? Integer.MAX_VALUE : limRaw, resultRows.size());
+            if (limRaw >= 0 && lim < resultRows.size()) {
                 if (stmt.withTies() && stmt.orderBy() != null && !stmt.orderBy().isEmpty() && !resultRows.isEmpty()) {
                     // WITH TIES: include additional rows tied with the last row by ORDER BY values
                     Object[] lastRow = resultRows.get(lim - 1);
@@ -1285,14 +1320,8 @@ class SelectExecutor {
             List<RowContext> virtualContexts = Cols.listOf(virtualCtx);
             return windowEvaluator.executeWindowSelect(stmt, virtualContexts, virtualCtx.getBindings());
         }
-        if (stmt.limit() != null) {
-            int lim = executor.toInt(executor.evalExpr(stmt.limit(), null));
-            if (lim < 0) throw new MemgresException("LIMIT must not be negative", "2201W");
-        }
-        if (stmt.offset() != null) {
-            int off = executor.toInt(executor.evalExpr(stmt.offset(), null));
-            if (off < 0) throw new MemgresException("OFFSET must not be negative", "2201X");
-        }
+        if (stmt.limit() != null) limitOffsetValue(stmt.limit(), true);
+        if (stmt.offset() != null) limitOffsetValue(stmt.offset(), false);
         if (stmt.where() != null) {
             Object whereVal = executor.evalExpr(stmt.where(), null);
             if (whereVal instanceof Number) {
@@ -1437,19 +1466,14 @@ class SelectExecutor {
                 });
             }
             // Apply OFFSET + LIMIT
-            if (stmt.offset() != null) {
-                int off = executor.toInt(executor.evalExpr(stmt.offset(), null));
-                if (off > 0 && off < rows.size()) rows = new ArrayList<>(rows.subList(off, rows.size()));
-                else if (off >= rows.size()) rows = Cols.listOf();
-            }
-            if (stmt.limit() != null) {
-                int lim = executor.toInt(executor.evalExpr(stmt.limit(), null));
-                if (lim < rows.size()) rows = new ArrayList<>(rows.subList(0, lim));
-            }
-            return QueryResult.select(columns, rows);
+            return QueryResult.select(columns, applyOffsetAndLimit(stmt, rows));
         }
 
-        return QueryResult.select(columns, Collections.singletonList(values));
+        // A row list of one still has to honour LIMIT and OFFSET; skipping that made LIMIT 0
+        // return the row it was told to exclude.
+        List<Object[]> single = new ArrayList<>();
+        single.add(values);
+        return QueryResult.select(columns, applyOffsetAndLimit(stmt, single));
     }
 
     private void collectUsingColumns(List<SelectStmt.FromItem> fromItems, Set<String> result) {
