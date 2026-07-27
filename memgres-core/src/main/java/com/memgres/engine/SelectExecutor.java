@@ -103,11 +103,10 @@ class SelectExecutor {
 
     private QueryResult executeSelectInner(SelectStmt stmt) {
         rejectMisplacedSrfs(stmt);
-        rejectSrfInAggregates(stmt);
-        validateDistinctOn(stmt);
-        validateFromClause(stmt.from());
         // SELECT without FROM
         if (stmt.from() == null || stmt.from().isEmpty()) {
+            rejectSrfInAggregates(stmt);
+            validateDistinctOn(stmt);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
                     || (stmt.having() != null && containsAggregate(stmt.having()));
             if (hasAgg) {
@@ -123,6 +122,12 @@ class SelectExecutor {
         }
 
         List<RowContext> contexts = executor.fromResolver.resolveFromClause(stmt.from(), stmt.where());
+
+        // PostgreSQL builds the range table before it analyses the rest of the query, so a name
+        // that does not resolve is reported on its own even when the clauses are also wrong.
+        rejectSrfInAggregates(stmt);
+        validateDistinctOn(stmt);
+        validateFromClause(stmt.from());
 
         List<RowContext.TableBinding> baseBindings;
         if (!contexts.isEmpty()) {
