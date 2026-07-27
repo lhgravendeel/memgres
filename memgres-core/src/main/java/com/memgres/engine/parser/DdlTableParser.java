@@ -13,6 +13,11 @@ import java.util.List;
  * extracted from DdlParser.
  */
 class DdlTableParser {
+    /** The properties LIKE can copy. Anything else is a syntax error, not a silently ignored word. */
+    private static final java.util.Set<String> LIKE_OPTIONS = Cols.setOf(
+            "ALL", "COMMENTS", "COMPRESSION", "CONSTRAINTS", "DEFAULTS", "GENERATED",
+            "IDENTITY", "INDEXES", "STATISTICS", "STORAGE");
+
     private final Parser parser;
     private final List<TableConstraint> pendingColumnChecks = new ArrayList<>();
 
@@ -120,7 +125,11 @@ class DdlTableParser {
                 StringBuilder likeOpts = new StringBuilder();
                 while (parser.matchKeyword("INCLUDING") || parser.matchKeyword("EXCLUDING")) {
                     boolean including = parser.tokens.get(parser.pos - 1).value().equals("INCLUDING");
+                    Token optToken = parser.peek();
                     String what = parser.readIdentifier().toUpperCase();
+                    if (!LIKE_OPTIONS.contains(what)) {
+                        throw new ParseException("syntax error", optToken);
+                    }
                     if (including) {
                         if (likeOpts.length() > 0) likeOpts.append(",");
                         likeOpts.append(what);
@@ -190,7 +199,10 @@ class DdlTableParser {
                 onCommitAction = "DROP";
             } else if (parser.matchKeywords("DELETE", "ROWS")) {
                 onCommitAction = "DELETE ROWS";
-            } else if (parser.matchKeywords("PRESERVE", "ROWS")) {
+            } else {
+                // PRESERVE is not reserved, so it arrives as a plain identifier.
+                parser.readIdentifier();
+                parser.matchKeyword("ROWS");
                 onCommitAction = "PRESERVE ROWS";
             }
         }
@@ -400,6 +412,7 @@ class DdlTableParser {
             }
             if (parser.matchKeyword("COLLATE")) {
                 if (!parser.isClauseKeyword()) {
+                    com.memgres.engine.DdlDefinitionChecks.rejectUncollatableType(typeName);
                     String collation = parser.readIdentifier();
                     if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
                     ExpressionParser.validateCollationStatic(collation, parser.peek());

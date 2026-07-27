@@ -627,7 +627,7 @@ class DdlParser {
         parser.expectKeyword("TABLE");
 
         boolean ifExists = parser.matchKeywords("IF", "EXISTS");
-        parser.matchKeyword("ONLY");
+        boolean only = parser.matchKeyword("ONLY");
         String schema = null;
         String table = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) { schema = table; table = parser.readIdentifier(); }
@@ -637,7 +637,7 @@ class DdlParser {
             actions.add(alterActionParser.parseAlterAction());
         } while (parser.match(TokenType.COMMA));
 
-        return new AlterTableStmt(schema, table, actions, ifExists);
+        return new AlterTableStmt(schema, table, actions, ifExists, only);
     }
 
     // ---- CREATE TRIGGER ----
