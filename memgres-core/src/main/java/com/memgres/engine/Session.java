@@ -1290,6 +1290,40 @@ public class Session {
         onCommitDeleteRowsTables.add(new String[]{schema, tableName});
     }
 
+    // ---- Nested execution (a function or DO body running inside one outer statement) ----
+
+    /** Depth of function/DO bodies currently running; 0 means we are at statement level. */
+    private int nestedExecutionDepth;
+    /** ON COMMIT DROP tables owed to the end of the outer statement, in autocommit. */
+    private final List<String[]> statementEndDropTables = new ArrayList<>();
+
+    public void enterNestedExecution() {
+        nestedExecutionDepth++;
+    }
+
+    /**
+     * A body that has finished ends the statement it was part of, once the outermost one returns.
+     * Anything a nested body created ON COMMIT DROP dies here — the equivalent, for an autocommit
+     * statement, of the implicit transaction committing.
+     */
+    public void exitNestedExecution() {
+        if (nestedExecutionDepth > 0) nestedExecutionDepth--;
+        if (nestedExecutionDepth > 0 || statementEndDropTables.isEmpty()) return;
+        for (String[] pair : statementEndDropTables) {
+            Schema s = database.getSchema(pair[0]);
+            if (s != null) s.removeTable(pair[1]);
+        }
+        statementEndDropTables.clear();
+    }
+
+    public boolean isInNestedExecution() {
+        return nestedExecutionDepth > 0;
+    }
+
+    public void registerStatementEndDrop(String schema, String tableName) {
+        statementEndDropTables.add(new String[]{schema, tableName});
+    }
+
     // ---- Deferred constraint checks ----
 
         public static final class DeferredFkCheck {

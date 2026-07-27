@@ -267,6 +267,10 @@ class DdlTableExecutor {
         if ("DROP".equals(stmt.onCommitAction()) && executor.session != null) {
             if (executor.session.isInTransaction()) {
                 executor.session.registerOnCommitDrop(schemaName, stmt.name());
+            } else if (executor.session.isInNestedExecution()) {
+                // A function body is part of one outer statement, so the table has to outlive the
+                // CREATE and die when that statement does — not the moment it is created.
+                executor.session.registerStatementEndDrop(schemaName, stmt.name());
             } else {
                 schema.removeTable(stmt.name());
             }
