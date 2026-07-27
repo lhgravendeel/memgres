@@ -103,6 +103,7 @@ class SelectExecutor {
 
     private QueryResult executeSelectInner(SelectStmt stmt) {
         rejectMisplacedSrfs(stmt);
+        windowEvaluator.validateWindowUsage(stmt);
         // SELECT without FROM
         if (stmt.from() == null || stmt.from().isEmpty()) {
             boolean hasAgg = hasAggregateInTargets(stmt.targets())

@@ -386,6 +386,12 @@ class SelectParser {
                     winFrame = parser.parseWindowFrame();
                 }
                 parser.expect(TokenType.RIGHT_PAREN);
+                for (SelectStmt.WindowDef existing : windowDefs) {
+                    if (existing.name().equalsIgnoreCase(winName)) {
+                        throw new com.memgres.engine.MemgresException(
+                                "window \"" + winName + "\" is already defined", "42P20");
+                    }
+                }
                 windowDefs.add(new SelectStmt.WindowDef(winName, winRefName, winPartitionBy, winOrderBy, winFrame));
             } while (parser.match(TokenType.COMMA));
         }
