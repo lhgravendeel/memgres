@@ -155,6 +155,41 @@ class FunctionEvaluator {
         }
     }
 
+    /**
+     * The declared array type of a column, or null when the expression does not name one. PG
+     * spells array types with a leading underscore in the catalog, so that is what identifies one.
+     */
+    private DataType arrayColumnType(Expression expr, RowContext ctx) {
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName();
+            if (name == null) return null;
+            String trimmed = name.trim();
+            if (!trimmed.endsWith("[]")) return null;
+            return DataType.fromPgName("_" + trimmed.substring(0, trimmed.length() - 2).trim());
+        }
+        if (!(expr instanceof ColumnRef) || ctx == null) return null;
+        ColumnRef ref = (ColumnRef) expr;
+        for (RowContext.TableBinding b : ctx.getBindings()) {
+            if (b.table() == null) continue;
+            if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
+                    && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+            int idx = b.table().getColumnIndex(ref.column());
+            if (idx < 0) continue;
+            DataType t = b.table().getColumns().get(idx).getType();
+            if (t != null && t.getPgName() != null && t.getPgName().startsWith("_")) return t;
+            return null;
+        }
+        return null;
+    }
+
+    /** {@code _int4} holds int4 elements; drop the underscore to name what goes in it. */
+    private DataType elementTypeOf(DataType arrayType) {
+        if (arrayType == null || arrayType.getPgName() == null) return null;
+        String name = arrayType.getPgName();
+        if (!name.startsWith("_")) return null;
+        return DataType.fromPgName(name.substring(1));
+    }
+
     Object evalFunction(FunctionCallExpr fn, RowContext ctx) {
         String name = fn.name().toLowerCase();
         // Strip schema prefixes for built-in function resolution
@@ -1269,6 +1304,32 @@ class FunctionEvaluator {
                     }
                 }
                 return rows;
+            }
+            // UPDATE t SET a[lo:hi] = value — a slice only ever names part of an array.
+            case "__array_assign_slice__": {
+                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                int lo = executor.toInt(executor.evalExpr(fn.args().get(1), ctx));
+                int hi = executor.toInt(executor.evalExpr(fn.args().get(2), ctx));
+                Object value = executor.evalExpr(fn.args().get(3), ctx);
+                return executor.arrayOperationHandler.assignSlice(arr, lo, hi, value);
+            }
+            // UPDATE t SET a[k] = value — an array index or a JSON key, told apart by the
+            // column's declared type rather than by how the subscript happens to be written.
+            case "__subscript_assign__": {
+                Expression target = fn.args().get(0);
+                DataType arrayType = arrayColumnType(target, ctx);
+                if (arrayType != null) {
+                    Object arr = executor.evalExpr(target, ctx);
+                    Object value = executor.evalExpr(fn.args().get(3), ctx);
+                    Object keyVal = executor.evalExpr(fn.args().get(4), ctx);
+                    // The element still has to fit the array's element type, as it would on insert.
+                    DataType elemType = elementTypeOf(arrayType);
+                    if (elemType != null) value = TypeCoercion.coerce(value, elemType);
+                    return executor.arrayOperationHandler.assignElement(
+                            arr, executor.toInt(keyVal), value);
+                }
+                return evalFunction(new FunctionCallExpr("jsonb_set",
+                        Cols.listOf(target, fn.args().get(1), fn.args().get(2))), ctx);
             }
             case "array_cat": {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);

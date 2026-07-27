@@ -16,6 +16,54 @@ class ArrayOperationHandler {
         this.executor = executor;
     }
 
+    /** Read an array value in any of the shapes it may arrive in, or null if it is not one. */
+    private List<Object> asElements(Object arrVal) {
+        if (arrVal == null) return new ArrayList<Object>();
+        if (arrVal instanceof List<?>) return new ArrayList<Object>((List<?>) arrVal);
+        if (arrVal instanceof String) {
+            String s = ((String) arrVal).trim();
+            if (s.startsWith("{") && s.endsWith("}")) {
+                return new ArrayList<Object>(FunctionEvaluator.parseSimplePgArray(s));
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Assign one element of an array, 1-based. Writing past the end grows the array and leaves
+     * NULLs in the gap, the way PG does.
+     */
+    Object assignElement(Object arrVal, int index, Object value) {
+        List<Object> elements = asElements(arrVal);
+        if (elements == null) return arrVal;
+        if (index < 1) return formatArrayForOutput(elements);
+        while (elements.size() < index) elements.add(null);
+        elements.set(index - 1, value);
+        return formatArrayForOutput(elements);
+    }
+
+    /**
+     * Replace the elements between two 1-based bounds with the elements of {@code value}. A slice
+     * that reaches past the end extends the array rather than being clipped to it.
+     */
+    Object assignSlice(Object arrVal, int lower, int upper, Object value) {
+        List<Object> elements = asElements(arrVal);
+        if (elements == null) return arrVal;
+        List<Object> replacement = asElements(value);
+        if (replacement == null) {
+            replacement = new ArrayList<Object>();
+            replacement.add(value);
+        }
+        if (lower < 1) lower = 1;
+        if (upper < lower) return formatArrayForOutput(elements);
+        while (elements.size() < upper) elements.add(null);
+        for (int i = lower; i <= upper; i++) {
+            int replIdx = i - lower;
+            elements.set(i - 1, replIdx < replacement.size() ? replacement.get(replIdx) : null);
+        }
+        return formatArrayForOutput(elements);
+    }
+
     Object evalArraySlice(ArraySliceExpr slice, RowContext ctx) {
         Object arrVal = executor.evalExpr(slice.array(), ctx);
         if (arrVal == null) return null;
