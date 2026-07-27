@@ -182,7 +182,7 @@ class ViewsJoinsReadTest {
             assertTrue(rs.next()); assertEquals("Engineering", rs.getString(1)); assertEquals(270000.0, rs.getDouble(2));
             assertTrue(rs.next()); assertEquals("HR", rs.getString(1)); assertEquals(65000.0, rs.getDouble(2));
 
-            s.execute("DROP VIEW mv_dept_totals");
+            s.execute("DROP MATERIALIZED VIEW mv_dept_totals");
         }
     }
 
@@ -205,7 +205,7 @@ class ViewsJoinsReadTest {
 
             // Clean up
             s.execute("DELETE FROM employees WHERE id IN (100, 101)");
-            s.execute("DROP VIEW mv_count");
+            s.execute("DROP MATERIALIZED VIEW mv_count");
         }
     }
 
@@ -233,7 +233,7 @@ class ViewsJoinsReadTest {
             assertEquals(before + 1, rs.getInt(1), "After REFRESH, materialized view should have updated data");
 
             s.execute("DELETE FROM employees WHERE id = 200");
-            s.execute("DROP VIEW mv_refresh_test");
+            s.execute("DROP MATERIALIZED VIEW mv_refresh_test");
         }
     }
 
@@ -252,7 +252,7 @@ class ViewsJoinsReadTest {
             assertEquals("Project Alpha", rs.getString(1));
             assertEquals(3, rs.getInt(2));
 
-            s.execute("DROP VIEW mv_project_summary");
+            s.execute("DROP MATERIALIZED VIEW mv_project_summary");
         }
     }
 
@@ -721,7 +721,7 @@ class ViewsJoinsReadTest {
             assertTrue(rs.next()); assertEquals("Hank", rs.getString(1));
             assertTrue(rs.next()); assertEquals("Alice", rs.getString(1));
 
-            s.execute("DROP VIEW mv_salaries");
+            s.execute("DROP MATERIALIZED VIEW mv_salaries");
         }
     }
 

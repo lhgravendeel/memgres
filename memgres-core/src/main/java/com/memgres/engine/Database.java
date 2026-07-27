@@ -846,6 +846,35 @@ public class Database {
         return schemas.computeIfAbsent(name, Schema::new);
     }
 
+    /**
+     * Rename a schema, carrying its contents with it. The schema object holds the tables, so it
+     * is re-keyed rather than rebuilt; anything that records the schema name separately is
+     * updated so the catalog and name resolution keep agreeing.
+     */
+    public void renameSchema(String oldName, String newName) {
+        Schema existing = schemas.get(oldName);
+        if (existing == null) {
+            throw new MemgresException("schema \"" + oldName + "\" does not exist", "3F000");
+        }
+        if (schemas.containsKey(newName)) {
+            throw new MemgresException("schema \"" + newName + "\" already exists", "42P06");
+        }
+        Schema renamed = new Schema(newName);
+        for (Map.Entry<String, Table> t : existing.getTables().entrySet()) {
+            renamed.addTable(t.getValue());
+        }
+        schemas.remove(oldName);
+        schemas.put(newName, renamed);
+        for (Map.Entry<String, ViewDef> e : new LinkedHashMap<>(views).entrySet()) {
+            ViewDef v = e.getValue();
+            if (oldName.equalsIgnoreCase(v.schemaName())) {
+                views.put(e.getKey(), new ViewDef(v.name(), newName, v.query(), v.orReplace(),
+                        v.materialized(), v.cachedColumns(), v.cachedRows(), v.sourceSQL(),
+                        v.checkOption(), v.reloptions(), v.populated()));
+            }
+        }
+    }
+
     public Map<String, Schema> getSchemas() {
         return schemas;
     }

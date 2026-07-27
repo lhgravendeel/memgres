@@ -444,6 +444,25 @@ class DdlViewExecutor {
 
     // ---- REFRESH MATERIALIZED VIEW ----
 
+    /** True when the view carries a unique index that CONCURRENTLY can match rows through. */
+    private boolean hasUniqueIndexForConcurrentRefresh(Database.ViewDef view) {
+        for (Map.Entry<String, String> e : executor.database.getIndexTableNames().entrySet()) {
+            String owner = e.getValue();
+            if (owner == null) continue;
+            // Index metadata records the table schema-qualified.
+            String bareOwner = owner.contains(".")
+                    ? owner.substring(owner.lastIndexOf('.') + 1) : owner;
+            if (!view.name().equalsIgnoreCase(bareOwner)) continue;
+            String indexName = e.getKey();
+            // A partial index does not cover every row, so it cannot identify them all.
+            if (executor.database.isUniqueIndex(indexName)
+                    && executor.database.getIndexWhereClause(indexName) == null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     QueryResult executeRefreshMaterializedView(RefreshMaterializedViewStmt stmt) {
         Database.ViewDef view = executor.database.getView(stmt.name());
         if (view == null) {
@@ -451,6 +470,23 @@ class DdlViewExecutor {
         }
         if (!view.materialized()) {
             throw new MemgresException("\"" + stmt.name() + "\" is not a materialized view");
+        }
+        if (stmt.concurrently()) {
+            // CONCURRENTLY replaces rows one by one instead of swapping the whole relation, so
+            // it needs a unique index to tell which stored row each new row corresponds to.
+            if (!stmt.withData()) {
+                throw new MemgresException(
+                        "CONCURRENTLY and WITH NO DATA options cannot be used together", "0A000");
+            }
+            if (!hasUniqueIndexForConcurrentRefresh(view)) {
+                String qualified = (view.schemaName() != null ? view.schemaName() : "public")
+                        + "." + view.name();
+                MemgresException e = new MemgresException("cannot refresh materialized view \""
+                        + qualified + "\" concurrently", "55000");
+                e.setHint("Create a unique index with no WHERE clause on one or more columns"
+                        + " of the materialized view.");
+                throw e;
+            }
         }
         if (!stmt.withData()) {
             // REFRESH ... WITH NO DATA: discard rows and mark the view unpopulated again

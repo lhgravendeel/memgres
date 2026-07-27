@@ -40,6 +40,9 @@ class DdlAlterTableExecutor {
 
     QueryResult executeAlterTable(AlterTableStmt stmt) {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        rejectActionsOnOtherRelationKinds(stmt);
+        QueryResult viewResult = alterViewRelation(stmt);
+        if (viewResult != null) return viewResult;
         Table table;
         try {
             table = executor.resolveTable(schemaName, stmt.table());
@@ -64,6 +67,168 @@ class DdlAlterTableExecutor {
         }
 
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /**
+     * Rename actions aimed at a view have to change the view definition, which is what the
+     * catalog reads. Routing them through the table path renamed a shadow relation instead,
+     * leaving the view registered under its old name and its columns untouched.
+     *
+     * @return the result when the statement targeted a view, or null to continue as a table
+     */
+    private QueryResult alterViewRelation(AlterTableStmt stmt) {
+        String bare = stmt.table().contains(".")
+                ? stmt.table().substring(stmt.table().lastIndexOf('.') + 1) : stmt.table();
+        Database.ViewDef view = executor.database.getView(bare);
+        if (view == null) return null;
+        for (AlterTableStmt.AlterAction action : stmt.actions()) {
+            // Anything else the view accepts, such as a column default, is left to the ordinary
+            // path rather than half-handled here.
+            if (!(action instanceof AlterTableStmt.RenameTable
+                    || action instanceof AlterTableStmt.RenameColumn
+                    || action instanceof AlterTableStmt.SetSchema)) {
+                return null;
+            }
+        }
+        for (AlterTableStmt.AlterAction action : stmt.actions()) {
+            if (action instanceof AlterTableStmt.RenameTable) {
+                String newName = ((AlterTableStmt.RenameTable) action).newName();
+                if (executor.database.getView(newName) != null
+                        || executor.database.getSchema(view.schemaName() != null
+                            ? view.schemaName() : executor.defaultSchema()) != null
+                        && executor.database.getSchema(view.schemaName() != null
+                            ? view.schemaName() : executor.defaultSchema()).getTable(newName) != null) {
+                    throw new MemgresException("relation \"" + newName + "\" already exists", "42P07");
+                }
+                executor.database.removeView(bare);
+                executor.database.addView(withViewName(view, newName, view.cachedColumns()));
+                view = executor.database.getView(newName);
+                bare = newName;
+            } else if (action instanceof AlterTableStmt.RenameColumn) {
+                AlterTableStmt.RenameColumn rc = (AlterTableStmt.RenameColumn) action;
+                List<Column> renamed = renameViewColumn(view, rc.oldName(), rc.newName(), bare);
+                executor.database.addView(withViewName(view, bare, renamed));
+                view = executor.database.getView(bare);
+            } else if (action instanceof AlterTableStmt.SetSchema) {
+                String target = ((AlterTableStmt.SetSchema) action).newSchema();
+                if (executor.database.getSchema(target) == null) {
+                    throw new MemgresException("schema \"" + target + "\" does not exist", "3F000");
+                }
+                executor.database.removeView(bare);
+                executor.database.addView(new Database.ViewDef(view.name(), target, view.query(),
+                        view.orReplace(), view.materialized(), view.cachedColumns(),
+                        view.cachedRows(), view.sourceSQL(), view.checkOption(),
+                        view.reloptions(), view.populated()));
+                view = executor.database.getView(bare);
+            }
+        }
+        return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    private List<Column> renameViewColumn(Database.ViewDef view, String oldName, String newName,
+                                           String relation) {
+        List<Column> cols = view.cachedColumns();
+        if (cols == null) {
+            throw new MemgresException("column \"" + oldName + "\" of relation \"" + relation
+                    + "\" does not exist", "42703");
+        }
+        List<Column> out = new ArrayList<>();
+        boolean found = false;
+        for (Column c : cols) {
+            if (c.getName().equalsIgnoreCase(newName)) {
+                throw new MemgresException("column \"" + newName + "\" of relation \"" + relation
+                        + "\" already exists", "42701");
+            }
+        }
+        for (Column c : cols) {
+            if (c.getName().equalsIgnoreCase(oldName)) {
+                found = true;
+                out.add(c.withName(newName));
+            } else {
+                out.add(c);
+            }
+        }
+        if (!found) {
+            throw new MemgresException("column \"" + oldName + "\" of relation \"" + relation
+                    + "\" does not exist", "42703");
+        }
+        return out;
+    }
+
+    private Database.ViewDef withViewName(Database.ViewDef view, String name, List<Column> cols) {
+        return new Database.ViewDef(name, view.schemaName(), view.query(), view.orReplace(),
+                view.materialized(), cols, view.cachedRows(), view.sourceSQL(),
+                view.checkOption(), view.reloptions(), view.populated());
+    }
+
+    /**
+     * ALTER TABLE reaches views, materialized views and sequences too, but only for the actions
+     * that are about the relation's name or ownership. Anything that would reshape stored rows
+     * has no meaning on those, and PostgreSQL names the offending action when it refuses.
+     */
+    private void rejectActionsOnOtherRelationKinds(AlterTableStmt stmt) {
+        String bare = stmt.table().contains(".")
+                ? stmt.table().substring(stmt.table().lastIndexOf('.') + 1) : stmt.table();
+        Database.ViewDef view = executor.database.getView(bare);
+        boolean isSequence = view == null && executor.database.hasSequence(bare);
+        if (view == null && !isSequence) return;
+        for (AlterTableStmt.AlterAction action : stmt.actions()) {
+            if (action instanceof AlterTableStmt.RenameTable
+                    || action instanceof AlterTableStmt.SetSchema
+                    || action instanceof AlterTableStmt.OwnerTo) {
+                continue;
+            }
+            // Renaming a column, and giving one a default that INSERT through the view can
+            // use, are both meaningful for a view but not for a sequence.
+            if (view != null && (action instanceof AlterTableStmt.RenameColumn
+                    || isColumnDefaultAction(action))) {
+                continue;
+            }
+            throw new MemgresException("ALTER action " + alterActionName(action)
+                    + " cannot be performed on relation \"" + bare + "\"", "42809");
+        }
+    }
+
+    /** True for ALTER COLUMN ... SET/DROP DEFAULT, which a view accepts. */
+    private static boolean isColumnDefaultAction(AlterTableStmt.AlterAction action) {
+        if (!(action instanceof AlterTableStmt.AlterColumn)) return false;
+        AlterTableStmt.AlterColumnAction inner = ((AlterTableStmt.AlterColumn) action).action();
+        return inner instanceof AlterTableStmt.SetDefault
+                || inner instanceof AlterTableStmt.DropDefault;
+    }
+
+    /** The action's name as PostgreSQL spells it when reporting an unsupported ALTER. */
+    private static String alterActionName(AlterTableStmt.AlterAction action) {
+        if (action instanceof AlterTableStmt.AddColumn) return "ADD COLUMN";
+        if (action instanceof AlterTableStmt.DropColumn) return "DROP COLUMN";
+        if (action instanceof AlterTableStmt.AddConstraint) return "ADD CONSTRAINT";
+        if (action instanceof AlterTableStmt.DropConstraint) return "DROP CONSTRAINT";
+        if (action instanceof AlterTableStmt.ValidateConstraint) return "VALIDATE CONSTRAINT";
+        if (action instanceof AlterTableStmt.RenameConstraint) return "RENAME CONSTRAINT";
+        if (action instanceof AlterTableStmt.AttachPartition) return "ATTACH PARTITION";
+        if (action instanceof AlterTableStmt.DetachPartition) return "DETACH PARTITION";
+        if (action instanceof AlterTableStmt.Inherit) return "INHERIT";
+        if (action instanceof AlterTableStmt.NoInherit) return "NO INHERIT";
+        if (action instanceof AlterTableStmt.EnableRls) return "ENABLE ROW SECURITY";
+        if (action instanceof AlterTableStmt.DisableRls) return "DISABLE ROW SECURITY";
+        if (action instanceof AlterTableStmt.ForceRls) return "FORCE ROW SECURITY";
+        if (action instanceof AlterTableStmt.NoForceRls) return "NO FORCE ROW SECURITY";
+        if (action instanceof AlterTableStmt.SetLogged) return "SET LOGGED";
+        if (action instanceof AlterTableStmt.SetStorageParams) return "SET";
+        if (action instanceof AlterTableStmt.AlterColumn) {
+            return "ALTER COLUMN ... " + alterColumnActionName(
+                    ((AlterTableStmt.AlterColumn) action).action());
+        }
+        return "ALTER";
+    }
+
+    private static String alterColumnActionName(AlterTableStmt.AlterColumnAction action) {
+        if (action instanceof AlterTableStmt.SetNotNull) return "SET NOT NULL";
+        if (action instanceof AlterTableStmt.DropNotNull) return "DROP NOT NULL";
+        if (action instanceof AlterTableStmt.SetDefault) return "SET DEFAULT";
+        if (action instanceof AlterTableStmt.DropDefault) return "DROP DEFAULT";
+        if (action instanceof AlterTableStmt.SetType) return "SET DATA TYPE";
+        return "ALTER";
     }
 
     private Table executeAction(AlterTableStmt.AlterAction action, Table table,
@@ -159,7 +324,13 @@ class DdlAlterTableExecutor {
         } else if (action instanceof AlterTableStmt.SetSchema) {
             AlterTableStmt.SetSchema setSchema = (AlterTableStmt.SetSchema) action;
             Schema oldSchema = executor.database.getSchema(schemaName);
-            Schema newSchema = executor.database.getOrCreateSchema(setSchema.newSchema());
+            // Creating the destination on demand would move the table somewhere nothing can
+            // name, which loses it outright.
+            Schema newSchema = executor.database.getSchema(setSchema.newSchema());
+            if (newSchema == null) {
+                throw new MemgresException("schema \"" + setSchema.newSchema()
+                        + "\" does not exist", "3F000");
+            }
             oldSchema.removeTable(stmt.table());
             newSchema.addTable(table);
             retargetDependents(schemaName, stmt.table(), setSchema.newSchema(), stmt.table());

@@ -1435,6 +1435,7 @@ class DdlObjectExecutor {
     QueryResult executeDropStmt(DropStmt stmt) {
         switch (stmt.objectType()) {
             case VIEW:
+            case MATERIALIZED_VIEW:
                 dropView(stmt);
                 break;
             case SEQUENCE:
@@ -1545,12 +1546,22 @@ class DdlObjectExecutor {
     }
 
     private void dropView(DropStmt stmt) {
+        // A materialized view is a different kind of object from a view, and dropping one by the
+        // wrong name would destroy stored data on what is usually a typo.
+        Database.ViewDef existing = executor.database.getView(stmt.name());
+        boolean wantMaterialized = stmt.objectType() == DropStmt.ObjectType.MATERIALIZED_VIEW;
+        if (existing != null && existing.materialized() != wantMaterialized) {
+            throw new MemgresException("\"" + stmt.name() + "\" is not a "
+                    + (wantMaterialized ? "materialized view" : "view"), "42809");
+        }
         if (!stmt.ifExists()) {
-            if (!executor.database.hasView(stmt.name())) {
+            if (existing == null) {
                 if (ddl.resolveTableOrNull(stmt.name()) != null) {
-                    throw new MemgresException("\"" + stmt.name() + "\" is not a view", "42809");
+                    throw new MemgresException("\"" + stmt.name() + "\" is not a "
+                            + (wantMaterialized ? "materialized view" : "view"), "42809");
                 }
-                throw new MemgresException("view \"" + stmt.name() + "\" does not exist", "42P01");
+                throw new MemgresException((wantMaterialized ? "materialized view \"" : "view \"")
+                        + stmt.name() + "\" does not exist", "42P01");
             }
         }
         Database.ViewDef oldView = executor.database.getView(stmt.name());

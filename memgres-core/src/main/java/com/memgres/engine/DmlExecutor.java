@@ -133,6 +133,21 @@ class DmlExecutor {
 
     // ---- INSERT ----
 
+    /**
+     * A materialized view holds the stored result of its query, so writing to it would be
+     * discarded by the next refresh. PostgreSQL refuses the write rather than accept one that
+     * cannot last.
+     */
+    private void rejectMaterializedViewWrite(String tableName) {
+        if (tableName == null) return;
+        String bare = tableName.contains(".")
+                ? tableName.substring(tableName.lastIndexOf('.') + 1) : tableName;
+        Database.ViewDef view = executor.database.getView(bare);
+        if (view != null && view.materialized()) {
+            throw new MemgresException("cannot change materialized view \"" + bare + "\"", "42809");
+        }
+    }
+
     QueryResult executeInsert(InsertStmt stmt) {
         return withCteScope(stmt.withClauses(), () -> executeInsertInner(stmt));
     }
@@ -140,6 +155,7 @@ class DmlExecutor {
     private QueryResult executeInsertInner(InsertStmt stmt) {
         // Check read-only transaction
         checkReadOnly("INSERT");
+        rejectMaterializedViewWrite(stmt.table());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're inserting through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
@@ -1017,6 +1033,7 @@ class DmlExecutor {
     private QueryResult executeUpdateInner(UpdateStmt stmt) {
         // Check read-only transaction
         checkReadOnly("UPDATE");
+        rejectMaterializedViewWrite(stmt.table());
         // A rule rewrites the statement before anything else looks at the table, so an
         // INSTEAD NOTHING rule means no update happens and none of the checks below apply.
         QueryResult ruled = applyInsteadRule(stmt.table(), "UPDATE", QueryResult.Type.UPDATE,
@@ -1585,6 +1602,7 @@ class DmlExecutor {
     private QueryResult executeDeleteInner(DeleteStmt stmt) {
         // Check read-only transaction
         checkReadOnly("DELETE");
+        rejectMaterializedViewWrite(stmt.table());
         QueryResult ruledDelete = applyInsteadRule(stmt.table(), "DELETE", QueryResult.Type.DELETE,
                 stmt.where(), null);
         if (ruledDelete != null) return ruledDelete;
@@ -1873,6 +1891,7 @@ class DmlExecutor {
 
     private QueryResult executeMergeInner(MergeStmt stmt) {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        rejectMaterializedViewWrite(stmt.targetTable());
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
