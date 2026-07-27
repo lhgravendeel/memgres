@@ -265,6 +265,29 @@ class DmlExecutor {
         }
     }
 
+    /**
+     * Undo steps recorded while a single statement runs, so that a statement which fails part way
+     * leaves nothing behind. The session's undo log only records inside an explicit transaction,
+     * and in autocommit PostgreSQL still treats each statement as all-or-nothing — without this a
+     * multi-row INSERT that failed on its last row kept every row before it.
+     */
+    private static final class StatementUndo {
+        private final List<Runnable> steps = new ArrayList<>();
+
+        void record(Runnable step) { steps.add(step); }
+
+        void revert() {
+            for (int i = steps.size() - 1; i >= 0; i--) {
+                try {
+                    steps.get(i).run();
+                } catch (RuntimeException ignored) {
+                    // Keep unwinding: a step that cannot be undone must not strand the rest.
+                }
+            }
+            steps.clear();
+        }
+    }
+
     QueryResult executeInsert(InsertStmt stmt) {
         return withCteScope(stmt.withClauses(), () -> executeInsertInner(stmt));
     }
@@ -337,6 +360,7 @@ class DmlExecutor {
         // The ON CONFLICT clause describes the relation, not any one row, so it is checked once.
         validateOnConflictTarget(stmt, table);
         java.util.Set<String> conflictKeysActedOn = new java.util.HashSet<>();
+        StatementUndo statementUndo = new StatementUndo();
 
         // Determine source rows: VALUES list or SELECT subquery
         List<List<Expression>> valueRows;
@@ -380,6 +404,9 @@ class DmlExecutor {
         // Fire BEFORE STATEMENT triggers
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.BEFORE, PgTrigger.Event.INSERT, table, null, null);
 
+        // A statement either happens or it does not: if a later row is refused, the rows already
+        // written by this same statement have to go with it.
+        try {
         List<Object[]> insertedRows = new ArrayList<>(); // for transition tables in statement triggers
         List<Object[]> afterRowTriggerNewRows = new ArrayList<>(); // queue AFTER ROW triggers
         List<Table> afterRowTriggerTables = new ArrayList<>(); // corresponding target tables for AFTER ROW
@@ -665,6 +692,14 @@ class DmlExecutor {
                         executor.constraintValidator.validateConstraints(conflictTable, newRow, conflictRow);
                         try {
                             conflictTable.updateRowInPlace(conflictRow, oldRow, newRow);
+                            {
+                                final Table undoTbl = conflictTable;
+                                final Object[] undoTarget = conflictRow;
+                                final Object[] undoBefore = Arrays.copyOf(oldRow, oldRow.length);
+                                final Object[] undoAfter = Arrays.copyOf(newRow, newRow.length);
+                                statementUndo.record(() ->
+                                        undoTbl.updateRowInPlace(undoTarget, undoAfter, undoBefore));
+                            }
                         } catch (Exception e) {
                             conflictTable.updateRowInPlace(conflictRow, newRow, oldRow);
                             throw e;
@@ -698,6 +733,9 @@ class DmlExecutor {
             // An ATTACHed partition may order its columns differently from the parent.
             Object[] storedRow = targetTable == table ? row : targetTable.rowFromParent(row);
             validateAndInsertWaiting(table, row, targetTable, storedRow);
+            final Table undoTable = targetTable;
+            final Object[] undoRow = storedRow;
+            statementUndo.record(() -> undoTable.removeRow(undoRow));
             recordInsertUndo(stmt.schema(), targetTable.getName(), storedRow);
             // C10: If routed to a child partition, also sync parent's RR snapshot
             if (targetTable != table && executor.session != null) {
@@ -761,6 +799,10 @@ class DmlExecutor {
             return QueryResult.returning(QueryResult.Type.INSERT, retCols, returningRows, inserted);
         }
         return QueryResult.command(QueryResult.Type.INSERT, inserted);
+        } catch (RuntimeException e) {
+            statementUndo.revert();
+            throw e;
+        }
     }
 
     // ---- COPY ----
