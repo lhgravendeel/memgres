@@ -215,7 +215,7 @@ class DdlParser {
         else if (parser.matchKeyword("SEQUENCE")) objectType = DropStmt.ObjectType.SEQUENCE;
         else if (parser.matchKeyword("SCHEMA")) objectType = DropStmt.ObjectType.SCHEMA;
         else if (parser.matchKeyword("DOMAIN")) objectType = DropStmt.ObjectType.DOMAIN;
-        else if (parser.matchKeyword("MATERIALIZED")) { parser.expectKeyword("VIEW"); objectType = DropStmt.ObjectType.VIEW; }
+        else if (parser.matchKeyword("MATERIALIZED")) { parser.expectKeyword("VIEW"); objectType = DropStmt.ObjectType.MATERIALIZED_VIEW; }
         else if (parser.matchKeyword("EXTENSION")) objectType = DropStmt.ObjectType.EXTENSION;
         else if (parser.matchKeyword("RULE")) objectType = DropStmt.ObjectType.RULE;
         else if (parser.matchKeyword("COLLATION")) objectType = DropStmt.ObjectType.COLLATION;
@@ -466,10 +466,8 @@ class DdlParser {
                 String oldCol = parser.readIdentifier();
                 parser.expectKeyword("TO");
                 String newCol = parser.readIdentifier();
-                // Materialized view column rename — delegate to view rename logic
-                // For now, treat as no-op since matview columns come from the query
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-                return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.NO_OP);
+                return renameRelationColumn(viewName, oldCol, newCol, viewIfExists);
             }
             if (parser.matchKeywords("RENAME", "TO")) {
                 return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.RENAME_TO);
@@ -480,7 +478,9 @@ class DdlParser {
             if (parser.matchKeywords("SET", "SCHEMA")) {
                 String newSchema = parser.readIdentifier();
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-                return new AlterViewStmt(viewName, null, viewIfExists, AlterViewStmt.Action.NO_OP);
+                return new AlterTableStmt(null, viewName,
+                        Cols.listOf((AlterTableStmt.AlterAction)
+                                new AlterTableStmt.SetSchema(newSchema)), viewIfExists);
             }
             if (parser.matchKeyword("SET") && parser.check(TokenType.LEFT_PAREN)) {
                 Map<String, String> opts = parseViewWithOptions();
@@ -494,6 +494,20 @@ class DdlParser {
             boolean viewIfExists = parser.matchKeywords("IF", "EXISTS");
             String viewName = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) viewName = parser.readIdentifier();
+            if (parser.matchKeywords("RENAME", "COLUMN")) {
+                String oldCol = parser.readIdentifier();
+                parser.expectKeyword("TO");
+                String newCol = parser.readIdentifier();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return renameRelationColumn(viewName, oldCol, newCol, viewIfExists);
+            }
+            if (parser.matchKeywords("SET", "SCHEMA")) {
+                String newSchema = parser.readIdentifier();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new AlterTableStmt(null, viewName,
+                        Cols.listOf((AlterTableStmt.AlterAction)
+                                new AlterTableStmt.SetSchema(newSchema)), viewIfExists);
+            }
             if (parser.matchKeywords("RENAME", "TO")) {
                 return new AlterViewStmt(viewName, parser.readIdentifier(), viewIfExists, AlterViewStmt.Action.RENAME_TO);
             }
@@ -538,7 +552,9 @@ class DdlParser {
                 return new AlterSchemaOwnerStmt(schemaName, parser.readIdentifier());
             }
             if (parser.matchKeywords("RENAME", "TO")) {
-                parser.readIdentifier();
+                String newName = parser.readIdentifier();
+                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+                return new AlterSchemaRenameStmt(schemaName, newName);
             }
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_noop", "ok");
@@ -870,7 +886,7 @@ class DdlParser {
         parser.expectKeyword("REFRESH");
         parser.expectKeyword("MATERIALIZED");
         parser.expectKeyword("VIEW");
-        parser.matchKeyword("CONCURRENTLY");
+        boolean concurrently = parser.matchKeyword("CONCURRENTLY");
         String name = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
         boolean withData = true;
@@ -878,7 +894,7 @@ class DdlParser {
             if (parser.matchKeyword("NO")) { parser.expectKeyword("DATA"); withData = false; }
             else parser.expectKeyword("DATA");
         }
-        return new RefreshMaterializedViewStmt(name, withData);
+        return new RefreshMaterializedViewStmt(name, withData, concurrently);
     }
 
     // ---- Misc small CREATE statements ----
@@ -1050,6 +1066,17 @@ class DdlParser {
             return new SetStmt("create_noop", "ok");
         }
         return new CreateAggregateStmt(name, argTypes, sfunc, stype, initcond, finalfunc, combinefunc, sortop);
+    }
+
+    /**
+     * ALTER VIEW ... RENAME COLUMN says the same thing as the ALTER TABLE spelling, so it is
+     * turned into that and handled in one place.
+     */
+    private AlterTableStmt renameRelationColumn(String relation, String oldCol, String newCol,
+                                                 boolean ifExists) {
+        return new AlterTableStmt(null, relation,
+                Cols.listOf((AlterTableStmt.AlterAction)
+                        new AlterTableStmt.RenameColumn(oldCol, newCol)), ifExists);
     }
 
     CreateRuleStmt parseCreateRule() {

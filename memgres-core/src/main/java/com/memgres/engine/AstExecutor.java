@@ -245,6 +245,11 @@ public class AstExecutor {
         if (stmt instanceof AlterIndexStmt) {
             return executeAlterIndex((AlterIndexStmt) stmt);
         }
+        if (stmt instanceof AlterSchemaRenameStmt) {
+            AlterSchemaRenameStmt s = (AlterSchemaRenameStmt) stmt;
+            database.renameSchema(s.name(), s.newName());
+            return QueryResult.message(QueryResult.Type.SET, "ALTER SCHEMA");
+        }
         if (stmt instanceof AlterSchemaOwnerStmt) {
             AlterSchemaOwnerStmt s = (AlterSchemaOwnerStmt) stmt;
             String newOwner = ddlExecutor.resolveOwnerName(s.newOwner());
