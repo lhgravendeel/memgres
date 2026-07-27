@@ -2997,6 +2997,14 @@ class DmlExecutor {
     void validateReturning(List<SelectStmt.SelectTarget> returning, Table table) {
         if (returning == null) return;
         for (SelectStmt.SelectTarget target : returning) {
+            // RETURNING reports the rows the statement touched one at a time; there is no
+            // group and no window frame for an aggregate or a window function to run over.
+            if (executor.selectExecutor.containsAggregate(target.expr())) {
+                throw new MemgresException("aggregate functions are not allowed in RETURNING", "42803");
+            }
+            if (executor.selectExecutor.containsWindowFunction(target.expr())) {
+                throw new MemgresException("window functions are not allowed in RETURNING", "42P20");
+            }
             if (target.expr() instanceof WildcardExpr) continue;
             if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();

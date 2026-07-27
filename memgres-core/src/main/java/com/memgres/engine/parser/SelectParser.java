@@ -953,6 +953,19 @@ class SelectParser {
         return items;
     }
 
+    /**
+     * The word PG's parser chokes on when a data-modifying statement is written where only a
+     * query belongs: INTO after INSERT, SET after UPDATE's target, FROM after DELETE.
+     */
+    private String firstReservedWordAfterDmlVerb() {
+        for (int i = parser.pos; i < parser.tokens.size() && i < parser.pos + 8; i++) {
+            String word = parser.tokens.get(i).value().toUpperCase();
+            if (word.equals("INTO") || word.equals("SET") || word.equals("FROM")) return word;
+        }
+        return parser.pos + 1 < parser.tokens.size()
+                ? parser.tokens.get(parser.pos + 1).value() : parser.peek().value();
+    }
+
     SelectStmt.FromItem parseFromItem() {
         SelectStmt.FromItem item = parseFromPrimary();
 
@@ -1206,32 +1219,13 @@ class SelectParser {
                 if (parser.checkKeyword("VALUES")) {
                     // A VALUES list may be the left arm of a set operation, not only the whole body
                     subStmt = tryParseSetOp(parseValuesBody());
-                } else if (parser.checkKeyword("UPDATE")) {
-                    subStmt = parser.parseUpdate();
-                } else if (parser.checkKeyword("DELETE")) {
-                    subStmt = parser.parseDelete();
-                } else if (parser.checkKeyword("INSERT")) {
-                    subStmt = parser.parseInsert();
-                    // PG rejects RETURNING NEW/OLD in INSERT subqueries
-                    if (subStmt instanceof com.memgres.engine.parser.ast.InsertStmt) {
-                        com.memgres.engine.parser.ast.InsertStmt ins = (com.memgres.engine.parser.ast.InsertStmt) subStmt;
-                        if (ins.returning() != null) {
-                            for (SelectStmt.SelectTarget rt : ins.returning()) {
-                                Expression retExpr = rt.expr();
-                                if (retExpr instanceof WildcardExpr) {
-                                    WildcardExpr we = (WildcardExpr) retExpr;
-                                    if (we.table() != null && (we.table().equalsIgnoreCase("NEW") || we.table().equalsIgnoreCase("OLD"))) {
-                                        throw new com.memgres.engine.MemgresException("syntax error at or near \"INTO\"", "42601");
-                                    }
-                                } else if (retExpr instanceof ColumnRef) {
-                                    ColumnRef cr = (ColumnRef) retExpr;
-                                    if (cr.table() != null && (cr.table().equalsIgnoreCase("NEW") || cr.table().equalsIgnoreCase("OLD"))) {
-                                        throw new com.memgres.engine.MemgresException("syntax error at or near \"INTO\"", "42601");
-                                    }
-                                }
-                            }
-                        }
-                    }
+                } else if (parser.checkKeyword("UPDATE") || parser.checkKeyword("DELETE")
+                        || parser.checkKeyword("INSERT")) {
+                    // Only a top-level CTE may modify data. PG's grammar has no production for a
+                    // write here at all, so it reads the verb as a name and fails on the first
+                    // reserved word after it; report the same token.
+                    throw new com.memgres.engine.MemgresException(
+                            "syntax error at or near \"" + firstReservedWordAfterDmlVerb() + "\"", "42601");
                 } else if (parser.check(TokenType.LEFT_PAREN)) {
                     // Parenthesized SELECT union: ((SELECT ...) UNION ALL (SELECT ...))
                     // or multi-wrapped arms: ((SELECT ...)) UNION ((SELECT ...))

@@ -130,9 +130,55 @@ class FromFunctionResolver {
 
         // Try user-defined function
         PgFunction userFunc = executor.database.getFunction(fname);
-        if (userFunc != null) return resolveUserFunction(userFunc, alias, colAliases, evalArgs);
+        if (userFunc != null) {
+            checkRecordColumnDefinitionList(userFunc, funcFrom);
+            return resolveUserFunction(userFunc, alias, colAliases, evalArgs);
+        }
 
-        throw new MemgresException("function " + fname + " does not exist", "42883");
+        return resolveScalarFunctionInFrom(funcFrom, fname, alias, colAliases);
+    }
+
+    /**
+     * A function returning bare {@code record} has no column names or types of its own, so the
+     * caller has to supply them; one that declares OUT parameters already has them, and PG
+     * rejects a second, possibly contradicting, description of the same row.
+     */
+    private void checkRecordColumnDefinitionList(PgFunction userFunc, SelectStmt.FunctionFrom funcFrom) {
+        if (!userFunc.declaresRecordResult()) return;
+        boolean hasOutParams = userFunc.hasOutParams();
+        boolean hasColumnDefs = funcFrom.columnAliases() != null && !funcFrom.columnAliases().isEmpty();
+        if (hasOutParams && hasColumnDefs) {
+            throw PgErrors.syntax("a column definition list is redundant for a function with OUT parameters");
+        }
+        if (!hasOutParams && !hasColumnDefs) {
+            throw PgErrors.syntax("a column definition list is required for functions returning \"record\"");
+        }
+    }
+
+    /**
+     * PG puts no set-returning requirement on a function in FROM: a plain scalar call is simply
+     * a one-row, one-column relation named after the function.
+     */
+    private List<RowContext> resolveScalarFunctionInFrom(SelectStmt.FunctionFrom funcFrom, String fname,
+                                                        String alias, List<String> colAliases) {
+        Object value = executor.evalExpr(new FunctionCallExpr(funcFrom.functionName(), funcFrom.args()), null);
+        DataType type = value == null ? DataType.TEXT : TypeCoercion.inferType(value);
+        List<Column> cols = new ArrayList<>();
+        cols.add(new Column(firstColAlias(colAliases, alias), type, true, false, null));
+        Object[] row;
+        if (funcFrom.withOrdinality()) {
+            String ordName = colAliases != null && colAliases.size() > 1
+                    ? stripColType(colAliases.get(1)) : "ordinality";
+            cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
+            row = new Object[]{value, 1L};
+        } else {
+            row = new Object[]{value};
+        }
+        Table virtualTable = new Table(alias, cols);
+        virtualTable.insertRow(row);
+        List<RowContext> contexts = new ArrayList<>();
+        contexts.add(new RowContext(virtualTable, alias, row));
+        return contexts;
     }
 
     // ---- generate_series ----
@@ -1185,6 +1231,7 @@ class FromFunctionResolver {
             } else if (!resultList.isEmpty() && resultList.get(0) instanceof Object[]) {
                 Object[] firstRow = (Object[]) resultList.get(0);
                 if (cols.isEmpty() && colAliases != null && !colAliases.isEmpty()) {
+                    checkRecordShape(userFunc, colAliases.size(), firstRow.length);
                     for (int i = 0; i < colAliases.size(); i++) {
                         cols.add(new Column(colAliases.get(i), DataType.TEXT, true, false, null));
                     }
@@ -1265,7 +1312,9 @@ class FromFunctionResolver {
                 Map<String, Object> map = (Map<String, Object>) result;
                 rowArr = map.values().toArray();
             } else {
-                rowArr = new Object[]{result};
+                // A single value carries no shape of its own to check against the alias list
+                rowArr = new Object[colAliases.size()];
+                rowArr[0] = result;
             }
             List<Column> cols = new ArrayList<>();
             for (int i = 0; i < colAliases.size(); i++) {
@@ -1289,6 +1338,19 @@ class FromFunctionResolver {
     }
 
     // ---- Shared helpers ----
+
+    /**
+     * The caller's column definition list is the only description of a {@code record} result,
+     * so it has to agree with what the function body actually produces.
+     */
+    private static void checkRecordShape(PgFunction userFunc, int declared, int produced) {
+        if (declared == produced) return;
+        MemgresException e = PgErrors.invalidObjectDefinition(
+                "return type mismatch in function declared to return record");
+        e.setDetail("Final statement returns too " + (produced < declared ? "few" : "many") + " columns.");
+        e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
+        throw e;
+    }
 
     private static String firstColAlias(List<String> colAliases, String fallback) {
         return (colAliases != null && !colAliases.isEmpty()) ? stripColType(colAliases.get(0)) : fallback;
