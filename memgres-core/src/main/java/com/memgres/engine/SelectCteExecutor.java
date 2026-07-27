@@ -181,6 +181,7 @@ class SelectCteExecutor {
         int maxRows = 10000000; // safety cap to prevent OOM in mutual recursion scenarios
         try {
         for (int iter = 0; !workingSet.isEmpty(); iter++) {
+            StatementCancel.check();
             if (iter >= maxIterations) {
                 throw new MemgresException(
                         "recursive query exceeded maximum number of iterations ("

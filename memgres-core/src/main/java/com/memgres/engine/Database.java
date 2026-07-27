@@ -2041,19 +2041,31 @@ public class Database {
                     throw new MemgresException("deadlock detected", "40P01");
                 }
                 if (System.currentTimeMillis() >= deadline) {
-                    throw new MemgresException("could not obtain lock on row in relation \""
-                            + relationName + "\"", "55P03");
+                    throw lockWaitExpired(configured > 0, relationName);
                 }
                 try {
                     Thread.sleep(5L);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
-                    throw new MemgresException("interrupted while waiting for row lock", "57014");
+                    throw StatementCancel.canceled();
                 }
             }
         } finally {
             waitingFor.remove(waiter);
         }
+    }
+
+    /**
+     * The error for a row lock that could not be taken in time. With lock_timeout set this is
+     * word for word PG's timeout error; the fallback wait exists only so a stuck session cannot
+     * block forever, and reports the lock it wanted rather than blaming a setting that is off.
+     */
+    private static MemgresException lockWaitExpired(boolean lockTimeoutConfigured, String relationName) {
+        if (lockTimeoutConfigured) {
+            return new MemgresException("canceling statement due to lock timeout", "55P03");
+        }
+        return new MemgresException("could not obtain lock on row in relation \""
+                + relationName + "\"", "55P03");
     }
 
     private boolean hasDeadlock(Session requester, Session blocker) {
@@ -2075,7 +2087,8 @@ public class Database {
     public void lockRowWaiting(String tableName, Object[] row, Session session, String mode) {
         final long safetyTimeoutMs = 5_000L; // fallback when lock_timeout is 0 (disabled)
         long lockTimeoutMs = GucSettings.parseTimeoutMillis(session.getGucSettings().get("lock_timeout"));
-        final long timeoutMs = lockTimeoutMs > 0 ? lockTimeoutMs : safetyTimeoutMs;
+        final boolean lockTimeoutConfigured = lockTimeoutMs > 0;
+        final long timeoutMs = lockTimeoutConfigured ? lockTimeoutMs : safetyTimeoutMs;
         final long pollMs = 10L;
         final long deadline = System.currentTimeMillis() + timeoutMs;
 
@@ -2110,7 +2123,7 @@ public class Database {
             // Check timeout
             if (System.currentTimeMillis() >= deadline) {
                 waitingFor.remove(session);
-                throw new MemgresException("could not obtain lock on row in relation \"" + tableName + "\"", "55P03");
+                throw lockWaitExpired(lockTimeoutConfigured, tableName);
             }
 
             // Sleep briefly before retrying
@@ -2119,7 +2132,7 @@ public class Database {
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 waitingFor.remove(session);
-                throw new MemgresException("interrupted while waiting for row lock", "57014");
+                throw StatementCancel.canceled();
             }
         }
     }

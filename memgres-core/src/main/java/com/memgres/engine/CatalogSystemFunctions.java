@@ -289,7 +289,8 @@ class CatalogSystemFunctions {
                                 Thread.sleep(millis);
                             } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
-                                throw new MemgresException("canceling statement due to statement timeout", "57014");
+                                // The sleep was broken by a timeout or a cancel request; report whichever it was.
+                                throw StatementCancel.canceled();
                             }
                         }
                     }
