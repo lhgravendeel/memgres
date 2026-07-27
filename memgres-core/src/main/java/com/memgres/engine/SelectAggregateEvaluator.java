@@ -43,7 +43,7 @@ class SelectAggregateEvaluator {
 
         for (List<Expression> groupingSet : groupingSets) {
             List<Expression> effectiveGroupBy = new ArrayList<>(fixedGroupBy);
-            effectiveGroupBy.addAll(groupingSet);
+            effectiveGroupBy.addAll(resolveGroupByRefs(groupingSet, stmt));
 
             Set<String> groupingSetColNames = new HashSet<>();
             for (Expression e : effectiveGroupBy) {
@@ -217,6 +217,35 @@ class SelectAggregateEvaluator {
         return ctx;
     }
 
+    /**
+     * Replace output-column ordinals and output aliases used as grouping expressions with the
+     * select-list expression they name. Applies to every grouping element, including the ones
+     * inside GROUPING SETS / ROLLUP / CUBE.
+     */
+    private List<Expression> resolveGroupByRefs(List<Expression> groupBy, SelectStmt stmt) {
+        if (groupBy == null) return null;
+        List<Expression> resolved = new ArrayList<>(groupBy);
+        for (int i = 0; i < resolved.size(); i++) {
+            Expression expr = resolved.get(i);
+            if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
+                Literal lit = (Literal) expr;
+                int ordinal = Integer.parseInt(lit.value());
+                if (ordinal >= 1 && ordinal <= stmt.targets().size()) {
+                    resolved.set(i, stmt.targets().get(ordinal - 1).expr());
+                }
+            } else if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
+                ColumnRef colRef = (ColumnRef) expr;
+                for (SelectStmt.SelectTarget target : stmt.targets()) {
+                    if (target.alias() != null && target.alias().equalsIgnoreCase(colRef.column())) {
+                        resolved.set(i, target.expr());
+                        break;
+                    }
+                }
+            }
+        }
+        return resolved;
+    }
+
     QueryResult executeAggregateSelect(SelectStmt stmt, List<RowContext> contexts,
                                         List<RowContext.TableBinding> baseBindings) {
         if (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty()) {
@@ -224,28 +253,7 @@ class SelectAggregateEvaluator {
         }
 
         // Resolve GROUP BY ordinals and aliases
-        List<Expression> resolvedGroupBy = stmt.groupBy();
-        if (resolvedGroupBy != null) {
-            resolvedGroupBy = new ArrayList<>(resolvedGroupBy);
-            for (int i = 0; i < resolvedGroupBy.size(); i++) {
-                Expression expr = resolvedGroupBy.get(i);
-                if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
-                    Literal lit = (Literal) expr;
-                    int ordinal = Integer.parseInt(lit.value());
-                    if (ordinal >= 1 && ordinal <= stmt.targets().size()) {
-                        resolvedGroupBy.set(i, stmt.targets().get(ordinal - 1).expr());
-                    }
-                } else if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
-                    ColumnRef colRef = (ColumnRef) expr;
-                    for (SelectStmt.SelectTarget target : stmt.targets()) {
-                        if (target.alias() != null && target.alias().equalsIgnoreCase(colRef.column())) {
-                            resolvedGroupBy.set(i, target.expr());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        List<Expression> resolvedGroupBy = resolveGroupByRefs(stmt.groupBy(), stmt);
 
         boolean hasGroupBy = resolvedGroupBy != null && !resolvedGroupBy.isEmpty();
         List<List<RowContext>> groups;
@@ -1283,7 +1291,9 @@ class SelectAggregateEvaluator {
             case "grouping": {
                 Set<String> currentGroupSet = currentGroupingSetColumns.get();
                 if (currentGroupSet == null) {
-                    throw new MemgresException("GROUPING is not supported without GROUPING SETS, ROLLUP, or CUBE", "42803");
+                    throw new MemgresException(
+                            "arguments to GROUPING must be grouping expressions of the associated query level",
+                            "42803");
                 }
                 // Result is a bitmask: bit i (from the left, most significant first) is 1
                 // if argument i is NOT grouped in the current grouping set.
