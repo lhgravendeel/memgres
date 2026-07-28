@@ -11,6 +11,10 @@ import java.util.*;
  * Extracted from DdlExecutor to separate concerns.
  */
 class DdlViewExecutor {
+    /** Errors about the query itself rather than about the rows it happens to read. */
+    private static final Set<String> ANALYSIS_ERRORS =
+            Cols.setOf("42803", "42P10", "42P20", "42601", "42809");
+
     private final DdlExecutor ddl;
     private final AstExecutor executor;
 
@@ -115,12 +119,12 @@ class DdlViewExecutor {
                 if ("42703".equals(e.getSqlState())) {
                     throw e;
                 }
-                // A view body is a query PostgreSQL analyses in full before it records it, so a
-                // query it would refuse to run is a view it refuses to define. Without this the
-                // definition was stored and the refusal deferred to every read of the view — and
-                // a view over an ungrouped column then answered with an arbitrary row's value.
-                if ("42803".equals(e.getSqlState()) || "42P20".equals(e.getSqlState())
-                        || "42809".equals(e.getSqlState())) {
+                // A query PostgreSQL refuses to analyse is refused as a view definition too:
+                // an ungrouped column, a sort position past the select list or a misplaced
+                // window function is wrong about the query itself, not about the rows it would
+                // read, and storing it only defers the error to every SELECT from the view — a
+                // view over an ungrouped column then answered with an arbitrary row's value.
+                if (ANALYSIS_ERRORS.contains(e.getSqlState())) {
                     throw e;
                 }
             } catch (Exception e) {

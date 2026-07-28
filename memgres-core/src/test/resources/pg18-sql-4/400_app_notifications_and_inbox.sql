@@ -142,7 +142,11 @@ SELECT
     ) AS unread_mentions
 FROM users u
 LEFT JOIN notifications n ON n.user_id = u.id
-GROUP BY u.username
+-- Grouped by the key, not by the unique username: PostgreSQL 18 rejects "u.id" inside the
+-- EXISTS when only "u.username" is grouped ("subquery uses ungrouped column"), because a
+-- UNIQUE NOT NULL column carries no functional dependency there. Grouping by the primary key
+-- licenses "u.username" instead, and produces exactly the same groups.
+GROUP BY u.id
 ORDER BY u.username;
 
 -- Bulk mark-as-read pattern.

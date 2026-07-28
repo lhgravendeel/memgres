@@ -62,6 +62,11 @@ final class GroupByValidator {
      */
     void validate(SelectStmt stmt, List<SelectStmt.SelectTarget> targets,
                   List<RowContext.TableBinding> bindings) {
+        // PostgreSQL transforms the sort clause before the grouping one, so an ORDER BY that
+        // names no output column is reported before anything the grouping has to say — even
+        // before an unresolvable GROUP BY item.
+        List<SelectStmt.OrderByItem> orderBy = select.resolveOrderBy(stmt.orderBy(), targets);
+
         // Resolving happens once for the whole grouping specification: ordinals become the
         // target they point at and bare names become the FROM column they name, so everything
         // downstream compares like with like.
@@ -77,11 +82,21 @@ final class GroupByValidator {
             determining = commonToEverySet(stmt.groupingSets(), targets, bindings);
         }
 
+        // A HAVING whose operators or functions do not resolve is a type error, and PostgreSQL
+        // reports it while it analyses HAVING — before it judges the query's grouping.
+        checkHavingTypes(stmt, bindings);
+        rejectDistinctSortKeysOutsideSelectList(stmt, targets, orderBy);
+
         Set<String> groupedForms = new LinkedHashSet<String>();
         for (Expression g : grouped) groupedForms.add(canon(g, bindings));
 
         Check check = new Check(groupedForms, determining, bindings);
         for (SelectStmt.SelectTarget t : targets) check.walk(t.expr());
+        if (stmt.distinctOn() != null) {
+            // DISTINCT ON keys are output expressions of the grouped result like any other, so
+            // they are judged even though they need not appear in the select list.
+            for (Expression on : stmt.distinctOn()) check.walk(on);
+        }
         if (stmt.having() != null) check.walk(stmt.having());
         if (stmt.windowDefs() != null) {
             // A WINDOW clause entry reads the grouped rows like any window specification, and is
@@ -95,13 +110,124 @@ final class GroupByValidator {
                 }
             }
         }
-        if (stmt.orderBy() != null) {
-            // ORDER BY may name an output column; resolve those before judging them, so that
-            // ORDER BY over an aggregate's alias stays legal.
-            for (SelectStmt.OrderByItem item : select.resolveOrderBy(stmt.orderBy(), targets)) {
+        if (orderBy != null) {
+            // ORDER BY may name an output column; those were resolved above, so that ORDER BY
+            // over an aggregate's alias stays legal.
+            for (SelectStmt.OrderByItem item : orderBy) {
                 check.walk(item.expr());
             }
         }
+    }
+
+    /**
+     * SELECT DISTINCT sorts the distinct rows, so every sort key has to be one of the columns
+     * that survives the DISTINCT. An aggregate the select list does not carry is as unavailable
+     * to it as a window function is, and PostgreSQL refuses both with the same message.
+     */
+    private void rejectDistinctSortKeysOutsideSelectList(SelectStmt stmt,
+                                                         List<SelectStmt.SelectTarget> targets,
+                                                         List<SelectStmt.OrderByItem> orderBy) {
+        if (!stmt.distinct() || orderBy == null || orderBy.isEmpty()) return;
+        if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty()) return;
+        for (SelectStmt.OrderByItem item : orderBy) {
+            if (select.resolveOrderByToColumnIndex(item.expr(), targets) < 0) {
+                throw new MemgresException(
+                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list", "42P10");
+            }
+        }
+    }
+
+    // ---- HAVING type resolution ----
+
+    /**
+     * The type errors PostgreSQL raises while analysing HAVING, which it does before it decides
+     * whether the query's expressions are grouped. Without this, {@code SELECT a, b ... GROUP BY a
+     * HAVING sum(b) > 1} blames the ungrouped {@code b} in the select list rather than the
+     * aggregate that has no meaning over a text column.
+     */
+    private void checkHavingTypes(SelectStmt stmt, List<RowContext.TableBinding> bindings) {
+        if (stmt.having() == null || bindings == null || bindings.size() != 1) return;
+        // Only a declared column has a type this may be judged against. A sub-select, a CTE, a
+        // view or a set-returning function is backed by a relation whose column types were
+        // inferred from a first result, and a derived column typed by inference — a window
+        // function's, say — would be refused for a type it does not really have.
+        if (!readsOneBaseTable(stmt)) return;
+        rejectUnresolvableTypes(stmt.having(), bindings);
+        select.executor.validateWhereTypesAgainstTable(stmt.having(), bindings.get(0).table());
+    }
+
+    /** True when the FROM clause is one plain table of the database and nothing else. */
+    private boolean readsOneBaseTable(SelectStmt stmt) {
+        if (stmt.from() == null || stmt.from().size() != 1) return false;
+        if (!(stmt.from().get(0) instanceof SelectStmt.TableRef)) return false;
+        SelectStmt.TableRef ref = (SelectStmt.TableRef) stmt.from().get(0);
+        if (select.lookupCte(ref.table()) != null) return false;
+        if (select.executor.database.getView(ref.table()) != null) return false;
+        try {
+            return select.executor.resolveTable(
+                    ref.schema() != null ? ref.schema() : select.executor.defaultSchema(),
+                    ref.table()) != null;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * The two type errors a HAVING can carry that need no row to see: {@code sum} and {@code avg}
+     * exist for numbers only, and a count compares as the bigint it is.
+     */
+    private void rejectUnresolvableTypes(Object node, List<RowContext.TableBinding> bindings) {
+        if (node == null) return;
+        if (node instanceof Statement) return;
+        if (node instanceof com.memgres.engine.parser.ast.FunctionCallExpr) {
+            com.memgres.engine.parser.ast.FunctionCallExpr call =
+                    (com.memgres.engine.parser.ast.FunctionCallExpr) node;
+            String name = call.name() == null ? "" : call.name().toLowerCase();
+            if (("sum".equals(name) || "avg".equals(name)) && call.args().size() == 1
+                    && call.args().get(0) instanceof ColumnRef) {
+                ColumnRef ref = (ColumnRef) call.args().get(0);
+                RowContext.TableBinding binding = findBinding(ref, bindings);
+                DataType type = binding == null ? null : columnType(binding, ref);
+                if (type == DataType.TEXT || type == DataType.VARCHAR || type == DataType.CHAR
+                        || type == DataType.BOOLEAN) {
+                    MemgresException e = new MemgresException(
+                            "function " + name + "(" + type.getPgName() + ") does not exist", "42883");
+                    e.setHint("No function matches the given name and argument types.");
+                    throw e;
+                }
+            }
+        }
+        if (node instanceof com.memgres.engine.parser.ast.BinaryExpr) {
+            com.memgres.engine.parser.ast.BinaryExpr bin =
+                    (com.memgres.engine.parser.ast.BinaryExpr) node;
+            rejectNonBigintCountComparison(bin.left(), bin.right());
+            rejectNonBigintCountComparison(bin.right(), bin.left());
+        }
+        AstWalk.forEachChild(node, new java.util.function.Consumer<Object>() {
+            @Override public void accept(Object child) { rejectUnresolvableTypes(child, bindings); }
+        });
+    }
+
+    /** {@code count(...) > 'x'} reads the literal as the bigint the count is, and fails there. */
+    private static void rejectNonBigintCountComparison(Expression maybeCount, Expression other) {
+        if (!(maybeCount instanceof com.memgres.engine.parser.ast.FunctionCallExpr)) return;
+        if (!"count".equalsIgnoreCase(
+                ((com.memgres.engine.parser.ast.FunctionCallExpr) maybeCount).name())) return;
+        if (!(other instanceof Literal)) return;
+        Literal literal = (Literal) other;
+        if (literal.literalType() != Literal.LiteralType.STRING) return;
+        try {
+            Long.parseLong(literal.value().trim());
+        } catch (NumberFormatException e) {
+            throw new MemgresException(
+                    "invalid input syntax for type bigint: \"" + literal.value() + "\"", "22P02");
+        }
+    }
+
+    private static DataType columnType(RowContext.TableBinding binding, ColumnRef ref) {
+        int index = binding.table().getColumnIndex(ref.column());
+        if (index < 0) return null;
+        return binding.table().getColumns().get(index).getType();
     }
 
     // ---- GROUP BY item resolution ----
@@ -155,13 +281,84 @@ final class GroupByValidator {
      */
     private Expression resolveName(Expression item, List<SelectStmt.SelectTarget> targets,
                                    List<RowContext.TableBinding> bindings) {
-        if (!(item instanceof ColumnRef) || ((ColumnRef) item).table() != null) return item;
+        if (!(item instanceof ColumnRef)) return item;
         ColumnRef ref = (ColumnRef) item;
         if (findBinding(ref, bindings) != null) return item;
-        for (SelectStmt.SelectTarget t : targets) {
-            if (t.alias() != null && t.alias().equalsIgnoreCase(ref.column())) return t.expr();
+        if (ref.table() == null) {
+            for (SelectStmt.SelectTarget t : targets) {
+                if (t.alias() != null && t.alias().equalsIgnoreCase(ref.column())) return t.expr();
+            }
         }
+        rejectUnresolvableGroupItem(ref, bindings);
         return item;
+    }
+
+    /**
+     * A GROUP BY item that names nothing is that error and no other. Left to fall through, it
+     * silently groups by nothing and the query is then blamed for the ungrouped columns the
+     * item was meant to license — which is neither the error PostgreSQL reports nor a useful
+     * one, since the name the query got wrong never appears in it.
+     */
+    private void rejectUnresolvableGroupItem(ColumnRef ref,
+                                             List<RowContext.TableBinding> bindings) {
+        if (bindings == null || bindings.isEmpty() || ref.column() == null) return;
+        if (SelectExecutor.isSystemColumn(ref.column())) return;
+        // A correlated reference to an enclosing query is resolved where that query's rows are,
+        // not here, so nothing in this FROM clause proves it wrong.
+        if (resolvesInEnclosingQuery(ref)) return;
+        if (ref.table() == null) {
+            // A bare name matching a FROM item is a whole-row reference, not a column.
+            for (RowContext.TableBinding binding : bindings) {
+                if (namesRelation(binding, ref.column())) return;
+            }
+            MemgresException e = new MemgresException(
+                    "column \"" + ref.column() + "\" does not exist", "42703");
+            for (RowContext.TableBinding binding : bindings) {
+                String hint = RowContext.suggestClosestColumn(ref.column(), binding.table());
+                if (hint != null) { e.setHint(hint); break; }
+            }
+            throw e;
+        }
+        String hiddenByAlias = null;
+        for (RowContext.TableBinding binding : bindings) {
+            if (binding.table() == null) continue;
+            boolean byAlias = ref.table().equalsIgnoreCase(binding.alias());
+            if (!byAlias && ref.table().equalsIgnoreCase(binding.table().getName())
+                    && binding.alias() != null
+                    && !binding.alias().equalsIgnoreCase(binding.table().getName())) {
+                hiddenByAlias = binding.alias();
+                continue;
+            }
+            if (byAlias || ref.table().equalsIgnoreCase(binding.table().getName())) {
+                // The relation is in the FROM clause; the column it was asked for is not.
+                throw new MemgresException(
+                        "column " + ref.table() + "." + ref.column() + " does not exist", "42703");
+            }
+        }
+        if (hiddenByAlias != null) {
+            MemgresException e = new MemgresException(
+                    "invalid reference to FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
+            e.setHint("Perhaps you meant to reference the table alias \"" + hiddenByAlias + "\".");
+            throw e;
+        }
+        throw new MemgresException(
+                "missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
+    }
+
+    private static boolean namesRelation(RowContext.TableBinding binding, String name) {
+        if (binding.alias() != null && binding.alias().equalsIgnoreCase(name)) return true;
+        return binding.table() != null && binding.table().getName().equalsIgnoreCase(name);
+    }
+
+    /** True when an enclosing query's rows can answer for this name. */
+    private boolean resolvesInEnclosingQuery(ColumnRef ref) {
+        for (RowContext outer : select.executor.outerContextStack) {
+            if (findBinding(ref, outer.getBindings()) != null) return true;
+            for (RowContext.TableBinding binding : outer.getBindings()) {
+                if (ref.table() != null && namesRelation(binding, ref.table())) return true;
+            }
+        }
+        return false;
     }
 
     /** The grouping expressions every grouping set has, the only ones a dependency may rest on. */
@@ -217,7 +414,7 @@ final class GroupByValidator {
     }
 
     /** The integer position an item denotes, or null when it is not an integer constant. */
-    private static Integer integerConstant(Expression item) {
+    static Integer integerConstant(Expression item) {
         int sign = 1;
         Expression node = item;
         while (node instanceof UnaryExpr) {
@@ -253,7 +450,13 @@ final class GroupByValidator {
         void walk(Object node) {
             if (node == null) return;
             if (node instanceof Literal || node instanceof WildcardExpr) return;
-            // A nested query has its own FROM and its own grouping rules.
+            if (node instanceof SelectStmt) {
+                // A nested query has its own FROM and its own grouping rules, but a column of
+                // ours that it reads is still one value per input row of ours, so it is ours
+                // to judge — PostgreSQL says so in as many words.
+                walkSubquery((SelectStmt) node, new ArrayList<Scope>());
+                return;
+            }
             if (node instanceof Statement) return;
             if (node instanceof Expression) {
                 Expression expr = (Expression) node;
@@ -285,6 +488,61 @@ final class GroupByValidator {
                 }
             }
             AstWalk.forEachChild(node, this::walk);
+        }
+
+        /**
+         * Judges the outer columns a nested query reads. Everything the nested query's own FROM
+         * can answer for belongs to it; what is left resolves against our FROM, and then has to
+         * be grouped exactly as it would in our own select list.
+         *
+         * <p>When the nested FROM cannot be resolved without running something — a CTE, a view,
+         * another sub-select — the nested query is left alone rather than guessed at: a name
+         * mistaken for an outer column would be reported as an error the query does not have.
+         */
+        private void walkSubquery(SelectStmt inner, List<Scope> enclosing) {
+            List<Scope> scopes = new ArrayList<Scope>(enclosing);
+            scopes.add(subqueryScope(inner));
+            final List<Scope> pass = scopes;
+            AstWalk.forEachChild(inner, new java.util.function.Consumer<Object>() {
+                @Override public void accept(Object child) { walkInSubquery(child, pass); }
+            });
+        }
+
+        private void walkInSubquery(Object node, List<Scope> scopes) {
+            if (node == null) return;
+            if (node instanceof Literal || node instanceof WildcardExpr) return;
+            if (node instanceof SelectStmt) {
+                walkSubquery((SelectStmt) node, scopes);
+                return;
+            }
+            if (node instanceof Statement) return;
+            if (node instanceof Expression) {
+                Expression expr = (Expression) node;
+                // An aggregate over an outer column belongs to the outer query, where the
+                // column is one of the rows being aggregated, so it is allowed.
+                if (isAggregateCall(expr)) return;
+                if (expr instanceof ColumnRef) {
+                    ColumnRef ref = (ColumnRef) expr;
+                    for (Scope scope : scopes) {
+                        if (ref.table() != null) {
+                            if (scope.names(ref.table())) return;
+                        } else {
+                            if (findBinding(ref, scope.resolved) != null) return;
+                            if (scope.opaque || scope.names(ref.column())) return;
+                        }
+                    }
+                    RowContext.TableBinding binding = findBinding(ref, bindings);
+                    if (binding == null) return;
+                    if (groupedForms.contains(canon(ref, bindings))) return;
+                    if (determinedByGrouping(ref, binding)) return;
+                    throw new MemgresException("subquery uses ungrouped column \""
+                            + qualify(ref, binding) + "\" from outer query", "42803");
+                }
+            }
+            final List<Scope> pass = scopes;
+            AstWalk.forEachChild(node, new java.util.function.Consumer<Object>() {
+                @Override public void accept(Object child) { walkInSubquery(child, pass); }
+            });
         }
 
         /** True when the grouping covers the column's whole primary key. */
@@ -333,6 +591,83 @@ final class GroupByValidator {
             return select.isAggregateFunction(((com.memgres.engine.parser.ast.FunctionCallExpr) expr).name());
         }
         return false;
+    }
+
+    // ---- Nested query scopes ----
+
+    /**
+     * What a nested query's own FROM clause brings into scope. A relation whose columns can be
+     * read off the catalog answers for the names it has; one that would have to be run first —
+     * a CTE, a view, a sub-select, a function — answers only for its own name, and leaves the
+     * scope opaque so that an unqualified name inside the nested query is left alone rather
+     * than guessed at.
+     */
+    private static final class Scope {
+        final List<RowContext.TableBinding> resolved = new ArrayList<RowContext.TableBinding>();
+        final List<String> names = new ArrayList<String>();
+        boolean opaque;
+
+        boolean names(String name) {
+            if (name == null) return false;
+            for (String candidate : names) {
+                if (name.equalsIgnoreCase(candidate)) return true;
+            }
+            return false;
+        }
+    }
+
+    private Scope subqueryScope(SelectStmt inner) {
+        Scope scope = new Scope();
+        if (inner.from() == null || inner.from().isEmpty()) return scope;
+        for (SelectStmt.FromItem item : inner.from()) {
+            addScopeItem(item, scope);
+        }
+        return scope;
+    }
+
+    private void addScopeItem(SelectStmt.FromItem item, Scope scope) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+            addScopeItem(join.left(), scope);
+            addScopeItem(join.right(), scope);
+            return;
+        }
+        if (item instanceof SelectStmt.SubqueryFrom) {
+            scope.opaque = true;
+            scope.names.add(((SelectStmt.SubqueryFrom) item).alias());
+            return;
+        }
+        if (item instanceof SelectStmt.FunctionFrom) {
+            SelectStmt.FunctionFrom function = (SelectStmt.FunctionFrom) item;
+            scope.opaque = true;
+            scope.names.add(function.alias() != null ? function.alias() : function.functionName());
+            return;
+        }
+        if (!(item instanceof SelectStmt.TableRef)) {
+            scope.opaque = true;
+            return;
+        }
+        SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+        String alias = ref.alias() != null ? ref.alias() : ref.table();
+        scope.names.add(alias);
+        if (select.lookupCte(ref.table()) != null
+                || select.executor.database.getView(ref.table()) != null) {
+            scope.opaque = true;
+            return;
+        }
+        Table table;
+        try {
+            table = select.executor.resolveTable(
+                    ref.schema() != null ? ref.schema() : select.executor.defaultSchema(), ref.table());
+        } catch (RuntimeException e) {
+            scope.opaque = true;
+            return;
+        }
+        if (table == null) {
+            scope.opaque = true;
+            return;
+        }
+        scope.resolved.add(new RowContext.TableBinding(table, alias, new Object[table.getColumns().size()]));
     }
 
     // ---- Relation and column resolution ----

@@ -544,10 +544,35 @@ class SelectAggregateEvaluator {
             });
         }
 
+        resultRows = applyDistinctOn(stmt, resultRows, rowGroups);
         resultRows = select.applyDistinct(stmt, resultRows);
         resultRows = select.applyOffsetAndLimit(stmt, resultRows);
 
         return QueryResult.select(resultColumns, resultRows);
+    }
+
+    /**
+     * DISTINCT ON over a grouped query keys on the groups, not the input rows: the key may be an
+     * aggregate, and the row it keeps is the first in the query's own order. Applied here rather
+     * than on the input rows, which no longer exist one-to-one once the query has grouped.
+     */
+    private List<Object[]> applyDistinctOn(SelectStmt stmt, List<Object[]> rows,
+                                           Map<Object[], List<RowContext>> rowGroups) {
+        if (stmt.distinctOn() == null || stmt.distinctOn().isEmpty()) return rows;
+        Set<String> seen = new LinkedHashSet<>();
+        List<Object[]> kept = new ArrayList<>();
+        for (Object[] row : rows) {
+            List<RowContext> group = rowGroups.get(row);
+            if (group == null) group = Cols.listOf();
+            RowContext representative = group.isEmpty() ? null : group.get(0);
+            StringBuilder key = new StringBuilder();
+            for (Expression on : stmt.distinctOn()) {
+                Object value = evalAggregateExpr(on, group, representative);
+                key.append(value == null ? "\0NULL" : RowKey.valueKey(value)).append('\1');
+            }
+            if (seen.add(key.toString())) kept.add(row);
+        }
+        return kept;
     }
 
     // ---- Aggregate expression evaluation ----
