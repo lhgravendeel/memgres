@@ -376,6 +376,8 @@ class DdlAdminExecutor {
 
     QueryResult executeCreatePolicy(CreatePolicyStmt stmt) {
         Table table = executor.resolveTable("public", stmt.table());
+        DdlDefinitionChecks.requireBooleanPredicate(stmt.usingExpr(), table, "POLICY");
+        DdlDefinitionChecks.requireBooleanPredicate(stmt.withCheckExpr(), table, "POLICY");
         table.addRlsPolicy(new RlsPolicy(stmt.name(), stmt.command(),
                 stmt.usingExpr(), stmt.withCheckExpr(), stmt.roles(), stmt.policyType()));
         return QueryResult.message(QueryResult.Type.SET, "CREATE POLICY");

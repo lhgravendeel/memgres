@@ -746,10 +746,20 @@ class SessionExecutor {
                 String namesStr = val.substring(0, colonIdx);
                 String mode = val.substring(colonIdx + 1);
                 boolean deferred = "DEFERRED".equalsIgnoreCase(mode);
-                if (executor.session != null) {
-                    if ("ALL".equals(namesStr)) {
+                if ("ALL".equals(namesStr)) {
+                    if (executor.session != null) {
                         executor.session.setAllConstraintsDeferred(deferred);
-                    } else {
+                    }
+                } else {
+                    // A name that matches no constraint would silently do nothing, leaving the
+                    // caller believing it had changed when a constraint fires.
+                    for (String cn : namesStr.split(",")) {
+                        String constraintName = cn.trim();
+                        if (!constraintExists(constraintName)) {
+                            throw PgErrors.undefinedObject("constraint", constraintName);
+                        }
+                    }
+                    if (executor.session != null) {
                         for (String cn : namesStr.split(",")) {
                             executor.session.setConstraintDeferred(cn.trim(), deferred);
                         }
@@ -2254,6 +2264,16 @@ class SessionExecutor {
             executor.session.removeCursor(stmt.cursorName());
         }
         return QueryResult.message(QueryResult.Type.SET, "CLOSE CURSOR");
+    }
+
+    /** True when some table in the database carries a constraint of this name. */
+    private boolean constraintExists(String name) {
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table table : schema.getTables().values()) {
+                if (table.getConstraint(name) != null) return true;
+            }
+        }
+        return false;
     }
 
     private boolean isRoleSuperuser(String role) {

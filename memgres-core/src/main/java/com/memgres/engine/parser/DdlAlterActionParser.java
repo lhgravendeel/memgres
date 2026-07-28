@@ -132,6 +132,16 @@ class DdlAlterActionParser {
                 parser.readIdentifier(); // access method name
                 return new AlterTableStmt.SetStorageParams();
             }
+            // SET WITHOUT CLUSTER / SET WITHOUT OIDS: both concern on-disk layout, so there is
+            // nothing to change here, but they are valid SQL and must not be a syntax error.
+            if (parser.matchKeyword("WITHOUT")) {
+                Token what = parser.peek();
+                String word = parser.readIdentifier();
+                if (!"cluster".equalsIgnoreCase(word) && !"oids".equalsIgnoreCase(word)) {
+                    throw new ParseException("Expected CLUSTER or OIDS", what);
+                }
+                return new AlterTableStmt.SetStorageParams();
+            }
             // Fall through; could be other SET variants, but for now error
             throw new ParseException("Unsupported ALTER TABLE SET action", parser.peek());
         }
@@ -243,6 +253,14 @@ class DdlAlterActionParser {
         if (parser.matchKeywords("DROP", "DEFAULT")) return new AlterTableStmt.DropDefault();
         if (parser.matchKeyword("TYPE") || parser.matchKeywords("SET", "DATA", "TYPE")) {
             String typeName = parser.parseTypeName();
+            // A collation only exists for the collatable types, so naming one for any other type
+            // is a contradiction PG refuses rather than silently ignoring.
+            if (parser.matchKeyword("COLLATE")) {
+                com.memgres.engine.DdlDefinitionChecks.rejectUncollatableType(typeName);
+                String collation = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
+                ExpressionParser.validateCollationStatic(collation, parser.peek());
+            }
             // Capture optional USING clause for data conversion
             Expression usingExpr = null;
             if (parser.matchKeyword("USING")) usingExpr = parser.parseExpression();
@@ -289,8 +307,15 @@ class DdlAlterActionParser {
         }
         // DROP IDENTITY [IF EXISTS]: remove identity
         if (parser.matchKeywords("DROP", "IDENTITY")) {
-            parser.matchKeywords("IF", "EXISTS");
-            return new AlterTableStmt.DropDefault();
+            return new AlterTableStmt.DropIdentity(parser.matchKeywords("IF", "EXISTS"));
+        }
+        // DROP EXPRESSION [IF EXISTS]: turn a stored generated column into an ordinary one.
+        // EXPRESSION is not reserved, so it arrives as a plain identifier.
+        if (parser.checkKeyword("DROP") && parser.pos + 1 < parser.tokens.size()
+                && "EXPRESSION".equalsIgnoreCase(parser.tokens.get(parser.pos + 1).value())) {
+            parser.advance();
+            parser.advance();
+            return new AlterTableStmt.DropExpression(parser.matchKeywords("IF", "EXISTS"));
         }
         // RESTART [WITH n]: identity restart
         if (parser.matchKeyword("RESTART")) {

@@ -10,17 +10,27 @@ public final class AlterTableStmt implements Statement {
     public final String table;
     public final List<AlterAction> actions;
     public final boolean ifExists;
+    /** ONLY: the action applies to this table alone and must not reach its children. */
+    public final boolean only;
 
-    public AlterTableStmt(String schema, String table, List<AlterAction> actions, boolean ifExists) {
+    public AlterTableStmt(String schema, String table, List<AlterAction> actions, boolean ifExists,
+                          boolean only) {
         this.schema = schema;
         this.table = table;
         this.actions = actions;
         this.ifExists = ifExists;
+        this.only = only;
+    }
+
+    public AlterTableStmt(String schema, String table, List<AlterAction> actions, boolean ifExists) {
+        this(schema, table, actions, ifExists, false);
     }
 
     public AlterTableStmt(String schema, String table, List<AlterAction> actions) {
-        this(schema, table, actions, false);
+        this(schema, table, actions, false, false);
     }
+
+    public boolean only() { return only; }
 
     public interface AlterAction {}
 
@@ -812,6 +822,20 @@ public final class AlterTableStmt implements Statement {
         public final String method;
         public SetCompression(String method) { this.method = method; }
         public String method() { return method; }
+    }
+
+    /** ALTER COLUMN ... DROP IDENTITY [IF EXISTS] — distinct from DROP DEFAULT, which never complains. */
+    public static final class DropIdentity implements AlterColumnAction {
+        public final boolean ifExists;
+        public DropIdentity(boolean ifExists) { this.ifExists = ifExists; }
+        public boolean ifExists() { return ifExists; }
+    }
+
+    /** ALTER COLUMN ... DROP EXPRESSION [IF EXISTS] — turns a generated column into an ordinary one. */
+    public static final class DropExpression implements AlterColumnAction {
+        public final boolean ifExists;
+        public DropExpression(boolean ifExists) { this.ifExists = ifExists; }
+        public boolean ifExists() { return ifExists; }
     }
 
         public static final class ColumnNoOp implements AlterColumnAction {
