@@ -1340,6 +1340,40 @@ public class Session {
         return nestedExecutionDepth > 0;
     }
 
+    // ---- Recursion depth (PostgreSQL's max_stack_depth) ----
+
+    /** Routine bodies — functions, procedures, DO blocks — currently on the call chain. */
+    private int routineDepth;
+    /** Trigger firings currently on the call chain. */
+    private int triggerDepth;
+
+    /**
+     * Recursion that never terminates has to be reported as PostgreSQL reports it — {@code 54001}
+     * naming the limit — rather than left to exhaust the Java stack, which surfaces as an internal
+     * error from wherever the stack happened to give out.
+     */
+    public void enterRoutine() {
+        if (routineDepth >= PgErrors.MAX_ROUTINE_DEPTH) {
+            throw PgErrors.stackDepthExceeded();
+        }
+        routineDepth++;
+    }
+
+    public void exitRoutine() {
+        if (routineDepth > 0) routineDepth--;
+    }
+
+    public void enterTriggerCall() {
+        if (triggerDepth >= PgErrors.MAX_TRIGGER_DEPTH) {
+            throw PgErrors.stackDepthExceeded();
+        }
+        triggerDepth++;
+    }
+
+    public void exitTriggerCall() {
+        if (triggerDepth > 0) triggerDepth--;
+    }
+
     public void registerStatementEndDrop(String schema, String tableName) {
         statementEndDropTables.add(new String[]{schema, tableName});
     }

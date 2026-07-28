@@ -59,7 +59,7 @@ class FromResolver {
                     return;
                 }
                 try {
-                    QueryResult vr = executor.executeStatement(view.query());
+                    QueryResult vr = executor.executeViewQuery(tableRef.table(), view.query());
                     if (!vr.getColumns().isEmpty()) {
                         bindings.add(new RowContext.TableBinding(
                                 new Table(alias, vr.getColumns()), alias, new Object[vr.getColumns().size()]));
@@ -407,7 +407,7 @@ class FromResolver {
                 if (viewOwner != null) executor.viewOwnerRole = viewOwner;
                 QueryResult viewResult;
                 try {
-                    viewResult = executor.executeStatement(view.query());
+                    viewResult = executor.executeViewQuery(tableRef.table(), view.query());
                 } finally {
                     executor.viewOwnerRole = priorViewOwner;
                 }
