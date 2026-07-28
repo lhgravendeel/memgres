@@ -116,6 +116,12 @@ public class Sequence {
         called = false;
     }
 
+    /** Set the counter and its called flag together, as ALTER SEQUENCE resolves them as a pair. */
+    public synchronized void setCurrentValue(long value, boolean isCalled) {
+        currentValue.set(value);
+        this.called = isCalled;
+    }
+
     /**
      * Returns the current internal value without checking the 'called' flag.
      * Used for snapshot/restore.

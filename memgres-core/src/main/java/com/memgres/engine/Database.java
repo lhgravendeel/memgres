@@ -36,6 +36,7 @@ public class Database {
     private final Map<String, DomainType> domains = new ConcurrentHashMap<>();
     private final Map<String, List<CreateTypeStmt.CompositeField>> compositeTypes = new ConcurrentHashMap<>();
     private final Map<String, String> rangeTypes = new ConcurrentHashMap<>(); // range type name → subtype name
+    private final Set<String> shellTypes = ConcurrentHashMap.newKeySet(); // CREATE TYPE name; with no definition
     private final Map<String, PgAggregate> userAggregates = new ConcurrentHashMap<>();
     private final Map<String, PgOperator> userOperators = new ConcurrentHashMap<>();
     private final Map<String, PgOperatorFamily> userOperatorFamilies = new ConcurrentHashMap<>();
@@ -998,6 +999,23 @@ public class Database {
 
     public Map<String, String> getRangeTypes() {
         return rangeTypes;
+    }
+
+    // Shell types: a name reserved by CREATE TYPE name; with no definition yet
+    public void addShellType(String name) {
+        shellTypes.add(name.toLowerCase());
+    }
+
+    public boolean isShellType(String name) {
+        return shellTypes.contains(name.toLowerCase());
+    }
+
+    public void removeShellType(String name) {
+        shellTypes.remove(name.toLowerCase());
+    }
+
+    public Set<String> getShellTypes() {
+        return shellTypes;
     }
 
     public void addUserCast(int sourceOid, int targetOid, int castFunc, String castContext, String castMethod) {

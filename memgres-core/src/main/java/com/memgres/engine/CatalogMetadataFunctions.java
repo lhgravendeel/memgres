@@ -599,21 +599,28 @@ class CatalogMetadataFunctions {
 
     private Object evalPgGetSerialSequence(FunctionCallExpr fn, RowContext ctx) {
         if (fn.args().size() < 2) return null;
-        String tblName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-        String colName = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+        Object tblArg = executor.evalExpr(fn.args().get(0), ctx);
+        Object colArg = executor.evalExpr(fn.args().get(1), ctx);
+        if (tblArg == null || colArg == null) return null;
+        String tblName = String.valueOf(tblArg);
+        String colName = String.valueOf(colArg);
         String explicitSchema = null;
         if (tblName.contains(".")) {
             explicitSchema = tblName.substring(0, tblName.lastIndexOf('.'));
             tblName = tblName.substring(tblName.lastIndexOf('.') + 1);
         }
+        boolean relationFound = false;
+        boolean columnFound = false;
         for (java.util.Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
             String schemaName = entry.getKey();
             if (explicitSchema != null && !schemaName.equalsIgnoreCase(explicitSchema)) continue;
             Schema schema = entry.getValue();
             Table tbl = schema.getTable(tblName);
             if (tbl != null) {
+                relationFound = true;
                 for (Column col : tbl.getColumns()) {
                     if (col.getName().equalsIgnoreCase(colName)) {
+                        columnFound = true;
                         String def = col.getDefaultValue();
                         if (def != null && def.toLowerCase().contains("nextval")) {
                             int q1 = def.indexOf('\'');
@@ -635,6 +642,15 @@ class CatalogMetadataFunctions {
                     }
                 }
             }
+        }
+        // A name that resolves to nothing is an error, not a NULL: a caller asking for the sequence
+        // behind a column it misspelled would otherwise read the NULL as "column has no sequence".
+        if (!relationFound && !executor.database.hasView(tblName)) {
+            throw new MemgresException("relation \"" + tblName + "\" does not exist", "42P01");
+        }
+        if (relationFound && !columnFound) {
+            throw new MemgresException(
+                    "column \"" + colName + "\" of relation \"" + tblName + "\" does not exist", "42703");
         }
         // M20: fallback — check sequences with OWNED BY pointing to this table.column
         for (java.util.Map.Entry<String, Sequence> seqEntry : executor.database.getSequences().entrySet()) {

@@ -679,10 +679,20 @@ class ComparisonSequenceCoverageTest {
     }
 
     @Test void testAlterSequenceMinvalue() throws SQLException {
-        exec("CREATE SEQUENCE seq_alt_min_test");
+        exec("CREATE SEQUENCE seq_alt_min_test START 10");
         exec("ALTER SEQUENCE seq_alt_min_test MINVALUE 5");
         // Sequence should still work; minvalue is a floor
+        assertEquals(10, queryLong("SELECT nextval('seq_alt_min_test')"));
         exec("DROP SEQUENCE seq_alt_min_test");
+    }
+
+    @Test void testAlterSequenceMinvalueAboveStartRejected() throws SQLException {
+        exec("CREATE SEQUENCE seq_alt_min_bad");
+        // PG rechecks START against the new MINVALUE, and the default START of 1 is below it
+        SQLException e = assertThrows(SQLException.class,
+                () -> exec("ALTER SEQUENCE seq_alt_min_bad MINVALUE 5"));
+        assertEquals("22023", e.getSQLState());
+        exec("DROP SEQUENCE seq_alt_min_bad");
     }
 
     @Test void testAlterSequenceMaxvalue() throws SQLException {
