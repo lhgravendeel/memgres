@@ -35,7 +35,18 @@ class ExprEvaluator {
 
     // ---- Main expression dispatcher ----
 
+    /**
+     * Countdown to the next cancellation poll. Every row of every scan passes through here, so
+     * this is where a runaway query notices statement_timeout; polling on each expression would
+     * cost more than it is worth, and a few thousand evaluations is still sub-millisecond.
+     */
+    private int cancelPollCountdown;
+
     public Object evalExpr(Expression expr, RowContext ctx) {
+        if (--cancelPollCountdown <= 0) {
+            cancelPollCountdown = 4096;
+            StatementCancel.check();
+        }
         if (expr instanceof Literal) return evalLiteral(((Literal) expr));
         if (expr instanceof PrecomputedValueExpr) return ((PrecomputedValueExpr) expr).value();
         // A set-returning function nested inside a larger SELECT-list expression (e.g.
@@ -163,6 +174,16 @@ class ExprEvaluator {
         }
         if (expr instanceof FieldAccessExpr) {
             FieldAccessExpr fa = (FieldAccessExpr) expr;
+            // A function declared to return bare "record" carries no column names, so there is
+            // nothing for (f()).x to match — PG says so rather than evaluating the call.
+            if (fa.expr() instanceof FunctionCallExpr) {
+                PgFunction pf = executor.database.getFunction(FunctionEvaluator.stripSchemaPrefix(
+                        ((FunctionCallExpr) fa.expr()).name().toLowerCase()));
+                if (pf != null && pf.declaresRecordResult() && !pf.hasOutParams()) {
+                    throw new MemgresException("could not identify column \"" + fa.field()
+                            + "\" in record data type", "42703");
+                }
+            }
             // Composite field access: (expr).field
             Object val = evalExpr(fa.expr(), ctx);
             if (val == null) return null;
@@ -191,7 +212,7 @@ class ExprEvaluator {
             if (val instanceof AstExecutor.PgRow) {
                 AstExecutor.PgRow row = (AstExecutor.PgRow) val;
                 if (typeName != null) {
-                    List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+                    List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
                     if (fields != null) {
                         for (int i = 0; i < fields.size(); i++) {
                             if (fields.get(i).name().equalsIgnoreCase(fieldName)) {
@@ -213,7 +234,7 @@ class ExprEvaluator {
             if (val instanceof String && ((String) val).startsWith("(") && ((String) val).endsWith(")")) {
                 String s = (String) val;
                 if (typeName != null) {
-                    List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+                    List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
                     if (fields != null) {
                         String[] parts = executor.splitCompositeString(s.substring(1, s.length() - 1));
                         for (int i = 0; i < fields.size(); i++) {
@@ -2045,11 +2066,81 @@ class ExprEvaluator {
         return sb.toString();
     }
 
+    /**
+     * The concrete result type of a polymorphic call, inferred from the argument expressions,
+     * or null when the arguments do not determine it.
+     */
+    private String polymorphicReturnType(PgFunction userFunc, FunctionCallExpr fn,
+                                         List<RowContext.TableBinding> bindings) {
+        List<String> declared = new ArrayList<>();
+        for (PgFunction.Param p : userFunc.getParams()) {
+            if ("OUT".equalsIgnoreCase(p.mode())) continue;
+            declared.add(p.typeName());
+        }
+        List<String> actual = new ArrayList<>();
+        for (Expression arg : fn.args()) {
+            actual.add(polymorphicArgTypeName(arg, bindings));
+        }
+        PolymorphicTypes.Binding binding = PolymorphicTypes.bind(declared, actual);
+        if (binding == null) return null;
+        return PolymorphicTypes.concreteType(
+                userFunc.getReturnType().replaceAll("\\(.*\\)", "").trim(), binding);
+    }
+
+    /**
+     * The type name of one call argument, for polymorphic binding. An ARRAY[...] constructor
+     * needs spelling out because the general inference reports every array as text.
+     */
+    private String polymorphicArgTypeName(Expression arg, List<RowContext.TableBinding> bindings) {
+        if (arg instanceof ArrayExpr && !((ArrayExpr) arg).isRow()) {
+            List<Expression> elements = ((ArrayExpr) arg).elements();
+            if (elements.isEmpty()) return null;
+            DataType elemType = inferTypeFromContext(elements.get(0), bindings);
+            return elemType != null ? PolymorphicTypes.typeName(elemType) + "[]" : null;
+        }
+        DataType dt = inferTypeFromContext(arg, bindings);
+        return PolymorphicTypes.typeName(dt);
+    }
+
+    /**
+     * Look up a user function for result-type inference. A qualified call names its schema
+     * outright; an unqualified one takes the first search_path schema that defines the name.
+     */
+    private PgFunction resolveUserFunctionForTyping(String name, FunctionCallExpr fn,
+                                                    List<RowContext.TableBinding> bindings) {
+        List<PgFunction> candidates;
+        int dot = name.lastIndexOf('.');
+        if (dot >= 0) {
+            candidates = executor.database.getFunctionOverloads(name.substring(0, dot), name.substring(dot + 1));
+        } else {
+            List<PgFunction> all = executor.database.getFunctionOverloads(name);
+            if (all.isEmpty()) return executor.database.getFunction(name);
+            candidates = new ArrayList<>();
+            for (String schema : executor.searchPathSchemas()) {
+                for (PgFunction f : all) {
+                    if (Database.schemaOf(f).equalsIgnoreCase(schema)) candidates.add(f);
+                }
+            }
+            if (candidates.isEmpty()) candidates = all;
+        }
+        if (candidates.isEmpty()) return null;
+        // Overloads differ in result type, so the call's argument types decide which one is meant.
+        List<String> hints = new ArrayList<>();
+        for (Expression arg : fn.args()) hints.add(polymorphicArgTypeName(arg, bindings));
+        PgFunction resolved = executor.database.resolveFunction(candidates, fn.args().size(), hints);
+        return resolved != null ? resolved : candidates.get(0);
+    }
+
     // ---- Expression alias derivation ----
 
     String exprToAlias(Expression expr) {
         if (expr instanceof ColumnRef) return ((ColumnRef) expr).column();
-        if (expr instanceof FunctionCallExpr) return ((FunctionCallExpr) expr).name();
+        if (expr instanceof FunctionCallExpr) {
+            // PG labels the column with the bare routine name; the schema qualifier is not part of it.
+            String fnName = ((FunctionCallExpr) expr).name();
+            int dot = fnName.lastIndexOf('.');
+            return dot >= 0 ? fnName.substring(dot + 1) : fnName;
+        }
         if (expr instanceof WindowFuncExpr) return ((WindowFuncExpr) expr).name();
         if (expr instanceof AtTimeZoneExpr) return "timezone";
         if (expr instanceof FieldAccessExpr) return ((FieldAccessExpr) expr).field();
@@ -2361,9 +2452,19 @@ class ExprEvaluator {
             if (name.equals("json_serialize")) return DataType.TEXT;
             // Check user-defined functions and aggregates for return type
             if (executor != null && executor.database != null) {
-                PgFunction userFunc = executor.database.getFunction(name);
+                PgFunction userFunc = resolveUserFunctionForTyping(name, fn, bindings);
                 if (userFunc != null && userFunc.getReturnType() != null) {
-                    DataType dt = DataType.fromPgName(userFunc.getReturnType().replaceAll("\\(.*\\)", "").trim());
+                    String declaredReturn = userFunc.getReturnType().replaceAll("\\(.*\\)", "").trim();
+                    if (PolymorphicTypes.isPolymorphic(declaredReturn)) {
+                        // The result type of a polymorphic routine is whatever this call's
+                        // arguments bind its slots to.
+                        String concrete = polymorphicReturnType(userFunc, fn, bindings);
+                        if (concrete != null) {
+                            DataType dt = DataType.fromPgName(concrete);
+                            if (dt != null) return dt;
+                        }
+                    }
+                    DataType dt = DataType.fromPgName(declaredReturn);
                     if (dt != null) return dt;
                 }
                 PgAggregate userAgg = executor.database.getAggregate(name);

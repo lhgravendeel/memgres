@@ -64,6 +64,9 @@ class CastEvaluator {
         oids.put(1009, "text[]");
         oids.put(1016, "bigint[]");
         oids.put(1000, "boolean[]");
+        for (String polyName : PolymorphicTypes.names()) {
+            oids.put(PolymorphicTypes.oid(polyName), polyName);
+        }
         OID_TO_TYPE = Collections.unmodifiableMap(oids);
     }
 
@@ -117,6 +120,36 @@ class CastEvaluator {
             return bits.toString();
         }
         return text;
+    }
+
+    /** Bits a bit string may declare: one attribute's worth (PG's MaxAttrSize, in bits). */
+    private static final long MAX_BIT_LENGTH = 10485760L * 8;
+
+    /**
+     * A bit string is stored in a single attribute, so PostgreSQL bounds the length modifier as
+     * it reads it rather than when the value is built. memgres holds the bits in an ordinary
+     * string, so an unbounded modifier is an unbounded allocation.
+     */
+    private static void checkBitTypmod(String typeName, String lowerSpec) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\((-?\\d+)\\)").matcher(lowerSpec);
+        if (!m.find()) return;
+        // PG names the type by its internal spelling, whichever syntax was written
+        String reported = typeName.equals("bit") ? "bit" : "varbit";
+        java.math.BigInteger written = new java.math.BigInteger(m.group(1));
+        // A type modifier is an int4, so one too wide fails as a bad integer before it is a
+        // length at all
+        if (written.bitLength() > 31) {
+            throw new MemgresException("value \"" + m.group(1)
+                    + "\" is out of range for type integer", "22003");
+        }
+        long n = written.longValue();
+        if (n < 1) {
+            throw new MemgresException("length for type " + reported + " must be at least 1", "22023");
+        }
+        if (n > MAX_BIT_LENGTH) {
+            throw new MemgresException("length for type " + reported + " cannot exceed "
+                    + MAX_BIT_LENGTH, "22023");
+        }
     }
 
     /**
@@ -179,24 +212,13 @@ class CastEvaluator {
     }
 
     /**
-     * Resolves the zone to use when interpreting a zoneless timestamptz literal.
-     * Follows the session TimeZone GUC only when it has been explicitly SET for this session
-     * (matching PG's "session TimeZone governs interpretation" semantics); otherwise falls back
-     * to the JVM's default zone, preserving memgres's historical default behavior.
+     * The zone a zoneless timestamptz literal is interpreted in: the session TimeZone, always.
+     * It has to be the same zone the value is later read back in, or a literal written as
+     * midnight comes back as the previous day — and the session is told over ParameterStatus
+     * which zone that is, so anything else would be a lie to the client.
      */
     private java.time.ZoneId sessionInterpretationZone() {
-        if (executor.session != null) {
-            GucSettings guc = executor.session.getGucSettings();
-            if (guc.hasSessionOverride("timezone")) {
-                String tz = guc.get("timezone");
-                if (tz != null) {
-                    try {
-                        return java.time.ZoneId.of(tz);
-                    } catch (Exception ignored) { /* fall back to JVM default below */ }
-                }
-            }
-        }
-        return java.time.ZoneId.systemDefault();
+        return TypeCoercion.sessionZone();
     }
 
     private int extraFloatDigits() {
@@ -231,6 +253,10 @@ class CastEvaluator {
         }
         String lowerSpec = typeSpec.toLowerCase().trim();
 
+        // A polymorphic pseudo-type is a placeholder, not a target: the value keeps whatever
+        // concrete type the caller passed in.
+        if (PolymorphicTypes.isPolymorphic(lowerSpec)) return val;
+
         // Reject impossible casts (PG raises 42846 "cannot cast type X to Y")
         if (lowerSpec.equals("uuid")) {
             if (val instanceof Number || val instanceof Boolean) {
@@ -262,7 +288,7 @@ class CastEvaluator {
         }
         // Handle numeric(precision, scale) and apply scale for proper formatting
         if (lowerSpec.startsWith("numeric(") || lowerSpec.startsWith("decimal(")) {
-            java.math.BigDecimal bd = TypeCoercion.toBigDecimal(val);
+            java.math.BigDecimal bd = NumericLimits.check(TypeCoercion.toBigDecimal(val));
             String params = lowerSpec.replaceAll(".*\\(([^)]+)\\).*", "$1");
             String[] parts = params.split(",");
             int precision = Integer.parseInt(parts[0].trim());
@@ -405,7 +431,7 @@ class CastEvaluator {
             case "numeric":
             case "decimal": {
                 if (val instanceof String && ((String) val).trim().equalsIgnoreCase("NaN")) return Double.NaN;
-                return TypeCoercion.toBigDecimal(val);
+                return NumericLimits.check(TypeCoercion.toBigDecimal(val));
             }
             case "citext": {
                 // citext preserves original case but compares case-insensitively
@@ -616,6 +642,9 @@ class CastEvaluator {
             case "bit":
             case "bit varying":
             case "varbit": {
+                // A bit string lives in one attribute, so PG bounds the modifier before it builds
+                // anything; without this, bit(200000000) allocates two hundred million characters.
+                checkBitTypmod(typeName, lowerSpec);
                 String bitStr;
                 if (val instanceof AstExecutor.PgBitString) {
                     bitStr = ((AstExecutor.PgBitString) val).bits();
@@ -1049,6 +1078,10 @@ class CastEvaluator {
                     return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
                 String rtName = val.toString().trim().toLowerCase();
+                // Polymorphic pseudo-types are real pg_type rows, so they cast like any other name
+                if (PolymorphicTypes.isPolymorphic(rtName)) {
+                    return new RegtypeValue(PolymorphicTypes.oid(rtName), rtName);
+                }
                 // Validate the type exists
                 DataType dt = DataType.fromPgName(rtName);
                 if (dt == null) {
@@ -1246,16 +1279,16 @@ class CastEvaluator {
                 if (typeName.equals("record")) {
                     return val;
                 }
-                // ROW cast to composite type; check arity
-                if (val instanceof AstExecutor.PgRow && executor.database.isCompositeType(typeName)) {
+                // ROW cast to a composite type, which a table also defines; check arity
+                List<CreateTypeStmt.CompositeField> rowFields = executor.database.getRowType(typeName);
+                if (val instanceof AstExecutor.PgRow && rowFields != null) {
                     AstExecutor.PgRow pr = (AstExecutor.PgRow) val;
-                    List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
-                    if (fields != null && pr.values().size() != fields.size()) {
+                    if (pr.values().size() != rowFields.size()) {
                         throw new MemgresException("cannot cast type record to " + typeName, "42846");
                     }
                 }
                 // If this type is not a known composite either, it doesn't exist
-                if (!executor.database.isCompositeType(typeName)) {
+                if (rowFields == null) {
                     // Check if it looks like a user-defined type name (not a built-in alias we missed)
                     // Known safe aliases that fall through: none should reach here after the switch above
                     // Only throw if the type name looks like an unknown identifier (not a PG built-in)
@@ -1382,8 +1415,17 @@ class CastEvaluator {
             } else if (elem instanceof java.util.List<?>) {
                 java.util.List<?> nested = (java.util.List<?>) elem;
                 sb.append(formatListAsPgArray(nested));
-            } else if (elem instanceof String) {
-                String s = (String) elem;
+            } else if (elem instanceof String || elem instanceof AstExecutor.PgRow
+                    || elem instanceof java.util.Map<?, ?>) {
+                // A composite element renders as (f1,f2), whose commas make it need quoting
+                String s;
+                if (elem instanceof AstExecutor.PgRow) {
+                    s = ((AstExecutor.PgRow) elem).toPgText();
+                } else if (elem instanceof java.util.Map<?, ?>) {
+                    s = AstExecutor.PgRow.fromFieldMap((java.util.Map<?, ?>) elem).toPgText();
+                } else {
+                    s = (String) elem;
+                }
                 // Quote strings that contain special chars
                 if (s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains(" ") || s.isEmpty()) {
                     sb.append("\"").append(s.replace("\"", "\\\"")).append("\"");

@@ -105,6 +105,9 @@ class SelectExecutor {
         rejectMisplacedSrfs(stmt);
         // SELECT without FROM
         if (stmt.from() == null || stmt.from().isEmpty()) {
+            rejectSrfInAggregates(stmt);
+            validateDistinctOn(stmt);
+            windowEvaluator.validateWindowUsage(stmt);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
                     || (stmt.having() != null && containsAggregate(stmt.having()));
             if (hasAgg) {
@@ -120,6 +123,13 @@ class SelectExecutor {
         }
 
         List<RowContext> contexts = executor.fromResolver.resolveFromClause(stmt.from(), stmt.where());
+
+        // PostgreSQL builds the range table before it analyses the rest of the query, so a name
+        // that does not resolve is reported on its own even when the clauses are also wrong.
+        rejectSrfInAggregates(stmt);
+        validateDistinctOn(stmt);
+        validateFromClause(stmt.from());
+        windowEvaluator.validateWindowUsage(stmt);
 
         List<RowContext.TableBinding> baseBindings;
         if (!contexts.isEmpty()) {
@@ -222,6 +232,8 @@ class SelectExecutor {
             }
         }
 
+        rejectAmbiguousQualifiedRefs(stmt, baseBindings, usingColumnsLower);
+
         // Validate array subscript type errors for empty tables
         if (contexts.isEmpty() && simpleFrom && !baseBindings.isEmpty()) {
             for (SelectStmt.SelectTarget target : stmt.targets()) {
@@ -289,18 +301,35 @@ class SelectExecutor {
         // Check if this query uses aggregation
         boolean hasGroupBy = stmt.groupBy() != null && !stmt.groupBy().isEmpty();
         boolean hasGroupingSets = stmt.groupingSets() != null && !stmt.groupingSets().isEmpty();
+        // An aggregate anywhere — select list, HAVING or ORDER BY — makes the query grouped,
+        // so every other expression in it must itself be grouped or aggregated.
         boolean hasAggregates = hasAggregateInTargets(stmt.targets()) ||
-                (stmt.having() != null && containsAggregate(stmt.having()));
+                (stmt.having() != null && containsAggregate(stmt.having())) ||
+                hasAggregateInOrderBy(stmt.orderBy());
 
         if (hasGroupBy || hasGroupingSets || hasAggregates) {
             // PG allows DISTINCT ON with GROUP BY and aggregates — DISTINCT ON is applied after grouping
             // Validate: non-aggregate columns must be in GROUP BY
-            if (!hasGroupBy && !hasGroupingSets && hasAggregates) {
+            // GROUP BY () (and any grouping-set spec whose sets are all empty) collapses the
+            // input to a single row, so the select list is as constrained as with no GROUP BY
+            if (!hasGroupBy && (hasGroupingSets || hasAggregates)) {
                 for (SelectStmt.SelectTarget target : stmt.targets()) {
                     if (!isAggregateOrConstant(target.expr())) {
-                        String colName = executor.exprToAlias(target.expr());
+                        String colName = target.expr() instanceof ColumnRef
+                                ? qualifyColumn((ColumnRef) target.expr(), baseBindings)
+                                : executor.exprToAlias(target.expr());
                         throw new MemgresException(
                                 "column \"" + colName + "\" must appear in the GROUP BY clause or be used in an aggregate function",
+                                "42803");
+                    }
+                }
+                // HAVING is evaluated once over the single implicit group, so a bare column
+                // there is as ungrouped as one in the select list.
+                if (stmt.having() != null) {
+                    for (ColumnRef cr : ungroupedColumnRefs(stmt.having())) {
+                        if (!resolvesToColumn(cr, baseBindings)) continue;
+                        throw new MemgresException("column \"" + qualifyColumn(cr, baseBindings)
+                                + "\" must appear in the GROUP BY clause or be used in an aggregate function",
                                 "42803");
                     }
                 }
@@ -376,8 +405,9 @@ class SelectExecutor {
                                     && !groupedExprs.contains(target.expr().toString().toLowerCase())
                                     && !(alias != null && groupedExprs.contains(alias.toLowerCase()))
                                     && !allColumnRefsCoveredByGroupBy(target.expr(), groupedExprs)) {
-                                throw new MemgresException(
-                                        "column \"" + colName + "\" must appear in the GROUP BY clause or be used in an aggregate function",
+                                throw new MemgresException("column \"" + (target.expr() instanceof ColumnRef
+                                            ? qualifyColumn((ColumnRef) target.expr(), baseBindings) : colName)
+                                        + "\" must appear in the GROUP BY clause or be used in an aggregate function",
                                         "42803");
                             }
                         }
@@ -701,6 +731,14 @@ class SelectExecutor {
     boolean hasAggregateInTargets(List<SelectStmt.SelectTarget> targets) {
         for (SelectStmt.SelectTarget target : targets) {
             if (containsAggregate(target.expr())) return true;
+        }
+        return false;
+    }
+
+    private boolean hasAggregateInOrderBy(List<SelectStmt.OrderByItem> orderBy) {
+        if (orderBy == null) return false;
+        for (SelectStmt.OrderByItem ob : orderBy) {
+            if (containsAggregate(ob.expr())) return true;
         }
         return false;
     }
@@ -1559,6 +1597,257 @@ class SelectExecutor {
                 if (construct != null) throw misplacedSrf(construct);
             }
         }
+    }
+
+    /**
+     * A join or subquery given an alias exposes everything it produces under that single name,
+     * so two of its columns can end up sharing one. PG refuses to pick between them, because
+     * which one it picked would be invisible in the query text.
+     */
+    private static void rejectAmbiguousQualifiedRefs(SelectStmt stmt,
+                                                     List<RowContext.TableBinding> bindings,
+                                                     Set<String> usingColumns) {
+        if (bindings == null || bindings.isEmpty()) return;
+        List<ColumnRef> refs = new ArrayList<>();
+        for (SelectStmt.SelectTarget t : stmt.targets()) collectLocalColumnRefs(t.expr(), refs);
+        collectLocalColumnRefs(stmt.where(), refs);
+        collectLocalColumnRefs(stmt.having(), refs);
+        if (stmt.groupBy() != null) {
+            for (Expression g : stmt.groupBy()) collectLocalColumnRefs(g, refs);
+        }
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem ob : stmt.orderBy()) collectLocalColumnRefs(ob.expr(), refs);
+        }
+        for (ColumnRef cr : refs) {
+            if (cr.table() == null || cr.column() == null || "*".equals(cr.column())) continue;
+            if (usingColumns.contains(cr.column().toLowerCase())) continue;
+            for (RowContext.TableBinding b : bindings) {
+                String exposed = b.alias() != null ? b.alias() : b.table().getName();
+                if (!cr.table().equalsIgnoreCase(exposed)) continue;
+                int matches = 0;
+                for (Column c : b.table().getColumns()) {
+                    if (c.getName().equalsIgnoreCase(cr.column())) matches++;
+                }
+                if (matches > 1) {
+                    throw new MemgresException(
+                            "column reference \"" + cr.column() + "\" is ambiguous", "42702");
+                }
+            }
+        }
+    }
+
+    /** Column references belonging to this query level; a nested query resolves its own. */
+    private static void collectLocalColumnRefs(Object node, List<ColumnRef> out) {
+        if (node == null) return;
+        if (node instanceof ColumnRef) {
+            out.add((ColumnRef) node);
+            return;
+        }
+        if (node instanceof com.memgres.engine.parser.ast.Statement) return;
+        AstWalk.forEachChild(node, child -> collectLocalColumnRefs(child, out));
+    }
+
+    /**
+     * The checks PG makes over a FROM clause before a single row is read: two items that would
+     * answer to the same name, a join condition that is not a per-row predicate, a USING column
+     * named twice, and a LATERAL item that reaches across a join it cannot see past.
+     */
+    private void validateFromClause(List<SelectStmt.FromItem> from) {
+        if (from == null) return;
+        Map<String, String> exposed = new LinkedHashMap<>();
+        for (SelectStmt.FromItem item : from) {
+            collectAndValidate(item, exposed);
+        }
+    }
+
+    /** Records the names {@code item} exposes to the query, validating it on the way down. */
+    private void collectAndValidate(SelectStmt.FromItem item, Map<String, String> exposed) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+            Map<String, String> leftNames = new LinkedHashMap<>();
+            collectAndValidate(join.left(), leftNames);
+            Map<String, String> rightNames = new LinkedHashMap<>();
+            collectAndValidate(join.right(), rightNames);
+            for (String n : leftNames.values()) addExposed(exposed, n);
+            for (String n : rightNames.values()) addExposed(exposed, n);
+            if (join.on() != null) {
+                if (containsAggregate(join.on())) {
+                    throw new MemgresException("aggregate functions are not allowed in JOIN conditions", "42803");
+                }
+                if (containsWindowFunction(join.on())) {
+                    throw new MemgresException("window functions are not allowed in JOIN conditions", "42P20");
+                }
+            }
+            if (join.using() != null) {
+                Set<String> seen = new HashSet<>();
+                for (String col : join.using()) {
+                    if (!seen.add(col.toLowerCase())) {
+                        throw new MemgresException(
+                                "column name \"" + col + "\" appears more than once in USING clause", "42701");
+                    }
+                }
+            }
+            rejectLateralAcrossNullableSide(join, leftNames);
+            return;
+        }
+        String name = exposedName(item);
+        if (name != null) addExposed(exposed, name);
+    }
+
+    private static void addExposed(Map<String, String> exposed, String name) {
+        if (exposed.put(name.toLowerCase(), name) != null) {
+            throw new MemgresException("table name \"" + name + "\" specified more than once", "42712");
+        }
+    }
+
+    /** The name a FROM item answers to: its alias, or failing that the relation's own name. */
+    private static String exposedName(SelectStmt.FromItem item) {
+        String name = null;
+        if (item instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef t = (SelectStmt.TableRef) item;
+            name = t.alias() != null ? t.alias() : t.table();
+        } else if (item instanceof SelectStmt.SubqueryFrom) {
+            name = ((SelectStmt.SubqueryFrom) item).alias();
+        } else if (item instanceof SelectStmt.FunctionFrom) {
+            SelectStmt.FunctionFrom f = (SelectStmt.FunctionFrom) item;
+            name = f.alias() != null ? f.alias()
+                    : FunctionEvaluator.stripSchemaPrefix(f.functionName());
+        }
+        // Names the parser invents for constructs with no user-visible name of their own
+        return name == null || name.startsWith("__") ? null : name;
+    }
+
+    /**
+     * A LATERAL item on the nullable side of a RIGHT or FULL join cannot see the other side:
+     * when it is evaluated the rows it would read from are not yet determined.
+     */
+    private static void rejectLateralAcrossNullableSide(SelectStmt.JoinFrom join,
+                                                       Map<String, String> leftNames) {
+        SelectStmt.JoinType type = join.joinType();
+        if (type != SelectStmt.JoinType.RIGHT && type != SelectStmt.JoinType.FULL
+                && type != SelectStmt.JoinType.NATURAL_RIGHT && type != SelectStmt.JoinType.NATURAL_FULL) {
+            return;
+        }
+        Object lateralBody = null;
+        if (join.right() instanceof SelectStmt.SubqueryFrom
+                && ((SelectStmt.SubqueryFrom) join.right()).lateral()) {
+            lateralBody = ((SelectStmt.SubqueryFrom) join.right()).subquery();
+        } else if (join.right() instanceof SelectStmt.FunctionFrom) {
+            // A function in FROM is implicitly lateral over the items to its left
+            lateralBody = ((SelectStmt.FunctionFrom) join.right()).args();
+        }
+        if (lateralBody == null) return;
+        String referenced = firstReferenceTo(lateralBody, leftNames.keySet());
+        if (referenced == null) return;
+        MemgresException e = new MemgresException(
+                "invalid reference to FROM-clause entry for table \"" + referenced + "\"", "42P10");
+        e.setDetail("The combining JOIN type must be INNER or LEFT for a LATERAL reference.");
+        throw e;
+    }
+
+    /** The first qualified reference under {@code node} naming one of {@code names}, or null. */
+    private static String firstReferenceTo(Object node, Set<String> names) {
+        Set<String> outer = new HashSet<>(names);
+        if (node instanceof SelectStmt) {
+            // A name the item re-uses for its own FROM entry shadows the outer one
+            Map<String, String> own = new LinkedHashMap<>();
+            List<SelectStmt.FromItem> from = ((SelectStmt) node).from();
+            if (from != null) {
+                for (SelectStmt.FromItem f : from) {
+                    String n = exposedName(f);
+                    if (n != null) own.put(n.toLowerCase(), n);
+                }
+            }
+            outer.removeAll(own.keySet());
+        }
+        Object found = AstWalk.findFirst(node, n -> n instanceof ColumnRef
+                && ((ColumnRef) n).table() != null
+                && outer.contains(((ColumnRef) n).table().toLowerCase()));
+        return found == null ? null : ((ColumnRef) found).table();
+    }
+
+    /**
+     * An aggregate consumes one row at a time, so a set-returning argument has no meaning:
+     * PG cannot say whether the set expands before or after the aggregation and refuses.
+     */
+    private void rejectSrfInAggregates(SelectStmt stmt) {
+        if (stmt.targets() != null) {
+            for (SelectStmt.SelectTarget t : stmt.targets()) rejectSrfInAggregates(t.expr());
+        }
+        if (stmt.having() != null) rejectSrfInAggregates(stmt.having());
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem ob : stmt.orderBy()) rejectSrfInAggregates(ob.expr());
+        }
+    }
+
+    private void rejectSrfInAggregates(Object node) {
+        if (node == null) return;
+        if (node instanceof FunctionCallExpr) {
+            FunctionCallExpr fc = (FunctionCallExpr) node;
+            if (isAggregateFunction(fc.name())) {
+                for (Expression arg : fc.args()) {
+                    if (containsSrf(arg)) {
+                        MemgresException e = new MemgresException(
+                                "aggregate function calls cannot contain set-returning function calls", "0A000");
+                        e.setHint("You might be able to move the set-returning function "
+                                + "into a LATERAL FROM item.");
+                        throw e;
+                    }
+                }
+            }
+        }
+        // A nested query gets its own analysis when it runs
+        if (node instanceof com.memgres.engine.parser.ast.Statement) return;
+        AstWalk.forEachChild(node, this::rejectSrfInAggregates);
+    }
+
+    /**
+     * DISTINCT ON keeps the first row of each group, so the groups have to be the outermost
+     * sort keys — otherwise which row survives depends on the plan and the query has no defined
+     * answer. PG requires the DISTINCT ON expressions to lead the ORDER BY, and so does this.
+     */
+    private static void validateDistinctOn(SelectStmt stmt) {
+        List<Expression> on = stmt.distinctOn();
+        if (on == null || on.isEmpty()) return;
+        List<SelectStmt.OrderByItem> orderBy = stmt.orderBy();
+        // Unordered, every row is equally arbitrary already, so PG imposes nothing
+        if (orderBy == null || orderBy.isEmpty()) return;
+        for (int i = 0; i < on.size(); i++) {
+            if (i >= orderBy.size()
+                    || !sortKeysMatch(on.get(i), resolveSortKey(orderBy.get(i).expr(), stmt.targets()))) {
+                throw new MemgresException(
+                        "SELECT DISTINCT ON expressions must match initial ORDER BY expressions", "42P10");
+            }
+        }
+    }
+
+    /** An ORDER BY item may name an output column by ordinal or alias; DISTINCT ON never does. */
+    private static Expression resolveSortKey(Expression expr, List<SelectStmt.SelectTarget> targets) {
+        if (targets == null) return expr;
+        if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
+            int ordinal = Integer.parseInt(((Literal) expr).value());
+            if (ordinal >= 1 && ordinal <= targets.size()) return targets.get(ordinal - 1).expr();
+            return expr;
+        }
+        if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
+            String name = ((ColumnRef) expr).column();
+            for (SelectStmt.SelectTarget t : targets) {
+                if (name.equalsIgnoreCase(t.alias())) return t.expr();
+            }
+        }
+        return expr;
+    }
+
+    /** Two sort keys are the same key when they name the same column or read identically. */
+    private static boolean sortKeysMatch(Expression a, Expression b) {
+        if (a == null || b == null) return false;
+        if (a instanceof ColumnRef && b instanceof ColumnRef) {
+            ColumnRef ca = (ColumnRef) a;
+            ColumnRef cb = (ColumnRef) b;
+            if (!ca.column().equalsIgnoreCase(cb.column())) return false;
+            return ca.table() == null || cb.table() == null || ca.table().equalsIgnoreCase(cb.table());
+        }
+        return a.toString().equalsIgnoreCase(b.toString());
     }
 
     private static MemgresException misplacedSrf(String construct) {

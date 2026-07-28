@@ -850,6 +850,58 @@ public final class TypeCoercion {
         return DATE_ORDER.get();
     }
 
+    /**
+     * The session TimeZone, published per-statement by {@link AstExecutor#execute} the same way
+     * DateStyle is. "Now" in PostgreSQL is a moment in the session's zone, not in the server
+     * JVM's: with TimeZone set to UTC, an Amsterdam server is already on the next calendar day
+     * for over an hour before {@code CURRENT_DATE} is allowed to move.
+     */
+    private static final ThreadLocal<ZoneId> SESSION_ZONE = new ThreadLocal<ZoneId>();
+
+    /** Set the session TimeZone used to resolve the current date and time. */
+    public static void setSessionZone(ZoneId zone) {
+        SESSION_ZONE.set(zone);
+    }
+
+    /** The bound zone, or null outside a statement — for saving and restoring it. */
+    static ZoneId rawSessionZone() {
+        return SESSION_ZONE.get();
+    }
+
+    /** The session TimeZone, or the JVM default outside a session. */
+    public static ZoneId sessionZone() {
+        ZoneId zone = SESSION_ZONE.get();
+        return zone != null ? zone : ZoneId.systemDefault();
+    }
+
+    /**
+     * The instant the current statement reads as "now", published by {@link AstExecutor#execute}.
+     * PostgreSQL answers every current date/time from one timestamp, so 'now' and LOCALTIMESTAMP
+     * in the same statement cannot land microseconds apart.
+     */
+    private static final ThreadLocal<OffsetDateTime> SESSION_INSTANT = new ThreadLocal<OffsetDateTime>();
+
+    /** Set the instant that resolves 'now', 'today', 'yesterday' and 'tomorrow'. */
+    public static void setSessionInstant(OffsetDateTime instant) {
+        SESSION_INSTANT.set(instant);
+    }
+
+    /** The bound instant, or null outside a statement — for saving and restoring it. */
+    static OffsetDateTime rawSessionInstant() {
+        return SESSION_INSTANT.get();
+    }
+
+    /** The current statement's instant, or a fresh reading outside a statement. */
+    public static OffsetDateTime sessionInstant() {
+        OffsetDateTime instant = SESSION_INSTANT.get();
+        return instant != null ? instant : OffsetDateTime.now();
+    }
+
+    /** "Now" as a wall clock in the session's own zone. */
+    private static LocalDateTime nowHere() {
+        return sessionInstant().atZoneSameInstant(sessionZone()).toLocalDateTime();
+    }
+
     // Three numeric fields separated by a single '/' or '-' (same separator), e.g. 01/02/2026.
     private static final java.util.regex.Pattern NUMERIC_DATE =
             java.util.regex.Pattern.compile("^(\\d{1,4})([-/])(\\d{1,2})\\2(\\d{1,4})$");
@@ -1026,7 +1078,7 @@ public final class TypeCoercion {
             return d;
         }
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalDate();
-        if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toLocalDate();
+        if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).atZoneSameInstant(sessionZone()).toLocalDate();
         String s = val.toString().trim();
         if (endsWithEra(s)) {
             LocalDate bc = toLocalDate(stripEra(s));
@@ -1035,9 +1087,9 @@ public final class TypeCoercion {
         // Handle special keywords
         switch (s.toLowerCase()) {
             case "epoch": return LocalDate.of(1970, 1, 1);
-            case "today": return LocalDate.now();
-            case "yesterday": return LocalDate.now().minusDays(1);
-            case "tomorrow": return LocalDate.now().plusDays(1);
+            case "today": return nowHere().toLocalDate();
+            case "yesterday": return nowHere().toLocalDate().minusDays(1);
+            case "tomorrow": return nowHere().toLocalDate().plusDays(1);
             case "infinity": return DATE_INFINITY;
             case "-infinity": return DATE_NEG_INFINITY;
         }
@@ -1099,7 +1151,7 @@ public final class TypeCoercion {
         String s = val.toString().trim();
         // Handle special keywords
         if (s.equalsIgnoreCase("allballs")) return LocalTime.MIDNIGHT;
-        if (s.equalsIgnoreCase("now")) return LocalTime.now();
+        if (s.equalsIgnoreCase("now")) return nowHere().toLocalTime();
         try { return LocalTime.parse(s); } catch (DateTimeParseException e) {
             // Try parsing as time with timezone offset (e.g., "10:30:00+02")
             try {
@@ -1319,7 +1371,7 @@ public final class TypeCoercion {
     public static LocalDateTime toLocalDateTime(Object val) {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val);
         if (val instanceof LocalDate) return ((LocalDate) val).atStartOfDay();
-        if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toLocalDateTime();
+        if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).atZoneSameInstant(sessionZone()).toLocalDateTime();
         String s = val.toString().trim();
         // A BC era suffix means a proleptic year of 1 - the written year: 44 BC is ISO year -43
         if (endsWithEra(s)) {
@@ -1332,10 +1384,10 @@ public final class TypeCoercion {
         if (s.equalsIgnoreCase("-infinity")) return TIMESTAMP_NEG_INFINITY;
         // Handle special keywords
         if (s.equalsIgnoreCase("epoch")) return LocalDateTime.of(1970, 1, 1, 0, 0, 0);
-        if (s.equalsIgnoreCase("now")) return LocalDateTime.now();
-        if (s.equalsIgnoreCase("today")) return LocalDate.now().atStartOfDay();
-        if (s.equalsIgnoreCase("yesterday")) return LocalDate.now().minusDays(1).atStartOfDay();
-        if (s.equalsIgnoreCase("tomorrow")) return LocalDate.now().plusDays(1).atStartOfDay();
+        if (s.equalsIgnoreCase("now")) return nowHere();
+        if (s.equalsIgnoreCase("today")) return nowHere().toLocalDate().atStartOfDay();
+        if (s.equalsIgnoreCase("yesterday")) return nowHere().toLocalDate().minusDays(1).atStartOfDay();
+        if (s.equalsIgnoreCase("tomorrow")) return nowHere().toLocalDate().plusDays(1).atStartOfDay();
         // A `timestamp` (without time zone) literal may still carry a trailing zone name/
         // abbreviation (e.g. "2024-01-01 12:00:00 UTC"); PG parses and validates it but
         // otherwise ignores it — the wall-clock value is taken as-is.

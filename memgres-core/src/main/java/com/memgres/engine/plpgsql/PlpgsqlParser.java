@@ -18,6 +18,8 @@ public class PlpgsqlParser {
 
     private final List<Token> tokens;
     private int pos;
+    /** Parameters of each cursor declared so far, so an OPEN can be checked against them. */
+    private final java.util.Map<String, List<String>> cursorParams = new java.util.HashMap<>();
 
     public PlpgsqlParser(String body) {
         this.tokens = new Lexer(body).tokenize();
@@ -98,6 +100,8 @@ public class PlpgsqlParser {
         List<PlpgsqlStatement> body = new ArrayList<>();
         List<PlpgsqlStatement.ExceptionHandler> handlers = new ArrayList<>();
 
+        String variableConflict = parsePragmas();
+
         String label = outerLabel;
         // Optional label: <<label_name>>
         if (check(TokenType.SHIFT_LEFT)) {
@@ -113,7 +117,9 @@ public class PlpgsqlParser {
         if (!matchKw("BEGIN")) {
             // If no BEGIN, try to parse statements until END or EOF
             body = parseStatements("END");
-            return new PlpgsqlStatement.Block(label, declarations, body, handlers);
+            PlpgsqlStatement.Block noBegin = new PlpgsqlStatement.Block(label, declarations, body, handlers);
+            noBegin.variableConflict = variableConflict;
+            return noBegin;
         }
 
         body = parseStatements("END", "EXCEPTION");
@@ -122,14 +128,73 @@ public class PlpgsqlParser {
             handlers = parseExceptionHandlers();
         }
 
-        matchKw("END");
-        // Consume optional label name after END (e.g., END my_block;)
-        if (!check(TokenType.SEMICOLON) && !check(TokenType.EOF) && !isAtEnd()) {
-            advance(); // consume label name
+        if (matchKw("END")) {
+            // Optional label name after END (e.g., END my_block;), which PG checks against the
+            // block's own label rather than skipping.
+            if (isLabelToken(peek())) {
+                checkEndLabel(readIdent(), label);
+            }
         }
         match(TokenType.SEMICOLON);
 
-        return new PlpgsqlStatement.Block(label, declarations, body, handlers);
+        PlpgsqlStatement.Block block = new PlpgsqlStatement.Block(label, declarations, body, handlers);
+        block.variableConflict = variableConflict;
+        return block;
+    }
+
+    /**
+     * Read the {@code #option value} pragmas a body may open with. They are compiler directives
+     * rather than statements, so they precede even the block label.
+     */
+    private String parsePragmas() {
+        String variableConflict = null;
+        while (check(TokenType.HASH)) {
+            advance();
+            String option = readIdent();
+            if ("variable_conflict".equalsIgnoreCase(option)) {
+                String value = peek().value();
+                if (!"error".equalsIgnoreCase(value) && !"use_variable".equalsIgnoreCase(value)
+                        && !"use_column".equalsIgnoreCase(value)) {
+                    throw new MemgresException("syntax error at or near \"" + value + "\"", "42601");
+                }
+                advance();
+                variableConflict = value.toLowerCase();
+            } else if ("print_strict_params".equalsIgnoreCase(option)) {
+                String value = peek().value();
+                if (!"on".equalsIgnoreCase(value) && !"off".equalsIgnoreCase(value)) {
+                    throw new MemgresException("syntax error at or near \"" + value + "\"", "42601");
+                }
+                advance();
+            } else {
+                throw new MemgresException("syntax error at or near \"" + option + "\"", "42601");
+            }
+        }
+        return variableConflict;
+    }
+
+    /**
+     * PG matches the name after END against the construct's own label; a name on an unlabeled
+     * construct is an error rather than something to skip.
+     */
+    private void checkEndLabel(String endLabel, String openLabel) {
+        if (openLabel == null) {
+            throw new MemgresException(
+                    "end label \"" + endLabel + "\" specified for unlabeled block", "42601");
+        }
+        if (!endLabel.equalsIgnoreCase(openLabel)) {
+            throw new MemgresException("end label \"" + endLabel
+                    + "\" differs from block's label \"" + openLabel + "\"", "42601");
+        }
+    }
+
+    /** Consume {@code END LOOP [label]} and check the label against the loop's own. */
+    private void endLoop(String label) {
+        matchKw("END");
+        matchKw("LOOP");
+        if (isLabelToken(peek())) {
+            checkEndLabel(readIdent(), label);
+        }
+        match(TokenType.SEMICOLON);
     }
 
     private List<PlpgsqlStatement.VarDeclaration> parseDeclarations() {
@@ -147,17 +212,41 @@ public class PlpgsqlParser {
                         "variable \"" + name + "\" is declared CONSTANT", "42601");
             }
 
+            // SCROLL and NO SCROLL only say whether the cursor may be read backwards; every
+            // memgres cursor materializes its rows, so both spellings are simply recognized.
+            boolean sawScroll = false;
+            if (checkKw("SCROLL")) { advance(); sawScroll = true; }
+            else if (checkKw("NO") && pos + 1 < tokens.size()
+                    && "SCROLL".equalsIgnoreCase(tokens.get(pos + 1).value())) {
+                advance(); advance(); sawScroll = true;
+            }
+
             if (checkKw("CURSOR")) {
                 advance();
                 // PG 18: CURSOR WITH HOLD is not valid in PL/pgSQL
                 if (checkKw("WITH")) {
                     throw new MemgresException("syntax error at or near \"WITH\"", "42601");
                 }
+                List<String> cursorNames = new ArrayList<>();
+                if (check(TokenType.LEFT_PAREN)) {
+                    advance();
+                    while (!check(TokenType.RIGHT_PAREN) && !isAtEnd()) {
+                        cursorNames.add(readIdent());
+                        readTypeName();
+                        if (!match(TokenType.COMMA)) break;
+                    }
+                    match(TokenType.RIGHT_PAREN);
+                }
                 matchKw("FOR");
                 String cursorSql = collectUntilSemicolon();
-                decls.add(new PlpgsqlStatement.VarDeclaration(name, "REFCURSOR", false, false, null, true, cursorSql));
+                decls.add(new PlpgsqlStatement.VarDeclaration(name, "REFCURSOR", false, false, null,
+                        true, cursorSql, cursorNames));
+                this.cursorParams.put(name.toLowerCase(), cursorNames);
                 match(TokenType.SEMICOLON);
                 continue;
+            }
+            if (sawScroll) {
+                throw new MemgresException("syntax error at or near \"" + peek().value() + "\"", "42601");
             }
 
             boolean constant = matchKw("CONSTANT");
@@ -166,19 +255,15 @@ public class PlpgsqlParser {
             if (matchKw("NOT")) { matchKw("NULL"); notNull = true; }
 
             String defaultExpr = null;
-            if (matchKw("DEFAULT") || match(TokenType.COLON_EQUALS)) {
+            // PL/pgSQL accepts =, := and DEFAULT interchangeably as the initialiser
+            if (matchKw("DEFAULT") || match(TokenType.COLON_EQUALS) || match(TokenType.EQUALS)) {
                 defaultExpr = collectUntilSemicolon();
             }
 
             decls.add(new PlpgsqlStatement.VarDeclaration(name, typeName, constant, notNull, defaultExpr, false, null));
-            if (!match(TokenType.SEMICOLON)) {
-                // Missing semicolon after variable declaration
-                if (!isAtEnd() && !checkKw("BEGIN")) {
-                    throw new RuntimeException("missing semicolon after variable declaration at position " + peek().position());
-                }
-                if (checkKw("BEGIN")) {
-                    throw new RuntimeException("missing semicolon after variable declaration before BEGIN");
-                }
+            if (!match(TokenType.SEMICOLON) && !isAtEnd()) {
+                throw new MemgresException(
+                        "syntax error at or near \"" + peek().value() + "\"", "42601");
             }
         }
         return decls;
@@ -296,6 +381,7 @@ public class PlpgsqlParser {
                 case "OPEN":
                     return parseOpenCursor();
                 case "FETCH":
+                case "MOVE":
                     return parseFetch();
                 case "CLOSE":
                     return parseCloseCursor();
@@ -395,9 +481,7 @@ public class PlpgsqlParser {
     private PlpgsqlStatement parseLoop(String label) {
         matchKw("LOOP");
         List<PlpgsqlStatement> body = parseStatements("END");
-        matchKw("END");
-        matchKw("LOOP");
-        match(TokenType.SEMICOLON);
+        endLoop(label);
         return new PlpgsqlStatement.LoopStmt(label, body);
     }
 
@@ -406,9 +490,7 @@ public class PlpgsqlParser {
         String condition = collectUntilKeyword("LOOP");
         matchKw("LOOP");
         List<PlpgsqlStatement> body = parseStatements("END");
-        matchKw("END");
-        matchKw("LOOP");
-        match(TokenType.SEMICOLON);
+        endLoop(label);
         return new PlpgsqlStatement.WhileStmt(label, condition, body);
     }
 
@@ -435,9 +517,7 @@ public class PlpgsqlParser {
             }
             matchKw("LOOP");
             List<PlpgsqlStatement> body = parseStatements("END");
-            matchKw("END");
-            matchKw("LOOP");
-            match(TokenType.SEMICOLON);
+            endLoop(label);
             return new PlpgsqlStatement.ForStmt(label, varNames.get(0), lower, upper, step, reverse, body);
         } else if (checkKw("EXECUTE")) {
             // FOR rec IN EXECUTE 'sql' [USING expr, ...] LOOP ... END LOOP
@@ -451,17 +531,13 @@ public class PlpgsqlParser {
             }
             matchKw("LOOP");
             List<PlpgsqlStatement> body = parseStatements("END");
-            matchKw("END");
-            matchKw("LOOP");
-            match(TokenType.SEMICOLON);
+            endLoop(label);
             return new PlpgsqlStatement.ForExecuteStmt(label, varNames, sqlExpr, usingExprs, body);
         } else {
             String sql = collectUntilKeyword("LOOP");
             matchKw("LOOP");
             List<PlpgsqlStatement> body = parseStatements("END");
-            matchKw("END");
-            matchKw("LOOP");
-            match(TokenType.SEMICOLON);
+            endLoop(label);
             return new PlpgsqlStatement.ForQueryStmt(label, varNames, sql, body);
         }
     }
@@ -515,9 +591,7 @@ public class PlpgsqlParser {
         String arrayExpr = collectUntilKeyword("LOOP");
         matchKw("LOOP");
         List<PlpgsqlStatement> body = parseStatements("END");
-        matchKw("END");
-        matchKw("LOOP");
-        match(TokenType.SEMICOLON);
+        endLoop(label);
         return new PlpgsqlStatement.ForeachStmt(label, varName, sliceDepth, arrayExpr, body);
     }
 
@@ -610,7 +684,7 @@ public class PlpgsqlParser {
             advance(); // consume SQLSTATE
             level = "EXCEPTION";
             if (check(TokenType.STRING_LITERAL)) {
-                errcode = advance().value();
+                errcode = "'" + advance().value().replace("'", "''") + "'";
             }
         } else if (!check(TokenType.STRING_LITERAL) && !check(TokenType.SEMICOLON) && !checkKw("USING")) {
             // Named condition: RAISE division_by_zero; or RAISE unique_violation USING MESSAGE = '...'
@@ -618,6 +692,7 @@ public class PlpgsqlParser {
         }
 
         String format = null;
+        String messageExpr = null;
         List<String> args = new ArrayList<>();
         String hint = null;
         String detail = null;
@@ -636,18 +711,20 @@ public class PlpgsqlParser {
         }
 
         if (matchKw("USING")) {
+            java.util.Set<String> seen = new java.util.HashSet<>();
             while (!check(TokenType.SEMICOLON) && !isAtEnd()) {
                 String key = readIdent();
                 if (match(TokenType.EQUALS) || match(TokenType.COLON_EQUALS)) {
-                    String val;
-                    if (check(TokenType.STRING_LITERAL)) {
-                        val = advance().value();
-                    } else {
-                        val = collectUntilMulti(",", ";");
+                    // The value is an ordinary expression, so it is kept as text and evaluated
+                    // when the RAISE runs rather than being read as a bare literal.
+                    String val = collectUntilMulti(",", ";");
+                    if (!seen.add(key.toUpperCase())) {
+                        throw new MemgresException(
+                                "RAISE option already specified: " + key.toUpperCase(), "42601");
                     }
                     switch (key.toUpperCase()) {
                         case "ERRCODE": errcode = val; break;
-                        case "MESSAGE": format = val; break;
+                        case "MESSAGE": messageExpr = val; break;
                         case "HINT": hint = val; break;
                         case "DETAIL": detail = val; break;
                         case "COLUMN": column = val; break;
@@ -663,8 +740,10 @@ public class PlpgsqlParser {
         }
 
         match(TokenType.SEMICOLON);
-        return new PlpgsqlStatement.RaiseStmt(level, format, args, errcode, hint,
-                detail, column, constraint, datatype, table, schema);
+        PlpgsqlStatement.RaiseStmt raise = new PlpgsqlStatement.RaiseStmt(level, format, args,
+                errcode, hint, detail, column, constraint, datatype, table, schema);
+        raise.messageExpr = messageExpr;
+        return raise;
     }
 
     // ---- PERFORM ----
@@ -905,15 +984,124 @@ public class PlpgsqlParser {
     private PlpgsqlStatement parseOpenCursor() {
         matchKw("OPEN");
         String cursorName = readIdent();
+        List<String> argExprs = new ArrayList<>();
+        List<String> argNames = new ArrayList<>();
+        // OPEN c(args) binds a bound cursor's parameters, positionally or by name
+        if (check(TokenType.LEFT_PAREN)) {
+            advance();
+            if (!check(TokenType.RIGHT_PAREN)) {
+                do {
+                    String argName = null;
+                    if ((peek().type() == TokenType.IDENTIFIER || peek().type() == TokenType.KEYWORD)
+                            && pos + 1 < tokens.size()
+                            && tokens.get(pos + 1).type() == TokenType.COLON_EQUALS) {
+                        argName = readIdent();
+                        advance(); // consume :=
+                    }
+                    argNames.add(argName);
+                    argExprs.add(collectArgument());
+                } while (match(TokenType.COMMA));
+            }
+            match(TokenType.RIGHT_PAREN);
+        }
         String sql = null;
         if (matchKw("FOR")) sql = collectUntilSemicolon();
         match(TokenType.SEMICOLON);
-        return new PlpgsqlStatement.OpenCursorStmt(cursorName, sql);
+        checkCursorArgs(cursorName, argNames);
+        return new PlpgsqlStatement.OpenCursorStmt(cursorName, sql, argExprs, argNames);
     }
 
+    /**
+     * PG matches an OPEN's arguments against the cursor's declared parameters while compiling the
+     * body, so a bad argument list keeps the function from being created at all.
+     */
+    private void checkCursorArgs(String cursorName, List<String> argNames) {
+        List<String> params = cursorParams.get(cursorName.toLowerCase());
+        if (params == null) return;
+        if (params.isEmpty()) {
+            if (!argNames.isEmpty()) {
+                throw new MemgresException(
+                        "cursor \"" + cursorName + "\" has no arguments", "42601");
+            }
+            return;
+        }
+        boolean[] bound = new boolean[params.size()];
+        for (int i = 0; i < argNames.size(); i++) {
+            String name = argNames.get(i);
+            int slot;
+            if (name != null) {
+                slot = -1;
+                for (int p = 0; p < params.size(); p++) {
+                    if (params.get(p).equalsIgnoreCase(name)) { slot = p; break; }
+                }
+                if (slot < 0) {
+                    throw new MemgresException("cursor \"" + cursorName
+                            + "\" has no argument named \"" + name + "\"", "42601");
+                }
+            } else {
+                slot = i;
+                if (slot >= params.size()) {
+                    throw new MemgresException(
+                            "too many arguments for cursor \"" + cursorName + "\"", "42601");
+                }
+            }
+            if (bound[slot]) {
+                throw new MemgresException("value for parameter \"" + params.get(slot)
+                        + "\" of cursor \"" + cursorName + "\" specified more than once", "42601");
+            }
+            bound[slot] = true;
+        }
+        for (boolean b : bound) {
+            if (!b) {
+                throw new MemgresException(
+                        "not enough arguments for cursor \"" + cursorName + "\"", "42601");
+            }
+        }
+    }
+
+    /** Collect one argument of an OPEN, stopping at the comma or paren that ends it. */
+    private String collectArgument() {
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        while (!isAtEnd()) {
+            Token t = peek();
+            if (depth == 0 && (t.type() == TokenType.COMMA || t.type() == TokenType.RIGHT_PAREN
+                    || t.type() == TokenType.SEMICOLON)) break;
+            if (t.type() == TokenType.LEFT_PAREN) depth++;
+            if (t.type() == TokenType.RIGHT_PAREN) depth--;
+            appendToken(sb, t);
+            advance();
+        }
+        return sb.toString().trim();
+    }
+
+    /** Directions a FETCH or MOVE may name; NEXT is the default when none is written. */
+    private static final java.util.Set<String> FETCH_DIRECTIONS = new java.util.HashSet<>(
+            java.util.Arrays.asList("NEXT", "PRIOR", "FIRST", "LAST", "ABSOLUTE", "RELATIVE",
+                    "FORWARD", "BACKWARD"));
+
     private PlpgsqlStatement parseFetch() {
-        matchKw("FETCH");
-        matchKw("NEXT"); matchKw("FROM");
+        boolean move = checkKw("MOVE");
+        advance(); // consume FETCH or MOVE
+
+        String direction = "NEXT";
+        String countExpr = null;
+        if (isLabelToken(peek()) && FETCH_DIRECTIONS.contains(peek().value().toUpperCase())) {
+            direction = advance().value().toUpperCase();
+        }
+        if ("ABSOLUTE".equals(direction) || "RELATIVE".equals(direction)
+                || "FORWARD".equals(direction) || "BACKWARD".equals(direction)) {
+            if (!checkKw("FROM") && !checkKw("IN") && !check(TokenType.SEMICOLON)) {
+                countExpr = collectUntilMulti("FROM", "IN", ";");
+            }
+        } else if ("NEXT".equals(direction) && !checkKw("FROM") && !checkKw("IN")
+                && (check(TokenType.INTEGER_LITERAL) || check(TokenType.MINUS))) {
+            // A bare count is FORWARD count
+            direction = "FORWARD";
+            countExpr = collectUntilMulti("FROM", "IN", ";");
+        }
+        if (!matchKw("FROM")) matchKw("IN");
+
         String cursorName = readIdent();
         List<String> intoVars = null;
         if (matchKw("INTO")) {
@@ -924,7 +1112,7 @@ public class PlpgsqlParser {
             }
         }
         match(TokenType.SEMICOLON);
-        return new PlpgsqlStatement.FetchStmt(cursorName, intoVars);
+        return new PlpgsqlStatement.FetchStmt(cursorName, intoVars, direction, countExpr, move);
     }
 
     private PlpgsqlStatement parseCloseCursor() {
@@ -985,30 +1173,66 @@ public class PlpgsqlParser {
     private PlpgsqlStatement parseAssignmentOrSql() {
         int saved = pos;
         StringBuilder target = new StringBuilder();
-        target.append(readIdent());
+        String baseName = readIdent();
+        target.append(baseName);
 
-        boolean qualified = false;
-        while (check(TokenType.DOT)) {
-            advance();
-            target.append(".").append(readIdent());
-            qualified = true;
+        // Steps past the variable name: field selections and subscripts, in any order, so that
+        // a[1].x and v.f[2] both reach the element they name.
+        List<PlpgsqlStatement.TargetStep> steps = new ArrayList<>();
+        boolean sawSubscript = false;
+        while (true) {
+            if (check(TokenType.DOT)) {
+                advance();
+                String field = readIdent();
+                target.append(".").append(field);
+                steps.add(PlpgsqlStatement.TargetStep.field(field));
+                continue;
+            }
+            if (check(TokenType.LEFT_BRACKET)) {
+                advance();
+                String lower = collectSubscript();
+                String upper = null;
+                if (match(TokenType.COLON)) {
+                    upper = collectSubscript();
+                }
+                if (!match(TokenType.RIGHT_BRACKET)) { pos = saved; return parseSqlStmt(); }
+                steps.add(upper != null
+                        ? PlpgsqlStatement.TargetStep.slice(lower, upper)
+                        : PlpgsqlStatement.TargetStep.subscript(lower));
+                sawSubscript = true;
+                continue;
+            }
+            break;
         }
 
-        if (match(TokenType.COLON_EQUALS)) {
+        // PG accepts = as a synonym for := everywhere an assignment is written
+        if (match(TokenType.COLON_EQUALS) || match(TokenType.EQUALS)) {
             String value = collectUntilSemicolon();
             match(TokenType.SEMICOLON);
-            return new PlpgsqlStatement.Assignment(target.toString(), value);
-        }
-
-        // Accept = for assignment (PG allows both := and = in PL/pgSQL)
-        if (match(TokenType.EQUALS)) {
-            String value = collectUntilSemicolon();
-            match(TokenType.SEMICOLON);
+            if (sawSubscript) {
+                return new PlpgsqlStatement.SubscriptAssignment(baseName, steps, value);
+            }
             return new PlpgsqlStatement.Assignment(target.toString(), value);
         }
 
         pos = saved;
         return parseSqlStmt();
+    }
+
+    /** Collect one subscript expression, stopping at the bracket or colon that closes it. */
+    private String collectSubscript() {
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        while (!isAtEnd()) {
+            Token t = peek();
+            if (depth == 0 && (t.type() == TokenType.RIGHT_BRACKET || t.type() == TokenType.COLON)) break;
+            if (t.type() == TokenType.SEMICOLON && depth == 0) break;
+            if (t.type() == TokenType.LEFT_PAREN || t.type() == TokenType.LEFT_BRACKET) depth++;
+            if (t.type() == TokenType.RIGHT_PAREN || t.type() == TokenType.RIGHT_BRACKET) depth--;
+            appendToken(sb, t);
+            advance();
+        }
+        return sb.toString().trim();
     }
 
     // ---- Exception handlers ----

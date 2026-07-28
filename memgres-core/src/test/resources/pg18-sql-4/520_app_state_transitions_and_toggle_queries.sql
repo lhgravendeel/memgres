@@ -63,10 +63,11 @@ FROM jobs
 WHERE job_id IN (2, 3, 4)
 ORDER BY job_id;
 
--- begin-expected
--- columns: updated_rows
--- row: 0
--- end-expected
+-- A write may only appear in a top-level CTE, never in a FROM subquery
+-- begin-expected-error
+-- sqlstate: 42601
+-- message-like: syntax error at or near "SET"
+-- end-expected-error
 SELECT COUNT(*) AS updated_rows
 FROM (
     UPDATE jobs

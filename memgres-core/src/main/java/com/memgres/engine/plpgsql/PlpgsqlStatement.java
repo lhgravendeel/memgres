@@ -17,6 +17,8 @@ public interface PlpgsqlStatement {
         public final String defaultExpr;
         public final boolean isCursor;
         public final String cursorQuery;
+        /** Names of a bound cursor's parameters, in declaration order; empty when it takes none. */
+        public final List<String> cursorParams;
 
         public VarDeclaration(
                 String name,
@@ -27,6 +29,20 @@ public interface PlpgsqlStatement {
                 boolean isCursor,
                 String cursorQuery
         ) {
+            this(name, typeName, constant, notNull, defaultExpr, isCursor, cursorQuery,
+                    java.util.Collections.<String>emptyList());
+        }
+
+        public VarDeclaration(
+                String name,
+                String typeName,
+                boolean constant,
+                boolean notNull,
+                String defaultExpr,
+                boolean isCursor,
+                String cursorQuery,
+                List<String> cursorParams
+        ) {
             this.name = name;
             this.typeName = typeName;
             this.constant = constant;
@@ -34,6 +50,7 @@ public interface PlpgsqlStatement {
             this.defaultExpr = defaultExpr;
             this.isCursor = isCursor;
             this.cursorQuery = cursorQuery;
+            this.cursorParams = cursorParams;
         }
 
         public String name() { return name; }
@@ -43,6 +60,7 @@ public interface PlpgsqlStatement {
         public String defaultExpr() { return defaultExpr; }
         public boolean isCursor() { return isCursor; }
         public String cursorQuery() { return cursorQuery; }
+        public List<String> cursorParams() { return cursorParams; }
 
         @Override
         public boolean equals(Object o) {
@@ -173,6 +191,11 @@ public interface PlpgsqlStatement {
         public final List<ExceptionHandler> exceptionHandlers;
         /** Name given by a {@code <<label>>} before BEGIN, so EXIT can name this block. */
         public final String label;
+        /**
+         * Value of the {@code #variable_conflict} pragma when the body opened with one. Only the
+         * outermost block can carry it, because the pragma applies to the whole function.
+         */
+        public String variableConflict;
 
         public Block(List<VarDeclaration> declarations, List<PlpgsqlStatement> body, List<ExceptionHandler> exceptionHandlers) {
             this(null, declarations, body, exceptionHandlers);
@@ -186,6 +209,7 @@ public interface PlpgsqlStatement {
         }
 
         public String label() { return label; }
+        public String variableConflict() { return variableConflict; }
         public List<VarDeclaration> declarations() { return declarations; }
         public List<PlpgsqlStatement> body() { return body; }
         public List<ExceptionHandler> exceptionHandlers() { return exceptionHandlers; }
@@ -726,6 +750,11 @@ public interface PlpgsqlStatement {
         public final String datatype;
         public final String table;
         public final String schema;
+        /**
+         * Message given by {@code USING MESSAGE = expr}. It is an expression rather than a format
+         * string, so it carries no {@code %} placeholders and is kept apart from {@link #format}.
+         */
+        public String messageExpr;
 
         public RaiseStmt(
                 String level,
@@ -769,6 +798,7 @@ public interface PlpgsqlStatement {
         public String datatype() { return datatype; }
         public String table() { return table; }
         public String schema() { return schema; }
+        public String messageExpr() { return messageExpr; }
 
         @Override
         public boolean equals(Object o) {
@@ -956,14 +986,27 @@ public interface PlpgsqlStatement {
         public static final class OpenCursorStmt implements PlpgsqlStatement {
         public final String cursorName;
         public final String sql;
+        /** Argument expressions of {@code OPEN c(...)}, in written order. */
+        public final List<String> argExprs;
+        /** Parameter name each argument was written against, or null for a positional one. */
+        public final List<String> argNames;
 
         public OpenCursorStmt(String cursorName, String sql) {
+            this(cursorName, sql, java.util.Collections.<String>emptyList(),
+                    java.util.Collections.<String>emptyList());
+        }
+
+        public OpenCursorStmt(String cursorName, String sql, List<String> argExprs, List<String> argNames) {
             this.cursorName = cursorName;
             this.sql = sql;
+            this.argExprs = argExprs;
+            this.argNames = argNames;
         }
 
         public String cursorName() { return cursorName; }
         public String sql() { return sql; }
+        public List<String> argExprs() { return argExprs; }
+        public List<String> argNames() { return argNames; }
 
         @Override
         public boolean equals(Object o) {
@@ -971,12 +1014,14 @@ public interface PlpgsqlStatement {
             if (o == null || getClass() != o.getClass()) return false;
             OpenCursorStmt that = (OpenCursorStmt) o;
             return java.util.Objects.equals(cursorName, that.cursorName)
-                && java.util.Objects.equals(sql, that.sql);
+                && java.util.Objects.equals(sql, that.sql)
+                && java.util.Objects.equals(argExprs, that.argExprs)
+                && java.util.Objects.equals(argNames, that.argNames);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(cursorName, sql);
+            return java.util.Objects.hash(cursorName, sql, argExprs, argNames);
         }
 
         @Override
@@ -988,14 +1033,31 @@ public interface PlpgsqlStatement {
         public static final class FetchStmt implements PlpgsqlStatement {
         public final String cursorName;
         public final List<String> intoVars;
+        /** NEXT, PRIOR, FIRST, LAST, ABSOLUTE, RELATIVE, FORWARD or BACKWARD. */
+        public final String direction;
+        /** Row count for the directions that take one, as written; null otherwise. */
+        public final String countExpr;
+        /** True for MOVE, which repositions without returning a row. */
+        public final boolean move;
 
         public FetchStmt(String cursorName, List<String> intoVars) {
+            this(cursorName, intoVars, "NEXT", null, false);
+        }
+
+        public FetchStmt(String cursorName, List<String> intoVars, String direction,
+                         String countExpr, boolean move) {
             this.cursorName = cursorName;
             this.intoVars = intoVars;
+            this.direction = direction;
+            this.countExpr = countExpr;
+            this.move = move;
         }
 
         public String cursorName() { return cursorName; }
         public List<String> intoVars() { return intoVars; }
+        public String direction() { return direction; }
+        public String countExpr() { return countExpr; }
+        public boolean move() { return move; }
 
         @Override
         public boolean equals(Object o) {
@@ -1003,17 +1065,74 @@ public interface PlpgsqlStatement {
             if (o == null || getClass() != o.getClass()) return false;
             FetchStmt that = (FetchStmt) o;
             return java.util.Objects.equals(cursorName, that.cursorName)
-                && java.util.Objects.equals(intoVars, that.intoVars);
+                && java.util.Objects.equals(intoVars, that.intoVars)
+                && java.util.Objects.equals(direction, that.direction)
+                && java.util.Objects.equals(countExpr, that.countExpr)
+                && move == that.move;
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(cursorName, intoVars);
+            return java.util.Objects.hash(cursorName, intoVars, direction, countExpr, move);
         }
 
         @Override
         public String toString() {
             return "FetchStmt[cursorName=" + cursorName + ", " + "intoVars=" + intoVars + "]";
+        }
+    }
+
+    /** One step of an assignment target after the variable name: a field or a subscript. */
+        public static final class TargetStep {
+        /** Field name for {@code .f}, or null when this step is a subscript. */
+        public final String field;
+        /** Subscript expression, or the lower bound of a slice. */
+        public final String index;
+        /** Upper bound of a slice such as {@code a[2:3]}, or null for a plain subscript. */
+        public final String upper;
+
+        private TargetStep(String field, String index, String upper) {
+            this.field = field;
+            this.index = index;
+            this.upper = upper;
+        }
+
+        public static TargetStep field(String name) { return new TargetStep(name, null, null); }
+        public static TargetStep subscript(String index) { return new TargetStep(null, index, null); }
+        public static TargetStep slice(String lower, String upper) { return new TargetStep(null, lower, upper); }
+
+        public boolean isField() { return field != null; }
+        public boolean isSlice() { return field == null && upper != null; }
+
+        @Override
+        public String toString() {
+            if (field != null) return "." + field;
+            return "[" + index + (upper != null ? ":" + upper : "") + "]";
+        }
+    }
+
+    /**
+     * Assignment whose target is reached through subscripts, such as {@code a[2] := 99} or
+     * {@code a[1].x := 9}. A plain {@code v.f := x} stays an {@link Assignment}.
+     */
+        public static final class SubscriptAssignment implements PlpgsqlStatement {
+        public final String baseName;
+        public final List<TargetStep> steps;
+        public final String valueExpr;
+
+        public SubscriptAssignment(String baseName, List<TargetStep> steps, String valueExpr) {
+            this.baseName = baseName;
+            this.steps = steps;
+            this.valueExpr = valueExpr;
+        }
+
+        public String baseName() { return baseName; }
+        public List<TargetStep> steps() { return steps; }
+        public String valueExpr() { return valueExpr; }
+
+        @Override
+        public String toString() {
+            return "SubscriptAssignment[baseName=" + baseName + ", steps=" + steps + "]";
         }
     }
 
