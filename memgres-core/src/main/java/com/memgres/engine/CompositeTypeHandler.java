@@ -102,7 +102,7 @@ class CompositeTypeHandler {
         if (val == null) return null;
         if (val instanceof AstExecutor.PgRow) {
             AstExecutor.PgRow row = (AstExecutor.PgRow) val;
-            List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+            List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
             if (fields != null) {
                 for (int i = 0; i < fields.size(); i++) {
                     if (fields.get(i).name().equalsIgnoreCase(fieldName)) {
@@ -121,7 +121,7 @@ class CompositeTypeHandler {
         }
         if (val instanceof String && ((String) val).startsWith("(") && ((String) val).endsWith(")")) {
             String s = (String) val;
-            List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+            List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
             if (fields != null) {
                 String[] parts = splitCompositeString(s.substring(1, s.length() - 1));
                 for (int i = 0; i < fields.size(); i++) {
@@ -180,7 +180,7 @@ class CompositeTypeHandler {
             inner = s;
         }
         String[] parts = splitCompositeString(inner);
-        List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+        List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
         List<Object> values = new ArrayList<>();
         for (int i = 0; i < parts.length; i++) {
             String part = parts[i].trim();
@@ -202,7 +202,7 @@ class CompositeTypeHandler {
      */
     java.util.List<CreateTypeStmt.CompositeField> resolveFieldsForType(String typeName) {
         if (typeName == null) return null;
-        java.util.List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+        java.util.List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
         if (fields != null) return fields;
         // Fallback: PG treats tables as composite types
         Table tbl = executor.database.getTable(typeName);

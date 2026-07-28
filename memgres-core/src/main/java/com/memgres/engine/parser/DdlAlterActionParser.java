@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -61,20 +62,7 @@ class DdlAlterActionParser {
             return new AlterTableStmt.AlterColumn(col, parseAlterColumnAction());
         }
         if (parser.matchKeywords("ALTER", "CONSTRAINT")) {
-            String constraintName = parser.readIdentifier();
-            // PG 18: ALTER CONSTRAINT ... [NOT] ENFORCED
-            if (parser.matchKeyword("ENFORCED")) {
-                return new AlterTableStmt.AlterConstraintEnforced(constraintName, false);
-            }
-            if (parser.matchKeywords("NOT", "ENFORCED")) {
-                return new AlterTableStmt.AlterConstraintEnforced(constraintName, true);
-            }
-            // PG also supports ALTER CONSTRAINT ... [NOT] DEFERRABLE [INITIALLY ...]
-            // Consume remaining tokens for forward compatibility
-            while (!parser.isAtEnd() && !parser.check(TokenType.COMMA) && !parser.check(TokenType.SEMICOLON)) {
-                parser.advance();
-            }
-            return new AlterTableStmt.AlterConstraintEnforced(constraintName, false);
+            return parseAlterConstraint();
         }
         // ALTER colname (without COLUMN keyword): shorthand for ALTER COLUMN colname
         if (parser.matchKeyword("ALTER")) {
@@ -132,6 +120,16 @@ class DdlAlterActionParser {
                 parser.readIdentifier(); // access method name
                 return new AlterTableStmt.SetStorageParams();
             }
+            // SET WITHOUT CLUSTER / SET WITHOUT OIDS: both concern on-disk layout, so there is
+            // nothing to change here, but they are valid SQL and must not be a syntax error.
+            if (parser.matchKeyword("WITHOUT")) {
+                Token what = parser.peek();
+                String word = parser.readIdentifier();
+                if (!"cluster".equalsIgnoreCase(word) && !"oids".equalsIgnoreCase(word)) {
+                    throw new ParseException("Expected CLUSTER or OIDS", what);
+                }
+                return new AlterTableStmt.SetStorageParams();
+            }
             // Fall through; could be other SET variants, but for now error
             throw new ParseException("Unsupported ALTER TABLE SET action", parser.peek());
         }
@@ -165,9 +163,12 @@ class DdlAlterActionParser {
                 parser.expectKeyword("SECURITY");
                 return new AlterTableStmt.EnableRls();
             }
-            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER
+            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER / ENABLE RULE
             parser.matchKeyword("REPLICA");
             parser.matchKeyword("ALWAYS");
+            if (parser.matchKeyword("RULE")) {
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), true);
+            }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL
             return new AlterTableStmt.EnableTrigger(trigName);
@@ -178,7 +179,10 @@ class DdlAlterActionParser {
                 parser.expectKeyword("SECURITY");
                 return new AlterTableStmt.DisableRls();
             }
-            // DISABLE TRIGGER
+            // DISABLE RULE suspends a rule; without it the only way to stop one is to drop it.
+            if (parser.matchKeyword("RULE")) {
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), false);
+            }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL
             return new AlterTableStmt.DisableTrigger(trigName);
@@ -236,6 +240,59 @@ class DdlAlterActionParser {
         throw new ParseException("Unsupported ALTER TABLE action", parser.peek());
     }
 
+    /**
+     * ALTER CONSTRAINT name followed by a constraint attribute list. The attributes are a set,
+     * not a sequence: PostgreSQL rejects a list that names the same property twice with
+     * different values, and rejects INITIALLY DEFERRED alongside NOT DEFERRABLE because the two
+     * contradict each other.
+     */
+    private AlterTableStmt.AlterAction parseAlterConstraint() {
+        String constraintName = parser.readIdentifier();
+        Boolean deferrable = null;
+        Boolean initiallyDeferred = null;
+        Boolean enforced = null;
+        boolean inheritability = false;
+        while (true) {
+            if (parser.matchKeyword("DEFERRABLE")) {
+                deferrable = conflictFree(deferrable, Boolean.TRUE);
+            } else if (parser.matchKeywords("NOT", "DEFERRABLE")) {
+                deferrable = conflictFree(deferrable, Boolean.FALSE);
+            } else if (parser.matchKeyword("INITIALLY")) {
+                Boolean next = parser.matchKeyword("DEFERRED") ? Boolean.TRUE : Boolean.FALSE;
+                if (!next) parser.matchKeyword("IMMEDIATE");
+                initiallyDeferred = conflictFree(initiallyDeferred, next);
+            } else if (parser.matchKeyword("ENFORCED")) {
+                enforced = conflictFree(enforced, Boolean.TRUE);
+            } else if (parser.matchKeywords("NOT", "ENFORCED")) {
+                enforced = conflictFree(enforced, Boolean.FALSE);
+            } else if (parser.matchKeywords("NO", "INHERIT") || parser.matchKeyword("INHERIT")) {
+                inheritability = true;
+            } else if (parser.matchKeywords("NOT", "VALID")) {
+                throw new MemgresException("constraints cannot be altered to be NOT VALID", "0A000");
+            } else {
+                break;
+            }
+        }
+        if (Boolean.TRUE.equals(initiallyDeferred)) {
+            if (Boolean.FALSE.equals(deferrable)) {
+                throw new MemgresException("constraint declared INITIALLY DEFERRED must be DEFERRABLE", "42601");
+            }
+            deferrable = Boolean.TRUE; // INITIALLY DEFERRED implies DEFERRABLE, as in PG's grammar
+        }
+        if (Boolean.FALSE.equals(deferrable)) {
+            initiallyDeferred = Boolean.FALSE;
+        }
+        return new AlterTableStmt.AlterConstraintAttrs(constraintName, deferrable,
+                initiallyDeferred, enforced, inheritability);
+    }
+
+    private static Boolean conflictFree(Boolean current, Boolean next) {
+        if (current != null && !current.equals(next)) {
+            throw new MemgresException("conflicting constraint properties", "42601");
+        }
+        return next;
+    }
+
     AlterTableStmt.AlterColumnAction parseAlterColumnAction() {
         if (parser.matchKeywords("SET", "NOT", "NULL")) return new AlterTableStmt.SetNotNull();
         if (parser.matchKeywords("DROP", "NOT", "NULL")) return new AlterTableStmt.DropNotNull();
@@ -243,6 +300,14 @@ class DdlAlterActionParser {
         if (parser.matchKeywords("DROP", "DEFAULT")) return new AlterTableStmt.DropDefault();
         if (parser.matchKeyword("TYPE") || parser.matchKeywords("SET", "DATA", "TYPE")) {
             String typeName = parser.parseTypeName();
+            // A collation only exists for the collatable types, so naming one for any other type
+            // is a contradiction PG refuses rather than silently ignoring.
+            if (parser.matchKeyword("COLLATE")) {
+                com.memgres.engine.DdlDefinitionChecks.rejectUncollatableType(typeName);
+                String collation = parser.readIdentifier();
+                if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
+                ExpressionParser.validateCollationStatic(collation, parser.peek());
+            }
             // Capture optional USING clause for data conversion
             Expression usingExpr = null;
             if (parser.matchKeyword("USING")) usingExpr = parser.parseExpression();
@@ -289,8 +354,15 @@ class DdlAlterActionParser {
         }
         // DROP IDENTITY [IF EXISTS]: remove identity
         if (parser.matchKeywords("DROP", "IDENTITY")) {
-            parser.matchKeywords("IF", "EXISTS");
-            return new AlterTableStmt.DropDefault();
+            return new AlterTableStmt.DropIdentity(parser.matchKeywords("IF", "EXISTS"));
+        }
+        // DROP EXPRESSION [IF EXISTS]: turn a stored generated column into an ordinary one.
+        // EXPRESSION is not reserved, so it arrives as a plain identifier.
+        if (parser.checkKeyword("DROP") && parser.pos + 1 < parser.tokens.size()
+                && "EXPRESSION".equalsIgnoreCase(parser.tokens.get(parser.pos + 1).value())) {
+            parser.advance();
+            parser.advance();
+            return new AlterTableStmt.DropExpression(parser.matchKeywords("IF", "EXISTS"));
         }
         // RESTART [WITH n]: identity restart
         if (parser.matchKeyword("RESTART")) {
@@ -392,6 +464,13 @@ class DdlAlterActionParser {
                 bounds.add(parser.advance().value());
                 parser.expect(TokenType.RIGHT_PAREN);
             }
+        }
+        if (bounds.isEmpty()) {
+            // PG's grammar requires a bound spec here; without one there is nothing to route on.
+            if (parser.isAtEnd() || parser.check(TokenType.SEMICOLON)) {
+                throw com.memgres.engine.PgErrors.syntax("syntax error at end of input");
+            }
+            throw new ParseException("Expected partition bound specification", parser.peek());
         }
         return new AlterTableStmt.AttachPartition(partSchema, partName, bounds);
     }

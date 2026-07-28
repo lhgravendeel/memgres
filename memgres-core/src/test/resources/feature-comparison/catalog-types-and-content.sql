@@ -681,8 +681,12 @@ SELECT typcategory::text AS typcategory, typelem::text AS typelem
 -- Neighbouring catalog behaviour that must not change
 -- ============================================================================
 
+-- upper is three routines in PG 18 -- over text, over a range and over a multirange -- and all
+-- three live in pg_catalog
 -- begin-expected
 -- columns: nspname
+-- row: pg_catalog
+-- row: pg_catalog
 -- row: pg_catalog
 -- end-expected
 SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace

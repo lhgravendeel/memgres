@@ -10,17 +10,27 @@ public final class AlterTableStmt implements Statement {
     public final String table;
     public final List<AlterAction> actions;
     public final boolean ifExists;
+    /** ONLY: the action applies to this table alone and must not reach its children. */
+    public final boolean only;
 
-    public AlterTableStmt(String schema, String table, List<AlterAction> actions, boolean ifExists) {
+    public AlterTableStmt(String schema, String table, List<AlterAction> actions, boolean ifExists,
+                          boolean only) {
         this.schema = schema;
         this.table = table;
         this.actions = actions;
         this.ifExists = ifExists;
+        this.only = only;
+    }
+
+    public AlterTableStmt(String schema, String table, List<AlterAction> actions, boolean ifExists) {
+        this(schema, table, actions, ifExists, false);
     }
 
     public AlterTableStmt(String schema, String table, List<AlterAction> actions) {
-        this(schema, table, actions, false);
+        this(schema, table, actions, false, false);
     }
+
+    public boolean only() { return only; }
 
     public interface AlterAction {}
 
@@ -565,6 +575,18 @@ public final class AlterTableStmt implements Statement {
         public String triggerName() { return triggerName; }
     }
 
+    /** ENABLE RULE name (enabled=true) or DISABLE RULE name (enabled=false). */
+        public static final class SetRuleEnabled implements AlterAction {
+        public final String ruleName;
+        public final boolean enabled;
+        public SetRuleEnabled(String ruleName, boolean enabled) {
+            this.ruleName = ruleName;
+            this.enabled = enabled;
+        }
+        public String ruleName() { return ruleName; }
+        public boolean enabled() { return enabled; }
+    }
+
     /** SET LOGGED (logged=true) or SET UNLOGGED (logged=false). */
         public static final class SetLogged implements AlterAction {
         public final boolean logged;
@@ -642,35 +664,58 @@ public final class AlterTableStmt implements Statement {
         }
     }
 
-        public static final class AlterConstraintEnforced implements AlterAction {
+    /**
+     * ALTER CONSTRAINT with its attribute list. Each attribute is tri-state: null means the
+     * command did not mention it, so the constraint keeps whatever it had. Which attributes were
+     * named decides which constraint kinds the command is legal on, so they are kept apart rather
+     * than collapsed into the resulting state.
+     */
+        public static final class AlterConstraintAttrs implements AlterAction {
         public final String constraintName;
-        public final boolean notEnforced;
+        public final Boolean deferrable;
+        public final Boolean initiallyDeferred;
+        public final Boolean enforced;
+        public final boolean alterInheritability;
 
-        public AlterConstraintEnforced(String constraintName, boolean notEnforced) {
+        public AlterConstraintAttrs(String constraintName, Boolean deferrable,
+                                    Boolean initiallyDeferred, Boolean enforced,
+                                    boolean alterInheritability) {
             this.constraintName = constraintName;
-            this.notEnforced = notEnforced;
+            this.deferrable = deferrable;
+            this.initiallyDeferred = initiallyDeferred;
+            this.enforced = enforced;
+            this.alterInheritability = alterInheritability;
         }
 
         public String constraintName() { return constraintName; }
-        public boolean notEnforced() { return notEnforced; }
+        public Boolean deferrable() { return deferrable; }
+        public Boolean initiallyDeferred() { return initiallyDeferred; }
+        public Boolean enforced() { return enforced; }
+        public boolean alterInheritability() { return alterInheritability; }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
-            AlterConstraintEnforced that = (AlterConstraintEnforced) o;
+            AlterConstraintAttrs that = (AlterConstraintAttrs) o;
             return java.util.Objects.equals(constraintName, that.constraintName)
-                && notEnforced == that.notEnforced;
+                && java.util.Objects.equals(deferrable, that.deferrable)
+                && java.util.Objects.equals(initiallyDeferred, that.initiallyDeferred)
+                && java.util.Objects.equals(enforced, that.enforced)
+                && alterInheritability == that.alterInheritability;
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(constraintName, notEnforced);
+            return java.util.Objects.hash(constraintName, deferrable, initiallyDeferred,
+                    enforced, alterInheritability);
         }
 
         @Override
         public String toString() {
-            return "AlterConstraintEnforced[constraintName=" + constraintName + ", notEnforced=" + notEnforced + "]";
+            return "AlterConstraintAttrs[constraintName=" + constraintName
+                + ", deferrable=" + deferrable + ", initiallyDeferred=" + initiallyDeferred
+                + ", enforced=" + enforced + ", alterInheritability=" + alterInheritability + "]";
         }
     }
 
@@ -812,6 +857,20 @@ public final class AlterTableStmt implements Statement {
         public final String method;
         public SetCompression(String method) { this.method = method; }
         public String method() { return method; }
+    }
+
+    /** ALTER COLUMN ... DROP IDENTITY [IF EXISTS] — distinct from DROP DEFAULT, which never complains. */
+    public static final class DropIdentity implements AlterColumnAction {
+        public final boolean ifExists;
+        public DropIdentity(boolean ifExists) { this.ifExists = ifExists; }
+        public boolean ifExists() { return ifExists; }
+    }
+
+    /** ALTER COLUMN ... DROP EXPRESSION [IF EXISTS] — turns a generated column into an ordinary one. */
+    public static final class DropExpression implements AlterColumnAction {
+        public final boolean ifExists;
+        public DropExpression(boolean ifExists) { this.ifExists = ifExists; }
+        public boolean ifExists() { return ifExists; }
     }
 
         public static final class ColumnNoOp implements AlterColumnAction {

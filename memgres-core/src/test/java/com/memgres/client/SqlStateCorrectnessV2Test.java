@@ -1133,15 +1133,14 @@ class SqlStateCorrectnessV2Test {
         }
     }
 
-    @Test void ntile_zero_gives_22023() {
-        // ntile(0) should error
+    @Test void ntile_zero_gives_22014() {
+        // PG has a SQLSTATE of its own for this: 22014 invalid_argument_for_ntile
         try {
             exec("SELECT ntile(0) OVER () FROM ssv2_t");
             fail("Expected error");
         } catch (SQLException e) {
-            String state = e.getSQLState();
-            assertTrue("22023".equals(state) || "22012".equals(state),
-                    "Expected 22023 or 22012, got " + state);
+            assertEquals("22014", e.getSQLState());
+            assertEquals("ERROR: argument of ntile must be greater than zero", e.getMessage());
         }
     }
 

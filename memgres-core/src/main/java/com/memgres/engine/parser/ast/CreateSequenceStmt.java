@@ -14,11 +14,19 @@ public final class CreateSequenceStmt implements Statement {
     public final boolean temporary;
     private Integer cache;
     private String asType;
+    private String ownedByTable;
+    private String ownedByColumn;
 
     public Integer getCache() { return cache; }
     public void setCache(Integer cache) { this.cache = cache; }
     public String getAsType() { return asType; }
     public void setAsType(String asType) { this.asType = asType; }
+    public String ownedByTable() { return ownedByTable; }
+    public String ownedByColumn() { return ownedByColumn; }
+    public void setOwnedBy(String table, String column) {
+        this.ownedByTable = table;
+        this.ownedByColumn = column;
+    }
 
     public CreateSequenceStmt(
             String name,

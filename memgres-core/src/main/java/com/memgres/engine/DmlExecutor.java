@@ -310,8 +310,21 @@ class DmlExecutor {
         // Check table-level locks (blocks if ACCESS EXCLUSIVE held by another session)
         executor.database.checkTableLockForDml(schemaName + "." + stmt.table(), executor.session);
 
-        // Check for INSTEAD / ALSO rules
-        String ruleVal = executor.database.getRule(stmt.table(), "INSERT");
+        // Check for INSTEAD / ALSO rules. Writing through an updatable view is rewritten to a
+        // write on the base table, so the base table's rules apply as well — a rule of the
+        // view's own takes precedence, as it does in PG, because it replaces the rewrite.
+        String ruleRelation = stmt.table();
+        String ruleVal = executor.database.getRule(ruleRelation, "INSERT");
+        if (ruleVal == null && table != null && table.getName() != null
+                && !table.getName().equalsIgnoreCase(stmt.table())) {
+            ruleRelation = table.getName();
+            ruleVal = executor.database.getRule(ruleRelation, "INSERT");
+        }
+        // A rule that writes back to its own table re-enters itself; PG detects that while
+        // rewriting the statement and never runs any of it.
+        if (ruleVal != null && executor.isRuleExpanding(ruleRelation, "INSERT")) {
+            throw PgErrors.infiniteRecursionInRules(ruleRelation);
+        }
         // Check for DO ALSO rule - will be applied after normal insert
         String alsoRuleSql = null;
         if (ruleVal != null && ruleVal.startsWith("ALSO:")) {
@@ -321,27 +334,8 @@ class DmlExecutor {
             return QueryResult.command(QueryResult.Type.INSERT, 0);
         }
         if (ruleVal != null && ruleVal.startsWith("INSTEAD:")) {
-            String ruleSql = ruleVal.substring("INSTEAD:".length());
             List<List<Expression>> ruleValueRows = stmt.values();
-            if (ruleValueRows != null) {
-                for (List<Expression> valueRow : ruleValueRows) {
-                    String sql = ruleSql;
-                    List<String> colNames = stmt.columns();
-                    if (colNames == null) {
-                        colNames = new ArrayList<>();
-                        for (Column c : table.getColumns()) colNames.add(c.getName());
-                    }
-                    for (int ci = 0; ci < Math.min(colNames.size(), valueRow.size()); ci++) {
-                        Object val = executor.evalExpr(valueRow.get(ci), null);
-                        String colName = colNames.get(ci);
-                        String replacement = val == null ? "NULL"
-                                : val instanceof Number ? val.toString()
-                                : "'" + val.toString().replace("'", "''") + "'";
-                        sql = sql.replaceAll("(?i)NEW\\s*\\.\\s*" + colName, replacement);
-                    }
-                    executor.execute(sql, Cols.listOf());
-                }
-            }
+            runInsertRuleActions(ruleVal.substring("INSTEAD:".length()), stmt, table, ruleRelation);
             return QueryResult.command(QueryResult.Type.INSERT, ruleValueRows != null ? ruleValueRows.size() : 0);
         }
 
@@ -771,24 +765,8 @@ class DmlExecutor {
         }
 
         // Execute DO ALSO rule if present
-        if (alsoRuleSql != null && stmt.values() != null) {
-            for (List<Expression> valueRow : stmt.values()) {
-                String sql = alsoRuleSql;
-                List<String> colNames = stmt.columns();
-                if (colNames == null) {
-                    colNames = new ArrayList<>();
-                    for (Column c : table.getColumns()) colNames.add(c.getName());
-                }
-                for (int ci = 0; ci < Math.min(colNames.size(), valueRow.size()); ci++) {
-                    Object val = executor.evalExpr(valueRow.get(ci), null);
-                    String colName = colNames.get(ci);
-                    String replacement = val == null ? "NULL"
-                            : val instanceof Number ? val.toString()
-                            : "'" + val.toString().replace("'", "''") + "'";
-                    sql = sql.replaceAll("(?i)NEW\\s*\\.\\s*" + colName, replacement);
-                }
-                executor.execute(sql, Cols.listOf());
-            }
+        if (alsoRuleSql != null) {
+            runInsertRuleActions(alsoRuleSql, stmt, table, ruleRelation);
         }
 
         // Track DML statistics
@@ -2668,6 +2646,10 @@ class DmlExecutor {
                                          Expression where, List<InsertStmt.SetClause> setClauses) {
         String ruleVal = executor.database.getRule(tableName, event);
         if (ruleVal == null) return null;
+        // A rule whose command lands back on its own relation would re-enter itself forever.
+        if (executor.isRuleExpanding(tableName, event)) {
+            throw PgErrors.infiniteRecursionInRules(tableName);
+        }
         if ("INSTEAD_NOTHING".equals(ruleVal)) {
             return QueryResult.command(type, 0);
         }
@@ -2681,28 +2663,81 @@ class DmlExecutor {
         List<Column> cols = affected.getColumns();
         Table rowShape = new Table(tableName, cols);
         int count = 0;
-        for (Object[] row : affected.getRows()) {
-            String sql = ruleSql;
-            RowContext rowCtx = new RowContext(rowShape, null, row);
-            for (int i = 0; i < cols.size(); i++) {
-                String colName = cols.get(i).getName();
-                Object oldVal = row[i];
-                Object newVal = oldVal;
-                if (setClauses != null) {
-                    for (InsertStmt.SetClause set : setClauses) {
-                        if (set.column().equalsIgnoreCase(colName)) {
-                            newVal = executor.evalExpr(set.value(), rowCtx);
-                            break;
+        executor.enterRuleExpansion(tableName, event);
+        try {
+            for (Object[] row : affected.getRows()) {
+                RowContext rowCtx = new RowContext(rowShape, null, row);
+                for (String action : Database.ruleActions(ruleSql)) {
+                    String sql = action;
+                    for (int i = 0; i < cols.size(); i++) {
+                        String colName = cols.get(i).getName();
+                        Object oldVal = row[i];
+                        Object newVal = oldVal;
+                        if (setClauses != null) {
+                            for (InsertStmt.SetClause set : setClauses) {
+                                if (set.column().equalsIgnoreCase(colName)) {
+                                    newVal = executor.evalExpr(set.value(), rowCtx);
+                                    break;
+                                }
+                            }
                         }
+                        sql = substituteRowAlias(sql, "NEW", colName, newVal);
+                        sql = substituteRowAlias(sql, "OLD", colName, oldVal);
                     }
+                    executor.execute(sql, Cols.listOf());
                 }
-                sql = substituteRowAlias(sql, "NEW", colName, newVal);
-                sql = substituteRowAlias(sql, "OLD", colName, oldVal);
+                count++;
             }
-            executor.execute(sql, Cols.listOf());
-            count++;
+        } finally {
+            executor.exitRuleExpansion(tableName, event);
         }
         return QueryResult.command(type, count);
+    }
+
+    /**
+     * Run each action of an INSERT rule once per inserted row, with {@code NEW.col} replaced by
+     * the value the statement supplied for that column.
+     */
+    private void runInsertRuleActions(String storedBody, InsertStmt stmt, Table table,
+                                      String ruleRelation) {
+        if (stmt.values() == null) return;
+        // A rule whose action writes back to the same relation would expand forever.
+        executor.enterRuleExpansion(ruleRelation, "INSERT");
+        try {
+            runInsertRuleActionRows(storedBody, stmt, table);
+        } finally {
+            executor.exitRuleExpansion(ruleRelation, "INSERT");
+        }
+    }
+
+    private void runInsertRuleActionRows(String storedBody, InsertStmt stmt, Table table) {
+        for (List<Expression> valueRow : stmt.values()) {
+            // Values arrive in the order the statement names them, and through a view that is
+            // the view's own column order mapped onto the base table.
+            List<String> colNames = stmt.columns();
+            if (colNames == null) colNames = activeViewColOrder;
+            if (colNames == null) {
+                colNames = new ArrayList<>();
+                for (Column c : table.getColumns()) colNames.add(c.getName());
+            }
+            for (String action : Database.ruleActions(storedBody)) {
+                String sql = action;
+                for (int ci = 0; ci < Math.min(colNames.size(), valueRow.size()); ci++) {
+                    Object val = executor.evalExpr(valueRow.get(ci), null);
+                    String colName = colNames.get(ci);
+                    String replacement = val == null ? "NULL"
+                            : val instanceof Number ? val.toString()
+                            : "'" + val.toString().replace("'", "''") + "'";
+                    sql = sql.replaceAll("(?i)NEW\\s*\\.\\s*" + colName, replacement);
+                }
+                // NEW carries every column of the row being inserted, so one the statement did
+                // not supply is null there — not a name left standing in the rule's own SQL.
+                for (Column c : table.getColumns()) {
+                    sql = sql.replaceAll("(?i)NEW\\s*\\.\\s*" + c.getName(), "NULL");
+                }
+                executor.execute(sql, Cols.listOf());
+            }
+        }
     }
 
     /** The rows the statement would have acted on, read through the relation it names. */
@@ -2997,6 +3032,14 @@ class DmlExecutor {
     void validateReturning(List<SelectStmt.SelectTarget> returning, Table table) {
         if (returning == null) return;
         for (SelectStmt.SelectTarget target : returning) {
+            // RETURNING reports the rows the statement touched one at a time; there is no
+            // group and no window frame for an aggregate or a window function to run over.
+            if (executor.selectExecutor.containsAggregate(target.expr())) {
+                throw new MemgresException("aggregate functions are not allowed in RETURNING", "42803");
+            }
+            if (executor.selectExecutor.containsWindowFunction(target.expr())) {
+                throw new MemgresException("window functions are not allowed in RETURNING", "42P20");
+            }
             if (target.expr() instanceof WildcardExpr) continue;
             if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();

@@ -68,9 +68,12 @@ class ExtensionsDDLCoverageTest {
     }
 
     @Test
-    void rule_create_on_select_do_instead_nothing() {
+    void rule_create_on_select_rejected_for_table() {
         assertNoError("CREATE TABLE rule_tbl4 (id INT)");
-        assertNoError("CREATE RULE rule_no_select AS ON SELECT TO rule_tbl4 DO INSTEAD NOTHING");
+        // An ON SELECT rule is how a view is represented, so a table may not carry one.
+        SQLException e = assertThrows(SQLException.class,
+                () -> exec("CREATE RULE rule_no_select AS ON SELECT TO rule_tbl4 DO INSTEAD NOTHING"));
+        assertEquals("42809", e.getSQLState());
     }
 
     @Test
