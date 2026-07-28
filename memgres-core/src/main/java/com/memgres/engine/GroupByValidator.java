@@ -1,6 +1,7 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.ArrayExpr;
+import com.memgres.engine.parser.ast.CastExpr;
 import com.memgres.engine.parser.ast.ColumnRef;
 import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.Literal;
@@ -85,7 +86,7 @@ final class GroupByValidator {
         // A HAVING whose operators or functions do not resolve is a type error, and PostgreSQL
         // reports it while it analyses HAVING — before it judges the query's grouping.
         checkHavingTypes(stmt, bindings);
-        rejectDistinctSortKeysOutsideSelectList(stmt, targets, orderBy);
+        rejectDistinctSortKeysOutsideSelectList(stmt, targets, orderBy, bindings);
 
         Set<String> groupedForms = new LinkedHashSet<String>();
         for (Expression g : grouped) groupedForms.add(canon(g, bindings));
@@ -123,18 +124,36 @@ final class GroupByValidator {
      * SELECT DISTINCT sorts the distinct rows, so every sort key has to be one of the columns
      * that survives the DISTINCT. An aggregate the select list does not carry is as unavailable
      * to it as a window function is, and PostgreSQL refuses both with the same message.
+     *
+     * <p>What counts as "one of them" is the column, not the spelling. PostgreSQL matches the
+     * sort key against the select list after both have been resolved, so {@code ORDER BY d.s}
+     * and a select list carrying a bare {@code s} of that same relation are the same column and
+     * the query is accepted — while {@code ORDER BY u.a} against a select list carrying
+     * {@code t.a} names a different column and is still refused.
      */
     private void rejectDistinctSortKeysOutsideSelectList(SelectStmt stmt,
                                                          List<SelectStmt.SelectTarget> targets,
-                                                         List<SelectStmt.OrderByItem> orderBy) {
+                                                         List<SelectStmt.OrderByItem> orderBy,
+                                                         List<RowContext.TableBinding> bindings) {
         if (!stmt.distinct() || orderBy == null || orderBy.isEmpty()) return;
         if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty()) return;
         for (SelectStmt.OrderByItem item : orderBy) {
-            if (select.resolveOrderByToColumnIndex(item.expr(), targets) < 0) {
-                throw new MemgresException(
-                        "for SELECT DISTINCT, ORDER BY expressions must appear in select list", "42P10");
-            }
+            if (select.resolveOrderByToColumnIndex(item.expr(), targets) >= 0) continue;
+            if (namesSelectListExpression(item.expr(), targets, bindings)) continue;
+            throw new MemgresException(
+                    "for SELECT DISTINCT, ORDER BY expressions must appear in select list", "42P10");
         }
+    }
+
+    /** True when the select list carries this expression, however either of them was written. */
+    private boolean namesSelectListExpression(Expression sortKey,
+                                              List<SelectStmt.SelectTarget> targets,
+                                              List<RowContext.TableBinding> bindings) {
+        String key = canon(sortKey, bindings);
+        for (SelectStmt.SelectTarget target : targets) {
+            if (key.equals(canon(target.expr(), bindings))) return true;
+        }
+        return false;
     }
 
     // ---- HAVING type resolution ----
@@ -200,12 +219,42 @@ final class GroupByValidator {
         if (node instanceof com.memgres.engine.parser.ast.BinaryExpr) {
             com.memgres.engine.parser.ast.BinaryExpr bin =
                     (com.memgres.engine.parser.ast.BinaryExpr) node;
-            rejectNonBigintCountComparison(bin.left(), bin.right());
-            rejectNonBigintCountComparison(bin.right(), bin.left());
+            if (readsLiteralAsBigint(bin.op())) {
+                rejectNonBigintCountComparison(bin.left(), bin.right());
+                rejectNonBigintCountComparison(bin.right(), bin.left());
+            }
         }
         AstWalk.forEachChild(node, new java.util.function.Consumer<Object>() {
             @Override public void accept(Object child) { rejectUnresolvableTypes(child, bindings); }
         });
+    }
+
+    /**
+     * The operators that read a bare string literal as the bigint the count beside it is.
+     *
+     * <p>A comparison and the four arithmetic operators do; nothing else does.
+     * {@code count(*) || 'x'} concatenates a bigint with a string and is ordinary SQL that
+     * PostgreSQL runs — as are LIKE, the JSON operators and every other operator that has its
+     * own reading of a string operand. Firing on any binary expression at all, as this once did,
+     * refused those working queries.
+     */
+    private static boolean readsLiteralAsBigint(com.memgres.engine.parser.ast.BinaryExpr.BinOp op) {
+        switch (op) {
+            case EQUAL:
+            case NOT_EQUAL:
+            case LESS_THAN:
+            case LESS_EQUAL:
+            case GREATER_THAN:
+            case GREATER_EQUAL:
+            case ADD:
+            case SUBTRACT:
+            case MULTIPLY:
+            case DIVIDE:
+            case MODULO:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** {@code count(...) > 'x'} reads the literal as the bigint the count is, and fails there. */
@@ -249,6 +298,7 @@ final class GroupByValidator {
 
     private void addResolved(Expression item, List<SelectStmt.SelectTarget> targets,
                              List<RowContext.TableBinding> bindings, List<Expression> out) {
+        item = eraseNoOpCast(item, bindings);
         Integer position = integerConstant(item);
         if (position != null) {
             if (position < 1 || position > targets.size()) {
@@ -291,6 +341,132 @@ final class GroupByValidator {
         }
         rejectUnresolvableGroupItem(ref, bindings);
         return item;
+    }
+
+    // ---- Casts the column already satisfies ----
+
+    /**
+     * A cast asking for the type its operand column already has, dropped.
+     *
+     * <p>PostgreSQL erases such a cast while it analyses the query, so {@code GROUP BY a::int}
+     * over an {@code int} column <em>is</em> {@code GROUP BY a}: it licenses a bare {@code a} in
+     * the select list, and a primary key grouped that way still determines its row. A cast to
+     * any other type — {@code b::varchar} over {@code text}, {@code n::numeric} over
+     * {@code numeric(10,2)} — is a real coercion producing a different value, so grouping by it
+     * leaves the column itself ungrouped, exactly as PostgreSQL has it.
+     *
+     * <p>Only a cast written directly over a column of the FROM clause is erased. That is the
+     * one operand whose type is declared rather than inferred, so nothing here has to guess a
+     * type and wrongly let an ungrouped column through.
+     */
+    private static Expression eraseNoOpCast(Expression expr, List<RowContext.TableBinding> bindings) {
+        while (expr instanceof CastExpr) {
+            CastExpr cast = (CastExpr) expr;
+            // a::int::int is two casts over the column, and PostgreSQL erases both.
+            Expression operand = eraseNoOpCast(cast.expr(), bindings);
+            if (!(operand instanceof ColumnRef)) return expr;
+            ColumnRef ref = (ColumnRef) operand;
+            RowContext.TableBinding binding = findBinding(ref, bindings);
+            if (binding == null) return expr;
+            int index = binding.table().getColumnIndex(ref.column());
+            if (index < 0) return expr;
+            if (!castsToOwnType(cast.typeName(), binding.table().getColumns().get(index))) return expr;
+            expr = ref;
+        }
+        return expr;
+    }
+
+    /** True when the cast names the column's own declared type, length or precision and all. */
+    private static boolean castsToOwnType(String typeName, Column column) {
+        if (typeName == null || column == null) return false;
+        String written = typeName.trim();
+        // A domain and an enum are named types of their own: naming a column's own domain or
+        // enum is the no-op cast, and naming the type underneath it is a conversion out of it.
+        if (column.getDomainTypeName() != null) {
+            return written.equalsIgnoreCase(column.getDomainTypeName());
+        }
+        if (column.getEnumTypeName() != null) {
+            return written.equalsIgnoreCase(column.getEnumTypeName());
+        }
+        if (column.getCompositeTypeName() != null || column.getArrayElementType() != null) {
+            return false;
+        }
+        String name = written.replaceAll("\\s+", " ");
+        Integer precision = null;
+        Integer scale = null;
+        int paren = name.indexOf('(');
+        if (paren >= 0) {
+            if (!name.endsWith(")")) return false;
+            String[] args = name.substring(paren + 1, name.length() - 1).split(",");
+            name = name.substring(0, paren).trim();
+            if (args.length > 2) return false;
+            try {
+                precision = Integer.valueOf(args[0].trim());
+                if (args.length > 1) scale = Integer.valueOf(args[1].trim());
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        DataType cast = builtInType(name);
+        if (cast == null || cast != declaredType(column.getType())) return false;
+        return sameModifier(precision, column.getPrecision())
+                && sameModifier(scale, column.getScale());
+    }
+
+    private static boolean sameModifier(Integer a, Integer b) {
+        return a == null ? b == null : a.equals(b);
+    }
+
+    /** A serial column is the integer type it is stored as, which is what a cast can name. */
+    private static DataType declaredType(DataType type) {
+        if (type == DataType.SERIAL) return DataType.INTEGER;
+        if (type == DataType.BIGSERIAL) return DataType.BIGINT;
+        if (type == DataType.SMALLSERIAL) return DataType.SMALLINT;
+        return type;
+    }
+
+    /**
+     * The built-in type a cast's type name names, or null for anything else.
+     *
+     * <p>Deliberately not {@link DataType#fromPgName}: that maps {@code citext} and the
+     * {@code reg*} aliases onto the type they are stored as, and a cast to one of those is a
+     * conversion PostgreSQL does not erase. A name this does not know simply keeps its cast.
+     */
+    private static DataType builtInType(String name) {
+        String lower = name.toLowerCase();
+        if ("smallint".equals(lower) || "int2".equals(lower)) return DataType.SMALLINT;
+        if ("integer".equals(lower) || "int".equals(lower) || "int4".equals(lower)) return DataType.INTEGER;
+        if ("bigint".equals(lower) || "int8".equals(lower)) return DataType.BIGINT;
+        if ("real".equals(lower) || "float4".equals(lower)) return DataType.REAL;
+        if ("double precision".equals(lower) || "float8".equals(lower)) return DataType.DOUBLE_PRECISION;
+        if ("numeric".equals(lower) || "decimal".equals(lower)) return DataType.NUMERIC;
+        if ("varchar".equals(lower) || "character varying".equals(lower)) return DataType.VARCHAR;
+        if ("char".equals(lower) || "character".equals(lower) || "bpchar".equals(lower)) return DataType.CHAR;
+        if ("text".equals(lower)) return DataType.TEXT;
+        if ("name".equals(lower)) return DataType.NAME;
+        if ("boolean".equals(lower) || "bool".equals(lower)) return DataType.BOOLEAN;
+        if ("date".equals(lower)) return DataType.DATE;
+        if ("timestamp".equals(lower) || "timestamp without time zone".equals(lower)) return DataType.TIMESTAMP;
+        if ("timestamptz".equals(lower) || "timestamp with time zone".equals(lower)) return DataType.TIMESTAMPTZ;
+        if ("time".equals(lower) || "time without time zone".equals(lower)) return DataType.TIME;
+        if ("timetz".equals(lower) || "time with time zone".equals(lower)) return DataType.TIMETZ;
+        if ("interval".equals(lower)) return DataType.INTERVAL;
+        if ("bytea".equals(lower)) return DataType.BYTEA;
+        if ("uuid".equals(lower)) return DataType.UUID;
+        if ("json".equals(lower)) return DataType.JSON;
+        if ("jsonb".equals(lower)) return DataType.JSONB;
+        if ("inet".equals(lower)) return DataType.INET;
+        if ("cidr".equals(lower)) return DataType.CIDR;
+        if ("macaddr".equals(lower)) return DataType.MACADDR;
+        if ("macaddr8".equals(lower)) return DataType.MACADDR8;
+        if ("money".equals(lower)) return DataType.MONEY;
+        if ("xml".equals(lower)) return DataType.XML;
+        if ("tsvector".equals(lower)) return DataType.TSVECTOR;
+        if ("tsquery".equals(lower)) return DataType.TSQUERY;
+        if ("bit".equals(lower)) return DataType.BIT;
+        if ("varbit".equals(lower) || "bit varying".equals(lower)) return DataType.VARBIT;
+        if ("oid".equals(lower)) return DataType.OID;
+        return null;
     }
 
     /**
@@ -723,6 +899,12 @@ final class GroupByValidator {
      */
     static String canon(Object node, List<RowContext.TableBinding> bindings) {
         if (node == null) return "~";
+        if (node instanceof CastExpr) {
+            // A cast to the column's own type is not part of the expression PostgreSQL compares,
+            // wherever in the expression it stands: GROUP BY a::int + 1 licenses a + 1.
+            Expression erased = eraseNoOpCast((CastExpr) node, bindings);
+            if (erased != node) return canon(erased, bindings);
+        }
         if (node instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) node;
             RowContext.TableBinding binding = findBinding(ref, bindings);
