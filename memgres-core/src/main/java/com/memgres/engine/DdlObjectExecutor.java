@@ -2322,6 +2322,9 @@ class DdlObjectExecutor {
         if (executor.database.getDomain(stmt.name()) != null) {
             throw new MemgresException("type \"" + stmt.name() + "\" already exists", "42710");
         }
+        // The base type's modifier is resolved after the name collision and before anything is
+        // written, so a domain over a width the type could never carry is never created.
+        TypeCoercion.checkDeclaredTypeLimits(stmt.baseType());
         String baseTypeName = stmt.baseType().replaceAll("\\(.*\\)", "").trim().replace("[]", "").trim();
         DataType baseType = DataType.fromPgName(baseTypeName);
         if (baseType == null) {

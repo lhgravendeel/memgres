@@ -2803,6 +2803,9 @@ class ExprEvaluator {
                     || name.equals("octet_length") || name.equals("bit_length")
                     || name.equals("position") || name.equals("strpos")
                     || name.equals("array_length") || name.equals("cardinality")
+                    || name.equals("array_ndims") || name.equals("array_upper")
+                    || name.equals("array_lower")
+                    || name.equals("num_nonnulls") || name.equals("num_nulls")
                     || name.equals("array_position")) return DataType.INTEGER;
             if (name.equals("array_positions")) return DataType.INT4_ARRAY;
             if (name.equals("sum") || name.equals("avg")) return DataType.NUMERIC;

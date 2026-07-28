@@ -1038,6 +1038,10 @@ class DdlAlterTableExecutor {
         if (colIdx < 0) {
             throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
         }
+        // The column is looked up before the target type's modifier is resolved, so a retype of a
+        // column that is not there is reported as that. ADD COLUMN checks the same limits through
+        // resolveColumnType; a retype names the same types and must reject the same widths.
+        TypeCoercion.checkDeclaredTypeLimits(setType.typeName());
         // Check for generated column dependencies
         String alterColLower = alterCol.column().toLowerCase();
         for (Column c : table.getColumns()) {
