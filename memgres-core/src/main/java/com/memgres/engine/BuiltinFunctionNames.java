@@ -34,7 +34,7 @@ final class BuiltinFunctionNames {
             "encode", "enum_cmp", "enum_first", "enum_last", "enum_range", "epoch", "exist", "exp",
             "extract", "first_value", "float4", "float8", "floor", "format", "format_type", "gb",
             "gen_random_bytes", "generate_series", "generate_subscripts", "get_current_ts_config",
-            "greatest", "has_column_privilege", "has_database_privilege",
+            "greatest", "has_any_column_privilege", "has_column_privilege", "has_database_privilege",
             "has_foreign_data_wrapper_privilege", "has_function_privilege", "has_language_privilege",
             "has_parameter_privilege", "has_schema_privilege", "has_sequence_privilege",
             "has_server_privilege", "has_table_privilege", "has_tablespace_privilege",

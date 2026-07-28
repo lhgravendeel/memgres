@@ -19,10 +19,12 @@ class CatalogSystemFunctions {
 
     private final AstExecutor executor;
     private final CatalogMetadataFunctions metadataFunctions;
+    private final CatalogPrivilegeFunctions privilegeFunctions;
 
     CatalogSystemFunctions(AstExecutor executor) {
         this.executor = executor;
         this.metadataFunctions = new CatalogMetadataFunctions(executor);
+        this.privilegeFunctions = new CatalogPrivilegeFunctions(executor);
     }
 
     private void requireArgs(FunctionCallExpr fn, int min) {
@@ -37,6 +39,9 @@ class CatalogSystemFunctions {
         // Try metadata/introspection functions first
         Object metaResult = metadataFunctions.eval(name, fn, ctx);
         if (metaResult != NOT_HANDLED) return metaResult;
+
+        Object privResult = privilegeFunctions.eval(name, fn, ctx);
+        if (privResult != NOT_HANDLED) return privResult;
 
         switch (name) {
             case "pg_typeof": {
@@ -411,110 +416,6 @@ class CatalogSystemFunctions {
             case "pg_database_size": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
                 return 8192L;
-            }
-            case "has_schema_privilege":
-                return evalHasPrivilege(fn, ctx, "SCHEMA");
-            case "has_table_privilege":
-                return evalHasPrivilege(fn, ctx, "TABLE");
-            case "has_function_privilege":
-                return evalHasPrivilege(fn, ctx, "FUNCTION");
-            case "has_database_privilege":
-                return true;
-            case "has_column_privilege": {
-                String colPrivUser;
-                String colPrivTable;
-                String colPrivCol;
-                String colPrivPriv;
-                if (fn.args().size() >= 4) {
-                    colPrivUser = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    colPrivTable = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toLowerCase();
-                    colPrivCol = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toLowerCase();
-                    colPrivPriv = String.valueOf(executor.evalExpr(fn.args().get(3), ctx)).toUpperCase().trim();
-                } else {
-                    colPrivUser = currentUserName();
-                    colPrivTable = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    colPrivCol = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toLowerCase();
-                    colPrivPriv = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toUpperCase().trim();
-                }
-                if (colPrivPriv.endsWith(" WITH GRANT OPTION")) {
-                    colPrivPriv = colPrivPriv.substring(0, colPrivPriv.length() - " WITH GRANT OPTION".length()).trim();
-                }
-                // Column and table privileges are keyed by schema-qualified table name.
-                String colPrivQual = AstExecutor.privilegeKey(executor.defaultSchema(), colPrivTable);
-                if (checkPrivilege(colPrivUser, colPrivPriv, "COLUMN", colPrivQual + "." + colPrivCol)) {
-                    return true;
-                }
-                return checkPrivilege(colPrivUser, colPrivPriv, "TABLE", colPrivQual);
-            }
-            case "has_sequence_privilege":
-                return true;
-            case "has_server_privilege":
-            case "has_tablespace_privilege":
-            case "has_type_privilege":
-            case "has_foreign_data_wrapper_privilege":
-            case "has_language_privilege":
-            case "has_parameter_privilege": {
-                // has_parameter_privilege(role, param_name, privilege) -> boolean
-                // Returns PG boolean value (rendered as "t"/"f" by wire protocol)
-                String hppUser, hppParam, hppPriv;
-                if (fn.args().size() >= 3) {
-                    hppUser = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    hppParam = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toLowerCase();
-                    hppPriv = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toUpperCase().trim();
-                } else {
-                    hppUser = currentUserName();
-                    hppParam = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    hppPriv = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toUpperCase().trim();
-                }
-                return checkPrivilege(hppUser, hppPriv, "PARAMETER", hppParam);
-            }
-            case "pg_has_role": {
-                String pgHasRoleUser;
-                String pgHasRoleRole;
-                String pgHasRolePriv;
-                if (fn.args().size() >= 3) {
-                    pgHasRoleUser = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    pgHasRoleRole = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toLowerCase();
-                    pgHasRolePriv = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toUpperCase();
-                } else {
-                    pgHasRoleUser = executor.session != null
-                            ? executor.session.getGucSettings().hasSessionOverride("role")
-                                ? executor.session.getGucSettings().get("role").toLowerCase()
-                                : "memgres"
-                            : "memgres";
-                    pgHasRoleRole = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-                    pgHasRolePriv = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toUpperCase();
-                }
-                if (pgHasRoleUser.equals(pgHasRoleRole)) { return true; }
-                // M12: Superusers can always SET ROLE (USAGE) to any role
-                if (pgHasRolePriv.contains("USAGE") || pgHasRolePriv.contains("SET")) {
-                    Map<String, String> suAttrs = executor.database.getRoles().get(pgHasRoleUser);
-                    if (suAttrs != null && "true".equalsIgnoreCase(suAttrs.get("SUPERUSER"))) return true;
-                }
-                if (pgHasRolePriv.contains("ADMIN")) { return false; }
-                Map<String, Set<String>> memberships = executor.database.getRoleMemberships();
-                Set<String> visited = new HashSet<>();
-                java.util.Queue<String> queue = new java.util.ArrayDeque<>();
-                queue.add(pgHasRoleRole);
-                visited.add(pgHasRoleRole);
-                boolean pgHasRoleFound = false;
-                while (!queue.isEmpty() && !pgHasRoleFound) {
-                    String current = queue.poll();
-                    Set<String> directMembers = memberships.get(current);
-                    if (directMembers != null && directMembers.contains(pgHasRoleUser)) {
-                        pgHasRoleFound = true;
-                        break;
-                    }
-                    if (directMembers != null) {
-                        for (String member : directMembers) {
-                            if (!visited.contains(member)) {
-                                visited.add(member);
-                                queue.add(member);
-                            }
-                        }
-                    }
-                }
-                return pgHasRoleFound;
             }
             case "pg_relation_size":
             case "pg_total_relation_size":
@@ -891,133 +792,6 @@ class CatalogSystemFunctions {
             default:
                 throw new MemgresException("invalid size: \"" + sizeStr + "\"", "22023");
         }
-    }
-
-    // ---- DRY helper for has_schema/table/function_privilege ----
-
-    private boolean evalHasPrivilege(FunctionCallExpr fn, RowContext ctx, String objectType) {
-        String user, objectName, priv;
-        if (fn.args().size() >= 3) {
-            user = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-            objectName = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toLowerCase();
-            priv = String.valueOf(executor.evalExpr(fn.args().get(2), ctx)).toUpperCase().trim();
-        } else {
-            user = currentUserName();
-            objectName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx)).toLowerCase();
-            priv = String.valueOf(executor.evalExpr(fn.args().get(1), ctx)).toUpperCase().trim();
-        }
-        boolean checkGrantOption = false;
-        if (priv.endsWith(" WITH GRANT OPTION")) {
-            checkGrantOption = true;
-            priv = priv.substring(0, priv.length() - " WITH GRANT OPTION".length()).trim();
-        }
-        // Strip argument types for FUNCTION: "funcname(int, text)" -> "funcname"
-        if ("FUNCTION".equals(objectType) && objectName.contains("(")) {
-            objectName = objectName.substring(0, objectName.indexOf('(')).trim();
-        }
-        // FUNCTION privileges are keyed bare; TABLE privileges keep their schema so a
-        // grant on one schema's table is not reported for a same-named table elsewhere.
-        if ("FUNCTION".equals(objectType) && objectName.contains(".")) {
-            objectName = objectName.substring(objectName.lastIndexOf('.') + 1);
-        }
-        if ("TABLE".equals(objectType)) {
-            objectName = AstExecutor.privilegeKey(executor.defaultSchema(), objectName);
-        }
-        if (checkGrantOption) {
-            // For WITH GRANT OPTION, superusers and owners always have it
-            Map<String, String> roleAttrs = executor.database.getRoles().get(user);
-            if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) return true;
-            // Check ownership
-            String ownerKey = objectType.equalsIgnoreCase("TABLE")
-                    ? "table:" + objectName : objectType.toLowerCase() + ":" + objectName;
-            String owner = executor.database.getObjectOwner(ownerKey);
-            if (owner != null && owner.equalsIgnoreCase(user)) return true;
-            // Check explicit grant option
-            return checkPrivilegeDirectOrInherited(user, priv + "_GRANT_OPTION", objectType, objectName, new HashSet<>());
-        }
-        return checkPrivilege(user, priv, objectType, objectName);
-    }
-
-    // ---- Privilege checking ----
-
-    private boolean checkPrivilege(String roleName, String privilege, String objectType, String objectName) {
-        String roleNameLower = roleName.toLowerCase();
-        String objectNameLower = objectName.toLowerCase();
-
-        // 1. Superusers have all privileges
-        Map<String, String> roleAttrs = executor.database.getRoles().get(roleNameLower);
-        if (roleAttrs != null && "true".equalsIgnoreCase(roleAttrs.get("SUPERUSER"))) {
-            return true;
-        }
-
-        // M12: PUBLIC pseudo-role has implicit USAGE+CREATE on schema "public"
-        if (objectType.equalsIgnoreCase("SCHEMA") && "public".equals(objectNameLower)
-                && ("USAGE".equalsIgnoreCase(privilege) || "CREATE".equalsIgnoreCase(privilege))) {
-            return true;
-        }
-
-        // 2. Owner has all privileges on their own objects
-        String ownerKey = objectType.equalsIgnoreCase("TABLE")
-                ? "table:" + objectNameLower
-                : objectType.equalsIgnoreCase("FUNCTION")
-                    ? "function:" + objectNameLower
-                    : objectType.equalsIgnoreCase("SCHEMA")
-                        ? "schema:" + objectNameLower
-                        : null;
-        if (ownerKey != null) {
-            String owner = executor.database.getObjectOwner(ownerKey);
-            if (owner != null && owner.equalsIgnoreCase(roleNameLower)) {
-                return true;
-            }
-        }
-
-        // 3 & 4. Direct or inherited privilege check
-        return checkPrivilegeDirectOrInherited(roleNameLower, privilege, objectType, objectNameLower,
-                new HashSet<>());
-    }
-
-    private boolean checkPrivilegeDirectOrInherited(String roleName, String privilege,
-            String objectType, String objectName, Set<String> visited) {
-        if (visited.contains(roleName)) return false;
-        visited.add(roleName);
-
-        Set<String> privs = executor.database.getRolePrivileges(roleName);
-        String objectNameLower = objectName.toLowerCase();
-        String checkKey = privilege.toUpperCase() + ":" + objectType.toUpperCase() + ":" + objectNameLower;
-        String allKey = "ALL:" + objectType.toUpperCase() + ":" + objectNameLower;
-        if (privs.contains(checkKey) || privs.contains(allKey)) {
-            return true;
-        }
-
-        Map<String, Set<String>> memberships = executor.database.getRoleMemberships();
-        for (Map.Entry<String, Set<String>> entry : memberships.entrySet()) {
-            String grantedRole = entry.getKey();
-            Set<String> members = entry.getValue();
-            if (members.contains(roleName) && !visited.contains(grantedRole)) {
-                if (checkPrivilegeDirectOrInherited(grantedRole, privilege, objectType, objectName, visited)) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    // ---- Helper methods ----
-
-    private String currentUserName() {
-        if (executor.session != null) {
-            GucSettings guc = executor.session.getGucSettings();
-            if (guc.hasSessionOverride("role")) {
-                String role = guc.get("role");
-                if (role != null && !role.equalsIgnoreCase("NONE") && !role.equalsIgnoreCase("DEFAULT")) {
-                    return role.toLowerCase();
-                }
-            }
-            String sessionAuth = guc.get("session_authorization");
-            if (sessionAuth != null) return sessionAuth.toLowerCase();
-        }
-        return "memgres";
     }
 
     static String pgTypeDisplayName(DataType dt) {
