@@ -20,6 +20,12 @@ class FromFunctionResolver {
      */
     private static final long MAX_SERIES_ROWS = 10_000_000L;
 
+    /**
+     * Poll for cancellation once per 1024 generated rows. A series builds rows without evaluating
+     * any expression, so it would otherwise run past statement_timeout unnoticed.
+     */
+    private static final long CANCEL_POLL_MASK = 1023L;
+
     private static MemgresException seriesTooLarge() {
         return new MemgresException(
                 "generate_series would produce more than " + MAX_SERIES_ROWS + " rows", "54000");
@@ -169,6 +175,7 @@ class FromFunctionResolver {
             java.time.OffsetDateTime cur = tzStart;
             long ord = 1;
             for (long guard = 0; guard < MAX_SERIES_ROWS; guard++) {
+                if ((guard & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (ascending ? cur.isAfter(tzStop) : cur.isBefore(tzStop)) break;
                 Object[] row = hasOrdinality ? new Object[]{cur, ord++} : new Object[]{cur};
                 virtualTable.insertRow(row);
@@ -200,6 +207,7 @@ class FromFunctionResolver {
             java.time.LocalDateTime cur = dtStart;
             long ord = 1;
             for (long guard = 0; guard < MAX_SERIES_ROWS; guard++) {
+                if ((guard & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (ascending ? cur.isAfter(dtStop) : cur.isBefore(dtStop)) break;
                 Object val = dateInput ? cur.atZone(java.time.ZoneOffset.UTC).toOffsetDateTime() : cur;
                 Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
@@ -230,10 +238,12 @@ class FromFunctionResolver {
             List<RowContext> numContexts = new ArrayList<>();
             boolean up = nStep.signum() > 0;
             long numOrd = 1;
+            long numProduced = 0;
             // Accumulate with add() so each value keeps PG's growing scale (1.0, 1.25, 1.50, ...)
             for (java.math.BigDecimal v = nStart;
                  up ? v.compareTo(nStop) <= 0 : v.compareTo(nStop) >= 0;
                  v = v.add(nStep)) {
+                if ((numProduced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 Object[] row = hasOrdinality ? new Object[]{v, numOrd++} : new Object[]{v};
                 numTable.insertRow(row);
                 numContexts.add(new RowContext(numTable, alias, row));
@@ -259,8 +269,10 @@ class FromFunctionResolver {
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
         long ord = 1;
+        long produced = 0;
         if (step > 0) {
             for (long v = start; v <= stop; v += step) {
+                if ((produced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
                 Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
                 virtualTable.insertRow(row);
@@ -268,6 +280,7 @@ class FromFunctionResolver {
             }
         } else if (step < 0) {
             for (long v = start; v >= stop; v += step) {
+                if ((produced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
                 Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
                 virtualTable.insertRow(row);
