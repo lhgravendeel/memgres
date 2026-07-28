@@ -108,10 +108,16 @@ class PgWireValueFormatter {
             } else if (datestyle != null && datestyle.toLowerCase().contains("sql")) {
                 return odt.format(DateTimeFormatter.ofPattern("MM/dd/yyyy")) + " " + timePart + offsetStr;
             }
+            // A timestamptz names its era the same way a timestamp does: there is no year zero.
+            String isoDate = String.format("%04d-%02d-%02d",
+                    com.memgres.engine.TypeCoercion.displayYear(odt.getYear()),
+                    odt.getMonthValue(), odt.getDayOfMonth());
             String datePart = odt.getNano() != 0
-                    ? stripTrailingFracZeros(odt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSSSSS")))
-                    : odt.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
-            return datePart + formatPgOffset(odt.getOffset());
+                    ? stripTrailingFracZeros(isoDate + " "
+                            + odt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")))
+                    : isoDate + " " + odt.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+            return datePart + formatPgOffset(odt.getOffset())
+                    + com.memgres.engine.TypeCoercion.eraSuffix(odt.getYear());
         } else if (val instanceof PgInterval) {
             PgInterval interval = (PgInterval) val;
             String intervalStyle = guc != null ? guc.get("intervalstyle") : "postgres";
