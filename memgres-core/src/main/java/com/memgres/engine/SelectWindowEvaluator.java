@@ -287,21 +287,200 @@ class SelectWindowEvaluator {
         return executor.evalExpr(expr, ctx);
     }
 
-    private WindowFuncExpr resolveNamedWindow(WindowFuncExpr wf, List<SelectStmt.WindowDef> windowDefs) {
-        if (wf.windowName() == null || windowDefs == null) return wf;
-        String winName = wf.windowName().toLowerCase();
-        for (SelectStmt.WindowDef def : windowDefs) {
-            if (def.name().equalsIgnoreCase(winName)) {
-                // OVER (w ROWS ...) refines the named window: whatever the call states wins,
-                // and the call's own FILTER / IGNORE NULLS must survive the substitution
-                return new WindowFuncExpr(wf.name(), wf.args(), wf.distinct(), wf.star(),
-                        wf.partitionBy() != null ? wf.partitionBy() : def.partitionBy(),
-                        wf.orderBy() != null ? wf.orderBy() : def.orderBy(),
-                        wf.frame() != null ? wf.frame() : def.frame(),
-                        null, wf.ignoreNulls(), wf.fromLast(), wf.filter());
+    /**
+     * PostgreSQL settles a window specification when it analyses the statement, not when it
+     * reaches a row: an undefined window name, a frame whose bounds cannot both be satisfied and
+     * a window function in a clause that forbids one are all rejected before anything is read.
+     * Checking here rather than in the evaluator means a meaningless specification is refused even
+     * when the table is empty, and refused identically on every execution path.
+     */
+    void validateWindowUsage(SelectStmt stmt) {
+        if (stmt.groupBy() != null) {
+            for (Expression g : stmt.groupBy()) {
+                if (select.containsWindowFunction(g)) {
+                    throw new MemgresException("window functions are not allowed in GROUP BY", "42P20");
+                }
             }
         }
-        throw new RuntimeException("Window \"" + wf.windowName() + "\" is not defined");
+        List<SelectStmt.WindowDef> defs = stmt.windowDefs();
+        List<WindowFuncExpr> calls = new ArrayList<>();
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            collectWindowFunctionsDeep(target.expr(), calls);
+        }
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem item : stmt.orderBy()) collectWindowFunctionsDeep(item.expr(), calls);
+        }
+        if (calls.isEmpty() && (defs == null || defs.isEmpty())) return;
+
+        // A named window is checked even when nothing references it, as PostgreSQL does.
+        if (defs != null) {
+            for (SelectStmt.WindowDef def : defs) resolveWindowDef(def, defs);
+        }
+        for (WindowFuncExpr wf : calls) {
+            for (Expression arg : wf.args()) {
+                if (select.containsWindowFunction(arg)) {
+                    throw new MemgresException("window function calls cannot be nested", "42P20");
+                }
+            }
+            if (wf.partitionBy() != null) {
+                for (Expression p : wf.partitionBy()) {
+                    if (select.containsWindowFunction(p)) throw windowInWindowDefinition();
+                }
+            }
+            if (wf.orderBy() != null) {
+                for (SelectStmt.OrderByItem o : wf.orderBy()) {
+                    if (select.containsWindowFunction(o.expr())) throw windowInWindowDefinition();
+                }
+            }
+            if (wf.filter() != null && !select.isAggregateFunction(wf.name())) {
+                throw PgErrors.notImplemented(
+                        "FILTER is not implemented for non-aggregate window functions");
+            }
+            validateFrame(resolveNamedWindow(wf, defs));
+        }
+    }
+
+    private static MemgresException windowInWindowDefinition() {
+        return new MemgresException("window functions are not allowed in window definitions", "42P20");
+    }
+
+    /** Collect every window function in an expression, including ones nested inside another. */
+    private void collectWindowFunctionsDeep(Expression expr, List<WindowFuncExpr> out) {
+        if (expr instanceof WindowFuncExpr) {
+            WindowFuncExpr wf = (WindowFuncExpr) expr;
+            out.add(wf);
+            for (Expression arg : wf.args()) collectWindowFunctionsDeep(arg, out);
+            if (wf.partitionBy() != null) {
+                for (Expression p : wf.partitionBy()) collectWindowFunctionsDeep(p, out);
+            }
+            if (wf.orderBy() != null) {
+                for (SelectStmt.OrderByItem o : wf.orderBy()) collectWindowFunctionsDeep(o.expr(), out);
+            }
+            if (wf.filter() != null) collectWindowFunctionsDeep(wf.filter(), out);
+            return;
+        }
+        collectWindowFunctions(expr, out);
+    }
+
+    /**
+     * Check a frame clause against the ORDER BY it will run under. RANGE and GROUPS offsets are
+     * measured in sort-key values rather than row positions, so they need a sort key of the right
+     * shape; and an offset must be a non-negative, non-NULL size.
+     */
+    private void validateFrame(WindowFuncExpr wf) {
+        WindowFuncExpr.FrameClause frame = wf.frame();
+        if (frame == null) return;
+        int orderByCount = wf.orderBy() == null ? 0 : wf.orderBy().size();
+        boolean hasOffsetBound = isOffsetBound(frame.start()) || isOffsetBound(frame.end());
+        if (frame.type() == WindowFuncExpr.FrameType.GROUPS && orderByCount == 0) {
+            throw new MemgresException("GROUPS mode requires an ORDER BY clause", "42P20");
+        }
+        if (frame.type() == WindowFuncExpr.FrameType.RANGE && hasOffsetBound && orderByCount != 1) {
+            throw new MemgresException(
+                    "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column", "42P20");
+        }
+        checkFrameOffset(frame, frame.start(), true);
+        checkFrameOffset(frame, frame.end(), false);
+    }
+
+    private static boolean isOffsetBound(WindowFuncExpr.FrameBound bound) {
+        return bound != null && (bound.boundType() == WindowFuncExpr.FrameBoundType.PRECEDING
+                || bound.boundType() == WindowFuncExpr.FrameBoundType.FOLLOWING);
+    }
+
+    private void checkFrameOffset(WindowFuncExpr.FrameClause frame, WindowFuncExpr.FrameBound bound,
+                                   boolean isStartBound) {
+        if (!isOffsetBound(bound)) return;
+        Object value = executor.evalExpr(bound.offset(), null);
+        if (value == null) {
+            throw new MemgresException(
+                    "frame " + (isStartBound ? "starting" : "ending") + " offset must not be null", "22004");
+        }
+        if (value instanceof Number && ((Number) value).doubleValue() < 0) {
+            if (frame.type() == WindowFuncExpr.FrameType.RANGE) {
+                throw new MemgresException(
+                        "invalid preceding or following size in window function", "22013");
+            }
+            throw new MemgresException(
+                    "frame " + (isStartBound ? "starting" : "ending") + " offset must not be negative", "22013");
+        }
+    }
+
+    /**
+     * Resolve {@code OVER w} / {@code OVER (w ...)} against the WINDOW clause.
+     *
+     * <p>The parenthesised form copies the named window, and a copy may not restate what the
+     * original already fixed — PostgreSQL refuses rather than guessing which of the two wins.
+     */
+    private WindowFuncExpr resolveNamedWindow(WindowFuncExpr wf, List<SelectStmt.WindowDef> windowDefs) {
+        if (wf.windowName() == null) return wf;
+        SelectStmt.WindowDef base = resolveWindowDef(
+                findWindowDef(wf.windowName(), windowDefs,
+                        windowDefs == null ? 0 : windowDefs.size()), windowDefs);
+        if (wf.copiedWindow()) {
+            MemgresException e = rejectBadCopy(wf.windowName(), base,
+                    wf.partitionBy(), wf.orderBy(), wf.frame());
+            if (e != null) {
+                if (wf.partitionBy() == null && wf.orderBy() == null && wf.frame() == null) {
+                    e.setHint("Omit the parentheses in this OVER clause.");
+                }
+                throw e;
+            }
+        }
+        return new WindowFuncExpr(wf.name(), wf.args(), wf.distinct(), wf.star(),
+                wf.partitionBy() != null ? wf.partitionBy() : base.partitionBy(),
+                wf.orderBy() != null ? wf.orderBy() : base.orderBy(),
+                wf.frame() != null ? wf.frame() : base.frame(),
+                null, wf.ignoreNulls(), wf.fromLast(), wf.filter(), false);
+    }
+
+    private static SelectStmt.WindowDef findWindowDef(String name, List<SelectStmt.WindowDef> windowDefs,
+                                                      int limit) {
+        if (windowDefs != null) {
+            for (int i = 0; i < Math.min(limit, windowDefs.size()); i++) {
+                if (windowDefs.get(i).name().equalsIgnoreCase(name)) return windowDefs.get(i);
+            }
+        }
+        throw PgErrors.undefinedObject("window", name);
+    }
+
+    /** Flatten {@code WINDOW w2 AS (w1 ...)} into a single specification. */
+    private SelectStmt.WindowDef resolveWindowDef(SelectStmt.WindowDef def,
+                                                   List<SelectStmt.WindowDef> windowDefs) {
+        if (def.refName() == null) return def;
+        // A base window must already be defined at this point in the WINDOW clause, so the
+        // chain cannot close on itself.
+        int position = 0;
+        while (position < windowDefs.size() && windowDefs.get(position) != def) position++;
+        SelectStmt.WindowDef base = resolveWindowDef(
+                findWindowDef(def.refName(), windowDefs, position), windowDefs);
+        MemgresException e = rejectBadCopy(def.refName(), base,
+                def.partitionBy(), def.orderBy(), def.frame());
+        if (e != null) throw e;
+        return new SelectStmt.WindowDef(def.name(), null,
+                def.partitionBy() != null ? def.partitionBy() : base.partitionBy(),
+                def.orderBy() != null ? def.orderBy() : base.orderBy(),
+                def.frame() != null ? def.frame() : base.frame());
+    }
+
+    /** The three ways a copy of a named window is invalid, in the order PostgreSQL reports them. */
+    private static MemgresException rejectBadCopy(String baseName, SelectStmt.WindowDef base,
+                                                   List<Expression> partitionBy,
+                                                   List<SelectStmt.OrderByItem> orderBy,
+                                                   WindowFuncExpr.FrameClause frame) {
+        if (partitionBy != null) {
+            return new MemgresException(
+                    "cannot override PARTITION BY clause of window \"" + baseName + "\"", "42P20");
+        }
+        if (orderBy != null && base.orderBy() != null && !base.orderBy().isEmpty()) {
+            return new MemgresException(
+                    "cannot override ORDER BY clause of window \"" + baseName + "\"", "42P20");
+        }
+        if (base.frame() != null) {
+            return new MemgresException(
+                    "cannot copy window \"" + baseName + "\" because it has a frame clause", "42P20");
+        }
+        return null;
     }
 
     private Object[] evaluateWindowFunction(WindowFuncExpr wf, List<RowContext> contexts) {
@@ -403,10 +582,16 @@ class SelectWindowEvaluator {
                 case "ntile": {
                     int numBuckets = 1;
                     if (!wf.args().isEmpty()) {
-                        numBuckets = executor.toInt(executor.evalExpr(wf.args().get(0), null));
+                        Object raw = executor.evalExpr(wf.args().get(0), null);
+                        if (raw == null) {
+                            // PG: a NULL bucket count produces NULL for every row of the partition
+                            for (int idx : sortedPartition) results[idx] = null;
+                            break;
+                        }
+                        numBuckets = executor.toInt(raw);
                     }
                     if (numBuckets <= 0) {
-                        throw new MemgresException("ntile requires a positive argument, found " + numBuckets, "22023");
+                        throw new MemgresException("argument of ntile must be greater than zero", "22014");
                     }
                     int partSize = sortedPartition.size();
                     // PG ntile: each row gets bucket (i+1) when numBuckets >= partSize,
@@ -430,64 +615,9 @@ class SelectWindowEvaluator {
                     }
                     break;
                 }
-                case "lag": {
-                    if (wf.args().isEmpty()) {
-                        throw new MemgresException("function lag() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
-                    }
-                    int offset = 1;
-                    Object defaultVal = null;
-                    if (wf.args().size() > 1) offset = executor.toInt(executor.evalExpr(wf.args().get(1), null));
-                    if (wf.args().size() > 2) defaultVal = executor.evalExpr(wf.args().get(2), null);
-                    Expression arg = wf.args().get(0);
-                    for (int i = 0; i < sortedPartition.size(); i++) {
-                        if (wf.ignoreNulls()) {
-                            // IGNORE NULLS: search backwards from current position for nth non-null
-                            Object found = defaultVal;
-                            int remaining = offset;
-                            for (int j = i - 1; j >= 0; j--) {
-                                Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(j)));
-                                if (val != null) {
-                                    remaining--;
-                                    if (remaining == 0) { found = val; break; }
-                                }
-                            }
-                            results[sortedPartition.get(i)] = found;
-                        } else if (i - offset >= 0) {
-                            results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(i - offset)));
-                        } else {
-                            results[sortedPartition.get(i)] = defaultVal;
-                        }
-                    }
-                    break;
-                }
+                case "lag":
                 case "lead": {
-                    if (wf.args().isEmpty()) {
-                        throw new MemgresException("function lead() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
-                    }
-                    int offset = 1;
-                    Object defaultVal = null;
-                    if (wf.args().size() > 1) offset = executor.toInt(executor.evalExpr(wf.args().get(1), null));
-                    if (wf.args().size() > 2) defaultVal = executor.evalExpr(wf.args().get(2), null);
-                    Expression arg = wf.args().get(0);
-                    for (int i = 0; i < sortedPartition.size(); i++) {
-                        if (wf.ignoreNulls()) {
-                            // IGNORE NULLS: search forwards from current position for nth non-null
-                            Object found = defaultVal;
-                            int remaining = offset;
-                            for (int j = i + 1; j < sortedPartition.size(); j++) {
-                                Object val = executor.evalExpr(arg, contexts.get(sortedPartition.get(j)));
-                                if (val != null) {
-                                    remaining--;
-                                    if (remaining == 0) { found = val; break; }
-                                }
-                            }
-                            results[sortedPartition.get(i)] = found;
-                        } else if (i + offset < sortedPartition.size()) {
-                            results[sortedPartition.get(i)] = executor.evalExpr(arg, contexts.get(sortedPartition.get(i + offset)));
-                        } else {
-                            results[sortedPartition.get(i)] = defaultVal;
-                        }
-                    }
+                    evaluateLeadLag(wf, funcName, contexts, sortedPartition, results);
                     break;
                 }
                 case "first_value": {
@@ -540,7 +670,17 @@ class SelectWindowEvaluator {
                 }
                 case "nth_value": {
                     Expression arg = wf.args().get(0);
-                    int nth = wf.args().size() > 1 ? executor.toInt(executor.evalExpr(wf.args().get(1), null)) : 1;
+                    int nth = 1;
+                    if (wf.args().size() > 1) {
+                        Object raw = executor.evalExpr(wf.args().get(1), null);
+                        if (raw == null) {
+                            // PG: a NULL position produces NULL for every row of the partition
+                            for (int idx : sortedPartition) results[idx] = null;
+                            break;
+                        }
+                        requireIntegralArgument(funcName, wf, raw, contexts);
+                        nth = executor.toInt(raw);
+                    }
                     // PG raises 22016 for nth <= 0
                     if (nth <= 0) {
                         throw new MemgresException(
@@ -595,6 +735,81 @@ class SelectWindowEvaluator {
         }
 
         return results;
+    }
+
+    /**
+     * lag and lead are the same walk in opposite directions, and PostgreSQL lets the offset carry
+     * the sign: {@code lag(v, -1)} looks forward exactly as {@code lead(v, 1)} does. Working in
+     * {@code long} keeps an offset near the integer limits from wrapping into a valid index.
+     */
+    private void evaluateLeadLag(WindowFuncExpr wf, String funcName, List<RowContext> contexts,
+                                  List<Integer> sortedPartition, Object[] results) {
+        if (wf.args().isEmpty()) {
+            MemgresException e = new MemgresException(
+                    "function " + funcName + "() does not exist", "42883");
+            e.setHint("No function matches the given name and argument types. "
+                    + "You might need to add explicit type casts.");
+            throw e;
+        }
+        Expression arg = wf.args().get(0);
+        Object defaultVal = wf.args().size() > 2 ? executor.evalExpr(wf.args().get(2), null) : null;
+        long step = 1;
+        if (wf.args().size() > 1) {
+            Object raw = executor.evalExpr(wf.args().get(1), null);
+            if (raw == null) {
+                // PG: a NULL offset produces NULL for every row, ignoring the default
+                for (int idx : sortedPartition) results[idx] = null;
+                return;
+            }
+            requireIntegralArgument(funcName, wf, raw, contexts);
+            step = ((Number) raw).longValue();
+        }
+        if ("lag".equals(funcName)) step = -step;
+
+        int size = sortedPartition.size();
+        for (int i = 0; i < size; i++) {
+            Object val;
+            if (wf.ignoreNulls() && step != 0) {
+                // IGNORE NULLS: walk in the offset's direction counting only non-null values
+                val = defaultVal;
+                long remaining = Math.abs(step);
+                int dir = step > 0 ? 1 : -1;
+                for (int j = i + dir; j >= 0 && j < size; j += dir) {
+                    Object v = executor.evalExpr(arg, contexts.get(sortedPartition.get(j)));
+                    if (v != null && --remaining == 0) { val = v; break; }
+                }
+            } else {
+                long target = (long) i + step;
+                val = (target >= 0 && target < size)
+                        ? executor.evalExpr(arg, contexts.get(sortedPartition.get((int) target)))
+                        : defaultVal;
+            }
+            results[sortedPartition.get(i)] = val;
+        }
+    }
+
+    /**
+     * The position arguments of lag, lead and nth_value are declared integer, so a fractional
+     * value is not a value error but a call PostgreSQL has no function for.
+     */
+    private void requireIntegralArgument(String funcName, WindowFuncExpr wf, Object offset,
+                                          List<RowContext> contexts) {
+        if (!(offset instanceof java.math.BigDecimal) && !(offset instanceof Double)
+                && !(offset instanceof Float)) {
+            return;
+        }
+        StringBuilder sig = new StringBuilder(funcName).append('(');
+        for (int i = 0; i < wf.args().size(); i++) {
+            if (i > 0) sig.append(", ");
+            Object v = contexts.isEmpty() ? null : executor.evalExpr(wf.args().get(i), contexts.get(0));
+            sig.append(pgTypeName(v));
+        }
+        sig.append(')');
+        MemgresException e = new MemgresException(
+                "function " + sig + " does not exist", "42883");
+        e.setHint("No function matches the given name and argument types. "
+                + "You might need to add explicit type casts.");
+        throw e;
     }
 
     private void evaluateAggregateWindowFunction(WindowFuncExpr wf, String funcName,
@@ -731,24 +946,45 @@ class SelectWindowEvaluator {
                 if (frameType == WindowFuncExpr.FrameType.RANGE) {
                     return resolveRangeOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, rawOffset, true, isStartBound);
                 } else if (frameType == WindowFuncExpr.FrameType.GROUPS) {
-                    int offsetVal = executor.toInt(rawOffset);
-                    return resolveGroupsOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, -offsetVal, isStartBound);
+                    return resolveGroupsOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, -rowOffset(rawOffset), isStartBound);
                 }
-                return currentIdx - executor.toInt(rawOffset);
+                return saturate((long) currentIdx - rowOffset(rawOffset));
             }
             case FOLLOWING: {
                 Object rawOffset = executor.evalExpr(bound.offset(), null);
                 if (frameType == WindowFuncExpr.FrameType.RANGE) {
                     return resolveRangeOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, rawOffset, false, isStartBound);
                 } else if (frameType == WindowFuncExpr.FrameType.GROUPS) {
-                    int offsetVal = executor.toInt(rawOffset);
-                    return resolveGroupsOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, offsetVal, isStartBound);
+                    return resolveGroupsOffsetBound(orderBy, contexts, sortedPartition, currentIdx, partitionSize, rowOffset(rawOffset), isStartBound);
                 }
-                return currentIdx + executor.toInt(rawOffset);
+                return saturate((long) currentIdx + rowOffset(rawOffset));
             }
             default:
                 throw new IllegalStateException("Unknown bound type: " + bound.boundType());
         }
+    }
+
+    /**
+     * A ROWS or GROUPS offset is a bigint in PostgreSQL, so a fractional offset is rounded on the
+     * way in rather than truncated: {@code ROWS 1.5 PRECEDING} covers two rows, not one.
+     */
+    private long rowOffset(Object rawOffset) {
+        if (rawOffset instanceof java.math.BigDecimal) {
+            return ((java.math.BigDecimal) rawOffset)
+                    .setScale(0, java.math.RoundingMode.HALF_UP).longValue();
+        }
+        if (rawOffset instanceof Double || rawOffset instanceof Float) {
+            return Math.round(((Number) rawOffset).doubleValue());
+        }
+        if (rawOffset instanceof Number) return ((Number) rawOffset).longValue();
+        return executor.toInt(rawOffset);
+    }
+
+    /** Keep an out-of-range row position out of range without letting it wrap around. */
+    private static int saturate(long index) {
+        if (index < Integer.MIN_VALUE) return Integer.MIN_VALUE;
+        if (index > Integer.MAX_VALUE) return Integer.MAX_VALUE;
+        return (int) index;
     }
 
     /**
@@ -841,8 +1077,22 @@ class SelectWindowEvaluator {
         }
         // Numeric offset — the boundary is compared against the ORDER BY values with
         // Comparable.compareTo, so it must come back as the same class as currentVal.
-        if (!(currentVal instanceof Number) || !(offset instanceof Number)) {
-            throw PgErrors.datatypeMismatch("invalid RANGE frame offset for the ORDER BY column type");
+        // PG resolves the offset against the sort column's type and refuses the pair outright
+        // rather than coercing, because the coercion would change which rows are in the frame.
+        if (!(currentVal instanceof Number)) {
+            throw PgErrors.notImplemented("RANGE with offset PRECEDING/FOLLOWING is not supported"
+                    + " for column type " + pgTypeName(currentVal));
+        }
+        boolean integralColumn = currentVal instanceof Integer || currentVal instanceof Long
+                || currentVal instanceof Short || currentVal instanceof Byte;
+        boolean fractionalOffset = offset instanceof java.math.BigDecimal
+                || offset instanceof Double || offset instanceof Float;
+        if (!(offset instanceof Number) || (integralColumn && fractionalOffset)) {
+            MemgresException e = PgErrors.notImplemented(
+                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type "
+                            + pgTypeName(currentVal) + " and offset type " + pgTypeName(offset));
+            e.setHint("Cast the offset value to an appropriate type.");
+            throw e;
         }
         if (currentVal instanceof java.math.BigDecimal) {
             java.math.BigDecimal cur = (java.math.BigDecimal) currentVal;
@@ -862,6 +1112,27 @@ class SelectWindowEvaluator {
         return result;
     }
 
+    /** PostgreSQL names a type in an error the way {@code format_type} does, not by its catalog name. */
+    private static String pgTypeName(Object value) {
+        DataType t = TypeCoercion.inferType(value);
+        if (t == null) return "unknown";
+        switch (t) {
+            case SMALLINT: return "smallint";
+            case INTEGER: return "integer";
+            case BIGINT: return "bigint";
+            case REAL: return "real";
+            case DOUBLE_PRECISION: return "double precision";
+            case BOOLEAN: return "boolean";
+            case VARCHAR: return "character varying";
+            case CHAR: return "character";
+            case TIMESTAMP: return "timestamp without time zone";
+            case TIMESTAMPTZ: return "timestamp with time zone";
+            case TIME: return "time without time zone";
+            case TIMETZ: return "time with time zone";
+            default: return t.getPgName();
+        }
+    }
+
     /**
      * For GROUPS frame with offset: find the boundary by counting peer groups.
      * direction is negative for PRECEDING, positive for FOLLOWING.
@@ -870,7 +1141,7 @@ class SelectWindowEvaluator {
                                           List<RowContext> contexts,
                                           List<Integer> sortedPartition,
                                           int currentIdx, int partitionSize,
-                                          int direction, boolean isStartBound) {
+                                          long direction, boolean isStartBound) {
         // First, identify peer group boundaries
         List<int[]> groups = new ArrayList<>(); // each element is [startIdx, endIdx]
         int gStart = 0;
@@ -889,19 +1160,19 @@ class SelectWindowEvaluator {
                 break;
             }
         }
-        int targetGroup = currentGroup + direction;
+        long targetGroup = currentGroup + direction;
         if (isStartBound) {
             // A start bound past the last group means an empty frame (start > end);
             // a start bound before the first group clamps to the partition start.
             if (targetGroup >= groups.size()) return partitionSize;
             if (targetGroup < 0) targetGroup = 0;
-            return groups.get(targetGroup)[0];
+            return groups.get((int) targetGroup)[0];
         } else {
             // An end bound before the first group means an empty frame (end < start);
             // an end bound past the last group clamps to the partition end.
             if (targetGroup < 0) return -1;
             if (targetGroup >= groups.size()) targetGroup = groups.size() - 1;
-            return groups.get(targetGroup)[1];
+            return groups.get((int) targetGroup)[1];
         }
     }
 

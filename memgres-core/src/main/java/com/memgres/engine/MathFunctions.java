@@ -241,7 +241,10 @@ class MathFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 long n = executor.toLong(arg);
-                if (n < 0) throw new MemgresException("factorial of a negative number is undefined", "2201F");
+                if (n < 0) throw new MemgresException("factorial of a negative number is undefined", "22003");
+                // 32177! is the widest factorial that still fits numeric's 131072 integral digits;
+                // past it PG refuses rather than build a number it could not store.
+                if (n > 32177) throw NumericLimits.valueOverflowsNumeric();
                 // Use BigDecimal for exact large results (PG returns numeric for factorial)
                 java.math.BigDecimal result = java.math.BigDecimal.ONE;
                 for (long i = 2; i <= n; i++) result = result.multiply(java.math.BigDecimal.valueOf(i));

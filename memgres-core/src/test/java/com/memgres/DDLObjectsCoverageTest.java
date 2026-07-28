@@ -1551,8 +1551,10 @@ class DDLObjectsCoverageTest {
 
     @Test
     void idx_using_gist() throws SQLException {
-        exec("CREATE TABLE idx_gist_tbl (id SERIAL PRIMARY KEY, val TEXT)");
-        exec("CREATE INDEX idx_gist_val ON idx_gist_tbl USING gist (val)");
+        // gist has no operator class for text without the btree_gist extension, so the index
+        // goes on a type it can actually handle
+        exec("CREATE TABLE idx_gist_tbl (id SERIAL PRIMARY KEY, val TEXT, loc point)");
+        exec("CREATE INDEX idx_gist_val ON idx_gist_tbl USING gist (loc)");
         exec("INSERT INTO idx_gist_tbl (val) VALUES ('gist_test')");
         assertEquals("gist_test", query1("SELECT val FROM idx_gist_tbl LIMIT 1"));
         exec("DROP INDEX IF EXISTS idx_gist_val");
@@ -1561,8 +1563,9 @@ class DDLObjectsCoverageTest {
 
     @Test
     void idx_using_gin() throws SQLException {
-        exec("CREATE TABLE idx_gin_tbl (id SERIAL PRIMARY KEY, tags TEXT)");
-        exec("CREATE INDEX idx_gin_tags ON idx_gin_tbl USING gin (tags)");
+        // likewise gin, which indexes the parts inside a value rather than the value itself
+        exec("CREATE TABLE idx_gin_tbl (id SERIAL PRIMARY KEY, tags TEXT, tag_arr text[])");
+        exec("CREATE INDEX idx_gin_tags ON idx_gin_tbl USING gin (tag_arr)");
         exec("INSERT INTO idx_gin_tbl (tags) VALUES ('a,b,c')");
         assertEquals("a,b,c", query1("SELECT tags FROM idx_gin_tbl LIMIT 1"));
         exec("DROP INDEX IF EXISTS idx_gin_tags");

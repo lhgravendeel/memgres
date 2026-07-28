@@ -505,16 +505,19 @@ class SystemInfoCoverageTest {
     // --- pg_get_serial_sequence('table', 'column') ---
 
     @Test
-    void testPgGetSerialSequenceNonExistent() throws SQLException {
-        String result = query1("SELECT pg_get_serial_sequence('nonexistent', 'id')");
-        // Returns null when no sequence found
-        assertNull(result);
+    void testPgGetSerialSequenceNonExistent() {
+        // PG reports the missing relation rather than returning NULL, which would read as
+        // "this column has no sequence"
+        SQLException e = assertThrows(SQLException.class,
+                () -> query1("SELECT pg_get_serial_sequence('nonexistent', 'id')"));
+        assertEquals("42P01", e.getSQLState());
     }
 
     @Test
-    void testPgGetSerialSequenceNoTable() throws SQLException {
-        String result = query1("SELECT pg_get_serial_sequence('foo', 'bar')");
-        assertNull(result);
+    void testPgGetSerialSequenceNoTable() {
+        SQLException e = assertThrows(SQLException.class,
+                () -> query1("SELECT pg_get_serial_sequence('foo', 'bar')"));
+        assertEquals("42P01", e.getSQLState());
     }
 
     // --- pg_table_is_visible(table_oid) ---

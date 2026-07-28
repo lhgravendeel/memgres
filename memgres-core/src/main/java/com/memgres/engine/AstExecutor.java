@@ -58,6 +58,18 @@ public class AstExecutor {
     List<Object> boundParameters = new ArrayList<>();
     // Statement timestamp: frozen at statement start for now()/statement_timestamp()
     OffsetDateTime currentStatementTimestamp = null;
+
+    /**
+     * The instant every "current" date/time reads from. PG derives CURRENT_DATE, CURRENT_TIME,
+     * LOCALTIMESTAMP and now() from one transaction timestamp, so they cannot disagree with each
+     * other part-way through a transaction that spans midnight.
+     */
+    OffsetDateTime currentInstant() {
+        if (session != null && session.getTransactionTimestamp() != null) {
+            return session.getTransactionTimestamp();
+        }
+        return currentStatementTimestamp != null ? currentStatementTimestamp : OffsetDateTime.now();
+    }
     // Current MERGE action for merge_action() function in RETURNING clause (PG 17+)
     String currentMergeAction = null;
     // Raw SQL text of the current top-level statement (for pg_prepared_statements/pg_cursors verbatim display)
@@ -81,6 +93,43 @@ public class AstExecutor {
      * "update" or "delete from". Set by the DML executor before it resolves the target.
      */
     String viewDmlVerb = "insert into";
+
+    /** Views whose body is currently being expanded, and rules currently being applied. */
+    private final Set<String> expansionsInProgress = new HashSet<>();
+
+    /**
+     * Run a view's body, refusing a view that is defined — directly or through other views — in
+     * terms of itself. Expanding it again would never finish, and PostgreSQL names the relation
+     * it came back to rather than letting the recursion run.
+     */
+    QueryResult executeViewQuery(String viewName, Statement viewQuery) {
+        String key = "view:" + viewName.toLowerCase();
+        if (!expansionsInProgress.add(key)) {
+            throw PgErrors.infiniteRecursionInRules(viewName);
+        }
+        try {
+            return executeStatement(viewQuery);
+        } finally {
+            expansionsInProgress.remove(key);
+        }
+    }
+
+    /**
+     * Claim the right to apply a rule for this relation and event. A rule that rewrites onto its
+     * own table would otherwise re-enter itself for as long as the stack lasted.
+     */
+    boolean enterRuleExpansion(String relation, String event) {
+        return expansionsInProgress.add("rule:" + event + ":" + relation.toLowerCase());
+    }
+
+    void exitRuleExpansion(String relation, String event) {
+        expansionsInProgress.remove("rule:" + event + ":" + relation.toLowerCase());
+    }
+
+    boolean isRuleExpanding(String relation, String event) {
+        return expansionsInProgress.contains("rule:" + event + ":" + relation.toLowerCase());
+    }
+
     // When true, column references with no context throw instead of returning column name as string
     private boolean strictColumnRefs = false;
 
@@ -121,16 +170,71 @@ public class AstExecutor {
         // H37: publish the session DateStyle field order so date input parsing honors DMY/YMD/MDY
         String previousDateOrder = TypeCoercion.getDateOrder();
         TypeCoercion.setDateOrder(currentDateStyleOrder());
+        // ... and the session TimeZone, which decides what "today" and CURRENT_DATE mean
+        java.time.ZoneId previousZone = TypeCoercion.rawSessionZone();
+        TypeCoercion.setSessionZone(currentSessionZone());
+        OffsetDateTime previousInstant = TypeCoercion.rawSessionInstant();
+        TypeCoercion.setSessionInstant(currentInstant());
         try {
             Statement stmt = Parser.parse(sql);
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
+            rejectNestedDataModifyingCtes(stmt);
             return executeStatement(stmt);
         } finally {
             this.boundParameters = previousParams;
             this.currentRawSql = previousRawSql;
             currentStatementTimestamp = null;
             TypeCoercion.setDateOrder(previousDateOrder);
+            TypeCoercion.setSessionZone(previousZone);
+            TypeCoercion.setSessionInstant(previousInstant);
         }
+    }
+
+    /**
+     * A data-modifying statement may only appear in the statement's outermost WITH list. Deeper
+     * down neither when the write happens nor what the surrounding query sees is defined, so PG
+     * refuses to run the query at all rather than pick an order.
+     */
+    private static void rejectNestedDataModifyingCtes(Statement root) {
+        Set<Object> topLevel = Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
+        collectTopLevelCtes(root, topLevel);
+        Object nested = AstWalk.findFirst(root, node -> {
+            List<SelectStmt.CommonTableExpr> ctes = ownCtes(node);
+            if (ctes == null || topLevel.contains(ctes)) return false;
+            for (SelectStmt.CommonTableExpr cte : ctes) {
+                if (isDataModifying(cte.query())) return true;
+            }
+            return false;
+        });
+        if (nested != null) {
+            throw PgErrors.notImplemented(
+                    "WITH clause containing a data-modifying statement must be at the top level");
+        }
+    }
+
+    /** The WITH lists that count as the statement's own, including each arm of a set operation. */
+    private static void collectTopLevelCtes(Statement stmt, Set<Object> out) {
+        if (stmt == null) return;
+        if (stmt instanceof SetOpStmt) {
+            collectTopLevelCtes(((SetOpStmt) stmt).left, out);
+            collectTopLevelCtes(((SetOpStmt) stmt).right, out);
+            return;
+        }
+        List<SelectStmt.CommonTableExpr> ctes = ownCtes(stmt);
+        if (ctes != null) out.add(ctes);
+    }
+
+    private static List<SelectStmt.CommonTableExpr> ownCtes(Object node) {
+        if (node instanceof SelectStmt) return ((SelectStmt) node).withClauses();
+        if (node instanceof InsertStmt) return ((InsertStmt) node).withClauses();
+        if (node instanceof UpdateStmt) return ((UpdateStmt) node).withClauses();
+        if (node instanceof DeleteStmt) return ((DeleteStmt) node).withClauses();
+        return null;
+    }
+
+    private static boolean isDataModifying(Statement stmt) {
+        return stmt instanceof InsertStmt || stmt instanceof UpdateStmt || stmt instanceof DeleteStmt
+                || stmt instanceof MergeStmt;
     }
 
     /**
@@ -145,6 +249,21 @@ public class AstExecutor {
         if (lower.contains("dmy")) return "DMY";
         if (lower.contains("ymd")) return "YMD";
         return "MDY";
+    }
+
+    /**
+     * The session TimeZone GUC as a zone. An unset or unrecognised value falls back to the JVM's
+     * zone, which is what the engine used before the setting was consulted at all.
+     */
+    private java.time.ZoneId currentSessionZone() {
+        if (session == null) return java.time.ZoneId.systemDefault();
+        String tz = session.getGucSettings().get("timezone");
+        if (tz == null || tz.isEmpty()) return java.time.ZoneId.systemDefault();
+        try {
+            return java.time.ZoneId.of(tz);
+        } catch (RuntimeException e) {
+            return java.time.ZoneId.systemDefault();
+        }
     }
 
     public QueryResult executeStatement(Statement stmt) {
@@ -223,6 +342,14 @@ public class AstExecutor {
         if (stmt instanceof AlterPolicyStmt) return ddlExecutor.executeAlterPolicy(((AlterPolicyStmt) stmt));
         if (stmt instanceof AlterDefaultPrivilegesStmt) {
             AlterDefaultPrivilegesStmt s = (AlterDefaultPrivilegesStmt) stmt;
+            // The schema and role are resolved to OIDs before anything is recorded, so naming one
+            // that does not exist is an error rather than a default nothing will ever match.
+            if (s.forRole() != null && !database.hasRole(s.forRole().toLowerCase())) {
+                throw PgErrors.undefinedObject("role", s.forRole());
+            }
+            if (s.inSchema() != null && database.getSchema(s.inSchema()) == null) {
+                throw new MemgresException("schema \"" + s.inSchema() + "\" does not exist", "3F000");
+            }
             if (s.isGrant()) {
                 String grantor = s.forRole() != null ? s.forRole() : sessionUser();
                 database.addDefaultAcl(new Database.DefaultAclEntry(
@@ -346,7 +473,7 @@ public class AstExecutor {
         return compositeTypeHandler.splitCompositeString(inner);
     }
 
-    PgRow parseCompositeToRow(String s, String typeName) {
+    public PgRow parseCompositeToRow(String s, String typeName) {
         return compositeTypeHandler.parseCompositeToRow(s, typeName);
     }
 
@@ -570,6 +697,20 @@ public class AstExecutor {
     /** The schema a CREATE lands in; raises when search_path names no usable schema. */
     String creationSchema() {
         return session != null ? session.getCreationSchema() : "public";
+    }
+
+    /**
+     * Schemas an unqualified name is looked up in, in precedence order. pg_catalog is implicitly
+     * first, which is what makes a built-in win over a same-named function in a user schema.
+     */
+    java.util.List<String> searchPathSchemas() {
+        java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
+        path.add("pg_catalog");
+        if (session != null) {
+            for (String s : session.getEffectiveSearchPath(false)) path.add(s.toLowerCase());
+        }
+        path.add("public");
+        return new ArrayList<>(path);
     }
 
     String sessionUser() {
@@ -1013,9 +1154,14 @@ public class AstExecutor {
                 return java.util.UUID.randomUUID();
             }
             if (lower.equals("now()") || lower.equals("current_timestamp")) {
-                if (type == DataType.DATE) return LocalDate.now();
-                if (type == DataType.TIMESTAMP) return LocalDateTime.now();
-                return OffsetDateTime.now();
+                OffsetDateTime instant = currentInstant();
+                if (type == DataType.DATE) {
+                    return instant.atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDate();
+                }
+                if (type == DataType.TIMESTAMP) {
+                    return instant.atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDateTime();
+                }
+                return instant;
             }
         }
         if (parsedExpr != null) {

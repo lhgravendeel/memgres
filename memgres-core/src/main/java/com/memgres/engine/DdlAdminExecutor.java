@@ -398,6 +398,8 @@ class DdlAdminExecutor {
                 }
             }
         }
+        DdlDefinitionChecks.requireBooleanPredicate(stmt.usingExpr(), table, "POLICY");
+        DdlDefinitionChecks.requireBooleanPredicate(stmt.withCheckExpr(), table, "POLICY");
         StoredExprCheck check = StoredExprCheck.forPolicy(table);
         check.check(stmt.usingExpr());
         check.check(stmt.withCheckExpr());

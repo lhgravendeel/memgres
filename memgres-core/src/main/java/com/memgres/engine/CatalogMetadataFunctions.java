@@ -599,21 +599,28 @@ class CatalogMetadataFunctions {
 
     private Object evalPgGetSerialSequence(FunctionCallExpr fn, RowContext ctx) {
         if (fn.args().size() < 2) return null;
-        String tblName = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-        String colName = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+        Object tblArg = executor.evalExpr(fn.args().get(0), ctx);
+        Object colArg = executor.evalExpr(fn.args().get(1), ctx);
+        if (tblArg == null || colArg == null) return null;
+        String tblName = String.valueOf(tblArg);
+        String colName = String.valueOf(colArg);
         String explicitSchema = null;
         if (tblName.contains(".")) {
             explicitSchema = tblName.substring(0, tblName.lastIndexOf('.'));
             tblName = tblName.substring(tblName.lastIndexOf('.') + 1);
         }
+        boolean relationFound = false;
+        boolean columnFound = false;
         for (java.util.Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
             String schemaName = entry.getKey();
             if (explicitSchema != null && !schemaName.equalsIgnoreCase(explicitSchema)) continue;
             Schema schema = entry.getValue();
             Table tbl = schema.getTable(tblName);
             if (tbl != null) {
+                relationFound = true;
                 for (Column col : tbl.getColumns()) {
                     if (col.getName().equalsIgnoreCase(colName)) {
+                        columnFound = true;
                         String def = col.getDefaultValue();
                         if (def != null && def.toLowerCase().contains("nextval")) {
                             int q1 = def.indexOf('\'');
@@ -635,6 +642,15 @@ class CatalogMetadataFunctions {
                     }
                 }
             }
+        }
+        // A name that resolves to nothing is an error, not a NULL: a caller asking for the sequence
+        // behind a column it misspelled would otherwise read the NULL as "column has no sequence".
+        if (!relationFound && !executor.database.hasView(tblName)) {
+            throw new MemgresException("relation \"" + tblName + "\" does not exist", "42P01");
+        }
+        if (relationFound && !columnFound) {
+            throw new MemgresException(
+                    "column \"" + colName + "\" of relation \"" + tblName + "\" does not exist", "42703");
         }
         // M20: fallback — check sequences with OWNED BY pointing to this table.column
         for (java.util.Map.Entry<String, Sequence> seqEntry : executor.database.getSequences().entrySet()) {
@@ -824,7 +840,14 @@ class CatalogMetadataFunctions {
         if (fn.args().isEmpty()) return null;
         Object arg = executor.evalExpr(fn.args().get(0), ctx);
         if (arg == null) return null;
-        String typeName = arg.toString().trim().toLowerCase();
+        return canonicalTypeName(executor.database, arg.toString().trim().toLowerCase());
+    }
+
+    /**
+     * The name PostgreSQL prints for a type spelled {@code typeName}, or null when no such type
+     * exists. Shared with the privilege functions, which have to tell a real type from a typo.
+     */
+    static String canonicalTypeName(Database database, String typeName) {
         String canonical;
         switch (typeName) {
             case "int4":
@@ -979,8 +1002,8 @@ class CatalogMetadataFunctions {
                 break;
         }
         if (canonical == null) {
-            if (executor.database.getCustomEnum(typeName) != null) canonical = typeName;
-            else if (executor.database.isDomain(typeName)) canonical = typeName;
+            if (database.getCustomEnum(typeName) != null) canonical = typeName;
+            else if (database.isDomain(typeName)) canonical = typeName;
         }
         return canonical;
     }
@@ -1135,7 +1158,9 @@ class CatalogMetadataFunctions {
         m.put(2287, "record[]");
         m.put(2278, "void");
         m.put(2276, "any");
-        m.put(2277, "anyarray");
+        for (String polyName : PolymorphicTypes.names()) {
+            m.put(PolymorphicTypes.oid(polyName), polyName);
+        }
         m.put(22, "int2vector");
         m.put(30, "oidvector");
         m.put(18, "\"char\"");

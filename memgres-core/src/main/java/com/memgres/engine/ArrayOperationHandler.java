@@ -152,6 +152,10 @@ class ArrayOperationHandler {
             else if (e instanceof List<?>) sb.append(formatArrayForOutput((List<?>) e));
             else if (e instanceof String && needsArrayQuoting((String) e)) {
                 sb.append("\"").append(((String) e).replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+            } else if (e instanceof AstExecutor.PgRow) {
+                // A composite element renders with commas, so it always needs quoting
+                String rowText = ((AstExecutor.PgRow) e).toPgText();
+                sb.append("\"").append(rowText.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
             } else sb.append(e);
         }
         sb.append("}");

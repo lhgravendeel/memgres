@@ -1274,27 +1274,39 @@ class CatalogCoreBuilder {
             });
         }
 
-        // Pseudo-types: trigger, event_trigger, void, record, etc.
+        // Pseudo-types: trigger, event_trigger, void, record, the polymorphic family, etc.
+        // Columns: name, oid, typlen, typalign, typstorage. The container-shaped polymorphic
+        // types (anyarray and the range/multirange forms) are varlena, like what they stand for.
         String[][] pseudoTypes = {
-                {"trigger", "2279"},
-                {"event_trigger", "3838"},
-                {"void", "2278"},
-                {"record", "2249"},
-                {"any", "2276"},
-                {"anyelement", "2283"},
-                {"anyarray", "2277"},
-                {"internal", "2281"},
-                {"cstring", "2275"},
+                {"trigger", "2279", "4", "i", "p"},
+                {"event_trigger", "3838", "4", "i", "p"},
+                {"void", "2278", "4", "i", "p"},
+                {"record", "2249", "4", "i", "p"},
+                {"any", "2276", "4", "i", "p"},
+                {"anyelement", "2283", "4", "i", "p"},
+                {"anyarray", "2277", "-1", "d", "x"},
+                {"anynonarray", "2776", "4", "i", "p"},
+                {"anyenum", "3500", "4", "i", "p"},
+                {"anyrange", "3831", "-1", "d", "x"},
+                {"anymultirange", "4537", "-1", "d", "x"},
+                {"anycompatible", "5077", "4", "i", "p"},
+                {"anycompatiblearray", "5078", "-1", "d", "x"},
+                {"anycompatiblenonarray", "5079", "4", "i", "p"},
+                {"anycompatiblerange", "5080", "-1", "d", "x"},
+                {"anycompatiblemultirange", "4538", "-1", "d", "x"},
+                {"internal", "2281", "4", "i", "p"},
+                {"cstring", "2275", "4", "i", "p"},
         };
         for (String[] pt : pseudoTypes) {
             String ptName = pt[0];
             int ptOid = Integer.parseInt(pt[1]);
+            short ptLen = Short.parseShort(pt[2]);
             table.insertRow(new Object[]{
                     ptOid, ptName, pgCatalogOid, 10,
-                    (short) 4, true, "p", "P", false, true, ",",
+                    ptLen, ptLen > 0, "p", "P", false, true, ",",
                     0, null, 0, 0,
                     ptName + "_in", ptName + "_out", "-", "-",
-                    "-", "-", "-", "i", "p",
+                    "-", "-", "-", pt[3], pt[4],
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
@@ -1348,6 +1360,18 @@ class CatalogCoreBuilder {
                     ctRelOid, null, 0, 0,
                     "record_in", "record_out", "record_recv", "record_send",
                     "-", "-", "-", "d", "x",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+        }
+
+        // Shell types: a name reserved but not yet defined, so typisdefined is false
+        for (String shellName : database.getShellTypes()) {
+            table.insertRow(new Object[]{
+                    oids.oid("type:" + shellName), shellName, oids.oid("ns:public"), 10,
+                    (short) 4, false, "p", "P", false, false, ",",
+                    0, null, 0, 0,
+                    "shell_in", "shell_out", "-", "-",
+                    "-", "-", "-", "i", "p",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
