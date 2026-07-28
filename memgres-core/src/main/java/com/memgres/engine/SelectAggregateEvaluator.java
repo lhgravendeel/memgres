@@ -707,6 +707,17 @@ class SelectAggregateEvaluator {
             InExpr in = (InExpr) expr;
             Object val = evalAggregateExpr(in.expr(), group, representative);
             if (val == null) return null;
+            // IN (subquery) is a set membership test, not a comparison against one value: reading
+            // the subquery as an element of the value list made every row of it a scalar
+            // subquery, so a second row raised 21000 instead of answering. Fold only the left
+            // side here -- which is where the aggregate is -- and let the ordinary evaluator run
+            // the subquery.
+            if (in.values() != null && in.values().size() == 1
+                    && in.values().get(0) instanceof SubqueryExpr) {
+                return executor.evalExpr(new InExpr(
+                        new ExprEvaluator.PrecomputedValueExpr(val), in.values(),
+                        in.negated(), in.fromAny()), representative);
+            }
             boolean found = false;
             boolean hasNull = false;
             for (Expression v : in.values()) {
@@ -750,6 +761,15 @@ class SelectAggregateEvaluator {
                 }
             }
             return c.elseExpr() != null ? evalAggregateExpr(c.elseExpr(), group, representative) : null;
+        } else if (expr instanceof AnyAllExpr && select.containsAggregate(((AnyAllExpr) expr).left())) {
+            // ANY/ALL over a subquery reads the whole result, so only the left side -- the one
+            // that can hold the aggregate -- is folded over the group first.
+            AnyAllExpr aa = (AnyAllExpr) expr;
+            Object leftVal = evalAggregateExpr(aa.left(), group, representative);
+            if (leftVal == null) return null;
+            return executor.evalExpr(new AnyAllExpr(
+                    new ExprEvaluator.PrecomputedValueExpr(leftVal), aa.op(), aa.subquery(),
+                    aa.isAll()), representative);
         } else if (expr instanceof WindowFuncExpr) {
             return null;
         } else if (expr instanceof Literal) {
@@ -1137,7 +1157,7 @@ class SelectAggregateEvaluator {
                         }
                     }
                 } catch (NumberFormatException e) {
-                    throw new MemgresException("function sum(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
+                    throw noSuchAggregate("sum", arg, group);
                 }
                 if (!hasValue) return null;
                 Double sumSpecial = specialTotal(sawNotANumber, sawPosInf, sawNegInf);
@@ -1395,6 +1415,9 @@ class SelectAggregateEvaluator {
                         result = (result == null) ? v
                                 : combineBits("bit_and", (AstExecutor.PgBitString) result, (AstExecutor.PgBitString) v, '&');
                     } else {
+                        // Only integers and bit strings have a bitwise aggregate; anything else
+                        // is a call PostgreSQL has no function for, not an internal cast failure.
+                        if (!(v instanceof Number)) throw noSuchAggregate(name, fn.args().get(0), group);
                         long iv = ((Number) v).longValue();
                         long acc = (result == null) ? iv : (((Number) result).longValue() & iv);
                         result = numericBitResult(v, acc);
@@ -1411,6 +1434,9 @@ class SelectAggregateEvaluator {
                         result = (result == null) ? v
                                 : combineBits("bit_or", (AstExecutor.PgBitString) result, (AstExecutor.PgBitString) v, '|');
                     } else {
+                        // Only integers and bit strings have a bitwise aggregate; anything else
+                        // is a call PostgreSQL has no function for, not an internal cast failure.
+                        if (!(v instanceof Number)) throw noSuchAggregate(name, fn.args().get(0), group);
                         long iv = ((Number) v).longValue();
                         long acc = (result == null) ? iv : (((Number) result).longValue() | iv);
                         result = numericBitResult(v, acc);
@@ -1427,6 +1453,9 @@ class SelectAggregateEvaluator {
                         result = (result == null) ? v
                                 : combineBits("bit_xor", (AstExecutor.PgBitString) result, (AstExecutor.PgBitString) v, '^');
                     } else {
+                        // Only integers and bit strings have a bitwise aggregate; anything else
+                        // is a call PostgreSQL has no function for, not an internal cast failure.
+                        if (!(v instanceof Number)) throw noSuchAggregate(name, fn.args().get(0), group);
                         long iv = ((Number) v).longValue();
                         long acc = (result == null) ? iv : (((Number) result).longValue() ^ iv);
                         result = numericBitResult(v, acc);
@@ -1853,8 +1882,32 @@ class SelectAggregateEvaluator {
                 throw new MemgresException("function " + fname + "(money) does not exist"
                         + "\n  Hint: No function matches the given name and argument types.", "42883");
             }
+            // A value that is not a number at all is the same missing function sum reports; it
+            // used to escape the accumulation loop below as an internal parse failure (XX000).
+            try {
+                SelectExecutor.toBigDecimal(val);
+            } catch (RuntimeException e) {
+                throw noSuchAggregate(fname, arg, group);
+            }
             return;
         }
+    }
+
+    /**
+     * PostgreSQL names the aggregate it has no such overload of by the argument's declared type,
+     * spelled as SQL spells it: {@code sum(character varying)}, not {@code sum(text)} read off
+     * the value that happened to be in the column.
+     */
+    private MemgresException noSuchAggregate(String fname, Expression arg, List<RowContext> group) {
+        RowContext sample = group.isEmpty() ? null : group.get(0);
+        DataType declared = executor.exprEvaluator.inferTypeFromContext(arg,
+                sample != null ? sample.getBindings()
+                        : new java.util.ArrayList<RowContext.TableBinding>());
+        String typeName = declared != null ? declared.toRegtypeDisplay() : argTypeName(arg, sample);
+        MemgresException e = new MemgresException(
+                "function " + fname + "(" + typeName + ") does not exist", "42883");
+        e.setHint("No function matches the given name and argument types.");
+        return e;
     }
 
     /** PG's bit-string bit_and/bit_or/bit_xor: bitwise, and only over equal-length operands. */

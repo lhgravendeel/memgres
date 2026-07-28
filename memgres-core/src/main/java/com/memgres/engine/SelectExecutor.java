@@ -746,6 +746,7 @@ class SelectExecutor {
         if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() != null && containsWindowFunction(c.left())) || containsWindowFunction(c.right()); }
         if (expr instanceof UnaryExpr) return containsWindowFunction(((UnaryExpr) expr).operand());
         if (expr instanceof CastExpr) return containsWindowFunction(((CastExpr) expr).expr());
+        if (expr instanceof IsNullExpr) return containsWindowFunction(((IsNullExpr) expr).expr());
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
             for (CaseExpr.WhenClause when : c.whenClauses()) {

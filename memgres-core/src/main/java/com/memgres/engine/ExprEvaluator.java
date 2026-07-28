@@ -2831,10 +2831,36 @@ class ExprEvaluator {
             DataType resolved = binaryResultType(bin.op(), lt, rt);
             return resolved != null ? resolved : DataType.TEXT;
         }
+        if (expr instanceof WindowFuncExpr) {
+            // The type a window call answers in. The ranking functions have a type of their own;
+            // the value-shifting ones answer in the type of the value they shift; and every other
+            // window call is an aggregate over the frame, so it resolves exactly as the same
+            // aggregate would. Without this a window column had no declared type and came out
+            // as text.
+            WindowFuncExpr wf = (WindowFuncExpr) expr;
+            String wfName = wf.name() == null ? ""
+                    : FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase());
+            if (wfName.equals("row_number") || wfName.equals("rank")
+                    || wfName.equals("dense_rank") || wfName.equals("count")) {
+                return DataType.BIGINT;
+            }
+            if (wfName.equals("ntile")) return DataType.INTEGER;
+            if (wfName.equals("percent_rank") || wfName.equals("cume_dist")) {
+                return DataType.DOUBLE_PRECISION;
+            }
+            if (wfName.equals("lag") || wfName.equals("lead") || wfName.equals("first_value")
+                    || wfName.equals("last_value") || wfName.equals("nth_value")) {
+                return wf.args().isEmpty() ? null : inferTypeFromContext(wf.args().get(0), bindings);
+            }
+            return inferTypeFromContext(
+                    new FunctionCallExpr(wf.name(), wf.args(), wf.distinct(), wf.star()), bindings);
+        }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
-            if (name.equals("count") || name.equals("length") || name.equals("char_length")
+            // count answers in bigint, which is what sum(count(*)) resolves against.
+            if (name.equals("count")) return DataType.BIGINT;
+            if (name.equals("length") || name.equals("char_length")
                     || name.equals("octet_length") || name.equals("bit_length")
                     || name.equals("position") || name.equals("strpos")
                     || name.equals("array_length") || name.equals("cardinality")
