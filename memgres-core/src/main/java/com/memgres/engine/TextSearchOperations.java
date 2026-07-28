@@ -12,6 +12,41 @@ import java.util.regex.Pattern;
  */
 public class TextSearchOperations {
 
+    /**
+     * The {@code @@} match. PostgreSQL declares it both ways round — tsvector @@ tsquery and
+     * tsquery @@ tsvector — so which operand is the document and which is the query follows from
+     * what they are, not from the side they were written on. Reading them in written order made
+     * {@code 'a'::tsquery @@ to_tsvector(...)} try to parse a vector as a query.
+     *
+     * <p>An operand that declares neither type is PostgreSQL's unknown and is read as whatever the
+     * other side leaves it: a vector opposite a query, a query opposite a vector.
+     */
+    public static Object matches(Object left, Object right) {
+        if (left == null || right == null) return null;
+        // One of each is the only pairing PG declares; two of a kind matches nothing
+        if (left instanceof TsQuery && right instanceof TsQuery) {
+            throw new MemgresException("operator does not exist: tsquery @@ tsquery", "42883");
+        }
+        if (left instanceof TsVector && right instanceof TsVector) {
+            throw new MemgresException("operator does not exist: tsvector @@ tsvector", "42883");
+        }
+        boolean queryOnLeft = left instanceof TsQuery
+                || (right instanceof TsVector && !(left instanceof TsVector));
+        Object documentSide = queryOnLeft ? right : left;
+        Object querySide = queryOnLeft ? left : right;
+        TsVector vector;
+        if (documentSide instanceof TsVector) {
+            vector = (TsVector) documentSide;
+        } else {
+            String text = documentSide.toString();
+            TsVector parsed = TsVector.parseLiteral(text);
+            vector = parsed != null ? parsed : TsVector.fromText(text);
+        }
+        TsQuery query = querySide instanceof TsQuery
+                ? (TsQuery) querySide : TsQuery.parse(querySide.toString());
+        return vector.matches(query);
+    }
+
     /** phraseto_tsquery: treats input as a phrase (words connected by <N> where N accounts for stopwords).
      *  Stopwords are removed and their positions are accounted for by increasing the distance. */
     public static TsQuery phraseToTsQuery(String input) {

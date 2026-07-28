@@ -56,9 +56,15 @@ class ExprEvaluator {
         // SelectExecutor.findSrfCall / projectRows.
         if (ctx != null && ctx.hasSrfOverride(expr)) return ctx.getSrfOverride(expr);
         if (expr instanceof ColumnRef) return evalColumnRef(((ColumnRef) expr), ctx);
-        if (expr instanceof BinaryExpr) return executor.binaryOpEvaluator.evalBinary(((BinaryExpr) expr), ctx);
+        if (expr instanceof BinaryExpr) {
+            rejectUnequalRowArity((BinaryExpr) expr);
+            return executor.binaryOpEvaluator.evalBinary(((BinaryExpr) expr), ctx);
+        }
         if (expr instanceof UnaryExpr) return evalUnaryValue(((UnaryExpr) expr).op(), evalExpr(((UnaryExpr) expr).operand(), ctx));
-        if (expr instanceof FunctionCallExpr) return executor.functionEvaluator.evalFunction(((FunctionCallExpr) expr), ctx);
+        if (expr instanceof FunctionCallExpr) {
+            unifyVariadicArgumentTypes((FunctionCallExpr) expr);
+            return executor.functionEvaluator.evalFunction(((FunctionCallExpr) expr), ctx);
+        }
         if (expr instanceof CastExpr) return evalCast(((CastExpr) expr), ctx);
         if (expr instanceof IsNullExpr) return evalIsNull(((IsNullExpr) expr), ctx);
         if (expr instanceof IsJsonExpr) return evalIsJson(((IsJsonExpr) expr), ctx);
@@ -148,6 +154,13 @@ class ExprEvaluator {
         if (expr instanceof IsBooleanExpr) {
             IsBooleanExpr ib = (IsBooleanExpr) expr;
             Object val = evalExpr(ib.expr(), ctx);
+            // These tests read a three-valued boolean, so a value that is not one has no answer:
+            // PG names the test and the type it was handed rather than coercing.
+            if (val != null && isBooleanTest(ib.test())
+                    && !(val instanceof Boolean) && !(val instanceof String)) {
+                throw new MemgresException("argument of " + booleanTestName(ib.test())
+                        + " must be type boolean, not type " + AstExecutor.pgTypeNameOf(val), "42804");
+            }
             Boolean b = val == null ? null : isTruthy(val);
             switch (ib.test()) {
                 case IS_TRUE:
@@ -948,7 +961,27 @@ class ExprEvaluator {
             }
             return castList;
         }
+        // A JSON null is a value that means "no value", so casting it onward gives SQL NULL. The
+        // word "null" arriving as plain text is not that -- it is text no type can read, which is
+        // why the source has to say it came from json before this applies.
+        if (isJsonValued(cast.expr()) && val instanceof String
+                && ((String) val).trim().equals("null")) {
+            String target = cast.typeName() == null ? "" : cast.typeName().toLowerCase().trim();
+            if (!target.equals("json") && !target.equals("jsonb")
+                    && !target.equals("text") && !target.equals("varchar")) {
+                return null;
+            }
+        }
         return executor.castEvaluator.applyCast(val, cast.typeName());
+    }
+
+    /** True when an expression is declared to produce json or jsonb. */
+    private static boolean isJsonValued(Expression expr) {
+        if (expr instanceof CastExpr) {
+            String t = ((CastExpr) expr).typeName();
+            return t != null && (t.equalsIgnoreCase("json") || t.equalsIgnoreCase("jsonb"));
+        }
+        return false;
     }
 
     /**
@@ -1362,6 +1395,22 @@ class ExprEvaluator {
     }
 
     private Object evalIn(InExpr in, RowContext ctx) {
+        // IN and "= ANY(array)" resolve the "=" of the operand type -- the parser turns the
+        // second into this node. NOT IN is not the negation of that: PostgreSQL expands it to
+        // "<> ALL", so it resolves "<>", which a point has even though it has no "=".
+        if (in.values() != null && !in.values().isEmpty()) {
+            Expression other = in.values().get(0);
+            // "= ANY(<array>)" keeps the whole array as its single value, so the comparison is
+            // against one element of it, not against the array
+            if (in.fromAny() && in.values().size() == 1) {
+                Expression element = arrayElementOperand(other);
+                if (element != null) other = element;
+            }
+            executor.binaryOpEvaluator.rejectMissingEqualityOperator(
+                    new BinaryExpr(in.expr(),
+                            in.negated() ? BinaryExpr.BinOp.NOT_EQUAL : BinaryExpr.BinOp.EQUAL,
+                            other), ctx);
+        }
         Object val = evalExpr(in.expr(), ctx);
         if (val == null) return null; // NULL IN (...) is NULL
 
@@ -1659,6 +1708,7 @@ class ExprEvaluator {
             throw new MemgresException(
                 "CASE types record and text cannot be matched", "42804");
         }
+        unifyResultTypes("CASE", caseResultBranches(c));
     }
 
     // ---- Subquery evaluation ----
@@ -1749,7 +1799,36 @@ class ExprEvaluator {
         return new AstExecutor.PgRow(values);
     }
 
+    /**
+     * An expression standing for one element of the array an ANY/ALL compares against, so the
+     * operator can be looked up against the element type. A constructor gives its first element; a
+     * cast to an array type gives a cast to that array's element type.
+     */
+    private static Expression arrayElementOperand(Expression array) {
+        if (array instanceof ArrayExpr) {
+            java.util.List<Expression> items = ((ArrayExpr) array).elements();
+            return items.isEmpty() ? null : items.get(0);
+        }
+        if (array instanceof CastExpr) {
+            String type = ((CastExpr) array).typeName();
+            if (type != null && type.trim().endsWith("[]")) {
+                String element = type.trim().substring(0, type.trim().length() - 2).trim();
+                return new CastExpr(((CastExpr) array).expr(), element);
+            }
+        }
+        return null;
+    }
+
     private Object evalAnyAllArray(AnyAllArrayExpr aaa, RowContext ctx) {
+        // "= ALL(array)" resolves "=" the same way; "<> ANY" resolves "<>", which point does have
+        Expression element = arrayElementOperand(aaa.array());
+        if (element != null) {
+            executor.binaryOpEvaluator.rejectMissingEqualityOperator(
+                    new BinaryExpr(aaa.left(), aaa.op(), element), ctx);
+        }
+        // x = ANY(ARRAY[...]) resolves the same "=" a plain comparison does, so a type that has
+        // no "=" cannot be compared this way either. This path never reaches BinaryOpEvaluator,
+        // so the rule is consulted directly against the left side and the array's first element.
         Object leftVal = evalExpr(aaa.left(), ctx);
         if (leftVal == null) return null;
         Object arrayVal = evalExpr(aaa.array(), ctx);
@@ -2698,5 +2777,235 @@ class ExprEvaluator {
             return Arrays.asList(inner.split(","));
         }
         return Cols.listOf(s);
+    }
+
+    /** True for the tests that read a three-valued boolean, so a non-boolean has no answer. */
+    private static boolean isBooleanTest(IsBooleanExpr.BooleanTest test) {
+        switch (test) {
+            case IS_TRUE: case IS_NOT_TRUE: case IS_FALSE: case IS_NOT_FALSE:
+            case IS_UNKNOWN: case IS_NOT_UNKNOWN:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** How PostgreSQL names each test in its error message. */
+    private static String booleanTestName(IsBooleanExpr.BooleanTest test) {
+        switch (test) {
+            case IS_TRUE: return "IS TRUE";
+            case IS_NOT_TRUE: return "IS NOT TRUE";
+            case IS_FALSE: return "IS FALSE";
+            case IS_NOT_FALSE: return "IS NOT FALSE";
+            case IS_UNKNOWN: return "IS UNKNOWN";
+            default: return "IS NOT UNKNOWN";
+        }
+    }
+
+    // ---- Row comparison ----
+
+    /**
+     * A row comparison is defined entry by entry, so two row constructors of different lengths have
+     * no comparison to make and PostgreSQL says so rather than answering. Reading the values
+     * instead let {@code ROW(1,2) < ROW(1,2,3)} come out true on the strength of the entries the
+     * two rows happen to share.
+     */
+    private static void rejectUnequalRowArity(BinaryExpr bin) {
+        if (!(bin.left() instanceof ArrayExpr) || !(bin.right() instanceof ArrayExpr)) return;
+        if (!isRowComparison(bin.op())) return;
+        ArrayExpr left = (ArrayExpr) bin.left();
+        ArrayExpr right = (ArrayExpr) bin.right();
+        if (!left.isRow() || !right.isRow()) return;
+        if (left.elements().size() == right.elements().size()) return;
+        throw new MemgresException("unequal number of entries in row expressions", "42601");
+    }
+
+    /** The operators that compare two rows entry by entry. */
+    private static boolean isRowComparison(BinaryExpr.BinOp op) {
+        switch (op) {
+            case EQUAL: case NOT_EQUAL:
+            case LESS_THAN: case GREATER_THAN: case LESS_EQUAL: case GREATER_EQUAL:
+            case IS_DISTINCT_FROM: case IS_NOT_DISTINCT_FROM:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // ---- Result type unification ----
+
+    /** The families a branch list can be unified within; PostgreSQL never mixes two of them. */
+    private enum ResultFamily { STRING, NUMERIC, BOOLEAN, DATETIME }
+
+    /**
+     * The type an expression is given by the query text itself -- a cast or a literal -- and
+     * nothing inferred. A column's type is deliberately not consulted: a derived column out of a
+     * subquery carries whatever type the engine defaulted it to, and refusing a query on the
+     * strength of that rejects SQL PostgreSQL runs, which is worse than the permissiveness being
+     * fixed. A bare string literal is PostgreSQL's {@code unknown} and returns null too.
+     */
+    private static String typeWrittenInQuery(Expression expr) {
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName();
+            return name == null ? null : name.toLowerCase().trim();
+        }
+        if (expr instanceof Literal) {
+            switch (((Literal) expr).literalType()) {
+                case INTEGER: return "integer";
+                case FLOAT: return "numeric";
+                case BOOLEAN: return "boolean";
+                default: return null;
+            }
+        }
+        return null;
+    }
+
+    /** True for a string literal written without a cast, which is PostgreSQL's {@code unknown}. */
+    private static boolean isUntypedStringLiteral(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
+    /**
+     * PostgreSQL settles CASE, COALESCE, GREATEST and LEAST on a single result type before it runs
+     * anything: it walks the branches keeping the widest declared type seen so far, and stops with
+     * an error the moment a branch names a type from another family. Answering from whichever
+     * branch happened to be taken let queries PostgreSQL refuses to plan return a value here.
+     *
+     * <p>Only a type the query writes down takes part. A bare string literal is {@code unknown} and
+     * is read as the settled type once it is known, which is why {@code COALESCE(1::int, 'x')}
+     * fails on the input {@code x} rather than on a type mismatch, while {@code '2'::text} beside
+     * an integer really is one.
+     *
+     * @param context how PostgreSQL names the construct in the error: CASE, COALESCE, GREATEST, LEAST
+     */
+    private void unifyResultTypes(String context, List<Expression> branches) {
+        String ptype = null;
+        ResultFamily pfamily = null;
+        int prank = 0;
+        for (int i = 0; i < branches.size(); i++) {
+            String name = typeWrittenInQuery(branches.get(i));
+            if (name == null) continue;
+            ResultFamily family = familyOf(name);
+            // A family this rule does not judge (uuid, json, ranges, geometry, a domain, an enum)
+            // carries its own coercion rules; guessing at them would reject SQL PostgreSQL accepts.
+            if (family == null) return;
+            if (pfamily == null) {
+                ptype = name;
+                pfamily = family;
+                prank = rankOf(name);
+                continue;
+            }
+            if (family != pfamily) {
+                throw new MemgresException(context + " types " + pgName(ptype) + " and "
+                        + pgName(name) + " cannot be matched", "42804");
+            }
+            int rank = rankOf(name);
+            if (rank > prank) {
+                ptype = name;
+                prank = rank;
+            }
+        }
+        // Reading an untyped literal as the settled type is what turns a mismatch into an input
+        // error. Only the two families whose text form memgres reads exactly as PostgreSQL does
+        // take part: a date or a string accepts too much for a failure here to mean the same thing.
+        if (pfamily != ResultFamily.NUMERIC && pfamily != ResultFamily.BOOLEAN) return;
+        for (int i = 0; i < branches.size(); i++) {
+            Expression branch = branches.get(i);
+            if (isUntypedStringLiteral(branch)) {
+                executor.castValue(((Literal) branch).value(), ptype);
+            }
+        }
+    }
+
+    /** The family a declared type belongs to, or null when it is one this rule leaves alone. */
+    private static ResultFamily familyOf(String typeName) {
+        String t = typeName.toLowerCase().trim();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        switch (t) {
+            case "text": case "varchar": case "character varying": case "char":
+            case "character": case "bpchar": case "name":
+                return ResultFamily.STRING;
+            case "smallint": case "integer": case "int": case "int2": case "int4": case "int8":
+            case "bigint": case "numeric": case "decimal": case "real": case "double precision":
+            case "float4": case "float8": case "float":
+                return ResultFamily.NUMERIC;
+            case "boolean": case "bool":
+                return ResultFamily.BOOLEAN;
+            case "date": case "timestamp": case "timestamptz":
+            case "timestamp without time zone": case "timestamp with time zone":
+                return ResultFamily.DATETIME;
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * How wide a type is within its family. The widest wins, which is the same answer PostgreSQL
+     * reaches by keeping whichever of two types the other converts to implicitly.
+     */
+    private static int rankOf(String typeName) {
+        String t = typeName.toLowerCase().trim();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        switch (t) {
+            case "char": case "character": case "bpchar": case "name": return 1;
+            case "varchar": case "character varying": return 2;
+            case "text": return 3;
+            case "smallint": case "int2": return 1;
+            case "integer": case "int": case "int4": return 2;
+            case "bigint": case "int8": return 3;
+            case "numeric": case "decimal": return 4;
+            case "real": case "float4": return 5;
+            case "double precision": case "float8": case "float": return 6;
+            case "date": return 1;
+            case "timestamp": case "timestamp without time zone": return 2;
+            case "timestamptz": case "timestamp with time zone": return 3;
+            default: return 0;
+        }
+    }
+
+    /** The name PostgreSQL prints for a type in a mismatch message. */
+    private static String pgName(String typeName) {
+        String t = typeName.toLowerCase().trim();
+        switch (t) {
+            case "int": case "int4": return "integer";
+            case "int2": return "smallint";
+            case "int8": return "bigint";
+            case "float8": case "float": return "double precision";
+            case "float4": return "real";
+            case "varchar": return "character varying";
+            case "char": case "bpchar": return "character";
+            case "bool": return "boolean";
+            case "decimal": return "numeric";
+            case "timestamp without time zone": return "timestamp";
+            case "timestamp with time zone": return "timestamptz";
+            default: return t;
+        }
+    }
+
+    /**
+     * COALESCE, GREATEST and LEAST settle on one type across all their arguments, exactly as CASE
+     * does across its branches.
+     */
+    private void unifyVariadicArgumentTypes(FunctionCallExpr fn) {
+        List<Expression> args = fn.args();
+        if (args == null || args.size() < 2) return;
+        String name = fn.name();
+        if (name.equalsIgnoreCase("coalesce")) unifyResultTypes("COALESCE", args);
+        else if (name.equalsIgnoreCase("greatest")) unifyResultTypes("GREATEST", args);
+        else if (name.equalsIgnoreCase("least")) unifyResultTypes("LEAST", args);
+    }
+
+    /**
+     * The CASE branches in the order PostgreSQL unifies them: the ELSE result first, then each
+     * WHEN result. The order is what decides which of the two types a mismatch message names first.
+     */
+    private static List<Expression> caseResultBranches(CaseExpr c) {
+        List<Expression> branches = new ArrayList<Expression>(c.whenClauses().size() + 1);
+        if (c.elseExpr() != null) branches.add(c.elseExpr());
+        for (CaseExpr.WhenClause when : c.whenClauses()) branches.add(when.result());
+        return branches;
     }
 }

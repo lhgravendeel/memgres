@@ -243,14 +243,8 @@ class CastEvaluator {
             }
             return null;
         }
-        // JSON/JSONB null literal → SQL NULL when cast to any other type
-        if (val instanceof String && ((String) val).trim().equals("null")) {
-            String s = (String) val;
-            String lt = typeSpec.toLowerCase().trim();
-            if (!lt.equals("json") && !lt.equals("jsonb") && !lt.equals("text") && !lt.equals("varchar")) {
-                return null;
-            }
-        }
+        // The word "null" is not input for any type: PG reads it as text and its input function
+        // refuses it. Treating it as SQL NULL turned a malformed value into a missing one.
         String lowerSpec = typeSpec.toLowerCase().trim();
 
         // A polymorphic pseudo-type is a placeholder, not a target: the value keeps whatever
@@ -342,7 +336,7 @@ class CastEvaluator {
             List<?> list;
             if (val instanceof List<?>) {
                 list = (List<?>) val;
-            } else if (valStr != null && valStr.startsWith("{") && valStr.endsWith("}")) {
+            } else if (valStr != null && ArrayOperationHandler.isArrayLiteralText(valStr)) {
                 String inner = valStr.substring(1, valStr.length() - 1).trim();
                 if (inner.isEmpty()) {
                     list = Cols.listOf();
@@ -358,6 +352,10 @@ class CastEvaluator {
                     // ({01,02}::text[] must stay "01","02", not 1,2).
                     list = executor.parsePostgresArrayLiteralRaw(valStr);
                 }
+            } else if (valStr != null) {
+                // Text becomes an array by being written as an array literal, never by being one
+                // element of one: PG reads '3'::int[] as a literal and fails to parse it.
+                throw new MemgresException("malformed array literal: \"" + val + "\"", "22P02");
             } else {
                 list = null;
             }
@@ -590,6 +588,13 @@ class CastEvaluator {
             }
             case "boolean":
             case "bool":
+                // Only integer converts to boolean; PG ships no cast from the wider numeric types,
+                // so a value that "looks true" is a type error rather than a truth value.
+                if (val instanceof java.math.BigDecimal || val instanceof Double
+                        || val instanceof Float || val instanceof Long || val instanceof Short) {
+                    throw new MemgresException("cannot cast type "
+                            + AstExecutor.pgTypeNameOf(val) + " to boolean", "42846");
+                }
                 return TypeCoercion.toBoolean(val);
             case "date":
                 return TypeCoercion.toLocalDateOrBc(val);
@@ -819,42 +824,10 @@ class CastEvaluator {
                     return sb.toString();
                 }
                 String jsonStr = val.toString();
-                // Validate JSON syntax
                 String trimmed = jsonStr.trim();
-                if (!trimmed.isEmpty() && !trimmed.startsWith("{") && !trimmed.startsWith("[")
-                        && !trimmed.startsWith("\"") && !trimmed.equals("null")
-                        && !trimmed.equals("true") && !trimmed.equals("false")) {
-                    // Try parsing as a number
-                    try { new java.math.BigDecimal(trimmed); } catch (NumberFormatException e) {
-                        throw new MemgresException("invalid input syntax for type json", "22P02");
-                    }
-                } else if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-                    // Validate JSON: balanced brackets + no trailing commas
-                    int depth = 0;
-                    boolean inStr = false;
-                    char prevNonWs = 0;
-                    for (int ci = 0; ci < trimmed.length(); ci++) {
-                        char ch = trimmed.charAt(ci);
-                        if (inStr) { if (ch == '"' && (ci == 0 || trimmed.charAt(ci-1) != '\\')) inStr = false; }
-                        else {
-                            if (ch == '"') inStr = true;
-                            else if (ch == '{' || ch == '[') {
-                                // Nesting this deep cannot be walked recursively later on, and
-                                // both json and jsonb must refuse it at input time.
-                                if (++depth > PgErrors.MAX_RECURSION_DEPTH) {
-                                    throw PgErrors.stackDepthExceeded();
-                                }
-                            }
-                            else if (ch == '}' || ch == ']') {
-                                // Trailing comma: ,} or ,]
-                                if (prevNonWs == ',') throw new MemgresException("invalid input syntax for type json", "22P02");
-                                depth--;
-                            }
-                            if (!Character.isWhitespace(ch)) prevNonWs = ch;
-                        }
-                    }
-                    if (depth != 0) throw new MemgresException("invalid input syntax for type json", "22P02");
-                }
+                // Parse it properly rather than balancing brackets: a bracket count cannot see a
+                // second document after the first, an unquoted key, or a number JSON has no form for.
+                JsonTextValidator.validate(trimmed);
                 // JSONB normalizes whitespace; JSON preserves input
                 if ("jsonb".equals(typeName)) {
                     return TypeCoercion.normalizeJsonb(trimmed);
@@ -1242,27 +1215,19 @@ class CastEvaluator {
                 // Check if it's a domain type
                 DomainType domain = executor.database.getDomain(typeName);
                 if (domain != null) {
-                    // A domain over a domain inherits its base's constraints, and PG reports
-                    // the innermost violation, so cast through the parent first
-                    DomainType parent = domain.getBaseTypeName() == null ? null
-                            : executor.database.getDomain(domain.getBaseTypeName());
-                    Object coerced = parent != null
-                            ? applyCast(val, domain.getBaseTypeName())
-                            : applyCast(val, domain.getBaseType().getPgName());
-                    // Validate domain CHECK constraint if present
-                    Expression checkExpr = domain.getParsedCheck();
-                    if (checkExpr != null) {
-                        // The check expression uses "value" as a column reference.
-                        // Create a single-column table context with column "value"
-                        Table valueTable = new Table("_domain_check", Cols.listOf(
-                                new Column("value", domain.getBaseType(), true, false, null)));
-                        Object[] valueRow = new Object[]{coerced};
-                        RowContext checkCtx = new RowContext(valueTable, null, valueRow);
-                        Object checkResult = executor.evalExpr(checkExpr, checkCtx);
-                        if (checkResult instanceof Boolean && !((Boolean) checkResult)) {
-                            Boolean b = (Boolean) checkResult;
-                            throw new MemgresException("value for domain " + typeName + " violates check constraint \"" + typeName + "_check\"", "23514");
-                        }
+                    // A domain over a domain inherits its base's constraints, so walk from the
+                    // base outwards. PG reports the constraint the base declared, but names the
+                    // domain the query actually wrote.
+                    List<DomainType> chain = new ArrayList<>();
+                    for (DomainType d = domain; d != null && chain.size() < 64; ) {
+                        chain.add(0, d);
+                        String base = d.getBaseTypeName();
+                        d = base == null ? null : executor.database.getDomain(base);
+                    }
+                    DomainType root = chain.get(0);
+                    Object coerced = applyCast(val, root.getBaseType().getPgName());
+                    for (DomainType d : chain) {
+                        checkDomainConstraints(d, typeName, coerced);
                     }
                     return coerced;
                 }
@@ -1299,6 +1264,36 @@ class CastEvaluator {
                 }
                 return val;
             }
+        }
+    }
+
+    /**
+     * Run every CHECK a domain carries against a value being cast to it. A constraint added by
+     * ALTER DOMAIN counts as much as one written into CREATE DOMAIN, and PostgreSQL enforces one
+     * marked NOT VALID on new values too — NOT VALID only excuses the rows already stored.
+     *
+     * @param reportedName the domain the query named, which is the one PG blames even when the
+     *        constraint was inherited from a domain this one is built on
+     */
+    private void checkDomainConstraints(DomainType domain, String reportedName, Object value) {
+        Table valueTable = new Table("_domain_check", Cols.listOf(
+                new Column("value", domain.getBaseType(), true, false, null)));
+        RowContext checkCtx = new RowContext(valueTable, null, new Object[]{value});
+        if (domain.getParsedCheck() != null) {
+            failIfViolated(domain.getParsedCheck(), checkCtx, reportedName, domain.getName() + "_check");
+        }
+        for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
+            if (nc.parsedCheck() == null) continue;
+            failIfViolated(nc.parsedCheck(), checkCtx, reportedName, nc.name());
+        }
+    }
+
+    /** A CHECK that answers NULL passes, the way it does on a table; only an explicit false fails. */
+    private void failIfViolated(Expression check, RowContext ctx, String domainName, String constraintName) {
+        Object result = executor.evalExpr(check, ctx);
+        if (result != null && !executor.isTruthy(result)) {
+            throw new MemgresException("value for domain " + domainName
+                    + " violates check constraint \"" + constraintName + "\"", "23514");
         }
     }
 

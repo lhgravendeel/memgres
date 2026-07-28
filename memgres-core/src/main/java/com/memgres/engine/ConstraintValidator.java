@@ -1512,7 +1512,10 @@ class ConstraintValidator {
                 List<?> rl = (List<?>) right;
                 Object leftFirst = ll.stream().filter(java.util.Objects::nonNull).findFirst().orElse(null);
                 Object rightFirst = rl.stream().filter(java.util.Objects::nonNull).findFirst().orElse(null);
-                if (leftFirst != null && rightFirst != null) {
+                // A sub-array as an element means the operands differ in dimension, not in element
+                // type: {{1,2},{3,4}} || {5,6} is a legal concatenation and gains a row.
+                boolean sameDimension = !(leftFirst instanceof List<?>) && !(rightFirst instanceof List<?>);
+                if (sameDimension && leftFirst != null && rightFirst != null) {
                     boolean leftNum = leftFirst instanceof Number;
                     boolean rightNum = rightFirst instanceof Number;
                     if (leftNum && !rightNum) {

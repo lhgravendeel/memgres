@@ -522,7 +522,28 @@ public class ExpressionParser {
         return parseComparison();
     }
 
+    /**
+     * A comparison, followed by the postfix null tests {@code ISNULL} and {@code NOTNULL}.
+     *
+     * <p>These are PostgreSQL's postfix spellings of IS NULL and IS NOT NULL, and they bind looser
+     * than every comparison operator, so {@code n = 5 ISNULL} asks whether the comparison came out
+     * NULL rather than whether 5 did. Only a bare identifier counts: a quoted {@code "isnull"} is a
+     * name, and an identifier anywhere else is still free to be a column called isnull.
+     */
     private Expression parseComparison() {
+        Expression left = parseComparisonOperand();
+        if (checkIdentifier("ISNULL")) {
+            advance();
+            return new IsNullExpr(left, false);
+        }
+        if (checkIdentifier("NOTNULL")) {
+            advance();
+            return new IsNullExpr(left, true);
+        }
+        return left;
+    }
+
+    private Expression parseComparisonOperand() {
         Expression left = parseOtherOps();
 
         // IS [NOT] NULL

@@ -37,10 +37,10 @@ class BinaryOpEvaluator {
     }
 
     /**
-     * PG's operator set is narrower than the values suggest. A point has no {@code =} (it uses
-     * {@code ~=}), an lseg contains nothing, and money compares only with money. The operand
-     * *values* cannot decide this -- a geometric value is stored as text, so a value-level rule
-     * would break plain string comparison -- so the declared type of each operand decides.
+     * PG's operator set is narrower than the values suggest. An lseg contains nothing and money
+     * compares only with money. The operand *values* cannot decide this -- a geometric value is
+     * stored as text, so a value-level rule would break plain string comparison -- so the declared
+     * type of each operand decides.
      */
     private void rejectPhantomOperator(BinaryExpr bin, RowContext ctx, Object left, Object right) {
         if (left == null || right == null) return;
@@ -49,29 +49,316 @@ class BinaryOpEvaluator {
         // money compares only with money; PG has no cross-type comparison for it
         boolean moneyLeft = left instanceof PgMoney;
         boolean moneyRight = right instanceof PgMoney;
-        if ((moneyLeft ^ moneyRight) && isComparison(op)
+        if ((moneyLeft ^ moneyRight) && (isComparison(op) || resolvesThroughEquality(op))
                 && (left instanceof Number || right instanceof Number)) {
             String other = AstExecutor.pgTypeNameOf(moneyLeft ? right : left);
+            String sym = resolvedOperatorSymbol(op);
             throw new MemgresException("operator does not exist: "
-                    + (moneyLeft ? "money " + binOpToSymbol(op) + " " + other
-                                 : other + " " + binOpToSymbol(op) + " money"), "42883");
+                    + (moneyLeft ? "money " + sym + " " + other
+                                 : other + " " + sym + " money"), "42883");
         }
 
-        String lType = declaredGeometricType(bin.left(), ctx);
-        String rType = declaredGeometricType(bin.right(), ctx);
-        if (lType == null && rType == null) return;
-
-        // point equality is spelled ~=, never =
-        if ((op == BinaryExpr.BinOp.EQUAL || op == BinaryExpr.BinOp.NOT_EQUAL)
-                && "point".equals(lType) && "point".equals(rType)) {
-            throw new MemgresException("operator does not exist: point " + binOpToSymbol(op) + " point"
-                    + "\n  Hint: No operator matches the given name and argument types.", "42883");
-        }
         // an lseg has no interior, so it contains nothing
-        if (op == BinaryExpr.BinOp.CONTAINS && "lseg".equals(lType)) {
+        if (op == BinaryExpr.BinOp.CONTAINS && "lseg".equals(declaredGeometricType(bin.left(), ctx))) {
+            String rType = declaredGeometricType(bin.right(), ctx);
             throw new MemgresException("operator does not exist: lseg @> "
                     + (rType != null ? rType : "unknown")
                     + "\n  Hint: No operator matches the given name and argument types.", "42883");
+        }
+    }
+
+    /**
+     * The types that carry no {@code =} operator at all: a point and a polygon are compared with
+     * {@code ~=}, which is a different question from equality and is spelled differently. Their
+     * {@code <>} is not affected -- a point has one, which is why this rule names the lookup that
+     * fails rather than the operator as written.
+     */
+    private static final Set<String> TYPES_WITHOUT_EQUALITY = Cols.setOf("point", "polygon");
+
+    /**
+     * The types that also have no {@code <>}. Measured from pg_operator: point does carry "<>"
+     * (its equality is the separate {@code ~=}), so only polygon lacks both.
+     */
+    private static final Set<String> TYPES_WITHOUT_INEQUALITY = Cols.setOf("polygon");
+
+    /**
+     * PostgreSQL resolves {@code =} against the declared types before it looks at a value, so a
+     * type that has no {@code =} cannot be compared even with a literal that would read as one.
+     * The untyped literal is named {@code unknown}, the type it never got to resolve to.
+     *
+     * <p>Runs before the untyped literal is read as the other side's type: PG reports the missing
+     * operator even when the literal is nothing that type could have parsed.
+     */
+    /** Also reached from IN and from ANY/ALL over an array, which resolve the same operator. */
+    void rejectMissingEqualityOperator(BinaryExpr bin, RowContext ctx) {
+        BinaryExpr.BinOp op = bin.op();
+        boolean inequality = op == BinaryExpr.BinOp.NOT_EQUAL;
+        if (op != BinaryExpr.BinOp.EQUAL && !inequality && !resolvesThroughEquality(op)) return;
+        Set<String> missing = inequality ? TYPES_WITHOUT_INEQUALITY : TYPES_WITHOUT_EQUALITY;
+        String lType = declaredGeometricType(bin.left(), ctx);
+        String rType = declaredGeometricType(bin.right(), ctx);
+        boolean lMissing = lType != null && missing.contains(lType);
+        boolean rMissing = rType != null && missing.contains(rType);
+        if (!lMissing && !rMissing) return;
+        // Only an untyped literal could have resolved to the type opposite it. Any other operand
+        // is a comparison between two different types, which is a lookup this rule cannot answer.
+        String lName = lMissing ? lType : (isUntypedStringLiteral(bin.left()) ? "unknown" : null);
+        String rName = rMissing ? rType : (isUntypedStringLiteral(bin.right()) ? "unknown" : null);
+        if (lName == null || rName == null) return;
+        throw new MemgresException("operator does not exist: "
+                + lName + " " + resolvedOperatorSymbol(op) + " " + rName
+                + "\n  Hint: No operator matches the given name and argument types.", "42883");
+    }
+
+    /**
+     * True for the operators PostgreSQL answers by looking up the {@code =} of the operand type.
+     * IS DISTINCT FROM is a NULL-safe equality, not an operator of its own, so a type pair that
+     * has no {@code =} cannot be written with it either.
+     */
+    private static boolean resolvesThroughEquality(BinaryExpr.BinOp op) {
+        return op == BinaryExpr.BinOp.IS_DISTINCT_FROM || op == BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM;
+    }
+
+    /** The operator PostgreSQL names in the error, which is {@code =} for the DISTINCT tests. */
+    private static String resolvedOperatorSymbol(BinaryExpr.BinOp op) {
+        return resolvesThroughEquality(op) ? "=" : binOpToSymbol(op);
+    }
+
+    /**
+     * The types whose operators take an untyped literal on the other side. Only types whose text
+     * form is unambiguous are listed: resolving against text or a number would change how ordinary
+     * string and arithmetic expressions behave, which is a far bigger blast radius than the bug.
+     */
+    private static final Set<String> LITERAL_RESOLVABLE_TYPES = Cols.setOf(
+            "inet", "cidr", "macaddr", "macaddr8",
+            "point", "line", "lseg", "box", "path", "polygon", "circle",
+            "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange",
+            "int4multirange", "int8multirange", "nummultirange", "datemultirange",
+            "tsmultirange", "tstzmultirange",
+            "interval", "uuid", "tsvector", "tsquery");
+
+    /**
+     * The type an untyped string literal on one side of {@code bin} should be read as, or null when
+     * neither side is such a literal or the other side's type is not one that resolves it.
+     */
+    private String untypedLiteralTargetType(BinaryExpr bin, RowContext ctx) {
+        boolean leftUntyped = isUntypedStringLiteral(bin.left());
+        boolean rightUntyped = isUntypedStringLiteral(bin.right());
+        // Two untyped literals resolve against each other in PG, which needs no help from here
+        if (leftUntyped == rightUntyped) return null;
+        String other = declaredOperandType(leftUntyped ? bin.right() : bin.left(), ctx);
+        if (other == null) return null;
+        if (other.endsWith("[]")) return other;
+        return LITERAL_RESOLVABLE_TYPES.contains(other) ? other : null;
+    }
+
+    /** The range types, whose value is a pair of bounds written between brackets. */
+    private static final Set<String> RANGE_TYPES = Cols.setOf(
+            "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange");
+
+    /** The multirange types, whose value is a brace-wrapped list of ranges. */
+    private static final Set<String> MULTIRANGE_TYPES = Cols.setOf(
+            "int4multirange", "int8multirange", "nummultirange", "datemultirange",
+            "tsmultirange", "tstzmultirange");
+
+    /**
+     * A multirange operator takes a multirange on both sides, so an untyped literal beside one is
+     * read as a multirange literal -- braces and all. A bare range literal is not one: PostgreSQL
+     * refuses it rather than quietly wrapping it, which is what let a multirange {@code @>} answer
+     * a question that was never asked of it.
+     */
+    private static void checkMultirangeLiteral(BinaryExpr.BinOp op, String targetType, Object value) {
+        if (!MULTIRANGE_TYPES.contains(targetType) || value == null) return;
+        if (!resolvesAgainstOperandType(op)) return;
+        String text = value.toString().trim();
+        if (text.startsWith("{") && text.endsWith("}")) return;
+        throw new MemgresException("malformed multirange literal: \"" + text + "\"", "22P02");
+    }
+
+    /**
+     * True for the operators PostgreSQL resolves within one type, so an untyped literal beside
+     * them has to be read as that type. Concatenation and pattern matching are deliberately left
+     * out: they resolve to their text forms, which read any value at all.
+     */
+    private static boolean resolvesAgainstOperandType(BinaryExpr.BinOp op) {
+        if (isComparison(op) || isArithmetic(op) || resolvesThroughEquality(op)) return true;
+        switch (op) {
+            case CONTAINS: case CONTAINED_BY: case OVERLAP:
+            case SHIFT_LEFT: case SHIFT_RIGHT: case RANGE_ADJACENT:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** True for a string literal written without a cast, which is PostgreSQL's {@code unknown}. */
+    private static boolean isUntypedStringLiteral(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
+    /** The type an operand is declared to have, from a cast or a column, or null. */
+    private String declaredOperandType(Expression expr, RowContext ctx) {
+        if (expr instanceof Literal) {
+            Literal lit = (Literal) expr;
+            switch (lit.literalType()) {
+                case INTEGER: return "integer";
+                case FLOAT: return "numeric";
+                case BOOLEAN: return "boolean";
+                // A string literal is PostgreSQL's unknown, which resolves against the other side
+                default: return null;
+            }
+        }
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName();
+            return name == null ? null : name.toLowerCase().trim();
+        }
+        if (expr instanceof ArrayExpr) {
+            String element = arrayElementTypeName((ArrayExpr) expr, ctx);
+            return element == null ? null : element + "[]";
+        }
+        if (expr instanceof FunctionCallExpr) {
+            String range = getRangeTypeName(expr);
+            if (range != null) return range;
+        }
+        if (expr instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) expr;
+            for (RowContext.TableBinding b : ctx.getBindings()) {
+                if (b.table() == null) continue;
+                if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
+                        && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+                int idx = b.table().getColumnIndex(ref.column());
+                if (idx < 0) continue;
+                DataType t = b.table().getColumns().get(idx).getType();
+                return t == null ? null : t.getPgName();
+            }
+        }
+        return null;
+    }
+
+    /** The element type of an array constructor, decided from its first typed element. */
+    private String arrayElementTypeName(ArrayExpr expr, RowContext ctx) {
+        for (Expression element : expr.elements()) {
+            if (element instanceof ArrayExpr) {
+                String nested = arrayElementTypeName((ArrayExpr) element, ctx);
+                if (nested != null) return nested;
+                continue;
+            }
+            if (element instanceof Literal) {
+                Literal lit = (Literal) element;
+                if (lit.literalType() == Literal.LiteralType.INTEGER) return "integer";
+                if (lit.literalType() == Literal.LiteralType.FLOAT) return "numeric";
+                if (lit.literalType() == Literal.LiteralType.STRING) return "text";
+                continue;
+            }
+            String declared = declaredOperandType(element, ctx);
+            if (declared != null) return declared;
+        }
+        return null;
+    }
+
+    /** The families an operator can be resolved within; PG has no operator across two of them. */
+    private enum TypeFamily { STRING, NUMERIC, BOOLEAN, JSON }
+
+    /**
+     * PostgreSQL resolves an operator against the declared types of its operands, and there is no
+     * {@code text = integer} or {@code text + integer} to resolve to — a query written that way is
+     * an error, not a comparison of a number with its spelling. Reading the values instead let
+     * {@code '5'::text = 5} answer true, so a query that fails in production passed here.
+     *
+     * <p>Only operands whose type is actually declared take part: a bare literal is {@code unknown}
+     * and PostgreSQL resolves it against the other side, so {@code '5' = 5} stays legal.
+     */
+    private void rejectCrossCategoryOperator(BinaryExpr bin, RowContext ctx) {
+        BinaryExpr.BinOp op = bin.op();
+        if (!isComparison(op) && !isArithmetic(op) && !resolvesThroughEquality(op)) return;
+        String lName = typeWrittenInQuery(bin.left());
+        String rName = typeWrittenInQuery(bin.right());
+        if (lName == null || rName == null) return;
+        TypeFamily lf = familyOf(lName);
+        TypeFamily rf = familyOf(rName);
+        if (lf == null || rf == null) return;
+
+        // json has no comparison or arithmetic operator of any kind, whatever sits opposite it
+        boolean reject = (lf == TypeFamily.JSON || rf == TypeFamily.JSON) || lf != rf;
+        if (!reject) return;
+        throw new MemgresException("operator does not exist: " + pgName(lName) + " "
+                + resolvedOperatorSymbol(op) + " " + pgName(rName)
+                + "\n  Hint: No operator matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
+    }
+
+    /**
+     * The type an operand is given by the query text itself — a cast or a literal — and nothing
+     * inferred. A column's type is deliberately not consulted: a derived column out of a subquery
+     * carries whatever type the engine defaulted it to, and rejecting an operator on the strength
+     * of that refuses SQL PostgreSQL runs, which is worse than the permissiveness being fixed.
+     */
+    private static String typeWrittenInQuery(Expression expr) {
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName();
+            return name == null ? null : name.toLowerCase().trim();
+        }
+        if (expr instanceof Literal) {
+            switch (((Literal) expr).literalType()) {
+                case INTEGER: return "integer";
+                case FLOAT: return "numeric";
+                case BOOLEAN: return "boolean";
+                default: return null;
+            }
+        }
+        return null;
+    }
+
+    private static boolean isArithmetic(BinaryExpr.BinOp op) {
+        switch (op) {
+            case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** The family a declared type belongs to, or null when it is one this rule leaves alone. */
+    private static TypeFamily familyOf(String typeName) {
+        String t = typeName.toLowerCase().trim();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        switch (t) {
+            case "text": case "varchar": case "character varying": case "char":
+            case "character": case "bpchar": case "name":
+                return TypeFamily.STRING;
+            case "smallint": case "integer": case "int": case "int2": case "int4": case "int8":
+            case "bigint": case "numeric": case "decimal": case "real": case "double precision":
+            case "float4": case "float8":
+                return TypeFamily.NUMERIC;
+            case "boolean": case "bool":
+                return TypeFamily.BOOLEAN;
+            case "json":
+                // json alone: it carries no comparison operators at all, not even equality.
+                // jsonb does have them, so it is deliberately left out of this rule.
+                return TypeFamily.JSON;
+            default:
+                // Dates, intervals, arrays, geometry, ranges and the rest have their own operator
+                // sets and cross-type rules; guessing at them would reject SQL PostgreSQL accepts.
+                return null;
+        }
+    }
+
+    /** The name PostgreSQL prints for a type in an operator error. */
+    private static String pgName(String typeName) {
+        String t = typeName.toLowerCase().trim();
+        switch (t) {
+            case "int": case "int4": return "integer";
+            case "int2": return "smallint";
+            case "int8": return "bigint";
+            case "float8": return "double precision";
+            case "float4": return "real";
+            case "varchar": return "character varying";
+            case "char": case "bpchar": return "character";
+            case "bool": return "boolean";
+            case "decimal": return "numeric";
+            default: return t;
         }
     }
 
@@ -198,10 +485,38 @@ class BinaryOpEvaluator {
             return false;
         }
 
+        // Resolved from the declared types alone, so it is decided before an untyped literal is
+        // read: PostgreSQL reports the operator it could not find even when that literal is text
+        // the type could never have parsed.
+        rejectMissingEqualityOperator(bin, ctx);
+
         Object left = executor.evalExpr(bin.left(), ctx);
         Object right = executor.evalExpr(bin.right(), ctx);
 
+        // A bare string literal has no type of its own. PostgreSQL resolves it against the other
+        // operand; guessing from its shape instead picks a type the query never mentioned, which
+        // is how '192.168.1.1' next to an inet came out as a point.
+        String resolveTo = untypedLiteralTargetType(bin, ctx);
+        if (resolveTo != null) {
+            if (isUntypedStringLiteral(bin.left())) {
+                checkMultirangeLiteral(bin.op(), resolveTo, left);
+                left = executor.castValue(left, resolveTo);
+            } else {
+                checkMultirangeLiteral(bin.op(), resolveTo, right);
+                right = executor.castValue(right, resolveTo);
+            }
+        }
+
+        rejectCrossCategoryOperator(bin, ctx);
         rejectPhantomOperator(bin, ctx, left, right);
+
+        // A range is stored as its text, so the values alone cannot tell one from a pair of dotted
+        // numbers -- which is how numrange * numrange came out as inet * inet. Where the query
+        // declares a range type the operator is resolved from that declaration instead.
+        if (bin.op() == BinaryExpr.BinOp.MULTIPLY) {
+            Object intersected = declaredRangeIntersection(bin, ctx, left, right);
+            if (intersected != NOT_A_RANGE_OPERATION) return intersected;
+        }
 
         // Collation-aware string comparison for EQUAL/NOT_EQUAL
         if ((bin.op() == BinaryExpr.BinOp.EQUAL || bin.op() == BinaryExpr.BinOp.NOT_EQUAL)
@@ -288,20 +603,6 @@ class BinaryOpEvaluator {
 
         // Operator type mismatch validation (before coercion)
         executor.validateOperatorTypes(bin.op(), left, right);
-
-        // Check for cross-type range operations (intersection via *)
-        if (bin.op() == BinaryExpr.BinOp.MULTIPLY
-                && left instanceof String && right instanceof String
-                && RangeOperations.isRangeString(((String) left)) && RangeOperations.isRangeString(((String) right))) {
-            String rs = (String) right;
-            String ls = (String) left;
-            String leftRangeType = getRangeTypeName(bin.left());
-            String rightRangeType = getRangeTypeName(bin.right());
-            if (leftRangeType != null && rightRangeType != null && !leftRangeType.equals(rightRangeType)) {
-                throw new MemgresException(
-                    "operator does not exist: " + leftRangeType + " * " + rightRangeType + "\n  Hint: No operator matches the given name and argument types. You might need to add explicit type casts.", "42883");
-            }
-        }
 
         // Try built-in operator handling; if it fails due to unsupported types,
         // fall back to user-defined operator lookup
@@ -734,11 +1035,7 @@ class BinaryOpEvaluator {
                 if (right instanceof TsVector) return TsVector.fromText(left.toString()).concat(((TsVector) right));
                 // Array concatenation: array || array, array || element, element || array
                 if (left instanceof List && right instanceof List) {
-                    List<?> ll = (List<?>) left;
-                    List<?> rl = (List<?>) right;
-                    List<Object> merged = new ArrayList<>(ll);
-                    merged.addAll(rl);
-                    return merged;
+                    return ArrayOperationHandler.concatArrays((List<?>) left, (List<?>) right);
                 }
                 if (left instanceof List) {
                     List<?> ll = (List<?>) left;
@@ -977,12 +1274,7 @@ class BinaryOpEvaluator {
                     }
                 }
                 // NULL @@ tsquery or tsvector @@ NULL → NULL (not false)
-                if (left == null || right == null) return null;
-                TsVector vec;
-                if (left instanceof TsVector) { vec = (TsVector) left; }
-                else { String s = left.toString(); TsVector p = TsVector.parseLiteral(s); vec = p != null ? p : TsVector.fromText(s); }
-                TsQuery query = right instanceof TsQuery ? (TsQuery) right : TsQuery.parse(right.toString());
-                return vec.matches(query);
+                return TextSearchOperations.matches(left, right);
             }
             case JSON_HASH_ARROW: {
                 if (left == null || right == null) return null;
@@ -1541,6 +1833,101 @@ class BinaryOpEvaluator {
         return java.util.Collections.singletonList(RangeOperations.parse(s));
     }
 
+    /** Handed back when this rule does not decide the operator, leaving the old path in charge. */
+    private static final Object NOT_A_RANGE_OPERATION = new Object();
+
+    /**
+     * The intersection of two operands the query declares to be ranges. PostgreSQL resolves
+     * {@code *} from those declarations -- a range meets a range and a multirange a multirange --
+     * and answers with the bounds that were written, not with a whole number the text was rounded
+     * to, which is why the bounds are chosen rather than recomputed.
+     */
+    private Object declaredRangeIntersection(BinaryExpr bin, RowContext ctx, Object left, Object right) {
+        String lType = declaredRangeType(bin.left(), bin.right(), ctx);
+        String rType = declaredRangeType(bin.right(), bin.left(), ctx);
+        if (lType == null || rType == null) return NOT_A_RANGE_OPERATION;
+        // A range meeting a multirange is a pairing this rule has nothing to say about, so it is
+        // left to the operand values as before.
+        if (MULTIRANGE_TYPES.contains(lType) != MULTIRANGE_TYPES.contains(rType)) {
+            return NOT_A_RANGE_OPERATION;
+        }
+        if (!lType.equals(rType)) {
+            throw new MemgresException("operator does not exist: " + lType + " * " + rType
+                    + "\n  Hint: No operator matches the given name and argument types."
+                    + " You might need to add explicit type casts.", "42883");
+        }
+        if (left == null || right == null) return null;
+        if (!(left instanceof String) || !(right instanceof String)) return NOT_A_RANGE_OPERATION;
+        if (MULTIRANGE_TYPES.contains(lType)) {
+            java.util.List<RangeOperations.PgRange> parts = new ArrayList<>();
+            for (RangeOperations.PgRange a : RangeOperations.parseMultirange((String) left)) {
+                for (RangeOperations.PgRange b : RangeOperations.parseMultirange((String) right)) {
+                    RangeOperations.PgRange part = intersectRanges(a, b);
+                    if (!part.isEmpty()) parts.add(part);
+                }
+            }
+            StringBuilder sb = new StringBuilder("{");
+            for (int i = 0; i < parts.size(); i++) {
+                if (i > 0) sb.append(',');
+                sb.append(parts.get(i).toString());
+            }
+            return sb.append('}').toString();
+        }
+        return intersectRanges(RangeOperations.parse((String) left),
+                RangeOperations.parse((String) right)).toString();
+    }
+
+    /**
+     * The range or multirange type an operand is declared to have. An untyped literal has already
+     * been read as the type opposite it by the time this runs, so it counts as that type too.
+     */
+    private String declaredRangeType(Expression expr, Expression other, RowContext ctx) {
+        String declared = declaredOperandType(expr, ctx);
+        if (declared == null && isUntypedStringLiteral(expr)) declared = declaredOperandType(other, ctx);
+        if (declared == null) return null;
+        return RANGE_TYPES.contains(declared) || MULTIRANGE_TYPES.contains(declared) ? declared : null;
+    }
+
+    /**
+     * The overlap of two ranges: the later of the two lower bounds and the earlier of the two
+     * upper bounds, each kept exactly as its own range wrote it.
+     */
+    private static RangeOperations.PgRange intersectRanges(
+            RangeOperations.PgRange a, RangeOperations.PgRange b) {
+        RangeOperations.PgRange empty = new RangeOperations.PgRange(null, null, true, false, true);
+        if (a.isEmpty() || b.isEmpty()) return empty;
+        RangeOperations.PgRange lo = startsLater(a, b) ? a : b;
+        RangeOperations.PgRange hi = endsEarlier(a, b) ? a : b;
+        RangeOperations.PgRange result = new RangeOperations.PgRange(lo.lower, hi.upper,
+                lo.lowerInclusive, hi.upperInclusive, false, lo.lowerStr, hi.upperStr);
+        return result.isEmpty() ? empty : result;
+    }
+
+    /** True when a's lower bound admits fewer values than b's. A missing bound is -infinity. */
+    private static boolean startsLater(RangeOperations.PgRange a, RangeOperations.PgRange b) {
+        if (a.lower == null) return false;
+        if (b.lower == null) return true;
+        int c = toBigDecimal(a.lower).compareTo(toBigDecimal(b.lower));
+        if (c != 0) return c > 0;
+        // At the same value the bound that excludes it starts later
+        return !a.lowerInclusive || b.lowerInclusive;
+    }
+
+    /** True when a's upper bound admits fewer values than b's. A missing bound is +infinity. */
+    private static boolean endsEarlier(RangeOperations.PgRange a, RangeOperations.PgRange b) {
+        if (a.upper == null) return false;
+        if (b.upper == null) return true;
+        int c = toBigDecimal(a.upper).compareTo(toBigDecimal(b.upper));
+        if (c != 0) return c < 0;
+        return !a.upperInclusive || b.upperInclusive;
+    }
+
+    private static java.math.BigDecimal toBigDecimal(Number n) {
+        if (n instanceof java.math.BigDecimal) return (java.math.BigDecimal) n;
+        if (n instanceof Double || n instanceof Float) return new java.math.BigDecimal(n.toString());
+        return java.math.BigDecimal.valueOf(n.longValue());
+    }
+
     private static String shiftBitString(String bits, int shift, boolean leftShift) {
         int len = bits.length();
         if (shift >= len || shift <= -len) {
@@ -1877,11 +2264,7 @@ class BinaryOpEvaluator {
                 if (right instanceof TsVector) return TsVector.fromText(left.toString()).concat(((TsVector) right));
                 // Array concatenation: array || array, array || element, element || array
                 if (left instanceof List && right instanceof List) {
-                    List<?> ll = (List<?>) left;
-                    List<?> rl = (List<?>) right;
-                    List<Object> merged = new ArrayList<>(ll);
-                    merged.addAll(rl);
-                    return merged;
+                    return ArrayOperationHandler.concatArrays((List<?>) left, (List<?>) right);
                 }
                 if (left instanceof List) {
                     List<?> ll = (List<?>) left;
@@ -1945,12 +2328,7 @@ class BinaryOpEvaluator {
                     }
                 }
                 // NULL @@ tsquery or tsvector @@ NULL → NULL (not false)
-                if (left == null || right == null) return null;
-                TsVector vec;
-                if (left instanceof TsVector) { vec = (TsVector) left; }
-                else { String s = left.toString(); TsVector p = TsVector.parseLiteral(s); vec = p != null ? p : TsVector.fromText(s); }
-                TsQuery query = right instanceof TsQuery ? (TsQuery) right : TsQuery.parse(right.toString());
-                return vec.matches(query);
+                return TextSearchOperations.matches(left, right);
             }
             case JSON_HASH_ARROW: {
                 if (left == null || right == null) return null;

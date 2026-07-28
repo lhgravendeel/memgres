@@ -23,6 +23,27 @@ class DdlFunctionParser {
         "JSON_ARRAYAGG", "JSON_OBJECTAGG"
     );
 
+    /**
+     * True when {@code firstIdent} is the first word of a two-word type name and the next token is
+     * the word that completes it — so what was read as a parameter name is really half a type.
+     */
+    private static boolean continuesMultiWordType(Parser parser, String firstIdent) {
+        String head = firstIdent == null ? "" : firstIdent.toLowerCase();
+        switch (head) {
+            case "double":
+                return parser.checkKeyword("PRECISION") || parser.checkIdentifier("precision");
+            case "character":
+            case "bit":
+                return parser.checkKeyword("VARYING") || parser.checkIdentifier("varying");
+            case "time":
+            case "timestamp":
+                return parser.checkKeyword("WITH") || parser.checkIdentifier("with")
+                        || parser.checkKeyword("WITHOUT") || parser.checkIdentifier("without");
+            default:
+                return false;
+        }
+    }
+
     DdlFunctionParser(Parser parser) {
         this.parser = parser;
     }
@@ -61,7 +82,14 @@ class DdlFunctionParser {
                 boolean isTypeOnly = parser.check(TokenType.COMMA) || parser.check(TokenType.RIGHT_PAREN) ||
                         parser.checkKeyword("DEFAULT") || parser.check(TokenType.COLON_EQUALS) ||
                         parser.check(TokenType.LEFT_BRACKET);
-                if (isTypeOnly) {
+                // A type whose name is two words has no parameter name in front of it: what looks
+                // like the name is the first half of the type. Reading "double" as the name left
+                // "precision" as the type, so the parameter could not be declared at all.
+                if (!isTypeOnly && continuesMultiWordType(parser, firstIdent)) {
+                    parser.pos = saved;
+                    String typeName = parser.parseTypeName();
+                    parsedParams.add(new CreateFunctionStmt.FuncParam(null, typeName, mode));
+                } else if (isTypeOnly) {
                     paramName = null;
                     String typeName = firstIdent;
                     typeName = readTypeModifiers(typeName);

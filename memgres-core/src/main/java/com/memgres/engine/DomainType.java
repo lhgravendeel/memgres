@@ -48,6 +48,12 @@ public class DomainType {
         this.defaultValue = defaultValue;
     }
 
+    /** Forget the CHECK that CREATE DOMAIN wrote, once ALTER DOMAIN DROP CONSTRAINT names it. */
+    public void clearInlineCheck() {
+        this.checkExpression = null;
+        this.parsedCheck = null;
+    }
+
     public void addConstraint(String constraintName, String rawCheckExpr, Expression parsedCheckExpr) {
         namedConstraints.add(new NamedConstraint(constraintName, rawCheckExpr, parsedCheckExpr, true));
     }

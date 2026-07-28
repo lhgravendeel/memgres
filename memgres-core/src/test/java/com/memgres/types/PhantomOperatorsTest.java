@@ -67,9 +67,17 @@ class PhantomOperatorsTest {
     // ------------------------------------------------------------------
 
     @Test
-    void pointHasNoEqualityOperator() {
+    void pointHasNoEqualityOperator() throws SQLException {
         assertEquals("42883", state("SELECT (point '(1,2)' = point '(1,2)')"));
-        assertEquals("42883", state("SELECT (point '(1,2)' <> point '(3,4)')"));
+        // "<>" IS a real point operator in PG -- pg_operator lists it -- so only "=" is missing,
+        // and point equality is spelled ~=
+        assertEquals("true", expr("SELECT (point '(1,2)' <> point '(3,4)')::text"));
+        assertEquals("true", expr("SELECT (point '(1,2)' ~= point '(1,2)')::text"));
+        // a polygon has neither
+        assertEquals("42883",
+                state("SELECT (polygon '((0,0),(1,1))' = polygon '((0,0),(1,1))')"));
+        assertEquals("42883",
+                state("SELECT (polygon '((0,0),(1,1))' <> polygon '((0,0),(2,2))')"));
     }
 
     /** A column carries its declared type into the operator resolution too. */

@@ -927,8 +927,26 @@ class FunctionEvaluator {
             case "nullif": {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
-                validateHomogeneousTypes(Cols.listOf(a != null ? a : "", b != null ? b : ""), "NULLIF");
-                return Objects.equals(a, b) ? null : a;
+                // NULL is never equal to anything, so PG hands the first argument straight back.
+                // Standing in an empty string for the missing value instead made NULLIF(1, NULL)
+                // read "" as an integer and fail on input the query never contained.
+                if (a == null) return null;
+                if (b == null) return a;
+                validateHomogeneousTypes(Cols.listOf(a, b), "NULLIF");
+                Object left = a, right = b;
+                // NULLIF is defined as a "=" between its arguments, and PG resolves that operator
+                // from the declared types: a bare literal is unknown and is read as the other
+                // side's type. Comparing the raw values instead left NULLIF(1, '1') at 1.
+                if (isUntypedStringLiteral(fn.args().get(1)) && !isUntypedStringLiteral(fn.args().get(0))) {
+                    right = readUntypedLiteralAs(right, left);
+                } else if (isUntypedStringLiteral(fn.args().get(0)) && !isUntypedStringLiteral(fn.args().get(1))) {
+                    left = readUntypedLiteralAs(left, right);
+                }
+                if (left instanceof Number && right instanceof Number) {
+                    // The numeric types share one comparison in PG, so 1 and 1.0 are equal there.
+                    return TypeCoercion.compare(left, right) == 0 ? null : a;
+                }
+                return Objects.equals(left, right) ? null : a;
             }
             case "greatest": {
                 if (fn.args().isEmpty()) throw new MemgresException("syntax error at or near \")\"", "42601");
@@ -1013,11 +1031,12 @@ class FunctionEvaluator {
                 return tsArg;
             }
             case "array_length": {
+                requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
-                if (!(arr instanceof List<?>) && !(arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}"))) {
+                if (!(arr instanceof List<?>) && !isPgArrayText(arr)) {
                     String typeName = arr instanceof Number ? "integer" : "text";
-                    throw new MemgresException("function array_length(" + typeName + ", integer) does not exist", "42804");
+                    throw new MemgresException("function array_length(" + typeName + ", integer) does not exist", "42883");
                 }
                 int dim = fn.args().size() > 1 ? executor.toInt(executor.evalExpr(fn.args().get(1), ctx)) : 1;
                 if (dim < 1) return null; // dimension 0 doesn't exist
@@ -1028,9 +1047,10 @@ class FunctionEvaluator {
                     if (dim == 2 && !list.isEmpty() && list.get(0) instanceof List<?>) return ((List<?>) list.get(0)).size();
                     return null; // dimension doesn't exist for this array
                 }
-                // Handle PostgreSQL array string format: {val1,val2,...}
-                if (arr instanceof String && ((String) arr).startsWith("{") && ((String) arr).endsWith("}")) {
-                    String s = (String) arr;
+                // Handle PostgreSQL array string format: {val1,val2,...}, with the optional
+                // "[lb:ub]=" prefix an array with a non-default lower bound is written with.
+                if (isPgArrayText(arr)) {
+                    String s = pgArrayBody(arr.toString());
                     if (dim != 1) return null;
                     String inner = s.substring(1, s.length() - 1).trim();
                     if (inner.isEmpty()) return null; // PG returns NULL for empty arrays
@@ -1039,6 +1059,7 @@ class FunctionEvaluator {
                 return null;
             }
             case "array_upper": {
+                requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 int dim2 = fn.args().size() > 1 ? executor.toInt(executor.evalExpr(fn.args().get(1), ctx)) : 1;
                 if (dim2 < 1) return null;
@@ -1069,6 +1090,7 @@ class FunctionEvaluator {
                 return null;
             }
             case "array_lower": {
+                requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 int dim2 = fn.args().size() > 1 ? executor.toInt(executor.evalExpr(fn.args().get(1), ctx)) : 1;
                 if (dim2 < 1) return null;
@@ -1097,6 +1119,7 @@ class FunctionEvaluator {
                 return null;
             }
             case "array_ndims": {
+                requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
                 String s = arr instanceof String ? (String) arr : TypeCoercion.formatPgArray(arr instanceof List<?> ? (List<?>) arr : Cols.listOf(arr));
@@ -1153,6 +1176,7 @@ class FunctionEvaluator {
                 return TypeCoercion.formatPgArray(list);
             }
             case "array_dims": {
+                requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
                 List<?> list = null;
@@ -1193,6 +1217,7 @@ class FunctionEvaluator {
                 return TypeCoercion.formatPgArray(list);
             }
             case "array_to_string": {
+                requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object delim = executor.evalExpr(fn.args().get(1), ctx);
                 // PG is strict on the delimiter: a NULL there makes the whole call NULL.
@@ -1230,6 +1255,7 @@ class FunctionEvaluator {
                 return null;
             }
             case "cardinality": {
+                requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr instanceof List<?>) return countLeafElements((List<?>) arr);
                 if (arr != null) {
@@ -1241,6 +1267,28 @@ class FunctionEvaluator {
                     }
                 }
                 return null;
+            }
+            // The function spellings of the ?| and ?& operators. PG exposes both, and code that
+            // builds SQL from a query builder tends to write the function rather than an operator
+            // the driver's parameter placeholder syntax collides with.
+            case "jsonb_exists_any":
+            case "jsonb_exists_all": {
+                Object json = executor.evalExpr(fn.args().get(0), ctx);
+                Object keysArg = executor.evalExpr(fn.args().get(1), ctx);
+                if (json == null || keysArg == null) return null;
+                List<String> keys = jsonbKeyArg(keysArg);
+                if (json instanceof HstoreValue) {
+                    Map<String, String> data = ((HstoreValue) json).getData();
+                    for (String key : keys) {
+                        boolean present = key != null && data.containsKey(key);
+                        if (name.endsWith("any") && present) return true;
+                        if (name.endsWith("all") && !present) return false;
+                    }
+                    return !name.endsWith("any");
+                }
+                return name.endsWith("any")
+                        ? JsonOperations.anyKeyExists(json.toString(), keys)
+                        : JsonOperations.allKeysExist(json.toString(), keys);
             }
             case "unnest": {
                 if (fn.args().isEmpty()) {
@@ -2421,7 +2469,12 @@ class FunctionEvaluator {
                                 }
                             }
                         }
-                        userFunc = executor.database.resolveFunction(overloads, fn.args().size(), argTypeHints);
+                        // Pick among same-arity candidates the way PG's function resolution does,
+                        // before falling back to the arity-and-hint match below.
+                        List<PgFunction> best = narrowByDeclaredArgTypes(overloads, fn, callHasNamedArgs);
+                        if (best != null) overloads = best;
+                        userFunc = overloads.isEmpty() ? null
+                                : executor.database.resolveFunction(overloads, fn.args().size(), argTypeHints);
                         // When explicit VARIADIC was used and the array was empty,
                         // expansion yields 0 variadic args. Resolution rejects this
                         // because it looks like no variadic args were provided.
@@ -2793,6 +2846,319 @@ class FunctionEvaluator {
                 // First was string, second is number; PG would infer text type, numbers coerce to text, that's OK
             }
         }
+    }
+
+    // ---- Overload resolution over the types the call was written with ----
+
+    /** The type categories PostgreSQL resolves an overloaded call within. */
+    private enum ArgCategory { NUMERIC, STRING, BOOLEAN }
+
+    /**
+     * How far a numeric type sits along the chain PostgreSQL casts implicitly: a value converts
+     * without being asked only towards a wider type, so numeric reaches float8 but not the other
+     * way round. This is what makes f(int)/f(float8) called with 6.0 resolve to the float8 one.
+     */
+    private static int numericRank(String type) {
+        switch (type) {
+            case "smallint": return 1;
+            case "integer": return 2;
+            case "bigint": return 3;
+            case "numeric": return 4;
+            case "real": return 5;
+            case "double precision": return 6;
+            default: return -1;
+        }
+    }
+
+    private static ArgCategory categoryOf(String type) {
+        if (numericRank(type) > 0) return ArgCategory.NUMERIC;
+        switch (type) {
+            case "text": case "character varying": case "character": case "name":
+                return ArgCategory.STRING;
+            case "boolean":
+                return ArgCategory.BOOLEAN;
+            default:
+                return null;
+        }
+    }
+
+    /** The type PostgreSQL falls back on within a category when nothing else decides. */
+    private static String preferredTypeOf(ArgCategory category) {
+        switch (category) {
+            case NUMERIC: return "double precision";
+            case STRING: return "text";
+            default: return "boolean";
+        }
+    }
+
+    /** The spelling PostgreSQL stores a type under, so that int, int4 and integer compare equal. */
+    private static String canonicalTypeName(String type) {
+        if (type == null) return null;
+        String t = type.toLowerCase().trim();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        switch (t) {
+            case "int": case "int4": return "integer";
+            case "int2": return "smallint";
+            case "int8": return "bigint";
+            case "float4": return "real";
+            case "float8": case "float": return "double precision";
+            case "decimal": return "numeric";
+            case "varchar": return "character varying";
+            case "char": case "bpchar": return "character";
+            case "bool": return "boolean";
+            default: return t;
+        }
+    }
+
+    /**
+     * The type the query text itself gives an argument, or null for PostgreSQL's {@code unknown}.
+     * Only a cast or a literal counts. A column or a nested call is deliberately left out: the
+     * engine's runtime value carries whatever Java class it was stored as, and narrowing a call
+     * on the strength of that would refuse overloads PostgreSQL resolves.
+     */
+    private static String writtenArgType(Expression expr) {
+        if (expr instanceof CastExpr) return canonicalTypeName(((CastExpr) expr).typeName());
+        if (expr instanceof Literal) {
+            switch (((Literal) expr).literalType()) {
+                case INTEGER: return "integer";
+                case FLOAT: return "numeric";
+                case BOOLEAN: return "boolean";
+                default: return null; // a string or NULL literal is unknown
+            }
+        }
+        return null;
+    }
+
+    /** True when an argument of one type reaches a parameter of another without an explicit cast. */
+    private static boolean acceptsImplicitly(String argType, String paramType) {
+        if (argType.equals(paramType)) return true;
+        ArgCategory ac = categoryOf(argType), pc = categoryOf(paramType);
+        if (ac == null || ac != pc) return false;
+        if (ac == ArgCategory.NUMERIC) return numericRank(argType) <= numericRank(paramType);
+        return ac == ArgCategory.STRING; // the string types all convert to each other
+    }
+
+    /**
+     * Narrows overloaded candidates to the one PostgreSQL would call, or returns null to leave the
+     * choice to the arity-and-hint match. PG resolves a call from the types written in the query:
+     * it keeps the candidates every argument reaches, prefers exact matches, then prefers the
+     * category's preferred type, and finally reads an untyped literal as the string type when a
+     * candidate takes one. Choosing the first same-arity candidate instead made f(int)/f(float8)
+     * answer with the int one for f('6') and f(6.0), which PostgreSQL sends to float8.
+     *
+     * <p>The rule engages only when every argument's type is written in the query and every
+     * candidate is a plain list of IN parameters of types this understands. Anything else — a
+     * column argument, a default, a VARIADIC, a domain or a composite parameter — is left to the
+     * existing path, because a wrong narrowing here rejects SQL PostgreSQL runs.
+     */
+    private List<PgFunction> narrowByDeclaredArgTypes(List<PgFunction> overloads,
+                                                      FunctionCallExpr fn, boolean callHasNamedArgs) {
+        if (callHasNamedArgs || overloads.size() < 2) return null;
+        List<String> argTypes = new ArrayList<>();
+        boolean anyUnknown = false;
+        for (Expression arg : fn.args()) {
+            String t = writtenArgType(arg);
+            if (t == null) {
+                if (!(arg instanceof Literal)) return null; // a column or a call: no opinion
+                anyUnknown = true;
+            } else if (categoryOf(t) == null) {
+                return null; // a cast to a type these rules say nothing about
+            }
+            argTypes.add(t);
+        }
+
+        List<PgFunction> candidates = new ArrayList<>();
+        for (PgFunction f : overloads) {
+            List<String> params = plainInputParamTypes(f);
+            // One candidate of a shape these rules do not model leaves the whole call undecided:
+            // discarding it could send the call to an overload PostgreSQL would not have chosen.
+            if (params == null) return null;
+            if (params.size() != argTypes.size()) continue;
+            boolean reachable = true;
+            for (int i = 0; i < params.size(); i++) {
+                if (argTypes.get(i) == null) continue; // unknown reaches anything
+                if (!acceptsImplicitly(argTypes.get(i), params.get(i))) { reachable = false; break; }
+            }
+            if (reachable) candidates.add(f);
+        }
+        if (candidates.isEmpty()) return new ArrayList<>(); // nothing matches: no such function
+        if (candidates.size() == 1) return candidates;
+
+        candidates = keepBest(candidates, argTypes, true);
+        if (candidates.size() == 1) return candidates;
+        candidates = keepBest(candidates, argTypes, false);
+        if (candidates.size() == 1) return candidates;
+        candidates = narrowUnknownArgs(candidates, argTypes);
+        if (candidates == null) return null;
+        if (candidates.size() == 1) return candidates;
+        if (!anyUnknown) return null; // ambiguous only among typed args: leave it to the old path
+        throw new MemgresException("function " + fn.name() + "(" + unknownSignature(argTypes)
+                + ") is not unique\n  Hint: Could not choose a best candidate function."
+                + " You might need to add explicit type casts.", "42725");
+    }
+
+    /**
+     * Keeps the candidates matching the most argument positions exactly, or — when
+     * {@code exact} is false — on the most preferred types of the arguments' categories.
+     */
+    private List<PgFunction> keepBest(List<PgFunction> candidates, List<String> argTypes, boolean exact) {
+        int bestScore = -1;
+        List<PgFunction> best = new ArrayList<>();
+        for (PgFunction f : candidates) {
+            List<String> params = plainInputParamTypes(f);
+            int score = 0;
+            for (int i = 0; i < argTypes.size(); i++) {
+                String arg = argTypes.get(i);
+                if (arg == null) continue;
+                String param = params.get(i);
+                if (exact ? arg.equals(param)
+                        : param.equals(preferredTypeOf(categoryOf(arg)))) score++;
+            }
+            if (score > bestScore) { bestScore = score; best.clear(); }
+            if (score == bestScore) best.add(f);
+        }
+        return best;
+    }
+
+    /**
+     * Applies PostgreSQL's last rule: at each argument the query left untyped, a candidate taking
+     * a string type wins because an untyped literal looks like one; failing that all candidates
+     * must agree on a category, and the category's preferred type wins within it. Returns null
+     * when a candidate's parameter falls outside these categories, where guessing is unsafe.
+     */
+    private List<PgFunction> narrowUnknownArgs(List<PgFunction> candidates, List<String> argTypes) {
+        for (int i = 0; i < argTypes.size() && candidates.size() > 1; i++) {
+            if (argTypes.get(i) != null) continue;
+            Set<ArgCategory> categories = new LinkedHashSet<>();
+            for (PgFunction f : candidates) {
+                ArgCategory c = categoryOf(plainInputParamTypes(f).get(i));
+                if (c == null) return null;
+                categories.add(c);
+            }
+            ArgCategory chosen = categories.contains(ArgCategory.STRING) ? ArgCategory.STRING
+                    : categories.size() == 1 ? categories.iterator().next() : null;
+            if (chosen == null) continue; // no clue at this position; PG reports it as ambiguous
+            List<PgFunction> kept = new ArrayList<>();
+            for (PgFunction f : candidates) {
+                if (categoryOf(plainInputParamTypes(f).get(i)) == chosen) kept.add(f);
+            }
+            String preferred = preferredTypeOf(chosen);
+            List<PgFunction> preferredOnly = new ArrayList<>();
+            for (PgFunction f : kept) {
+                if (plainInputParamTypes(f).get(i).equals(preferred)) preferredOnly.add(f);
+            }
+            candidates = preferredOnly.isEmpty() ? kept : preferredOnly;
+        }
+        return candidates;
+    }
+
+    /** The signature PostgreSQL prints for a call it could not resolve. */
+    private static String unknownSignature(List<String> argTypes) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < argTypes.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(argTypes.get(i) == null ? "unknown" : argTypes.get(i));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The canonical types of a function's parameters when it takes nothing but plain IN
+     * parameters of types these rules model, or null when it does not.
+     */
+    private static List<String> plainInputParamTypes(PgFunction f) {
+        List<String> types = new ArrayList<>();
+        for (PgFunction.Param p : f.getParams()) {
+            String mode = p.mode();
+            if (mode != null && !"IN".equalsIgnoreCase(mode)) return null;
+            if (p.defaultExpr() != null) return null;
+            String t = canonicalTypeName(p.typeName());
+            if (t == null || categoryOf(t) == null) return null;
+            types.add(t);
+        }
+        return types;
+    }
+
+    /** True for a string literal written without a cast, which is PostgreSQL's {@code unknown}. */
+    private static boolean isUntypedStringLiteral(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
+    /**
+     * Reads an untyped literal as the type of the value it is being compared with. Only a numeric
+     * counterpart is handled: every other type either already compares as text or has a spelling
+     * this would have to guess at, and guessing rejects input PostgreSQL accepts.
+     */
+    private static Object readUntypedLiteralAs(Object literalValue, Object typedValue) {
+        if (!(literalValue instanceof String) || !(typedValue instanceof Number)) return literalValue;
+        String text = ((String) literalValue).trim();
+        try {
+            return new BigDecimal(text);
+        } catch (NumberFormatException e) {
+            throw new MemgresException("invalid input syntax for type "
+                    + numericTypeNameOf(typedValue) + ": \"" + literalValue + "\"", "22P02");
+        }
+    }
+
+    /** The type name PostgreSQL prints when an untyped literal will not read as this number. */
+    private static String numericTypeNameOf(Object value) {
+        if (value instanceof Integer || value instanceof Short) return "integer";
+        if (value instanceof Long) return "bigint";
+        if (value instanceof Double || value instanceof Float) return "double precision";
+        return "numeric";
+    }
+
+    /**
+     * PostgreSQL binds an {@code anyarray} parameter from the type its argument is declared to
+     * have, and a bare literal has none — {@code array_length('{1,2,3}', 1)} is an error there
+     * rather than an array. Only what the query wrote is inspected, so a cast, an ARRAY
+     * constructor, a column and a nested function call all carry a type and keep working.
+     */
+    private static void requireDeclaredArrayArg(Expression arg) {
+        if (!(arg instanceof Literal)) return;
+        Literal.LiteralType type = ((Literal) arg).literalType();
+        if (type == Literal.LiteralType.STRING || type == Literal.LiteralType.NULL) {
+            throw new MemgresException(
+                    "could not determine polymorphic type because input has type unknown", "42804");
+        }
+    }
+
+    /**
+     * True when a value is an array in PostgreSQL's text form, either {@code {a,b}} or the
+     * {@code [0:2]={a,b,c}} form an array with a non-default lower bound is written with.
+     */
+    private static boolean isPgArrayText(Object value) {
+        if (!(value instanceof String)) return false;
+        String body = pgArrayBody((String) value);
+        return body.startsWith("{") && body.endsWith("}");
+    }
+
+    /** The {@code {...}} part of an array's text form, with any {@code [lb:ub]=} prefix removed. */
+    private static String pgArrayBody(String text) {
+        String s = text.trim();
+        if (s.startsWith("[")) {
+            int eq = s.indexOf("]=");
+            if (eq > 0) return s.substring(eq + 2).trim();
+        }
+        return s;
+    }
+
+    /** The keys an {@code ?|}/{@code ?&} style argument names, from a text[] value or its text form. */
+    private List<String> jsonbKeyArg(Object value) {
+        if (value instanceof List<?>) {
+            List<String> keys = new ArrayList<>();
+            for (Object o : (List<?>) value) keys.add(o == null ? null : o.toString());
+            return keys;
+        }
+        String s = value.toString().trim();
+        if (s.startsWith("{") && s.endsWith("}")) {
+            List<String> keys = new ArrayList<>();
+            for (Object o : parseSimplePgArray(s)) keys.add(o == null ? null : o.toString());
+            return keys;
+        }
+        throw new MemgresException("malformed array literal: \"" + s + "\"", "22P02");
     }
 
     /** Returns true if the string can be parsed as a number. */

@@ -1429,8 +1429,10 @@ class DdlParser {
         }
         if (parser.matchKeywords("DROP", "DEFAULT"))
             return new AlterDomainStmt(domainName, "DROP_DEFAULT", null, null, null, null);
-        if (parser.matchKeywords("ADD", "CONSTRAINT")) {
-            String constraintName = parser.readIdentifier();
+        // The constraint name is optional: ALTER DOMAIN d ADD CHECK (...) is as valid as the
+        // named form, and PostgreSQL then names the constraint itself.
+        if (parser.matchKeyword("ADD")) {
+            String constraintName = parser.matchKeyword("CONSTRAINT") ? parser.readIdentifier() : null;
             parser.expectKeyword("CHECK");
             parser.expect(TokenType.LEFT_PAREN);
             int startPos = parser.pos;
@@ -1441,7 +1443,10 @@ class DdlParser {
             return new AlterDomainStmt(domainName, "ADD_CONSTRAINT", null, constraintName, checkExpr, raw, notValid, null);
         }
         if (parser.matchKeywords("DROP", "CONSTRAINT")) {
-            return new AlterDomainStmt(domainName, "DROP_CONSTRAINT", null, parser.readIdentifier(), null, null);
+            boolean ifExists = parser.matchKeywords("IF", "EXISTS");
+            String name = parser.readIdentifier();
+            return new AlterDomainStmt(domainName,
+                    ifExists ? "DROP_CONSTRAINT_IF_EXISTS" : "DROP_CONSTRAINT", null, name, null, null);
         }
         if (parser.matchKeywords("VALIDATE", "CONSTRAINT")) {
             return new AlterDomainStmt(domainName, "VALIDATE", null, parser.readIdentifier(), null, null);
