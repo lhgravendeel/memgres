@@ -973,7 +973,9 @@ class ExprEvaluator {
             }
         }
         checkNumericSpecialToInteger(cast, val);
-        return executor.castEvaluator.applyCast(val, cast.typeName());
+        boolean unknownLiteral = cast.expr() instanceof Literal
+                && ((Literal) cast.expr()).literalType() == Literal.LiteralType.STRING;
+        return executor.castEvaluator.applyCast(val, cast.typeName(), unknownLiteral);
     }
 
     /**
