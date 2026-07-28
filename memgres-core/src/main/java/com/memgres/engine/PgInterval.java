@@ -240,6 +240,23 @@ public class PgInterval implements Comparable<PgInterval> {
                 long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(seconds * 1_000_000L);
                 return checked(totalMonths, days, totalMicros);
             }
+            // ISO 8601's alternative form, PYYYY-MM-DDThh:mm:ss: the same fields written
+            // positionally rather than each with its own designator letter
+            Matcher alt = java.util.regex.Pattern.compile(
+                    "^[Pp](-?\\d+)-(\\d+)-(\\d+)(?:[Tt](-?\\d+):(\\d+):(\\d+(?:\\.\\d+)?))?$"
+            ).matcher(s);
+            if (alt.matches()) {
+                int years = Integer.parseInt(alt.group(1));
+                int mons = Integer.parseInt(alt.group(2));
+                int days = Integer.parseInt(alt.group(3));
+                int hours = alt.group(4) != null ? Integer.parseInt(alt.group(4)) : 0;
+                int minutes = alt.group(5) != null ? Integer.parseInt(alt.group(5)) : 0;
+                double seconds = alt.group(6) != null ? Double.parseDouble(alt.group(6)) : 0;
+                long totalMonths = (long) years * 12 + mons;
+                long totalMicros = (hours * 3600L + minutes * 60L) * 1_000_000L
+                        + Math.round(seconds * 1_000_000L);
+                return checked(totalMonths, days, totalMicros);
+            }
         }
 
         // Try verbose format first: '1 year 2 months 3 weeks 3 days 4 hours 5 minutes 6 seconds'
@@ -509,23 +526,24 @@ public class PgInterval implements Comparable<PgInterval> {
         int years = months / 12;
         int mons = months % 12;
 
-        // PG marks a positive field that follows a negative one with an explicit '+', which is
-        // what makes '-1 mons +3 days' the printed form -- and what has to read back in.
+        // PG marks a positive field that directly follows a negative one with an explicit '+',
+        // which is what makes '-1 mons +3 days' the printed form -- and what has to read back
+        // in. Only the field before decides, so '-1 years +2 mons 3 days' has one plus, not two.
         boolean sawNegative = false;
         if (years != 0) {
             if (sawNegative && years > 0) sb.append('+');
             sb.append(years).append(years == 1 ? " year " : " years ");
-            sawNegative |= years < 0;
+            sawNegative = years < 0;
         }
         if (mons != 0) {
             if (sawNegative && mons > 0) sb.append('+');
             sb.append(mons).append(mons == 1 ? " mon " : " mons ");
-            sawNegative |= mons < 0;
+            sawNegative = mons < 0;
         }
         if (days != 0) {
             if (sawNegative && days > 0) sb.append('+');
             sb.append(days).append(days == 1 ? " day " : " days ");
-            sawNegative |= days < 0;
+            sawNegative = days < 0;
         }
 
         long absMicros = Math.abs(microseconds);

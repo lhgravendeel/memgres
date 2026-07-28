@@ -2455,6 +2455,10 @@ class ExprEvaluator {
                 // timestamptz value advertised/decoded as DATE corrupts pgjdbc's binary decode).
                 if (fn.args().size() >= 2) {
                     DataType dt = inferTypeFromContext(fn.args().get(1), bindings);
+                    // PG has no date_trunc over date or time; a date resolves through the
+                    // timestamptz form and a time through the interval one
+                    if (dt == DataType.DATE) return DataType.TIMESTAMPTZ;
+                    if (dt == DataType.TIME) return DataType.INTERVAL;
                     if (dt != null) return dt;
                 }
                 return DataType.TIMESTAMP;
