@@ -237,12 +237,13 @@ class StringFunctions {
                     java.util.List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(((String) arg));
                     if (ranges.isEmpty()) return null;
                     RangeOperations.PgRange last = ranges.get(ranges.size() - 1);
-                    return last.isEmpty() ? null : last.upper();
+                    return last.isEmpty() ? null : last.upperValue();
                 }
+                // Range upper() — the bound comes back as a value of the element type
                 if (arg instanceof String && RangeOperations.isRangeString(((String) arg))) {
                     String s = (String) arg;
                     RangeOperations.PgRange r = RangeOperations.parse(s);
-                    return r.isEmpty() ? null : r.upper();
+                    return r.isEmpty() ? null : r.upperValue();
                 }
                 if (arg instanceof Number) throw new MemgresException("function upper(integer) does not exist", "42883");
                 if (asciiOnly) {
@@ -301,13 +302,13 @@ class StringFunctions {
                     java.util.List<RangeOperations.PgRange> ranges = RangeOperations.parseMultirange(((String) arg));
                     if (ranges.isEmpty()) return null;
                     RangeOperations.PgRange first = ranges.get(0);
-                    return first.isEmpty() ? null : first.lower();
+                    return first.isEmpty() ? null : first.lowerValue();
                 }
-                // Range lower() function
+                // Range lower() function — the bound comes back as a value of the element type
                 if (arg instanceof String && RangeOperations.isRangeString(((String) arg))) {
                     String s = (String) arg;
                     RangeOperations.PgRange r = RangeOperations.parse(s);
-                    return r.isEmpty() ? null : r.lower();
+                    return r.isEmpty() ? null : r.lowerValue();
                 }
                 if (arg instanceof Number) throw new MemgresException("function lower(integer) does not exist", "42883");
                 {

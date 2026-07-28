@@ -296,9 +296,40 @@ public final class TypeCoercion {
             case TSQUERY:
                 if (value instanceof TsQuery) return value;
                 return TsQuery.parse(value.toString());
+            case INT4RANGE:
+            case INT8RANGE:
+            case NUMRANGE:
+            case DATERANGE:
+            case TSRANGE:
+            case TSTZRANGE:
+                // A range's column type names its element type, so the bounds are read and stored
+                // as values of it — the same normalisation an explicit cast performs.
+                return RangeOperations.parse(value.toString().trim(), targetType.getPgName())
+                        .toString();
+            case INT4MULTIRANGE:
+            case INT8MULTIRANGE:
+            case NUMMULTIRANGE:
+            case DATEMULTIRANGE:
+            case TSMULTIRANGE:
+            case TSTZMULTIRANGE:
+                return normalizeMultirangeForStorage(value.toString().trim(), targetType);
             default:
                 return value;
         }
+    }
+
+    private static String normalizeMultirangeForStorage(String text, DataType targetType) {
+        String rangeType = targetType.getPgName().replace("multirange", "range");
+        if (text.equalsIgnoreCase("empty")) return "{}";
+        if (RangeOperations.isRangeString(text)) {
+            RangeOperations.PgRange one = RangeOperations.parse(text, rangeType);
+            return one.isEmpty() ? "{}" : "{" + one + "}";
+        }
+        java.util.List<RangeOperations.PgRange> parts = new java.util.ArrayList<>();
+        for (RangeOperations.PgRange r : RangeOperations.parseMultirangeLiteral(text, rangeType)) {
+            if (!r.isEmpty()) parts.add(r);
+        }
+        return RangeOperations.formatMultirange(RangeOperations.mergeAndSort(parts));
     }
 
     /**
@@ -418,6 +449,21 @@ public final class TypeCoercion {
                 return value instanceof TsVector;
             case TSQUERY:
                 return value instanceof TsQuery;
+            case INT4RANGE:
+            case INT8RANGE:
+            case NUMRANGE:
+            case DATERANGE:
+            case TSRANGE:
+            case TSTZRANGE:
+            case INT4MULTIRANGE:
+            case INT8MULTIRANGE:
+            case NUMMULTIRANGE:
+            case DATEMULTIRANGE:
+            case TSMULTIRANGE:
+            case TSTZMULTIRANGE:
+                // A range arrives as text and stays text, but the text has to be the canonical
+                // form for the column's element type rather than whatever was written.
+                return false;
             default:
                 return value instanceof String;
         }

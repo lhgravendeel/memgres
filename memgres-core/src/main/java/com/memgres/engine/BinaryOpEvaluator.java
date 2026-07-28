@@ -1583,40 +1583,24 @@ class BinaryOpEvaluator {
                     if (RangeOperations.isMultirangeOrEmpty(ls)) {
                         if (RangeOperations.isMultirangeOrEmpty(rs)) return RangeOperations.multirangeContainsMultirange(ls, rs);
                         if (RangeOperations.isRangeString(rs)) return RangeOperations.multirangeContainsRange(ls, RangeOperations.parse(rs));
-                        if (right instanceof Number) return RangeOperations.multirangeContains(ls, ((Number) right));
-                        try { return RangeOperations.multirangeContains(ls, Long.parseLong(rs)); } catch (NumberFormatException ignore) {}
-                        return false;
+                        return RangeOperations.multirangeContainsValue(ls, right);
                     }
                     // Range containment: range @> value or range @> range or range @> multirange
                     if (RangeOperations.isRangeString(ls)) {
                         RangeOperations.PgRange range = RangeOperations.parse(ls);
-                        if (right instanceof Number) return range.contains(((Number) right));
-                        if (right instanceof java.time.LocalDateTime) return range.contains(((java.time.LocalDateTime) right).toEpochSecond(java.time.ZoneOffset.UTC));
-                        if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
                         // range @> multirange: true if range contains every sub-range
-                        if (RangeOperations.isMultirangeOrEmpty(rs)) {
+                        if (!(right instanceof Number) && RangeOperations.isMultirangeOrEmpty(rs)) {
                             return RangeOperations.multirangeContainsMultirange("{" + ls + "}", rs);
                         }
-                        if (RangeOperations.isRangeString(rs)) return range.containsRange(RangeOperations.parse(rs));
-                        // PG: range @> non-range-non-number -> try parsing
-                        try {
-                            return range.contains(Long.parseLong(rs));
-                        } catch (NumberFormatException e) {
-                            // Try decimal (numrange @> numeric-as-string)
-                            try { return range.contains(new java.math.BigDecimal(rs)); } catch (NumberFormatException ignored) {}
-                            // Try timestamp
-                            if (rs.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}.*")) {
-                                try {
-                                    java.time.LocalDateTime ldt = TypeCoercion.toLocalDateTime(rs);
-                                    return range.contains(ldt.toEpochSecond(java.time.ZoneOffset.UTC));
-                                } catch (Exception ignored) {}
-                            }
-                            // Try date
-                            if (rs.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
-                                return range.contains(java.time.LocalDate.parse(rs.substring(0, 10)).toEpochDay());
-                            }
+                        if (!(right instanceof Number) && RangeOperations.isRangeString(rs)) {
+                            return range.containsRange(RangeOperations.parse(rs));
+                        }
+                        // range @> value: the probe is read as a value of the element type
+                        Boolean held = range.containsValue(right);
+                        if (held == null) {
                             throw new MemgresException("malformed range literal: \"" + rs + "\"", "22P02");
                         }
+                        return held;
                     }
                 }
                 // PG array containment: {1,2,3} @> {2,3}
@@ -1680,20 +1664,19 @@ class BinaryOpEvaluator {
                     if (RangeOperations.isMultirangeOrEmpty(rs)) {
                         if (RangeOperations.isMultirangeOrEmpty(ls)) return RangeOperations.multirangeContainsMultirange(rs, ls);
                         if (RangeOperations.isRangeString(ls)) return RangeOperations.multirangeContainsRange(rs, RangeOperations.parse(ls));
-                        if (left instanceof Number) return RangeOperations.multirangeContains(rs, ((Number) left));
-                        try { return RangeOperations.multirangeContains(rs, Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
-                        return false;
+                        return RangeOperations.multirangeContainsValue(rs, left);
                     }
                     if (RangeOperations.isRangeString(rs)) {
                         RangeOperations.PgRange range = RangeOperations.parse(rs);
                         // multirange <@ range: true if range contains every sub-range
-                        if (RangeOperations.isMultirangeOrEmpty(ls)) {
+                        if (!(left instanceof Number) && RangeOperations.isMultirangeOrEmpty(ls)) {
                             return RangeOperations.multirangeContainsMultirange("{" + rs + "}", ls);
                         }
-                        if (RangeOperations.isRangeString(ls)) return range.containsRange(RangeOperations.parse(ls));
-                        if (left instanceof Number) return range.contains(((Number) left));
-                        try { return range.contains(Long.parseLong(ls)); } catch (NumberFormatException ignore) {}
-                        try { return range.contains(new java.math.BigDecimal(ls)); } catch (NumberFormatException ignore) {}
+                        if (!(left instanceof Number) && RangeOperations.isRangeString(ls)) {
+                            return range.containsRange(RangeOperations.parse(ls));
+                        }
+                        Boolean held = range.containsValue(left);
+                        if (held != null) return held;
                     }
                 }
                 // PG array containment: {2,3} <@ {1,2,3}
@@ -2147,16 +2130,7 @@ class BinaryOpEvaluator {
      */
     private static RangeOperations.PgRange unionRanges(
             RangeOperations.PgRange a, RangeOperations.PgRange b) {
-        if (a.isEmpty()) return b;
-        if (b.isEmpty()) return a;
-        if (!a.overlaps(b) && !RangeOperations.areAdjacent(a, b)
-                && !RangeOperations.areAdjacent(b, a)) {
-            throw new MemgresException("result of range union would not be contiguous", "22000");
-        }
-        RangeOperations.PgRange lo = startsLater(a, b) ? b : a;
-        RangeOperations.PgRange hi = endsEarlier(a, b) ? b : a;
-        return new RangeOperations.PgRange(lo.lower, hi.upper, lo.lowerInclusive,
-                hi.upperInclusive, false, lo.lowerStr, hi.upperStr);
+        return RangeOperations.union(a, b);
     }
 
     /**
@@ -2165,23 +2139,7 @@ class BinaryOpEvaluator {
      */
     private static RangeOperations.PgRange differenceRanges(
             RangeOperations.PgRange a, RangeOperations.PgRange b) {
-        RangeOperations.PgRange empty =
-                new RangeOperations.PgRange(null, null, true, false, true);
-        if (a.isEmpty() || b.isEmpty() || !a.overlaps(b)) return a;
-        if (b.containsRange(a)) return empty;
-        boolean coversStart = startsLater(a, b);
-        boolean coversEnd = endsEarlier(a, b);
-        if (!coversStart && !coversEnd) {
-            throw new MemgresException("result of range difference would not be contiguous", "22000");
-        }
-        if (coversStart) {
-            // b covers the start of a, so a keeps everything above b's upper bound
-            return new RangeOperations.PgRange(b.upper, a.upper, !b.upperInclusive,
-                    a.upperInclusive, false, b.upperStr, a.upperStr);
-        }
-        // b covers the end of a, so a keeps everything below b's lower bound
-        return new RangeOperations.PgRange(a.lower, b.lower, a.lowerInclusive,
-                !b.lowerInclusive, false, a.lowerStr, b.lowerStr);
+        return RangeOperations.subtract(a, b);
     }
 
     /**
@@ -2208,32 +2166,7 @@ class BinaryOpEvaluator {
      */
     private static RangeOperations.PgRange intersectRanges(
             RangeOperations.PgRange a, RangeOperations.PgRange b) {
-        RangeOperations.PgRange empty = new RangeOperations.PgRange(null, null, true, false, true);
-        if (a.isEmpty() || b.isEmpty()) return empty;
-        RangeOperations.PgRange lo = startsLater(a, b) ? a : b;
-        RangeOperations.PgRange hi = endsEarlier(a, b) ? a : b;
-        RangeOperations.PgRange result = new RangeOperations.PgRange(lo.lower, hi.upper,
-                lo.lowerInclusive, hi.upperInclusive, false, lo.lowerStr, hi.upperStr);
-        return result.isEmpty() ? empty : result;
-    }
-
-    /** True when a's lower bound admits fewer values than b's. A missing bound is -infinity. */
-    private static boolean startsLater(RangeOperations.PgRange a, RangeOperations.PgRange b) {
-        if (a.lower == null) return false;
-        if (b.lower == null) return true;
-        int c = toBigDecimal(a.lower).compareTo(toBigDecimal(b.lower));
-        if (c != 0) return c > 0;
-        // At the same value the bound that excludes it starts later
-        return !a.lowerInclusive || b.lowerInclusive;
-    }
-
-    /** True when a's upper bound admits fewer values than b's. A missing bound is +infinity. */
-    private static boolean endsEarlier(RangeOperations.PgRange a, RangeOperations.PgRange b) {
-        if (a.upper == null) return false;
-        if (b.upper == null) return true;
-        int c = toBigDecimal(a.upper).compareTo(toBigDecimal(b.upper));
-        if (c != 0) return c < 0;
-        return !a.upperInclusive || b.upperInclusive;
+        return RangeOperations.intersection(a, b);
     }
 
     private static java.math.BigDecimal toBigDecimal(Number n) {
@@ -2683,25 +2616,20 @@ class BinaryOpEvaluator {
                 if (!lIsList && !rIsList) {
                     // Multirange containment
                     if (RangeOperations.isMultirangeOrEmpty(lStr)) {
-                        if (right instanceof Number) return RangeOperations.multirangeContains(lStr, ((Number) right));
-                        try { return RangeOperations.multirangeContains(lStr, Long.parseLong(rStr)); } catch (NumberFormatException ignore) {}
-                        return false;
+                        return RangeOperations.multirangeContainsValue(lStr, right);
                     }
                     // Range containment
                     if (RangeOperations.isRangeString(lStr)) {
                         RangeOperations.PgRange range = RangeOperations.parse(lStr);
-                        if (right instanceof Number) return range.contains(((Number) right));
-                        if (right instanceof java.time.LocalDate) return range.contains(((java.time.LocalDate) right).toEpochDay());
                         // range @> multirange: true if range contains every sub-range
-                        if (RangeOperations.isMultirangeOrEmpty(rStr)) {
+                        if (!(right instanceof Number) && RangeOperations.isMultirangeOrEmpty(rStr)) {
                             return RangeOperations.multirangeContainsMultirange("{" + lStr + "}", rStr);
                         }
-                        if (RangeOperations.isRangeString(rStr)) return range.containsRange(RangeOperations.parse(rStr));
-                        if (rStr.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
-                            return range.contains(java.time.LocalDate.parse(rStr.substring(0, 10)).toEpochDay());
+                        if (!(right instanceof Number) && RangeOperations.isRangeString(rStr)) {
+                            return range.containsRange(RangeOperations.parse(rStr));
                         }
-                        try { return range.contains(Long.parseLong(rStr)); } catch (NumberFormatException ignore) {}
-                        try { return range.contains(new java.math.BigDecimal(rStr)); } catch (NumberFormatException ignore) {}
+                        Boolean held = range.containsValue(right);
+                        if (held != null) return held;
                     }
                 }
                 // PG array containment (NULL elements never match)
@@ -2750,20 +2678,19 @@ class BinaryOpEvaluator {
                     if (RangeOperations.isMultirangeOrEmpty(rStr)) {
                         if (RangeOperations.isMultirangeOrEmpty(lStr)) return RangeOperations.multirangeContainsMultirange(rStr, lStr);
                         if (RangeOperations.isRangeString(lStr)) return RangeOperations.multirangeContainsRange(rStr, RangeOperations.parse(lStr));
-                        if (left instanceof Number) return RangeOperations.multirangeContains(rStr, ((Number) left));
-                        try { return RangeOperations.multirangeContains(rStr, Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
-                        return false;
+                        return RangeOperations.multirangeContainsValue(rStr, left);
                     }
                     if (RangeOperations.isRangeString(rStr)) {
                         RangeOperations.PgRange range = RangeOperations.parse(rStr);
                         // multirange <@ range: true if range contains every sub-range
-                        if (RangeOperations.isMultirangeOrEmpty(lStr)) {
+                        if (!(left instanceof Number) && RangeOperations.isMultirangeOrEmpty(lStr)) {
                             return RangeOperations.multirangeContainsMultirange("{" + rStr + "}", lStr);
                         }
-                        if (RangeOperations.isRangeString(lStr)) return range.containsRange(RangeOperations.parse(lStr));
-                        if (left instanceof Number) return range.contains(((Number) left));
-                        try { return range.contains(Long.parseLong(lStr)); } catch (NumberFormatException ignore) {}
-                        try { return range.contains(new java.math.BigDecimal(lStr)); } catch (NumberFormatException ignore) {}
+                        if (!(left instanceof Number) && RangeOperations.isRangeString(lStr)) {
+                            return range.containsRange(RangeOperations.parse(lStr));
+                        }
+                        Boolean held = range.containsValue(left);
+                        if (held != null) return held;
                     }
                 }
                 // PG array containment (NULL elements never match)

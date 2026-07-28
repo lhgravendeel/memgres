@@ -591,6 +591,10 @@ class SelectAggregateEvaluator {
     private Object evalOrderedSetAggregate(OrderedSetAggExpr osa, List<RowContext> group) {
         String name = osa.funcName().toLowerCase();
         List<SelectStmt.OrderByItem> orderBy = osa.withinGroupOrderBy();
+        checkOrderedSetArity(osa, group);
+        if (HYPOTHETICAL_SET_AGGREGATES.contains(name)) {
+            return evalHypotheticalSetAggregate(name, osa, group);
+        }
 
         List<RowContext> sorted = new ArrayList<>(group);
         if (orderBy != null && !orderBy.isEmpty()) {
@@ -724,49 +728,118 @@ class SelectAggregateEvaluator {
                         .map(Map.Entry::getKey).orElse(null);
                 return modeKey != null ? firstOccurrence.get(modeKey) : null;
             }
-            case "rank": {
-                if (osa.args().isEmpty()) return null;
-                Object hypoObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
-                long rank = 1;
-                for (Object v : vals) {
-                    if (executor.compareValues(v, hypoObj) < 0) rank++;
-                }
-                return rank;
-            }
-            case "dense_rank": {
-                if (osa.args().isEmpty()) return null;
-                Object hypoObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
-                Set<String> seen = new LinkedHashSet<>();
-                for (Object v : vals) {
-                    if (executor.compareValues(v, hypoObj) < 0) seen.add(v.toString());
-                }
-                return (long)(seen.size() + 1);
-            }
-            case "percent_rank": {
-                if (osa.args().isEmpty()) return null;
-                Object hypoObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
-                if (vals.isEmpty()) return 0.0;
-                long rankVal = 1;
-                for (Object v : vals) {
-                    if (executor.compareValues(v, hypoObj) < 0) rankVal++;
-                }
-                return (double)(rankVal - 1) / vals.size();
-            }
-            case "cume_dist": {
-                if (osa.args().isEmpty()) return null;
-                Object hypoObj = executor.evalExpr(osa.args().get(0), group.isEmpty() ? null : group.get(0));
-                long countLE = 0;
-                for (Object v : vals) {
-                    if (executor.compareValues(v, hypoObj) <= 0) countLE++;
-                }
-                // The hypothetical row joins both the numerator and the denominator:
-                // (countLE + 1) / (N + 1). Empty group: (0 + 1) / (0 + 1) = 1.0.
-                return (double) (countLE + 1) / (vals.size() + 1);
-            }
             default: {
                 throw notAnOrderedSetAggregate(osa, group);
             }
         }
+    }
+
+    /** The ordered-set aggregates that rank a hypothetical row against the group. */
+    private static final Set<String> HYPOTHETICAL_SET_AGGREGATES = new LinkedHashSet<>(
+            Arrays.asList("rank", "dense_rank", "percent_rank", "cume_dist"));
+
+    /**
+     * Every ordered-set aggregate has a fixed arity, and for the hypothetical-set four the direct
+     * arguments have to match the WITHIN GROUP sort columns one for one — they are the row being
+     * ranked. PG resolves the call against both lists at once and, finding no such function, says
+     * so; accepting a mismatched call instead ranks against whatever prefix happened to line up.
+     */
+    private void checkOrderedSetArity(OrderedSetAggExpr osa, List<RowContext> group) {
+        String name = osa.funcName().toLowerCase();
+        int args = osa.args().size();
+        int keys = osa.withinGroupOrderBy() == null ? 0 : osa.withinGroupOrderBy().size();
+        boolean ok;
+        if (HYPOTHETICAL_SET_AGGREGATES.contains(name)) {
+            ok = keys >= 1 && args == keys;
+        } else if (name.equals("percentile_cont") || name.equals("percentile_disc")) {
+            ok = args == 1 && keys == 1;
+        } else if (name.equals("mode")) {
+            ok = args == 0 && keys == 1;
+        } else {
+            return;
+        }
+        if (!ok) throw noSuchOrderedSetFunction(osa, group);
+    }
+
+    /**
+     * Rank a hypothetical row built from the direct arguments against the group, comparing the
+     * whole sort key rather than only its first column and honouring each column's direction and
+     * NULL placement — the row is inserted into the same ordering the WITHIN GROUP clause states.
+     */
+    private Object evalHypotheticalSetAggregate(
+            String name, OrderedSetAggExpr osa, List<RowContext> group) {
+        List<SelectStmt.OrderByItem> orderBy = osa.withinGroupOrderBy();
+        RowContext sample = group.isEmpty() ? null : group.get(0);
+        int keys = orderBy.size();
+        Object[] hypo = new Object[keys];
+        for (int i = 0; i < keys; i++) {
+            hypo[i] = executor.evalExpr(osa.args().get(i), sample);
+        }
+        long below = 0;
+        long atOrBelow = 0;
+        Set<String> distinctBelow = new LinkedHashSet<>();
+        for (RowContext ctx : group) {
+            Object[] row = new Object[keys];
+            for (int i = 0; i < keys; i++) {
+                row[i] = executor.evalExpr(orderBy.get(i).expr(), ctx);
+            }
+            int cmp = compareSortKeys(row, hypo, orderBy);
+            if (cmp < 0) {
+                below++;
+                distinctBelow.add(Arrays.deepToString(row));
+            }
+            if (cmp <= 0) atOrBelow++;
+        }
+        int n = group.size();
+        if (name.equals("rank")) return Long.valueOf(below + 1);
+        if (name.equals("dense_rank")) return Long.valueOf(distinctBelow.size() + 1);
+        if (name.equals("percent_rank")) {
+            if (n == 0) return Double.valueOf(0.0);
+            return Double.valueOf((double) below / n);
+        }
+        // cume_dist: the hypothetical row joins both the numerator and the denominator
+        return Double.valueOf((double) (atOrBelow + 1) / (n + 1));
+    }
+
+    /** Order two sort keys under a WITHIN GROUP ORDER BY list, column directions and all. */
+    private int compareSortKeys(Object[] a, Object[] b, List<SelectStmt.OrderByItem> orderBy) {
+        for (int i = 0; i < orderBy.size(); i++) {
+            SelectStmt.OrderByItem item = orderBy.get(i);
+            boolean desc = item.descending();
+            // PG's default is NULLS LAST for ASC and NULLS FIRST for DESC
+            boolean nullsFirst = item.nullsFirst() != null ? item.nullsFirst().booleanValue() : desc;
+            int cmp;
+            if (a[i] == null || b[i] == null) {
+                if (a[i] == null && b[i] == null) continue;
+                cmp = a[i] == null ? (nullsFirst ? -1 : 1) : (nullsFirst ? 1 : -1);
+                return cmp;
+            }
+            cmp = executor.compareValues(a[i], b[i]);
+            if (desc) cmp = -cmp;
+            if (cmp != 0) return cmp;
+        }
+        return 0;
+    }
+
+    /** PG names the missing function with the direct arguments and the sort columns together. */
+    private MemgresException noSuchOrderedSetFunction(OrderedSetAggExpr osa, List<RowContext> group) {
+        RowContext sample = group.isEmpty() ? null : group.get(0);
+        StringBuilder types = new StringBuilder();
+        for (Expression a : osa.args()) {
+            if (types.length() > 0) types.append(", ");
+            types.append(argTypeName(a, sample));
+        }
+        if (osa.withinGroupOrderBy() != null) {
+            for (SelectStmt.OrderByItem item : osa.withinGroupOrderBy()) {
+                if (types.length() > 0) types.append(", ");
+                types.append(argTypeName(item.expr(), sample));
+            }
+        }
+        MemgresException e = new MemgresException(
+                "function " + osa.funcName().toLowerCase() + "(" + types + ") does not exist", "42883");
+        e.setHint("No function matches the given name and argument types. "
+                + "You might need to add explicit type casts.");
+        return e;
     }
 
     /**
@@ -783,23 +856,7 @@ class SelectAggregateEvaluator {
             return PgErrors.wrongObjectType(
                     name + " is not an ordered-set aggregate, so it cannot have WITHIN GROUP");
         }
-        RowContext sample = group.isEmpty() ? null : group.get(0);
-        StringBuilder types = new StringBuilder();
-        for (Expression a : osa.args()) {
-            if (types.length() > 0) types.append(", ");
-            types.append(argTypeName(a, sample));
-        }
-        if (osa.withinGroupOrderBy() != null) {
-            for (SelectStmt.OrderByItem item : osa.withinGroupOrderBy()) {
-                if (types.length() > 0) types.append(", ");
-                types.append(argTypeName(item.expr(), sample));
-            }
-        }
-        MemgresException e = new MemgresException(
-                "function " + name + "(" + types + ") does not exist", "42883");
-        e.setHint("No function matches the given name and argument types. "
-                + "You might need to add explicit type casts.");
-        return e;
+        return noSuchOrderedSetFunction(osa, group);
     }
 
     /** PG leaves a bare quoted literal as "unknown" until a resolved call forces its type. */
@@ -1092,19 +1149,7 @@ class SelectAggregateEvaluator {
                 }
                 if (allRanges.isEmpty()) return null;
                 // Sort and merge overlapping/adjacent ranges
-                allRanges.sort((a, b) -> Long.compare(a.effectiveLower(), b.effectiveLower()));
-                java.util.List<RangeOperations.PgRange> merged = new java.util.ArrayList<>();
-                merged.add(allRanges.get(0));
-                for (int mi = 1; mi < allRanges.size(); mi++) {
-                    RangeOperations.PgRange last = merged.get(merged.size() - 1);
-                    RangeOperations.PgRange curr = allRanges.get(mi);
-                    if (last.effectiveUpper() >= curr.effectiveLower()) {
-                        merged.set(merged.size() - 1, RangeOperations.merge(last, curr));
-                    } else {
-                        merged.add(curr);
-                    }
-                }
-                return RangeOperations.formatMultirange(merged);
+                return RangeOperations.formatMultirange(RangeOperations.mergeAndSort(allRanges));
             }
             case "range_intersect_agg": {
                 // range_intersect_agg(anyrange) → range: running intersection of all input ranges
