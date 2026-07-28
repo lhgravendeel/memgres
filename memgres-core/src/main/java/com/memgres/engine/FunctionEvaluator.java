@@ -211,6 +211,46 @@ class FunctionEvaluator {
         return DataType.fromPgName(name.substring(1));
     }
 
+    /**
+     * The array-mutating functions are declared over {@code anyarray}, so an untyped literal
+     * handed to one is read as an array of whatever element type the call settles on -- not left
+     * as the piece of text it looks like. Dropping it instead is what made
+     * {@code array_cat('{1,2}','{3}')} answer {@code {}}: both operands were text, neither was a
+     * List, and the function quietly concatenated nothing at all.
+     *
+     * @param elementTypeName the element type the other argument states, or null for text
+     */
+    private Object readArrayOperand(Object value, String elementTypeName) {
+        if (!(value instanceof String)) return value;
+        String body = ArrayLiteral.body((String) value);
+        if (!body.startsWith("{") || !body.endsWith("}")) return value;
+        String element = elementTypeName != null ? elementTypeName : "text";
+        try {
+            return executor.applyCast(value, element + "[]");
+        } catch (MemgresException e) {
+            // A literal the settled element type cannot read stays as it was, so the existing
+            // error surfaces from the operation rather than from this resolution step.
+            return value;
+        }
+    }
+
+    /** The type name an already-typed value carries, which an untyped literal beside it takes. */
+    private static String elementTypeNameOf(Object value) {
+        if (value == null) return null;
+        if (value instanceof String) return null;
+        return AstExecutor.pgTypeNameOf(value);
+    }
+
+    /** The element type of an argument that is already a proper array, or null. */
+    private static String elementTypeNameOfArray(Object value) {
+        if (!(value instanceof List<?>)) return null;
+        for (Object element : (List<?>) value) {
+            String name = elementTypeNameOf(element);
+            if (name != null) return name;
+        }
+        return null;
+    }
+
     Object evalFunction(FunctionCallExpr fn, RowContext ctx) {
         String name = fn.name().toLowerCase();
         // Strip schema prefixes for built-in function resolution
@@ -925,6 +965,11 @@ class FunctionEvaluator {
                 return result;
             }
             case "nullif": {
+                // NULLIF is an "=" written another way, so the operator is resolved from the
+                // declared types before anything is evaluated: NULLIF(1, '2'::text) has no
+                // integer = text to resolve to and is an error, not the 1 it used to return.
+                executor.binaryOpEvaluator.rejectUnresolvableOperator(
+                        new BinaryExpr(fn.args().get(0), BinaryExpr.BinOp.EQUAL, fn.args().get(1)), ctx);
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
                 // NULL is never equal to anything, so PG hands the first argument straight back.
@@ -953,6 +998,7 @@ class FunctionEvaluator {
                 List<Object> vals = new ArrayList<>();
                 for (Expression arg : fn.args()) vals.add(executor.evalExpr(arg, ctx));
                 validateHomogeneousTypes(vals, "GREATEST");
+                readUntypedLiteralsAsSettledType(fn.args(), vals);
                 Object max = null;
                 for (Object val : vals) {
                     if (val != null && (max == null || executor.compareValues(val, max) > 0)) max = val;
@@ -964,6 +1010,7 @@ class FunctionEvaluator {
                 List<Object> vals = new ArrayList<>();
                 for (Expression arg : fn.args()) vals.add(executor.evalExpr(arg, ctx));
                 validateHomogeneousTypes(vals, "LEAST");
+                readUntypedLiteralsAsSettledType(fn.args(), vals);
                 Object min = null;
                 for (Object val : vals) {
                     if (val != null && (min == null || executor.compareValues(val, min) < 0)) min = val;
@@ -1488,13 +1535,16 @@ class FunctionEvaluator {
             case "array_cat": {
                 Object a = executor.evalExpr(fn.args().get(0), ctx);
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
+                Object aArr = readArrayOperand(a, elementTypeNameOfArray(b));
+                Object bArr = readArrayOperand(b, elementTypeNameOfArray(a));
                 List<Object> result = new ArrayList<>();
-                if (a instanceof List<?>) result.addAll((List<?>) a);
-                if (b instanceof List<?>) result.addAll((List<?>) b);
+                if (aArr instanceof List<?>) result.addAll((List<?>) aArr);
+                if (bArr instanceof List<?>) result.addAll((List<?>) bArr);
                 return result;
             }
             case "array_append": {
-                Object arr = executor.evalExpr(fn.args().get(0), ctx);
+                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
+                        elementTypeNameOf(executor.evalExpr(fn.args().get(1), ctx)));
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
                 // Type compatibility check: if array has numeric elements, reject text element
                 if (arr instanceof List<?> && !((List<?>) arr).isEmpty() && elem != null) {
@@ -1513,15 +1563,17 @@ class FunctionEvaluator {
             }
             case "array_prepend": {
                 Object elem = executor.evalExpr(fn.args().get(0), ctx);
-                Object arr = executor.evalExpr(fn.args().get(1), ctx);
+                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(1), ctx),
+                        elementTypeNameOf(elem));
                 List<Object> result = new ArrayList<>();
                 result.add(elem);
                 if (arr instanceof List<?>) result.addAll((List<?>) arr);
                 return result;
             }
             case "array_remove": {
-                Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
+                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
+                        elementTypeNameOf(elem));
                 List<Object> result = new ArrayList<>();
                 if (arr instanceof List<?>) {
                     for (Object o : (List<?>) arr) {
@@ -1531,8 +1583,9 @@ class FunctionEvaluator {
                 return result;
             }
             case "array_position": {
-                Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
+                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
+                        elementTypeNameOf(elem));
                 int startPos = 1;
                 if (fn.args().size() > 2) {
                     Object startArg = executor.evalExpr(fn.args().get(2), ctx);
@@ -1547,8 +1600,9 @@ class FunctionEvaluator {
                 return null;
             }
             case "array_positions": {
-                Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
+                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
+                        elementTypeNameOf(elem));
                 List<Object> positions = new ArrayList<>();
                 if (arr instanceof List<?>) {
                     List<?> la = (List<?>) arr;
@@ -1559,8 +1613,9 @@ class FunctionEvaluator {
                 return positions;
             }
             case "array_replace": {
-                Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 Object oldVal = executor.evalExpr(fn.args().get(1), ctx);
+                Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
+                        elementTypeNameOf(oldVal));
                 Object newVal = executor.evalExpr(fn.args().get(2), ctx);
                 List<Object> result = new ArrayList<>();
                 if (arr instanceof List<?>) {
@@ -3142,11 +3197,46 @@ class FunctionEvaluator {
      * counterpart is handled: every other type either already compares as text or has a spelling
      * this would have to guess at, and guessing rejects input PostgreSQL accepts.
      */
+    /**
+     * GREATEST and LEAST settle on one type across their arguments before comparing anything, so
+     * an untyped literal beside an integer is read as an integer: {@code GREATEST('10', 9)} is
+     * the number 10, not the text '10' that sorts before '9'. Answering from the raw literal made
+     * the value's type disagree with the one the column advertises.
+     */
+    private static void readUntypedLiteralsAsSettledType(List<Expression> args, List<Object> vals) {
+        Object typed = null;
+        for (int i = 0; i < args.size() && i < vals.size(); i++) {
+            if (!isUntypedStringLiteral(args.get(i)) && vals.get(i) != null) {
+                typed = vals.get(i);
+                break;
+            }
+        }
+        if (typed == null) return;
+        for (int i = 0; i < args.size() && i < vals.size(); i++) {
+            if (isUntypedStringLiteral(args.get(i))) {
+                vals.set(i, readUntypedLiteralAs(vals.get(i), typed));
+            }
+        }
+    }
+
     private static Object readUntypedLiteralAs(Object literalValue, Object typedValue) {
         if (!(literalValue instanceof String) || !(typedValue instanceof Number)) return literalValue;
         String text = ((String) literalValue).trim();
         try {
-            return new BigDecimal(text);
+            BigDecimal read = new BigDecimal(text);
+            // The literal takes the settled type, not a wider one: GREATEST('10', 9) is an
+            // integer 10 and pg_typeof says so, where a BigDecimal would have said numeric.
+            if (typedValue instanceof Integer || typedValue instanceof Short) {
+                return read.intValueExact();
+            }
+            if (typedValue instanceof Long) return read.longValueExact();
+            if (typedValue instanceof Double || typedValue instanceof Float) {
+                return read.doubleValue();
+            }
+            return read;
+        } catch (ArithmeticException e) {
+            throw new MemgresException("invalid input syntax for type "
+                    + numericTypeNameOf(typedValue) + ": \"" + literalValue + "\"", "22P02");
         } catch (NumberFormatException e) {
             throw new MemgresException("invalid input syntax for type "
                     + numericTypeNameOf(typedValue) + ": \"" + literalValue + "\"", "22P02");

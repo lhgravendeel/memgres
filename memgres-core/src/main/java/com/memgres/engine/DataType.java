@@ -312,8 +312,81 @@ public enum DataType {
             case "_aclitem":
                 return ACLITEM_ARRAY;
             default:
+                // Any other array spelling resolves through its element type, so a cast to
+                // date[] or uuid[] carries its own array OID instead of falling back to text.
+                if (normalized.endsWith("[]")) {
+                    return arrayOf(fromPgName(normalized.substring(0, normalized.length() - 2)));
+                }
+                if (normalized.startsWith("_")) {
+                    return arrayOf(fromPgName(normalized.substring(1)));
+                }
                 return null;
         }
+    }
+
+    /** The array type over an element type, or null when memgres carries no OID for it. */
+    public static DataType arrayOf(DataType element) {
+        if (element == null) return null;
+        switch (element) {
+            case BOOLEAN: return BOOL_ARRAY;
+            case SMALLINT: case SMALLSERIAL: return INT2_ARRAY;
+            case INTEGER: case SERIAL: return INT4_ARRAY;
+            case BIGINT: case BIGSERIAL: return INT8_ARRAY;
+            case REAL: return FLOAT4_ARRAY;
+            case DOUBLE_PRECISION: return FLOAT8_ARRAY;
+            case NUMERIC: return NUMERIC_ARRAY;
+            case TEXT: return TEXT_ARRAY;
+            case VARCHAR: return VARCHAR_ARRAY;
+            case CHAR: return CHAR_ARRAY;
+            case NAME: return NAME_ARRAY;
+            case DATE: return DATE_ARRAY;
+            case TIMESTAMP: return TIMESTAMP_ARRAY;
+            case TIMESTAMPTZ: return TIMESTAMPTZ_ARRAY;
+            case TIME: return TIME_ARRAY;
+            case TIMETZ: return TIMETZ_ARRAY;
+            case INTERVAL: return INTERVAL_ARRAY;
+            case UUID: return UUID_ARRAY;
+            case BYTEA: return BYTEA_ARRAY;
+            case JSON: return JSON_ARRAY;
+            case JSONB: return JSONB_ARRAY;
+            case INET: return INET_ARRAY;
+            default: return null;
+        }
+    }
+
+    /** The element type an array type is built over, or null when it is not an array type. */
+    public static DataType elementOf(DataType array) {
+        if (array == null) return null;
+        switch (array) {
+            case BOOL_ARRAY: return BOOLEAN;
+            case INT2_ARRAY: return SMALLINT;
+            case INT4_ARRAY: return INTEGER;
+            case INT8_ARRAY: return BIGINT;
+            case FLOAT4_ARRAY: return REAL;
+            case FLOAT8_ARRAY: return DOUBLE_PRECISION;
+            case NUMERIC_ARRAY: return NUMERIC;
+            case TEXT_ARRAY: return TEXT;
+            case VARCHAR_ARRAY: return VARCHAR;
+            case CHAR_ARRAY: return CHAR;
+            case NAME_ARRAY: return NAME;
+            case DATE_ARRAY: return DATE;
+            case TIMESTAMP_ARRAY: return TIMESTAMP;
+            case TIMESTAMPTZ_ARRAY: return TIMESTAMPTZ;
+            case TIME_ARRAY: return TIME;
+            case TIMETZ_ARRAY: return TIMETZ;
+            case INTERVAL_ARRAY: return INTERVAL;
+            case UUID_ARRAY: return UUID;
+            case BYTEA_ARRAY: return BYTEA;
+            case JSON_ARRAY: return JSON;
+            case JSONB_ARRAY: return JSONB;
+            case INET_ARRAY: return INET;
+            default: return null;
+        }
+    }
+
+    /** True for the array types, whose operators answer in the array type rather than in text. */
+    public static boolean isArrayType(DataType t) {
+        return elementOf(t) != null;
     }
 
     /** Look up DataType by OID. Returns null if not found. */

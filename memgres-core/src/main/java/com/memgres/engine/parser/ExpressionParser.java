@@ -1241,6 +1241,9 @@ public class ExpressionParser {
                         String val = advance().value();
                         return new CastExpr(Literal.ofString(val), "time");
                     }
+                    // TIME WITH/WITHOUT TIME ZONE 'value', the spelling TIMESTAMP already accepts
+                    Expression timeLiteral = specialFormParser.parseQualifiedTimeLiteral();
+                    if (timeLiteral != null) return timeLiteral;
                     break;
                 }
                 case "TIMESTAMP": {

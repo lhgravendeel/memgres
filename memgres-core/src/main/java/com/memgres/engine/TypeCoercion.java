@@ -635,7 +635,14 @@ public final class TypeCoercion {
         if (lower.equals("nan")) {
             return Double.NaN;
         }
-        return Double.parseDouble(s);
+        try {
+            return Double.parseDouble(s);
+        } catch (NumberFormatException e) {
+            // float8's input function accepts the same non-decimal integer forms int4 does
+            java.math.BigInteger whole = parseIntegerText(s);
+            if (whole != null) return whole.doubleValue();
+            throw e;
+        }
     }
 
     public static PgMoney toMoney(Object val) {
@@ -743,6 +750,10 @@ public final class TypeCoercion {
         try {
             return new BigDecimal(s);
         } catch (NumberFormatException e) {
+            // numeric's input function reads the non-decimal integer forms and the underscore
+            // separator exactly as int4's does, so '0x2a'::numeric is 42 and not an error
+            java.math.BigInteger whole = parseIntegerText(s);
+            if (whole != null) return new BigDecimal(whole);
             throw new MemgresException("invalid input syntax for type numeric: \"" + val + "\"", "22P02");
         }
     }
@@ -1291,9 +1302,13 @@ public final class TypeCoercion {
                     try { return LocalTime.parse(timePart); } catch (DateTimeParseException e3) { /* fall through */ }
                 }
             }
-            // Use 22008 for well-formatted but out-of-range times (e.g. 25:00:00)
-            String errCode = s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*") ? "22008" : "22007";
-            throw new MemgresException("date/time field value out of range: \"" + val + "\"", errCode);
+            // Use 22008 for well-formatted but out-of-range times (e.g. 25:00:00); text that is
+            // no time at all gets PG's 22007 wording, which names the type it would not read as
+            if (!s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*")) {
+                throw new MemgresException(
+                        "invalid input syntax for type time: \"" + val + "\"", "22007");
+            }
+            throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
         }
     }
 
