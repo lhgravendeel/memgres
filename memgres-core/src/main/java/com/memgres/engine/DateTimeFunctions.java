@@ -30,7 +30,9 @@ class DateTimeFunctions {
                     // age(xid) → int4: transaction age (return small constant for memgres)
                     if (arg instanceof Number) return 1;
                     // PG: single-arg age() uses current_date (midnight), not now()
-                    java.time.LocalDateTime dt1 = java.time.LocalDate.now().atStartOfDay();
+                    java.time.LocalDateTime dt1 = executor.currentInstant()
+                            .atZoneSameInstant(TypeCoercion.sessionZone())
+                            .toLocalDate().atStartOfDay();
                     java.time.LocalDateTime dt2 = TypeCoercion.toLocalDateTime(arg);
                     return computeAge(dt1, dt2);
                 }
@@ -55,7 +57,19 @@ class DateTimeFunctions {
                 Object fieldObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object source = executor.evalExpr(fn.args().get(1), ctx);
                 String field = fieldObj.toString().toLowerCase();
-                return truncateDate(field, source);
+                // A timestamptz truncates in the session's zone, or in the zone the third
+                // argument names: midnight is a local idea, not a UTC one.
+                java.time.ZoneId zone = TypeCoercion.sessionZone();
+                if (fn.args().size() > 2) {
+                    Object zoneObj = executor.evalExpr(fn.args().get(2), ctx);
+                    if (zoneObj == null) return null;
+                    try {
+                        zone = java.time.ZoneId.of(zoneObj.toString().trim());
+                    } catch (RuntimeException e) {
+                        throw new MemgresException("time zone \"" + zoneObj + "\" not recognized", "22023");
+                    }
+                }
+                return truncateDate(field, source, zone);
             }
             case "make_date": {
                 int year = executor.toInt(executor.evalExpr(fn.args().get(0), ctx));
@@ -346,7 +360,7 @@ class DateTimeFunctions {
         java.time.LocalDateTime dt;
         if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
         else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
-        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).withOffsetSameInstant(java.time.ZoneOffset.UTC).toLocalDateTime();
+        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDateTime();
         else dt = TypeCoercion.toLocalDateTime(source);
 
         // A date has no time of day, so PG refuses the sub-day units outright rather than
@@ -457,6 +471,10 @@ class DateTimeFunctions {
     }
 
     private Object truncateDate(String field, Object source) {
+        return truncateDate(field, source, TypeCoercion.sessionZone());
+    }
+
+    private Object truncateDate(String field, Object source, java.time.ZoneId zone) {
         if (source == null) return null;
         // date_trunc(unit, interval) zeroes every field below the unit; there is no calendar
         // involved, so it is a separate rule from the timestamp one
@@ -465,7 +483,7 @@ class DateTimeFunctions {
         boolean isDate = source instanceof java.time.LocalDate;
         if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
         else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
-        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).withOffsetSameInstant(java.time.ZoneOffset.UTC).toLocalDateTime();
+        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).atZoneSameInstant(zone).toLocalDateTime();
         else dt = TypeCoercion.toLocalDateTime(source);
 
         java.time.LocalDateTime result;
@@ -521,7 +539,7 @@ class DateTimeFunctions {
                 throw new MemgresException("unit \"" + field + "\" not recognized for type timestamp", "22023");
         }
         if (isDate) return result.toLocalDate();
-        if (source instanceof java.time.OffsetDateTime) return result.atOffset(java.time.ZoneOffset.UTC);
+        if (source instanceof java.time.OffsetDateTime) return result.atZone(zone).toOffsetDateTime();
         return result;
     }
 
