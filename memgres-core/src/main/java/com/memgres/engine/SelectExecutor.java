@@ -74,7 +74,12 @@ class SelectExecutor {
         if (name == null) return null;
         String lower = name.toLowerCase();
         for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
-            if (scope.containsKey(lower)) return null;
+            // A name mapped to null is a WITH item hidden from the body being run, so the stored
+            // relation is what this name means here; anything else shadows the catalog.
+            if (scope.containsKey(lower)) {
+                if (scope.get(lower) != null) return null;
+                break;
+            }
         }
         Schema schema = executor.database.getSchema(
                 schemaName != null ? schemaName : executor.defaultSchema());

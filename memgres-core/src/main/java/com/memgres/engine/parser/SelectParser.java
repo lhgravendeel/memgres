@@ -5,9 +5,11 @@ import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * SELECT statement parsing, extracted from Parser to reduce class size.
@@ -646,7 +648,7 @@ class SelectParser {
             SelectStmt.CommonTableExpr origCte = ctes.get(last);
             if (!origCte.recursive()) {
                 throw new com.memgres.engine.MemgresException(
-                    "WITH query \"" + origCte.name() + "\" is not recursive", "42601");
+                    "WITH query is not recursive", "42601");
             }
             ctes.set(last, new SelectStmt.CommonTableExpr(origCte.name(), origCte.columnNames(),
                     origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns, cycleCol, cyclePathCol, cycleByColumns));
@@ -748,7 +750,19 @@ class SelectParser {
             parser.expect(TokenType.RIGHT_PAREN);
 
             ctes.add(new SelectStmt.CommonTableExpr(name, columnNames, cteBody, recursive));
+            // SEARCH and CYCLE belong to the item just closed, not to the WITH clause, so they
+            // are read here — before the comma that starts the next item, which is why
+            // "SEARCH ... SET ord, s AS (...)" parses at all.
+            consumeSearchCycleClauses(ctes);
         } while (parser.match(TokenType.COMMA));
+
+        Set<String> seenNames = new HashSet<>();
+        for (SelectStmt.CommonTableExpr cte : ctes) {
+            if (!seenNames.add(cte.name().toLowerCase())) {
+                throw new com.memgres.engine.MemgresException(
+                        "WITH query name \"" + cte.name() + "\" specified more than once", "42712");
+            }
+        }
 
         return ctes;
     }
