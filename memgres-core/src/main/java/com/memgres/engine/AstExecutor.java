@@ -81,6 +81,43 @@ public class AstExecutor {
      * "update" or "delete from". Set by the DML executor before it resolves the target.
      */
     String viewDmlVerb = "insert into";
+
+    /** Views whose body is currently being expanded, and rules currently being applied. */
+    private final Set<String> expansionsInProgress = new HashSet<>();
+
+    /**
+     * Run a view's body, refusing a view that is defined — directly or through other views — in
+     * terms of itself. Expanding it again would never finish, and PostgreSQL names the relation
+     * it came back to rather than letting the recursion run.
+     */
+    QueryResult executeViewQuery(String viewName, Statement viewQuery) {
+        String key = "view:" + viewName.toLowerCase();
+        if (!expansionsInProgress.add(key)) {
+            throw PgErrors.infiniteRecursionInRules(viewName);
+        }
+        try {
+            return executeStatement(viewQuery);
+        } finally {
+            expansionsInProgress.remove(key);
+        }
+    }
+
+    /**
+     * Claim the right to apply a rule for this relation and event. A rule that rewrites onto its
+     * own table would otherwise re-enter itself for as long as the stack lasted.
+     */
+    boolean enterRuleExpansion(String relation, String event) {
+        return expansionsInProgress.add("rule:" + event + ":" + relation.toLowerCase());
+    }
+
+    void exitRuleExpansion(String relation, String event) {
+        expansionsInProgress.remove("rule:" + event + ":" + relation.toLowerCase());
+    }
+
+    boolean isRuleExpanding(String relation, String event) {
+        return expansionsInProgress.contains("rule:" + event + ":" + relation.toLowerCase());
+    }
+
     // When true, column references with no context throw instead of returning column name as string
     private boolean strictColumnRefs = false;
 
@@ -223,6 +260,14 @@ public class AstExecutor {
         if (stmt instanceof AlterPolicyStmt) return ddlExecutor.executeAlterPolicy(((AlterPolicyStmt) stmt));
         if (stmt instanceof AlterDefaultPrivilegesStmt) {
             AlterDefaultPrivilegesStmt s = (AlterDefaultPrivilegesStmt) stmt;
+            // The schema and role are resolved to OIDs before anything is recorded, so naming one
+            // that does not exist is an error rather than a default nothing will ever match.
+            if (s.forRole() != null && !database.hasRole(s.forRole().toLowerCase())) {
+                throw PgErrors.undefinedObject("role", s.forRole());
+            }
+            if (s.inSchema() != null && database.getSchema(s.inSchema()) == null) {
+                throw new MemgresException("schema \"" + s.inSchema() + "\" does not exist", "3F000");
+            }
             if (s.isGrant()) {
                 String grantor = s.forRole() != null ? s.forRole() : sessionUser();
                 database.addDefaultAcl(new Database.DefaultAclEntry(

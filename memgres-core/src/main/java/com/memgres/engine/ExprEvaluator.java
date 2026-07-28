@@ -35,7 +35,18 @@ class ExprEvaluator {
 
     // ---- Main expression dispatcher ----
 
+    /**
+     * Countdown to the next cancellation poll. Every row of every scan passes through here, so
+     * this is where a runaway query notices statement_timeout; polling on each expression would
+     * cost more than it is worth, and a few thousand evaluations is still sub-millisecond.
+     */
+    private int cancelPollCountdown;
+
     public Object evalExpr(Expression expr, RowContext ctx) {
+        if (--cancelPollCountdown <= 0) {
+            cancelPollCountdown = 4096;
+            StatementCancel.check();
+        }
         if (expr instanceof Literal) return evalLiteral(((Literal) expr));
         if (expr instanceof PrecomputedValueExpr) return ((PrecomputedValueExpr) expr).value();
         // A set-returning function nested inside a larger SELECT-list expression (e.g.

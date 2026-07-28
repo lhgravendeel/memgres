@@ -295,7 +295,9 @@ class SelectExecutor {
         if (hasGroupBy || hasGroupingSets || hasAggregates) {
             // PG allows DISTINCT ON with GROUP BY and aggregates — DISTINCT ON is applied after grouping
             // Validate: non-aggregate columns must be in GROUP BY
-            if (!hasGroupBy && !hasGroupingSets && hasAggregates) {
+            // GROUP BY () (and any grouping-set spec whose sets are all empty) collapses the
+            // input to a single row, so the select list is as constrained as with no GROUP BY
+            if (!hasGroupBy && (hasGroupingSets || hasAggregates)) {
                 for (SelectStmt.SelectTarget target : stmt.targets()) {
                     if (!isAggregateOrConstant(target.expr())) {
                         String colName = executor.exprToAlias(target.expr());

@@ -2600,9 +2600,11 @@ class FunctionEvaluator {
                 if (AGGREGATES.contains(name)) {
                     return null; // Will be handled by aggregate executor
                 }
-                // grouping() requires GROUPING SETS / ROLLUP / CUBE
+                // grouping() only makes sense over a grouping expression of this query level
                 if (name.equals("grouping")) {
-                    throw new MemgresException("GROUPING is not supported without GROUPING SETS, ROLLUP, or CUBE", "42803");
+                    throw new MemgresException(
+                            "arguments to GROUPING must be grouping expressions of the associated query level",
+                            "42803");
                 }
                 // "open" is not a SQL function; PG gives 42704 (undefined_object)
                 if (name.equals("open") || name.equals("close")) {
