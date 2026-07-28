@@ -313,12 +313,15 @@ class FunctionEvaluator {
                 return executor.currentStatementTimestamp != null ? executor.currentStatementTimestamp : OffsetDateTime.now();
             }
             case "current_date":
-                return LocalDate.now();
+                return executor.currentInstant()
+                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDate();
             case "current_time":
             case "localtime":
-                return LocalTime.now();
+                return executor.currentInstant()
+                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalTime();
             case "localtimestamp":
-                return LocalDateTime.now();
+                return executor.currentInstant()
+                        .atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDateTime();
             case "version":
                 return "PostgreSQL 18.0";
             case "gen_random_uuid":
@@ -2362,19 +2365,23 @@ class FunctionEvaluator {
                             overloads = filtered;
                         }
                     } else if (!name.contains(".") && executor.session != null) {
-                        Set<String> visibleSchemas = new LinkedHashSet<>();
+                        List<String> visibleSchemas = new ArrayList<>();
                         visibleSchemas.add("pg_catalog");
                         String searchPath = executor.session.getGucSettings().get("search_path");
                         if (searchPath != null) {
                             for (String sp : searchPath.split(",")) {
-                                visibleSchemas.add(sp.trim().toLowerCase());
+                                String sc = sp.trim().toLowerCase();
+                                if (!visibleSchemas.contains(sc)) visibleSchemas.add(sc);
                             }
                         }
-                        visibleSchemas.add("public");
+                        if (!visibleSchemas.contains("public")) visibleSchemas.add("public");
+                        // Group by search_path position so the earliest schema holding this name wins,
+                        // the way PG resolves an unqualified routine reference.
                         List<PgFunction> filtered = new ArrayList<>();
-                        for (PgFunction f : overloads) {
-                            String fSchema = f.getSchemaName() != null ? f.getSchemaName().toLowerCase() : "public";
-                            if (visibleSchemas.contains(fSchema)) filtered.add(f);
+                        for (String schema : visibleSchemas) {
+                            for (PgFunction f : overloads) {
+                                if (Database.schemaOf(f).equalsIgnoreCase(schema)) filtered.add(f);
+                            }
                         }
                         // Apply filter. Fall back to unfiltered only if ALL functions have null schema (built-ins)
                         if (!filtered.isEmpty()) {
@@ -2414,13 +2421,13 @@ class FunctionEvaluator {
                                 }
                             }
                         }
-                        userFunc = executor.database.resolveFunction(lookupName, fn.args().size(), argTypeHints);
+                        userFunc = executor.database.resolveFunction(overloads, fn.args().size(), argTypeHints);
                         // When explicit VARIADIC was used and the array was empty,
                         // expansion yields 0 variadic args. Resolution rejects this
                         // because it looks like no variadic args were provided.
                         // Retry with argCount+1 to simulate the empty array as one arg.
                         if (userFunc == null && callUsedVariadic && fn.args().isEmpty()) {
-                            userFunc = executor.database.resolveFunction(lookupName, 1, argTypeHints);
+                            userFunc = executor.database.resolveFunction(overloads, 1, argTypeHints);
                         }
                     } else {
                         userFunc = null;
@@ -2567,6 +2574,7 @@ class FunctionEvaluator {
                         }
                         args.add(val);
                     }
+                    checkPolymorphicArgs(inputParams, args, fn.args(), ctx, name);
                     // STRICT: return NULL immediately if any argument is NULL
                     // For set-returning functions, return empty set instead of NULL
                     if (userFunc.isStrict()) {
@@ -2600,9 +2608,11 @@ class FunctionEvaluator {
                 if (AGGREGATES.contains(name)) {
                     return null; // Will be handled by aggregate executor
                 }
-                // grouping() requires GROUPING SETS / ROLLUP / CUBE
+                // grouping() only makes sense over a grouping expression of this query level
                 if (name.equals("grouping")) {
-                    throw new MemgresException("GROUPING is not supported without GROUPING SETS, ROLLUP, or CUBE", "42803");
+                    throw new MemgresException(
+                            "arguments to GROUPING must be grouping expressions of the associated query level",
+                            "42803");
                 }
                 // "open" is not a SQL function; PG gives 42704 (undefined_object)
                 if (name.equals("open") || name.equals("close")) {
@@ -3033,6 +3043,55 @@ class FunctionEvaluator {
         if (t instanceof java.time.LocalDate) return ((java.time.LocalDate) t).atStartOfDay();
         if (t instanceof java.time.OffsetDateTime) return ((java.time.OffsetDateTime) t).toLocalDateTime();
         throw new MemgresException("cannot convert to LocalDateTime for comparison", "42804");
+    }
+
+    /**
+     * A polymorphic signature only accepts arguments that bind its slots consistently — an
+     * anyarray slot needs an array, an anynonarray slot needs a scalar, and every anyelement
+     * slot must land on the same type. PG reports a call that cannot bind as no such function.
+     */
+    private void checkPolymorphicArgs(List<PgFunction.Param> inputParams, List<Object> args,
+                                      List<Expression> argExprs, RowContext ctx, String name) {
+        List<String> declared = new ArrayList<>();
+        boolean anyPolymorphic = false;
+        for (PgFunction.Param p : inputParams) {
+            declared.add(p.typeName());
+            if (PolymorphicTypes.isPolymorphic(p.typeName())) anyPolymorphic = true;
+        }
+        if (!anyPolymorphic) return;
+        List<String> actual = new ArrayList<>();
+        for (int i = 0; i < args.size(); i++) {
+            // A NULL value still carries a type when the expression has one (a cast or a column);
+            // only a bare NULL literal is the "unknown" PG refuses to resolve a polymorph from.
+            String t = PolymorphicTypes.actualTypeName(args.get(i));
+            if (t == null && i < argExprs.size()) t = declaredTypeOf(argExprs.get(i), ctx);
+            actual.add(t);
+        }
+        PolymorphicTypes.Binding binding = PolymorphicTypes.bind(declared, actual);
+        if (binding == null) {
+            StringBuilder argTypes = new StringBuilder();
+            for (int i = 0; i < actual.size(); i++) {
+                if (i > 0) argTypes.append(", ");
+                argTypes.append(actual.get(i) == null ? "unknown" : actual.get(i));
+            }
+            throw new MemgresException("function " + name + "(" + argTypes + ") does not exist", "42883");
+        }
+        for (String d : declared) {
+            if (PolymorphicTypes.concreteType(d, binding) == null) {
+                throw new MemgresException(
+                        "could not determine polymorphic type because input has type unknown", "42804");
+            }
+        }
+    }
+
+    /** The static type of an argument expression, used when its runtime value is NULL. */
+    private String declaredTypeOf(Expression expr, RowContext ctx) {
+        try {
+            return PolymorphicTypes.typeName(executor.exprEvaluator.inferTypeFromContext(
+                    expr, ctx != null ? ctx.getBindings() : new ArrayList<RowContext.TableBinding>()));
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /** Strip well-known schema prefixes (pg_catalog., information_schema.) from a function name. */

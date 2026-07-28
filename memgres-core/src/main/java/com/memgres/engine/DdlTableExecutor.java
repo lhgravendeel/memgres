@@ -32,6 +32,11 @@ class DdlTableExecutor {
         if ("pg_catalog".equalsIgnoreCase(schemaName) || "information_schema".equalsIgnoreCase(schemaName)) {
             throw new MemgresException("permission denied for schema " + schemaName, "42501");
         }
+        // ON COMMIT describes what happens to the rows at the end of the transaction that made
+        // them, which only means anything for a table that lives no longer than the session.
+        if (stmt.onCommitAction() != null && !stmt.temporary()) {
+            throw new MemgresException("ON COMMIT can only be used on temporary tables", "42P16");
+        }
         Schema schema = executor.database.getOrCreateSchema(schemaName);
 
         if (schema.getTable(stmt.name()) != null) {
@@ -112,6 +117,8 @@ class DdlTableExecutor {
             if (!definedColumnNames.add(def.name().toLowerCase())) {
                 throw new MemgresException("column \"" + def.name() + "\" specified more than once", "42701");
             }
+            DdlDefinitionChecks.rejectSystemColumnName(def.name());
+            DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
 
             DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(def.typeName(), def.precision());
             DataType dataType = resolved.dataType();
@@ -126,6 +133,15 @@ class DdlTableExecutor {
 
             // GENERATED AS IDENTITY
             if (def.identity() != null) {
+                // Identity is fed by a sequence, so both the type and the absence of a competing
+                // DEFAULT have to hold before the sequence is created.
+                DdlDefinitionChecks.requireIdentityType(dataType);
+                if (def.defaultExpr() != null
+                        || dataType == DataType.SERIAL || dataType == DataType.BIGSERIAL
+                        || dataType == DataType.SMALLSERIAL) {
+                    throw PgErrors.syntax("both default and identity specified for column \""
+                            + def.name() + "\" of table \"" + stmt.name() + "\"");
+                }
                 notNull = true;
                 String seqName = stmt.name() + "_" + def.name() + "_seq";
                 Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
@@ -178,8 +194,8 @@ class DdlTableExecutor {
                         try {
                             new java.math.BigDecimal(strVal);
                         } catch (NumberFormatException e) {
-                            throw new MemgresException("invalid input syntax for type " + dataType.getPgName()
-                                    + ": \"" + strVal + "\"", "22P02");
+                            throw new MemgresException("invalid input syntax for type "
+                                    + dataType.toRegtypeDisplay() + ": \"" + strVal + "\"", "22P02");
                         }
                     }
                 }
@@ -229,6 +245,7 @@ class DdlTableExecutor {
 
         // Validate generated column expressions
         validateGeneratedColumns(stmt.columns(), columns);
+        rejectKeysOnVirtualColumns(stmt, columns);
 
         Table table = new Table(stmt.name(), columns);
         if (stmt.unlogged()) table.setUnlogged(true);
@@ -310,11 +327,16 @@ class DdlTableExecutor {
                     }
                     continue;
                 }
+                if (tc.type() == TableConstraint.ConstraintType.CHECK) {
+                    DdlDefinitionChecks.requireBooleanPredicate(tc.checkExpr(), table, "CHECK");
+                }
                 StoredConstraint sc = ddl.convertTableConstraint(stmt.name(), tc);
                 if (sc != null) {
                     // For FK constraints without explicit schema, set the schema from the table's schema
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
                             && sc.getReferencesSchema() == null && sc.getReferencesTable() != null) {
+                        Table refTable = ddl.resolveTableOrNull(sc.getReferencesTable());
+                        if (refTable != null) checkTempPermanentReference(schemaName, refTable);
                         sc.setReferencesSchema(schemaName);
                     }
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
@@ -366,6 +388,60 @@ class DdlTableExecutor {
         // M11: Apply ALTER DEFAULT PRIVILEGES to newly created table
         applyDefaultPrivileges(schemaName, stmt.name(), executor.currentRole());
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /**
+     * A VIRTUAL generated column is recomputed on every read and never stored, so there is
+     * nothing for a unique index to hold; PostgreSQL refuses to key on one. Checked before the
+     * table exists, so a rejected definition leaves nothing behind.
+     */
+    private void rejectKeysOnVirtualColumns(CreateTableStmt stmt, List<Column> columns) {
+        Set<String> virtual = new HashSet<>();
+        for (Column c : columns) {
+            if (c.getGeneratedExpr() != null && c.isVirtual()) {
+                virtual.add(c.getName().toLowerCase());
+            }
+        }
+        if (virtual.isEmpty()) return;
+        for (ColumnDef def : stmt.columns()) {
+            if (!virtual.contains(def.name().toLowerCase())) continue;
+            if (def.primaryKey()) throw virtualKeyError(true);
+            if (def.unique()) throw virtualKeyError(false);
+        }
+        if (stmt.constraints() == null) return;
+        for (TableConstraint tc : stmt.constraints()) {
+            boolean pk = tc.type() == TableConstraint.ConstraintType.PRIMARY_KEY;
+            boolean uq = tc.type() == TableConstraint.ConstraintType.UNIQUE;
+            if ((!pk && !uq) || tc.columns() == null) continue;
+            for (String col : tc.columns()) {
+                if (virtual.contains(col.toLowerCase())) throw virtualKeyError(pk);
+            }
+        }
+    }
+
+    private static MemgresException virtualKeyError(boolean primaryKey) {
+        return PgErrors.notImplemented(primaryKey
+                ? "primary keys on virtual generated columns are not supported"
+                : "unique constraints on virtual generated columns are not supported");
+    }
+
+    /**
+     * A temporary table disappears at session end, so a foreign key across that boundary either
+     * outlives its target or holds a permanent table hostage to one session. PostgreSQL refuses
+     * both directions.
+     */
+    void checkTempPermanentReference(String schemaName, Table refTable) {
+        boolean sourceTemp = isTempSchema(schemaName);
+        boolean targetTemp = isTempSchema(findSchemaNameOf(refTable, schemaName));
+        if (sourceTemp == targetTemp) return;
+        throw new MemgresException(sourceTemp
+                ? "constraints on temporary tables may reference only temporary tables"
+                : "constraints on permanent tables may reference only permanent tables", "42P16");
+    }
+
+    /** True for the per-session temp schema, whatever suffix this session's is named with. */
+    static boolean isTempSchema(String schemaName) {
+        return schemaName != null && schemaName.toLowerCase().startsWith("pg_temp");
     }
 
     /** M11: Apply default privileges from ALTER DEFAULT PRIVILEGES to a newly created table. */
@@ -1174,7 +1250,14 @@ class DdlTableExecutor {
 
         QueryResult result = executor.executeStatement(stmt.query());
         List<Column> columns = new ArrayList<>();
+        // The query's output names become the table's column names, so they have to satisfy the
+        // same rules a column list does — a repeated or system name is rejected here, not later.
+        Set<String> seenNames = new HashSet<>();
         for (Column srcCol : result.getColumns()) {
+            DdlDefinitionChecks.rejectSystemColumnName(srcCol.getName());
+            if (!seenNames.add(srcCol.getName().toLowerCase())) {
+                throw PgErrors.duplicateColumn(srcCol.getName());
+            }
             columns.add(new Column(srcCol.getName(), srcCol.getType(), true, false, null,
                     srcCol.getEnumTypeName(), srcCol.getPrecision(), srcCol.getScale(), null));
         }

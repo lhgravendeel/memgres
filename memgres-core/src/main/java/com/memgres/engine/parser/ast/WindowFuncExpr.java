@@ -18,6 +18,12 @@ public final class WindowFuncExpr implements Expression {
     public final boolean ignoreNulls;
     public final boolean fromLast;
     public final Expression filter;
+    /**
+     * True for {@code OVER (w ...)}, false for {@code OVER w}. PostgreSQL treats the two
+     * differently: the parenthesised form copies the named window and may not override parts of
+     * it, while the bare form simply uses it.
+     */
+    public final boolean copiedWindow;
 
     public WindowFuncExpr(
             String name,
@@ -59,6 +65,24 @@ public final class WindowFuncExpr implements Expression {
             boolean fromLast,
             Expression filter
     ) {
+        this(name, args, distinct, star, partitionBy, orderBy, frame, windowName,
+                ignoreNulls, fromLast, filter, false);
+    }
+
+    public WindowFuncExpr(
+            String name,
+            List<Expression> args,
+            boolean distinct,
+            boolean star,
+            List<Expression> partitionBy,
+            List<SelectStmt.OrderByItem> orderBy,
+            FrameClause frame,
+            String windowName,
+            boolean ignoreNulls,
+            boolean fromLast,
+            Expression filter,
+            boolean copiedWindow
+    ) {
         this.name = name;
         this.args = args;
         this.distinct = distinct;
@@ -70,6 +94,7 @@ public final class WindowFuncExpr implements Expression {
         this.ignoreNulls = ignoreNulls;
         this.fromLast = fromLast;
         this.filter = filter;
+        this.copiedWindow = copiedWindow;
     }
 
     /**
@@ -190,6 +215,7 @@ public final class WindowFuncExpr implements Expression {
     public boolean ignoreNulls() { return ignoreNulls; }
     public boolean fromLast() { return fromLast; }
     public Expression filter() { return filter; }
+    public boolean copiedWindow() { return copiedWindow; }
 
     @Override
     public boolean equals(Object o) {

@@ -153,6 +153,9 @@ class DdlExecutor {
         if (refTable == null) {
             throw new MemgresException("relation \"" + refTableName + "\" does not exist", "42P01");
         }
+        // A key across the temp/permanent boundary outlives one of its two ends, so PostgreSQL
+        // refuses it. Checked here so all three ways of declaring a key are covered.
+        tableExecutor.checkTempPermanentReference(schemaName, refTable);
         ConstraintValidator.validateForeignKeyDefinition(table, refTable, refTableName, fk);
     }
 
@@ -438,6 +441,9 @@ class DdlExecutor {
             } else if (executor.database.isCompositeType(baseType)) {
                 dataType = DataType.TEXT;
                 compositeTypeName = baseType;
+            } else if (executor.database.isShellType(baseType)) {
+                // A shell has no representation yet, so nothing can be declared as one
+                throw new MemgresException("type \"" + baseType + "\" is only a shell", "42704");
             } else {
                 throw new MemgresException("type \"" + baseType + "\" does not exist", "42704");
             }

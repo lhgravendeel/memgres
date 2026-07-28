@@ -516,6 +516,19 @@ class ConstraintValidator {
 
         // Try O(1) index lookup on referenced table's PK/UNIQUE index
         boolean found = false;
+        // A row may satisfy a self-referencing key by itself: PostgreSQL checks the constraint
+        // once the row is in place, so a row pointing at its own key is accepted. The check here
+        // runs before the row is stored, so it has to be considered explicitly.
+        if (refTable == table) {
+            boolean selfMatch = true;
+            for (int i = 0; i < refColIndices.length; i++) {
+                if (!valuesEqual(fkVals[i], row[refColIndices[i]])) {
+                    selfMatch = false;
+                    break;
+                }
+            }
+            if (selfMatch) found = true;
+        }
         for (Table searchTable : searchTables) {
             if (found) break;
             // Recompute ref column indices for each partition table (columns should match)
@@ -869,6 +882,20 @@ class ConstraintValidator {
     }
 
     void handleFkOnDelete(Table parentTable, Object[] deletedRow, java.util.Set<Object[]> alsoDeleting) {
+        handleFkOnDelete(parentTable, deletedRow, alsoDeleting,
+                Collections.newSetFromMap(new java.util.IdentityHashMap<Object[], Boolean>()));
+    }
+
+    /**
+     * Two tables referencing each other with ON DELETE CASCADE is an ordinary schema, and so is a
+     * table referencing itself. The walk therefore has to visit each row once: without
+     * {@code cascaded} it follows the cycle back to a row it has already deleted and recurses
+     * until the stack is gone.
+     */
+    private void handleFkOnDelete(Table parentTable, Object[] deletedRow,
+                                  java.util.Set<Object[]> alsoDeleting,
+                                  java.util.Set<Object[]> cascaded) {
+        if (!cascaded.add(deletedRow)) return;
         String parentSchemaName = findSchemaName(parentTable);
         // Find all tables with FK constraints referencing this table
         for (Schema schema : executor.database.getSchemas().values()) {
@@ -931,7 +958,7 @@ class ConstraintValidator {
                             if (!deleteSet.isEmpty()) {
                                 // Recurse: handle FK cascades on the child table's dependents before deleting
                                 for (Object[] childRow : deleteSet) {
-                                    handleFkOnDelete(childTable, childRow);
+                                    handleFkOnDelete(childTable, childRow, null, cascaded);
                                 }
                                 childTable.deleteRows(deleteSet);
                                 // Record undo so ROLLBACK can restore the deleted rows
@@ -1046,6 +1073,14 @@ class ConstraintValidator {
      * Handle FK ON UPDATE actions for all tables that reference the given table.
      */
     void handleFkOnUpdate(Table parentTable, Object[] oldRow, Object[] newRow) {
+        handleFkOnUpdate(parentTable, oldRow, newRow,
+                Collections.newSetFromMap(new java.util.IdentityHashMap<Object[], Boolean>()));
+    }
+
+    /** As with the delete walk, a cycle of ON UPDATE CASCADE constraints must visit each row once. */
+    private void handleFkOnUpdate(Table parentTable, Object[] oldRow, Object[] newRow,
+                                  java.util.Set<Object[]> cascaded) {
+        if (!cascaded.add(newRow)) return;
         String parentSchemaName = findSchemaName(parentTable);
         for (Schema schema : executor.database.getSchemas().values()) {
             for (Table childTable : schema.getTables().values()) {
@@ -1111,7 +1146,7 @@ class ConstraintValidator {
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
                                     recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
                                     // Recurse: the child row's FK columns changed
-                                    handleFkOnUpdate(childTable, oldVals, childRow);
+                                    handleFkOnUpdate(childTable, oldVals, childRow, cascaded);
                                 }
                             }
                             break;
@@ -1144,7 +1179,7 @@ class ConstraintValidator {
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
                                     recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
-                                    handleFkOnUpdate(childTable, oldVals, childRow);
+                                    handleFkOnUpdate(childTable, oldVals, childRow, cascaded);
                                 }
                             }
                             break;
@@ -1169,7 +1204,7 @@ class ConstraintValidator {
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
                                     recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
-                                    handleFkOnUpdate(childTable, oldVals, childRow);
+                                    handleFkOnUpdate(childTable, oldVals, childRow, cascaded);
                                 }
                             }
                             break;

@@ -20,6 +20,12 @@ class FromFunctionResolver {
      */
     private static final long MAX_SERIES_ROWS = 10_000_000L;
 
+    /**
+     * Poll for cancellation once per 1024 generated rows. A series builds rows without evaluating
+     * any expression, so it would otherwise run past statement_timeout unnoticed.
+     */
+    private static final long CANCEL_POLL_MASK = 1023L;
+
     private static MemgresException seriesTooLarge() {
         return new MemgresException(
                 "generate_series would produce more than " + MAX_SERIES_ROWS + " rows", "54000");
@@ -130,9 +136,55 @@ class FromFunctionResolver {
 
         // Try user-defined function
         PgFunction userFunc = executor.database.getFunction(fname);
-        if (userFunc != null) return resolveUserFunction(userFunc, alias, colAliases, evalArgs);
+        if (userFunc != null) {
+            checkRecordColumnDefinitionList(userFunc, funcFrom);
+            return resolveUserFunction(userFunc, alias, colAliases, evalArgs);
+        }
 
-        throw new MemgresException("function " + fname + " does not exist", "42883");
+        return resolveScalarFunctionInFrom(funcFrom, fname, alias, colAliases);
+    }
+
+    /**
+     * A function returning bare {@code record} has no column names or types of its own, so the
+     * caller has to supply them; one that declares OUT parameters already has them, and PG
+     * rejects a second, possibly contradicting, description of the same row.
+     */
+    private void checkRecordColumnDefinitionList(PgFunction userFunc, SelectStmt.FunctionFrom funcFrom) {
+        if (!userFunc.declaresRecordResult()) return;
+        boolean hasOutParams = userFunc.hasOutParams();
+        boolean hasColumnDefs = funcFrom.columnAliases() != null && !funcFrom.columnAliases().isEmpty();
+        if (hasOutParams && hasColumnDefs) {
+            throw PgErrors.syntax("a column definition list is redundant for a function with OUT parameters");
+        }
+        if (!hasOutParams && !hasColumnDefs) {
+            throw PgErrors.syntax("a column definition list is required for functions returning \"record\"");
+        }
+    }
+
+    /**
+     * PG puts no set-returning requirement on a function in FROM: a plain scalar call is simply
+     * a one-row, one-column relation named after the function.
+     */
+    private List<RowContext> resolveScalarFunctionInFrom(SelectStmt.FunctionFrom funcFrom, String fname,
+                                                        String alias, List<String> colAliases) {
+        Object value = executor.evalExpr(new FunctionCallExpr(funcFrom.functionName(), funcFrom.args()), null);
+        DataType type = value == null ? DataType.TEXT : TypeCoercion.inferType(value);
+        List<Column> cols = new ArrayList<>();
+        cols.add(new Column(firstColAlias(colAliases, alias), type, true, false, null));
+        Object[] row;
+        if (funcFrom.withOrdinality()) {
+            String ordName = colAliases != null && colAliases.size() > 1
+                    ? stripColType(colAliases.get(1)) : "ordinality";
+            cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
+            row = new Object[]{value, 1L};
+        } else {
+            row = new Object[]{value};
+        }
+        Table virtualTable = new Table(alias, cols);
+        virtualTable.insertRow(row);
+        List<RowContext> contexts = new ArrayList<>();
+        contexts.add(new RowContext(virtualTable, alias, row));
+        return contexts;
     }
 
     // ---- generate_series ----
@@ -165,19 +217,22 @@ class FromFunctionResolver {
                 cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
             }
             Table virtualTable = new Table(alias, cols);
+            List<Object[]> rows = new ArrayList<>();
             List<RowContext> contexts = new ArrayList<>();
             java.time.OffsetDateTime cur = tzStart;
             long ord = 1;
             for (long guard = 0; guard < MAX_SERIES_ROWS; guard++) {
+                if ((guard & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (ascending ? cur.isAfter(tzStop) : cur.isBefore(tzStop)) break;
                 Object[] row = hasOrdinality ? new Object[]{cur, ord++} : new Object[]{cur};
-                virtualTable.insertRow(row);
+                rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
                 java.time.OffsetDateTime next = ivStep.addTo(cur);
                 if (next.isEqual(cur)) break;
                 cur = next;
                 if (guard == MAX_SERIES_ROWS - 1) throw seriesTooLarge();
             }
+            virtualTable.replaceAllRows(rows);
             return contexts;
         }
         // Date/timestamp overload
@@ -196,20 +251,23 @@ class FromFunctionResolver {
                 cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
             }
             Table virtualTable = new Table(alias, cols);
+            List<Object[]> rows = new ArrayList<>();
             List<RowContext> contexts = new ArrayList<>();
             java.time.LocalDateTime cur = dtStart;
             long ord = 1;
             for (long guard = 0; guard < MAX_SERIES_ROWS; guard++) {
+                if ((guard & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (ascending ? cur.isAfter(dtStop) : cur.isBefore(dtStop)) break;
                 Object val = dateInput ? cur.atZone(java.time.ZoneOffset.UTC).toOffsetDateTime() : cur;
                 Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
-                virtualTable.insertRow(row);
+                rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
                 java.time.LocalDateTime next = ivStep.addTo(cur);
                 if (next.isEqual(cur)) break;
                 cur = next;
                 if (guard == MAX_SERIES_ROWS - 1) throw seriesTooLarge();
             }
+            virtualTable.replaceAllRows(rows);
             return contexts;
         }
         // Numeric overload: a fractional bound or step must not be truncated to bigint
@@ -227,17 +285,22 @@ class FromFunctionResolver {
                 numCols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
             }
             Table numTable = new Table(alias, numCols);
+            List<Object[]> numRows = new ArrayList<>();
             List<RowContext> numContexts = new ArrayList<>();
             boolean up = nStep.signum() > 0;
             long numOrd = 1;
+            long numProduced = 0;
             // Accumulate with add() so each value keeps PG's growing scale (1.0, 1.25, 1.50, ...)
             for (java.math.BigDecimal v = nStart;
                  up ? v.compareTo(nStop) <= 0 : v.compareTo(nStop) >= 0;
                  v = v.add(nStep)) {
+                if ((numProduced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
+                if (numRows.size() >= MAX_SERIES_ROWS) throw seriesTooLarge();
                 Object[] row = hasOrdinality ? new Object[]{v, numOrd++} : new Object[]{v};
-                numTable.insertRow(row);
+                numRows.add(row);
                 numContexts.add(new RowContext(numTable, alias, row));
             }
+            numTable.replaceAllRows(numRows);
             return numContexts;
         }
         try {
@@ -257,23 +320,30 @@ class FromFunctionResolver {
             cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
         }
         Table virtualTable = new Table(alias, cols);
+        List<Object[]> rows = new ArrayList<>();
         List<RowContext> contexts = new ArrayList<>();
         long ord = 1;
-        if (step > 0) {
-            for (long v = start; v <= stop; v += step) {
+        long produced = 0;
+        if (step != 0) {
+            boolean ascending = step > 0;
+            long v = start;
+            while (ascending ? v <= stop : v >= stop) {
+                if ((produced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
+                if (rows.size() >= MAX_SERIES_ROWS) throw seriesTooLarge();
                 Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
                 Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
-                virtualTable.insertRow(row);
+                rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
-            }
-        } else if (step < 0) {
-            for (long v = start; v >= stop; v += step) {
-                Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
-                Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
-                virtualTable.insertRow(row);
-                contexts.add(new RowContext(virtualTable, alias, row));
+                long next = v + step;
+                // A series that runs to the edge of bigint wraps on its last step; the loop
+                // condition would then hold again and never end.
+                if (((v ^ next) & (step ^ next)) < 0) break;
+                v = next;
             }
         }
+        // Publish the rows in one go: Table.insertRow copies the whole row list on every call, so
+        // filling a large series through it is quadratic and five million rows never finished.
+        virtualTable.replaceAllRows(rows);
         return contexts;
     }
 
@@ -1185,6 +1255,7 @@ class FromFunctionResolver {
             } else if (!resultList.isEmpty() && resultList.get(0) instanceof Object[]) {
                 Object[] firstRow = (Object[]) resultList.get(0);
                 if (cols.isEmpty() && colAliases != null && !colAliases.isEmpty()) {
+                    checkRecordShape(userFunc, colAliases.size(), firstRow.length);
                     for (int i = 0; i < colAliases.size(); i++) {
                         cols.add(new Column(colAliases.get(i), DataType.TEXT, true, false, null));
                     }
@@ -1265,7 +1336,9 @@ class FromFunctionResolver {
                 Map<String, Object> map = (Map<String, Object>) result;
                 rowArr = map.values().toArray();
             } else {
-                rowArr = new Object[]{result};
+                // A single value carries no shape of its own to check against the alias list
+                rowArr = new Object[colAliases.size()];
+                rowArr[0] = result;
             }
             List<Column> cols = new ArrayList<>();
             for (int i = 0; i < colAliases.size(); i++) {
@@ -1289,6 +1362,19 @@ class FromFunctionResolver {
     }
 
     // ---- Shared helpers ----
+
+    /**
+     * The caller's column definition list is the only description of a {@code record} result,
+     * so it has to agree with what the function body actually produces.
+     */
+    private static void checkRecordShape(PgFunction userFunc, int declared, int produced) {
+        if (declared == produced) return;
+        MemgresException e = PgErrors.invalidObjectDefinition(
+                "return type mismatch in function declared to return record");
+        e.setDetail("Final statement returns too " + (produced < declared ? "few" : "many") + " columns.");
+        e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
+        throw e;
+    }
 
     private static String firstColAlias(List<String> colAliases, String fallback) {
         return (colAliases != null && !colAliases.isEmpty()) ? stripColType(colAliases.get(0)) : fallback;
