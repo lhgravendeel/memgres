@@ -388,6 +388,7 @@ class DdlExecutor {
      * Used by CREATE TABLE and ALTER TABLE ADD COLUMN.
      */
     ResolvedType resolveColumnType(String typeName, Integer precision) {
+        TypeCoercion.checkDeclaredTypeLimits(typeName);
         String fullTypeName = typeName.replaceAll("\\(.*\\)", "").trim();
         boolean isArray = fullTypeName.endsWith("[]");
         DataType arrayElementType = null;

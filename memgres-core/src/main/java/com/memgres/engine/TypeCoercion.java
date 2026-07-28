@@ -651,12 +651,82 @@ public final class TypeCoercion {
      */
     public static void checkNumericTypmod(BigDecimal rounded, int precision, int scale) {
         int intDigits = precision - scale;
-        if (intDigits < 0) return;
-        BigDecimal limit = BigDecimal.TEN.pow(intDigits);
+        // A scale wider than the precision leaves a fractional-only field: 10^-5 is still the
+        // bound the value must stay under, so the check runs for a negative digit count too.
+        BigDecimal limit = BigDecimal.ONE.movePointRight(intDigits);
         if (rounded.abs().compareTo(limit) >= 0) {
             throw new MemgresException("numeric field overflow"
                     + "\n  Detail: A field with precision " + precision + ", scale " + scale
                     + " must round to an absolute value less than 10^" + intDigits + ".", "22003");
+        }
+    }
+
+    /** Longest a varchar or char may declare: PG packs the length into a typmod capped here. */
+    private static final int MAX_CHAR_LENGTH = 10485760;
+
+    /**
+     * Reject a type modifier outside the range the type's own input function accepts. PG checks
+     * these when the declaration is made, so a table it could never hold is never created.
+     *
+     * @param typeSpec the written type, modifier included, e.g. {@code numeric(1001,2)}
+     */
+    public static void checkDeclaredTypeLimits(String typeSpec) {
+        if (typeSpec == null) return;
+        int open = typeSpec.indexOf('(');
+        int close = typeSpec.indexOf(')', open + 1);
+        if (open < 0 || close < 0) return;
+        String name = typeSpec.substring(0, open).trim().toLowerCase(java.util.Locale.ROOT);
+        String[] args = typeSpec.substring(open + 1, close).split(",");
+        Integer first = parseModifier(args, 0);
+        if (first == null) return;
+
+        if (name.equals("varchar") || name.equals("character varying")) {
+            checkCharLength(first, "varchar");
+        } else if (name.equals("char") || name.equals("character") || name.equals("bpchar")) {
+            checkCharLength(first, "char");
+        } else if (name.equals("bit")) {
+            if (first < 1) throw lengthAtLeastOne("bit");
+        } else if (name.equals("varbit") || name.equals("bit varying")) {
+            if (first < 1) throw lengthAtLeastOne("varbit");
+        } else if (name.equals("numeric") || name.equals("decimal")) {
+            if (first < 1 || first > 1000) {
+                throw new MemgresException("NUMERIC precision " + first
+                        + " must be between 1 and 1000", "22023");
+            }
+            Integer scale = parseModifier(args, 1);
+            if (scale != null && (scale < -1000 || scale > 1000)) {
+                throw new MemgresException("NUMERIC scale " + scale
+                        + " must be between -1000 and 1000", "22023");
+            }
+        } else if (name.equals("float")) {
+            if (first < 1) {
+                throw new MemgresException("precision for type float must be at least 1 bit", "22023");
+            }
+            if (first > 53) {
+                throw new MemgresException("precision for type float must be less than 54 bits", "22023");
+            }
+        }
+    }
+
+    private static void checkCharLength(int length, String typeName) {
+        if (length < 1) throw lengthAtLeastOne(typeName);
+        if (length > MAX_CHAR_LENGTH) {
+            throw new MemgresException("length for type " + typeName
+                    + " cannot exceed " + MAX_CHAR_LENGTH, "22023");
+        }
+    }
+
+    private static MemgresException lengthAtLeastOne(String typeName) {
+        return new MemgresException("length for type " + typeName + " must be at least 1", "22023");
+    }
+
+    /** The n-th modifier as an integer, or null when it is absent or not a plain number. */
+    private static Integer parseModifier(String[] args, int index) {
+        if (index >= args.length) return null;
+        try {
+            return Integer.valueOf(args[index].trim());
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

@@ -493,6 +493,10 @@ public class AstExecutor {
         return castEvaluator.applyCast(val, typeSpec);
     }
 
+    void checkNumericSpecialToInteger(CastExpr cast, Object val) {
+        exprEvaluator.checkNumericSpecialToInteger(cast, val);
+    }
+
     /**
      * Coerce a value to a named type the way an assignment would, so a PL/pgSQL variable of a
      * domain carries the domain's constraints rather than only its name.

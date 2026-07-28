@@ -1410,14 +1410,13 @@ class SqlStateCorrectnessV2Test {
         }
     }
 
-    @Test void ln_negative_gives_22023() {
+    // PG reports an invalid logarithm argument, not an invalid parameter value.
+    @Test void ln_negative_gives_2201E() {
         try {
             exec("SELECT ln(-1)");
             fail("Expected error");
         } catch (SQLException e) {
-            String state = e.getSQLState();
-            assertTrue("22023".equals(state) || "2201F".equals(state),
-                    "Expected 22023 or 2201F, got " + state);
+            assertEquals("2201E", e.getSQLState());
         }
     }
 
