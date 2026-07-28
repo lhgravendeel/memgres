@@ -115,6 +115,14 @@ class DdlViewExecutor {
                 if ("42703".equals(e.getSqlState())) {
                     throw e;
                 }
+                // A view body is a query PostgreSQL analyses in full before it records it, so a
+                // query it would refuse to run is a view it refuses to define. Without this the
+                // definition was stored and the refusal deferred to every read of the view — and
+                // a view over an ungrouped column then answered with an arbitrary row's value.
+                if ("42803".equals(e.getSqlState()) || "42P20".equals(e.getSqlState())
+                        || "42809".equals(e.getSqlState())) {
+                    throw e;
+                }
             } catch (Exception e) {
                 // Silently ignore execution errors during view validation
             }

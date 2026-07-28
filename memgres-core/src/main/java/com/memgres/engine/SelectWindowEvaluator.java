@@ -327,6 +327,9 @@ class SelectWindowEvaluator {
      * when the table is empty, and refused identically on every execution path.
      */
     void validateWindowUsage(SelectStmt stmt) {
+        // A window function written as a plain call is a window function all the same, and saying
+        // so is more use than reporting a function nobody spelled wrong as missing.
+        select.placementCheck.rejectWindowCallWithoutOver(stmt);
         if (stmt.groupBy() != null) {
             for (Expression g : stmt.groupBy()) {
                 if (select.containsWindowFunction(g)) {
@@ -340,13 +343,10 @@ class SelectWindowEvaluator {
             throw new MemgresException("window functions are not allowed in HAVING", "42P20");
         }
         // LIMIT and OFFSET are read once for the whole query, before any row has a position in a
-        // window to be measured against.
-        if (select.containsWindowFunction(stmt.limit())) {
-            throw new MemgresException("window functions are not allowed in LIMIT", "42P20");
-        }
-        if (select.containsWindowFunction(stmt.offset())) {
-            throw new MemgresException("window functions are not allowed in OFFSET", "42P20");
-        }
+        // window to be measured against and before any group has been collected to aggregate. A
+        // sub-select there may of course aggregate: it is a query of its own with its own rows.
+        select.placementCheck.reject(stmt.limit(), "LIMIT");
+        select.placementCheck.reject(stmt.offset(), "OFFSET");
         for (SelectStmt.SelectTarget target : stmt.targets()) {
             validateCallPlacement(target.expr(), false);
         }

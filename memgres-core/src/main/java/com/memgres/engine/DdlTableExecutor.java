@@ -210,6 +210,20 @@ class DdlTableExecutor {
                 }
             }
 
+            // A DEFAULT and a generation expression are both evaluated for one row at a time, with
+            // no other row in sight; PostgreSQL names each context in its own words.
+            executor.selectExecutor.placementCheck.reject(def.defaultExpr(), "DEFAULT expressions");
+            if (def.generatedExpr() != null) {
+                Expression generated = null;
+                try {
+                    generated = com.memgres.engine.parser.Parser.parseExpression(def.generatedExpr());
+                } catch (RuntimeException ignored) {
+                    // An expression that will not parse is reported by whatever reads it next
+                }
+                executor.selectExecutor.placementCheck.reject(
+                        generated, "column generation expressions");
+            }
+
             // Validate generated column expression
             if (def.generatedExpr() != null) {
                 // PG rejects DEFAULT + GENERATED ALWAYS AS on same column
@@ -328,6 +342,9 @@ class DdlTableExecutor {
                     continue;
                 }
                 if (tc.type() == TableConstraint.ConstraintType.CHECK) {
+                    // A CHECK is tested against the row being written, on its own; it can see no
+                    // other row, so nothing in it may need a group or a finished result.
+                    executor.selectExecutor.placementCheck.reject(tc.checkExpr(), "check constraints");
                     DdlDefinitionChecks.requireBooleanPredicate(tc.checkExpr(), table, "CHECK");
                 }
                 StoredConstraint sc = ddl.convertTableConstraint(stmt.name(), tc);

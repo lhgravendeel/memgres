@@ -1340,6 +1340,8 @@ class DdlAlterTableExecutor {
         }
 
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.CHECK) {
+            executor.selectExecutor.placementCheck.reject(
+                    addConstraint.constraint().checkExpr(), "check constraints");
             DdlDefinitionChecks.requireBooleanPredicate(
                     addConstraint.constraint().checkExpr(), table, "CHECK");
         }
