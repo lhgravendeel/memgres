@@ -1490,6 +1490,26 @@ public class ExpressionParser {
     }
 
     /**
+     * PostgreSQL's {@code FUNC_MAX_ARGS}: a pg_proc entry has room for this many argument types,
+     * so no function call — variadic ones included — may carry more.
+     */
+    private static final int MAX_FUNCTION_ARGS = 100;
+
+    /**
+     * Refuse a function call with more arguments than PostgreSQL can pass. This is deliberately
+     * confined to real function calls: {@code COALESCE}, {@code GREATEST}, {@code LEAST},
+     * {@code NULLIF} and the XML forms are grammar productions of their own in PostgreSQL rather
+     * than {@code FuncCall} nodes, they never reach {@code ParseFuncOrColumn}, and a hundred-odd
+     * arguments to those is accepted. They are parsed elsewhere here for the same reason.
+     */
+    private static void checkFunctionArgCount(int argCount) {
+        if (argCount > MAX_FUNCTION_ARGS) {
+            throw new com.memgres.engine.MemgresException("cannot pass more than "
+                    + MAX_FUNCTION_ARGS + " arguments to a function", "54023");
+        }
+    }
+
+    /**
      * Parse a function call expression: name(...) with optional DISTINCT, ORDER BY,
      * FILTER, WITHIN GROUP, and OVER clauses. DRYs unqualified and schema-qualified function calls.
      */
@@ -1522,6 +1542,7 @@ public class ExpressionParser {
             }
             expect(TokenType.RIGHT_PAREN);
         }
+        checkFunctionArgCount(args.size());
 
         // IGNORE NULLS / RESPECT NULLS: PG 18 does not support this syntax.
         // Reject with syntax error to match PG 18 behavior.

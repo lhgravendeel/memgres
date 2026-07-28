@@ -183,6 +183,8 @@ class DdlExecutor {
         switch (tc.type()) {
             case PRIMARY_KEY: {
                 if (name == null) name = tableName + "_pkey";
+                // A key is stored as an index, so it is bounded by what an index tuple holds.
+                DdlIndexValidator.checkIndexColumnCount(tc.columns(), null);
                 StoredConstraint pk = StoredConstraint.primaryKey(name, resolveConstraintColumns(tc.columns()));
                 if (tc.deferrable()) {
                     pk.setDeferrable(true);
@@ -191,6 +193,7 @@ class DdlExecutor {
                 return pk;
             }
             case UNIQUE: {
+                DdlIndexValidator.checkIndexColumnCount(tc.columns(), null);
                 List<String> cols = resolveConstraintColumns(tc.columns());
                 if (name == null) name = tableName + "_" + String.join("_", cols) + "_key";
                 StoredConstraint sc = StoredConstraint.unique(name, cols);
