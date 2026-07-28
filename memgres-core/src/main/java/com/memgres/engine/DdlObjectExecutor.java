@@ -2380,6 +2380,40 @@ class DdlObjectExecutor {
 
     // ---- ALTER DOMAIN ----
 
+    /**
+     * The name PostgreSQL gives a CHECK added without one: the domain name and {@code _check},
+     * then {@code _check1}, {@code _check2} and so on once that is taken.
+     */
+    private static String generatedCheckName(DomainType domain) {
+        String base = domain.getName() + "_check";
+        for (int suffix = 0; ; suffix++) {
+            String candidate = suffix == 0 ? base : base + suffix;
+            if (!domainHasConstraint(domain, candidate)) return candidate;
+        }
+    }
+
+    /** Drop a constraint by name, including the unnamed CHECK that CREATE DOMAIN wrote. */
+    private static void dropDomainConstraint(DomainType domain, String name) {
+        if (name == null) return;
+        if (domain.getParsedCheck() != null && name.equalsIgnoreCase(domain.getName() + "_check")) {
+            domain.clearInlineCheck();
+            return;
+        }
+        domain.removeConstraint(name);
+    }
+
+    /** True when the domain already carries a constraint of this name, inline one included. */
+    private static boolean domainHasConstraint(DomainType domain, String name) {
+        if (name == null) return false;
+        if (domain.getParsedCheck() != null && name.equalsIgnoreCase(domain.getName() + "_check")) {
+            return true;
+        }
+        for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
+            if (name.equalsIgnoreCase(nc.name())) return true;
+        }
+        return false;
+    }
+
     QueryResult executeAlterDomain(AlterDomainStmt stmt) {
         DomainType domain = executor.database.getDomain(stmt.domainName());
         if (domain == null) {
@@ -2393,6 +2427,8 @@ class DdlObjectExecutor {
                 domain.setDefaultValue(null);
                 break;
             case "ADD_CONSTRAINT": {
+                String constraintName = stmt.constraintName() != null
+                        ? stmt.constraintName() : generatedCheckName(domain);
                 if (stmt.checkExpr() != null) {
                     try {
                         Table valueTable = new Table("_domain_check",
@@ -2418,7 +2454,7 @@ class DdlObjectExecutor {
                                             Object result = executor.evalExpr(stmt.checkExpr(), valCtx);
                                             if (!executor.isTruthy(result)) {
                                                 throw new MemgresException(
-                                                        "value for domain " + stmt.domainName() + " violates check constraint \"" + stmt.constraintName() + "\"",
+                                                        "value for domain " + stmt.domainName() + " violates check constraint \"" + constraintName + "\"",
                                                         "23514");
                                             }
                                         }
@@ -2428,11 +2464,18 @@ class DdlObjectExecutor {
                         }
                     }
                 }
-                domain.addConstraint(stmt.constraintName(), stmt.rawCheckExpr(), stmt.checkExpr(), !stmt.notValid());
+                domain.addConstraint(constraintName, stmt.rawCheckExpr(), stmt.checkExpr(), !stmt.notValid());
                 break;
             }
             case "DROP_CONSTRAINT":
-                domain.removeConstraint(stmt.constraintName());
+                if (!domainHasConstraint(domain, stmt.constraintName())) {
+                    throw new MemgresException("constraint \"" + stmt.constraintName()
+                            + "\" of domain \"" + stmt.domainName() + "\" does not exist", "42704");
+                }
+                dropDomainConstraint(domain, stmt.constraintName());
+                break;
+            case "DROP_CONSTRAINT_IF_EXISTS":
+                dropDomainConstraint(domain, stmt.constraintName());
                 break;
             case "VALIDATE": {
                 boolean found = false;

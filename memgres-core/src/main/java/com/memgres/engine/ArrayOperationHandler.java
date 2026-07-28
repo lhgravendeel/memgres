@@ -16,6 +16,62 @@ class ArrayOperationHandler {
         this.executor = executor;
     }
 
+    /**
+     * True when text is spelled the way PostgreSQL spells an array value. An array cast reads its
+     * input as an array literal and nothing else, so {@code '3'::int[]} is a malformed literal
+     * rather than a one-element array — and {@code ARRAY[1,2] || '3'} is that same cast.
+     */
+    static boolean isArrayLiteralText(String text) {
+        String t = text.trim();
+        return t.length() >= 2 && t.charAt(0) == '{' && t.charAt(t.length() - 1) == '}';
+    }
+
+    /**
+     * Concatenate two arrays. PostgreSQL joins two arrays of the same dimension end to end, but
+     * appends an operand of one dimension less as a single element, so {@code {{1,2},{3,4}}} and
+     * {@code {5,6}} make a three-row array rather than four loose values. An empty array has no
+     * dimensions at all and simply leaves the other operand as it was.
+     */
+    static List<Object> concatArrays(List<?> left, List<?> right) {
+        List<Object> merged = new ArrayList<Object>();
+        if (left.isEmpty() || right.isEmpty()) {
+            merged.addAll(left);
+            merged.addAll(right);
+            return merged;
+        }
+        int leftDims = dimensionsOf(left);
+        int rightDims = dimensionsOf(right);
+        if (leftDims == rightDims + 1) {
+            merged.addAll(left);
+            merged.add(new ArrayList<Object>(right));
+        } else if (rightDims == leftDims + 1) {
+            merged.add(new ArrayList<Object>(left));
+            merged.addAll(right);
+        } else {
+            merged.addAll(left);
+            merged.addAll(right);
+        }
+        return merged;
+    }
+
+    /** How many dimensions an array value has, counted down its first non-null element. */
+    private static int dimensionsOf(List<?> array) {
+        int dims = 1;
+        Object first = firstNonNull(array);
+        while (first instanceof List<?>) {
+            dims++;
+            first = firstNonNull((List<?>) first);
+        }
+        return dims;
+    }
+
+    private static Object firstNonNull(List<?> values) {
+        for (Object v : values) {
+            if (v != null) return v;
+        }
+        return null;
+    }
+
     /** Read an array value in any of the shapes it may arrive in, or null if it is not one. */
     private List<Object> asElements(Object arrVal) {
         if (arrVal == null) return new ArrayList<Object>();

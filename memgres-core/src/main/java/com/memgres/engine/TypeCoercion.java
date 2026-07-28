@@ -529,6 +529,11 @@ public final class TypeCoercion {
                 throw integerOutOfRange();
             return (int) lv;
         }
+        if (val instanceof Double || val instanceof Float) {
+            long lv = roundFloatToLong(((Number) val).doubleValue());
+            if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE) throw integerOutOfRange();
+            return (int) lv;
+        }
         if (val instanceof Number) {
             Number n = (Number) val;
             long lv = n.longValue();
@@ -539,24 +544,12 @@ public final class TypeCoercion {
         if (val instanceof Boolean) return ((Boolean) val) ? 1 : 0;
         String s = val.toString().trim();
         if (s.isEmpty()) throw new MemgresException("invalid input syntax for type integer: \"\"", "22P02");
-        try {
-            if (s.contains(".")) {
-                java.math.BigDecimal bd = new java.math.BigDecimal(s);
-                long lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
-                if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
-                    throw integerOutOfRange();
-                return (int) lv;
-            }
-            long lv = Long.parseLong(s);
-            if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
-                throw integerOutOfRange();
-            return (int) lv;
-        } catch (NumberFormatException e) {
-            if (s.matches("[+-]?\\d+")) {
-                throw integerOutOfRange();
-            }
+        java.math.BigInteger parsed = parseIntegerText(s);
+        if (parsed == null) {
             throw new MemgresException("invalid input syntax for type integer: \"" + val + "\"", "22P02");
         }
+        if (parsed.bitLength() >= 32) throw integerOutOfRange();
+        return parsed.intValue();
     }
 
     public static Long toLong(Object val) {
@@ -584,20 +577,34 @@ public final class TypeCoercion {
                 throw bigintOutOfRange();
             }
         }
+        if (val instanceof Double || val instanceof Float) {
+            return roundFloatToLong(((Number) val).doubleValue());
+        }
         if (val instanceof Number) return ((Number) val).longValue();
         if (val instanceof Boolean) return ((Boolean) val) ? 1L : 0L;
         String s = val.toString().trim();
         if (s.isEmpty()) throw new MemgresException("invalid input syntax for type bigint: \"\"", "22P02");
-        try {
-            if (s.contains(".")) return (long) Double.parseDouble(s);
-            return Long.parseLong(s);
-        } catch (NumberFormatException e) {
-            // Distinguish out-of-range from bad syntax: if the string looks numeric but overflows, it's 22003
-            if (s.matches("[+-]?\\d+")) {
-                throw bigintOutOfRange();
-            }
+        java.math.BigInteger parsed = parseIntegerText(s);
+        if (parsed == null) {
             throw new MemgresException("invalid input syntax for type bigint: \"" + val + "\"", "22P02");
         }
+        if (parsed.bitLength() >= 64) throw bigintOutOfRange();
+        return parsed.longValue();
+    }
+
+    /**
+     * A float converts to an integer by rounding half to even, which is what PostgreSQL reports:
+     * 0.5 and 2.5 both land on 2, 1.5 lands on 2. Truncating instead turns 1.6 into 1. A value
+     * with no integer to land on is out of range, not a saturated bound — returning
+     * Long.MAX_VALUE would report a plausible wrong number instead of an error.
+     */
+    private static long roundFloatToLong(double d) {
+        if (Double.isNaN(d) || Double.isInfinite(d)) throw bigintOutOfRange();
+        double rounded = Math.rint(d);
+        if (rounded < -9.223372036854776E18 || rounded >= 9.223372036854776E18) {
+            throw bigintOutOfRange();
+        }
+        return (long) rounded;
     }
 
     static Float toFloat(Object val) {
@@ -807,28 +814,83 @@ public final class TypeCoercion {
         return sb.toString();
     }
 
+    /** The words boolean input accepts, each matchable by any prefix that names only one of them. */
+    private static final String[] BOOLEAN_TRUE_WORDS = {"true", "yes", "on"};
+    private static final String[] BOOLEAN_FALSE_WORDS = {"false", "no", "off"};
+
     public static Boolean toBoolean(Object val) {
         if (val instanceof Boolean) return ((Boolean) val);
         if (val instanceof Number) return ((Number) val).intValue() != 0;
         String s = val.toString().trim().toLowerCase();
-        switch (s) {
-            case "true":
-            case "t":
-            case "yes":
-            case "y":
-            case "on":
-            case "1":
-                return true;
-            case "false":
-            case "f":
-            case "no":
-            case "n":
-            case "off":
-            case "0":
-                return false;
-            default:
-                throw new MemgresException("invalid input syntax for type boolean: \"" + val + "\"", "22P02");
+        if (s.equals("1")) return true;
+        if (s.equals("0")) return false;
+        // PG takes any prefix that names exactly one word, so "tr" is true and "fals" is false,
+        // while "o" is neither because it starts both "on" and "off".
+        Boolean matched = null;
+        if (!s.isEmpty()) {
+            for (String word : BOOLEAN_TRUE_WORDS) {
+                if (word.startsWith(s)) {
+                    if (matched != null && !matched) return ambiguousBoolean(val);
+                    matched = Boolean.TRUE;
+                }
+            }
+            for (String word : BOOLEAN_FALSE_WORDS) {
+                if (word.startsWith(s)) {
+                    if (matched != null && matched) return ambiguousBoolean(val);
+                    matched = Boolean.FALSE;
+                }
+            }
         }
+        if (matched != null) return matched;
+        throw new MemgresException("invalid input syntax for type boolean: \"" + val + "\"", "22P02");
+    }
+
+    private static Boolean ambiguousBoolean(Object val) {
+        throw new MemgresException("invalid input syntax for type boolean: \"" + val + "\"", "22P02");
+    }
+
+    /**
+     * Read text as an integer the way PostgreSQL's input function does: an optional sign, then
+     * either a radix prefix ({@code 0x}, {@code 0o}, {@code 0b}) or decimal digits, with
+     * underscores allowed between digits as separators. A fraction is not integer input, however
+     * close to whole it is — {@code '2.5'::int} is an error, while {@code 2.5::numeric::int} is 3.
+     *
+     * @return the value, or null when the text is not integer input at all
+     */
+    static java.math.BigInteger parseIntegerText(String raw) {
+        String s = raw.trim();
+        if (s.isEmpty()) return null;
+        boolean negative = false;
+        int i = 0;
+        char first = s.charAt(0);
+        if (first == '+' || first == '-') {
+            negative = first == '-';
+            i = 1;
+        }
+        int radix = 10;
+        if (i + 1 < s.length() && s.charAt(i) == '0') {
+            char kind = Character.toLowerCase(s.charAt(i + 1));
+            if (kind == 'x') { radix = 16; i += 2; }
+            else if (kind == 'o') { radix = 8; i += 2; }
+            else if (kind == 'b') { radix = 2; i += 2; }
+        }
+        StringBuilder digits = new StringBuilder();
+        boolean lastWasDigit = false;
+        for (; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '_') {
+                // a separator has to sit between two digits, never at either end
+                if (!lastWasDigit || i + 1 >= s.length()) return null;
+                lastWasDigit = false;
+                continue;
+            }
+            if (Character.digit(c, radix) < 0) return null;
+            digits.append(c);
+            lastWasDigit = true;
+        }
+        if (digits.length() == 0 || !lastWasDigit) return null;
+        java.math.BigInteger value = new java.math.BigInteger(digits.toString(), radix);
+        return negative ? value.negate() : value;
     }
 
     // ---- Date/Time conversions ----
@@ -1139,9 +1201,14 @@ public final class TypeCoercion {
                 try { return LocalDate.parse(datePart, fmt); } catch (DateTimeParseException e) { /* try next */ }
             }
         }
-        // Use 22008 (datetime_field_overflow) for well-formatted but out-of-range dates (e.g. 2023-02-29)
-        String errCode = s.matches("\\d{4}-\\d{2}-\\d{2}.*") ? "22008" : "22007";
-        throw new MemgresException("date/time field value out of range: \"" + val + "\"", errCode);
+        // A date that is written correctly but names a day that does not exist has a field out of
+        // range (2023-02-29); text that is not a date at all never had a field to overflow, so PG
+        // reports it as input syntax instead.
+        if (s.matches("\\d{4}-\\d{2}-\\d{2}.*")) {
+            throw new MemgresException(
+                    "date/time field value out of range: \"" + val + "\"", "22008");
+        }
+        throw new MemgresException("invalid input syntax for type date: \"" + val + "\"", "22007");
     }
 
     public static LocalTime toLocalTime(Object val) {
