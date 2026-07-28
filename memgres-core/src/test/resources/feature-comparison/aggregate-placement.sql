@@ -470,12 +470,13 @@ SELECT a FROM plv_nokey n WHERE n.a IN (SELECT max(k) FROM plv_other) OR true
 -- end-expected-error
 CREATE VIEW plv_badview AS SELECT a, b FROM plv_nokey GROUP BY a;
 
+CREATE VIEW plv_okview AS SELECT a, count(*) n FROM plv_nokey GROUP BY a;
+
 -- begin-expected
 -- columns: a | n
 -- row: 1, 2
 -- row: 2, 1
 -- end-expected
-CREATE VIEW plv_okview AS SELECT a, count(*) n FROM plv_nokey GROUP BY a;
 SELECT a, n FROM plv_okview ORDER BY a;
 
 -- 11: nothing above narrows an ordinary grouped, windowed or joined query
