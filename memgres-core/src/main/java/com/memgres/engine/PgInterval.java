@@ -5,6 +5,8 @@ import com.memgres.engine.util.Strs;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -200,6 +202,25 @@ public class PgInterval implements Comparable<PgInterval> {
             "(?:(-?\\d+(?:\\.\\d+)?)\\s+seconds?)?",
             Pattern.CASE_INSENSITIVE
     );
+
+    /**
+     * Parse an interval literal written with a field qualifier, e.g. {@code INTERVAL '5' DAY TO
+     * HOUR}. The qualifier decides what an unlabelled number in the literal counts, then decides
+     * which of the parsed fields survive; a literal that names its own units is only trimmed.
+     */
+    public static PgInterval parse(String input, IntervalTypmod typmod) {
+        if (typmod == null) return parse(input);
+        if (typmod.range() != IntervalTypmod.FULL_RANGE) {
+            PgInterval ranged;
+            try {
+                ranged = parseRanged(input, typmod);
+            } catch (NumberFormatException | ArithmeticException e) {
+                throw PgErrors.intervalFieldOutOfRange(input == null ? "" : input.trim());
+            }
+            if (ranged != null) return typmod.apply(ranged);
+        }
+        return typmod.apply(parse(input));
+    }
 
     /**
      * Parse a PostgreSQL interval string like '1 year 2 months 3 days 04:05:06'.
@@ -404,41 +425,201 @@ public class PgInterval implements Comparable<PgInterval> {
             double value = Double.parseDouble(tok.group(4));
             String unit = tok.group(5) == null ? "second" : normalizeUnit(tok.group(5));
             if (unit == null) return null;
-            // Scale the larger units down to years first, so one fractional rule covers them all
-            if ("millennium".equals(unit)) { value *= 1000; unit = "year"; }
-            else if ("century".equals(unit)) { value *= 100; unit = "year"; }
-            else if ("decade".equals(unit)) { value *= 10; unit = "year"; }
-            long whole = (long) value;
-            double frac = value - whole;
-            switch (unit) {
-                case "year":
-                    // A fractional year spills into whole months, as PG does
-                    months += whole * 12 + Math.round(frac * 12);
-                    break;
-                case "month":
-                    months += whole;
-                    days += Math.round(frac * 30);
-                    break;
-                case "week":
-                    days += whole * 7;
-                    micros += Math.round(frac * 7 * 86_400_000_000L);
-                    break;
-                case "day":
-                    days += whole;
-                    micros += Math.round(frac * 86_400_000_000L);
-                    break;
-                case "hour":        micros += Math.round(value * 3_600_000_000L); break;
-                case "minute":      micros += Math.round(value * 60_000_000L); break;
-                case "second":      micros += Math.round(value * 1_000_000L); break;
-                case "millisecond": micros += Math.round(value * 1_000L); break;
-                case "microsecond": micros += Math.round(value); break;
-                default: return null;
-            }
+            Accum one = new Accum();
+            if (!addUnit(one, value, unit)) return null;
+            months += one.months;
+            days += one.days;
+            micros += one.micros;
             matchedAny = true;
         }
         if (!matchedAny || end != s.length()) return null;
         if (ago) return checked(-months, -days, -micros);
         return checked(months, days, micros);
+    }
+
+    /** Running totals while a list of quantity-and-unit fields is decoded. */
+    private static final class Accum {
+        long months;
+        long days;
+        long micros;
+    }
+
+    /**
+     * Add {@code value} of {@code unit} to the running totals, spilling a fractional quantity
+     * into the next smaller field the way PG does.
+     *
+     * @return false when the unit is not one this type can hold
+     */
+    private static boolean addUnit(Accum acc, double value, String unit) {
+        // Scale the larger units down to years first, so one fractional rule covers them all
+        if ("millennium".equals(unit)) { value *= 1000; unit = "year"; }
+        else if ("century".equals(unit)) { value *= 100; unit = "year"; }
+        else if ("decade".equals(unit)) { value *= 10; unit = "year"; }
+        long whole = (long) value;
+        double frac = value - whole;
+        switch (unit) {
+            case "year":
+                // A fractional year spills into whole months, as PG does
+                acc.months += whole * 12 + Math.round(frac * 12);
+                break;
+            case "month":
+                acc.months += whole;
+                acc.days += Math.round(frac * 30);
+                break;
+            case "week":
+                acc.days += whole * 7;
+                acc.micros += Math.round(frac * 7 * 86_400_000_000L);
+                break;
+            case "day":
+                acc.days += whole;
+                acc.micros += Math.round(frac * 86_400_000_000L);
+                break;
+            case "hour":        acc.micros += Math.round(value * 3_600_000_000L); break;
+            case "minute":      acc.micros += Math.round(value * 60_000_000L); break;
+            case "second":      acc.micros += Math.round(value * 1_000_000L); break;
+            case "millisecond": acc.micros += Math.round(value * 1_000L); break;
+            case "microsecond": acc.micros += Math.round(value); break;
+            default: return false;
+        }
+        return true;
+    }
+
+    /**
+     * One field of a qualified interval literal. PG splits the text on whitespace and reads the
+     * fields right to left, which is what lets the unit word in '2 hours' name the number to its
+     * left and what lets '1 2' DAY TO HOUR mean a day and an hour.
+     */
+    private static final Pattern QUALIFIED_FIELD = Pattern.compile(
+            "\\G\\s*(?:"
+          + "([+-]?\\d+):(\\d+)(?::(\\d+(?:\\.\\d+)?))?"      // 1,2,3 time-of-day HH:MM[:SS]
+          + "|([+-]?\\d+)-(\\d+)"                              // 4,5   sql_standard years-months
+          + "|([+-]?(?:\\d+(?:\\.\\d+)?|\\.\\d+))"             // 6     bare quantity
+          + "|([A-Za-z]+)"                                     // 7     unit word, or "ago"
+          + "|(@)"                                             // 8     PG's traditional lead-in
+          + ")\\s*");
+
+    /**
+     * Decode a literal against a field qualifier. A number the literal does not label takes the
+     * qualifier's least significant field, so INTERVAL '5' DAY TO HOUR is five hours; and PG
+     * refuses a literal that fills the same field twice rather than adding the two together.
+     *
+     * @return the decoded interval, or null when the text is not a shape this reader recognises
+     *         (an ISO 8601 duration, say) and the unqualified reader should have it instead
+     */
+    private static PgInterval parseRanged(String input, IntervalTypmod typmod) {
+        if (input == null || Strs.isBlank(input)) return null;
+        String s = input.trim();
+        if (s.equalsIgnoreCase("infinity") || s.equalsIgnoreCase("+infinity")) return INFINITY;
+        if (s.equalsIgnoreCase("-infinity")) return NEG_INFINITY;
+        // An ISO 8601 duration names every unit itself, so the qualifier has nothing to assign
+        if (s.startsWith("P") || s.startsWith("p")) return null;
+
+        List<String[]> fields = new ArrayList<String[]>();
+        Matcher tok = QUALIFIED_FIELD.matcher(s);
+        int end = 0;
+        while (tok.find()) {
+            end = tok.end();
+            if (tok.group(1) != null) {
+                fields.add(new String[]{"time", tok.group(1), tok.group(2), tok.group(3)});
+            } else if (tok.group(4) != null) {
+                fields.add(new String[]{"ym", tok.group(4), tok.group(5)});
+            } else if (tok.group(6) != null) {
+                fields.add(new String[]{"num", tok.group(6)});
+            } else if (tok.group(7) != null) {
+                fields.add(new String[]{"word", tok.group(7)});
+            } else {
+                fields.add(new String[]{"at"});
+            }
+        }
+        if (fields.isEmpty() || end != s.length()) return null;
+
+        Accum acc = new Accum();
+        int filled = 0;
+        String pendingUnit = null;
+        boolean ago = false;
+        for (int i = fields.size() - 1; i >= 0; i--) {
+            String[] f = fields.get(i);
+            if ("at".equals(f[0])) continue;
+            if ("word".equals(f[0])) {
+                if ("ago".equalsIgnoreCase(f[1])) { ago = true; continue; }
+                String unit = normalizeUnit(f[1]);
+                if (unit == null) return null;
+                pendingUnit = unit;
+                continue;
+            }
+            if ("time".equals(f[0])) {
+                int timeFields = IntervalTypmod.HOUR | IntervalTypmod.MINUTE | IntervalTypmod.SECOND;
+                if ((filled & timeFields) != 0) throw invalidIntervalSyntax(input);
+                filled |= timeFields;
+                acc.micros += timeFieldMicros(f[1], f[2], f[3], typmod.range());
+                // PG reads whatever stands to the left of a time-of-day as a day count
+                pendingUnit = "day";
+                continue;
+            }
+            if ("ym".equals(f[0])) {
+                int ymFields = IntervalTypmod.YEAR | IntervalTypmod.MONTH;
+                if ((filled & ymFields) != 0) throw invalidIntervalSyntax(input);
+                filled |= ymFields;
+                long sign = f[1].startsWith("-") ? -1 : 1;
+                long years = Math.abs(Long.parseLong(stripPlus(f[1])));
+                long mons = Long.parseLong(f[2]);
+                acc.months += sign * (years * 12 + mons);
+                pendingUnit = null;
+                continue;
+            }
+            String unit = pendingUnit != null
+                    ? pendingUnit : IntervalTypmod.unitName(typmod.defaultUnit());
+            int bit = fieldBitOf(unit);
+            if ((filled & bit) != 0) throw invalidIntervalSyntax(input);
+            filled |= bit;
+            double value;
+            try {
+                value = Double.parseDouble(stripPlus(f[1]));
+            } catch (NumberFormatException e) {
+                return null;
+            }
+            if (!addUnit(acc, value, unit)) return null;
+            // 'D H' is the SQL standard spelling of DAY TO HOUR, so an hour hands DAY leftwards
+            pendingUnit = "hour".equals(unit) ? "day" : null;
+        }
+        if (ago) return checked(-acc.months, -acc.days, -acc.micros);
+        return checked(acc.months, acc.days, acc.micros);
+    }
+
+    private static String stripPlus(String s) {
+        return s.startsWith("+") ? s.substring(1) : s;
+    }
+
+    /** Microseconds held by one HH:MM[:SS] field; the sign on the hours covers the whole field. */
+    private static long timeFieldMicros(String hh, String mm, String ss, int range) {
+        boolean negative = hh.startsWith("-");
+        long hours = Math.abs(Long.parseLong(stripPlus(hh)));
+        long minutes = Long.parseLong(mm);
+        double seconds = ss != null ? Double.parseDouble(ss) : 0;
+        // Under MINUTE TO SECOND the SQL standard reads a two-part time field as MM:SS
+        if (ss == null && range == (IntervalTypmod.MINUTE | IntervalTypmod.SECOND)) {
+            seconds = minutes;
+            minutes = hours;
+            hours = 0;
+        }
+        long field = (hours * 3600L + minutes * 60L) * 1_000_000L + Math.round(seconds * 1_000_000L);
+        return negative ? -field : field;
+    }
+
+    /** The interval field a unit word fills, for detecting a literal that fills one twice. */
+    private static int fieldBitOf(String unit) {
+        if ("year".equals(unit) || "decade".equals(unit)
+                || "century".equals(unit) || "millennium".equals(unit)) return IntervalTypmod.YEAR;
+        if ("month".equals(unit)) return IntervalTypmod.MONTH;
+        if ("day".equals(unit) || "week".equals(unit)) return IntervalTypmod.DAY;
+        if ("hour".equals(unit)) return IntervalTypmod.HOUR;
+        if ("minute".equals(unit)) return IntervalTypmod.MINUTE;
+        return IntervalTypmod.SECOND;
+    }
+
+    private static MemgresException invalidIntervalSyntax(String input) {
+        return new MemgresException(
+                "invalid input syntax for type interval: \"" + input + "\"", "22007");
     }
 
     /** Map a PG interval unit word (any accepted abbreviation or plural) to its canonical name. */

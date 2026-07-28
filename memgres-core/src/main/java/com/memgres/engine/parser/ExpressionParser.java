@@ -285,12 +285,13 @@ public class ExpressionParser {
         } else if (name.equalsIgnoreCase("INTERVAL")) {
             // Handle INTERVAL qualifiers: INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, etc.
             // Also INTERVAL YEAR, INTERVAL HOUR, etc. (single field)
+            // The qualifier is part of the type's identity, so it is spelled one way regardless
+            // of how it was written: "interval day to second", never "interval day TO second".
             if (checkIntervalField()) {
-                sb.append(" ").append(advance().value()); // consume field keyword
+                sb.append(" ").append(advance().value().toLowerCase()); // consume field keyword
                 if (checkKeyword("TO") || checkIdentCI("TO")) {
-                    sb.append(" ").append(advance().value()); // consume TO
-                    // Consume the target field keyword
-                    sb.append(" ").append(readIdentifier());
+                    advance(); // consume TO
+                    sb.append(" to ").append(readIdentifier().toLowerCase());
                 }
             }
         } else if (name.equalsIgnoreCase("BIT") && checkKeyword("VARYING")) {
@@ -1033,6 +1034,10 @@ public class ExpressionParser {
             } else if (matchKeywords("AT", "TIME", "ZONE")) {
                 Expression zone = parsePrimary();
                 expr = new AtTimeZoneExpr(expr, zone);
+            } else if (matchKeywords("AT", "LOCAL")) {
+                // PG 17's AT LOCAL is AT TIME ZONE with the session's TimeZone, which the
+                // evaluator reads when the zone expression is absent.
+                expr = new AtTimeZoneExpr(expr, null);
             } else if (matchKeyword("COLLATE")) {
                 // COLLATE postfix: validate collation name and wrap in CollateExpr.
                 if (isClauseKeyword()) {

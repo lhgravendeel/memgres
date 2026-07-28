@@ -111,9 +111,21 @@ class CatalogSystemFunctions {
                             return pgTypeDisplayName(DataType.fromPgName(baseType)) + "[]";
                         } catch (Exception e) { return tn; }
                     }
+                    // A qualifier or a precision is part of the modifier, not of the type's
+                    // name: INTERVAL '3' DAY is still just an interval.
+                    if (IntervalTypmod.fromTypeSpec(tn) != null) return "interval";
                     try {
                         return pgTypeDisplayName(DataType.fromPgName(tn));
                     } catch (Exception e) { return tn; }
+                }
+                if (rawExpr instanceof AtTimeZoneExpr) {
+                    // AT TIME ZONE / AT LOCAL swaps a value between the zoned and zoneless
+                    // spelling of its type; a timetz is a formatted string, which the value-shape
+                    // fallback below would otherwise report as text.
+                    Object shifted = executor.evalExpr(rawExpr, ctx);
+                    if (shifted instanceof LocalDateTime) return "timestamp without time zone";
+                    if (shifted instanceof OffsetDateTime) return "timestamp with time zone";
+                    if (TypeCoercion.looksLikeTimeTz(shifted)) return "time with time zone";
                 }
                 if (rawExpr instanceof ArrayExpr && !((ArrayExpr) rawExpr).isRow() && !((ArrayExpr) rawExpr).elements().isEmpty()) {
                     ArrayExpr arrExpr = (ArrayExpr) rawExpr;
