@@ -1579,6 +1579,8 @@ class FunctionEvaluator {
                             // Escaped character: emit literal
                             sb.append(java.util.regex.Pattern.quote(String.valueOf(next)));
                             ci++; // skip next
+                        } else if (ch == escChar) {
+                            // An escape with nothing left to escape is dropped, as PG does
                         } else if (ch == '%') {
                             sb.append(".*");
                         } else if (ch == '_') {

@@ -1556,28 +1556,7 @@ class ExprEvaluator {
         if (esc != null && esc.length() > 1) {
             throw new MemgresException("invalid escape string", "22025");
         }
-        // PG uses backslash as the default escape when no ESCAPE clause is specified
-        if (esc == null) esc = "\\";
-
-        // Build regex from LIKE pattern with escape character support
-        StringBuilder regex = new StringBuilder();
-        for (int i = 0; i < pat.length(); i++) {
-            char ch = pat.charAt(i);
-            if (!esc.isEmpty() && ch == esc.charAt(0) && i + 1 < pat.length()) {
-                // Next character is literal (escaped)
-                i++;
-                regex.append(java.util.regex.Pattern.quote(String.valueOf(pat.charAt(i))));
-            } else if (ch == '%') {
-                regex.append(".*");
-            } else if (ch == '_') {
-                regex.append(".");
-            } else {
-                regex.append(java.util.regex.Pattern.quote(String.valueOf(ch)));
-            }
-        }
-
-        String regexStr = like.caseInsensitive() ? "(?i)" + regex : regex.toString();
-        boolean matches = str.matches(regexStr);
+        boolean matches = likeMatch(str, pat, esc, like.caseInsensitive());
         return like.negated() ? !matches : matches;
     }
 
@@ -1936,29 +1915,80 @@ class ExprEvaluator {
         return true;
     }
 
-    /** Convert a SQL LIKE pattern to a Java regex, using backslash as the default escape. */
-    static String likeToRegex(String likePattern) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < likePattern.length(); i++) {
-            char c = likePattern.charAt(i);
-            if (c == '\\' && i + 1 < likePattern.length()) {
-                // Backslash escapes the next character (PG default escape)
-                i++;
-                char next = likePattern.charAt(i);
-                sb.append(java.util.regex.Pattern.quote(String.valueOf(next)));
-            } else if (c == '%') {
-                sb.append(".*");
-            } else if (c == '_') {
-                sb.append(".");
-            } else {
-                // Escape regex special characters
-                if ("\\[]{}()^$.|*+?".indexOf(c) >= 0) {
-                    sb.append('\\');
+    /** Match a SQL LIKE pattern with backslash as the escape character. */
+    static boolean likeMatch(String text, String pattern, boolean caseInsensitive) {
+        return likeMatch(text, pattern, "\\", caseInsensitive);
+    }
+
+    /**
+     * PostgreSQL's LIKE matcher, following like_match.c rather than a regex translation.
+     * The difference that matters is when the pattern ends with the escape character:
+     * PostgreSQL only complains once matching actually walks onto that escape, so
+     * {@code 'abc' LIKE 'ab\'} is an error while {@code 'ab' LIKE 'ab\'} is plain false.
+     *
+     * @param escape the escape string; empty disables escaping, null means the default backslash
+     */
+    static boolean likeMatch(String text, String pattern, String escape, boolean caseInsensitive) {
+        boolean noEscape = escape != null && escape.isEmpty();
+        char esc = (escape == null || escape.isEmpty()) ? '\\' : escape.charAt(0);
+        return matchLike(text, 0, pattern, 0, esc, noEscape, caseInsensitive);
+    }
+
+    private static boolean matchLike(String t, int ti, String p, int pi,
+                                     char esc, boolean noEscape, boolean ci) {
+        int tlen = t.length();
+        int plen = p.length();
+        while (ti < tlen && pi < plen) {
+            char pc = p.charAt(pi);
+            if (!noEscape && pc == esc) {
+                pi++;
+                if (pi >= plen) throw patternEndsWithEscape();
+                if (!sameChar(p.charAt(pi), t.charAt(ti), ci)) return false;
+            } else if (pc == '%') {
+                pi++;
+                while (pi < plen && p.charAt(pi) == '%') pi++;
+                if (pi >= plen) return true; // a trailing % swallows the rest
+                // The remainder must start with a literal, an escape or _; knowing which
+                // keeps the search from retrying every position of the text.
+                char firstpat = 0;
+                boolean literalFirst = true;
+                if (!noEscape && p.charAt(pi) == esc) {
+                    if (pi + 1 >= plen) throw patternEndsWithEscape();
+                    firstpat = p.charAt(pi + 1);
+                } else if (p.charAt(pi) == '_') {
+                    literalFirst = false;
+                } else {
+                    firstpat = p.charAt(pi);
                 }
-                sb.append(c);
+                for (int k = ti; k < tlen; k++) {
+                    if (literalFirst && !sameChar(firstpat, t.charAt(k), ci)) continue;
+                    if (matchLike(t, k, p, pi, esc, noEscape, ci)) return true;
+                }
+                return false;
+            } else if (pc == '_') {
+                ti++;
+                pi++;
+                continue;
+            } else if (!sameChar(pc, t.charAt(ti), ci)) {
+                return false;
             }
+            ti++;
+            pi++;
         }
-        return sb.toString();
+        if (ti < tlen) return false;
+        // The text is spent; only a run of % can still match nothing
+        while (pi < plen && p.charAt(pi) == '%') pi++;
+        return pi >= plen;
+    }
+
+    private static boolean sameChar(char a, char b, boolean caseInsensitive) {
+        if (a == b) return true;
+        return caseInsensitive
+                && Character.toLowerCase(a) == Character.toLowerCase(b);
+    }
+
+    private static MemgresException patternEndsWithEscape() {
+        return new MemgresException("LIKE pattern must not end with escape character", "22025");
     }
 
     /** Strict truthiness check that distinguishes null from false. */

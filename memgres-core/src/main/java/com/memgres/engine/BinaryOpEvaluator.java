@@ -1092,13 +1092,11 @@ class BinaryOpEvaluator {
                             left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase();
                     throw new MemgresException("operator does not exist: " + tn + " ~~ unknown", "42883");
                 }
-                String pattern = AstExecutor.likeToRegex(right.toString());
-                return left.toString().matches("(?s)" + pattern);
+                return AstExecutor.likeMatch(left.toString(), right.toString(), false);
             }
             case ILIKE: {
                 if (left == null || right == null) return null;
-                String pattern = AstExecutor.likeToRegex(right.toString());
-                return left.toString().matches("(?si)" + pattern);
+                return AstExecutor.likeMatch(left.toString(), right.toString(), true);
             }
             case SIMILAR_TO: {
                 if (left == null || right == null) return null;
@@ -1176,22 +1174,12 @@ class BinaryOpEvaluator {
                         }
                         return null;
                     }
-                    // PG array string format: {elem1,elem2,...}
-                    if (left instanceof String && ((String) left).startsWith("{") && ((String) left).endsWith("}") && !((String) left).startsWith("{\"")) {
-                        String ls = (String) left;
-                        String inner = ls.substring(1, ls.length() - 1);
-                        if (!inner.isEmpty()) {
-                            String[] parts = inner.split(",", -1);
-                            int idx = n.intValue() - 1; // PG arrays are 1-based
-                            if (idx >= 0 && idx < parts.length) {
-                                String val = parts[idx].trim();
-                                if (val.equalsIgnoreCase("NULL")) return null;
-                                try { return Integer.parseInt(val); } catch (NumberFormatException e) {
-                                    try { return Long.parseLong(val); } catch (NumberFormatException e2) { return val; }
-                                }
-                            }
-                        }
-                        return null;
+                    // PG array string format: {elem1,elem2,...}; a quoted element may hold a
+                    // comma of its own, so the split has to respect the quoting
+                    if (left instanceof String && isPgArrayText((String) left)) {
+                        List<Object> elements = FunctionEvaluator.parseSimplePgArray((String) left);
+                        int idx = n.intValue() - 1; // PG arrays are 1-based
+                        return (idx >= 0 && idx < elements.size()) ? elements.get(idx) : null;
                     }
                     // jsonb string scalar ("...") accessed with an integer: the -> operator
                     // treats the scalar as a one-element array (index 0 echoes the scalar,
@@ -1651,23 +1639,19 @@ class BinaryOpEvaluator {
             }
             case REGEX_MATCH: {
                 if (left == null || right == null) return null;
-                try { return java.util.regex.Pattern.compile(pgRegexToJava(right.toString())).matcher(left.toString()).find(); }
-                catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
+                return PgRegex.compile(right.toString()).matcher(left.toString()).find();
             }
             case REGEX_IMATCH: {
                 if (left == null || right == null) return null;
-                try { return java.util.regex.Pattern.compile(pgRegexToJava(right.toString()), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
-                catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
+                return PgRegex.compile(right.toString(), PgRegex.caseInsensitive()).matcher(left.toString()).find();
             }
             case NOT_REGEX_MATCH: {
                 if (left == null || right == null) return null;
-                try { return !java.util.regex.Pattern.compile(pgRegexToJava(right.toString())).matcher(left.toString()).find(); }
-                catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
+                return !PgRegex.compile(right.toString()).matcher(left.toString()).find();
             }
             case NOT_REGEX_IMATCH: {
                 if (left == null || right == null) return null;
-                try { return !java.util.regex.Pattern.compile(pgRegexToJava(right.toString()), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
-                catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
+                return !PgRegex.compile(right.toString(), PgRegex.caseInsensitive()).matcher(left.toString()).find();
             }
             case RANGE_ADJACENT: {
                 if (left == null || right == null) return null;
@@ -2643,23 +2627,19 @@ class BinaryOpEvaluator {
             }
             case REGEX_MATCH: {
                 if (left == null || right == null) return null;
-                try { return java.util.regex.Pattern.compile(pgRegexToJava(right.toString())).matcher(left.toString()).find(); }
-                catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
+                return PgRegex.compile(right.toString()).matcher(left.toString()).find();
             }
             case REGEX_IMATCH: {
                 if (left == null || right == null) return null;
-                try { return java.util.regex.Pattern.compile(pgRegexToJava(right.toString()), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
-                catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
+                return PgRegex.compile(right.toString(), PgRegex.caseInsensitive()).matcher(left.toString()).find();
             }
             case NOT_REGEX_MATCH: {
                 if (left == null || right == null) return null;
-                try { return !java.util.regex.Pattern.compile(pgRegexToJava(right.toString())).matcher(left.toString()).find(); }
-                catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
+                return !PgRegex.compile(right.toString()).matcher(left.toString()).find();
             }
             case NOT_REGEX_IMATCH: {
                 if (left == null || right == null) return null;
-                try { return !java.util.regex.Pattern.compile(pgRegexToJava(right.toString()), java.util.regex.Pattern.CASE_INSENSITIVE).matcher(left.toString()).find(); }
-                catch (java.util.regex.PatternSyntaxException e) { throw new MemgresException("invalid regular expression: " + e.getDescription(), "2201B"); }
+                return !PgRegex.compile(right.toString(), PgRegex.caseInsensitive()).matcher(left.toString()).find();
             }
             case RANGE_ADJACENT: {
                 if (left == null || right == null) return null;
@@ -2686,13 +2666,11 @@ class BinaryOpEvaluator {
                             left instanceof Boolean ? "boolean" : left.getClass().getSimpleName().toLowerCase();
                     throw new MemgresException("operator does not exist: " + tn + " ~~ unknown", "42883");
                 }
-                String likePattern = AstExecutor.likeToRegex(right.toString());
-                return left.toString().matches("(?s)" + likePattern);
+                return AstExecutor.likeMatch(left.toString(), right.toString(), false);
             }
             case ILIKE: {
                 if (left == null || right == null) return null;
-                String ilikePattern = AstExecutor.likeToRegex(right.toString());
-                return left.toString().matches("(?si)" + ilikePattern);
+                return AstExecutor.likeMatch(left.toString(), right.toString(), true);
             }
             case SIMILAR_TO: {
                 if (left == null || right == null) return null;
@@ -2735,58 +2713,24 @@ class BinaryOpEvaluator {
     }
 
     /**
-     * Convert PG-specific regex flags to Java equivalents.
-     * PG (?n) = newline-sensitive (. excludes \n, ^ and $ match at line boundaries) → Java (?m)
-     * PG (?x) = extended (ignore whitespace and # comments) → Java (?x)
-     * PG (?s) = . matches everything including \n → Java (?s)
-     * PG (?i) = case insensitive → Java (?i)
+     * True for text holding a PG array literal such as {@code {a,b}} or {@code {"a b"}}.
+     * A JSON object opens the same way, so a quoted first token followed by a colon is
+     * read as an object rather than an array.
      */
-    static String pgRegexToJava(String pattern) {
-        // PG embedded flags: (?n) → Java (?m) (MULTILINE)
-        pattern = pattern.replace("(?n)", "(?m)");
-        // Convert POSIX bracket classes [[:digit:]] → \\p{Digit} etc.
-        pattern = pattern.replace("[:alpha:]", "\\p{Alpha}");
-        pattern = pattern.replace("[:digit:]", "\\p{Digit}");
-        pattern = pattern.replace("[:alnum:]", "\\p{Alnum}");
-        pattern = pattern.replace("[:upper:]", "\\p{Upper}");
-        pattern = pattern.replace("[:lower:]", "\\p{Lower}");
-        pattern = pattern.replace("[:space:]", "\\p{Space}");
-        pattern = pattern.replace("[:print:]", "\\p{Print}");
-        pattern = pattern.replace("[:punct:]", "\\p{Punct}");
-        pattern = pattern.replace("[:cntrl:]", "\\p{Cntrl}");
-        pattern = pattern.replace("[:xdigit:]", "\\p{XDigit}");
-        pattern = pattern.replace("[:graph:]", "\\p{Graph}");
-        pattern = pattern.replace("[:blank:]", "\\p{Blank}");
-        // PG word boundaries: \m (begin), \M (end), \y (either) → Java \b
-        pattern = pattern.replace("\\m", "\\b");
-        pattern = pattern.replace("\\M", "\\b");
-        pattern = pattern.replace("\\y", "\\b");
-        // Fix $ anchor: Java $ matches before trailing \n even without MULTILINE.
-        // PG $ matches only at end of string (unless (?n) is set, already converted to (?m)).
-        // Replace bare $ with \z (absolute end) — skip $ inside [...] or preceded by \.
-        if (pattern.contains("$") && !pattern.contains("(?m)")) {
-            StringBuilder sb = new StringBuilder();
-            boolean inCharClass = false;
-            for (int i = 0; i < pattern.length(); i++) {
-                char c = pattern.charAt(i);
-                if (c == '\\' && i + 1 < pattern.length()) {
-                    sb.append(c).append(pattern.charAt(i + 1));
-                    i++;
-                } else if (c == '[' && !inCharClass) {
-                    inCharClass = true;
-                    sb.append(c);
-                } else if (c == ']' && inCharClass) {
-                    inCharClass = false;
-                    sb.append(c);
-                } else if (c == '$' && !inCharClass) {
-                    sb.append("\\z");
-                } else {
-                    sb.append(c);
-                }
-            }
-            pattern = sb.toString();
+    private static boolean isPgArrayText(String s) {
+        if (!s.startsWith("{") || !s.endsWith("}")) return false;
+        int i = 1;
+        while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
+        if (i >= s.length() || s.charAt(i) != '"') return true;
+        i++;
+        while (i < s.length()) {
+            char c = s.charAt(i);
+            if (c == '\\') { i += 2; continue; }
+            i++;
+            if (c == '"') break;
         }
-        return pattern;
+        while (i < s.length() && Character.isWhitespace(s.charAt(i))) i++;
+        return i >= s.length() || s.charAt(i) != ':';
     }
 
     /**
@@ -2805,6 +2749,9 @@ class BinaryOpEvaluator {
                 // Escaped character, treat next char as literal
                 sb.append(java.util.regex.Pattern.quote(pattern.substring(i + 1, i + 2)));
                 i += 2;
+            } else if (chStr.equals(esc)) {
+                // An escape with nothing left to escape is dropped, as PG's similar_escape does
+                i++;
             } else if (ch == '%') {
                 sb.append(".*");
                 i++;

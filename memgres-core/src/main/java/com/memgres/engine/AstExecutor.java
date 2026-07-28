@@ -1249,8 +1249,8 @@ public class AstExecutor {
         return exprEvaluator.isTruthy(val);
     }
 
-    static String likeToRegex(String likePattern) {
-        return ExprEvaluator.likeToRegex(likePattern);
+    static boolean likeMatch(String text, String pattern, boolean caseInsensitive) {
+        return ExprEvaluator.likeMatch(text, pattern, caseInsensitive);
     }
 
     boolean isTruthyStrict(Object val) {
