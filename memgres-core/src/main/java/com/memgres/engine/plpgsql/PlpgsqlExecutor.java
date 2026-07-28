@@ -366,6 +366,9 @@ public class PlpgsqlExecutor {
         if (isSetof || isTable) {
             List<Object> results = new ArrayList<>();
             scope.declare("__return_next_results__", results);
+            if (isSetof) {
+                scope.declare("__return_setof_type__", returnType.substring("SETOF".length()).trim());
+            }
             // Store out param names for RETURN NEXT with no expression
             if (isTable && !outParams.isEmpty()) {
                 List<String> outNames = new ArrayList<>();
@@ -380,11 +383,16 @@ public class PlpgsqlExecutor {
             return results;
         }
 
+        boolean returned = false;
         try {
             executeBlock(block, scope);
         } catch (ReturnSignal rs) {
+            returned = true;
             // Explicit RETURN; if we also have OUT params, prefer the OUT param values
-            if (outParams.isEmpty()) return rs.value;
+            if (outParams.isEmpty()) {
+                checkReturnedRecord(rs.value, returnType);
+                return rs.value;
+            }
         }
 
         // Collect OUT/INOUT param values as the return value
@@ -404,7 +412,35 @@ public class PlpgsqlExecutor {
             return record;
         }
 
+        // A function that forgets to RETURN would otherwise hand the caller a NULL that nothing
+        // downstream can tell apart from a real one
+        if (!returned && returnType != null && !returnType.isEmpty()
+                && !"void".equalsIgnoreCase(returnType)
+                && !"trigger".equalsIgnoreCase(returnType)
+                && !"event_trigger".equalsIgnoreCase(returnType)) {
+            throw new MemgresException("control reached end of function without RETURN", "2F005");
+        }
         return null;
+    }
+
+    /**
+     * A record returned where a composite type is declared has to have that type's fields. A row
+     * of the wrong width is how a composite value ends up being read at the wrong field offsets.
+     */
+    private void checkReturnedRecord(Object value, String returnType) {
+        if (value == null || returnType == null) return;
+        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
+                database.getRowType(returnType.trim());
+        if (fields == null) return;
+        int width;
+        if (value instanceof AstExecutor.PgRow) width = ((AstExecutor.PgRow) value).values().size();
+        else if (value instanceof Object[]) width = ((Object[]) value).length;
+        else if (value instanceof Map) width = ((Map<?, ?>) value).size();
+        else return;
+        if (width != fields.size()) {
+            throw new MemgresException(
+                    "returned record type does not match expected record type", "42804");
+        }
     }
 
     private Object executeInternalFunction(String name, List<Object> args) {
@@ -1242,15 +1278,35 @@ public class PlpgsqlExecutor {
 
     private void executeForeach(PlpgsqlStatement.ForeachStmt stmt, Scope scope) {
         Object arrayObj = evalExpr(stmt.arrayExpr(), scope);
-        if (arrayObj == null) return;
+        if (arrayObj == null) {
+            throw new MemgresException("FOREACH expression must not be null", "22004");
+        }
+        if (!(arrayObj instanceof List) && !(arrayObj instanceof Object[])) {
+            throw new MemgresException("FOREACH expression must yield an array, not type "
+                    + pgTypeNameOf(arrayObj), "42804");
+        }
         List<?> list = arrayObj instanceof List ? (List<?>) arrayObj
-                : arrayObj instanceof Object[] ? Arrays.asList((Object[]) arrayObj) : Cols.listOf();
+                : Arrays.asList((Object[]) arrayObj);
 
         int sliceDepth = stmt.sliceDepth();
+        String varType = scope.declaredType(stmt.varName());
+        boolean varIsArray = varType != null && varType.endsWith("[]");
+        if (sliceDepth > 0) {
+            int ndim = arrayDepth(list);
+            if (sliceDepth > ndim) {
+                throw new MemgresException("slice dimension (" + sliceDepth
+                        + ") is out of the valid range 0.." + ndim, "2202E");
+            }
+            if (!varIsArray) {
+                throw new MemgresException(
+                        "FOREACH ... SLICE loop variable must be of an array type", "42804");
+            }
+        }
 
-        // When sliceDepth > 0, iterate over sub-arrays at the given depth.
-        // For example, SLICE 1 on a 2D array [[1,2],[3,4],[5,6]] yields [1,2], [3,4], [5,6].
-        List<?> slices = sliceDepth > 0 ? sliceArray(list, sliceDepth) : list;
+        // Without SLICE the loop variable takes one element at a time, so a multi-dimensional
+        // array is walked in storage order rather than handing the variable a sub-array
+        List<?> slices = sliceDepth > 0 ? sliceArray(list, sliceDepth)
+                : (varIsArray ? list : flattenArray(list));
 
         // FOREACH targets an existing declared variable (it keeps its last value after the loop)
         if (!scope.has(stmt.varName())) {
@@ -1312,6 +1368,28 @@ public class PlpgsqlExecutor {
         }
     }
 
+    /** Walk a nested array into its elements, the order PG stores a multi-dimensional array in. */
+    private List<Object> flattenArray(List<?> list) {
+        List<Object> flat = new ArrayList<Object>();
+        for (Object element : list) {
+            if (element instanceof List) flat.addAll(flattenArray((List<?>) element));
+            else flat.add(element);
+        }
+        return flat;
+    }
+
+    /** The name PostgreSQL reports a value's type by, for the messages that name it. */
+    private String pgTypeNameOf(Object val) {
+        if (val instanceof Integer) return "integer";
+        if (val instanceof Long) return "bigint";
+        if (val instanceof Short) return "smallint";
+        if (val instanceof java.math.BigDecimal) return "numeric";
+        if (val instanceof Double) return "double precision";
+        if (val instanceof Float) return "real";
+        if (val instanceof Boolean) return "boolean";
+        return "text";
+    }
+
     private int arrayDepth(Object obj) {
         if (obj instanceof List && !((List<?>) obj).isEmpty()) {
             return 1 + arrayDepth(((List<?>) obj).get(0));
@@ -1359,6 +1437,12 @@ public class PlpgsqlExecutor {
             }
         } else {
             value = evalExpr(expr, scope);
+            // The row joins a set of the declared type, so it goes through that type's input
+            // function here rather than reaching the caller as whatever the expression produced
+            String elementType = (String) scope.get("__return_setof_type__");
+            if (elementType != null && database.getRowType(elementType) == null) {
+                value = astExecutor.castValue(value, elementType);
+            }
         }
         List<Object> results = (List<Object>) scope.get("__return_next_results__");
         if (results != null) {
@@ -1376,6 +1460,7 @@ public class PlpgsqlExecutor {
     private void executeReturnQuery(PlpgsqlStatement.ReturnQueryStmt stmt, Scope scope) {
         String sql = substituteVariables(stmt.sql(), scope);
         QueryResult result = astExecutor.execute(sql);
+        checkQueryShape(result, scope);
         // PG sets FOUND after RETURN QUERY based on whether the query produced rows
         scope.set("found", !result.getRows().isEmpty());
         List<Object> results = (List<Object>) scope.get("__return_next_results__");
@@ -1396,6 +1481,7 @@ public class PlpgsqlExecutor {
         // Splice USING parameters ($1, $2, ...) into the SQL string
         sql = substituteUsingParams(sql, stmt.usingExprs(), scope);
         QueryResult result = astExecutor.execute(sql);
+        checkQueryShape(result, scope);
         // PG sets FOUND after RETURN QUERY EXECUTE based on whether the query produced rows
         scope.set("found", !result.getRows().isEmpty());
         List<Object> results = (List<Object>) scope.get("__return_next_results__");
@@ -1403,6 +1489,31 @@ public class PlpgsqlExecutor {
             for (Object[] row : result.getRows()) {
                 results.add(row.length == 1 ? row[0] : row);
             }
+        }
+    }
+
+    /** The spellings boolean's input function accepts, which is all ASSERT will take. */
+    private static final Map<String, Boolean> BOOLEAN_TEXT = new LinkedHashMap<>();
+    static {
+        for (String t : new String[]{"t", "true", "y", "yes", "on", "1"}) BOOLEAN_TEXT.put(t, true);
+        for (String f : new String[]{"f", "false", "n", "no", "off", "0"}) BOOLEAN_TEXT.put(f, false);
+    }
+
+    /**
+     * A RETURN QUERY feeding a set of a composite type has to produce that composite's columns.
+     * A query with fewer of them would otherwise be read with the wrong field offsets.
+     */
+    private void checkQueryShape(QueryResult result, Scope scope) {
+        String elementType = (String) scope.get("__return_setof_type__");
+        if (elementType == null) return;
+        // SETOF record takes its shape from the caller's column definition list, so only a named
+        // composite says here how many columns the query has to produce
+        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
+                database.getRowType(elementType);
+        if (fields == null) return;
+        if (result.getColumns() != null && result.getColumns().size() != fields.size()) {
+            throw new MemgresException(
+                    "structure of query does not match function result type", "42804");
         }
     }
 
@@ -1417,11 +1528,19 @@ public class PlpgsqlExecutor {
             }
         }
         Object condVal = evalExpr(stmt.condition(), scope);
+        // The condition is a boolean expression, not merely something truthy: PG puts whatever it
+        // evaluates to through boolean's input function, and 42 is not a boolean
         boolean passed = false;
         if (condVal instanceof Boolean) {
             passed = (Boolean) condVal;
         } else if (condVal != null) {
-            passed = true; // non-null, non-false is truthy
+            String text = String.valueOf(condVal).trim();
+            if (condVal instanceof String && BOOLEAN_TEXT.containsKey(text.toLowerCase())) {
+                passed = BOOLEAN_TEXT.get(text.toLowerCase());
+            } else {
+                throw new MemgresException(
+                        "invalid input syntax for type boolean: \"" + text + "\"", "22P02");
+            }
         }
         if (!passed) {
             String message = "assertion failed";
@@ -1586,6 +1705,14 @@ public class PlpgsqlExecutor {
 
             // Note: PG's EXECUTE never changes FOUND (it does update GET DIAGNOSTICS ROW_COUNT)
             if (stmt.intoVars() != null) {
+                if (stmt.strict()) {
+                    if (result.getRows().isEmpty()) {
+                        throw new MemgresException("query returned no rows", "P0002");
+                    }
+                    if (result.getRows().size() > 1) {
+                        throw new MemgresException("query returned more than one row", "P0003");
+                    }
+                }
                 if (!result.getRows().isEmpty()) {
                     setFromRow(scope, stmt.intoVars(), result);
                 } else {
@@ -1669,6 +1796,11 @@ public class PlpgsqlExecutor {
                     int idx = Integer.parseInt(sql.substring(numStart, numEnd));
                     if (idx >= 1 && idx <= literals.size()) {
                         out.append(literals.get(idx - 1));
+                    } else if (idx >= 1) {
+                        // Leaving the placeholder in place would run a query with a literal $2 in
+                        // it; PG reports the argument the USING list never supplied
+                        throw new MemgresException(
+                                "there is no parameter $" + idx, "42P02");
                     } else {
                         out.append(sql, i, numEnd);
                     }
@@ -2141,6 +2273,15 @@ public class PlpgsqlExecutor {
     private void executeOpenCursor(PlpgsqlStatement.OpenCursorStmt stmt, Scope scope) {
         String sql = stmt.sql();
         Object bound = scope.get(stmt.cursorName());
+        if (bound instanceof CursorState) {
+            CursorState open = (CursorState) bound;
+            if (!open.closed) {
+                throw new MemgresException(
+                        "cursor \"" + open.portal + "\" already in use", "42P03");
+            }
+            // A closed cursor may be opened again, from whatever the declaration gave it
+            bound = open.source;
+        }
         Scope argScope = scope;
         if (sql == null) {
             if (bound instanceof BoundCursor) {
@@ -2158,9 +2299,14 @@ public class PlpgsqlExecutor {
             // A refcursor variable holds its portal name; PG generates one when it has none
             String portal = bound instanceof String && !((String) bound).trim().isEmpty()
                     ? ((String) bound).trim() : stmt.cursorName();
+            // Two variables naming the same portal are two names for one cursor, and the second
+            // OPEN would silently discard the first one's rows
+            if (bound instanceof String && session != null && session.getCursor(portal) != null) {
+                throw new MemgresException("cursor \"" + portal + "\" already in use", "42P03");
+            }
             sql = substituteVariables(sql, argScope);
             QueryResult result = astExecutor.execute(sql);
-            scope.set(stmt.cursorName(), new CursorState(result, portal));
+            scope.set(stmt.cursorName(), new CursorState(result, portal, bound));
             // Register the portal with the session so the caller can FETCH from it after the
             // function returns -- that is the whole point of returning a refcursor
             if (session != null) {
@@ -2202,6 +2348,12 @@ public class PlpgsqlExecutor {
 
     private void executeFetch(PlpgsqlStatement.FetchStmt stmt, Scope scope) {
         Object cursorObj = scope.get(stmt.cursorName());
+        String gone = missingPortal(cursorObj);
+        if (gone != null) {
+            // Reading past a CLOSE returns no row rather than erroring only if we stay quiet;
+            // the caller would see a short result set with no signal
+            throw new MemgresException("cursor \"" + gone + "\" does not exist", "34000");
+        }
         if (!(cursorObj instanceof CursorState)) {
             // An unopened cursor variable still holds no portal, which is what PG reports
             throw new MemgresException(
@@ -2238,7 +2390,35 @@ public class PlpgsqlExecutor {
     }
 
     private void executeCloseCursor(PlpgsqlStatement.CloseCursorStmt stmt, Scope scope) {
+        Object cursorObj = scope.get(stmt.cursorName());
+        String gone = missingPortal(cursorObj);
+        if (gone != null) {
+            throw new MemgresException("cursor \"" + gone + "\" does not exist", "34000");
+        }
+        if (cursorObj instanceof CursorState) {
+            CursorState cursor = (CursorState) cursorObj;
+            cursor.closed = true;
+            if (session != null) session.removeCursor(cursor.portal);
+            return;
+        }
         scope.set(stmt.cursorName(), null);
+    }
+
+    /**
+     * The portal name a cursor variable still carries after its portal has gone, or null when the
+     * variable names a cursor that is open or has never been opened at all.
+     */
+    private String missingPortal(Object cursorObj) {
+        if (cursorObj instanceof CursorState) {
+            CursorState cursor = (CursorState) cursorObj;
+            return cursor.closed ? cursor.portal : null;
+        }
+        if (cursorObj instanceof String) {
+            String portal = ((String) cursorObj).trim();
+            if (portal.isEmpty()) return null;
+            return session != null && session.getCursor(portal) == null ? portal : null;
+        }
+        return null;
     }
 
     /** A cursor declared with a query, before it is opened. */
@@ -2258,15 +2438,20 @@ public class PlpgsqlExecutor {
         final QueryResult result;
         /** The portal name this cursor is registered under, which is also its text value. */
         final String portal;
+        /** What the declaration left in the variable, so a CLOSEd cursor can be opened again. */
+        final Object source;
+        /** True once CLOSE has dropped the portal; the variable still names it. */
+        boolean closed;
         /**
          * PG's cursor position: 0 before the first row, n+1 past the last, otherwise the 1-based
          * index of the current row. Backward and absolute movement need the "before"/"after"
          * states, which a plain next-row index cannot express.
          */
         int position = 0;
-        CursorState(QueryResult result, String portal) {
+        CursorState(QueryResult result, String portal, Object source) {
             this.result = result;
             this.portal = portal;
+            this.source = source;
         }
 
         /** Reposition as the direction says and return the row landed on, or null for none. */

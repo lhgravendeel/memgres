@@ -614,6 +614,7 @@ class DdlObjectExecutor {
                 params.add(new PgFunction.Param(fp.name(), fp.typeName(), fp.mode(), fp.defaultExpr()));
             }
         }
+        validateSignature(params);
 
         // A polymorphic result has to be determinable from a polymorphic argument of the same family.
         PolymorphicTypes.validateSignature(stmt.returnType(), params.stream()
@@ -635,10 +636,15 @@ class DdlObjectExecutor {
             com.memgres.engine.plpgsql.PlpgsqlStatement.Block parsedBody =
                     com.memgres.engine.plpgsql.PlpgsqlParser.parse(stmt.body());
             List<String> paramNames = new ArrayList<>();
+            boolean hasOutParams = false;
             for (PgFunction.Param p : params) {
                 if (p.name() != null) paramNames.add(p.name());
+                String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+                if ("OUT".equals(mode) || "INOUT".equals(mode)) hasOutParams = true;
             }
-            PlpgsqlBodyValidator.validate(executor, parsedBody, paramNames);
+            PlpgsqlBodyValidator.Routine routine = new PlpgsqlBodyValidator.Routine(
+                    stmt.isProcedure(), stmt.returnType(), hasOutParams);
+            PlpgsqlBodyValidator.validate(executor, parsedBody, paramNames, routine);
         }
 
         // Validate SQL language function bodies (only when check_function_bodies=on)
@@ -1166,6 +1172,45 @@ class DdlObjectExecutor {
                 "delete", "slice", "hstore_to_json", "hstore_to_jsonb",
                 "hstore_to_json_loose", "hstore_to_jsonb_loose",
                 "hstore_to_array", "hstore_to_matrix", "populate_record").contains(name);
+    }
+
+    /**
+     * The rules a parameter list has to obey to be callable at all: VARIADIC collects the trailing
+     * arguments into an array, so it must be an array and must come last, and a parameter without
+     * a default can never be reached once an earlier one has taken its default's place.
+     */
+    private void validateSignature(List<PgFunction.Param> params) {
+        boolean sawDefault = false;
+        for (int i = 0; i < params.size(); i++) {
+            PgFunction.Param p = params.get(i);
+            String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
+            if ("OUT".equals(mode)) continue;
+            if ("VARIADIC".equals(mode)) {
+                String type = p.typeName() == null ? "" : p.typeName().trim().toLowerCase();
+                type = type.replace("\"", "");
+                // VARIADIC "any" is the untyped form, which takes the arguments as they come
+                if (!type.isEmpty() && !type.endsWith("[]") && !type.equals("anyarray")
+                        && !type.equals("any") && !type.equals("anycompatiblearray")) {
+                    throw new MemgresException("VARIADIC parameter must be an array", "42P13");
+                }
+                for (int j = i + 1; j < params.size(); j++) {
+                    String laterMode = params.get(j).mode() == null
+                            ? "IN" : params.get(j).mode().toUpperCase();
+                    if (!"OUT".equals(laterMode)) {
+                        throw new MemgresException(
+                                "VARIADIC parameter must be the last input parameter", "42P13");
+                    }
+                }
+                continue;
+            }
+            if (p.defaultExpr() != null) {
+                sawDefault = true;
+            } else if (sawDefault) {
+                throw new MemgresException(
+                        "input parameters after one with a default value must also have defaults",
+                        "42P13");
+            }
+        }
     }
 
     /**
