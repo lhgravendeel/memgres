@@ -1175,114 +1175,84 @@ class SelectParser {
         return false;
     }
 
-    SelectStmt.FromItem parseFromPrimary() {
-        // ROWS FROM(fn1(...), fn2(...)) [WITH ORDINALITY] AS alias(cols)
-        if (parser.checkKeyword("ROWS") && parser.checkKeywordAt(1, "FROM")) {
-            parser.advance(); // ROWS
-            parser.advance(); // FROM
+    /**
+     * {@code ROWS FROM (f(...) [AS (name type, ...)], g(...)) [WITH ORDINALITY] [AS] alias(cols)}.
+     *
+     * <p>Each function may carry its own column definition list, which is what distinguishes
+     * ROWS FROM from an ordinary function item: the item's alias list renames the columns of all
+     * the functions at once and so cannot describe any one of them. Carried through as a
+     * {@code __rows_from__} function item whose arguments are {@link RowsFromItem}s.
+     */
+    private SelectStmt.FromItem parseRowsFrom() {
+        parser.advance(); // ROWS
+        parser.advance(); // FROM
+        parser.expect(TokenType.LEFT_PAREN);
+        List<Expression> items = new ArrayList<>();
+        do {
+            String name = parser.readIdentifier();
             parser.expect(TokenType.LEFT_PAREN);
-            List<String> funcNames = new ArrayList<>();
-            List<List<Expression>> funcArgsList = new ArrayList<>();
-            do {
-                String fn = parser.readIdentifier();
-                funcNames.add(fn);
-                parser.expect(TokenType.LEFT_PAREN);
-                List<Expression> fnArgs = new ArrayList<>();
-                if (!parser.check(TokenType.RIGHT_PAREN)) {
-                    fnArgs = parser.parseExpressionList();
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
-                funcArgsList.add(fnArgs);
-            } while (parser.match(TokenType.COMMA));
-            parser.expect(TokenType.RIGHT_PAREN);
-            boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
-            String alias = null;
-            if (parser.matchKeyword("AS")) {
-                alias = parser.readIdentifier();
-            } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                    || isKeywordValidAsBareAlias()) {
-                alias = parser.readIdentifier();
+            List<Expression> args = new ArrayList<>();
+            if (!parser.check(TokenType.RIGHT_PAREN)) {
+                args = parser.parseExpressionList();
             }
-            List<String> colAliases = null;
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance();
-                colAliases = new ArrayList<>();
+            parser.expect(TokenType.RIGHT_PAREN);
+            List<String> columnDefs = null;
+            int beforeAs = parser.position();
+            if (parser.matchKeyword("AS") && parser.check(TokenType.LEFT_PAREN)) {
+                parser.advance(); // (
+                columnDefs = new ArrayList<>();
                 while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    colAliases.add(parser.readIdentifier());
+                    String col = parser.readIdentifier();
                     if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
-                        parser.parseTypeName(); // optional type
+                        col = col + " " + parser.parseTypeName();
                     }
+                    columnDefs.add(col);
                     parser.match(TokenType.COMMA);
                 }
                 parser.expect(TokenType.RIGHT_PAREN);
+            } else {
+                parser.resetPosition(beforeAs);
             }
-            // Encode as FunctionFrom with special name "__rows_from__"
-            // args = list of function calls encoded as nested ArrayExpr/FunctionCallExpr
-            List<Expression> rowsFromArgs = new ArrayList<>();
-            for (int i = 0; i < funcNames.size(); i++) {
-                rowsFromArgs.add(new com.memgres.engine.parser.ast.FunctionCallExpr(funcNames.get(i), funcArgsList.get(i), false, false));
+            items.add(new RowsFromItem(new FunctionCallExpr(name, args, false, false), columnDefs));
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
+        String alias = null;
+        if (parser.matchKeyword("AS")) {
+            alias = parser.readIdentifier();
+        } else if (parser.peek().type() == TokenType.IDENTIFIER
+                || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
+                || isKeywordValidAsBareAlias()) {
+            alias = parser.readIdentifier();
+        }
+        List<String> colAliases = null;
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance();
+            colAliases = new ArrayList<>();
+            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                colAliases.add(parser.readIdentifier());
+                if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                    parser.parseTypeName(); // optional type
+                }
+                parser.match(TokenType.COMMA);
             }
-            List<String> finalColAliases = colAliases;
-            if (withOrdinality && finalColAliases == null) {
-                finalColAliases = new ArrayList<>();
-                finalColAliases.add("ordinality");
-            }
-            return new SelectStmt.FunctionFrom("__rows_from__", rowsFromArgs, alias, finalColAliases);
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
+        return new SelectStmt.FunctionFrom("__rows_from__", items, alias, colAliases, withOrdinality);
+    }
+
+    SelectStmt.FromItem parseFromPrimary() {
+        // ROWS FROM(fn1(...) [AS (coldef)], ...) [WITH ORDINALITY] [AS] alias(cols)
+        if (parser.checkKeyword("ROWS") && parser.checkKeywordAt(1, "FROM")) {
+            return parseRowsFrom();
         }
 
         // LATERAL subquery
         boolean lateral = parser.matchKeyword("LATERAL");
 
-        // [LATERAL] ROWS FROM(fn1(...), fn2(...)) [WITH ORDINALITY] AS alias(cols)
+        // [LATERAL] ROWS FROM(...) — same item, reached after the LATERAL keyword
         if (parser.checkKeyword("ROWS") && parser.checkKeywordAt(1, "FROM")) {
-            parser.advance(); // ROWS
-            parser.advance(); // FROM
-            parser.expect(TokenType.LEFT_PAREN);
-            List<String> funcNames = new ArrayList<>();
-            List<List<Expression>> funcArgsList = new ArrayList<>();
-            do {
-                String fn = parser.readIdentifier();
-                funcNames.add(fn);
-                parser.expect(TokenType.LEFT_PAREN);
-                List<Expression> fnArgs = new ArrayList<>();
-                if (!parser.check(TokenType.RIGHT_PAREN)) {
-                    fnArgs = parser.parseExpressionList();
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
-                funcArgsList.add(fnArgs);
-            } while (parser.match(TokenType.COMMA));
-            parser.expect(TokenType.RIGHT_PAREN);
-            boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
-            String alias = null;
-            if (parser.matchKeyword("AS")) {
-                alias = parser.readIdentifier();
-            } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                    || isKeywordValidAsBareAlias()) {
-                alias = parser.readIdentifier();
-            }
-            List<String> colAliases = null;
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance();
-                colAliases = new ArrayList<>();
-                while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    colAliases.add(parser.readIdentifier());
-                    if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
-                        parser.parseTypeName(); // optional type
-                    }
-                    parser.match(TokenType.COMMA);
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
-            }
-            List<Expression> rowsFromArgs = new ArrayList<>();
-            for (int i = 0; i < funcNames.size(); i++) {
-                rowsFromArgs.add(new com.memgres.engine.parser.ast.FunctionCallExpr(funcNames.get(i), funcArgsList.get(i), false, false));
-            }
-            List<String> finalColAliases = colAliases;
-            if (withOrdinality && finalColAliases == null) {
-                finalColAliases = new ArrayList<>();
-                finalColAliases.add("ordinality");
-            }
-            return new SelectStmt.FunctionFrom("__rows_from__", rowsFromArgs, alias, finalColAliases);
+            return parseRowsFrom();
         }
 
         // Subquery: [LATERAL] (SELECT|VALUES ...) [AS] alias [(col1, col2, ...)]

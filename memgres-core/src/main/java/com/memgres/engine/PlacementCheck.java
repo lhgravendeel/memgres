@@ -326,6 +326,17 @@ final class PlacementCheck {
     }
 
     /**
+     * True when a call is a window function, and so may carry an OVER clause on its own account.
+     * An aggregate may carry one too, but for a different reason, so the callers ask separately.
+     */
+    static boolean isWindowFunctionName(String name) {
+        if (name == null) return false;
+        String stripped = FunctionEvaluator.stripSchemaPrefix(name.toLowerCase());
+        return WINDOW_ONLY_FUNCTIONS.contains(stripped)
+                || HYPOTHETICAL_SET_FUNCTIONS.contains(stripped);
+    }
+
+    /**
      * Rejects a window function written as a plain call, anywhere in the tree — including inside
      * another window call's own specification, which is why this is a walk of its own rather than
      * the one {@link #reject} uses, which stops at the enclosing window call.

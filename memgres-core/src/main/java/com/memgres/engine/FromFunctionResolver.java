@@ -89,6 +89,10 @@ class FromFunctionResolver {
         List<String> colAliases = stripColTypes(rawColAliases);
         if (fname.equals("__json_table__")) return resolveJsonTable(funcFrom, alias);
         if (fname.equals("__xmltable__")) return resolveXmlTable(funcFrom, alias);
+        if (fname.equals("__rows_from__")) return resolveRowsFrom(funcFrom, alias);
+        if (SINGLE_VALUE_SRFS.contains(fname) && hasColumnDefinitionList(rawColAliases)) {
+            throw onlyForRecord();
+        }
         List<Object> evalArgs = new ArrayList<>();
         for (Expression arg : funcFrom.args()) {
             evalArgs.add(executor.evalExpr(arg, null));
@@ -102,7 +106,7 @@ class FromFunctionResolver {
                 funcFrom.withOrdinality(), funcFrom.args());
         if (fname.equals("_pg_expandarray")) return resolveExpandArray(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
-            return resolveJsonEach(fname, alias, colAliases, evalArgs);
+            return resolveJsonEach(fname, alias, colAliases, evalArgs, funcFrom.withOrdinality());
         if (fname.equals("jsonb_to_recordset") || fname.equals("json_to_recordset") || fname.equals("jsonb_to_record") || fname.equals("json_to_record"))
             return resolveJsonToRecordset(alias, rawColAliases, evalArgs);
         if (fname.equals("json_populate_recordset") || fname.equals("jsonb_populate_recordset")
@@ -124,7 +128,6 @@ class FromFunctionResolver {
         if (fname.equals("string_to_table")) return resolveStringToTable(alias, colAliases, evalArgs);
         if (fname.equals("regexp_split_to_table")) return resolveRegexpSplitToTable(alias, colAliases, evalArgs);
         if (fname.startsWith("__tablesample__:")) return resolveTablesample(fname, alias, evalArgs);
-        if (fname.equals("__rows_from__")) return resolveRowsFrom(funcFrom, alias, colAliases);
         if (fname.equals("pg_create_logical_replication_slot")) return resolveCreateLogicalReplicationSlot(alias, colAliases, evalArgs);
         if (fname.equals("pg_create_physical_replication_slot")) return resolveCreatePhysicalReplicationSlot(alias, colAliases, evalArgs);
         if (fname.equals("pg_ls_dir")) return resolvePgLsDir(alias, colAliases);
@@ -147,7 +150,8 @@ class FromFunctionResolver {
         PgFunction userFunc = executor.database.getFunction(fname);
         if (userFunc != null) {
             checkRecordColumnDefinitionList(userFunc, funcFrom);
-            return resolveUserFunction(userFunc, alias, colAliases, evalArgs);
+            // Raw, not stripped: a column definition list gives the columns their types too.
+            return resolveUserFunction(userFunc, alias, rawColAliases, evalArgs);
         }
 
         return resolveScalarFunctionInFrom(funcFrom, fname, alias, colAliases);
@@ -155,20 +159,60 @@ class FromFunctionResolver {
 
     /**
      * A function returning bare {@code record} has no column names or types of its own, so the
-     * caller has to supply them; one that declares OUT parameters already has them, and PG
-     * rejects a second, possibly contradicting, description of the same row.
+     * caller has to supply them; one that declares OUT or TABLE parameters already has them, and
+     * PG rejects a second, possibly contradicting, description of the same row; and one that
+     * returns a named type has nothing a description could add.
+     *
+     * <p>What counts as a description is a column definition list -- names with types. A bare
+     * alias list only renames the columns that are there, so it is allowed wherever a table
+     * alias is, and it does not satisfy the requirement a {@code record} result places on the
+     * caller: {@code SELECT * FROM f() AS t(p, q)} is still missing the types.
      */
     private void checkRecordColumnDefinitionList(PgFunction userFunc, SelectStmt.FunctionFrom funcFrom) {
-        if (!userFunc.declaresRecordResult()) return;
-        boolean hasOutParams = userFunc.hasOutParams();
-        boolean hasColumnDefs = funcFrom.columnAliases() != null && !funcFrom.columnAliases().isEmpty();
-        if (hasOutParams && hasColumnDefs) {
-            throw PgErrors.syntax("a column definition list is redundant for a function with OUT parameters");
+        boolean definitionList = hasColumnDefinitionList(funcFrom.columnAliases());
+        if (userFunc.hasOutParams()) {
+            if (definitionList) {
+                throw PgErrors.syntax(
+                        "a column definition list is redundant for a function with OUT parameters");
+            }
+            return;
         }
-        if (!hasOutParams && !hasColumnDefs) {
-            throw PgErrors.syntax("a column definition list is required for functions returning \"record\"");
+        if (userFunc.declaresRecordResult()) {
+            if (!definitionList) {
+                throw PgErrors.syntax(
+                        "a column definition list is required for functions returning \"record\"");
+            }
+            return;
         }
+        if (definitionList) throw onlyForRecord();
     }
+
+    private static MemgresException onlyForRecord() {
+        return PgErrors.syntax(
+                "a column definition list is only allowed for functions returning \"record\"");
+    }
+
+    /** A column definition list names types; an alias list only renames what is already there. */
+    static boolean hasColumnDefinitionList(List<String> aliases) {
+        if (aliases == null) return false;
+        for (String alias : aliases) {
+            if (alias != null && alias.indexOf(' ') > 0) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The built-in set-returning functions whose rows are one value, not a record. None of them
+     * can be given a column definition list, for the same reason a table cannot: the columns are
+     * already decided. Named one by one rather than by exclusion so that a function whose shape
+     * this file does not know stays as permissive as it was.
+     */
+    private static final Set<String> SINGLE_VALUE_SRFS = new HashSet<>(Arrays.asList(
+            "generate_series", "generate_subscripts", "unnest", "string_to_table",
+            "regexp_split_to_table", "json_object_keys", "jsonb_object_keys",
+            "json_array_elements", "jsonb_array_elements",
+            "json_array_elements_text", "jsonb_array_elements_text",
+            "jsonb_path_query", "jsonb_path_query_tz", "skeys", "svals"));
 
     /**
      * PG puts no set-returning requirement on a function in FROM: a plain scalar call is simply
@@ -727,26 +771,41 @@ class FromFunctionResolver {
 
     // ---- jsonb_each / json_each ----
 
-    private List<RowContext> resolveJsonEach(String fname, String alias, List<String> colAliases, List<Object> evalArgs) {
+    private List<RowContext> resolveJsonEach(String fname, String alias, List<String> colAliases,
+                                             List<Object> evalArgs, boolean withOrdinality) {
         Object jsonVal = evalArgs.get(0);
+        boolean isText = fname.contains("_text");
         String keyCol = (colAliases != null && colAliases.size() >= 1) ? colAliases.get(0) : "key";
         String valCol = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "value";
-        Table virtualTable = new Table(alias, Cols.listOf(
-                new Column(keyCol, DataType.TEXT, true, false, null),
-                new Column(valCol, DataType.TEXT, true, false, null)));
+        // The _text spellings render the value as text; the others hand back the JSON itself,
+        // which is a json or jsonb column and not a string that happens to look like one.
+        DataType valType = isText ? DataType.TEXT
+                : fname.startsWith("jsonb") ? DataType.JSONB : DataType.JSON;
+        List<Column> cols = new ArrayList<>();
+        cols.add(new Column(keyCol, DataType.TEXT, true, false, null));
+        cols.add(new Column(valCol, valType, true, false, null));
+        if (withOrdinality) {
+            String ordName = (colAliases != null && colAliases.size() >= 3)
+                    ? colAliases.get(2) : "ordinality";
+            cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
+        }
+        Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
         if (jsonVal != null) {
             String json = jsonVal.toString().trim();
             JsonFunctions.requireJsonEachObject(fname, json);
             try {
-                boolean isText = fname.contains("_text");
                 Map<String, String> pairs = JsonFunctions.eachMembers(fname, json);
+                long ordinal = 0;
                 for (Map.Entry<String, String> entry : pairs.entrySet()) {
                     String value = entry.getValue();
                     if (isText && value != null && value.startsWith("\"") && value.endsWith("\"")) {
                         value = value.substring(1, value.length() - 1);
                     }
-                    Object[] row = new Object[]{entry.getKey(), value};
+                    ordinal++;
+                    Object[] row = withOrdinality
+                            ? new Object[]{entry.getKey(), value, ordinal}
+                            : new Object[]{entry.getKey(), value};
                     virtualTable.insertRow(row);
                     contexts.add(new RowContext(virtualTable, alias, row));
                 }
@@ -1193,39 +1252,67 @@ class FromFunctionResolver {
 
     // ---- ROWS FROM ----
 
-    private List<RowContext> resolveRowsFrom(SelectStmt.FunctionFrom funcFrom, String alias, List<String> colAliases) {
-        List<List<Object>> columns = new ArrayList<>();
+    /**
+     * {@code ROWS FROM (f(...), g(...))} is the functions side by side rather than one after the
+     * other: each keeps all of its own columns, in its own order, and the item has as many rows
+     * as the longest of them, the shorter ones reading NULL past their end.
+     *
+     * <p>Each function is resolved exactly as it would be on its own, so a function returning a
+     * record contributes that record's columns under their own names and types --
+     * {@code ROWS FROM (generate_series(1,2), json_each('{"a":1}'))} is three columns, not two.
+     */
+    private List<RowContext> resolveRowsFrom(SelectStmt.FunctionFrom funcFrom, String alias) {
+        List<Column> cols = new ArrayList<>();
+        List<List<Object[]>> perFunctionRows = new ArrayList<>();
+        List<Integer> widths = new ArrayList<>();
         int maxLen = 0;
         for (Expression arg : funcFrom.args()) {
-            if (arg instanceof FunctionCallExpr) {
-                FunctionCallExpr fnExpr = (FunctionCallExpr) arg;
-                SelectStmt.FunctionFrom subFunc = new SelectStmt.FunctionFrom(
-                    fnExpr.name(), fnExpr.args(), null, null);
-                List<RowContext> rows = resolveFunctionFrom(subFunc);
-                List<Object> vals = new ArrayList<>();
-                for (RowContext rc : rows) {
-                    List<RowContext.TableBinding> bindings = rc.getBindings();
-                    Object[] rowData = bindings.isEmpty() ? null : bindings.get(0).row();
-                    vals.add(rowData != null && rowData.length > 0 ? rowData[0] : null);
-                }
-                columns.add(vals);
-                maxLen = Math.max(maxLen, vals.size());
+            FunctionCallExpr call;
+            List<String> columnDefs = null;
+            if (arg instanceof RowsFromItem) {
+                call = ((RowsFromItem) arg).call();
+                columnDefs = ((RowsFromItem) arg).columnDefs();
+            } else if (arg instanceof FunctionCallExpr) {
+                call = (FunctionCallExpr) arg;
+            } else {
+                continue;
             }
+            SelectStmt.FunctionFrom sub =
+                    new SelectStmt.FunctionFrom(call.name(), call.args(), null, columnDefs);
+            List<RowContext> rows = resolveFunctionFrom(sub);
+            List<Column> subCols = null;
+            List<Object[]> subRows = new ArrayList<>();
+            for (RowContext rc : rows) {
+                List<RowContext.TableBinding> bindings = rc.getBindings();
+                if (bindings.isEmpty()) continue;
+                if (subCols == null) subCols = bindings.get(0).table().getColumns();
+                subRows.add(bindings.get(0).row());
+            }
+            if (subCols == null) {
+                // Nothing was produced, so nothing described the shape; PG still names the
+                // column after the function.
+                subCols = Cols.listOf(new Column(
+                        FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase()),
+                        DataType.TEXT, true, false, null));
+            }
+            cols.addAll(subCols);
+            widths.add(subCols.size());
+            perFunctionRows.add(subRows);
+            maxLen = Math.max(maxLen, subRows.size());
         }
 
-        List<Column> cols = new ArrayList<>();
+        boolean hasOrdinality = funcFrom.withOrdinality();
         List<String> ca = funcFrom.columnAliases();
-        boolean hasOrdinality = false;
-        int numFuncs = columns.size();
-        if (ca != null && ca.size() > numFuncs) {
-            hasOrdinality = true;
-        }
-        for (int i = 0; i < numFuncs; i++) {
-            String cname = (ca != null && i < ca.size()) ? ca.get(i) : ("column" + (i + 1));
-            cols.add(new Column(cname, DataType.TEXT, true, false, null));
+        if (ca != null) {
+            for (int i = 0; i < ca.size() && i < cols.size(); i++) {
+                Column c = cols.get(i);
+                cols.set(i, new Column(stripColType(ca.get(i)), c.getType(), true, false, null));
+            }
         }
         if (hasOrdinality) {
-            cols.add(new Column(ca.get(numFuncs), DataType.BIGINT, true, false, null));
+            String ordName = ca != null && ca.size() > cols.size()
+                    ? stripColType(ca.get(cols.size())) : "ordinality";
+            cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
         }
 
         String tblAlias = alias != null ? alias : "rows_from";
@@ -1233,12 +1320,16 @@ class FromFunctionResolver {
         List<RowContext> contexts = new ArrayList<>();
         for (int row = 0; row < maxLen; row++) {
             Object[] rowData = new Object[cols.size()];
-            for (int c = 0; c < numFuncs; c++) {
-                rowData[c] = row < columns.get(c).size() ? columns.get(c).get(row) : null;
+            int at = 0;
+            for (int f = 0; f < perFunctionRows.size(); f++) {
+                List<Object[]> rows = perFunctionRows.get(f);
+                Object[] src = row < rows.size() ? rows.get(row) : null;
+                for (int c = 0; c < widths.get(f); c++) {
+                    rowData[at + c] = src != null && c < src.length ? src[c] : null;
+                }
+                at += widths.get(f);
             }
-            if (hasOrdinality) {
-                rowData[numFuncs] = (long)(row + 1);
-            }
+            if (hasOrdinality) rowData[at] = (long) (row + 1);
             virtualTable.insertRow(rowData);
             contexts.add(new RowContext(virtualTable, tblAlias, rowData));
         }
@@ -1314,10 +1405,13 @@ class FromFunctionResolver {
                 }
             } else if (!resultList.isEmpty() && resultList.get(0) instanceof Object[]) {
                 Object[] firstRow = (Object[]) resultList.get(0);
-                if (cols.isEmpty() && colAliases != null && !colAliases.isEmpty()) {
+                // A signature that names its own result columns is the description; an alias
+                // list written alongside only renames them, and never says how many there are.
+                boolean namedBySignature = userFunc.hasOutParams();
+                if (cols.isEmpty() && !namedBySignature && colAliases != null && !colAliases.isEmpty()) {
                     checkRecordShape(userFunc, colAliases.size(), firstRow.length);
                     for (int i = 0; i < colAliases.size(); i++) {
-                        cols.add(new Column(colAliases.get(i), DataType.TEXT, true, false, null));
+                        cols.add(columnFromDef(colAliases.get(i), i + 1));
                     }
                 } else if (cols.isEmpty()) {
                     for (int i = 0; i < firstRow.length; i++) {
@@ -1327,9 +1421,17 @@ class FromFunctionResolver {
                 int colIdx = 0;
                 for (PgFunction.Param p : params) {
                     if ("OUT".equalsIgnoreCase(p.mode()) && colIdx < cols.size()) {
+                        DataType dt = DataType.fromPgName(p.typeName());
                         cols.set(colIdx, new Column(p.name() != null ? p.name() : "column" + (colIdx + 1),
-                                DataType.TEXT, true, false, null));
+                                dt != null ? dt : DataType.TEXT, true, false, null));
                         colIdx++;
+                    }
+                }
+                if (namedBySignature && colAliases != null) {
+                    for (int i = 0; i < colAliases.size() && i < cols.size(); i++) {
+                        Column c = cols.get(i);
+                        cols.set(i, new Column(stripColType(colAliases.get(i)), c.getType(),
+                                true, false, null));
                     }
                 }
                 virtualTable = new Table(alias, cols);
@@ -1369,7 +1471,8 @@ class FromFunctionResolver {
             List<Column> cols = new ArrayList<>();
             for (int i = 0; i < outParams.size(); i++) {
                 PgFunction.Param op = outParams.get(i);
-                String cname = (colAliases != null && i < colAliases.size()) ? colAliases.get(i)
+                String cname = (colAliases != null && i < colAliases.size())
+                        ? stripColType(colAliases.get(i))
                         : (op.name() != null ? op.name() : ("column" + (i + 1)));
                 DataType dt = DataType.fromPgName(op.typeName());
                 cols.add(new Column(cname, dt != null ? dt : DataType.TEXT, true, false, null));
@@ -1402,7 +1505,7 @@ class FromFunctionResolver {
             }
             List<Column> cols = new ArrayList<>();
             for (int i = 0; i < colAliases.size(); i++) {
-                cols.add(new Column(colAliases.get(i), DataType.TEXT, true, false, null));
+                cols.add(columnFromDef(colAliases.get(i), i + 1));
             }
             Table virtualTable = new Table(alias, cols);
             List<RowContext> contexts = new ArrayList<>();
@@ -1410,9 +1513,11 @@ class FromFunctionResolver {
             contexts.add(new RowContext(virtualTable, alias, rowArr));
             return contexts;
         }
-        // Scalar function in FROM
+        // Scalar function in FROM: one column of the type the function declares.
         String colName = firstColAlias(colAliases, alias);
-        Column col = new Column(colName, DataType.TEXT, true, false, null);
+        DataType declared = DataType.fromPgName(userFunc.getReturnType());
+        Column col = new Column(colName, declared != null ? declared : DataType.TEXT,
+                true, false, null);
         Table virtualTable = new Table(alias, Cols.listOf(col));
         List<RowContext> contexts = new ArrayList<>();
         Object[] row = new Object[]{result};
@@ -1438,6 +1543,20 @@ class FromFunctionResolver {
 
     private static String firstColAlias(List<String> colAliases, String fallback) {
         return (colAliases != null && !colAliases.isEmpty()) ? stripColType(colAliases.get(0)) : fallback;
+    }
+
+    /**
+     * The column one column-definition entry describes. An entry that names a type -- {@code "x
+     * integer"} -- gives the column that type; a bare name leaves it unknown, and text is what
+     * the rest of this file falls back to.
+     */
+    private static Column columnFromDef(String def, int ordinal) {
+        String name = stripColType(def);
+        DataType type = null;
+        int sp = def == null ? -1 : def.indexOf(' ');
+        if (sp > 0) type = DataType.fromPgName(def.substring(sp + 1).trim());
+        return new Column(name != null ? name : "column" + ordinal,
+                type != null ? type : DataType.TEXT, true, false, null);
     }
 
     /** Strip type information from a column alias like "id integer" -> "id". */
