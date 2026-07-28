@@ -94,7 +94,10 @@ class SelectWindowEvaluator {
             resultRows.add(rowValues.toArray());
         }
 
-        // ORDER BY
+        // ORDER BY. The row order is tracked as the input rows it came from, because DISTINCT ON
+        // below has to read window values, and those are computed per input row.
+        int[] rowOrder = new int[resultRows.size()];
+        for (int i = 0; i < rowOrder.length; i++) rowOrder[i] = i;
         List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
             // A window function ordered by rather than selected has no output column to read, and
@@ -141,13 +144,49 @@ class SelectWindowEvaluator {
                 return 0;
             });
             List<Object[]> sorted = new ArrayList<>(resultRows.size());
-            for (int idx : indices) sorted.add(finalResultRows.get(idx));
+            for (int i = 0; i < indices.length; i++) {
+                sorted.add(finalResultRows.get(indices[i]));
+                rowOrder[i] = indices[i];
+            }
             resultRows = sorted;
         }
 
+        resultRows = applyDistinctOn(stmt, resultRows, contexts, rowOrder);
         resultRows = select.applyDistinct(stmt, resultRows);
         resultRows = select.applyOffsetAndLimit(stmt, resultRows);
         return QueryResult.select(resultColumns, resultRows);
+    }
+
+    /**
+     * DISTINCT ON over a query with window functions. A window function in the key has one value
+     * per input row of the whole partition, so it is computed over the input rows and then read
+     * in the order the result ended up in — evaluating it a row at a time gives every row the
+     * same value and collapses the result to one row.
+     */
+    private List<Object[]> applyDistinctOn(SelectStmt stmt, List<Object[]> rows,
+                                           List<RowContext> contexts, int[] rowOrder) {
+        if (stmt.distinctOn() == null || stmt.distinctOn().isEmpty()) return rows;
+        List<Expression> keys = stmt.distinctOn();
+        Object[][] windowValues = new Object[keys.size()][];
+        for (int ki = 0; ki < keys.size(); ki++) {
+            if (select.containsWindowFunction(keys.get(ki))) {
+                windowValues[ki] = evaluateWindowExpression(keys.get(ki), contexts, stmt.windowDefs());
+            }
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        List<Object[]> kept = new ArrayList<>();
+        for (int ri = 0; ri < rows.size(); ri++) {
+            int source = rowOrder[ri];
+            StringBuilder key = new StringBuilder();
+            for (int ki = 0; ki < keys.size(); ki++) {
+                Object value = windowValues[ki] != null
+                        ? windowValues[ki][source]
+                        : executor.evalExpr(keys.get(ki), contexts.get(source));
+                key.append(value == null ? "\0NULL" : RowKey.valueKey(value)).append('\1');
+            }
+            if (seen.add(key.toString())) kept.add(rows.get(ri));
+        }
+        return kept;
     }
 
     /**
@@ -326,7 +365,7 @@ class SelectWindowEvaluator {
      * Checking here rather than in the evaluator means a meaningless specification is refused even
      * when the table is empty, and refused identically on every execution path.
      */
-    void validateWindowUsage(SelectStmt stmt) {
+    void validateWindowUsage(SelectStmt stmt, List<RowContext.TableBinding> bindings) {
         if (stmt.groupBy() != null) {
             for (Expression g : stmt.groupBy()) {
                 if (select.containsWindowFunction(g)) {
@@ -367,8 +406,8 @@ class SelectWindowEvaluator {
         // A named window is checked even when nothing references it, as PostgreSQL does.
         if (defs != null) {
             for (SelectStmt.WindowDef def : defs) {
-                resolveWindowDef(def, defs);
-                validateFrameOffsets(def.frame());
+                SelectStmt.WindowDef resolved = resolveWindowDef(def, defs);
+                validateFrameOffsets(def.frame(), namedWindowCall(resolved), bindings);
             }
         }
         for (WindowFuncExpr wf : calls) {
@@ -394,8 +433,14 @@ class SelectWindowEvaluator {
                 throw PgErrors.notImplemented(
                         "FILTER is not implemented for non-aggregate window functions");
             }
-            validateFrame(resolveNamedWindow(wf, defs));
+            validateFrame(resolveNamedWindow(wf, defs), bindings);
         }
+    }
+
+    /** A stand-in call carrying a named window's ORDER BY, so its frame can be judged the same way. */
+    private static WindowFuncExpr namedWindowCall(SelectStmt.WindowDef def) {
+        return new WindowFuncExpr("row_number", Cols.<Expression>listOf(), false, false,
+                def.partitionBy(), def.orderBy(), def.frame(), null, false, false, null, false);
     }
 
     private static MemgresException windowInWindowDefinition() {
@@ -593,10 +638,10 @@ class SelectWindowEvaluator {
      * measured in sort-key values rather than row positions, so they need a sort key of the right
      * shape; and an offset must be a non-negative, non-NULL size.
      */
-    private void validateFrame(WindowFuncExpr wf) {
+    private void validateFrame(WindowFuncExpr wf, List<RowContext.TableBinding> bindings) {
         WindowFuncExpr.FrameClause frame = wf.frame();
         if (frame == null) return;
-        validateFrameOffsets(frame);
+        validateFrameOffsets(frame, wf, bindings);
         int orderByCount = wf.orderBy() == null ? 0 : wf.orderBy().size();
         boolean hasOffsetBound = isOffsetBound(frame.start()) || isOffsetBound(frame.end());
         if (frame.type() == WindowFuncExpr.FrameType.GROUPS && orderByCount == 0) {
@@ -615,13 +660,15 @@ class SelectWindowEvaluator {
      * placed in a frame: it may not depend on the row (a column reference), on the group
      * (an aggregate) or on the framing itself (a window function).
      */
-    private void validateFrameOffsets(WindowFuncExpr.FrameClause frame) {
+    private void validateFrameOffsets(WindowFuncExpr.FrameClause frame, WindowFuncExpr wf,
+                                      List<RowContext.TableBinding> bindings) {
         if (frame == null) return;
-        validateFrameOffset(frame.start(), frame.type());
-        validateFrameOffset(frame.end(), frame.type());
+        validateFrameOffset(frame.start(), frame.type(), wf, bindings);
+        validateFrameOffset(frame.end(), frame.type(), wf, bindings);
     }
 
-    private void validateFrameOffset(WindowFuncExpr.FrameBound bound, WindowFuncExpr.FrameType type) {
+    private void validateFrameOffset(WindowFuncExpr.FrameBound bound, WindowFuncExpr.FrameType type,
+                                     WindowFuncExpr wf, List<RowContext.TableBinding> bindings) {
         if (!isOffsetBound(bound) || bound.offset() == null) return;
         Expression offset = bound.offset();
         if (select.containsWindowFunction(offset)) throw windowInWindowDefinition();
@@ -629,10 +676,123 @@ class SelectWindowEvaluator {
             throw new MemgresException(
                     "aggregate functions are not allowed in window " + type, "42803");
         }
+        // PostgreSQL resolves the offset's type before it asks whether the offset is constant,
+        // so an offset of the wrong type is that error and not "must not contain variables".
+        checkOffsetType(offset, type, wf, bindings);
         if (referencesColumn(offset)) {
             throw new MemgresException(
                     "argument of " + type + " must not contain variables", "42P10");
         }
+    }
+
+    /**
+     * The type a frame offset has to have. ROWS and GROUPS count rows, so their offset is a
+     * bigint whatever the query is ordered by; RANGE measures in the ordering column's own type,
+     * so the offset is resolved against that column and the pair either works or does not.
+     *
+     * <p>Both are decided here, before any row is read, because that is where PostgreSQL decides
+     * them: a query that never produces a row still has an offset of the wrong type.
+     */
+    private void checkOffsetType(Expression offset, WindowFuncExpr.FrameType type,
+                                 WindowFuncExpr wf, List<RowContext.TableBinding> bindings) {
+        if (type == WindowFuncExpr.FrameType.RANGE) {
+            DataType orderType = orderingColumnType(wf, bindings);
+            if (orderType == null) return;
+            if (!supportsRangeOffset(orderType)) {
+                throw PgErrors.notImplemented("RANGE with offset PRECEDING/FOLLOWING is not"
+                        + " supported for column type " + pgTypeName(orderType));
+            }
+            String unknown = unknownLiteral(offset);
+            if (unknown != null) {
+                parseAs(unknown, orderType);
+                return;
+            }
+            DataType offsetType = staticType(offset, bindings);
+            if (offsetType != null && !compatibleRangeOffset(orderType, offsetType)) {
+                MemgresException e = PgErrors.notImplemented(
+                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type "
+                                + pgTypeName(orderType) + " and offset type " + pgTypeName(offsetType));
+                e.setHint("Cast the offset value to an appropriate type.");
+                throw e;
+            }
+            return;
+        }
+        String unknown = unknownLiteral(offset);
+        if (unknown != null) {
+            parseAs(unknown, DataType.BIGINT);
+            return;
+        }
+        DataType offsetType = staticType(offset, bindings);
+        if (offsetType != null && !isNumeric(offsetType)) {
+            throw new MemgresException("argument of " + type + " must be type bigint, not type "
+                    + pgTypeName(offsetType), "42804");
+        }
+    }
+
+    /** The literal text of an offset written as a quoted constant, which carries no type of its own. */
+    private static String unknownLiteral(Expression offset) {
+        if (!(offset instanceof Literal)) return null;
+        Literal literal = (Literal) offset;
+        return literal.literalType() == Literal.LiteralType.STRING ? literal.value() : null;
+    }
+
+    /** Read an untyped constant as the type the frame needs, reporting what PostgreSQL reports. */
+    private static void parseAs(String text, DataType type) {
+        try {
+            if (type == DataType.NUMERIC
+                    || type == DataType.REAL || type == DataType.DOUBLE_PRECISION) {
+                new java.math.BigDecimal(text.trim());
+            } else {
+                Long.parseLong(text.trim());
+            }
+        } catch (NumberFormatException e) {
+            throw new MemgresException(
+                    "invalid input syntax for type " + pgTypeName(type) + ": \"" + text + "\"", "22P02");
+        }
+    }
+
+    /** The declared type of an offset that is a plain column, or null when it is anything else. */
+    private static DataType staticType(Expression offset, List<RowContext.TableBinding> bindings) {
+        if (!(offset instanceof ColumnRef) || bindings == null) return null;
+        ColumnRef ref = (ColumnRef) offset;
+        for (RowContext.TableBinding binding : bindings) {
+            Table table = binding.table();
+            if (table == null) continue;
+            if (ref.table() != null && !ref.table().equalsIgnoreCase(binding.alias())
+                    && !ref.table().equalsIgnoreCase(table.getName())) {
+                continue;
+            }
+            int index = table.getColumnIndex(ref.column());
+            if (index >= 0) return table.getColumns().get(index).getType();
+        }
+        return null;
+    }
+
+    private static DataType orderingColumnType(WindowFuncExpr wf, List<RowContext.TableBinding> bindings) {
+        if (wf.orderBy() == null || wf.orderBy().size() != 1) return null;
+        return staticType(wf.orderBy().get(0).expr(), bindings);
+    }
+
+    private static boolean isNumeric(DataType type) {
+        return type == DataType.SMALLINT || type == DataType.INTEGER || type == DataType.BIGINT
+                || type == DataType.NUMERIC
+                || type == DataType.REAL || type == DataType.DOUBLE_PRECISION;
+    }
+
+    private static boolean isIntegral(DataType type) {
+        return type == DataType.SMALLINT || type == DataType.INTEGER || type == DataType.BIGINT;
+    }
+
+    private static boolean supportsRangeOffset(DataType type) {
+        return isNumeric(type) || type == DataType.DATE || type == DataType.TIMESTAMP
+                || type == DataType.TIMESTAMPTZ || type == DataType.TIME || type == DataType.TIMETZ
+                || type == DataType.INTERVAL;
+    }
+
+    private static boolean compatibleRangeOffset(DataType orderType, DataType offsetType) {
+        if (isIntegral(orderType)) return isIntegral(offsetType);
+        if (isNumeric(orderType)) return isNumeric(offsetType);
+        return true;
     }
 
     /**
@@ -1266,6 +1426,16 @@ class SelectWindowEvaluator {
             return Math.round(((Number) rawOffset).doubleValue());
         }
         if (rawOffset instanceof Number) return ((Number) rawOffset).longValue();
+        if (rawOffset instanceof String) {
+            // A quoted offset carries no type of its own; the frame reads it as the bigint it
+            // counts rows in, and says so when it does not read.
+            try {
+                return Long.parseLong(((String) rawOffset).trim());
+            } catch (NumberFormatException e) {
+                throw new MemgresException(
+                        "invalid input syntax for type bigint: \"" + rawOffset + "\"", "22P02");
+            }
+        }
         return executor.toInt(rawOffset);
     }
 
@@ -1374,6 +1544,19 @@ class SelectWindowEvaluator {
         }
         boolean integralColumn = currentVal instanceof Integer || currentVal instanceof Long
                 || currentVal instanceof Short || currentVal instanceof Byte;
+        if (offset instanceof String) {
+            // A quoted offset takes the ordering column's type, so it is read as one of those
+            // values here rather than refused for being text.
+            String text = ((String) offset).trim();
+            try {
+                offset = integralColumn
+                        ? (Object) Long.valueOf(Long.parseLong(text))
+                        : (Object) new java.math.BigDecimal(text);
+            } catch (NumberFormatException e) {
+                throw new MemgresException("invalid input syntax for type "
+                        + pgTypeName(TypeCoercion.inferType(currentVal)) + ": \"" + text + "\"", "22P02");
+            }
+        }
         boolean fractionalOffset = offset instanceof java.math.BigDecimal
                 || offset instanceof Double || offset instanceof Float;
         if (!(offset instanceof Number) || (integralColumn && fractionalOffset)) {
@@ -1403,7 +1586,10 @@ class SelectWindowEvaluator {
 
     /** PostgreSQL names a type in an error the way {@code format_type} does, not by its catalog name. */
     private static String pgTypeName(Object value) {
-        DataType t = TypeCoercion.inferType(value);
+        return pgTypeName(TypeCoercion.inferType(value));
+    }
+
+    private static String pgTypeName(DataType t) {
         if (t == null) return "unknown";
         switch (t) {
             case SMALLINT: return "smallint";

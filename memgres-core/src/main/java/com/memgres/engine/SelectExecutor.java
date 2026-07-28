@@ -110,7 +110,7 @@ class SelectExecutor {
         if (stmt.from() == null || stmt.from().isEmpty()) {
             rejectSrfInAggregates(stmt);
             validateDistinctOn(stmt);
-            windowEvaluator.validateWindowUsage(stmt);
+            windowEvaluator.validateWindowUsage(stmt, null);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
                     || (stmt.having() != null && containsAggregate(stmt.having()));
             if (hasAgg) {
@@ -132,7 +132,6 @@ class SelectExecutor {
         rejectSrfInAggregates(stmt);
         validateDistinctOn(stmt);
         validateFromClause(stmt.from());
-        windowEvaluator.validateWindowUsage(stmt);
 
         List<RowContext.TableBinding> baseBindings;
         if (!contexts.isEmpty()) {
@@ -140,6 +139,10 @@ class SelectExecutor {
         } else {
             baseBindings = executor.fromResolver.resolveTableBindings(stmt.from());
         }
+
+        // The relations are resolved first: a window frame's offset is resolved against the
+        // column the window is ordered by, which is one of them.
+        windowEvaluator.validateWindowUsage(stmt, baseBindings);
 
         // Validate column references against table schema
         boolean simpleFrom = stmt.from().stream().allMatch(f -> f instanceof SelectStmt.TableRef);
@@ -324,8 +327,11 @@ class SelectExecutor {
             return aggregateEvaluator.executeAggregateSelect(grouped, contexts, baseBindings);
         }
 
-        // Check for window functions in targets, or ordered by without being selected
+        // Check for window functions in targets, in a DISTINCT ON key, or ordered by without
+        // being selected. A window function anywhere needs the whole partition, so the query
+        // cannot be answered a row at a time.
         if (hasWindowFunctionInTargets(stmt.targets())
+                || distinctOnNeedsWindowEvaluation(stmt)
                 || windowEvaluator.orderByNeedsWindowEvaluation(stmt)) {
             return windowEvaluator.executeWindowSelect(stmt, contexts, baseBindings);
         }
@@ -711,6 +717,15 @@ class SelectExecutor {
         return out.isEmpty() ? targets : out;
     }
 
+    /** True when a DISTINCT ON key is a window function, which only the window pass can evaluate. */
+    private boolean distinctOnNeedsWindowEvaluation(SelectStmt stmt) {
+        if (stmt.distinctOn() == null) return false;
+        for (Expression on : stmt.distinctOn()) {
+            if (containsWindowFunction(on)) return true;
+        }
+        return false;
+    }
+
     List<SelectStmt.OrderByItem> resolveOrderBy(List<SelectStmt.OrderByItem> orderBy,
                                                   List<SelectStmt.SelectTarget> targets) {
         if (orderBy == null || orderBy.isEmpty()) return orderBy;
@@ -719,14 +734,18 @@ class SelectExecutor {
         for (SelectStmt.OrderByItem item : orderBy) {
             Expression expr = item.expr();
 
-            if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
-                Literal lit = (Literal) expr;
-                int pos = Integer.parseInt(lit.value());
-                if (pos >= 1 && pos <= targets.size()) {
-                    expr = targets.get(pos - 1).expr();
-                } else if (pos < 1 || pos > targets.size()) {
+            // A constant in ORDER BY is an output-column position and nothing else, exactly as
+            // in GROUP BY: an integer outside the select list is out of range rather than a
+            // value to sort every row by, and a constant that is not an integer at all names
+            // no column and sorts nothing.
+            Integer pos = GroupByValidator.integerConstant(expr);
+            if (pos != null) {
+                if (pos < 1 || pos > targets.size()) {
                     throw new MemgresException("ORDER BY position " + pos + " is not in select list", "42P10");
                 }
+                expr = targets.get(pos - 1).expr();
+            } else if (expr instanceof Literal) {
+                throw new MemgresException("non-integer constant in ORDER BY", "42601");
             }
 
             if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
