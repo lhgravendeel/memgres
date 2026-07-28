@@ -50,6 +50,10 @@ import java.util.Set;
  */
 final class GroupByValidator {
 
+    /** The names every relation answers for without declaring them as columns. */
+    private static final Set<String> SYSTEM_COLUMNS = new java.util.HashSet<String>(
+            java.util.Arrays.asList("ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "oid"));
+
     private final SelectExecutor select;
 
     GroupByValidator(SelectExecutor select) {
@@ -209,8 +213,11 @@ final class GroupByValidator {
                 DataType type = binding == null ? null : columnType(binding, ref);
                 if (type == DataType.TEXT || type == DataType.VARCHAR || type == DataType.CHAR
                         || type == DataType.BOOLEAN) {
+                    // PostgreSQL names the type the way SQL spells it -- character varying, not
+                    // the catalog's varchar -- which is what toRegtypeDisplay renders.
                     MemgresException e = new MemgresException(
-                            "function " + name + "(" + type.getPgName() + ") does not exist", "42883");
+                            "function " + name + "(" + type.toRegtypeDisplay() + ") does not exist",
+                            "42883");
                     e.setHint("No function matches the given name and argument types.");
                     throw e;
                 }
@@ -641,10 +648,13 @@ final class GroupByValidator {
                 // GROUP BY just as much as under GROUPING SETS, where it always answers 0.
                 if (isGroupingCall(expr)) {
                     for (Expression arg : ((com.memgres.engine.parser.ast.FunctionCallExpr) expr).args()) {
-                        if (!groupedForms.contains(canon(arg, bindings))) {
-                            throw new MemgresException("arguments to GROUPING must be grouping "
-                                    + "expressions of the associated query level", "42803");
-                        }
+                        if (groupedForms.contains(canon(arg, bindings))) continue;
+                        // A name is resolved before it is judged as a grouping expression, and a
+                        // select-list alias is not a name an expression can use: GROUPING(k) over
+                        // "SELECT s AS k" is an undefined column, not a misplaced GROUPING.
+                        rejectUnknownColumn(arg);
+                        throw new MemgresException("arguments to GROUPING must be grouping "
+                                + "expressions of the associated query level", "42803");
                     }
                     return;
                 }
@@ -664,6 +674,26 @@ final class GroupByValidator {
                 }
             }
             AstWalk.forEachChild(node, this::walk);
+        }
+
+        /**
+         * A GROUPING argument that is a bare name no relation in the FROM answers for is an
+         * undefined column, which PostgreSQL reports before it asks whether the query groups by
+         * it. Only an unqualified name over relations whose columns are all known is judged: a
+         * qualified one, a system column and anything reached through a relation this walk could
+         * not resolve are left to the grouping-expression message.
+         */
+        private void rejectUnknownColumn(Expression arg) {
+            if (!(arg instanceof ColumnRef)) return;
+            ColumnRef ref = (ColumnRef) arg;
+            if (ref.table() != null || ref.column() == null) return;
+            if (SYSTEM_COLUMNS.contains(ref.column().toLowerCase())) return;
+            if (bindings == null || bindings.isEmpty()) return;
+            for (RowContext.TableBinding binding : bindings) {
+                if (binding.table() == null) return;
+            }
+            if (findBinding(ref, bindings) != null) return;
+            throw new MemgresException("column \"" + ref.column() + "\" does not exist", "42703");
         }
 
         /**

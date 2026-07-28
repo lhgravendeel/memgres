@@ -58,6 +58,16 @@ class CatalogSystemFunctions {
             case "pg_typeof": {
                 Expression rawExpr = fn.args().get(0);
 
+                // An expression already folded to a value -- a window call resolved over its
+                // partition, an aggregate over its group -- carries the type its own expression
+                // was declared to have. That declaration is exactly what pg_typeof asks for, and
+                // it is the only answer available when the fold produced NULL.
+                if (rawExpr instanceof ExprEvaluator.PrecomputedValueExpr) {
+                    DataType declared =
+                            ((ExprEvaluator.PrecomputedValueExpr) rawExpr).declaredType();
+                    if (declared != null) return pgTypeDisplayName(declared);
+                }
+
                 // Check if this is a system column reference (ctid, xmin, xmax, cmin, cmax, tableoid)
                 if (rawExpr instanceof ColumnRef && ctx != null) {
                     ColumnRef colRef = (ColumnRef) rawExpr;

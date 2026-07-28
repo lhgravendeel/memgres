@@ -261,6 +261,8 @@ class SelectWindowEvaluator {
                 collectWindowFunctions(when.result(), out);
             }
             if (c.elseExpr() != null) collectWindowFunctions(c.elseExpr(), out);
+        } else if (expr instanceof IsNullExpr) {
+            collectWindowFunctions(((IsNullExpr) expr).expr(), out);
         } else if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             for (Expression arg : fn.args()) collectWindowFunctions(arg, out);
@@ -311,6 +313,15 @@ class SelectWindowEvaluator {
                     : executor.evalExpr(cast.expr(), ctx);
             return executor.castEvaluator.applyCast(val, cast.typeName());
         }
+        if (expr instanceof IsNullExpr) {
+            // Without this the test fell through to ordinary evaluation, where the window call
+            // has no value and every row answered "IS NULL" -- including the rows that have one.
+            IsNullExpr isn = (IsNullExpr) expr;
+            Object val = select.containsWindowFunction(isn.expr())
+                    ? evalWithWindowValues(isn.expr(), ctx, precomputed, rowIndex)
+                    : executor.evalExpr(isn.expr(), ctx);
+            return isn.negated() ? val != null : val == null;
+        }
         if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
             Expression testExpr = c.operand();
@@ -345,11 +356,18 @@ class SelectWindowEvaluator {
             boolean hasWindowArg = fn.args().stream().anyMatch(select::containsWindowFunction);
             if (hasWindowArg) {
                 List<Expression> resolvedArgs = new ArrayList<>();
+                List<RowContext.TableBinding> argScope = ctx != null
+                        ? ctx.getBindings() : new ArrayList<RowContext.TableBinding>();
                 for (Expression arg : fn.args()) {
                     Object val = select.containsWindowFunction(arg)
                             ? evalWithWindowValues(arg, ctx, precomputed, rowIndex)
                             : executor.evalExpr(arg, ctx);
-                    resolvedArgs.add(val == null ? Literal.ofNull() : Literal.ofString(val.toString()));
+                    // The window value keeps the type its own expression has. Rendering it as a
+                    // string literal handed the enclosing call PostgreSQL's "unknown", so
+                    // pg_typeof(sum(x) OVER ()) answered unknown and anything computed from one
+                    // was resolved as text.
+                    resolvedArgs.add(new ExprEvaluator.PrecomputedValueExpr(val,
+                            executor.exprEvaluator.inferTypeFromContext(arg, argScope)));
                 }
                 return executor.functionEvaluator.evalFunction(
                         new FunctionCallExpr(fn.name(), resolvedArgs, fn.distinct(), fn.star()), ctx);
@@ -1488,8 +1506,7 @@ class SelectWindowEvaluator {
             for (int i = 0; i < partitionSize; i++) {
                 Object v = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(i)));
                 if (v != null) {
-                    @SuppressWarnings("unchecked")
-                    int cmp = ((java.lang.Comparable<Object>) boundaryVal).compareTo(v);
+                    int cmp = compareToOrderValue(boundaryVal, v);
                     // ascending start: first row >= boundary; descending start: first row <= boundary
                     if (descending ? cmp >= 0 : cmp <= 0) return i;
                 }
@@ -1499,8 +1516,7 @@ class SelectWindowEvaluator {
             for (int i = partitionSize - 1; i >= 0; i--) {
                 Object v = executor.evalExpr(orderExpr, contexts.get(sortedPartition.get(i)));
                 if (v != null) {
-                    @SuppressWarnings("unchecked")
-                    int cmp = ((java.lang.Comparable<Object>) boundaryVal).compareTo(v);
+                    int cmp = compareToOrderValue(boundaryVal, v);
                     // ascending end: last row <= boundary; descending end: last row >= boundary
                     if (descending ? cmp <= 0 : cmp >= 0) return i;
                 }
@@ -1509,29 +1525,42 @@ class SelectWindowEvaluator {
         }
     }
 
+    /**
+     * Compares a frame boundary against an ordering value. A date offset by an interval with a
+     * time part lands between two days, which PostgreSQL keeps by reading the date column as the
+     * timestamp it promotes to; the dates it is compared against promote the same way.
+     */
+    @SuppressWarnings("unchecked")
+    private static int compareToOrderValue(java.lang.Comparable<?> boundary, Object value) {
+        if (boundary instanceof java.time.LocalDateTime && value instanceof java.time.LocalDate) {
+            return ((java.time.LocalDateTime) boundary)
+                    .compareTo(((java.time.LocalDate) value).atStartOfDay());
+        }
+        return ((java.lang.Comparable<Object>) boundary).compareTo(value);
+    }
+
     /** Compute currentVal ± offset for RANGE frame boundaries. */
     @SuppressWarnings("unchecked")
     private java.lang.Comparable<?> computeRangeBoundary(Object currentVal, Object offset, boolean subtract) {
         if (offset instanceof PgInterval) {
+            // The offset is added to the ordering value the way any interval is: a month is a
+            // calendar month, not thirty days, so the boundary of "INTERVAL '1 month' PRECEDING"
+            // from 2024-02-01 is 2024-01-01 and not 2024-01-02.
             PgInterval iv = (PgInterval) offset;
-            long totalDays = iv.getMonths() * 30L + iv.getDays();
-            long totalMicros = iv.getMicroseconds();
+            PgInterval signed = subtract ? iv.negate() : iv;
             if (currentVal instanceof java.time.LocalDate) {
                 java.time.LocalDate d = (java.time.LocalDate) currentVal;
-                long days = totalDays + totalMicros / (24L * 3600 * 1_000_000);
-                return subtract ? d.minusDays(days) : d.plusDays(days);
+                // A whole number of days keeps the boundary a date; a time part does not, and
+                // PostgreSQL reads the column as the timestamp the date promotes to.
+                return signed.getMicroseconds() == 0
+                        ? (java.lang.Comparable<?>) signed.addTo(d)
+                        : (java.lang.Comparable<?>) signed.addTo(d.atStartOfDay());
             }
             if (currentVal instanceof java.time.LocalDateTime) {
-                java.time.LocalDateTime dt = (java.time.LocalDateTime) currentVal;
-                dt = subtract ? dt.minusDays(totalDays) : dt.plusDays(totalDays);
-                long nanos = totalMicros * 1000;
-                return subtract ? dt.minusNanos(nanos) : dt.plusNanos(nanos);
+                return signed.addTo((java.time.LocalDateTime) currentVal);
             }
             if (currentVal instanceof java.time.OffsetDateTime) {
-                java.time.OffsetDateTime dt = (java.time.OffsetDateTime) currentVal;
-                dt = subtract ? dt.minusDays(totalDays) : dt.plusDays(totalDays);
-                long nanos = totalMicros * 1000;
-                return subtract ? dt.minusNanos(nanos) : dt.plusNanos(nanos);
+                return signed.addTo((java.time.OffsetDateTime) currentVal);
             }
         }
         // Numeric offset — the boundary is compared against the ORDER BY values with
@@ -1590,22 +1619,9 @@ class SelectWindowEvaluator {
     }
 
     private static String pgTypeName(DataType t) {
-        if (t == null) return "unknown";
-        switch (t) {
-            case SMALLINT: return "smallint";
-            case INTEGER: return "integer";
-            case BIGINT: return "bigint";
-            case REAL: return "real";
-            case DOUBLE_PRECISION: return "double precision";
-            case BOOLEAN: return "boolean";
-            case VARCHAR: return "character varying";
-            case CHAR: return "character";
-            case TIMESTAMP: return "timestamp without time zone";
-            case TIMESTAMPTZ: return "timestamp with time zone";
-            case TIME: return "time without time zone";
-            case TIMETZ: return "time with time zone";
-            default: return t.getPgName();
-        }
+        // One renderer for all of them: the SQL spelling PostgreSQL writes in a message --
+        // character varying rather than the catalog's varchar.
+        return t == null ? "unknown" : t.toRegtypeDisplay();
     }
 
     /**
