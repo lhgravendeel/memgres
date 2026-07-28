@@ -234,14 +234,14 @@ class ProcedureFunctionGapsTest {
     }
 
     @Test
-    void function_returning_void_with_select_fails() {
-        // RETURNS void but body has SELECT; should fail
-        assertThrows(SQLException.class,
-                () -> exec("""
-                    CREATE FUNCTION badf_void() RETURNS void
-                    LANGUAGE SQL AS $$ SELECT 1 $$
-                    """),
-                "RETURNS void with SELECT body should fail");
+    void function_returning_void_discards_the_body_result() throws SQLException {
+        // Calling something for its side effect and discarding the value is the ordinary way
+        // to write a void SQL function; PG accepts it and yields NULL.
+        exec("""
+            CREATE FUNCTION badf_void() RETURNS void
+            LANGUAGE SQL AS $$ SELECT 1 $$
+            """);
+        assertNull(scalar("SELECT badf_void()"));
     }
 
     @Test

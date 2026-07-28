@@ -618,6 +618,26 @@ class SessionExecutor {
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
 
+        if (name.equals("alter_aggregate")) {
+            String[] parts = stmt.value().split("\0", -1);
+            java.util.List<String> argTypes = parts[1].isEmpty()
+                    ? Cols.listOf() : java.util.Arrays.asList(parts[1].split("\1"));
+            PgAggregate agg = executor.database.getAggregate(parts[0]);
+            if (agg == null || !DdlObjectExecutor.aggregateArgsMatch(agg, argTypes)) {
+                throw new MemgresException("aggregate " + parts[0] + "("
+                        + DdlObjectExecutor.canonicalTypeList(argTypes) + ") does not exist", "42883");
+            }
+            if ("rename".equals(parts[2])) {
+                executor.database.removeAggregate(parts[0]);
+                PgAggregate renamed = new PgAggregate(parts[3], agg.getSfunc(), agg.getStype(),
+                        agg.getInitcond(), agg.getFinalfunc(), agg.getCombinefunc(), agg.getSortop(),
+                        agg.getArgTypes());
+                renamed.setSchemaName(agg.getSchemaName());
+                executor.database.addAggregate(renamed);
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+
         // CREATE STATISTICS
         if (name.equals("create_statistics")) {
             String[] parts = stmt.value().split("\0", -1);
@@ -627,30 +647,39 @@ class SessionExecutor {
             String kindsStr = parts.length > 3 ? parts[3] : "";
             java.util.List<String> cols = colsStr.isEmpty() ? Cols.listOf() : java.util.Arrays.asList(colsStr.split(","));
             java.util.List<String> kinds = kindsStr.isEmpty() ? Cols.listOf() : java.util.Arrays.asList(kindsStr.split(","));
+            boolean ifNotExists = parts.length > 4 && "1".equals(parts[4]);
+            if (ifNotExists && executor.database.getExtendedStatistic(statName) != null) {
+                if (executor.session != null) {
+                    executor.session.addNotice("NOTICE", "42710",
+                            "statistics object \"" + statName + "\" already exists, skipping", null);
+                }
+                return QueryResult.command(QueryResult.Type.SET, 0);
+            }
+            validateStatisticsDefinition(statName, tableName, cols, kinds);
             ExtendedStatistic stat = new ExtendedStatistic(statName, tableName, cols, kinds);
             executor.database.addExtendedStatistic(stat);
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("alter_statistics_rename")) {
             String[] parts = stmt.value().split("\0", 2);
-            ExtendedStatistic stat = executor.database.getExtendedStatistic(parts[0]);
-            if (stat != null) {
-                executor.database.removeExtendedStatistic(parts[0]);
-                stat.setName(parts[1]);
-                executor.database.addExtendedStatistic(stat);
-            }
+            ExtendedStatistic stat = requireStatistic(parts[0]);
+            executor.database.removeExtendedStatistic(parts[0]);
+            stat.setName(parts[1]);
+            executor.database.addExtendedStatistic(stat);
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("alter_statistics_target")) {
             String[] parts = stmt.value().split("\0", 2);
-            ExtendedStatistic stat = executor.database.getExtendedStatistic(parts[0]);
-            if (stat != null) {
-                stat.setStattarget(Integer.parseInt(parts[1]));
-            }
+            requireStatistic(parts[0]).setStattarget(Integer.parseInt(parts[1]));
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("drop_statistics")) {
-            executor.database.removeExtendedStatistic(stmt.value());
+            String[] parts = stmt.value().split("\0", -1);
+            boolean ifExists = parts.length > 1 && "1".equals(parts[1]);
+            if (!ifExists || executor.database.getExtendedStatistic(parts[0]) != null) {
+                requireStatistic(parts[0]);
+                executor.database.removeExtendedStatistic(parts[0]);
+            }
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
 
@@ -2274,6 +2303,61 @@ class SessionExecutor {
             }
         }
         return false;
+    }
+
+    // ---- CREATE / ALTER / DROP STATISTICS ----
+
+    /** The statistics kinds PG 18 can build. */
+    private static final Set<String> STATISTICS_KINDS =
+            Cols.setOf("ndistinct", "dependencies", "mcv");
+
+    private ExtendedStatistic requireStatistic(String statName) {
+        ExtendedStatistic stat = executor.database.getExtendedStatistic(statName);
+        if (stat == null) {
+            throw new MemgresException(
+                    "statistics object \"" + statName + "\" does not exist", "42704");
+        }
+        return stat;
+    }
+
+    /**
+     * Extended statistics describe a correlation between columns of one table, so anything the
+     * planner could not read them back from — an unknown kind, a column that is not there, a
+     * single column — is rejected at definition time rather than stored and ignored.
+     */
+    private void validateStatisticsDefinition(String statName, String tableName,
+                                              List<String> cols, List<String> kinds) {
+        for (String kind : kinds) {
+            if (!STATISTICS_KINDS.contains(kind.toLowerCase())) {
+                throw new MemgresException(
+                        "unrecognized statistics kind \"" + kind + "\"", "42601");
+            }
+        }
+        if (executor.database.getView(tableName) != null) {
+            throw new MemgresException(
+                    "cannot define statistics for relation \"" + tableName + "\"", "42809");
+        }
+        Table table = executor.resolveTable(executor.defaultSchema(), tableName);
+        if (executor.database.getExtendedStatistic(statName) != null) {
+            throw new MemgresException(
+                    "statistics object \"" + statName + "\" already exists", "42710");
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        int plainColumns = 0;
+        for (String col : cols) {
+            if (col.startsWith("(")) continue; // an expression, not a column reference
+            if (table.getColumnIndex(col) < 0) {
+                throw new MemgresException("column \"" + col + "\" does not exist", "42703");
+            }
+            if (!seen.add(col.toLowerCase())) {
+                throw new MemgresException(
+                        "duplicate column name in statistics definition", "42701");
+            }
+            plainColumns++;
+        }
+        if (plainColumns == cols.size() && cols.size() < 2) {
+            throw new MemgresException("extended statistics require at least 2 columns", "42P17");
+        }
     }
 
     private boolean isRoleSuperuser(String role) {

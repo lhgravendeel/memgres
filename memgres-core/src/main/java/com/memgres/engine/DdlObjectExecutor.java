@@ -239,23 +239,30 @@ class DdlObjectExecutor {
     // ---- CREATE FUNCTION ----
 
     QueryResult executeCreateAggregate(CreateAggregateStmt stmt) {
-        // Validate that the state transition function exists (skip known built-in PG functions)
-        if (stmt.sfunc() != null) {
-            PgFunction func = executor.database.getFunction(stmt.sfunc());
-            if (func == null && !isKnownBuiltinFunction(stmt.sfunc())) {
-                // PG includes parameter types: sfunc(stype, argTypes...)
-                StringBuilder sig = new StringBuilder(stmt.sfunc());
-                sig.append("(");
-                if (stmt.stype() != null) sig.append(stmt.stype());
-                if (stmt.argTypes() != null) {
-                    for (String at : stmt.argTypes()) {
-                        sig.append(", ").append(at);
-                    }
-                }
-                sig.append(")");
-                throw new MemgresException("function " + sig + " does not exist", "42883");
-            }
+        // An aggregate with no state function or no state type cannot compute anything
+        if (stmt.sfunc() == null) {
+            throw new MemgresException("aggregate sfunc must be specified", "42P13");
         }
+        if (stmt.stype() == null) {
+            throw new MemgresException("aggregate stype must be specified", "42P13");
+        }
+
+        // The transition function takes the running state plus the aggregated arguments; an
+        // ordered-set aggregate's direct arguments go to the final function instead.
+        List<String> transArgs = new ArrayList<>();
+        transArgs.add(stmt.stype());
+        transArgs.addAll(aggregatedArgTypes(stmt));
+        requireFunctionSignature(stmt.sfunc(), transArgs);
+        if (stmt.finalfunc() != null) {
+            requireFunctionSignature(stmt.finalfunc(), Cols.listOf(stmt.stype()));
+        }
+
+        PgAggregate existing = executor.database.getAggregate(stmt.name());
+        if (existing != null && aggregateArgsMatch(existing, stmt.argTypes())) {
+            throw new MemgresException("function \"" + stmt.name()
+                    + "\" already exists with same argument types", "42723");
+        }
+
         PgAggregate agg = new PgAggregate(
                 stmt.name(),
                 stmt.sfunc(),
@@ -269,6 +276,71 @@ class DdlObjectExecutor {
         agg.setSchemaName(executor.defaultSchema());
         executor.database.addAggregate(agg);
         return QueryResult.command(QueryResult.Type.SET, 0);
+    }
+
+    /** The argument types the transition function receives, i.e. everything after ORDER BY. */
+    private static List<String> aggregatedArgTypes(CreateAggregateStmt stmt) {
+        List<String> out = new ArrayList<>();
+        if (stmt.argTypes() == null) return out;
+        int from = stmt.directArgCount() >= 0 ? stmt.directArgCount() : 0;
+        for (int i = from; i < stmt.argTypes().size(); i++) {
+            String t = stmt.argTypes().get(i);
+            if (!"*".equals(t)) out.add(t);
+        }
+        return out;
+    }
+
+    /**
+     * Require a function of this name accepting exactly these argument types. Names that look
+     * like PG's internal C functions are accepted unseen — memgres has no catalog of them.
+     */
+    private void requireFunctionSignature(String funcName, List<String> argTypes) {
+        String bare = funcName.contains(".")
+                ? funcName.substring(funcName.lastIndexOf('.') + 1) : funcName;
+        List<PgFunction> overloads = executor.database.getFunctionOverloads(bare);
+        if (overloads.isEmpty()) {
+            if (isKnownBuiltinFunction(funcName)) return;
+        } else {
+            for (PgFunction f : overloads) {
+                if (paramTypesMatch(f, argTypes)) return;
+            }
+        }
+        throw new MemgresException(
+                "function " + funcName + "(" + canonicalTypeList(argTypes) + ") does not exist", "42883");
+    }
+
+    /** True when the function's declared input parameters are exactly these types. */
+    private static boolean paramTypesMatch(PgFunction f, List<String> argTypes) {
+        List<String> declared = new ArrayList<>();
+        for (PgFunction.Param p : f.getParams()) {
+            if (!"OUT".equalsIgnoreCase(p.mode())) declared.add(DataType.canonicalName(p.typeName()));
+        }
+        if (declared.size() != argTypes.size()) return false;
+        for (int i = 0; i < declared.size(); i++) {
+            if (!declared.get(i).equals(DataType.canonicalName(argTypes.get(i)))) return false;
+        }
+        return true;
+    }
+
+    static String canonicalTypeList(List<String> types) {
+        if (types == null || types.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String t : types) {
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(DataType.canonicalName(t));
+        }
+        return sb.toString();
+    }
+
+    /** True when the aggregate was declared with exactly these argument types. */
+    static boolean aggregateArgsMatch(PgAggregate agg, List<String> argTypes) {
+        String[] declared = agg.getArgTypes() != null ? agg.getArgTypes() : new String[0];
+        List<String> wanted = argTypes != null ? argTypes : Cols.<String>listOf();
+        if (declared.length != wanted.size()) return false;
+        for (int i = 0; i < declared.length; i++) {
+            if (!DataType.canonicalName(declared[i]).equals(DataType.canonicalName(wanted.get(i)))) return false;
+        }
+        return true;
     }
 
     // ---- CREATE/ALTER/DROP OPERATOR ----
@@ -297,26 +369,16 @@ class DdlObjectExecutor {
             throw new MemgresException(
                 "operator argument types must be specified", "42P13");
         }
+        // An operator with no function has nothing to evaluate
+        if (stmt.function() == null) {
+            throw new MemgresException("operator function must be specified", "42P13");
+        }
 
         // Validate that the backing function exists (skip for well-known built-in PG functions)
-        if (stmt.function() != null) {
-            String funcName = stmt.function();
-            PgFunction func;
-            if (funcName.contains(".")) {
-                String[] parts = funcName.split("\\.", 2);
-                func = executor.database.getFunction(parts[0], parts[1]);
-            } else {
-                func = executor.database.getFunction(funcName);
-            }
-            if (func == null && !isKnownBuiltinFunction(funcName)) {
-                StringBuilder sig = new StringBuilder(funcName).append("(");
-                boolean first = true;
-                if (stmt.leftArg() != null) { sig.append(stmt.leftArg()); first = false; }
-                if (stmt.rightArg() != null) { if (!first) sig.append(", "); sig.append(stmt.rightArg()); }
-                sig.append(")");
-                throw new MemgresException("function " + sig + " does not exist", "42883");
-            }
-        }
+        List<String> opArgs = new ArrayList<>();
+        if (stmt.leftArg() != null) opArgs.add(stmt.leftArg());
+        if (stmt.rightArg() != null) opArgs.add(stmt.rightArg());
+        requireFunctionSignature(stmt.function(), opArgs);
 
         PgOperator op = new PgOperator(stmt.name(), stmt.leftArg(), stmt.rightArg(), stmt.function());
         op.setCommutator(stmt.commutator());
@@ -505,6 +567,12 @@ class DdlObjectExecutor {
             }
         }
 
+        // A body written for a language nothing can run is stored but never callable
+        if (stmt.language() != null && !INSTALLED_LANGUAGES.contains(stmt.language().toLowerCase())) {
+            throw new MemgresException(
+                    "language \"" + stmt.language().toLowerCase() + "\" does not exist", "42704");
+        }
+
         // Validate return type exists (PG validates at CREATE time)
         if (stmt.returnType() != null && !stmt.returnType().isEmpty()) {
             String retType = stmt.returnType();
@@ -631,6 +699,7 @@ class DdlObjectExecutor {
                 }
                 if (sameTypes) {
                     if (stmt.orReplace()) {
+                        checkReplaceKeepsSignature(existing, stmt, params);
                         executor.database.removeFunction(funcSchema, stmt.name(), existingTypes);
                         break;
                     }
@@ -663,6 +732,63 @@ class DdlObjectExecutor {
         executor.database.setObjectOwner("function:" + stmt.name(), executor.sessionUser());
         executor.recordUndo(new Session.CreateFunctionUndo(stmt.name()));
         return QueryResult.command(QueryResult.Type.CREATE_FUNCTION, 0);
+    }
+
+    /** The languages a stock PostgreSQL has; memgres runs sql and plpgsql bodies itself. */
+    private static final Set<String> INSTALLED_LANGUAGES =
+            Cols.setOf("sql", "plpgsql", "c", "internal");
+
+    /**
+     * CREATE OR REPLACE keeps the identity of the existing function, so callers compiled against
+     * its result type and parameter names stay valid; changing either is a new function, and PG
+     * makes you drop the old one first.
+     */
+    private void checkReplaceKeepsSignature(PgFunction existing, CreateFunctionStmt stmt,
+                                            List<PgFunction.Param> params) {
+        List<PgFunction.Param> oldOut = outParams(existing.getParams());
+        List<PgFunction.Param> newOut = outParams(params);
+        boolean outChanged = oldOut.size() != newOut.size();
+        for (int i = 0; !outChanged && i < oldOut.size(); i++) {
+            outChanged = !sameParamName(oldOut.get(i).name(), newOut.get(i).name())
+                    || !DataType.canonicalName(oldOut.get(i).typeName())
+                            .equals(DataType.canonicalName(newOut.get(i).typeName()));
+        }
+        String oldRet = existing.getReturnType() == null ? "" : DataType.canonicalName(existing.getReturnType());
+        String newRet = stmt.returnType() == null ? "" : DataType.canonicalName(stmt.returnType());
+        if (outChanged || !oldRet.equals(newRet)) {
+            throw new MemgresException("cannot change return type of existing function", "42P13");
+        }
+        List<PgFunction.Param> oldIn = inParams(existing.getParams());
+        List<PgFunction.Param> newIn = inParams(params);
+        for (int i = 0; i < oldIn.size() && i < newIn.size(); i++) {
+            String oldName = oldIn.get(i).name();
+            if (oldName == null || oldName.isEmpty()) continue;
+            if (!sameParamName(oldName, newIn.get(i).name())) {
+                throw new MemgresException(
+                        "cannot change name of input parameter \"" + oldName + "\"", "42P13");
+            }
+        }
+    }
+
+    private static boolean sameParamName(String a, String b) {
+        if (a == null || a.isEmpty()) return b == null || b.isEmpty();
+        return a.equalsIgnoreCase(b);
+    }
+
+    private static List<PgFunction.Param> outParams(List<PgFunction.Param> params) {
+        List<PgFunction.Param> out = new ArrayList<>();
+        for (PgFunction.Param p : params) {
+            if ("OUT".equalsIgnoreCase(p.mode()) || "INOUT".equalsIgnoreCase(p.mode())) out.add(p);
+        }
+        return out;
+    }
+
+    private static List<PgFunction.Param> inParams(List<PgFunction.Param> params) {
+        List<PgFunction.Param> out = new ArrayList<>();
+        for (PgFunction.Param p : params) {
+            if (!"OUT".equalsIgnoreCase(p.mode())) out.add(p);
+        }
+        return out;
     }
 
     private void validateSqlFunctionBody(CreateFunctionStmt stmt, List<PgFunction.Param> params) {
@@ -793,12 +919,6 @@ class DdlObjectExecutor {
             throw new MemgresException(
                     "return type mismatch in function declared to return " + (retType != null ? retType : "integer")
                     + "\n  Detail: Function's final statement must be SELECT or INSERT/UPDATE/DELETE RETURNING.",
-                    "42P13");
-        }
-
-        if (!stmt.isProcedure() && "void".equalsIgnoreCase(retType) && parsed instanceof SelectStmt) {
-            throw new MemgresException(
-                    "return type mismatch in function declared to return void\n  Detail: Function's final statement must be SELECT or INSERT/UPDATE/DELETE RETURNING.",
                     "42P13");
         }
 
@@ -1546,18 +1666,88 @@ class DdlObjectExecutor {
     // ---- CREATE EVENT TRIGGER ----
 
     QueryResult executeCreateEventTrigger(CreateEventTriggerStmt stmt) {
+        // A trigger whose function returns anything else cannot be called by the event machinery
+        PgFunction func = executor.database.getFunction(stmt.functionName());
+        if (func == null) {
+            throw new MemgresException("function " + stmt.functionName() + "() does not exist", "42883");
+        }
+        if (!"event_trigger".equalsIgnoreCase(String.valueOf(func.getReturnType()).trim())) {
+            throw new MemgresException(
+                    "function " + stmt.functionName() + " must return type event_trigger", "42P17");
+        }
+        if (stmt.tags() != null) {
+            for (String tag : stmt.tags()) {
+                String normalized = tag.trim().toUpperCase();
+                if (EVENT_TRIGGER_TAGS.contains(normalized)) continue;
+                if (NON_DDL_COMMAND_TAGS.contains(normalized)) {
+                    throw new MemgresException(
+                            "event triggers are not supported for " + normalized, "0A000");
+                }
+                throw new MemgresException(
+                        "filter value \"" + tag + "\" not recognized for filter variable \"tag\"", "42601");
+            }
+        }
+        if (executor.database.getEventTrigger(stmt.name()) != null) {
+            throw new MemgresException("event trigger \"" + stmt.name() + "\" already exists", "42710");
+        }
         PgEventTrigger et = new PgEventTrigger(stmt.name(), stmt.event(), stmt.functionName(), stmt.tags());
         executor.database.addEventTrigger(et);
         return QueryResult.command(QueryResult.Type.CREATE_TRIGGER, 0);
     }
+
+    /** Command tags an event trigger may filter on (PG's "Event Trigger Firing Matrix"). */
+    private static final Set<String> EVENT_TRIGGER_TAGS = Cols.setOf(
+            "ALTER AGGREGATE", "ALTER COLLATION", "ALTER CONVERSION", "ALTER DOMAIN",
+            "ALTER DEFAULT PRIVILEGES", "ALTER EXTENSION", "ALTER FOREIGN DATA WRAPPER",
+            "ALTER FOREIGN TABLE", "ALTER FUNCTION", "ALTER LANGUAGE", "ALTER LARGE OBJECT",
+            "ALTER MATERIALIZED VIEW", "ALTER OPERATOR", "ALTER OPERATOR CLASS",
+            "ALTER OPERATOR FAMILY", "ALTER POLICY", "ALTER PROCEDURE", "ALTER PUBLICATION",
+            "ALTER ROUTINE", "ALTER RULE", "ALTER SCHEMA", "ALTER SEQUENCE", "ALTER SERVER",
+            "ALTER STATISTICS", "ALTER SUBSCRIPTION", "ALTER TABLE", "ALTER TEXT SEARCH CONFIGURATION",
+            "ALTER TEXT SEARCH DICTIONARY", "ALTER TEXT SEARCH PARSER", "ALTER TEXT SEARCH TEMPLATE",
+            "ALTER TRIGGER", "ALTER TYPE", "ALTER USER MAPPING", "ALTER VIEW",
+            "COMMENT", "CREATE ACCESS METHOD", "CREATE AGGREGATE", "CREATE CAST",
+            "CREATE COLLATION", "CREATE CONVERSION", "CREATE DOMAIN", "CREATE EXTENSION",
+            "CREATE FOREIGN DATA WRAPPER", "CREATE FOREIGN TABLE", "CREATE FUNCTION",
+            "CREATE INDEX", "CREATE LANGUAGE", "CREATE MATERIALIZED VIEW", "CREATE OPERATOR",
+            "CREATE OPERATOR CLASS", "CREATE OPERATOR FAMILY", "CREATE POLICY", "CREATE PROCEDURE",
+            "CREATE PUBLICATION", "CREATE RULE", "CREATE SCHEMA", "CREATE SEQUENCE",
+            "CREATE SERVER", "CREATE STATISTICS", "CREATE SUBSCRIPTION", "CREATE TABLE",
+            "CREATE TABLE AS", "CREATE TEXT SEARCH CONFIGURATION", "CREATE TEXT SEARCH DICTIONARY",
+            "CREATE TEXT SEARCH PARSER", "CREATE TEXT SEARCH TEMPLATE", "CREATE TRANSFORM",
+            "CREATE TRIGGER", "CREATE TYPE", "CREATE USER MAPPING", "CREATE VIEW",
+            "DROP ACCESS METHOD", "DROP AGGREGATE", "DROP CAST", "DROP COLLATION",
+            "DROP CONVERSION", "DROP DOMAIN", "DROP EXTENSION", "DROP FOREIGN DATA WRAPPER",
+            "DROP FOREIGN TABLE", "DROP FUNCTION", "DROP INDEX", "DROP LANGUAGE",
+            "DROP MATERIALIZED VIEW", "DROP OPERATOR", "DROP OPERATOR CLASS",
+            "DROP OPERATOR FAMILY", "DROP OWNED", "DROP POLICY", "DROP PROCEDURE",
+            "DROP PUBLICATION", "DROP ROUTINE", "DROP RULE", "DROP SCHEMA", "DROP SEQUENCE",
+            "DROP SERVER", "DROP STATISTICS", "DROP SUBSCRIPTION", "DROP TABLE",
+            "DROP TEXT SEARCH CONFIGURATION", "DROP TEXT SEARCH DICTIONARY",
+            "DROP TEXT SEARCH PARSER", "DROP TEXT SEARCH TEMPLATE", "DROP TRANSFORM",
+            "DROP TRIGGER", "DROP TYPE", "DROP USER MAPPING", "DROP VIEW",
+            "GRANT", "IMPORT FOREIGN SCHEMA", "REFRESH MATERIALIZED VIEW", "REVOKE",
+            "SECURITY LABEL", "SELECT INTO");
+
+    /** Command tags PostgreSQL knows but refuses to fire event triggers for. */
+    private static final Set<String> NON_DDL_COMMAND_TAGS = Cols.setOf(
+            "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "TRUNCATE", "COPY", "CALL", "DO",
+            "VACUUM", "ANALYZE", "CLUSTER", "REINDEX", "CHECKPOINT", "EXPLAIN", "PREPARE",
+            "EXECUTE", "DEALLOCATE", "DECLARE CURSOR", "FETCH", "MOVE", "CLOSE CURSOR",
+            "LISTEN", "NOTIFY", "UNLISTEN", "LOCK TABLE", "SET", "RESET", "SHOW",
+            "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "START TRANSACTION",
+            "CREATE DATABASE", "DROP DATABASE", "ALTER DATABASE", "CREATE ROLE", "DROP ROLE",
+            "ALTER ROLE", "CREATE TABLESPACE", "DROP TABLESPACE", "ALTER TABLESPACE",
+            "CREATE EVENT TRIGGER", "ALTER EVENT TRIGGER", "DROP EVENT TRIGGER",
+            "REASSIGN OWNED", "LOAD", "DISCARD", "ALTER SYSTEM", "REFRESH COLLATION VERSION");
 
     // ---- ALTER EVENT TRIGGER ----
 
     QueryResult executeAlterEventTrigger(AlterEventTriggerStmt stmt) {
         PgEventTrigger et = executor.database.getEventTrigger(stmt.name());
         if (et == null) {
-            // Silently succeed for compatibility (some tests expect no-op behavior)
-            return QueryResult.command(QueryResult.Type.SET, 0);
+            throw new MemgresException(
+                    "event trigger \"" + stmt.name() + "\" does not exist", "42704");
         }
         switch (stmt.action()) {
             case DISABLE:
@@ -1589,8 +1779,9 @@ class DdlObjectExecutor {
     QueryResult executeDropEventTrigger(DropEventTriggerStmt stmt) {
         PgEventTrigger et = executor.database.getEventTrigger(stmt.name());
         if (et == null) {
-            // Silently succeed for compatibility
-            return QueryResult.command(QueryResult.Type.SET, 0);
+            if (stmt.ifExists()) return QueryResult.command(QueryResult.Type.SET, 0);
+            throw new MemgresException(
+                    "event trigger \"" + stmt.name() + "\" does not exist", "42704");
         }
         executor.database.removeEventTrigger(stmt.name());
         return QueryResult.command(QueryResult.Type.SET, 0);
@@ -1636,6 +1827,16 @@ class DdlObjectExecutor {
                 dropRule(stmt);
                 break;
             case AGGREGATE: {
+                PgAggregate agg = executor.database.getAggregate(stmt.name());
+                // Dropping by name alone would take down an aggregate of a different signature
+                if (agg == null
+                        || (stmt.paramTypes() != null && !aggregateArgsMatch(agg, stmt.paramTypes()))) {
+                    if (!stmt.ifExists()) {
+                        throw new MemgresException("aggregate " + stmt.name() + "("
+                                + canonicalTypeList(stmt.paramTypes()) + ") does not exist", "42883");
+                    }
+                    break;
+                }
                 executor.database.removeAggregate(stmt.name());
                 break;
             }
@@ -1658,7 +1859,8 @@ class DdlObjectExecutor {
                             .anyMatch(c -> (int) c[0] == srcOid && (int) c[1] == tgtOid);
                     if (!exists && !stmt.ifExists()) {
                         throw new MemgresException(
-                                "cast from type " + parts[0].trim() + " to type " + parts[1].trim() + " does not exist",
+                                "cast from type " + DataType.canonicalName(parts[0])
+                                + " to type " + DataType.canonicalName(parts[1]) + " does not exist",
                                 "42704");
                     }
                     if (exists) {
@@ -1668,8 +1870,15 @@ class DdlObjectExecutor {
                 break;
             }
             case OPERATOR: {
-                // name is encoded as "opname(leftarg,rightarg)" by the parser
+                // name is encoded as "schema.opname(leftarg,rightarg)" by the parser, which
+                // assumes public for an unqualified name; the operator lives wherever the
+                // search path put it.
                 String opKey = stmt.name();
+                if (!executor.database.hasOperator(opKey) && opKey.startsWith("public.")) {
+                    String searchPathKey = executor.defaultSchema().toLowerCase()
+                            + opKey.substring("public".length());
+                    if (executor.database.hasOperator(searchPathKey)) opKey = searchPathKey;
+                }
                 if (!executor.database.hasOperator(opKey)) {
                     if (!stmt.ifExists()) {
                         throw new MemgresException("operator does not exist: " + stmt.name(), "42704");
@@ -2897,21 +3106,119 @@ class DdlObjectExecutor {
     // ---- CREATE CAST ----
 
     QueryResult executeCreateCast(CreateCastStmt stmt) {
+        validateTypeExists(stmt.sourceType);
+        validateTypeExists(stmt.targetType);
         // Resolve source and target type OIDs using DataType enum for built-in types
         int sourceOid = resolveTypeOid(stmt.sourceType);
         int targetOid = resolveTypeOid(stmt.targetType);
-        String castMethod = stmt.functionName != null ? "f" : "b";
+        String castMethod = stmt.functionName != null ? "f" : (stmt.withInout ? "i" : "b");
         int castFunc = 0; // 0 for binary coercible / without function
-        // Binary-compatible casts involving domain types are not allowed
-        if (castMethod.equals("b")) {
-            if (executor.database.getDomain(stmt.sourceType.toLowerCase()) != null
-                    || executor.database.getDomain(stmt.targetType.toLowerCase()) != null) {
-                throw new MemgresException("domain data types must not be marked binary-compatible", "42P17");
-            }
+        if (castMethod.equals("f")) {
+            validateCastFunction(stmt);
+        } else if (castMethod.equals("b")) {
+            validateBinaryCoercible(stmt);
+        }
+        if (executor.database.getUserDefinedCasts().stream()
+                .anyMatch(c -> (int) c[0] == sourceOid && (int) c[1] == targetOid)) {
+            throw new MemgresException("cast from type " + DataType.canonicalName(stmt.sourceType)
+                    + " to type " + DataType.canonicalName(stmt.targetType) + " already exists", "42710");
         }
         // Store in database for inclusion in pg_cast virtual table
         executor.database.addUserCast(sourceOid, targetOid, castFunc, stmt.castContext, castMethod);
         return QueryResult.command(QueryResult.Type.CREATE_TYPE, 0);
+    }
+
+    /**
+     * A cast function has to take the source type and produce the target type; registering one
+     * that does neither leaves a cast that reinterprets values of a type it never handled.
+     */
+    private void validateCastFunction(CreateCastStmt stmt) {
+        String bare = stmt.functionName.contains(".")
+                ? stmt.functionName.substring(stmt.functionName.lastIndexOf('.') + 1) : stmt.functionName;
+        List<PgFunction> overloads = executor.database.getFunctionOverloads(bare);
+        PgFunction func = null;
+        if (stmt.funcArgTypes != null) {
+            for (PgFunction f : overloads) {
+                if (paramTypesMatch(f, stmt.funcArgTypes)) { func = f; break; }
+            }
+        } else if (!overloads.isEmpty()) {
+            func = overloads.get(0);
+        }
+        if (func == null) {
+            if (isKnownBuiltinFunction(stmt.functionName)) return;
+            throw new MemgresException("function " + stmt.functionName + "("
+                    + canonicalTypeList(stmt.funcArgTypes) + ") does not exist", "42883");
+        }
+        List<PgFunction.Param> params = func.getParams();
+        String firstParam = params.isEmpty() ? null : params.get(0).typeName();
+        if (firstParam == null
+                || !DataType.canonicalName(firstParam).equals(DataType.canonicalName(stmt.sourceType))) {
+            throw new MemgresException(
+                    "argument of cast function must match or be binary-coercible from source data type",
+                    "42P17");
+        }
+        if (func.getReturnType() == null
+                || !DataType.canonicalName(func.getReturnType()).equals(DataType.canonicalName(stmt.targetType))) {
+            throw new MemgresException(
+                    "return data type of cast function must match or be binary-coercible to target data type",
+                    "42P17");
+        }
+    }
+
+    /**
+     * WITHOUT FUNCTION claims the two types are the same bytes. Accepting that between types
+     * stored differently would register a cast that reinterprets one type's memory as another.
+     */
+    private void validateBinaryCoercible(CreateCastStmt stmt) {
+        String src = stmt.sourceType.toLowerCase();
+        String tgt = stmt.targetType.toLowerCase();
+        if (DataType.canonicalName(src).equals(DataType.canonicalName(tgt))) {
+            throw new MemgresException("source data type and target data type are the same", "42P17");
+        }
+        if (!storageClass(src).equals(storageClass(tgt))) {
+            throw new MemgresException("source and target data types are not physically compatible", "42P17");
+        }
+        if (executor.database.isCompositeType(src) || executor.database.isCompositeType(tgt)) {
+            throw new MemgresException("composite data types are not binary-compatible", "42P17");
+        }
+        if (executor.database.isCustomEnum(src) || executor.database.isCustomEnum(tgt)) {
+            throw new MemgresException("enum data types are not binary-compatible", "42P17");
+        }
+        if (executor.database.getDomain(src) != null || executor.database.getDomain(tgt) != null) {
+            throw new MemgresException("domain data types must not be marked binary-compatible", "42P17");
+        }
+    }
+
+    /**
+     * PG calls two types physically compatible when typlen, typbyval and typalign all agree;
+     * this reports that triple as one key.
+     */
+    private String storageClass(String typeName) {
+        String base = typeName.toLowerCase().replaceAll("\\(.*\\)", "").trim();
+        if (base.endsWith("[]")) return "-1/f/d";           // every array is a varlena
+        if (executor.database.isCompositeType(base)) return "-1/f/d";
+        if (executor.database.isCustomEnum(base)) return "4/t/i";
+        DomainType dom = executor.database.getDomain(base);
+        if (dom != null) return storageClass(dom.getBaseTypeName());
+        DataType dt = DataType.fromPgName(base);
+        if (dt == null) return "unknown:" + base;
+        switch (dt) {
+            case SMALLINT: return "2/t/s";
+            case INTEGER: case SERIAL: case REAL: case DATE: case OID: return "4/t/i";
+            case BIGINT: case BIGSERIAL: case DOUBLE_PRECISION: case TIMESTAMP: case TIMESTAMPTZ:
+            case TIME: case MONEY: return "8/t/d";
+            case BOOLEAN: return "1/t/c";
+            case UUID: return "16/f/c";
+            case INTERVAL: return "16/f/d";
+            case TIMETZ: return "12/f/d";
+            case CHAR: case VARCHAR: case TEXT: return "-1/f/i";
+            case NAME: return "64/f/c";
+            case POINT: return "16/f/d";
+            case LSEG: case BOX: return "32/f/d";
+            case LINE: return "24/f/d";
+            case CIRCLE: return "24/f/d";
+            default: return "-1/f/i";
+        }
     }
 
     /** Resolve a SQL type name to its OID, checking built-in types first, then domains/enums. */

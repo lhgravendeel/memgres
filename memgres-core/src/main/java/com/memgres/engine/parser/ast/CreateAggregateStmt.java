@@ -11,6 +11,8 @@ import java.util.Objects;
 public final class CreateAggregateStmt implements Statement {
     public final String name;
     public final List<String> argTypes;
+    /** Count of direct (pre-ORDER BY) arguments of an ordered-set aggregate; -1 if plain. */
+    public final int directArgCount;
     public final String sfunc;
     public final String stype;
     public final String initcond;    // may be null
@@ -20,8 +22,15 @@ public final class CreateAggregateStmt implements Statement {
 
     public CreateAggregateStmt(String name, List<String> argTypes, String sfunc, String stype,
                                String initcond, String finalfunc, String combinefunc, String sortop) {
+        this(name, argTypes, -1, sfunc, stype, initcond, finalfunc, combinefunc, sortop);
+    }
+
+    public CreateAggregateStmt(String name, List<String> argTypes, int directArgCount, String sfunc,
+                               String stype, String initcond, String finalfunc, String combinefunc,
+                               String sortop) {
         this.name = name;
         this.argTypes = argTypes;
+        this.directArgCount = directArgCount;
         this.sfunc = sfunc;
         this.stype = stype;
         this.initcond = initcond;
@@ -32,6 +41,7 @@ public final class CreateAggregateStmt implements Statement {
 
     public String name() { return name; }
     public List<String> argTypes() { return argTypes; }
+    public int directArgCount() { return directArgCount; }
     public String sfunc() { return sfunc; }
     public String stype() { return stype; }
     public String initcond() { return initcond; }

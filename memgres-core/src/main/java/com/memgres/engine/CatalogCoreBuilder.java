@@ -1142,7 +1142,7 @@ class CatalogCoreBuilder {
             if (dt == DataType.ENUM || dt == DataType.SERIAL || dt == DataType.BIGSERIAL
                     || dt == DataType.SMALLSERIAL
                     || dt.getPgName().startsWith("_")
-                    || dt == DataType.RECORD) continue;
+                    || dt == DataType.RECORD || dt == DataType.VOID) continue;
             String cat;
             switch (dt) {
                 case SMALLINT:

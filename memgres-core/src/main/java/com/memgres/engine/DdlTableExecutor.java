@@ -869,6 +869,11 @@ class DdlTableExecutor {
                                 if (m.find()) depends = true;
                             }
                         }
+                        // A BEGIN ATOMIC body is parsed at definition time and records a real
+                        // dependency, unlike a string body which is only resolved when called
+                        if (!depends && fn.isAtomicBody() && sqlFunctionDependsOnTable(fn, name)) {
+                            depends = true;
+                        }
                         if (depends) {
                             throw new MemgresException(
                                     "cannot drop table " + name + " because other objects depend on it\n"
