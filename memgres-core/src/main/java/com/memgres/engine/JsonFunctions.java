@@ -33,6 +33,40 @@ class JsonFunctions {
         }
     }
 
+    /**
+     * PG will not guess what a caller meant by handing an object to an array function: it names
+     * the container it got and stops. Answering 0, NULL or the input unchanged instead hid the
+     * mistake behind a value nothing downstream could tell from a real one. The json and jsonb
+     * families word the same complaint differently, so both wordings are kept.
+     */
+    static void requireJsonArray(String name, String json) {
+        if (JsonOperations.isArray(json)) return;
+        boolean object = JsonOperations.isObject(json);
+        if (name.startsWith("jsonb_")) {
+            throw new MemgresException(
+                    "cannot extract elements from " + (object ? "an object" : "a scalar"), "22023");
+        }
+        throw new MemgresException(
+                "cannot call " + name + " on " + (object ? "a non-array" : "a scalar"), "22023");
+    }
+
+    /** The key-listing functions need an object; an array and a scalar are named apart. */
+    static void requireJsonObject(String name, String json) {
+        if (JsonOperations.isObject(json)) return;
+        throw new MemgresException("cannot call " + name + " on "
+                + (JsonOperations.isArray(json) ? "an array" : "a scalar"), "22023");
+    }
+
+    /** json_each words its refusal as deconstruction, jsonb_each as a call on a non-object. */
+    static void requireJsonEachObject(String name, String json) {
+        if (JsonOperations.isObject(json)) return;
+        if (name.startsWith("jsonb_")) {
+            throw new MemgresException("cannot call " + name + " on a non-object", "22023");
+        }
+        throw new MemgresException(JsonOperations.isArray(json)
+                ? "cannot deconstruct an array as an object" : "cannot deconstruct a scalar", "22023");
+    }
+
     private void requireArgs(FunctionCallExpr fn, int min) {
         if (fn.args().size() < min) {
             throw new MemgresException(
@@ -45,12 +79,25 @@ class JsonFunctions {
         switch (name) {
             case "jsonb_build_object":
             case "json_build_object": {
+                // Arguments alternate key and value, so an odd count leaves a key with no value
+                if (fn.args().size() % 2 != 0) {
+                    throw new MemgresException("argument list must have even number of elements\n"
+                            + "  Hint: The arguments of " + name + "() must consist of alternating keys and values.",
+                            "22023");
+                }
+                boolean jsonb = name.startsWith("jsonb");
                 StringBuilder sb = new StringBuilder("{");
                 for (int i = 0; i < fn.args().size(); i += 2) {
                     if (i > 0) sb.append(", ");
                     Object key = executor.evalExpr(fn.args().get(i), ctx);
-                    Object val = (i + 1 < fn.args().size()) ? executor.evalExpr(fn.args().get(i + 1), ctx) : null;
-                    sb.append("\"").append(key).append("\": ");
+                    if (key == null) {
+                        // The two families report a null key differently, down to the SQLSTATE
+                        throw jsonb
+                                ? new MemgresException("argument " + (i + 1) + ": key must not be null", "22023")
+                                : new MemgresException("null value not allowed for object key", "22004");
+                    }
+                    Object val = executor.evalExpr(fn.args().get(i + 1), ctx);
+                    sb.append("\"").append(key).append("\"").append(jsonb ? ": " : " : ");
                     appendJsonValue(sb, val);
                 }
                 sb.append("}");
@@ -74,7 +121,7 @@ class JsonFunctions {
                 if (arg instanceof Number || arg instanceof Boolean) return arg.toString();
                 String s = arg.toString();
                 if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) return s;
-                return "\"" + arg.toString().replace("\"", "\\\"") + "\"";
+                return JsonOperations.quote(s);
             }
             case "row_to_json": {
                 // Try whole-row resolution first for ColumnRef args (e.g., row_to_json(x) where x is a table alias)
@@ -126,40 +173,26 @@ class JsonFunctions {
                 return arg.toString();
             }
             case "jsonb_path_query": {
-                requireArgs(fn, 2);
-                Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
-                Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
-                if (jsonVal == null || pathVal == null) return new ArrayList<>();
-                String path = pathVal.toString().trim();
-                if (fn.args().size() > 2) {
-                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
-                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                PathCall call = preparePath(fn, ctx);
+                if (call == null) return new ArrayList<>();
+                try {
+                    return new ArrayList<>(evaluateJsonPathAll(call.json, call.path));
+                } catch (MemgresException e) {
+                    if (!call.silent || !isSuppressible(e)) throw e;
+                    return new ArrayList<>(); // Return as List for SRF expansion
                 }
-                // The mode word is part of the path; check the shape after it
-                String bodyPath = stripJsonPathMode(path);
-                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
-                }
-                List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
-                return new ArrayList<>(results); // Return as List for SRF expansion
             }
             case "jsonb_path_query_array": {
                 // PG: collect all jsonpath matches into a jsonb array.
-                requireArgs(fn, 2);
-                Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
-                Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
-                if (jsonVal == null || pathVal == null) return null;
-                String path = pathVal.toString().trim();
-                if (fn.args().size() > 2) {
-                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
-                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                PathCall call = preparePath(fn, ctx);
+                if (call == null) return null;
+                List<String> results;
+                try {
+                    results = evaluateJsonPathAll(call.json, call.path);
+                } catch (MemgresException e) {
+                    if (!call.silent || !isSuppressible(e)) throw e;
+                    results = new ArrayList<>();
                 }
-                // The mode word is part of the path; check the shape after it
-                String bodyPath = stripJsonPathMode(path);
-                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
-                }
-                List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
                 StringBuilder sb = new StringBuilder("[");
                 for (int i = 0; i < results.size(); i++) {
                     if (i > 0) sb.append(", ");
@@ -169,42 +202,28 @@ class JsonFunctions {
                 return sb.toString();
             }
             case "jsonb_path_query_first": {
-                requireArgs(fn, 2);
-                Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
-                Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
-                if (jsonVal == null || pathVal == null) return null;
-                String path = pathVal.toString().trim();
-                if (fn.args().size() > 2) {
-                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
-                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                PathCall call = preparePath(fn, ctx);
+                if (call == null) return null;
+                try {
+                    List<String> results = evaluateJsonPathAll(call.json, call.path);
+                    return results.isEmpty() ? null : results.get(0);
+                } catch (MemgresException e) {
+                    if (!call.silent || !isSuppressible(e)) throw e;
+                    return null;
                 }
-                // The mode word is part of the path; check the shape after it
-                String bodyPath = stripJsonPathMode(path);
-                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
-                }
-                List<String> results = evaluateJsonPathAll(jsonVal.toString(), path);
-                return results.isEmpty() ? null : results.get(0);
             }
             case "jsonb_path_exists": {
-                requireArgs(fn, 2);
-                Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
-                Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
-                if (jsonVal == null || pathVal == null) return null;
-                String path = pathVal.toString().trim();
-                if (fn.args().size() > 2) {
-                    Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
-                    if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+                PathCall call = preparePath(fn, ctx);
+                if (call == null) return null;
+                try {
+                    return evaluateJsonPathExists(call.json, call.path);
+                } catch (MemgresException e) {
+                    if (!call.silent || !isSuppressible(e)) throw e;
+                    return null;
                 }
-                // Basic jsonpath validation: must start with $
-                // The mode word is part of the path; check the shape after it
-                String bodyPath = stripJsonPathMode(path);
-                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
-                }
-                return evaluateJsonPathExists(jsonVal.toString(), path);
             }
             case "jsonb_path_match": {
+                // A predicate is not a path, so this one takes the arguments without the check
                 requireArgs(fn, 2);
                 Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
                 Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
@@ -214,36 +233,14 @@ class JsonFunctions {
                     Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
                     if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
                 }
-                // Handle exists(...) syntax
-                if (path.startsWith("exists(") && path.endsWith(")")) {
-                    String innerPath = path.substring(7, path.length() - 1).trim();
-                    boolean existsResult = evaluateJsonPathExists(jsonVal.toString(), innerPath);
-                    return existsResult;
+                boolean silent = fn.args().size() > 3
+                        && executor.isTruthy(executor.evalExpr(fn.args().get(3), ctx));
+                try {
+                    return evalPathMatch(jsonVal.toString(), path);
+                } catch (MemgresException e) {
+                    if (!silent || !isSuppressible(e)) throw e;
+                    return null;
                 }
-                // Handle predicate expressions like $.a == 2
-                // Check if the path contains a comparison operator at the top level
-                String[] compOps = {"==", "!=", ">=", "<=", ">", "<"};
-                boolean isPredicate = false;
-                for (String op : compOps) {
-                    if (path.contains(op)) { isPredicate = true; break; }
-                }
-                if (isPredicate) {
-                    Boolean predResult = evaluateJsonPathPredicate(jsonVal.toString(), path);
-                    return predResult;
-                }
-                // The mode word is part of the path; check the shape after it
-                String bodyPath = stripJsonPathMode(path);
-                if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
-                    throw new MemgresException("syntax error at or near \"" + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
-                }
-                Object result = evaluateJsonPath(jsonVal.toString(), path);
-                if (result == null) return null;
-                if (result instanceof Boolean) return ((Boolean) result);
-                String rs = result.toString().trim();
-                if (rs.equals("true")) return true;
-                if (rs.equals("false")) return false;
-                // jsonb_path_match result must be boolean; SQLSTATE 22038
-                throw new MemgresException("jsonpath item method .boolean() can only be applied to a boolean, numeric, or string JSON item", "22038");
             }
             // _tz variants: delegate to non-tz equivalents (timezone-aware, but we treat them the same)
             case "jsonb_path_exists_tz":
@@ -273,18 +270,11 @@ class JsonFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 String s = arg.toString().trim();
-                if (s.startsWith("[")) {
-                    // Count elements by commas (simplified)
-                    if (s.equals("[]")) return 0;
-                    int depth = 0, count = 1;
-                    for (char c : s.toCharArray()) {
-                        if (c == '[' || c == '{') depth++;
-                        else if (c == ']' || c == '}') depth--;
-                        else if (c == ',' && depth == 1) count++;
-                    }
-                    return count;
+                if (!JsonOperations.isArray(s)) {
+                    throw new MemgresException("cannot get array length of a "
+                            + (JsonOperations.isObject(s) ? "non-array" : "scalar"), "22023");
                 }
-                return 0;
+                return JsonOperations.parseArrayElements(s).size();
             }
             case "jsonb_pretty": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -321,42 +311,25 @@ class JsonFunctions {
             case "json_array_elements_text":
             case "jsonb_array_elements_text": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
-                if (json == null) return null;
+                // A set-returning function given NULL produces no rows at all
+                if (json == null) return new ArrayList<>();
                 String s = json.toString().trim();
-                if (s.startsWith("[")) {
-                    List<Object> elements = new ArrayList<>();
-                    // Simple JSON array parsing
-                    String inner = s.substring(1, s.length() - 1).trim();
-                    if (!inner.isEmpty()) {
-                        // Split on commas at top level
-                        int depth = 0;
-                        int start = 0;
-                        for (int ci = 0; ci <= inner.length(); ci++) {
-                            if (ci == inner.length() || (inner.charAt(ci) == ',' && depth == 0)) {
-                                String elem = inner.substring(start, ci).trim();
-                                if (name.endsWith("_text") && elem.startsWith("\"") && elem.endsWith("\"")) {
-                                    elem = elem.substring(1, elem.length() - 1);
-                                }
-                                elements.add(elem);
-                                start = ci + 1;
-                            } else if (inner.charAt(ci) == '{' || inner.charAt(ci) == '[') depth++;
-                            else if (inner.charAt(ci) == '}' || inner.charAt(ci) == ']') depth--;
-                        }
-                    }
-                    return elements; // Return as List for SRF expansion
+                requireJsonArray(name, s);
+                List<Object> elements = new ArrayList<>();
+                for (String elem : JsonOperations.parseArrayElements(s)) {
+                    if (name.endsWith("_text")) elem = JsonOperations.jsonValueToText(elem);
+                    elements.add(elem);
                 }
-                return null;
+                return elements; // Return as List for SRF expansion
             }
             case "jsonb_object_keys":
             case "json_object_keys": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
-                if (json == null) return null;
+                if (json == null) return new ArrayList<>();
                 String s = json.toString().trim();
-                if (s.startsWith("{")) {
-                    Map<String, String> map = JsonOperations.parseObjectKeys(s);
-                    return new ArrayList<>(map.keySet());
-                }
-                return null;
+                requireJsonObject(name, s);
+                Map<String, String> map = JsonOperations.parseObjectKeys(s);
+                return new ArrayList<>(map.keySet());
             }
             case "jsonb_set": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
@@ -485,10 +458,13 @@ class JsonFunctions {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
                 return json == null ? null : JsonOperations.stripNulls(json.toString(), true);
             }
+            case "json_object":
             case "jsonb_object": {
                 // jsonb_object(text[]) → builds a JSON object from a flat array of key/value pairs
                 // jsonb_object(keys text[], values text[]) → builds a JSON object from two arrays
                 requireArgs(fn, 1);
+                // json keeps the spacing of its own text output, which puts spaces round the colon
+                String colon = name.startsWith("jsonb") ? "\": " : "\" : ";
                 Object arg1 = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg1 == null) return null;
                 if (fn.args().size() >= 2) {
@@ -505,7 +481,7 @@ class JsonFunctions {
                         if (i > 0) sb.append(", ");
                         Object k = keys.get(i);
                         if (k == null) throw new MemgresException("null value not allowed for object key", "22023");
-                        sb.append("\"").append(k.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+                        sb.append("\"").append(k.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append(colon);
                         Object v = values.get(i);
                         if (v == null) sb.append("null");
                         else sb.append("\"").append(v.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
@@ -516,14 +492,14 @@ class JsonFunctions {
                     // Single flat array form: jsonb_object('{k1,v1,k2,v2,...}')
                     List<Object> elems = toList(arg1);
                     if (elems.size() % 2 != 0) {
-                        throw new MemgresException("array must have even number of elements", "22023");
+                        throw new MemgresException("array must have even number of elements", "2202E");
                     }
                     StringBuilder sb = new StringBuilder("{");
                     for (int i = 0; i < elems.size(); i += 2) {
                         if (i > 0) sb.append(", ");
                         Object k = elems.get(i);
                         if (k == null) throw new MemgresException("null value not allowed for object key", "22023");
-                        sb.append("\"").append(k.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\": ");
+                        sb.append("\"").append(k.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append(colon);
                         Object v = elems.get(i + 1);
                         if (v == null) sb.append("null");
                         else sb.append("\"").append(v.toString().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
@@ -771,10 +747,98 @@ class JsonFunctions {
     }
 
     List<String> evaluateJsonPathAll(String json, String path) {
-        boolean strict = isStrictJsonPath(path);
+        final boolean strict = isStrictJsonPath(path);
         path = stripJsonPathMode(path);
+        if (JsonPathArithmetic.isArithmetic(path)) {
+            final String doc = json;
+            return JsonPathArithmetic.evaluate(path, new JsonPathArithmetic.PathEvaluator() {
+                @Override public List<String> evaluate(String operandPath) {
+                    return strict ? evaluateStrictJsonPath(doc, operandPath)
+                            : evaluateLaxJsonPath(doc, operandPath);
+                }
+            });
+        }
         if (strict) return evaluateStrictJsonPath(json, path);
         return evaluateLaxJsonPath(json, path);
+    }
+
+    /**
+     * The @? and @@ operators, and the silent argument, answer NULL rather than raising when the
+     * document does not have the shape the path asks for. Only errors from walking the document
+     * are swallowed — a path that does not parse is still a syntax error.
+     */
+    static boolean isSuppressible(MemgresException e) {
+        String state = e.getSqlState();
+        return state != null && state.startsWith("22");
+    }
+
+    /** The arguments of a jsonb_path_* call, evaluated once. */
+    private static final class PathCall {
+        final String json;
+        final String path;
+        final boolean silent;
+
+        PathCall(String json, String path, boolean silent) {
+            this.json = json;
+            this.path = path;
+            this.silent = silent;
+        }
+    }
+
+    /**
+     * Evaluate the arguments, bind the vars object into the path and check its shape.
+     *
+     * @return the call to make, or null when either the document or the path is NULL
+     */
+    private PathCall preparePath(FunctionCallExpr fn, RowContext ctx) {
+        requireArgs(fn, 2);
+        Object jsonVal = executor.evalExpr(fn.args().get(0), ctx);
+        Object pathVal = executor.evalExpr(fn.args().get(1), ctx);
+        if (jsonVal == null || pathVal == null) return null;
+        String path = pathVal.toString().trim();
+        if (fn.args().size() > 2) {
+            Object varsVal = executor.evalExpr(fn.args().get(2), ctx);
+            if (varsVal != null) path = bindJsonPathVars(path, varsVal.toString());
+        }
+        boolean silent = fn.args().size() > 3
+                && executor.isTruthy(executor.evalExpr(fn.args().get(3), ctx));
+        // The mode word is part of the path; check the shape after it. An expression may open
+        // with an operand of its own, so only something that is neither is a syntax error.
+        String bodyPath = stripJsonPathMode(path);
+        if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")
+                && !JsonPathArithmetic.isArithmetic(bodyPath)) {
+            throw new MemgresException("syntax error at or near \""
+                    + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
+        }
+        return new PathCall(jsonVal.toString(), path, silent);
+    }
+
+    /** jsonb_path_match: the path has to produce one boolean. */
+    private Object evalPathMatch(String json, String path) {
+        // Handle exists(...) syntax
+        if (path.startsWith("exists(") && path.endsWith(")")) {
+            return evaluateJsonPathExists(json, path.substring(7, path.length() - 1).trim());
+        }
+        // Handle predicate expressions like $.a == 2
+        // Check if the path contains a comparison operator at the top level
+        String[] compOps = {"==", "!=", ">=", "<=", ">", "<"};
+        for (String op : compOps) {
+            if (path.contains(op)) return evaluateJsonPathPredicate(json, path);
+        }
+        // The mode word is part of the path; check the shape after it
+        String bodyPath = stripJsonPathMode(path);
+        if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
+            throw new MemgresException("syntax error at or near \""
+                    + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
+        }
+        Object result = evaluateJsonPath(json, path);
+        if (result == null) return null;
+        if (result instanceof Boolean) return result;
+        String rs = result.toString().trim();
+        if (rs.equals("true")) return true;
+        if (rs.equals("false")) return false;
+        // jsonb_path_match result must be boolean; SQLSTATE 22038
+        throw new MemgresException("jsonpath item method .boolean() can only be applied to a boolean, numeric, or string JSON item", "22038");
     }
 
     private List<String> evaluateLaxJsonPath(String json, String path) {

@@ -542,6 +542,22 @@ class BinaryOpEvaluator {
             }
         }
 
+        // A jsonb scalar reaches @@ looking like a tsvector would; the declared type says which
+        // operator was written, and a jsonpath predicate is never a tsquery.
+        if (bin.op() == BinaryExpr.BinOp.TS_MATCH && left != null && right != null
+                && isJsonbExpression(bin.left(), ctx)) {
+            return executor.functionEvaluator.evaluateJsonPathPredicateSilent(
+                    left.toString().trim(), right.toString().trim());
+        }
+
+        // A jsonb scalar is stored as its own text, so only the declared type tells
+        // '"x"'::jsonb - 'a' apart from subtracting one text value from another. PG has nothing
+        // to delete from a scalar and says so instead of falling back to arithmetic.
+        if (bin.op() == BinaryExpr.BinOp.SUBTRACT && left instanceof String && right != null
+                && isJsonbExpression(bin.left(), ctx) && JsonOperations.isScalarValue((String) left)) {
+            throw new MemgresException("cannot delete from scalar", "22023");
+        }
+
         // hstore - ::text → key deletion (explicit text cast means "delete key", not "subtract hstore")
         // Without explicit cast, PG resolves untyped literal as hstore (same-type preference)
         if (bin.op() == BinaryExpr.BinOp.SUBTRACT && left instanceof HstoreValue
@@ -1274,7 +1290,7 @@ class BinaryOpEvaluator {
                     String ls = left.toString().trim();
                     if (ls.startsWith("{") || ls.startsWith("[")) {
                         String path = right.toString().trim();
-                        return executor.functionEvaluator.evaluateJsonPathPredicate(ls, path);
+                        return executor.functionEvaluator.evaluateJsonPathPredicateSilent(ls, path);
                     }
                 }
                 // NULL @@ tsquery or tsvector @@ NULL → NULL (not false)
@@ -1520,7 +1536,7 @@ class BinaryOpEvaluator {
             case JSONB_PATH_EXISTS_OP: {
                 // @? operator, equivalent to jsonb_path_exists
                 if (left == null || right == null) return null;
-                return executor.functionEvaluator.evaluateJsonPathExists(left.toString().trim(), right.toString().trim());
+                return executor.functionEvaluator.evaluateJsonPathExistsSilent(left.toString().trim(), right.toString().trim());
             }
             case JSON_DELETE_PATH: {
                 if (left == null || right == null) return null;
@@ -2332,7 +2348,7 @@ class BinaryOpEvaluator {
                     String ls = left.toString().trim();
                     if (ls.startsWith("{") || ls.startsWith("[")) {
                         String path = right.toString().trim();
-                        return executor.functionEvaluator.evaluateJsonPathPredicate(ls, path);
+                        return executor.functionEvaluator.evaluateJsonPathPredicateSilent(ls, path);
                     }
                 }
                 // NULL @@ tsquery or tsvector @@ NULL → NULL (not false)
@@ -2516,7 +2532,7 @@ class BinaryOpEvaluator {
             case JSONB_PATH_EXISTS_OP: {
                 // @? operator, equivalent to jsonb_path_exists
                 if (left == null || right == null) return null;
-                return executor.functionEvaluator.evaluateJsonPathExists(left.toString().trim(), right.toString().trim());
+                return executor.functionEvaluator.evaluateJsonPathExistsSilent(left.toString().trim(), right.toString().trim());
             }
             case JSON_DELETE_PATH: {
                 if (left == null || right == null) return null;

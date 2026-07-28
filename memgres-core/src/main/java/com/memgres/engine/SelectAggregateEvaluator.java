@@ -1228,7 +1228,9 @@ class SelectAggregateEvaluator {
             case "json_object_agg":
             case "jsonb_object_agg": {
                 if (group.isEmpty()) return null;
-                StringBuilder sb = new StringBuilder("{");
+                // json prints the object the way its own text output does, padded and with
+                // spaces round the colon; jsonb is normalized below and loses the padding again
+                StringBuilder sb = new StringBuilder("{ ");
                 boolean first = true;
                 for (RowContext r : group) {
                     Object k = executor.evalExpr(fn.args().get(0), r);
@@ -1241,13 +1243,13 @@ class SelectAggregateEvaluator {
                     }
                     if (!first) sb.append(", ");
                     first = false;
-                    sb.append("\"").append(k.toString().replace("\"", "\\\"")).append("\": ");
+                    sb.append("\"").append(k.toString().replace("\"", "\\\"")).append("\" : ");
                     if (v == null) sb.append("null");
                     else if (v instanceof Number) sb.append(v);
                     else if (v instanceof Boolean) sb.append(v);
                     else sb.append("\"").append(v.toString().replace("\"", "\\\"")).append("\"");
                 }
-                sb.append("}");
+                sb.append(" }");
                 String result = sb.toString();
                 if (name.equals("jsonb_object_agg")) {
                     result = JsonOperations.normalizeJsonb(result);

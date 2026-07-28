@@ -2723,6 +2723,28 @@ class FunctionEvaluator {
         return jsonFunctions.evaluateJsonPathExists(json, path);
     }
 
+    /**
+     * The @? and @@ operators take no silent argument because they are always silent: a document
+     * that does not have the shape the path asks for makes them NULL rather than an error.
+     */
+    Boolean evaluateJsonPathExistsSilent(String json, String path) {
+        try {
+            return jsonFunctions.evaluateJsonPathExists(json, path);
+        } catch (MemgresException e) {
+            if (!JsonFunctions.isSuppressible(e)) throw e;
+            return null;
+        }
+    }
+
+    Boolean evaluateJsonPathPredicateSilent(String json, String path) {
+        try {
+            return jsonFunctions.evaluateJsonPathPredicate(json, path);
+        } catch (MemgresException e) {
+            if (!JsonFunctions.isSuppressible(e)) throw e;
+            return null;
+        }
+    }
+
     // ---- Kept utility methods ----
 
     /**

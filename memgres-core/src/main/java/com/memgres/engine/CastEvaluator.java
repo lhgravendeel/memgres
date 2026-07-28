@@ -837,7 +837,7 @@ class CastEvaluator {
                 // Parse it properly rather than balancing brackets: a bracket count cannot see a
                 // second document after the first, an unquoted key, or a number JSON has no form for.
                 JsonTextValidator.validate(trimmed);
-                // JSONB normalizes whitespace; JSON preserves input
+                // JSONB normalizes whitespace and decodes string escapes; JSON preserves input
                 if ("jsonb".equals(typeName)) {
                     return TypeCoercion.normalizeJsonb(trimmed);
                 }
