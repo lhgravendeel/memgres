@@ -97,6 +97,18 @@ class SelectWindowEvaluator {
         // ORDER BY
         List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
+            // A window function ordered by rather than selected has no output column to read, and
+            // it cannot be evaluated a row at a time either: it needs the whole partition. So it
+            // is computed over the input rows here, in the order they were projected in.
+            final java.util.IdentityHashMap<SelectStmt.OrderByItem, Object[]> orderByWindowValues =
+                    new java.util.IdentityHashMap<>();
+            for (SelectStmt.OrderByItem item : resolvedOrderBy) {
+                if (select.containsWindowFunction(item.expr())
+                        && select.resolveOrderByToColumnIndex(item.expr(), stmt.targets()) < 0) {
+                    orderByWindowValues.put(item,
+                            evaluateWindowExpression(item.expr(), contexts, stmt.windowDefs()));
+                }
+            }
             Integer[] indices = new Integer[resultRows.size()];
             for (int i = 0; i < indices.length; i++) indices[i] = i;
             final List<Object[]> finalResultRows = resultRows;
@@ -105,9 +117,12 @@ class SelectWindowEvaluator {
                 Object[] b = finalResultRows.get(bi);
                 for (SelectStmt.OrderByItem item : resolvedOrderBy) {
                     int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
+                    Object[] windowValues = orderByWindowValues.get(item);
                     Object va, vb;
                     if (colIdx >= 0) {
                         va = a[colIdx]; vb = b[colIdx];
+                    } else if (windowValues != null) {
+                        va = windowValues[ai]; vb = windowValues[bi];
                     } else {
                         va = executor.evalExpr(item.expr(), contexts.get(ai));
                         vb = executor.evalExpr(item.expr(), contexts.get(bi));
@@ -133,6 +148,23 @@ class SelectWindowEvaluator {
         resultRows = select.applyDistinct(stmt, resultRows);
         resultRows = select.applyOffsetAndLimit(stmt, resultRows);
         return QueryResult.select(resultColumns, resultRows);
+    }
+
+    /**
+     * A window function in ORDER BY has to be computed over the whole result before the rows can
+     * be put in order by it, so a query with one there takes the window path even when its select
+     * list has none. DISTINCT and set-returning targets are left to the ordinary path, which has
+     * rules of its own for them that this path does not carry.
+     */
+    boolean orderByNeedsWindowEvaluation(SelectStmt stmt) {
+        if (stmt.distinct() || stmt.orderBy() == null || stmt.orderBy().isEmpty()) return false;
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            if (SelectExecutor.containsSrf(target.expr())) return false;
+        }
+        for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+            if (select.containsWindowFunction(item.expr())) return true;
+        }
+        return false;
     }
 
     /**
@@ -302,6 +334,17 @@ class SelectWindowEvaluator {
                 }
             }
         }
+        // LIMIT and OFFSET are read once for the whole query, before any row has a position in a
+        // window to be measured against.
+        if (select.containsWindowFunction(stmt.limit())) {
+            throw new MemgresException("window functions are not allowed in LIMIT", "42P20");
+        }
+        if (select.containsWindowFunction(stmt.offset())) {
+            throw new MemgresException("window functions are not allowed in OFFSET", "42P20");
+        }
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            validateCallPlacement(target.expr());
+        }
         List<SelectStmt.WindowDef> defs = stmt.windowDefs();
         List<WindowFuncExpr> calls = new ArrayList<>();
         for (SelectStmt.SelectTarget target : stmt.targets()) {
@@ -314,9 +357,15 @@ class SelectWindowEvaluator {
 
         // A named window is checked even when nothing references it, as PostgreSQL does.
         if (defs != null) {
-            for (SelectStmt.WindowDef def : defs) resolveWindowDef(def, defs);
+            for (SelectStmt.WindowDef def : defs) {
+                resolveWindowDef(def, defs);
+                validateFrameOffsets(def.frame());
+            }
         }
         for (WindowFuncExpr wf : calls) {
+            if (wf.distinct()) {
+                throw PgErrors.notImplemented("DISTINCT is not implemented for window functions");
+            }
             for (Expression arg : wf.args()) {
                 if (select.containsWindowFunction(arg)) {
                     throw new MemgresException("window function calls cannot be nested", "42P20");
@@ -342,6 +391,74 @@ class SelectWindowEvaluator {
 
     private static MemgresException windowInWindowDefinition() {
         return new MemgresException("window functions are not allowed in window definitions", "42P20");
+    }
+
+    /**
+     * A FILTER condition is tested per input row, before there is a group to aggregate or a
+     * frame to number, and an aggregate reads its arguments per input row for the same reason.
+     * Neither can therefore contain a call that only has a value once the rows have been
+     * collected, so PostgreSQL refuses the shape rather than choosing an order for it.
+     */
+    private void validateCallPlacement(Expression expr) {
+        if (expr == null) return;
+        if (expr instanceof WindowFuncExpr) {
+            WindowFuncExpr wf = (WindowFuncExpr) expr;
+            rejectMisplacedCallsInFilter(wf.filter());
+            for (Expression arg : wf.args()) validateCallPlacement(arg);
+            return;
+        }
+        if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            rejectMisplacedCallsInFilter(fn.filter());
+            if (select.isAggregateFunction(fn.name())) {
+                for (Expression arg : fn.args()) {
+                    if (select.containsWindowFunction(arg)) throw windowUnderAggregate();
+                }
+                if (fn.orderBy() != null) {
+                    for (SelectStmt.OrderByItem o : fn.orderBy()) {
+                        if (select.containsWindowFunction(o.expr())) throw windowUnderAggregate();
+                    }
+                }
+            }
+            for (Expression arg : fn.args()) validateCallPlacement(arg);
+            return;
+        }
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            validateCallPlacement(bin.left());
+            validateCallPlacement(bin.right());
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            validateCallPlacement(cop.left());
+            validateCallPlacement(cop.right());
+        } else if (expr instanceof UnaryExpr) {
+            validateCallPlacement(((UnaryExpr) expr).operand());
+        } else if (expr instanceof CastExpr) {
+            validateCallPlacement(((CastExpr) expr).expr());
+        } else if (expr instanceof CaseExpr) {
+            CaseExpr c = (CaseExpr) expr;
+            validateCallPlacement(c.operand());
+            for (CaseExpr.WhenClause when : c.whenClauses()) {
+                validateCallPlacement(when.condition());
+                validateCallPlacement(when.result());
+            }
+            validateCallPlacement(c.elseExpr());
+        }
+    }
+
+    private static MemgresException windowUnderAggregate() {
+        return new MemgresException(
+                "aggregate function calls cannot contain window function calls", "42803");
+    }
+
+    private void rejectMisplacedCallsInFilter(Expression filter) {
+        if (filter == null) return;
+        if (select.containsWindowFunction(filter)) {
+            throw new MemgresException("window functions are not allowed in FILTER", "42P20");
+        }
+        if (select.containsAggregate(filter)) {
+            throw new MemgresException("aggregate functions are not allowed in FILTER", "42803");
+        }
     }
 
     /** Collect every window function in an expression, including ones nested inside another. */
@@ -370,6 +487,7 @@ class SelectWindowEvaluator {
     private void validateFrame(WindowFuncExpr wf) {
         WindowFuncExpr.FrameClause frame = wf.frame();
         if (frame == null) return;
+        validateFrameOffsets(frame);
         int orderByCount = wf.orderBy() == null ? 0 : wf.orderBy().size();
         boolean hasOffsetBound = isOffsetBound(frame.start()) || isOffsetBound(frame.end());
         if (frame.type() == WindowFuncExpr.FrameType.GROUPS && orderByCount == 0) {
@@ -381,6 +499,68 @@ class SelectWindowEvaluator {
         }
         checkFrameOffset(frame, frame.start(), true);
         checkFrameOffset(frame, frame.end(), false);
+    }
+
+    /**
+     * A frame offset is one size for the whole window, so it is read once before any row is
+     * placed in a frame: it may not depend on the row (a column reference), on the group
+     * (an aggregate) or on the framing itself (a window function).
+     */
+    private void validateFrameOffsets(WindowFuncExpr.FrameClause frame) {
+        if (frame == null) return;
+        validateFrameOffset(frame.start(), frame.type());
+        validateFrameOffset(frame.end(), frame.type());
+    }
+
+    private void validateFrameOffset(WindowFuncExpr.FrameBound bound, WindowFuncExpr.FrameType type) {
+        if (!isOffsetBound(bound) || bound.offset() == null) return;
+        Expression offset = bound.offset();
+        if (select.containsWindowFunction(offset)) throw windowInWindowDefinition();
+        if (select.containsAggregate(offset)) {
+            throw new MemgresException(
+                    "aggregate functions are not allowed in window " + type, "42803");
+        }
+        if (referencesColumn(offset)) {
+            throw new MemgresException(
+                    "argument of " + type + " must not contain variables", "42P10");
+        }
+    }
+
+    /**
+     * True when the expression reads a column of the query's own rows. A sub-select reads its
+     * own rows instead, so it is a constant as far as the enclosing frame is concerned.
+     */
+    private static boolean referencesColumn(Expression expr) {
+        if (expr == null) return false;
+        if (expr instanceof SubqueryExpr || expr instanceof ExistsExpr
+                || expr instanceof AnyAllExpr || expr instanceof ArraySubqueryExpr) {
+            return false;
+        }
+        if (expr instanceof ColumnRef) return true;
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            return referencesColumn(bin.left()) || referencesColumn(bin.right());
+        }
+        if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            return referencesColumn(cop.left()) || referencesColumn(cop.right());
+        }
+        if (expr instanceof UnaryExpr) return referencesColumn(((UnaryExpr) expr).operand());
+        if (expr instanceof CastExpr) return referencesColumn(((CastExpr) expr).expr());
+        if (expr instanceof CaseExpr) {
+            CaseExpr c = (CaseExpr) expr;
+            if (referencesColumn(c.operand()) || referencesColumn(c.elseExpr())) return true;
+            for (CaseExpr.WhenClause when : c.whenClauses()) {
+                if (referencesColumn(when.condition()) || referencesColumn(when.result())) return true;
+            }
+            return false;
+        }
+        if (expr instanceof FunctionCallExpr) {
+            for (Expression arg : ((FunctionCallExpr) expr).args()) {
+                if (referencesColumn(arg)) return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isOffsetBound(WindowFuncExpr.FrameBound bound) {

@@ -507,18 +507,12 @@ class ExprSpecialFormParser {
             ep.expectKeyword("ROW");
             return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.CURRENT_ROW, null);
         }
-        // Parse offset expression including ::type casts (e.g. '1 day'::interval).
-        // A sign is part of the offset: PostgreSQL parses "-1 PRECEDING" and rejects it as a
-        // negative size at run time, not as a syntax error.
-        boolean negated = false;
-        if (ep.match(TokenType.MINUS)) negated = true;
-        else ep.match(TokenType.PLUS);
-        Expression offset = ep.parsePrimary();
-        while (ep.match(TokenType.CAST)) {
-            String typeName = ep.parseTypeName();
-            offset = new CastExpr(offset, typeName);
-        }
-        if (negated) offset = new UnaryExpr(UnaryExpr.UnaryOp.NEGATE, offset);
+        // A frame offset is an ordinary value expression — "1 + 1 PRECEDING" and
+        // "(SELECT max(v) FROM t) / 10 PRECEDING" are both legal — so it is parsed down to the
+        // operator level below comparison, which stops on the PRECEDING/FOLLOWING keyword that
+        // ends it. A sign is part of the offset: PostgreSQL parses "-1 PRECEDING" and rejects it
+        // as a negative size at run time, not as a syntax error.
+        Expression offset = ep.parseOtherOps();
         if (ep.matchKeyword("PRECEDING")) return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.PRECEDING, offset);
         ep.expectKeyword("FOLLOWING");
         return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.FOLLOWING, offset);
