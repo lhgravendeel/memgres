@@ -107,6 +107,7 @@ class SelectExecutor {
         if (stmt.from() == null || stmt.from().isEmpty()) {
             rejectSrfInAggregates(stmt);
             validateDistinctOn(stmt);
+            windowEvaluator.validateWindowUsage(stmt);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
                     || (stmt.having() != null && containsAggregate(stmt.having()));
             if (hasAgg) {
@@ -128,6 +129,7 @@ class SelectExecutor {
         rejectSrfInAggregates(stmt);
         validateDistinctOn(stmt);
         validateFromClause(stmt.from());
+        windowEvaluator.validateWindowUsage(stmt);
 
         List<RowContext.TableBinding> baseBindings;
         if (!contexts.isEmpty()) {
@@ -308,7 +310,9 @@ class SelectExecutor {
         if (hasGroupBy || hasGroupingSets || hasAggregates) {
             // PG allows DISTINCT ON with GROUP BY and aggregates — DISTINCT ON is applied after grouping
             // Validate: non-aggregate columns must be in GROUP BY
-            if (!hasGroupBy && !hasGroupingSets && hasAggregates) {
+            // GROUP BY () (and any grouping-set spec whose sets are all empty) collapses the
+            // input to a single row, so the select list is as constrained as with no GROUP BY
+            if (!hasGroupBy && (hasGroupingSets || hasAggregates)) {
                 for (SelectStmt.SelectTarget target : stmt.targets()) {
                     if (!isAggregateOrConstant(target.expr())) {
                         String colName = target.expr() instanceof ColumnRef

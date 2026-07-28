@@ -337,6 +337,7 @@ class DdlAlterTableExecutor {
         } else if (action instanceof AlterTableStmt.Inherit) {
             AlterTableStmt.Inherit inherit = (AlterTableStmt.Inherit) action;
             Table parentTable = executor.resolveTable(schemaName, inherit.parentTable());
+            rejectInheritanceCycle(table, parentTable, stmt.table(), inherit.parentTable());
             table.setParentTable(parentTable);
             parentTable.addChild(table);
         } else if (action instanceof AlterTableStmt.NoInherit) {
@@ -1272,6 +1273,7 @@ class DdlAlterTableExecutor {
                                          AlterTableStmt stmt, String schemaName) {
         String partSchemaName = attach.partitionSchema() != null ? attach.partitionSchema() : schemaName;
         Table partition = executor.resolveTable(partSchemaName, attach.partitionName());
+        rejectInheritanceCycle(partition, table, attach.partitionName(), stmt.table());
         if (table.getPartitions().contains(partition)) {
             throw new MemgresException("table \"" + attach.partitionName()
                     + "\" is already a partition of \"" + stmt.table() + "\"", "42809");
@@ -1288,6 +1290,34 @@ class DdlAlterTableExecutor {
         partition.setPartitionParent(table);
         partition.setParentColumnRemap(buildParentColumnRemap(table, partition));
         table.addPartition(partition);
+    }
+
+    /**
+     * Refuse to make {@code child} a child of {@code parent} when the parent already sits below
+     * the child in the hierarchy — inheritance and partitioning share one graph, so either link
+     * can close a loop. Storing the link instead would leave a cyclic catalog, and every later
+     * walk of it (a SELECT on either table, DROP TABLE, a pg_inherits query) would run until the
+     * stack was gone, leaving the tables unusable and undroppable.
+     */
+    private static void rejectInheritanceCycle(Table child, Table parent,
+                                               String childName, String parentName) {
+        Set<Table> seen = Collections.newSetFromMap(new IdentityHashMap<Table, Boolean>());
+        if (isSelfOrDescendant(parent, child, seen)) {
+            throw PgErrors.circularInheritance(childName, parentName);
+        }
+    }
+
+    /** True when {@code candidate} is {@code root} itself or sits anywhere beneath it. */
+    private static boolean isSelfOrDescendant(Table candidate, Table root, Set<Table> seen) {
+        if (candidate == root) return true;
+        if (!seen.add(root)) return false;
+        for (Table c : root.getChildren()) {
+            if (isSelfOrDescendant(candidate, c, seen)) return true;
+        }
+        for (Table p : root.getPartitions()) {
+            if (isSelfOrDescendant(candidate, p, seen)) return true;
+        }
+        return false;
     }
 
     /**

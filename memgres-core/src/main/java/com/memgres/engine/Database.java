@@ -966,6 +966,23 @@ public class Database {
         return compositeTypes.get(name.toLowerCase());
     }
 
+    /**
+     * Fields of the composite type a name denotes. Every table implicitly defines one with its
+     * own name and columns, so a row can be cast to a table's type the way PG allows.
+     */
+    public List<CreateTypeStmt.CompositeField> getRowType(String name) {
+        List<CreateTypeStmt.CompositeField> explicit = getCompositeType(name);
+        if (explicit != null) return explicit;
+        Table table = getTable(name);
+        if (table == null) return null;
+        List<CreateTypeStmt.CompositeField> fields = new ArrayList<>();
+        for (Column col : table.getColumns()) {
+            fields.add(new CreateTypeStmt.CompositeField(col.getName(),
+                    col.getType() != null ? col.getType().name().toLowerCase() : "text"));
+        }
+        return fields;
+    }
+
     public void removeCompositeType(String name) {
         compositeTypes.remove(name.toLowerCase());
     }
@@ -1132,6 +1149,24 @@ public class Database {
     }
 
     /**
+     * Returns the overloads of this name that live in the given schema. Functions are a
+     * per-schema namespace in PG, so the same name may exist in several schemas at once and
+     * every by-name lookup has to say which one it means.
+     */
+    public List<PgFunction> getFunctionOverloads(String schema, String name) {
+        List<PgFunction> result = new ArrayList<>();
+        for (PgFunction f : getFunctionOverloads(name)) {
+            if (schemaOf(f).equalsIgnoreCase(schema)) result.add(f);
+        }
+        return result;
+    }
+
+    /** A function with no recorded schema is treated as living in public. */
+    public static String schemaOf(PgFunction f) {
+        return f.getSchemaName() != null ? f.getSchemaName() : "public";
+    }
+
+    /**
      * A variadic parameter normally has to be given at least one value, but one declared with a
      * default supplies its own, so the call may leave it out entirely.
      */
@@ -1146,8 +1181,15 @@ public class Database {
 
     /** Finds the best matching overload by argument count and types. */
     public PgFunction resolveFunction(String name, int argCount, List<String> argTypeHints) {
-        List<PgFunction> overloads = getFunctionOverloads(name);
-        if (overloads.isEmpty()) return null;
+        return resolveFunction(getFunctionOverloads(name), argCount, argTypeHints);
+    }
+
+    /**
+     * Finds the best matching overload among an already-narrowed candidate list. Callers that
+     * have applied schema visibility pass the surviving candidates in search_path order.
+     */
+    public PgFunction resolveFunction(List<PgFunction> overloads, int argCount, List<String> argTypeHints) {
+        if (overloads == null || overloads.isEmpty()) return null;
         // For a single overload, return it unless type hints indicate a clearly incompatible call.
         // This preserves correct behavior for functions with default params or INOUT params
         // where arg count may not match param count, while still rejecting calls like
@@ -1277,12 +1319,20 @@ public class Database {
         functionOverloads.remove(key);
     }
 
+    /** Remove every overload of this name that lives in the given schema. */
+    public void removeFunction(String schema, String name) {
+        removeMatchingOverloads(name, f -> schema == null || schemaOf(f).equalsIgnoreCase(schema));
+    }
+
     /** Remove a specific overload by name and param types. */
     public void removeFunction(String name, List<String> paramTypes) {
-        String key = name.toLowerCase();
-        List<PgFunction> overloads = functionOverloads.get(key);
-        if (overloads == null) return;
-        overloads.removeIf(f -> {
+        removeFunction(null, name, paramTypes);
+    }
+
+    /** Remove a specific overload by schema, name and param types. A null schema matches any. */
+    public void removeFunction(String schema, String name, List<String> paramTypes) {
+        removeMatchingOverloads(name, f -> {
+            if (schema != null && !schemaOf(f).equalsIgnoreCase(schema)) return false;
             List<String> fTypes = f.getParams().stream()
                     .filter(p -> !"OUT".equalsIgnoreCase(p.mode()))
                     .map(PgFunction.Param::typeName)
@@ -1293,6 +1343,13 @@ public class Database {
             }
             return true;
         });
+    }
+
+    private void removeMatchingOverloads(String name, java.util.function.Predicate<PgFunction> matches) {
+        String key = name.toLowerCase();
+        List<PgFunction> overloads = functionOverloads.get(key);
+        if (overloads == null) return;
+        overloads.removeIf(matches);
         if (overloads.isEmpty()) {
             functionOverloads.remove(key);
             functions.remove(key);
@@ -2041,19 +2098,31 @@ public class Database {
                     throw new MemgresException("deadlock detected", "40P01");
                 }
                 if (System.currentTimeMillis() >= deadline) {
-                    throw new MemgresException("could not obtain lock on row in relation \""
-                            + relationName + "\"", "55P03");
+                    throw lockWaitExpired(configured > 0, relationName);
                 }
                 try {
                     Thread.sleep(5L);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
-                    throw new MemgresException("interrupted while waiting for row lock", "57014");
+                    throw StatementCancel.canceled();
                 }
             }
         } finally {
             waitingFor.remove(waiter);
         }
+    }
+
+    /**
+     * The error for a row lock that could not be taken in time. With lock_timeout set this is
+     * word for word PG's timeout error; the fallback wait exists only so a stuck session cannot
+     * block forever, and reports the lock it wanted rather than blaming a setting that is off.
+     */
+    private static MemgresException lockWaitExpired(boolean lockTimeoutConfigured, String relationName) {
+        if (lockTimeoutConfigured) {
+            return new MemgresException("canceling statement due to lock timeout", "55P03");
+        }
+        return new MemgresException("could not obtain lock on row in relation \""
+                + relationName + "\"", "55P03");
     }
 
     private boolean hasDeadlock(Session requester, Session blocker) {
@@ -2075,7 +2144,8 @@ public class Database {
     public void lockRowWaiting(String tableName, Object[] row, Session session, String mode) {
         final long safetyTimeoutMs = 5_000L; // fallback when lock_timeout is 0 (disabled)
         long lockTimeoutMs = GucSettings.parseTimeoutMillis(session.getGucSettings().get("lock_timeout"));
-        final long timeoutMs = lockTimeoutMs > 0 ? lockTimeoutMs : safetyTimeoutMs;
+        final boolean lockTimeoutConfigured = lockTimeoutMs > 0;
+        final long timeoutMs = lockTimeoutConfigured ? lockTimeoutMs : safetyTimeoutMs;
         final long pollMs = 10L;
         final long deadline = System.currentTimeMillis() + timeoutMs;
 
@@ -2110,7 +2180,7 @@ public class Database {
             // Check timeout
             if (System.currentTimeMillis() >= deadline) {
                 waitingFor.remove(session);
-                throw new MemgresException("could not obtain lock on row in relation \"" + tableName + "\"", "55P03");
+                throw lockWaitExpired(lockTimeoutConfigured, tableName);
             }
 
             // Sleep briefly before retrying
@@ -2119,7 +2189,7 @@ public class Database {
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 waitingFor.remove(session);
-                throw new MemgresException("interrupted while waiting for row lock", "57014");
+                throw StatementCancel.canceled();
             }
         }
     }
