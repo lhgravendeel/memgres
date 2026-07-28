@@ -1,7 +1,6 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.*;
-import com.memgres.engine.util.Strs;
 
 /**
  * Date/time function evaluation, extracted from FunctionEvaluator to reduce class size.
@@ -212,16 +211,18 @@ class DateTimeFunctions {
                 if (fn.args().size() < 2) {
                     return source.toString();
                 }
-                String fmt = executor.evalExpr(fn.args().get(1), ctx).toString();
-                return formatToChar(source, fmt);
+                Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
+                if (fmtObj == null) return null; // to_char(x, NULL) is NULL, not a template error
+                return formatToChar(source, fmtObj.toString());
             }
             case "to_date": {
                 Object source = executor.evalExpr(fn.args().get(0), ctx);
                 if (source == null) return null;
                 if (fn.args().size() >= 2) {
-                    String dateStr = source.toString();
-                    String fmt = executor.evalExpr(fn.args().get(1), ctx).toString();
-                    return parseDateWithFormat(dateStr, fmt);
+                    Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
+                    if (fmtObj == null) return null;
+                    return DateTimeTemplate.parse(source.toString(), fmtObj.toString())
+                            .toLocalDate();
                 }
                 return TypeCoercion.toLocalDate(source);
             }
@@ -233,8 +234,10 @@ class DateTimeFunctions {
                     return java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochSecond(n.longValue()), java.time.ZoneOffset.UTC);
                 }
                 if (fn.args().size() >= 2) {
-                    String fmt = executor.evalExpr(fn.args().get(1), ctx).toString();
-                    java.time.LocalDateTime ldt = parseTimestampWithFormat(source.toString(), fmt);
+                    Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
+                    if (fmtObj == null) return null;
+                    java.time.LocalDateTime ldt =
+                            DateTimeTemplate.parse(source.toString(), fmtObj.toString());
                     return ldt.atOffset(java.time.ZoneOffset.UTC);
                 }
                 return TypeCoercion.toOffsetDateTime(source);
@@ -573,188 +576,10 @@ class DateTimeFunctions {
         return new PgInterval(months, days, micros);
     }
 
+    /** to_char dispatches on the value: a number takes the numeric templates, a date the others. */
     private String formatToChar(Object source, String fmt) {
-        java.time.LocalDateTime dt;
-        if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
-        else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
-        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).toLocalDateTime();
-        else if (source instanceof Number) {
-            Number n = (Number) source;
-            return formatNumber(n, fmt);
-        }
-        else dt = TypeCoercion.toLocalDateTime(source);
-
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < fmt.length()) {
-            String rest = fmt.substring(i);
-            if (rest.startsWith("YYYY")) { sb.append(String.format("%04d", dt.getYear())); i += 4; }
-            else if (rest.startsWith("YY")) { sb.append(String.format("%02d", dt.getYear() % 100)); i += 2; }
-            else if (rest.startsWith("Month")) {
-                String mname = dt.getMonth().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH);
-                String formatted = mname.substring(0, 1).toUpperCase() + mname.substring(1).toLowerCase();
-                sb.append(String.format("%-9s", formatted));
-                i += 5;
-            }
-            else if (rest.startsWith("MONTH")) {
-                sb.append(dt.getMonth().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH).toUpperCase());
-                i += 5;
-            }
-            else if (rest.startsWith("month")) {
-                sb.append(dt.getMonth().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH).toLowerCase());
-                i += 5;
-            }
-            else if (rest.startsWith("Mon")) {
-                String mname = dt.getMonth().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH);
-                sb.append(mname.substring(0, 1).toUpperCase()).append(mname.substring(1).toLowerCase());
-                i += 3;
-            }
-            else if (rest.startsWith("MM")) { sb.append(String.format("%02d", dt.getMonthValue())); i += 2; }
-            else if (rest.startsWith("DD")) { sb.append(String.format("%02d", dt.getDayOfMonth())); i += 2; }
-            else if (rest.startsWith("Day")) {
-                String dname = dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH);
-                String formatted = dname.substring(0, 1).toUpperCase() + dname.substring(1).toLowerCase();
-                sb.append(String.format("%-9s", formatted));
-                i += 3;
-            }
-            else if (rest.startsWith("DAY")) {
-                sb.append(dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH).toUpperCase());
-                i += 3;
-            }
-            else if (rest.startsWith("day")) {
-                sb.append(dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH).toLowerCase());
-                i += 3;
-            }
-            else if (rest.startsWith("Dy")) {
-                String dname = dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH);
-                sb.append(dname.substring(0, 1).toUpperCase()).append(dname.substring(1).toLowerCase());
-                i += 2;
-            }
-            else if (rest.startsWith("DY")) {
-                sb.append(dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH).toUpperCase());
-                i += 2;
-            }
-            else if (rest.startsWith("dy")) {
-                sb.append(dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH).toLowerCase());
-                i += 2;
-            }
-            else if (rest.startsWith("HH24")) { sb.append(String.format("%02d", dt.getHour())); i += 4; }
-            else if (rest.startsWith("HH12") || rest.startsWith("HH")) {
-                int h = dt.getHour() % 12; if (h == 0) h = 12;
-                sb.append(String.format("%02d", h));
-                i += rest.startsWith("HH12") ? 4 : 2;
-            }
-            else if (rest.startsWith("MI")) { sb.append(String.format("%02d", dt.getMinute())); i += 2; }
-            else if (rest.startsWith("SS")) { sb.append(String.format("%02d", dt.getSecond())); i += 2; }
-            else if (rest.startsWith("Q")) { sb.append((dt.getMonthValue() - 1) / 3 + 1); i += 1; }
-            else if (rest.startsWith("D")) {
-                int dow = dt.getDayOfWeek().getValue() % 7 + 1;
-                sb.append(dow);
-                i += 1;
-            }
-            else if (rest.startsWith("AM") || rest.startsWith("PM")) {
-                sb.append(dt.getHour() < 12 ? "AM" : "PM"); i += 2;
-            }
-            else if (rest.startsWith("am") || rest.startsWith("pm")) {
-                sb.append(dt.getHour() < 12 ? "am" : "pm"); i += 2;
-            }
-            else if (rest.startsWith("TZH")) {
-                if (source instanceof java.time.OffsetDateTime) {
-                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
-                    int totalSeconds = offset.getTotalSeconds();
-                    String sign = totalSeconds >= 0 ? "+" : "-";
-                    int hours = Math.abs(totalSeconds) / 3600;
-                    sb.append(String.format("%s%02d", sign, hours));
-                } else {
-                    sb.append("+00");
-                }
-                i += 3;
-            }
-            else if (rest.startsWith("TZM")) {
-                if (source instanceof java.time.OffsetDateTime) {
-                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
-                    int minutes = (Math.abs(offset.getTotalSeconds()) % 3600) / 60;
-                    sb.append(String.format("%02d", minutes));
-                } else {
-                    sb.append("00");
-                }
-                i += 3;
-            }
-            else if (rest.startsWith("TZ")) {
-                if (source instanceof java.time.OffsetDateTime) {
-                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
-                    if (offset.getTotalSeconds() == 0) {
-                        sb.append("UTC");
-                    } else {
-                        sb.append(offset.getId().replace("Z", "UTC"));
-                    }
-                } else {
-                    sb.append("UTC");
-                }
-                i += 2;
-            }
-            else if (rest.startsWith("OF")) {
-                if (source instanceof java.time.OffsetDateTime) {
-                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
-                    int totalSeconds = offset.getTotalSeconds();
-                    String sign = totalSeconds >= 0 ? "+" : "-";
-                    int absSeconds = Math.abs(totalSeconds);
-                    int hours = absSeconds / 3600;
-                    int minutes = (absSeconds % 3600) / 60;
-                    if (minutes != 0) {
-                        sb.append(String.format("%s%02d:%02d", sign, hours, minutes));
-                    } else {
-                        sb.append(String.format("%s%02d", sign, hours));
-                    }
-                } else {
-                    sb.append("+00");
-                }
-                i += 2;
-            }
-            else { sb.append(fmt.charAt(i)); i++; }
-        }
-        return sb.toString();
-    }
-
-    private java.time.LocalDate parseDateWithFormat(String dateStr, String pgFmt) {
-        String javaPattern = pgFmt
-                .replace("YYYY", "yyyy")
-                .replace("MM", "MM")
-                .replace("DD", "dd");
-        java.time.format.DateTimeFormatter strict = java.time.format.DateTimeFormatter
-                .ofPattern(javaPattern.replace("yyyy", "uuuu"))
-                .withResolverStyle(java.time.format.ResolverStyle.STRICT);
-        try {
-            return java.time.LocalDate.parse(dateStr, strict);
-        } catch (Exception strictFailed) {
-            // Either the text does not fit the pattern at all, or a field is out of range.
-            // A lenient parse tells the two apart: it clamps Feb 30 to Feb 28, and PG rejects
-            // exactly the inputs that a lenient parse has to clamp.
-            try {
-                java.time.LocalDate.parse(dateStr,
-                        java.time.format.DateTimeFormatter.ofPattern(javaPattern));
-            } catch (Exception notThisPattern) {
-                return TypeCoercion.toLocalDate(dateStr);
-            }
-            throw new MemgresException(
-                    "date/time field value out of range: \"" + dateStr + "\"", "22008");
-        }
-    }
-
-    private java.time.LocalDateTime parseTimestampWithFormat(String tsStr, String pgFmt) {
-        String javaPattern = pgFmt
-                .replace("YYYY", "yyyy")
-                .replace("MM", "MM")
-                .replace("DD", "dd")
-                .replace("HH24", "HH")
-                .replace("HH12", "hh")
-                .replace("MI", "mm")
-                .replace("SS", "ss");
-        try {
-            return java.time.LocalDateTime.parse(tsStr, java.time.format.DateTimeFormatter.ofPattern(javaPattern));
-        } catch (Exception e) {
-            return TypeCoercion.toLocalDateTime(tsStr);
-        }
+        if (source instanceof Number) return NumericTemplate.format((Number) source, fmt);
+        return DateTimeTemplate.toChar(source, fmt);
     }
 
     /**
@@ -792,95 +617,4 @@ class DateTimeFunctions {
         return negative ? value.negate() : value;
     }
 
-    private String formatNumber(Number n, String fmt) {
-        double val = n.doubleValue();
-        boolean negative = val < 0;
-        double absVal = Math.abs(val);
-
-        boolean fillMode = false;
-        String fmtWork = fmt;
-        if (fmtWork.toUpperCase().startsWith("FM")) {
-            fillMode = true;
-            fmtWork = fmtWork.substring(2);
-        }
-
-        boolean miSuffix = false;
-        if (fmtWork.toUpperCase().endsWith("MI")) {
-            miSuffix = true;
-            fmtWork = fmtWork.substring(0, fmtWork.length() - 2);
-        }
-
-        boolean prSuffix = false;
-        if (fmtWork.toUpperCase().endsWith("PR")) {
-            prSuffix = true;
-            fmtWork = fmtWork.substring(0, fmtWork.length() - 2);
-        }
-
-        int intDigits9 = 0, intDigits0 = 0, fracDigits = 0;
-        boolean hasDecimal = fmtWork.contains(".");
-        boolean hasComma = fmtWork.contains(",");
-        String intPart, fracPart = "";
-        if (hasDecimal) {
-            int dotIdx = fmtWork.indexOf('.');
-            intPart = fmtWork.substring(0, dotIdx);
-            fracPart = fmtWork.substring(dotIdx + 1);
-            fracDigits = fracPart.length();
-        } else {
-            intPart = fmtWork;
-        }
-        for (char c : intPart.toCharArray()) {
-            if (c == '9') intDigits9++;
-            else if (c == '0') intDigits0++;
-        }
-        int totalIntDigits = intDigits9 + intDigits0;
-
-        String formatted;
-        if (hasDecimal) {
-            formatted = String.format(java.util.Locale.US, "%." + fracDigits + "f", absVal);
-        } else {
-            formatted = String.valueOf((long) absVal);
-        }
-
-        String intStr, fracStr = "";
-        if (formatted.contains(".")) {
-            int dotIdx = formatted.indexOf('.');
-            intStr = formatted.substring(0, dotIdx);
-            fracStr = formatted.substring(dotIdx + 1);
-        } else {
-            intStr = formatted;
-        }
-
-        while (intStr.length() < totalIntDigits) {
-            intStr = (intDigits0 > 0 && intStr.length() < totalIntDigits) ? "0" + intStr : " " + intStr;
-        }
-
-        if (hasComma) {
-            StringBuilder grouped = new StringBuilder();
-            int count = 0;
-            for (int i = intStr.length() - 1; i >= 0; i--) {
-                char c = intStr.charAt(i);
-                if (c == ' ') {
-                    grouped.insert(0, c);
-                } else {
-                    if (count > 0 && count % 3 == 0) grouped.insert(0, ',');
-                    grouped.insert(0, c);
-                    count++;
-                }
-            }
-            intStr = grouped.toString();
-        }
-
-        StringBuilder result = new StringBuilder();
-        if (!fillMode) result.append(' ');
-        if (negative && !miSuffix && !prSuffix) result.append('-');
-        if (prSuffix && negative) result.append('<');
-        result.append(intStr);
-        if (hasDecimal) result.append('.').append(fracStr);
-        if (miSuffix) result.append(negative ? '-' : ' ');
-        if (prSuffix) result.append(negative ? '>' : ' ');
-
-        String res = result.toString();
-        if (fillMode) res = Strs.stripLeading(res);
-        return res;
-    }
 }
