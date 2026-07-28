@@ -26,8 +26,40 @@ class SelectCteExecutor {
         String lcName = name.toLowerCase();
         if (executor.executingCtes.contains(lcName)) return null;
         for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
-            SelectStmt.CommonTableExpr cte = scope.get(lcName);
-            if (cte != null) return cte;
+            // A scope may hold a name mapped to null: that is a WITH item deliberately hidden
+            // from the body being run (see maskFor), and it must stop the search rather than let
+            // an enclosing scope answer, so that the name falls through to a stored relation.
+            if (scope.containsKey(lcName)) return scope.get(lcName);
+        }
+        return null;
+    }
+
+    /**
+     * The names a plain (non-RECURSIVE) WITH item may not see, mapped to null so they mask the
+     * scope the query itself pushed.
+     *
+     * <p>{@code WITH x AS (SELECT n FROM y), y AS (...)} is not a forward reference in PostgreSQL
+     * — it is an error, because a WITH item without RECURSIVE sees only the items written before
+     * it, and its own name is not among them either. If a stored relation happens to carry the
+     * name, that relation is what the body reads. Both follow from hiding the item and every
+     * later sibling for the duration of its body.
+     */
+    private Map<String, SelectStmt.CommonTableExpr> maskFor(SelectStmt.CommonTableExpr cte) {
+        if (cte.recursive()) return null;
+        for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
+            int position = -1;
+            int i = 0;
+            for (SelectStmt.CommonTableExpr sibling : scope.values()) {
+                if (sibling == cte) { position = i; break; }
+                i++;
+            }
+            if (position < 0) continue;
+            Map<String, SelectStmt.CommonTableExpr> mask = new LinkedHashMap<>();
+            int j = 0;
+            for (String siblingName : scope.keySet()) {
+                if (j++ >= position) mask.put(siblingName, null);
+            }
+            return mask.isEmpty() ? null : mask;
         }
         return null;
     }
@@ -40,10 +72,19 @@ class SelectCteExecutor {
         QueryResult cached = executor.cteResultCache.get(cacheKey);
         if (cached != null) return cached;
 
-        if (cte.recursive()) {
+        if (cte.recursive()) detectMutualRecursionCycle(cte, cacheKey);
+
+        // Declaring RECURSIVE does not make a WITH item recursive; naming itself does. One that
+        // never names itself is an ordinary query, and running it through the fixed-point loop
+        // would repeat its rows, so it takes the plain path — and SEARCH or CYCLE, which order
+        // and cut a recursion that is not there, is refused the way PG refuses it.
+        if (cte.recursive() && RecursiveCteCheck.selfReferencing(cte)) {
             QueryResult result = executeRecursiveCte(cte);
             executor.cteResultCache.put(cacheKey, result);
             return result;
+        }
+        if (cte.searchColumn() != null || cte.cycleColumn() != null) {
+            throw new MemgresException("WITH query is not recursive", "42601");
         }
 
         if (executor.executingCtes.contains(cacheKey)) {
@@ -53,9 +94,12 @@ class SelectCteExecutor {
         executor.executingCtes.add(cacheKey);
 
         QueryResult result;
+        Map<String, SelectStmt.CommonTableExpr> mask = maskFor(cte);
+        if (mask != null) executor.cteStack.push(mask);
         try {
             result = executor.executeStatement(cte.query());
         } finally {
+            if (mask != null) executor.cteStack.pop();
             executor.executingCtes.remove(cacheKey);
         }
 
@@ -81,13 +125,12 @@ class SelectCteExecutor {
      * Execute a recursive CTE using iterative fixed-point evaluation.
      */
     private QueryResult executeRecursiveCte(SelectStmt.CommonTableExpr cte) {
-        if (!(cte.query() instanceof SetOpStmt)) {
-            return executeCte(new SelectStmt.CommonTableExpr(cte.name(), cte.columnNames(), cte.query(), false));
-        }
+        RecursiveCteCheck.validate(select, cte);
         SetOpStmt setOp = (SetOpStmt) cte.query();
 
         QueryResult baseResult = executor.executeStatement(setOp.left());
         List<Column> columns = baseResult.getColumns();
+        RecursiveCteCheck.checkColumnTypes(cte.name(), columns, setOp.right());
 
         if (cte.columnNames() != null && !cte.columnNames().isEmpty()) {
             List<Column> renamedCols = new ArrayList<>();
@@ -173,7 +216,6 @@ class SelectCteExecutor {
         List<List<Object>> workingSetCyclePaths = hasCycle ? new ArrayList<>(cyclePaths) : null;
 
         String cteLower = cte.name().toLowerCase();
-        detectMutualRecursionCycle(cte, cteLower);
         executor.executingCtes.add(cteLower);
         // Stopping the loop early would return a shorter result than the query defines, with
         // nothing to say so; both caps report instead.
@@ -633,6 +675,7 @@ class SelectCteExecutor {
         for (Deque<Map<String, SelectStmt.CommonTableExpr>> stack = executor.cteStack;
              !stack.isEmpty(); ) {
             for (Map.Entry<String, SelectStmt.CommonTableExpr> entry : stack.peek().entrySet()) {
+                if (entry.getValue() == null) continue; // a masked name, not a WITH item in scope
                 if (!entry.getKey().equals(cteLower) && entry.getValue().recursive()) {
                     siblingMap.put(entry.getKey(), entry.getValue());
                 }
