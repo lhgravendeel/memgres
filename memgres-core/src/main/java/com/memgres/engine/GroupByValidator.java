@@ -83,6 +83,18 @@ final class GroupByValidator {
         Check check = new Check(groupedForms, determining, bindings);
         for (SelectStmt.SelectTarget t : targets) check.walk(t.expr());
         if (stmt.having() != null) check.walk(stmt.having());
+        if (stmt.windowDefs() != null) {
+            // A WINDOW clause entry reads the grouped rows like any window specification, and is
+            // judged even when nothing names it — as PostgreSQL judges it.
+            for (SelectStmt.WindowDef def : stmt.windowDefs()) {
+                if (def.partitionBy() != null) {
+                    for (Expression p : def.partitionBy()) check.walk(p);
+                }
+                if (def.orderBy() != null) {
+                    for (SelectStmt.OrderByItem item : def.orderBy()) check.walk(item.expr());
+                }
+            }
+        }
         if (stmt.orderBy() != null) {
             // ORDER BY may name an output column; resolve those before judging them, so that
             // ORDER BY over an aggregate's alias stays legal.

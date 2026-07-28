@@ -334,6 +334,11 @@ class SelectWindowEvaluator {
                 }
             }
         }
+        // HAVING chooses which groups survive, and a window runs over the groups that did, so a
+        // window function there would have to be computed before the rows it computes over exist.
+        if (stmt.having() != null && select.containsWindowFunction(stmt.having())) {
+            throw new MemgresException("window functions are not allowed in HAVING", "42P20");
+        }
         // LIMIT and OFFSET are read once for the whole query, before any row has a position in a
         // window to be measured against.
         if (select.containsWindowFunction(stmt.limit())) {
@@ -343,7 +348,11 @@ class SelectWindowEvaluator {
             throw new MemgresException("window functions are not allowed in OFFSET", "42P20");
         }
         for (SelectStmt.SelectTarget target : stmt.targets()) {
-            validateCallPlacement(target.expr());
+            validateCallPlacement(target.expr(), false);
+        }
+        validateCallPlacement(stmt.having(), false);
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem item : stmt.orderBy()) validateCallPlacement(item.expr(), false);
         }
         List<SelectStmt.WindowDef> defs = stmt.windowDefs();
         List<WindowFuncExpr> calls = new ArrayList<>();
@@ -398,13 +407,39 @@ class SelectWindowEvaluator {
      * frame to number, and an aggregate reads its arguments per input row for the same reason.
      * Neither can therefore contain a call that only has a value once the rows have been
      * collected, so PostgreSQL refuses the shape rather than choosing an order for it.
+     *
+     * <p>{@code insideAggregateArgs} says whether the walk is already inside what an aggregate
+     * reads. An aggregate there would have to be folded before the aggregate around it, over the
+     * same rows, and there is no such second pass: {@code sum(sum(v))} is rejected. A window
+     * function resets the flag, because what a window reads is not an input row but a row of the
+     * already-grouped result — {@code sum(sum(v)) OVER ()} sums one value per group, and the
+     * inner call is this query's own aggregate rather than a nested one. Two levels are still
+     * nested, so {@code sum(sum(sum(v))) OVER ()} and {@code rank() OVER (ORDER BY sum(sum(v)))}
+     * are rejected as before.
      */
-    private void validateCallPlacement(Expression expr) {
+    private void validateCallPlacement(Expression expr, boolean insideAggregateArgs) {
         if (expr == null) return;
         if (expr instanceof WindowFuncExpr) {
             WindowFuncExpr wf = (WindowFuncExpr) expr;
             rejectMisplacedCallsInFilter(wf.filter());
-            for (Expression arg : wf.args()) validateCallPlacement(arg);
+            for (Expression arg : wf.args()) validateCallPlacement(arg, false);
+            if (wf.partitionBy() != null) {
+                for (Expression p : wf.partitionBy()) validateCallPlacement(p, false);
+            }
+            if (wf.orderBy() != null) {
+                for (SelectStmt.OrderByItem o : wf.orderBy()) validateCallPlacement(o.expr(), false);
+            }
+            return;
+        }
+        if (expr instanceof OrderedSetAggExpr) {
+            OrderedSetAggExpr osa = (OrderedSetAggExpr) expr;
+            if (insideAggregateArgs) throw nestedAggregate();
+            for (Expression arg : osa.args()) validateCallPlacement(arg, true);
+            if (osa.withinGroupOrderBy() != null) {
+                for (SelectStmt.OrderByItem o : osa.withinGroupOrderBy()) {
+                    validateCallPlacement(o.expr(), true);
+                }
+            }
             return;
         }
         if (expr instanceof FunctionCallExpr) {
@@ -419,36 +454,110 @@ class SelectWindowEvaluator {
                         if (select.containsWindowFunction(o.expr())) throw windowUnderAggregate();
                     }
                 }
+                if (insideAggregateArgs) throw nestedAggregate();
+                for (Expression arg : fn.args()) validateCallPlacement(arg, true);
+                if (fn.orderBy() != null) {
+                    for (SelectStmt.OrderByItem o : fn.orderBy()) validateCallPlacement(o.expr(), true);
+                }
+                return;
             }
-            for (Expression arg : fn.args()) validateCallPlacement(arg);
+            for (Expression arg : fn.args()) validateCallPlacement(arg, insideAggregateArgs);
             return;
         }
         if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
-            validateCallPlacement(bin.left());
-            validateCallPlacement(bin.right());
+            validateCallPlacement(bin.left(), insideAggregateArgs);
+            validateCallPlacement(bin.right(), insideAggregateArgs);
         } else if (expr instanceof CustomOperatorExpr) {
             CustomOperatorExpr cop = (CustomOperatorExpr) expr;
-            validateCallPlacement(cop.left());
-            validateCallPlacement(cop.right());
+            validateCallPlacement(cop.left(), insideAggregateArgs);
+            validateCallPlacement(cop.right(), insideAggregateArgs);
         } else if (expr instanceof UnaryExpr) {
-            validateCallPlacement(((UnaryExpr) expr).operand());
+            validateCallPlacement(((UnaryExpr) expr).operand(), insideAggregateArgs);
         } else if (expr instanceof CastExpr) {
-            validateCallPlacement(((CastExpr) expr).expr());
+            validateCallPlacement(((CastExpr) expr).expr(), insideAggregateArgs);
+        } else if (expr instanceof IsNullExpr) {
+            validateCallPlacement(((IsNullExpr) expr).expr(), insideAggregateArgs);
+        } else if (expr instanceof IsJsonExpr) {
+            validateCallPlacement(((IsJsonExpr) expr).expr(), insideAggregateArgs);
+        } else if (expr instanceof InExpr) {
+            validateCallPlacement(((InExpr) expr).expr(), insideAggregateArgs);
+        } else if (expr instanceof LikeExpr) {
+            LikeExpr like = (LikeExpr) expr;
+            validateCallPlacement(like.left(), insideAggregateArgs);
+            validateCallPlacement(like.pattern(), insideAggregateArgs);
         } else if (expr instanceof CaseExpr) {
             CaseExpr c = (CaseExpr) expr;
-            validateCallPlacement(c.operand());
+            validateCallPlacement(c.operand(), insideAggregateArgs);
             for (CaseExpr.WhenClause when : c.whenClauses()) {
-                validateCallPlacement(when.condition());
-                validateCallPlacement(when.result());
+                validateCallPlacement(when.condition(), insideAggregateArgs);
+                validateCallPlacement(when.result(), insideAggregateArgs);
             }
-            validateCallPlacement(c.elseExpr());
+            validateCallPlacement(c.elseExpr(), insideAggregateArgs);
         }
     }
 
     private static MemgresException windowUnderAggregate() {
         return new MemgresException(
                 "aggregate function calls cannot contain window function calls", "42803");
+    }
+
+    private static MemgresException nestedAggregate() {
+        return new MemgresException("aggregate function calls cannot be nested", "42803");
+    }
+
+    /**
+     * The parts of an expression that a window function does not compute for itself: its
+     * arguments, what it partitions and orders by, its FILTER condition, and whatever stands
+     * beside it. Over a grouped query each of those is a value of the grouped row rather than of
+     * an input row — {@code sum(v)} is one number per group, {@code g} is the group's key — so
+     * the caller evaluates them once per group and binds them to these very nodes. That is what
+     * makes an aggregate legal under a window here, and it is also why a window's ORDER BY no
+     * longer has to find its expression among the grouped result's columns, which are the output
+     * aliases and carry neither {@code sum(v)} nor a grouping column the select list omits.
+     */
+    void collectGroupedWindowInputs(Expression expr, List<SelectStmt.WindowDef> defs,
+                                     List<Expression> out) {
+        if (expr == null) return;
+        if (!select.containsWindowFunction(expr)) {
+            out.add(expr);
+            return;
+        }
+        if (expr instanceof WindowFuncExpr) {
+            WindowFuncExpr wf = resolveNamedWindow((WindowFuncExpr) expr, defs);
+            out.addAll(wf.args());
+            if (wf.partitionBy() != null) out.addAll(wf.partitionBy());
+            if (wf.orderBy() != null) {
+                for (SelectStmt.OrderByItem o : wf.orderBy()) out.add(o.expr());
+            }
+            if (wf.filter() != null) out.add(wf.filter());
+            return;
+        }
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            collectGroupedWindowInputs(bin.left(), defs, out);
+            collectGroupedWindowInputs(bin.right(), defs, out);
+        } else if (expr instanceof CustomOperatorExpr) {
+            CustomOperatorExpr cop = (CustomOperatorExpr) expr;
+            collectGroupedWindowInputs(cop.left(), defs, out);
+            collectGroupedWindowInputs(cop.right(), defs, out);
+        } else if (expr instanceof UnaryExpr) {
+            collectGroupedWindowInputs(((UnaryExpr) expr).operand(), defs, out);
+        } else if (expr instanceof CastExpr) {
+            collectGroupedWindowInputs(((CastExpr) expr).expr(), defs, out);
+        } else if (expr instanceof CaseExpr) {
+            CaseExpr c = (CaseExpr) expr;
+            collectGroupedWindowInputs(c.operand(), defs, out);
+            for (CaseExpr.WhenClause when : c.whenClauses()) {
+                collectGroupedWindowInputs(when.condition(), defs, out);
+                collectGroupedWindowInputs(when.result(), defs, out);
+            }
+            collectGroupedWindowInputs(c.elseExpr(), defs, out);
+        } else if (expr instanceof FunctionCallExpr) {
+            for (Expression arg : ((FunctionCallExpr) expr).args()) {
+                collectGroupedWindowInputs(arg, defs, out);
+            }
+        }
     }
 
     private void rejectMisplacedCallsInFilter(Expression filter) {

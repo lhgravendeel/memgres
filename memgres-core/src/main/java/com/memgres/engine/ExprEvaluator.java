@@ -59,12 +59,11 @@ class ExprEvaluator {
         }
         if (expr instanceof Literal) return evalLiteral(((Literal) expr));
         if (expr instanceof PrecomputedValueExpr) return ((PrecomputedValueExpr) expr).value();
-        // A set-returning function nested inside a larger SELECT-list expression (e.g.
-        // day_start + interval '1h' * generate_series(0,23,2)) is expanded by SelectExecutor:
-        // the SRF call is evaluated once per row to get its element list, then this exact node
-        // is bound to each element in turn while the owning expression is re-evaluated. See
-        // SelectExecutor.findSrfCall / projectRows.
-        if (ctx != null && ctx.hasSrfOverride(expr)) return ctx.getSrfOverride(expr);
+        // A node whose value the caller has already settled reads that value instead of being
+        // computed again: an expanded set-returning call bound to one of its elements (see
+        // SelectExecutor.findSrfCall / projectRows), or a window function's input over a grouped
+        // query, bound to the value the group has for it. See RowContext.setBoundValue.
+        if (ctx != null && ctx.hasBoundValue(expr)) return ctx.getBoundValue(expr);
         if (expr instanceof ColumnRef) return evalColumnRef(((ColumnRef) expr), ctx);
         if (expr instanceof BinaryExpr) {
             rejectUnequalRowArity((BinaryExpr) expr);

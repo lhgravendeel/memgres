@@ -25,6 +25,85 @@ class SelectAggregateEvaluator {
         this.executor = select.executor;
     }
 
+    /**
+     * The window functions of a grouped query, computed over the rows that query produces.
+     *
+     * <p>A window in a grouped query runs over the grouped result: the rows it frames are the
+     * groups, and everything its specification names — its arguments, PARTITION BY, ORDER BY and
+     * FILTER — is a value of the grouped row. Those are evaluated here, once per group as the
+     * group's row is emitted, and bound to their expression nodes; the window evaluator then
+     * reads the bound values. Looking them up in the grouped result instead cannot work, because
+     * its columns are the output aliases: {@code sum(v)} is not among them, and neither is a
+     * grouping column the select list happens to omit.
+     */
+    private final class GroupedWindowPass {
+        private final SelectStmt stmt;
+        private final List<Expression> inputs = new ArrayList<>();
+        private final List<Object[]> inputValues = new ArrayList<>();
+        private final boolean windowed;
+        /** One per emitted row, in emission order; null until {@link #apply} has run. */
+        private List<RowContext> contexts;
+
+        GroupedWindowPass(SelectStmt stmt, List<SelectStmt.OrderByItem> resolvedOrderBy) {
+            this.stmt = stmt;
+            boolean any = false;
+            for (SelectStmt.SelectTarget target : stmt.targets()) any |= collect(target.expr());
+            if (resolvedOrderBy != null) {
+                for (SelectStmt.OrderByItem item : resolvedOrderBy) any |= collect(item.expr());
+            }
+            this.windowed = any;
+        }
+
+        private boolean collect(Expression expr) {
+            if (!select.containsWindowFunction(expr)) return false;
+            select.windowEvaluator.collectGroupedWindowInputs(expr, stmt.windowDefs(), inputs);
+            return true;
+        }
+
+        /** Records what the windows will read for a row the query is about to emit. */
+        void recordRow(List<RowContext> group, RowContext representative) {
+            if (!windowed) return;
+            Object[] values = new Object[inputs.size()];
+            for (int i = 0; i < inputs.size(); i++) {
+                values[i] = evalAggregateExpr(inputs.get(i), group, representative);
+            }
+            inputValues.add(values);
+        }
+
+        /** Replaces every window-function output column with the value the window computes. */
+        void apply(List<Column> resultColumns, List<Object[]> resultRows) {
+            if (!windowed || resultRows.isEmpty()) return;
+            Table virtualTable = new Table("__agg_result__", resultColumns);
+            contexts = new ArrayList<>(resultRows.size());
+            for (int ri = 0; ri < resultRows.size(); ri++) {
+                Object[] row = resultRows.get(ri);
+                virtualTable.insertRow(row);
+                RowContext ctx = new RowContext(Cols.listOf(
+                        new RowContext.TableBinding(virtualTable, "__agg_result__", row)));
+                Object[] values = inputValues.get(ri);
+                for (int i = 0; i < inputs.size(); i++) ctx.setBoundValue(inputs.get(i), values[i]);
+                contexts.add(ctx);
+            }
+            for (int ti = 0; ti < stmt.targets().size(); ti++) {
+                Expression expr = stmt.targets().get(ti).expr();
+                if (!select.containsWindowFunction(expr)) continue;
+                Object[] windowVals = select.windowEvaluator.evaluateWindowExpression(
+                        expr, contexts, stmt.windowDefs());
+                for (int ri = 0; ri < resultRows.size(); ri++) resultRows.get(ri)[ti] = windowVals[ri];
+            }
+        }
+
+        /**
+         * The values an ORDER BY key holding a window function computes, indexed as the rows were
+         * emitted, or null when the key is not one. A window ordered by rather than selected has
+         * no output column to read and cannot be computed a row at a time either.
+         */
+        Object[] orderByValues(Expression expr) {
+            if (contexts == null || !select.containsWindowFunction(expr)) return null;
+            return select.windowEvaluator.evaluateWindowExpression(expr, contexts, stmt.windowDefs());
+        }
+    }
+
     // ---- Aggregate SELECT pipelines ----
 
     QueryResult executeGroupingSetsSelect(SelectStmt stmt, List<RowContext> contexts,
@@ -40,6 +119,8 @@ class SelectAggregateEvaluator {
         }
 
         List<Object[]> allResultRows = new ArrayList<>();
+        List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
+        GroupedWindowPass windows = new GroupedWindowPass(stmt, resolvedOrderBy);
 
         for (List<Expression> groupingSet : groupingSets) {
             List<Expression> effectiveGroupBy = new ArrayList<>(fixedGroupBy);
@@ -109,19 +190,33 @@ class SelectAggregateEvaluator {
                     if (!executor.isTruthy(havingResult)) continue;
                 }
                 allResultRows.add(row);
+                windows.recordRow(group, maskedRep);
             }
         }
         currentGroupingSetColumns.set(null);
 
+        // A window over grouping sets runs over every row every set produced, as one result.
+        windows.apply(resultColumns, allResultRows);
+
         // ORDER BY
-        List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
             final List<SelectStmt.OrderByItem> ob = resolvedOrderBy;
+            final Object[][] windowKeys = new Object[ob.size()][];
+            final Map<Object[], Integer> emittedAt = new IdentityHashMap<>();
+            for (int oi = 0; oi < ob.size(); oi++) {
+                if (select.resolveOrderByToColumnIndex(ob.get(oi).expr(), stmt.targets()) < 0) {
+                    windowKeys[oi] = windows.orderByValues(ob.get(oi).expr());
+                }
+            }
+            for (int ri = 0; ri < allResultRows.size(); ri++) emittedAt.put(allResultRows.get(ri), ri);
             allResultRows.sort((a, b) -> {
-                for (SelectStmt.OrderByItem item : ob) {
+                for (int oi = 0; oi < ob.size(); oi++) {
+                    SelectStmt.OrderByItem item = ob.get(oi);
                     int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
-                    Object va = colIdx >= 0 ? a[colIdx] : null;
-                    Object vb = colIdx >= 0 ? b[colIdx] : null;
+                    Object va = colIdx >= 0 ? a[colIdx]
+                            : windowKeys[oi] != null ? windowKeys[oi][emittedAt.get(a)] : null;
+                    Object vb = colIdx >= 0 ? b[colIdx]
+                            : windowKeys[oi] != null ? windowKeys[oi][emittedAt.get(b)] : null;
                     if (va == null && vb == null) continue;
                     if (va == null || vb == null) {
                         boolean nullsFirst = item.nullsFirst() != null ? item.nullsFirst() : item.descending();
@@ -302,6 +397,9 @@ class SelectAggregateEvaluator {
         // into groups: HAVING drops groups, and the indexes stop lining up as soon as it does.
         Map<Object[], List<RowContext>> rowGroups = new IdentityHashMap<>();
 
+        List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
+        GroupedWindowPass windows = new GroupedWindowPass(stmt, resolvedOrderBy);
+
         for (List<RowContext> group : groups) {
             RowContext representative = group.isEmpty() ? null : group.get(0);
 
@@ -313,78 +411,61 @@ class SelectAggregateEvaluator {
             }
 
             if (stmt.having() != null) {
-                if (select.containsWindowFunction(stmt.having())) {
-                    throw new MemgresException("window functions are not allowed in HAVING", "42P20");
-                }
                 Object havingResult = evalAggregateExpr(stmt.having(), group, representative);
                 if (!executor.isTruthy(havingResult)) continue;
             }
 
             resultRows.add(row);
             rowGroups.put(row, group);
+            windows.recordRow(group, representative);
         }
 
         if (groups.isEmpty() && !hasGroupBy) {
+            List<RowContext> empty = Cols.listOf();
             Object[] row = new Object[stmt.targets().size()];
             for (int i = 0; i < stmt.targets().size(); i++) {
                 Expression expr = stmt.targets().get(i).expr();
-                row[i] = evalAggregateExpr(expr, Cols.listOf(), null);
+                row[i] = evalAggregateExpr(expr, empty, null);
             }
             resultRows.add(row);
+            rowGroups.put(row, empty);
+            windows.recordRow(empty, null);
         }
 
-        // Post-process window functions over the grouped result set
-        if (select.hasWindowFunctionInTargets(stmt.targets()) && !resultRows.isEmpty()) {
-            Table virtualTable = new Table("__agg_result__", resultColumns);
-            for (Object[] row : resultRows) {
-                virtualTable.insertRow(row);
-            }
-            List<RowContext> aggContexts = new ArrayList<>(resultRows.size());
-            for (Object[] row : resultRows) {
-                aggContexts.add(new RowContext(Cols.listOf(
-                        new RowContext.TableBinding(virtualTable, "__agg_result__", row))));
-            }
-
-            for (int ti = 0; ti < stmt.targets().size(); ti++) {
-                Expression expr = stmt.targets().get(ti).expr();
-                if (select.containsWindowFunction(expr)) {
-                    Object[] windowVals = select.windowEvaluator.evaluateWindowExpression(expr, aggContexts, stmt.windowDefs());
-                    for (int ri = 0; ri < resultRows.size(); ri++) {
-                        resultRows.get(ri)[ti] = windowVals[ri];
-                    }
-                }
-            }
-        }
+        windows.apply(resultColumns, resultRows);
 
         // ORDER BY on aggregate results
         // Pre-compute ORDER BY values for aggregate expressions not in target columns
-        List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
         Map<Object[], Object[]> orderByValues = null;
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
-            // An ORDER BY key that is not an output column has to be computed per group, whether
-            // it is an aggregate (ORDER BY count(*)) or a grouped expression the select list
-            // happens not to carry (GROUP BY a+0 ORDER BY a+0). Sorting by the first output
-            // column instead, as this did for the latter, silently returns the wrong order.
+            // An ORDER BY key that is not an output column has to be computed over the grouped
+            // result, whether it is an aggregate (ORDER BY count(*)), a grouped expression the
+            // select list happens not to carry (GROUP BY a+0 ORDER BY a+0) or a window function
+            // (ORDER BY rank() OVER (ORDER BY sum(v))). Sorting by the first output column
+            // instead, as this did for the latter two, silently returns the wrong order.
+            Object[][] windowKeys = new Object[resolvedOrderBy.size()][];
             boolean needsGroupEval = false;
-            for (SelectStmt.OrderByItem item : resolvedOrderBy) {
-                if (select.resolveOrderByToColumnIndex(item.expr(), stmt.targets()) < 0) {
-                    needsGroupEval = true;
-                    break;
-                }
+            for (int oi = 0; oi < resolvedOrderBy.size(); oi++) {
+                SelectStmt.OrderByItem item = resolvedOrderBy.get(oi);
+                if (select.resolveOrderByToColumnIndex(item.expr(), stmt.targets()) >= 0) continue;
+                needsGroupEval = true;
+                windowKeys[oi] = windows.orderByValues(item.expr());
             }
             if (needsGroupEval && !resultRows.isEmpty()) {
                 orderByValues = new IdentityHashMap<>();
-                for (Object[] resultRow : resultRows) {
+                for (int ri = 0; ri < resultRows.size(); ri++) {
+                    Object[] resultRow = resultRows.get(ri);
                     List<RowContext> group = rowGroups.get(resultRow);
-                    if (group == null) continue;
-                    RowContext rep = group.isEmpty() ? null : group.get(0);
+                    RowContext rep = group == null || group.isEmpty() ? null : group.get(0);
                     Object[] obVals = new Object[resolvedOrderBy.size()];
                     for (int oi = 0; oi < resolvedOrderBy.size(); oi++) {
                         SelectStmt.OrderByItem item = resolvedOrderBy.get(oi);
                         int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
                         if (colIdx >= 0) {
                             obVals[oi] = resultRow[colIdx];
-                        } else {
+                        } else if (windowKeys[oi] != null) {
+                            obVals[oi] = windowKeys[oi][ri];
+                        } else if (group != null) {
                             obVals[oi] = evalAggregateExpr(item.expr(), group, rep);
                         }
                     }
@@ -912,11 +993,10 @@ class SelectAggregateEvaluator {
     Object evalAggregate(FunctionCallExpr fn, List<RowContext> group) {
         String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase());
 
-        for (Expression arg : fn.args()) {
-            if (select.containsAggregate(arg)) {
-                throw new MemgresException("aggregate function calls cannot be nested", "42803");
-            }
-        }
+        // A nested aggregate is refused while the statement is analysed, in
+        // SelectWindowEvaluator.validateCallPlacement, so that the shape is rejected whether or
+        // not the query reaches a row and so that the one legal nesting -- an aggregate under a
+        // window function, whose arguments this method is also handed -- is let through.
 
         if (fn.filter() != null) {
             group = group.stream()

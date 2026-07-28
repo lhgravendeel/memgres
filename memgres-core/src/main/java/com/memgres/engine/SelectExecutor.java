@@ -266,11 +266,13 @@ class SelectExecutor {
 
         // WHERE
         if (stmt.where() != null) {
-            if (containsAggregate(stmt.where())) {
-                throw new MemgresException("aggregate functions are not allowed in WHERE", "42803");
-            }
+            // The window function is reported first: an aggregate inside its OVER clause belongs
+            // to the window, and PostgreSQL names the call that may not stand here at all.
             if (containsWindowFunction(stmt.where())) {
                 throw new MemgresException("window functions are not allowed in WHERE", "42P20");
+            }
+            if (containsAggregate(stmt.where())) {
+                throw new MemgresException("aggregate functions are not allowed in WHERE", "42803");
             }
             // Pre-flight type validation of WHERE clause (PG checks at plan time)
             // Only validate for simple single-table SELECTs (not CTEs/subqueries/joins)
@@ -308,7 +310,8 @@ class SelectExecutor {
         // so every other expression in it must itself be grouped or aggregated.
         boolean hasAggregates = hasAggregateInTargets(stmt.targets()) ||
                 (stmt.having() != null && containsAggregate(stmt.having())) ||
-                hasAggregateInOrderBy(stmt.orderBy());
+                hasAggregateInOrderBy(stmt.orderBy()) ||
+                hasAggregateInWindowDefs(stmt.windowDefs());
 
         if (hasGroupBy || hasGroupingSets || hasAggregates) {
             // A star stands for the columns it expands to, and grouping is judged — and GROUP BY
@@ -566,6 +569,16 @@ class SelectExecutor {
         if (expr instanceof AnyAllExpr) return false;
         if (expr instanceof ArraySubqueryExpr) return false;
         if (expr instanceof OrderedSetAggExpr) return true;
+        // A window function is not itself an aggregate, but what it reads may be one: it runs
+        // over the grouped result, so sum(sum(v)) OVER () and rank() OVER (ORDER BY sum(v)) are
+        // queries with one row per group exactly as sum(v) on its own would be.
+        if (expr instanceof WindowFuncExpr) {
+            WindowFuncExpr wf = (WindowFuncExpr) expr;
+            for (Expression arg : wf.args()) {
+                if (containsAggregate(arg)) return true;
+            }
+            return windowSpecContainsAggregate(wf.partitionBy(), wf.orderBy());
+        }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
             if (isAggregateFunction(fn.name())) return true;
@@ -595,6 +608,33 @@ class SelectExecutor {
     boolean hasAggregateInTargets(List<SelectStmt.SelectTarget> targets) {
         for (SelectStmt.SelectTarget target : targets) {
             if (containsAggregate(target.expr())) return true;
+        }
+        return false;
+    }
+
+    /**
+     * A WINDOW clause entry is part of the window specification of every call that names it, so
+     * an aggregate written there groups the query just as one written in an inline OVER does.
+     */
+    private boolean hasAggregateInWindowDefs(List<SelectStmt.WindowDef> defs) {
+        if (defs == null) return false;
+        for (SelectStmt.WindowDef def : defs) {
+            if (windowSpecContainsAggregate(def.partitionBy(), def.orderBy())) return true;
+        }
+        return false;
+    }
+
+    private boolean windowSpecContainsAggregate(List<Expression> partitionBy,
+                                                List<SelectStmt.OrderByItem> orderBy) {
+        if (partitionBy != null) {
+            for (Expression p : partitionBy) {
+                if (containsAggregate(p)) return true;
+            }
+        }
+        if (orderBy != null) {
+            for (SelectStmt.OrderByItem o : orderBy) {
+                if (containsAggregate(o.expr())) return true;
+            }
         }
         return false;
     }
@@ -1259,7 +1299,7 @@ class SelectExecutor {
         }
 
         Object[] values = new Object[stmt.targets().size()];
-        // Only used to host SRF override bindings (see RowContext.setSrfOverride) when a target
+        // Only used to host SRF element bindings (see RowContext.setBoundValue) when a target
         // expression contains a nested set-returning function call; a no-FROM SELECT has no
         // table bindings to resolve columns against, so an empty context is safe here.
         RowContext srfHostCtx = new RowContext(Cols.<RowContext.TableBinding>listOf());
@@ -1474,11 +1514,12 @@ class SelectExecutor {
             for (String n : leftNames.values()) addExposed(exposed, n);
             for (String n : rightNames.values()) addExposed(exposed, n);
             if (join.on() != null) {
-                if (containsAggregate(join.on())) {
-                    throw new MemgresException("aggregate functions are not allowed in JOIN conditions", "42803");
-                }
+                // As in WHERE, the window function is named first when a condition holds both.
                 if (containsWindowFunction(join.on())) {
                     throw new MemgresException("window functions are not allowed in JOIN conditions", "42P20");
+                }
+                if (containsAggregate(join.on())) {
+                    throw new MemgresException("aggregate functions are not allowed in JOIN conditions", "42803");
                 }
             }
             if (join.using() != null) {
@@ -1741,11 +1782,11 @@ class SelectExecutor {
         }
         List<Object> results = new ArrayList<>(elements.size());
         for (Object element : elements) {
-            ctx.setSrfOverride(srfNode, element);
+            ctx.setBoundValue(srfNode, element);
             try {
                 results.add(executor.evalExpr(expr, ctx));
             } finally {
-                ctx.clearSrfOverride(srfNode);
+                ctx.clearBoundValue(srfNode);
             }
         }
         return results;
