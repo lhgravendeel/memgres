@@ -674,6 +674,7 @@ class BinaryOpEvaluator {
                 if (left instanceof PgMoney && right instanceof PgMoney) {
                     return ((PgMoney) left).divideByMoney((PgMoney) right);
                 }
+                rejectFloatDivisionByZero(left, right);
                 return executor.numericOp(left, right, (a, b) -> a / b, BinaryOpEvaluator::divideExact,
                     (a, b) -> a.divide(b, 20, java.math.RoundingMode.HALF_UP));
             }
@@ -682,7 +683,10 @@ class BinaryOpEvaluator {
                     java.math.BigDecimal::remainder);
             case POWER: {
                 if (left == null || right == null) return null;
-                double result = Math.pow(executor.toDouble(left), executor.toDouble(right));
+                double powBase = executor.toDouble(left);
+                double powExp = executor.toDouble(right);
+                NumericLimits.checkPowerDomain(powBase, powExp);
+                double result = Math.pow(powBase, powExp);
                 // Numeric overflow: if either operand is BigDecimal, check for infinity
                 if ((left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) && Double.isInfinite(result)) {
                     throw new MemgresException("value overflows numeric format", "22003");
@@ -1997,6 +2001,7 @@ class BinaryOpEvaluator {
                 if (left instanceof PgMoney && right instanceof PgMoney) {
                     return ((PgMoney) left).divideByMoney((PgMoney) right);
                 }
+                rejectFloatDivisionByZero(left, right);
                 return executor.numericOp(left, right, (a, b) -> a / b, BinaryOpEvaluator::divideExact,
                     (a, b) -> a.divide(b, 20, java.math.RoundingMode.HALF_UP));
             }
@@ -2005,7 +2010,10 @@ class BinaryOpEvaluator {
                     java.math.BigDecimal::remainder);
             case POWER: {
                 if (left == null || right == null) return null;
-                double result = Math.pow(executor.toDouble(left), executor.toDouble(right));
+                double powBase = executor.toDouble(left);
+                double powExp = executor.toDouble(right);
+                NumericLimits.checkPowerDomain(powBase, powExp);
+                double result = Math.pow(powBase, powExp);
                 // Numeric overflow: if either operand is BigDecimal, check for infinity
                 if ((left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) && Double.isInfinite(result)) {
                     throw new MemgresException("value overflows numeric format", "22003");
@@ -2876,6 +2884,18 @@ class BinaryOpEvaluator {
      * PG's numeric power pads the result to 17 significant digits, so 10.0^3 prints as
      * 1000.0000000000000 rather than 1000.
      */
+    /**
+     * PG's float division reports a zero divisor rather than handing back an infinity. Only a
+     * NaN dividend escapes it, which is why the check looks at the dividend at all.
+     */
+    private static void rejectFloatDivisionByZero(Object left, Object right) {
+        boolean isFloat = left instanceof Double || left instanceof Float
+                || right instanceof Double || right instanceof Float;
+        if (!isFloat || !(right instanceof Number) || ((Number) right).doubleValue() != 0) return;
+        if (left instanceof Number && Double.isNaN(((Number) left).doubleValue())) return;
+        throw new MemgresException("division by zero", "22012");
+    }
+
     private static java.math.BigDecimal numericPowerScale(double value) {
         java.math.BigDecimal bd = new java.math.BigDecimal(Double.toString(value));
         int intDigits = bd.abs().compareTo(java.math.BigDecimal.ONE) < 0

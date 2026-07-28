@@ -322,6 +322,7 @@ class ArrayOperationHandler {
             list.add(executor.evalExpr(elem, ctx));
         }
         if (arr.isRow()) return new AstExecutor.PgRow(list);
+        checkArrayDimensions(list);
         // Validate multi-dimensional array: all sub-arrays must have the same size
         if (!list.isEmpty() && list.get(0) instanceof List<?>) {
             int expectedSize = ((List<?>) list.get(0)).size();
@@ -354,6 +355,23 @@ class ArrayOperationHandler {
             }
         }
         return list;
+    }
+
+    /** PG stores an array's dimension count in a fixed-size header, capped at MAXDIM. */
+    private static final int MAX_ARRAY_DIMENSIONS = 6;
+
+    private static void checkArrayDimensions(List<Object> list) {
+        int dims = 1;
+        Object probe = list.isEmpty() ? null : list.get(0);
+        while (probe instanceof List<?>) {
+            dims++;
+            List<?> inner = (List<?>) probe;
+            probe = inner.isEmpty() ? null : inner.get(0);
+        }
+        if (dims > MAX_ARRAY_DIMENSIONS) {
+            throw new MemgresException("number of array dimensions (" + dims
+                    + ") exceeds the maximum allowed (" + MAX_ARRAY_DIMENSIONS + ")", "54000");
+        }
     }
 
     Object evalArraySubquery(ArraySubqueryExpr asq, RowContext outerCtx) {

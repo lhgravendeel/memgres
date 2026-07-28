@@ -273,6 +273,7 @@ class CastEvaluator {
             }
         }
 
+        TypeCoercion.checkDeclaredTypeLimits(lowerSpec);
         // Handle float(p): p <= 24 means REAL, p >= 25 means DOUBLE PRECISION
         if (lowerSpec.startsWith("float(")) {
             String pStr = lowerSpec.replaceAll(".*\\((\\d+)\\).*", "$1");
@@ -282,6 +283,13 @@ class CastEvaluator {
         }
         // Handle numeric(precision, scale) and apply scale for proper formatting
         if (lowerSpec.startsWith("numeric(") || lowerSpec.startsWith("decimal(")) {
+            Double specialTypmod = NumericLimits.specialNumericOrNull(val);
+            if (specialTypmod != null) {
+                // NaN fits any numeric(p,s); an infinity is larger than every value the field
+                // could round to, so PG reports the same overflow it does for a huge number.
+                if (specialTypmod.isNaN()) return specialTypmod;
+                throw new MemgresException("numeric field overflow", "22003");
+            }
             java.math.BigDecimal bd = NumericLimits.check(TypeCoercion.toBigDecimal(val));
             String params = lowerSpec.replaceAll(".*\\(([^)]+)\\).*", "$1");
             String[] parts = params.split(",");
@@ -428,7 +436,8 @@ class CastEvaluator {
             }
             case "numeric":
             case "decimal": {
-                if (val instanceof String && ((String) val).trim().equalsIgnoreCase("NaN")) return Double.NaN;
+                Double special = NumericLimits.specialNumericOrNull(val);
+                if (special != null) return special;
                 return NumericLimits.check(TypeCoercion.toBigDecimal(val));
             }
             case "citext": {
