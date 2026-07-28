@@ -467,44 +467,64 @@ class NoopDdlCoverageTest {
     // 123: Event Triggers
     // ========================================================================
 
+    /** PG only accepts a function returning event_trigger here, so each test declares one. */
+    private void eventTriggerFunction(String name) throws SQLException {
+        exec("CREATE OR REPLACE FUNCTION " + name + "() RETURNS event_trigger"
+                + " LANGUAGE plpgsql AS $$ BEGIN END $$");
+    }
+
+    private void eventTrigger(String name) throws SQLException {
+        eventTriggerFunction("my_func");
+        exec("CREATE EVENT TRIGGER " + name + " ON ddl_command_start EXECUTE FUNCTION my_func()");
+    }
+
     @Test void testCreateEventTrigger() throws SQLException {
-        exec("CREATE EVENT TRIGGER mytrigger ON ddl_command_start EXECUTE FUNCTION my_func()");
+        eventTrigger("et_create");
     }
 
     @Test void testCreateEventTriggerWithFilter() throws SQLException {
-        exec("CREATE EVENT TRIGGER mytrigger ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION my_func()");
+        eventTriggerFunction("my_func");
+        exec("CREATE EVENT TRIGGER et_filter ON ddl_command_end WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION my_func()");
     }
 
     @Test void testCreateEventTriggerSqlDrop() throws SQLException {
+        eventTriggerFunction("my_drop_func");
         exec("CREATE EVENT TRIGGER drop_trigger ON sql_drop EXECUTE FUNCTION my_drop_func()");
     }
 
     @Test void testCreateEventTriggerTableRewrite() throws SQLException {
+        eventTriggerFunction("my_rewrite_func");
         exec("CREATE EVENT TRIGGER rewrite_trigger ON table_rewrite EXECUTE FUNCTION my_rewrite_func()");
     }
 
     @Test void testAlterEventTrigger() throws SQLException {
-        exec("ALTER EVENT TRIGGER mytrigger DISABLE");
+        eventTrigger("et_disable");
+        exec("ALTER EVENT TRIGGER et_disable DISABLE");
     }
 
     @Test void testAlterEventTriggerEnable() throws SQLException {
-        exec("ALTER EVENT TRIGGER mytrigger ENABLE");
+        eventTrigger("et_enable");
+        exec("ALTER EVENT TRIGGER et_enable ENABLE");
     }
 
     @Test void testAlterEventTriggerEnableAlways() throws SQLException {
-        exec("ALTER EVENT TRIGGER mytrigger ENABLE ALWAYS");
+        eventTrigger("et_always");
+        exec("ALTER EVENT TRIGGER et_always ENABLE ALWAYS");
     }
 
     @Test void testAlterEventTriggerRename() throws SQLException {
-        exec("ALTER EVENT TRIGGER mytrigger RENAME TO newtrigger");
+        eventTrigger("et_rename");
+        exec("ALTER EVENT TRIGGER et_rename RENAME TO newtrigger");
     }
 
     @Test void testAlterEventTriggerOwner() throws SQLException {
-        exec("ALTER EVENT TRIGGER mytrigger OWNER TO newowner");
+        eventTrigger("et_owner");
+        exec("ALTER EVENT TRIGGER et_owner OWNER TO newowner");
     }
 
     @Test void testDropEventTrigger() throws SQLException {
-        exec("DROP EVENT TRIGGER mytrigger");
+        eventTrigger("et_drop");
+        exec("DROP EVENT TRIGGER et_drop");
     }
 
     @Test void testDropEventTriggerIfExists() throws SQLException {
@@ -643,49 +663,68 @@ class NoopDdlCoverageTest {
     // 127: Statistics Objects
     // ========================================================================
 
+    /** Statistics are defined over a real table's real columns, so each test needs one. */
+    private void statTable() throws SQLException {
+        exec("CREATE TABLE IF NOT EXISTS stat_test (a int, b int, c text)");
+    }
+
+    private void statistic(String name) throws SQLException {
+        statTable();
+        exec("CREATE STATISTICS " + name + " ON a, b FROM stat_test");
+    }
+
     @Test void testCreateStatisticsBasic() throws SQLException {
-        exec("CREATE TABLE stat_test (a int, b int, c text)");
-        exec("CREATE STATISTICS mystat ON a, b FROM stat_test");
+        statistic("mystat");
     }
 
     @Test void testCreateStatisticsNdistinct() throws SQLException {
+        statTable();
         exec("CREATE STATISTICS mystat_nd (ndistinct) ON a, b FROM stat_test");
     }
 
     @Test void testCreateStatisticsDependencies() throws SQLException {
+        statTable();
         exec("CREATE STATISTICS mystat_dep (dependencies) ON a, b FROM stat_test");
     }
 
     @Test void testCreateStatisticsMcv() throws SQLException {
+        statTable();
         exec("CREATE STATISTICS mystat_mcv (mcv) ON a, b FROM stat_test");
     }
 
     @Test void testCreateStatisticsMultipleKinds() throws SQLException {
+        statTable();
         exec("CREATE STATISTICS mystat_multi (ndistinct, dependencies, mcv) ON a, b, c FROM stat_test");
     }
 
     @Test void testCreateStatisticsIfNotExists() throws SQLException {
-        exec("CREATE STATISTICS IF NOT EXISTS mystat ON a, b FROM stat_test");
+        statistic("mystat_ine");
+        exec("CREATE STATISTICS IF NOT EXISTS mystat_ine ON a, b FROM stat_test");
     }
 
     @Test void testAlterStatistics() throws SQLException {
-        exec("ALTER STATISTICS mystat SET STATISTICS 1000");
+        statistic("mystat_target");
+        exec("ALTER STATISTICS mystat_target SET STATISTICS 1000");
     }
 
     @Test void testAlterStatisticsOwner() throws SQLException {
-        exec("ALTER STATISTICS mystat OWNER TO newowner");
+        statistic("mystat_owner");
+        exec("ALTER STATISTICS mystat_owner OWNER TO newowner");
     }
 
     @Test void testAlterStatisticsRename() throws SQLException {
-        exec("ALTER STATISTICS mystat RENAME TO newstat");
+        statistic("mystat_rename");
+        exec("ALTER STATISTICS mystat_rename RENAME TO newstat");
     }
 
     @Test void testAlterStatisticsSchema() throws SQLException {
-        exec("ALTER STATISTICS mystat SET SCHEMA public");
+        statistic("mystat_schema");
+        exec("ALTER STATISTICS mystat_schema SET SCHEMA public");
     }
 
     @Test void testDropStatistics() throws SQLException {
-        exec("DROP STATISTICS mystat");
+        statistic("mystat_drop");
+        exec("DROP STATISTICS mystat_drop");
     }
 
     @Test void testDropStatisticsIfExists() throws SQLException {

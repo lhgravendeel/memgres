@@ -438,6 +438,8 @@ public class PlpgsqlExecutor {
 
         // Check if this is a SETOF or TABLE-returning function
         String returnType = function.getReturnType();
+        // RETURNS void discards whatever the final statement produced
+        if ("void".equalsIgnoreCase(returnType)) return null;
         boolean isSetof = returnType != null && returnType.toUpperCase().startsWith("SETOF");
         boolean isTable = returnType != null && returnType.equalsIgnoreCase("TABLE");
         if (isSetof || isTable) {

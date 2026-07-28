@@ -305,7 +305,7 @@ class DdlParser {
             String statName = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) statName = parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_statistics", statName);
+            return new SetStmt("drop_statistics", statName + "\0" + (dropIfExists ? "1" : "0"));
         }
         else throw new ParseException("Unsupported DROP target", parser.peek());
 
@@ -611,8 +611,9 @@ class DdlParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_noop", "ok");
         }
+        if (parser.matchKeyword("AGGREGATE")) return parseAlterAggregate();
         // No-op ALTER targets
-        if (parser.matchKeyword("AGGREGATE") || parser.matchKeyword("COLLATION")
+        if (parser.matchKeyword("COLLATION")
                 || parser.matchKeyword("RULE") || parser.matchKeyword("CONVERSION")
                 || parser.matchKeyword("TABLESPACE")
                 || parser.matchKeyword("LANGUAGE")
@@ -970,16 +971,21 @@ class DdlParser {
         // Parse argument types: CREATE AGGREGATE name ( argtype [, ...] ) ( ... )
         // or CREATE AGGREGATE name ( ORDER BY argtype ) for ordered-set aggregates
         List<String> argTypes = new ArrayList<>();
+        // Arguments before ORDER BY are the direct arguments of an ordered-set aggregate; they
+        // are not passed to the transition function, so the two groups have to stay apart.
+        int directArgCount = -1;
         if (parser.match(TokenType.LEFT_PAREN)) {
             // Check for ORDER BY (ordered-set aggregate) or * or type list
             if (parser.matchKeyword("ORDER")) {
                 parser.matchKeyword("BY");
+                directArgCount = 0;
             }
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
                 // Handle ORDER BY appearing mid-list (ordered-set aggregates)
                 if (parser.checkKeyword("ORDER")) {
                     parser.advance(); // consume ORDER
                     parser.matchKeyword("BY"); // consume BY
+                    directArgCount = argTypes.size();
                     continue;
                 }
                 if (parser.check(TokenType.STAR)) {
@@ -1061,11 +1067,8 @@ class DdlParser {
             parser.expect(TokenType.RIGHT_PAREN);
         }
 
-        if (sfunc == null || stype == null) {
-            // Incomplete aggregate — treat as no-op (some dumps have partial aggregates)
-            return new SetStmt("create_noop", "ok");
-        }
-        return new CreateAggregateStmt(name, argTypes, sfunc, stype, initcond, finalfunc, combinefunc, sortop);
+        return new CreateAggregateStmt(name, argTypes, directArgCount, sfunc, stype, initcond,
+                finalfunc, combinefunc, sortop);
     }
 
     /**
@@ -1472,6 +1475,13 @@ class DdlParser {
             }
         }
         String name = opName.toString().trim();
+        // The grammar only accepts a symbolic operator name here, so a word is a syntax error
+        // at the parenthesis that follows it, exactly as PG reports it.
+        for (int i = 0; i < name.length(); i++) {
+            if ("+-*/<>=~!@#%^&|`?".indexOf(name.charAt(i)) < 0) {
+                throw new com.memgres.engine.MemgresException("syntax error at or near \"(\"", "42601");
+            }
+        }
 
         parser.expect(TokenType.LEFT_PAREN);
 
@@ -2039,8 +2049,12 @@ class DdlParser {
         }
         List<String> tags = null;
         if (parser.matchKeyword("WHEN")) {
-            // WHEN TAG IN ('tag1', 'tag2', ...)
-            parser.readIdentifier(); // TAG
+            // WHEN TAG IN ('tag1', 'tag2', ...); TAG is the only filter variable PG defines
+            String filterVar = parser.readIdentifier();
+            if (!"tag".equalsIgnoreCase(filterVar)) {
+                throw new com.memgres.engine.MemgresException(
+                        "unrecognized filter variable \"" + filterVar.toLowerCase() + "\"", "42601");
+            }
             parser.expectKeyword("IN");
             parser.match(TokenType.LEFT_PAREN);
             tags = new ArrayList<>();
@@ -2152,10 +2166,31 @@ class DdlParser {
         String tableName = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier();
 
-        // Encode: "create_statistics:name:table:col1,col2:kind1,kind2"
+        // Encode: "create_statistics:name:table:col1,col2:kind1,kind2:ifNotExists"
         String kindsStr = kinds.isEmpty() ? "" : String.join(",", kinds);
         String colsStr = String.join(",", columns);
-        return new SetStmt("create_statistics", name + "\0" + tableName + "\0" + colsStr + "\0" + kindsStr);
+        return new SetStmt("create_statistics", name + "\0" + tableName + "\0" + colsStr + "\0"
+                + kindsStr + "\0" + (ifNotExists ? "1" : "0"));
+    }
+
+    // ---- ALTER AGGREGATE ----
+
+    Statement parseAlterAggregate() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        List<String> argTypes = new ArrayList<>();
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            argTypes = parseFunctionDropParamTypes();
+        }
+        String action = "noop";
+        String newName = "";
+        if (parser.matchKeywords("RENAME", "TO")) {
+            action = "rename";
+            newName = parser.readIdentifier();
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_aggregate",
+                name + "\0" + String.join("\1", argTypes) + "\0" + action + "\0" + newName);
     }
 
     // ---- ALTER STATISTICS ----
@@ -2574,19 +2609,18 @@ class DdlParser {
         parser.expect(TokenType.RIGHT_PAREN);
 
         String functionName = null;
+        List<String> funcArgTypes = null;
+        boolean withInout = false;
         if (parser.matchKeyword("WITH")) {
             if (parser.matchKeyword("FUNCTION")) {
                 functionName = parser.readIdentifier();
-                // consume optional argument list
-                if (parser.match(TokenType.LEFT_PAREN)) {
-                    while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                        parser.advance();
-                    }
-                    parser.expect(TokenType.RIGHT_PAREN);
+                if (parser.match(TokenType.DOT)) functionName += "." + parser.readIdentifier();
+                if (parser.check(TokenType.LEFT_PAREN)) {
+                    funcArgTypes = parseFunctionDropParamTypes();
                 }
             } else if (parser.matchKeyword("INOUT")) {
                 // WITH INOUT: I/O conversion cast
-                functionName = null;
+                withInout = true;
             }
         } else if (parser.matchKeywords("WITHOUT", "FUNCTION")) {
             functionName = null;
@@ -2601,6 +2635,6 @@ class DdlParser {
             }
         }
 
-        return new CreateCastStmt(sourceType, targetType, functionName, castContext);
+        return new CreateCastStmt(sourceType, targetType, functionName, funcArgTypes, withInout, castContext);
     }
 }
