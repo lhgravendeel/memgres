@@ -1142,7 +1142,9 @@ class CatalogMetadataFunctions {
         m.put(2287, "record[]");
         m.put(2278, "void");
         m.put(2276, "any");
-        m.put(2277, "anyarray");
+        for (String polyName : PolymorphicTypes.names()) {
+            m.put(PolymorphicTypes.oid(polyName), polyName);
+        }
         m.put(22, "int2vector");
         m.put(30, "oidvector");
         m.put(18, "\"char\"");

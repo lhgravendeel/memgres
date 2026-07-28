@@ -651,6 +651,20 @@ public class AstExecutor {
         return session != null ? session.getCreationSchema() : "public";
     }
 
+    /**
+     * Schemas an unqualified name is looked up in, in precedence order. pg_catalog is implicitly
+     * first, which is what makes a built-in win over a same-named function in a user schema.
+     */
+    java.util.List<String> searchPathSchemas() {
+        java.util.LinkedHashSet<String> path = new java.util.LinkedHashSet<>();
+        path.add("pg_catalog");
+        if (session != null) {
+            for (String s : session.getEffectiveSearchPath(false)) path.add(s.toLowerCase());
+        }
+        path.add("public");
+        return new ArrayList<>(path);
+    }
+
     String sessionUser() {
         if (session != null && session.getConnectingUser() != null) {
             return session.getConnectingUser();

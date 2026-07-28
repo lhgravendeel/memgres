@@ -10,6 +10,8 @@ public final class DropStmt implements Statement {
     public final boolean ifExists;
     public final boolean cascade;
     public final java.util.List<String> paramTypes;
+    /** Explicit schema qualifier, when the statement gave one; null means "search the path". */
+    public final String schema;
 
     public DropStmt(
             ObjectType objectType,
@@ -29,12 +31,25 @@ public final class DropStmt implements Statement {
             boolean cascade,
             java.util.List<String> paramTypes
     ) {
+        this(objectType, name, onTable, ifExists, cascade, paramTypes, null);
+    }
+
+    public DropStmt(
+            ObjectType objectType,
+            String name,
+            String onTable,
+            boolean ifExists,
+            boolean cascade,
+            java.util.List<String> paramTypes,
+            String schema
+    ) {
         this.objectType = objectType;
         this.name = name;
         this.onTable = onTable;
         this.ifExists = ifExists;
         this.cascade = cascade;
         this.paramTypes = paramTypes;
+        this.schema = schema;
     }
 
     public enum ObjectType {
@@ -49,6 +64,7 @@ public final class DropStmt implements Statement {
     public boolean ifExists() { return ifExists; }
     public boolean cascade() { return cascade; }
     public java.util.List<String> paramTypes() { return paramTypes; }
+    public String schema() { return schema; }
 
     @Override
     public boolean equals(Object o) {

@@ -27,6 +27,17 @@ class CatalogSystemFunctions {
         this.privilegeFunctions = new CatalogPrivilegeFunctions(executor);
     }
 
+    /** True when the call names a user function whose declared result type is polymorphic. */
+    private boolean isPolymorphicUserFunction(FunctionCallExpr fn) {
+        String name = fn.name();
+        int dot = name.lastIndexOf('.');
+        if (dot >= 0) name = name.substring(dot + 1);
+        for (PgFunction f : executor.database.getFunctionOverloads(name)) {
+            if (PolymorphicTypes.isPolymorphic(f.getReturnType())) return true;
+        }
+        return false;
+    }
+
     private void requireArgs(FunctionCallExpr fn, int min) {
         if (fn.args().size() < min) {
             throw new MemgresException(
@@ -163,7 +174,17 @@ class CatalogSystemFunctions {
 
                 if (arg instanceof AstExecutor.PgRow) return "record";
 
-                if (arg == null) return "unknown";
+                if (arg == null) {
+                    // A polymorphic routine's result type comes from its arguments, so it is known
+                    // even when the call returned NULL and there is no value to read it off.
+                    if (rawExpr instanceof FunctionCallExpr && isPolymorphicUserFunction((FunctionCallExpr) rawExpr)) {
+                        DataType inferred = executor.exprEvaluator.inferTypeFromContext(
+                                rawExpr, ctx != null ? ctx.getBindings()
+                                        : new ArrayList<RowContext.TableBinding>());
+                        if (inferred != null) return pgTypeDisplayName(inferred);
+                    }
+                    return "unknown";
+                }
 
                 if (arg instanceof java.util.List<?>) {
                     java.util.List<?> list = (java.util.List<?>) arg;
