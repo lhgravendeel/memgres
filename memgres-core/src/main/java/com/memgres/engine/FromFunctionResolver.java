@@ -734,7 +734,7 @@ class FromFunctionResolver {
             JsonFunctions.requireJsonEachObject(fname, json);
             try {
                 boolean isText = fname.contains("_text");
-                Map<String, String> pairs = JsonOperations.parseObjectKeys(json);
+                Map<String, String> pairs = JsonFunctions.eachMembers(fname, json);
                 for (Map.Entry<String, String> entry : pairs.entrySet()) {
                     String value = entry.getValue();
                     if (isText && value != null && value.startsWith("\"") && value.endsWith("\"")) {
@@ -1062,7 +1062,7 @@ class FromFunctionResolver {
         if (json != null) {
             String s = json.toString().trim();
             JsonFunctions.requireJsonObject(fname, s);
-            for (String key : JsonOperations.parseObjectKeys(s).keySet()) {
+            for (String key : JsonFunctions.eachMembers(fname, s).keySet()) {
                 Object[] row = new Object[]{key};
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));

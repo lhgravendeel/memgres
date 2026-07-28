@@ -47,6 +47,7 @@ class SelectExecutor {
     static final Set<String> SRF_FUNCTION_NAMES = Cols.setOf("generate_series", "unnest", "regexp_matches",
             "json_array_elements", "jsonb_array_elements", "json_object_keys", "jsonb_object_keys",
             "json_array_elements_text", "jsonb_array_elements_text", "generate_subscripts",
+            "json_each", "jsonb_each", "json_each_text", "jsonb_each_text",
             "jsonb_path_query", "jsonb_path_query_tz", "aclexplode", "string_to_table", "regexp_split_to_table",
             "pg_listening_channels", "pg_snapshot_xip", "txid_snapshot_xip",
             "skeys", "svals", "each", "_pg_expandarray");
@@ -462,7 +463,9 @@ class SelectExecutor {
         List<Column> resultColumns = new ArrayList<>();
         List<java.util.function.Function<RowContext, Object>> projections = new ArrayList<>();
 
-        buildProjections(stmt.targets(), baseBindings, resultColumns, projections, usingColumnsLower);
+        Set<Integer> srfIndices = new HashSet<>();
+        buildProjections(stmt.targets(), baseBindings, resultColumns, projections, usingColumnsLower,
+                srfIndices);
 
         // An ordinal ORDER BY counts output columns, so a star target has to be expanded
         // first: SELECT * FROM t ORDER BY 2 means the table's second column.
@@ -486,13 +489,6 @@ class SelectExecutor {
             }
         }
 
-        // Check for SRFs
-        Set<Integer> srfIndices = new HashSet<>();
-        for (int ti = 0; ti < stmt.targets().size(); ti++) {
-            if (isSrfCall(stmt.targets().get(ti).expr())) {
-                srfIndices.add(ti);
-            }
-        }
         boolean hasSrf = !srfIndices.isEmpty();
 
         if (!hasSrf) {
@@ -1033,12 +1029,19 @@ class SelectExecutor {
         return resultRows;
     }
 
+    /**
+     * @param srfProjections collects the index of every projection whose value is a set to expand
+     *     into rows. A star target contributes several projections for the one target, so
+     *     counting targets would point the expansion at the wrong column.
+     */
     private void buildProjections(List<SelectStmt.SelectTarget> targets,
                                    List<RowContext.TableBinding> baseBindings,
                                    List<Column> resultColumns,
                                    List<java.util.function.Function<RowContext, Object>> projections,
-                                   Set<String> usingColumnsForDedup) {
+                                   Set<String> usingColumnsForDedup,
+                                   Set<Integer> srfProjections) {
         for (SelectStmt.SelectTarget target : targets) {
+            int projectionStart = projections.size();
             if (target.expr() instanceof WildcardExpr) {
                 WildcardExpr w = (WildcardExpr) target.expr();
                 if (w.table() != null) {
@@ -1100,7 +1103,18 @@ class SelectExecutor {
                 CompositeStarExpr cse = (CompositeStarExpr) target.expr();
                 String typeName = resolveCompositeTypeFromBindings(cse.expr(), baseBindings);
                 if (typeName == null) typeName = executor.resolveCompositeTypeNamePublic(cse.expr(), null);
-                if (typeName != null) {
+                List<String> recordFields = typeName != null ? null
+                        : JsonFunctions.recordFieldNames(cse.expr());
+                if (recordFields != null) {
+                    // A record built by the call itself, not by a declared type: the names come
+                    // from the function, and one call can produce a whole set of such records.
+                    for (int fi = 0; fi < recordFields.size(); fi++) {
+                        resultColumns.add(new Column(recordFields.get(fi), DataType.TEXT, true, false, null));
+                        final Expression innerExpr = cse.expr();
+                        final int fieldIdx = fi;
+                        projections.add(ctx -> recordField(executor.evalExpr(innerExpr, ctx), fieldIdx));
+                    }
+                } else if (typeName != null) {
                     List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
                     if (fields != null) {
                         final String resolvedTypeName = typeName;
@@ -1166,7 +1180,23 @@ class SelectExecutor {
                     projections.add(ctx -> executor.evalExpr(expr, ctx));
                 }
             }
+            if (srfProjections != null && isSrfCall(target.expr())) {
+                for (int pi = projectionStart; pi < projections.size(); pi++) srfProjections.add(pi);
+            }
         }
+    }
+
+    /**
+     * One field of a record, or the same field of every record when the value is a whole set --
+     * which keeps the fields of {@code (jsonb_each(x)).*} expanding in step with each other.
+     */
+    private static Object recordField(Object value, int fieldIdx) {
+        if (value instanceof List<?>) {
+            List<Object> fields = new ArrayList<>();
+            for (Object element : (List<?>) value) fields.add(recordField(element, fieldIdx));
+            return fields;
+        }
+        return value instanceof RecordValue ? ((RecordValue) value).valueAt(fieldIdx) : null;
     }
 
     /** Copy a column from a table, setting tableOid and attNum for RowDescription metadata. */
@@ -1394,7 +1424,16 @@ class SelectExecutor {
                     CompositeStarExpr cse = (CompositeStarExpr) target.expr();
                     String typeName = executor.resolveCompositeTypeNamePublic(cse.expr(), null);
                     Object val = executor.evalExpr(cse.expr(), null);
-                    if (typeName != null) {
+                    List<String> recordFields = typeName != null ? null
+                            : JsonFunctions.recordFieldNames(cse.expr());
+                    if (recordFields != null) {
+                        for (int fi = 0; fi < recordFields.size(); fi++) {
+                            columns.add(new Column(recordFields.get(fi), DataType.TEXT, true, false, null));
+                            Object field = recordField(val, fi);
+                            if (field instanceof List<?>) srfMap.put(valuesList.size(), (List<?>) field);
+                            valuesList.add(field);
+                        }
+                    } else if (typeName != null) {
                         List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
                         if (fields != null) {
                             for (CreateTypeStmt.CompositeField field : fields) {
@@ -1412,6 +1451,10 @@ class SelectExecutor {
                 }
             }
             Object[] values = valuesList.toArray();
+            if (!srfMap.isEmpty()) {
+                return QueryResult.select(columns,
+                        applyOffsetAndLimit(stmt, expandSrfRows(values, srfMap)));
+            }
             List<Object[]> rows = new ArrayList<>();
             rows.add(values);
             return QueryResult.select(columns, rows);
@@ -1457,20 +1500,7 @@ class SelectExecutor {
         }
 
         if (srfIndex >= 0 && srfList != null) {
-            List<Object[]> rows = new ArrayList<>();
-            int maxLen = 0;
-            for (List<?> sl : srfMap.values()) {
-                if (sl.size() > maxLen) maxLen = sl.size();
-            }
-            for (int ri = 0; ri < maxLen; ri++) {
-                Object[] row = Arrays.copyOf(values, values.length);
-                for (Map.Entry<Integer, List<?>> entry : srfMap.entrySet()) {
-                    int idx = entry.getKey();
-                    List<?> sl = entry.getValue();
-                    row[idx] = ri < sl.size() ? sl.get(ri) : null;
-                }
-                rows.add(row);
-            }
+            List<Object[]> rows = expandSrfRows(values, srfMap);
             List<SelectStmt.OrderByItem> resolvedOrderBy = resolveOrderBy(stmt.orderBy(), stmt.targets());
             if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
                 final List<SelectStmt.OrderByItem> ob = resolvedOrderBy;
@@ -1512,6 +1542,27 @@ class SelectExecutor {
         List<Object[]> single = new ArrayList<>();
         single.add(values);
         return QueryResult.select(columns, applyOffsetAndLimit(stmt, single));
+    }
+
+    /**
+     * One row per element of the largest set in the row. Sets of different sizes run to the
+     * longest and the shorter ones read NULL past their end, which is what PG does since 10.
+     */
+    private static List<Object[]> expandSrfRows(Object[] values, Map<Integer, List<?>> srfMap) {
+        int maxLen = 0;
+        for (List<?> sl : srfMap.values()) {
+            if (sl.size() > maxLen) maxLen = sl.size();
+        }
+        List<Object[]> rows = new ArrayList<>();
+        for (int ri = 0; ri < maxLen; ri++) {
+            Object[] row = Arrays.copyOf(values, values.length);
+            for (Map.Entry<Integer, List<?>> entry : srfMap.entrySet()) {
+                List<?> sl = entry.getValue();
+                row[entry.getKey()] = ri < sl.size() ? sl.get(ri) : null;
+            }
+            rows.add(row);
+        }
+        return rows;
     }
 
     private void collectUsingColumns(List<SelectStmt.FromItem> fromItems, Set<String> result) {
@@ -1911,6 +1962,9 @@ class SelectExecutor {
         if (expr instanceof UnaryExpr) return findSrfCall(((UnaryExpr) expr).operand());
         if (expr instanceof com.memgres.engine.parser.ast.FieldAccessExpr) {
             return findSrfCall(((com.memgres.engine.parser.ast.FieldAccessExpr) expr).expr());
+        }
+        if (expr instanceof CompositeStarExpr) {
+            return findSrfCall(((CompositeStarExpr) expr).expr());
         }
         return null;
     }
