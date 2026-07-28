@@ -282,8 +282,13 @@ class DdlAlterTableExecutor {
             executeAttachPartition(attach, table, stmt, schemaName);
         } else if (action instanceof AlterTableStmt.DetachPartition) {
             AlterTableStmt.DetachPartition detach = (AlterTableStmt.DetachPartition) action;
+            requirePartitionedTable(table, stmt.table(), "DETACH PARTITION");
             String detachSchemaName = detach.partitionSchema() != null ? detach.partitionSchema() : schemaName;
             Table partition = executor.resolveTable(detachSchemaName, detach.partitionName());
+            if (!table.getPartitions().contains(partition)) {
+                throw new MemgresException("relation \"" + detach.partitionName()
+                        + "\" is not a partition of relation \"" + stmt.table() + "\"", "42P01");
+            }
             table.removePartition(partition);
             partition.setPartitionParent(null);
             partition.clearPartitionBounds();
@@ -299,21 +304,8 @@ class DdlAlterTableExecutor {
                     oldConstraint.getCheckExpr(), oldConstraint.getReferencesTable(),
                     oldConstraint.getReferencesColumns(), oldConstraint.getOnDelete(), oldConstraint.getOnUpdate());
             table.addConstraint(newConstraint);
-        } else if (action instanceof AlterTableStmt.AlterConstraintEnforced) {
-            AlterTableStmt.AlterConstraintEnforced ace = (AlterTableStmt.AlterConstraintEnforced) action;
-            StoredConstraint sc = table.getConstraint(ace.constraintName());
-            if (sc == null) {
-                throw new MemgresException("constraint \"" + ace.constraintName() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
-            }
-            // PG 18: only FOREIGN KEY constraints support ALTER CONSTRAINT ... [NOT] ENFORCED.
-            // CHECK, UNIQUE, PRIMARY KEY, and EXCLUDE constraints cannot be toggled.
-            if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) {
-                throw new MemgresException(
-                        "cannot alter enforceability of constraint \"" + ace.constraintName()
-                                + "\" of relation \"" + stmt.table() + "\"",
-                        "42809");
-            }
-            sc.setNotEnforced(ace.notEnforced());
+        } else if (action instanceof AlterTableStmt.AlterConstraintAttrs) {
+            executeAlterConstraint((AlterTableStmt.AlterConstraintAttrs) action, table, stmt);
         } else if (action instanceof AlterTableStmt.SetSchema) {
             AlterTableStmt.SetSchema setSchema = (AlterTableStmt.SetSchema) action;
             Schema oldSchema = executor.database.getSchema(schemaName);
@@ -1353,20 +1345,20 @@ class DdlAlterTableExecutor {
             sc.setPromotedFromIndex(true);
         }
         if (sc != null) {
+            // For FK constraints without explicit schema, default to the table's schema
+            if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
+                    && sc.getReferencesSchema() == null && sc.getReferencesTable() != null) {
+                sc.setReferencesSchema(schemaName);
+            }
+            // PG checks the key's definition before it looks for a name collision.
+            if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
+                ddl.validateForeignKeyDefinition(sc, table, schemaName);
+            }
             if (sc.getName() != null && table.getConstraint(sc.getName()) != null) {
                 throw new MemgresException("constraint \"" + sc.getName() + "\" for relation \"" + stmt.table() + "\" already exists", "42710");
             }
             if (addConstraint.notValid()) {
                 sc.setConvalidated(false);
-            }
-            // For FK constraints without explicit schema, default to the table's schema
-            if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
-                    && sc.getReferencesSchema() == null && sc.getReferencesTable() != null) {
-                Table refTable = ddl.resolveTableOrNull(sc.getReferencesTable());
-                if (refTable != null) {
-                    ddl.tableExecutor.checkTempPermanentReference(schemaName, refTable);
-                }
-                sc.setReferencesSchema(schemaName);
             }
             if (!sc.isNotEnforced() && !addConstraint.notValid()) {
                 if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
@@ -1492,6 +1484,37 @@ class DdlAlterTableExecutor {
         }
     }
 
+    /**
+     * Which constraint kinds accept which attributes is what PostgreSQL checks here, and it
+     * checks it per attribute named rather than per statement: deferrability belongs to foreign
+     * keys, inheritability to not-null constraints, enforceability to foreign keys.
+     */
+    private void executeAlterConstraint(AlterTableStmt.AlterConstraintAttrs ac, Table table,
+                                        AlterTableStmt stmt) {
+        StoredConstraint sc = table.getConstraint(ac.constraintName());
+        if (sc == null) {
+            throw new MemgresException("constraint \"" + ac.constraintName() + "\" of relation \""
+                    + stmt.table() + "\" does not exist", "42704");
+        }
+        boolean isForeignKey = sc.getType() == StoredConstraint.Type.FOREIGN_KEY;
+        if ((ac.deferrable() != null || ac.initiallyDeferred() != null) && !isForeignKey) {
+            throw PgErrors.wrongObjectType("constraint \"" + ac.constraintName() + "\" of relation \""
+                    + stmt.table() + "\" is not a foreign key constraint");
+        }
+        // memgres has no stored NOT NULL constraint object, so inheritability never applies.
+        if (ac.alterInheritability()) {
+            throw PgErrors.wrongObjectType("constraint \"" + ac.constraintName() + "\" of relation \""
+                    + stmt.table() + "\" is not a not-null constraint");
+        }
+        if (ac.enforced() != null && !isForeignKey) {
+            throw PgErrors.wrongObjectType("cannot alter enforceability of constraint \""
+                    + ac.constraintName() + "\" of relation \"" + stmt.table() + "\"");
+        }
+        if (ac.deferrable() != null) sc.setDeferrable(ac.deferrable());
+        if (ac.initiallyDeferred() != null) sc.setInitiallyDeferred(ac.initiallyDeferred());
+        if (ac.enforced() != null) sc.setNotEnforced(!ac.enforced());
+    }
+
     private void executeValidateConstraint(AlterTableStmt.ValidateConstraint vc, Table table,
                                             AlterTableStmt stmt) {
         StoredConstraint sc = table.getConstraint(vc.constraintName());
@@ -1513,25 +1536,79 @@ class DdlAlterTableExecutor {
 
     private void executeAttachPartition(AlterTableStmt.AttachPartition attach, Table table,
                                          AlterTableStmt stmt, String schemaName) {
+        requirePartitionedTable(table, stmt.table(), "ATTACH PARTITION");
         String partSchemaName = attach.partitionSchema() != null ? attach.partitionSchema() : schemaName;
+        rejectNonTableRelation(attach.partitionName(), "ATTACH PARTITION");
         Table partition = executor.resolveTable(partSchemaName, attach.partitionName());
         rejectInheritanceCycle(partition, table, attach.partitionName(), stmt.table());
         if (table.getPartitions().contains(partition)) {
             throw new MemgresException("table \"" + attach.partitionName()
                     + "\" is already a partition of \"" + stmt.table() + "\"", "42809");
         }
-        // C4a: Validate column compatibility (names and types must match parent)
-        validatePartitionColumns(table, partition, attach.partitionName());
-        // Validate bounds before attaching, so overlapping bounds (42P17) don't leave
+        // A table can belong to one parent only; attaching it a second time would give it two
+        // routing paths, and detaching either would leave the other pointing at nothing.
+        if (partition.getPartitionParent() != null) {
+            throw PgErrors.wrongObjectType("\"" + attach.partitionName() + "\" is already a partition");
+        }
+        // Validate bounds before attaching, so a rejected bound (42P16/42P17) doesn't leave
         // the table half-attached to the parent's routing list
         if (attach.bounds() != null && !attach.bounds().isEmpty()) {
             ddl.tableExecutor.applyPartitionBounds(partition, table, attach.bounds(), attach.partitionName());
         }
+        // C4a: Validate column compatibility (names and types must match parent)
+        validatePartitionColumns(table, partition, attach.partitionName());
         // C4b: Validate existing rows satisfy partition bounds
         validateExistingRowBounds(partition, table, attach.partitionName());
+        // Rows the default partition absorbed only because nothing else claimed them would now
+        // belong to the new partition, so the default's constraint no longer holds for them.
+        validateDefaultPartitionRows(table, partition, attach.partitionName());
         partition.setPartitionParent(table);
         partition.setParentColumnRemap(buildParentColumnRemap(table, partition));
         table.addPartition(partition);
+    }
+
+    /** ATTACH/DETACH PARTITION only apply to a partitioned table. */
+    private void requirePartitionedTable(Table table, String relation, String action) {
+        if (table.getPartitionStrategy() != null) return;
+        MemgresException ex = new MemgresException("ALTER action " + action
+                + " cannot be performed on relation \"" + relation + "\"", "42809");
+        ex.setDetail("This operation is not supported for tables.");
+        throw ex;
+    }
+
+    /** A view named as the partition of an ATTACH is refused before it resolves to a base table. */
+    private void rejectNonTableRelation(String name, String action) {
+        Database.ViewDef view = executor.database.getView(name);
+        if (view == null) return;
+        MemgresException ex = new MemgresException("ALTER action " + action
+                + " cannot be performed on relation \"" + name + "\"", "42809");
+        ex.setDetail(view.materialized
+                ? "This operation is not supported for materialized views."
+                : "This operation is not supported for views.");
+        throw ex;
+    }
+
+    /**
+     * A default partition holds exactly the rows no other partition claims. Attaching a partition
+     * narrows that set, so any row the default is holding which the new bounds would now cover
+     * makes the default's own constraint false.
+     */
+    private void validateDefaultPartitionRows(Table parent, Table incoming, String partName) {
+        String strategy = parent.getPartitionStrategy();
+        if (strategy == null) return;
+        String partCol = parent.getPartitionColumn();
+        if (partCol == null) return;
+        for (Table existing : parent.getPartitions()) {
+            if (!existing.isDefaultPartition() || existing.getRows().isEmpty()) continue;
+            int colIdx = existing.getColumnIndex(partCol);
+            if (colIdx < 0) continue;
+            for (Object[] row : existing.getRows()) {
+                if (rowSatisfiesBounds(row[colIdx], incoming, strategy)) {
+                    throw new MemgresException("updated partition constraint for default partition \""
+                            + existing.getName() + "\" would be violated by some row", "23514");
+                }
+            }
+        }
     }
 
     /**

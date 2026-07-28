@@ -53,7 +53,8 @@ class ForeignKeyAdvancedTest {
 
     @Test
     void testOnDeleteSetNullSingleColumn() throws SQLException {
-        exec("CREATE TABLE fk_parent (id serial PRIMARY KEY, name text)");
+        // The referenced pair needs a key of its own; the primary key alone does not cover it.
+        exec("CREATE TABLE fk_parent (id serial PRIMARY KEY, name text, UNIQUE (id, name))");
         exec("""
             CREATE TABLE fk_child (
                 id serial PRIMARY KEY,
@@ -64,6 +65,22 @@ class ForeignKeyAdvancedTest {
                     ON DELETE SET NULL (parent_name)
             )
         """);
+    }
+
+    @Test
+    void testReferencedPairWithoutItsOwnKeyIsRejected() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            exec("CREATE TABLE fk_parent_nokey (id serial PRIMARY KEY, name text)");
+            exec("""
+                CREATE TABLE fk_child_nokey (
+                    id serial PRIMARY KEY,
+                    parent_id int,
+                    parent_name text,
+                    FOREIGN KEY (parent_id, parent_name) REFERENCES fk_parent_nokey(id, name)
+                )
+            """);
+        });
+        assertEquals("42830", e.getSQLState(), e.getMessage());
     }
 
     @Test
@@ -82,7 +99,7 @@ class ForeignKeyAdvancedTest {
     }
 
     @Test
-    void testOnUpdateSetDefaultPartialColumn() throws SQLException {
+    void testOnDeleteSetDefaultPartialColumn() throws SQLException {
         exec("CREATE TABLE fk_p3 (id int PRIMARY KEY, code text UNIQUE)");
         exec("""
             CREATE TABLE fk_c3 (
@@ -90,9 +107,26 @@ class ForeignKeyAdvancedTest {
                 parent_id int DEFAULT 0,
                 parent_code text,
                 FOREIGN KEY (parent_id) REFERENCES fk_p3(id)
-                    ON UPDATE SET DEFAULT (parent_id)
+                    ON DELETE SET DEFAULT (parent_id)
             )
         """);
+    }
+
+    /** PG accepts a column list only on ON DELETE, never on ON UPDATE. */
+    @Test
+    void testOnUpdateSetDefaultPartialColumnIsRejected() {
+        SQLException e = assertThrows(SQLException.class, () -> {
+            exec("CREATE TABLE fk_p3b (id int PRIMARY KEY)");
+            exec("""
+                CREATE TABLE fk_c3b (
+                    id serial PRIMARY KEY,
+                    parent_id int DEFAULT 0,
+                    FOREIGN KEY (parent_id) REFERENCES fk_p3b(id)
+                        ON UPDATE SET DEFAULT (parent_id)
+                )
+            """);
+        });
+        assertEquals("0A000", e.getSQLState(), e.getMessage());
     }
 
     // =========================================================================
