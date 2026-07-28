@@ -390,4 +390,55 @@ class TriggerRulePolicyValidationTest {
         exec("DROP VIEW trp_cvv");
         exec("DROP TABLE trp_cv CASCADE");
     }
+
+    // ---- a rule reached through an updatable view ----
+
+    @Test
+    void aBaseTableRuleAlsoRunsWhenTheWriteArrivesThroughAView() throws Exception {
+        exec("CREATE TABLE trp_rv (i int, j text)");
+        exec("CREATE TABLE trp_rvlog (m text)");
+        exec("CREATE VIEW trp_rvv AS SELECT i FROM trp_rv WHERE i > 0 WITH CHECK OPTION");
+        exec("CREATE RULE trp_rvr AS ON INSERT TO trp_rv"
+                + " DO ALSO INSERT INTO trp_rvlog VALUES (NEW.j)");
+        try {
+            // writing to the table runs the rule
+            exec("INSERT INTO trp_rv VALUES (7, 'g')");
+            assertEquals("g", scalar("SELECT string_agg(m, ',' ORDER BY m) FROM trp_rvlog"));
+            // and so does writing through the view, which is rewritten onto the same table.
+            // The view has no j, so NEW.j is null there rather than a name left unresolved.
+            exec("INSERT INTO trp_rvv VALUES (8)");
+            assertEquals("g", scalar("SELECT string_agg(m, ',' ORDER BY m) FROM trp_rvlog"));
+            assertEquals("2", scalar("SELECT count(*)::text FROM trp_rvlog"));
+            assertEquals("7,8", scalar("SELECT string_agg(i::text, ',' ORDER BY i) FROM trp_rv"));
+        } finally {
+            exec("DROP VIEW IF EXISTS trp_rvv");
+            exec("DROP TABLE IF EXISTS trp_rv CASCADE");
+            exec("DROP TABLE IF EXISTS trp_rvlog CASCADE");
+        }
+    }
+
+    @Test
+    void recursionIsDetectedThroughAViewToo() throws Exception {
+        exec("CREATE TABLE trp_rr (i int, j text)");
+        exec("CREATE TABLE trp_rrlog (m text)");
+        exec("CREATE VIEW trp_rrv AS SELECT i FROM trp_rr WHERE i > 0 WITH CHECK OPTION");
+        exec("CREATE RULE trp_rrself AS ON INSERT TO trp_rrlog"
+                + " DO ALSO INSERT INTO trp_rrlog VALUES ('c')");
+        exec("CREATE RULE trp_rrhop AS ON INSERT TO trp_rr"
+                + " DO ALSO INSERT INTO trp_rrlog VALUES (NEW.j)");
+        try {
+            // the loop is one hop away from the table named, and two from the view
+            assertRejected("42P17", "infinite recursion detected in rules for relation",
+                    "INSERT INTO trp_rr VALUES (1, 'a')");
+            assertRejected("42P17", "infinite recursion detected in rules for relation",
+                    "INSERT INTO trp_rrv VALUES (5)");
+            // nothing of the refused statement survives
+            assertEquals("0", scalar("SELECT count(*)::text FROM trp_rrlog"));
+            assertEquals("0", scalar("SELECT count(*)::text FROM trp_rr"));
+        } finally {
+            exec("DROP VIEW IF EXISTS trp_rrv");
+            exec("DROP TABLE IF EXISTS trp_rr CASCADE");
+            exec("DROP TABLE IF EXISTS trp_rrlog CASCADE");
+        }
+    }
 }
