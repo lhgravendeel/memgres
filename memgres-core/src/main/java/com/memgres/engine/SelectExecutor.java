@@ -321,8 +321,9 @@ class SelectExecutor {
             return aggregateEvaluator.executeAggregateSelect(grouped, contexts, baseBindings);
         }
 
-        // Check for window functions in targets
-        if (hasWindowFunctionInTargets(stmt.targets())) {
+        // Check for window functions in targets, or ordered by without being selected
+        if (hasWindowFunctionInTargets(stmt.targets())
+                || windowEvaluator.orderByNeedsWindowEvaluation(stmt)) {
             return windowEvaluator.executeWindowSelect(stmt, contexts, baseBindings);
         }
 

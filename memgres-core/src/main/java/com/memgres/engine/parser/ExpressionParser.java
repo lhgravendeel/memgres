@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -1605,11 +1606,21 @@ public class ExpressionParser {
             expectKeyword("BY");
             List<SelectStmt.OrderByItem> withinOrderBy = parseOrderByList();
             expect(TokenType.RIGHT_PAREN);
+            if (checkKeyword("OVER")) {
+                throw new MemgresException("OVER is not supported for ordered-set aggregate "
+                        + name.toLowerCase(), "0A000");
+            }
             return new OrderedSetAggExpr(name.toLowerCase(), args, withinOrderBy);
         }
 
         // Check for OVER clause: window function
         if (checkKeyword("OVER")) {
+            // An aggregate's own ORDER BY decides the order it accumulates its input in, which a
+            // window frame already fixes; PostgreSQL has never implemented the combination.
+            if (innerOrderBy != null) {
+                throw new MemgresException(
+                        "aggregate ORDER BY is not implemented for window functions", "0A000");
+            }
             return specialFormParser.parseWindowFunction(name, args, distinct, isStar, ignoreNulls, fromLast, filter);
         }
 
