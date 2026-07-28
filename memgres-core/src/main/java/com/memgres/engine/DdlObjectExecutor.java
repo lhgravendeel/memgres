@@ -629,11 +629,16 @@ class DdlObjectExecutor {
             hasUnsupportedTxnCmd = containsUnsupportedTransactionCommand(stmt.body());
         }
         if (checkBodies && "plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
-            validatePlpgsqlDeclarations(stmt.body());
             validatePlpgsqlRaiseArgs(stmt.body());
             // PG compiles the body at CREATE time, so a body it cannot parse never becomes a
             // function that only fails when someone calls it.
-            com.memgres.engine.plpgsql.PlpgsqlParser.parse(stmt.body());
+            com.memgres.engine.plpgsql.PlpgsqlStatement.Block parsedBody =
+                    com.memgres.engine.plpgsql.PlpgsqlParser.parse(stmt.body());
+            List<String> paramNames = new ArrayList<>();
+            for (PgFunction.Param p : params) {
+                if (p.name() != null) paramNames.add(p.name());
+            }
+            PlpgsqlBodyValidator.validate(executor, parsedBody, paramNames);
         }
 
         // Validate SQL language function bodies (only when check_function_bodies=on)
@@ -1072,6 +1077,11 @@ class DdlObjectExecutor {
      * Used for validating return types and parameter types at CREATE FUNCTION time.
      */
     private void validateTypeExists(String typeName) {
+        validateTypeExists(executor, typeName);
+    }
+
+    /** Shared with the PL/pgSQL body validator, which checks declared variable types the same way. */
+    static void validateTypeExists(AstExecutor executor, String typeName) {
         if (typeName == null || typeName.isEmpty()) return;
         String base = typeName.replaceAll("\\(.*\\)", "").replace("[]", "").trim();
         if (base.isEmpty()) return;
@@ -1156,62 +1166,6 @@ class DdlObjectExecutor {
                 "delete", "slice", "hstore_to_json", "hstore_to_jsonb",
                 "hstore_to_json_loose", "hstore_to_jsonb_loose",
                 "hstore_to_array", "hstore_to_matrix", "populate_record").contains(name);
-    }
-
-    /**
-     * Validate PL/pgSQL DECLARE variable types at CREATE FUNCTION time.
-     * PG 18 validates that declared variable types exist immediately.
-     */
-    private void validatePlpgsqlDeclarations(String body) {
-        try {
-            com.memgres.engine.plpgsql.PlpgsqlStatement.Block block =
-                    com.memgres.engine.plpgsql.PlpgsqlParser.parse(body);
-            for (com.memgres.engine.plpgsql.PlpgsqlStatement.VarDeclaration decl : block.declarations()) {
-                String typeName = decl.typeName();
-                if (typeName == null || typeName.isEmpty()) continue;
-                if ("REFCURSOR".equalsIgnoreCase(typeName) || "refcursor".equals(typeName)) continue;
-                if ("record".equalsIgnoreCase(typeName)) continue;
-
-                // Handle %ROWTYPE
-                if (typeName.toUpperCase().endsWith("%ROWTYPE")) {
-                    String tableName = typeName.substring(0, typeName.length() - 8); // remove %ROWTYPE
-                    if (tableName.endsWith(".")) tableName = tableName.substring(0, tableName.length() - 1);
-                    // Validate table exists
-                    try {
-                        executor.resolveTable(executor.defaultSchema(), tableName);
-                    } catch (MemgresException e) {
-                        if ("42P01".equals(e.getSqlState())) throw e;
-                    }
-                    continue;
-                }
-
-                // Handle %TYPE
-                if (typeName.toUpperCase().endsWith("%TYPE")) {
-                    String ref = typeName.substring(0, typeName.length() - 5); // remove %TYPE
-                    int dotIdx = ref.lastIndexOf('.');
-                    if (dotIdx > 0) {
-                        String tableName = ref.substring(0, dotIdx);
-                        String colName = ref.substring(dotIdx + 1);
-                        try {
-                            Table table = executor.resolveTable(executor.defaultSchema(), tableName);
-                            if (table.getColumnIndex(colName) < 0) {
-                                throw new MemgresException("column \"" + colName + "\" does not exist", "42703");
-                            }
-                        } catch (MemgresException e) {
-                            if ("42P01".equals(e.getSqlState()) || "42703".equals(e.getSqlState())) throw e;
-                        }
-                    }
-                    continue;
-                }
-
-                // Regular type - validate existence
-                validateTypeExists(typeName);
-            }
-        } catch (MemgresException e) {
-            throw e;
-        } catch (Exception ignored) {
-            // Parse errors in the body are not validation errors at CREATE time
-        }
     }
 
     /**

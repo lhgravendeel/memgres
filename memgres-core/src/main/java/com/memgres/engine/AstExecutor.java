@@ -493,6 +493,42 @@ public class AstExecutor {
         return castEvaluator.applyCast(val, typeSpec);
     }
 
+    /**
+     * Coerce a value to a named type the way an assignment would, so a PL/pgSQL variable of a
+     * domain carries the domain's constraints rather than only its name.
+     */
+    public Object castValue(Object val, String typeSpec) {
+        return castEvaluator.applyCast(val, typeSpec);
+    }
+
+    /**
+     * The type a {@code table.column%TYPE} reference resolves to, or null when nothing typed
+     * answers to it. A domain column resolves to the domain so the constraint travels with it.
+     */
+    public String resolveTypeReference(String ref) {
+        if (ref == null) return null;
+        String[] parts = ref.split("\\.");
+        if (parts.length < 2) return null;
+        String column = parts[parts.length - 1];
+        String relation = parts[parts.length - 2];
+        String schema = parts.length >= 3 ? parts[parts.length - 3] : defaultSchema();
+        Table table;
+        try {
+            table = resolveTable(schema, relation);
+        } catch (RuntimeException e) {
+            return null;
+        }
+        if (table == null) return null;
+        int idx = table.getColumnIndex(column);
+        if (idx < 0) return null;
+        Column col = table.getColumns().get(idx);
+        if (col.getDomainTypeName() != null) return col.getDomainTypeName();
+        if (col.getEnumTypeName() != null) return col.getEnumTypeName();
+        if (col.getCompositeTypeName() != null) return null;
+        if (col.getArrayElementType() != null) return col.getArrayElementType().getPgName() + "[]";
+        return col.getType() != null ? col.getType().getPgName() : null;
+    }
+
     Object evalBinaryValues(BinaryExpr.BinOp op, Object left, Object right) {
         return binaryOpEvaluator.evalBinaryValues(op, left, right);
     }

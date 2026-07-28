@@ -64,9 +64,13 @@ public class PlpgsqlExecutor {
     }
 
     // Variable scope
-    static class Scope {
+    class Scope {
         final Map<String, Object> variables = new LinkedHashMap<>();
         final Map<String, String> declaredTypes = new LinkedHashMap<>();
+        /** Variables declared NOT NULL, mapped to the spelling the declaration used. */
+        final Map<String, String> notNullVars = new LinkedHashMap<>();
+        /** Variables of a domain type, so every assignment re-checks the domain's constraints. */
+        final Map<String, String> domainVars = new LinkedHashMap<>();
         final java.util.Set<String> outputOnlyVars = new java.util.HashSet<>();
         final Scope parent;
         int lastRowCount = 0;
@@ -97,13 +101,28 @@ public class PlpgsqlExecutor {
             Scope s = this;
             while (s != null) {
                 if (s.variables.containsKey(key)) {
-                    s.variables.put(key, value);
+                    s.variables.put(key, s.checkAssignable(key, value));
                     s.outputOnlyVars.remove(key); // once explicitly assigned, it's no longer output-only
                     return;
                 }
                 s = s.parent;
             }
             variables.put(key, value);
+        }
+
+        /**
+         * A declaration's NOT NULL and a domain's constraints have to hold on every write, not
+         * only on the initialiser — otherwise a value the declared type cannot represent moves
+         * freely through the variable.
+         */
+        Object checkAssignable(String key, Object value) {
+            String declaredName = notNullVars.get(key);
+            if (declaredName != null && value == null) {
+                throw new MemgresException("null value cannot be assigned to variable \""
+                        + declaredName + "\" declared NOT NULL", "22004");
+            }
+            String domain = domainVars.get(key);
+            return domain != null ? astExecutor.castValue(value, domain) : value;
         }
 
         boolean has(String name) {
@@ -169,6 +188,9 @@ public class PlpgsqlExecutor {
         } catch (RuntimeException e) {
             throw new MemgresException(e.getMessage() != null ? e.getMessage() : "syntax error in PL/pgSQL block", "42601");
         }
+        // PG compiles a DO block before running it, so a declaration it rejects never reaches a
+        // statement — nothing the block would have done takes effect.
+        PlpgsqlBodyValidator.validate(astExecutor, block, null);
         // DO blocks are anonymous code blocks that support transaction control (PG 11+)
         this.isProcedureExecution = true;
         this.currentFunctionName = null;
@@ -663,9 +685,22 @@ public class PlpgsqlExecutor {
                         decl.typeName());
                 continue;
             }
+            String coerceType = coercionType(decl.typeName());
             Object defaultVal = null;
             if (decl.defaultExpr() != null) {
-                defaultVal = evalDeclarationDefault(decl, scope);
+                defaultVal = evalDeclarationDefault(decl, coerceType, scope);
+            } else if (coerceType != null && database.isDomain(coerceType)) {
+                // A variable with no initialiser starts as NULL, which a NOT NULL domain rejects
+                astExecutor.castValue(null, coerceType);
+            }
+            if (decl.notNull() && defaultVal == null) {
+                throw new MemgresException("null value cannot be assigned to variable \""
+                        + decl.name() + "\" declared NOT NULL", "22004");
+            }
+            String key = decl.name().toLowerCase();
+            if (decl.notNull()) scope.notNullVars.put(key, decl.name());
+            if (coerceType != null && database.isDomain(coerceType)) {
+                scope.domainVars.put(key, coerceType);
             }
             scope.declareTyped(decl.name(), defaultVal, decl.typeName());
         }
@@ -754,16 +789,40 @@ public class PlpgsqlExecutor {
     }
 
     /**
-     * An array-typed variable must hold an array rather than the text of one, or a later
-     * subscript would have nothing to index into; PG coerces every initialiser to the declared
-     * type, and it is the array case that a raw evaluation gets wrong.
+     * PG runs every initialiser through the declared type's input function, so a value the type
+     * cannot represent fails at the declaration rather than travelling on inside the variable.
+     * The array case matters twice over: without the cast the variable holds the text of an
+     * array, which a later subscript has nothing to index into.
      */
-    private Object evalDeclarationDefault(PlpgsqlStatement.VarDeclaration decl, Scope scope) {
-        String type = decl.typeName();
-        if (type != null && type.endsWith("[]")) {
-            return evalExpr("CAST(" + decl.defaultExpr() + " AS " + type + ")", scope);
+    private Object evalDeclarationDefault(PlpgsqlStatement.VarDeclaration decl, String coerceType,
+                                          Scope scope) {
+        if (coerceType != null) {
+            return evalExpr("CAST(" + decl.defaultExpr() + " AS " + coerceType + ")", scope);
         }
         return evalExpr(decl.defaultExpr(), scope);
+    }
+
+    /**
+     * The concrete type an initialiser and later assignments are coerced to, or null when the
+     * declared type carries no coercion of its own — a record, a cursor or a whole row, where a
+     * cast would say nothing the value does not already say.
+     */
+    private String coercionType(String typeName) {
+        if (typeName == null) return null;
+        String type = typeName.trim();
+        if (type.isEmpty()) return null;
+        String upper = type.toUpperCase();
+        if (upper.endsWith("%ROWTYPE")) return null;
+        if (upper.endsWith("%TYPE")) {
+            String resolved = astExecutor.resolveTypeReference(
+                    type.substring(0, type.length() - "%TYPE".length()));
+            return resolved != null ? coercionType(resolved) : null;
+        }
+        String base = type.replaceAll("\\(.*\\)", "").replace("[]", "").trim();
+        if (base.equalsIgnoreCase("record") || base.equalsIgnoreCase("refcursor")) return null;
+        // A composite value already carries its own field names; casting it adds nothing
+        if (database.isCompositeType(base) || database.getRowType(base) != null) return null;
+        return type;
     }
 
     /**
