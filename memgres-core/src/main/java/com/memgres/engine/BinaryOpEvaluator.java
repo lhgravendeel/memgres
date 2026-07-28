@@ -152,9 +152,60 @@ class BinaryOpEvaluator {
         return LITERAL_RESOLVABLE_TYPES.contains(other) ? other : null;
     }
 
+    /** True for text spelled as an array, with or without the lower bounds an array may carry. */
+    private static boolean isArrayText(String text) {
+        String body = ArrayLiteral.body(text);
+        return body.startsWith("{") && body.endsWith("}");
+    }
+
     /** The range types, whose value is a pair of bounds written between brackets. */
     private static final Set<String> RANGE_TYPES = Cols.setOf(
             "int4range", "int8range", "numrange", "daterange", "tsrange", "tstzrange");
+
+    /**
+     * The element type each range is built over. A range's containment operators are declared over
+     * this type and nothing else -- there is no {@code numrange @> integer} to fall back on, even
+     * though an integer is a perfectly good numeric, so asking one that way is an error.
+     */
+    private static String rangeSubtype(String rangeType) {
+        if (rangeType == null) return null;
+        String base = rangeType.replace("multirange", "range");
+        if (base.equals("int4range")) return "integer";
+        if (base.equals("int8range")) return "bigint";
+        if (base.equals("numrange")) return "numeric";
+        if (base.equals("daterange")) return "date";
+        if (base.equals("tsrange")) return "timestamp without time zone";
+        if (base.equals("tstzrange")) return "timestamp with time zone";
+        return null;
+    }
+
+    /**
+     * A containment test between a range and a value of some other type than the range is built
+     * over. Only a type the query states counts: a column's type in memgres is whatever the engine
+     * settled on, and refusing an operator on the strength of that would reject working SQL.
+     */
+    private void rejectRangeElementTypeMismatch(BinaryExpr bin, RowContext ctx) {
+        if (bin.op() != BinaryExpr.BinOp.CONTAINS && bin.op() != BinaryExpr.BinOp.CONTAINED_BY) {
+            return;
+        }
+        String lDeclared = declaredOperandType(bin.left(), ctx);
+        String rDeclared = declaredOperandType(bin.right(), ctx);
+        boolean lRange = lDeclared != null
+                && (RANGE_TYPES.contains(lDeclared) || MULTIRANGE_TYPES.contains(lDeclared));
+        boolean rRange = rDeclared != null
+                && (RANGE_TYPES.contains(rDeclared) || MULTIRANGE_TYPES.contains(rDeclared));
+        if (lRange == rRange) return;
+        String scalar = typeWrittenInQuery(lRange ? bin.right() : bin.left());
+        if (scalar == null || familyOf(scalar) == null) return;
+        String subtype = rangeSubtype(lRange ? lDeclared : rDeclared);
+        if (subtype == null || subtype.equals(pgName(scalar))) return;
+        String lName = lRange ? lDeclared : pgName(scalar);
+        String rName = lRange ? pgName(scalar) : rDeclared;
+        throw new MemgresException("operator does not exist: " + lName + " "
+                + binOpToSymbol(bin.op()) + " " + rName
+                + "\n  Hint: No operator matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
+    }
 
     /** The multirange types, whose value is a brace-wrapped list of ranges. */
     private static final Set<String> MULTIRANGE_TYPES = Cols.setOf(
@@ -508,14 +559,16 @@ class BinaryOpEvaluator {
         }
 
         rejectCrossCategoryOperator(bin, ctx);
+        rejectRangeElementTypeMismatch(bin, ctx);
         rejectPhantomOperator(bin, ctx, left, right);
 
         // A range is stored as its text, so the values alone cannot tell one from a pair of dotted
         // numbers -- which is how numrange * numrange came out as inet * inet. Where the query
         // declares a range type the operator is resolved from that declaration instead.
-        if (bin.op() == BinaryExpr.BinOp.MULTIPLY) {
-            Object intersected = declaredRangeIntersection(bin, ctx, left, right);
-            if (intersected != NOT_A_RANGE_OPERATION) return intersected;
+        if (bin.op() == BinaryExpr.BinOp.MULTIPLY || bin.op() == BinaryExpr.BinOp.ADD
+                || bin.op() == BinaryExpr.BinOp.SUBTRACT) {
+            Object combined = declaredRangeArithmetic(bin, ctx, left, right);
+            if (combined != NOT_A_RANGE_OPERATION) return combined;
         }
 
         // Collation-aware string comparison for EQUAL/NOT_EQUAL
@@ -832,13 +885,13 @@ class BinaryOpEvaluator {
                 boolean leftIsRow = left instanceof AstExecutor.PgRow || left instanceof List<?>;
                 boolean rightIsRow = right instanceof AstExecutor.PgRow || right instanceof List<?>;
                 if (leftIsRow != rightIsRow) {
-                    // Allow comparing PG array literal string with an array/list
-                    if (left instanceof String && ((String) left).startsWith("{") && ((String) left).endsWith("}") && rightIsRow) {
-                        String s = (String) left;
-                        return TypeCoercion.areEqual(left, right);
-                    }
-                    if (right instanceof String && ((String) right).startsWith("{") && ((String) right).endsWith("}") && leftIsRow) {
-                        String s = (String) right;
+                    // Allow comparing PG array literal string with an array/list. An array's lower
+                    // bounds are part of its shape, so one written with a bound other than 1 is not
+                    // equal to the same elements written without one.
+                    String literal = rightIsRow && left instanceof String ? (String) left
+                            : (leftIsRow && right instanceof String ? (String) right : null);
+                    if (literal != null && isArrayText(literal)) {
+                        if (ArrayLiteral.statedBounds(literal) != null) return false;
                         return TypeCoercion.areEqual(left, right);
                     }
                     throw new MemgresException("operator does not exist: " +
@@ -1837,12 +1890,14 @@ class BinaryOpEvaluator {
     private static final Object NOT_A_RANGE_OPERATION = new Object();
 
     /**
-     * The intersection of two operands the query declares to be ranges. PostgreSQL resolves
-     * {@code *} from those declarations -- a range meets a range and a multirange a multirange --
-     * and answers with the bounds that were written, not with a whole number the text was rounded
-     * to, which is why the bounds are chosen rather than recomputed.
+     * The meet, join or difference of two operands the query declares to be ranges. PostgreSQL
+     * resolves {@code *}, {@code +} and {@code -} from those declarations -- a range against a
+     * range and a multirange against a multirange -- and answers with the bounds that were written,
+     * not with a whole number the text was rounded to, which is why the bounds are chosen rather
+     * than recomputed.
      */
-    private Object declaredRangeIntersection(BinaryExpr bin, RowContext ctx, Object left, Object right) {
+    private Object declaredRangeArithmetic(BinaryExpr bin, RowContext ctx, Object left, Object right) {
+        BinaryExpr.BinOp op = bin.op();
         String lType = declaredRangeType(bin.left(), bin.right(), ctx);
         String rType = declaredRangeType(bin.right(), bin.left(), ctx);
         if (lType == null || rType == null) return NOT_A_RANGE_OPERATION;
@@ -1852,13 +1907,20 @@ class BinaryOpEvaluator {
             return NOT_A_RANGE_OPERATION;
         }
         if (!lType.equals(rType)) {
-            throw new MemgresException("operator does not exist: " + lType + " * " + rType
+            throw new MemgresException("operator does not exist: " + lType + " " + binOpToSymbol(op)
+                    + " " + rType
                     + "\n  Hint: No operator matches the given name and argument types."
                     + " You might need to add explicit type casts.", "42883");
         }
         if (left == null || right == null) return null;
         if (!(left instanceof String) || !(right instanceof String)) return NOT_A_RANGE_OPERATION;
         if (MULTIRANGE_TYPES.contains(lType)) {
+            if (op == BinaryExpr.BinOp.ADD) {
+                return RangeOperations.multirangeUnion((String) left, (String) right);
+            }
+            if (op == BinaryExpr.BinOp.SUBTRACT) {
+                return RangeOperations.multirangeSubtract((String) left, (String) right);
+            }
             java.util.List<RangeOperations.PgRange> parts = new ArrayList<>();
             for (RangeOperations.PgRange a : RangeOperations.parseMultirange((String) left)) {
                 for (RangeOperations.PgRange b : RangeOperations.parseMultirange((String) right)) {
@@ -1873,8 +1935,55 @@ class BinaryOpEvaluator {
             }
             return sb.append('}').toString();
         }
-        return intersectRanges(RangeOperations.parse((String) left),
-                RangeOperations.parse((String) right)).toString();
+        RangeOperations.PgRange a = RangeOperations.parse((String) left);
+        RangeOperations.PgRange b = RangeOperations.parse((String) right);
+        if (op == BinaryExpr.BinOp.ADD) return unionRanges(a, b).toString();
+        if (op == BinaryExpr.BinOp.SUBTRACT) return differenceRanges(a, b).toString();
+        return intersectRanges(a, b).toString();
+    }
+
+    /**
+     * The join of two ranges. A range type holds one pair of bounds and nothing else, so two ranges
+     * with a gap between them have no union PostgreSQL can express -- it says so rather than
+     * quietly handing back a range that covers the gap as well.
+     */
+    private static RangeOperations.PgRange unionRanges(
+            RangeOperations.PgRange a, RangeOperations.PgRange b) {
+        if (a.isEmpty()) return b;
+        if (b.isEmpty()) return a;
+        if (!a.overlaps(b) && !RangeOperations.areAdjacent(a, b)
+                && !RangeOperations.areAdjacent(b, a)) {
+            throw new MemgresException("result of range union would not be contiguous", "22000");
+        }
+        RangeOperations.PgRange lo = startsLater(a, b) ? b : a;
+        RangeOperations.PgRange hi = endsEarlier(a, b) ? b : a;
+        return new RangeOperations.PgRange(lo.lower, hi.upper, lo.lowerInclusive,
+                hi.upperInclusive, false, lo.lowerStr, hi.upperStr);
+    }
+
+    /**
+     * What is left of the first range once the second is taken out of it. Cutting a hole in the
+     * middle leaves two pieces, which is one more than a range can hold.
+     */
+    private static RangeOperations.PgRange differenceRanges(
+            RangeOperations.PgRange a, RangeOperations.PgRange b) {
+        RangeOperations.PgRange empty =
+                new RangeOperations.PgRange(null, null, true, false, true);
+        if (a.isEmpty() || b.isEmpty() || !a.overlaps(b)) return a;
+        if (b.containsRange(a)) return empty;
+        boolean coversStart = startsLater(a, b);
+        boolean coversEnd = endsEarlier(a, b);
+        if (!coversStart && !coversEnd) {
+            throw new MemgresException("result of range difference would not be contiguous", "22000");
+        }
+        if (coversStart) {
+            // b covers the start of a, so a keeps everything above b's upper bound
+            return new RangeOperations.PgRange(b.upper, a.upper, !b.upperInclusive,
+                    a.upperInclusive, false, b.upperStr, a.upperStr);
+        }
+        // b covers the end of a, so a keeps everything below b's lower bound
+        return new RangeOperations.PgRange(a.lower, b.lower, a.lowerInclusive,
+                !b.lowerInclusive, false, a.lowerStr, b.lowerStr);
     }
 
     /**

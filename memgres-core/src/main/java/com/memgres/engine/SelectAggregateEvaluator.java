@@ -1004,11 +1004,13 @@ class SelectAggregateEvaluator {
                     if (seen != null && val != null && !seen.add(distinctKey(val))) continue;
                     list.add(val);
                 }
+                checkAccumulatedArrays(list);
                 StringBuilder sb = new StringBuilder("{");
                 for (int ai = 0; ai < list.size(); ai++) {
                     if (ai > 0) sb.append(",");
                     Object v = list.get(ai);
                     if (v == null) sb.append("NULL");
+                    else if (v instanceof List<?>) sb.append(TypeCoercion.formatPgArray((List<?>) v));
                     else if (v instanceof String) {
                         String sv = (String) v;
                         if (sv.isEmpty() || sv.equalsIgnoreCase("NULL") || sv.contains(",") || sv.contains("{") || sv.contains("}") || sv.contains("\"") || sv.contains("\\") || sv.contains(" ")) {
@@ -1614,6 +1616,32 @@ class SelectAggregateEvaluator {
         if (sample instanceof Short) return (short) acc;
         if (sample instanceof Integer) return (int) acc;
         return acc >= Integer.MIN_VALUE && acc <= Integer.MAX_VALUE ? (Object) (int) acc : (Object) acc;
+    }
+
+    /**
+     * Arrays collected by array_agg become the rows of one array of the next dimension up, so they
+     * all have to be the same shape and none of them may be missing. A shorter row or a null one
+     * has no place to go, and PostgreSQL says so rather than building a ragged result.
+     */
+    private static void checkAccumulatedArrays(List<Object> values) {
+        int width = -1;
+        boolean anyArray = false;
+        for (Object v : values) {
+            if (v instanceof List<?>) { anyArray = true; break; }
+        }
+        if (!anyArray) return;
+        for (Object v : values) {
+            if (v == null) {
+                throw new MemgresException("cannot accumulate null arrays", "22004");
+            }
+            if (!(v instanceof List<?>)) continue;
+            int size = ((List<?>) v).size();
+            if (width < 0) width = size;
+            else if (width != size) {
+                throw new MemgresException(
+                        "cannot accumulate arrays of different dimensionality", "2202E");
+            }
+        }
     }
 
     /** Sort a group by the aggregate's ORDER BY clause (used by string_agg, array_agg, json_agg, etc.). */

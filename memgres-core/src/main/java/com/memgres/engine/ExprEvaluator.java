@@ -2284,6 +2284,25 @@ class ExprEvaluator {
 
     // ---- Type inference ----
 
+    /** True for a bare string literal, which PostgreSQL types from whatever sits opposite it. */
+    private static boolean isUnknownLiteral(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
+    /** True for the range and multirange types, whose operators answer in their own type. */
+    private static boolean isRangeType(DataType t) {
+        switch (t) {
+            case INT4RANGE: case INT8RANGE: case NUMRANGE:
+            case DATERANGE: case TSRANGE: case TSTZRANGE:
+            case INT4MULTIRANGE: case INT8MULTIRANGE: case NUMMULTIRANGE:
+            case DATEMULTIRANGE: case TSMULTIRANGE: case TSTZMULTIRANGE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     DataType inferTypeFromContext(Expression expr, List<RowContext.TableBinding> bindings) {
         if (expr instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) expr;
@@ -2361,6 +2380,17 @@ class ExprEvaluator {
                     || bin.op() == BinaryExpr.BinOp.MODULO) {
                 DataType leftType = inferTypeFromContext(bin.left(), bindings);
                 DataType rightType = inferTypeFromContext(bin.right(), bindings);
+                // A range meets, joins or is cut by another range and stays that same range type.
+                // Describing the column as an integer instead handed the driver a value it could
+                // not read: "[5,10)" is no integer, so the row never arrived at all. An untyped
+                // literal opposite a range is read as one, so it answers in that type too.
+                if (leftType != null && isRangeType(leftType)
+                        && (leftType == rightType || isUnknownLiteral(bin.right()))) {
+                    return leftType;
+                }
+                if (rightType != null && isRangeType(rightType) && isUnknownLiteral(bin.left())) {
+                    return rightType;
+                }
                 // If either is NUMERIC, result is NUMERIC (except double wins)
                 if (leftType == DataType.DOUBLE_PRECISION || rightType == DataType.DOUBLE_PRECISION)
                     return DataType.DOUBLE_PRECISION;
