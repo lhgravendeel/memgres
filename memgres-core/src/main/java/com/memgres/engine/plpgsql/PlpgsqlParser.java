@@ -968,12 +968,7 @@ public class PlpgsqlParser {
                     }
                 }
             }
-            String upperItem = itemName.toUpperCase();
-            if ("RESULT_OID".equals(upperItem)) {
-                throw new com.memgres.engine.MemgresException(
-                        "unrecognized GET DIAGNOSTICS item at or near \"RESULT_OID\"", "42601");
-            }
-            items.add(new PlpgsqlStatement.DiagItem(varName, upperItem));
+            items.add(new PlpgsqlStatement.DiagItem(varName, itemName.toUpperCase()));
         } while (match(TokenType.COMMA));
         match(TokenType.SEMICOLON);
         return new PlpgsqlStatement.GetDiagnosticsStmt(items, stacked);
