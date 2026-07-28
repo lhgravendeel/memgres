@@ -163,15 +163,14 @@ class CastEvaluator {
         else if ("int8range".equals(rangeType)) element = "bigint";
         else return;
         String text = literal.trim();
-        if (text.length() < 3 || text.equalsIgnoreCase("empty")) return;
-        String inner = text.substring(1, text.length() - 1);
-        String[] parts = inner.split(",", 2);
+        if (text.equalsIgnoreCase("empty")) return;
+        // Text that is not a two-bound literal is malformed rather than out of range; leave the
+        // range parser to say so, in the words PG uses for it.
+        String[] parts = RangeOperations.boundTexts(text);
+        if (parts == null) return;
         for (String part : parts) {
             String bound = part.trim();
             if (bound.isEmpty()) continue;
-            if (bound.length() >= 2 && bound.startsWith("\"") && bound.endsWith("\"")) {
-                bound = bound.substring(1, bound.length() - 1);
-            }
             java.math.BigInteger value;
             try {
                 value = new java.math.BigInteger(bound);
@@ -232,6 +231,14 @@ class CastEvaluator {
     }
 
     Object applyCast(Object val, String typeSpec) {
+        return applyCast(val, typeSpec, false);
+    }
+
+    /**
+     * @param fromUnknownLiteral the value was written as a bare quoted literal, so PG reads it with
+     *        the target type's input function rather than converting a value of a known type.
+     */
+    Object applyCast(Object val, String typeSpec, boolean fromUnknownLiteral) {
         if (val == null) {
             // A NOT NULL domain rejects null even through a cast, and the constraint is
             // inherited from every domain it is built on
@@ -319,6 +326,18 @@ class CastEvaluator {
             String s = val.toString();
             if (s.length() > n) return s.substring(0, n);
             return String.format("%-" + n + "s", s);
+        }
+        // An interval type carries its field qualifier and its fractional-seconds precision in
+        // the type name, and both change the value: the qualifier decides what an unlabelled
+        // number in the literal counts and which fields survive, the precision how many
+        // fractional digits do. Both have to be seen before the text is read, not after.
+        if (!lowerSpec.endsWith("[]")) {
+            IntervalTypmod intervalTypmod = IntervalTypmod.fromTypeSpec(lowerSpec);
+            if (intervalTypmod != null) {
+                if (val instanceof PgInterval) return intervalTypmod.apply((PgInterval) val);
+                if (val instanceof String) return PgInterval.parse((String) val, intervalTypmod);
+                return intervalTypmod.apply(TypeCoercion.toInterval(val));
+            }
         }
         String typeName = typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim();
         // Handle array casting: when value is a List or PG array literal string, cast each element
@@ -591,21 +610,8 @@ class CastEvaluator {
             case "timestamptz":
             case "timestamp with time zone":
                 return TypeCoercion.toOffsetDateTime(val, sessionInterpretationZone());
-            case "interval":
-            case "interval year to month":
-            case "interval day to second":
-            case "interval year":
-            case "interval month":
-            case "interval day":
-            case "interval hour":
-            case "interval minute":
-            case "interval second":
-            case "interval day to hour":
-            case "interval day to minute":
-            case "interval hour to minute":
-            case "interval hour to second":
-            case "interval minute to second":
-                return TypeCoercion.toInterval(val);
+            // "interval", with or without a qualifier, is handled above where the qualifier can
+            // still reach the literal's text.
             case "money":
                 // PG does not allow direct float→money cast (must go through numeric first)
                 if (val instanceof Double || val instanceof Float) {
@@ -736,7 +742,9 @@ class CastEvaluator {
                 // The bounds have to fit the range's element type. Narrowing them silently would
                 // leave a plausible range whose bounds are not the ones written.
                 checkRangeBoundsFitElementType(rangeStr, typeName);
-                return RangeOperations.parse(rangeStr).toString();
+                // The target type names the element type, so the bounds are read and written back
+                // as values of it rather than as whatever the written text happened to resemble.
+                return RangeOperations.parse(rangeStr, typeName).toString();
             }
             case "int4multirange":
             case "int8multirange":
@@ -744,15 +752,13 @@ class CastEvaluator {
             case "datemultirange":
             case "tsmultirange":
             case "tstzmultirange": {
-                boolean isTsMultirange = typeName.equals("tsmultirange") || typeName.equals("tstzmultirange");
                 String s = val.toString().trim();
-                // For tsmultirange/tstzmultirange: normalize date-only bounds to timestamp format
-                if (isTsMultirange) {
-                    s = RangeOperations.normalizeDateBoundsToTimestamp(s);
-                }
-                // Implicit cast: range → multirange (wrap single range)
-                if (RangeOperations.isRangeString(s)) {
-                    RangeOperations.PgRange parsed = RangeOperations.parse(s);
+                String rangeType = typeName.replace("multirange", "range");
+                // A range value casts to its multirange type, but a written literal has to be a
+                // multirange literal: PG reads the text with the multirange input function, which
+                // wants the braces. Only the source can tell those two apart.
+                if (!fromUnknownLiteral && RangeOperations.isRangeString(s)) {
+                    RangeOperations.PgRange parsed = RangeOperations.parse(s, rangeType);
                     if (parsed.isEmpty()) return "{}";
                     return "{" + parsed.toString() + "}";
                 }
@@ -760,25 +766,12 @@ class CastEvaluator {
                 // Multirange literal validation and canonicalization. The error names the value as
                 // it was written, whitespace and all, so the untrimmed text is what is read.
                 java.util.List<RangeOperations.PgRange> parsed = new java.util.ArrayList<>();
-                for (RangeOperations.PgRange r : RangeOperations.parseMultirangeLiteral(
-                        isTsMultirange ? s : val.toString())) {
+                for (RangeOperations.PgRange r
+                        : RangeOperations.parseMultirangeLiteral(val.toString(), rangeType)) {
                     if (!r.isEmpty()) parsed.add(r);
                 }
                 if (parsed.isEmpty()) return "{}";
-                // Sort and merge overlapping/adjacent
-                parsed.sort((a, b) -> Long.compare(a.effectiveLower(), b.effectiveLower()));
-                java.util.List<RangeOperations.PgRange> merged = new java.util.ArrayList<>();
-                merged.add(parsed.get(0));
-                for (int mi = 1; mi < parsed.size(); mi++) {
-                    RangeOperations.PgRange last = merged.get(merged.size() - 1);
-                    RangeOperations.PgRange curr = parsed.get(mi);
-                    if (last.effectiveUpper() >= curr.effectiveLower()) {
-                        merged.set(merged.size() - 1, RangeOperations.merge(last, curr));
-                    } else {
-                        merged.add(curr);
-                    }
-                }
-                return RangeOperations.formatMultirange(merged);
+                return RangeOperations.formatMultirange(RangeOperations.mergeAndSort(parsed));
             }
             case "uuid": {
                 if (val instanceof java.util.UUID) return val;

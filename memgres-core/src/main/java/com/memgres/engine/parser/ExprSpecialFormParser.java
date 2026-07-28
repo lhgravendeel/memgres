@@ -135,18 +135,43 @@ class ExprSpecialFormParser {
             }
         }
         ep.advance();
+        // interval(3) '1.234567 seconds': the precision is written before the literal, the way
+        // PG spells a typed literal for any type that takes a modifier.
+        String leadingPrecision = parseLeadingPrecision();
         if (ep.check(TokenType.STRING_LITERAL)) {
             String val = ep.advance().value();
-            // Check for optional interval qualifier: YEAR TO MONTH, DAY TO SECOND, etc.
+            // Check for optional interval qualifier: YEAR TO MONTH, DAY TO SECOND(2), etc.
             String qualifier = parseIntervalQualifier();
-            return new CastExpr(Literal.ofString(val), qualifier != null ? "interval " + qualifier : "interval");
+            String type = "interval";
+            if (qualifier != null) type = type + " " + qualifier;
+            if (leadingPrecision != null) type = type + leadingPrecision;
+            return new CastExpr(Literal.ofString(val), type);
         }
         return new CastExpr(ep.parsePrimary(), "interval");
     }
 
     /**
+     * Consume a {@code (N)} that stands between INTERVAL and its literal, but only when a literal
+     * really follows: {@code interval(x)} with anything else after the parenthesis is a call.
+     *
+     * @return the precision written as "(N)", or null when there is none
+     */
+    private String parseLeadingPrecision() {
+        if (!ep.check(TokenType.LEFT_PAREN)) return null;
+        if (ep.pos + 3 >= ep.tokens.size()) return null;
+        if (ep.tokens.get(ep.pos + 1).type() != TokenType.INTEGER_LITERAL) return null;
+        if (ep.tokens.get(ep.pos + 2).type() != TokenType.RIGHT_PAREN) return null;
+        if (ep.tokens.get(ep.pos + 3).type() != TokenType.STRING_LITERAL) return null;
+        ep.advance();
+        String digits = ep.advance().value();
+        ep.advance();
+        return "(" + digits + ")";
+    }
+
+    /**
      * Parse optional interval qualifier: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND,
-     * or compound forms like YEAR TO MONTH, DAY TO SECOND, etc.
+     * or compound forms like YEAR TO MONTH, DAY TO SECOND, plus the fractional-seconds
+     * precision the last field may carry -- SECOND(3), DAY TO SECOND(2).
      * Returns null if no qualifier is present.
      */
     private String parseIntervalQualifier() {
@@ -155,11 +180,23 @@ class ExprSpecialFormParser {
             if (ep.checkKeyword("TO") || ep.checkIdentCI("TO")) {
                 ep.advance(); // consume TO
                 String toField = ep.readIdentifier().toLowerCase();
-                return field + " to " + toField;
+                return field + " to " + toField + parseFieldPrecision();
             }
-            return field;
+            return field + parseFieldPrecision();
         }
         return null;
+    }
+
+    /** Consume the {@code (N)} a SECOND field may carry; returns "" when there is none. */
+    private String parseFieldPrecision() {
+        if (!ep.check(TokenType.LEFT_PAREN)) return "";
+        if (ep.pos + 2 >= ep.tokens.size()) return "";
+        if (ep.tokens.get(ep.pos + 1).type() != TokenType.INTEGER_LITERAL) return "";
+        if (ep.tokens.get(ep.pos + 2).type() != TokenType.RIGHT_PAREN) return "";
+        ep.advance();
+        String digits = ep.advance().value();
+        ep.advance();
+        return "(" + digits + ")";
     }
 
     Expression parseTimestamp() {
@@ -181,6 +218,33 @@ class ExprSpecialFormParser {
             return new CastExpr(Literal.ofString(val), tsType);
         }
         return new ColumnRef("timestamp");
+    }
+
+    /**
+     * {@code TIME WITH TIME ZONE '10:00+02'} and its WITHOUT form, which are as much a typed
+     * literal as {@code TIMESTAMP WITH TIME ZONE '...'} is. Returns null, with the parser left
+     * where it started, when what follows TIME is not one of those spellings.
+     */
+    Expression parseQualifiedTimeLiteral() {
+        int saved = ep.pos;
+        ep.advance(); // consume TIME
+        String type;
+        if (ep.checkKeyword("WITH")) {
+            type = "timetz";
+        } else if (ep.checkKeyword("WITHOUT")) {
+            type = "time";
+        } else {
+            ep.pos = saved;
+            return null;
+        }
+        ep.advance();
+        if (ep.checkKeyword("TIME")) ep.advance();
+        if (ep.checkKeyword("ZONE")) ep.advance();
+        if (ep.pos < ep.tokens.size() && ep.tokens.get(ep.pos).type() == TokenType.STRING_LITERAL) {
+            return new CastExpr(Literal.ofString(ep.advance().value()), type);
+        }
+        ep.pos = saved;
+        return null;
     }
 
     Expression parseSubstring() {

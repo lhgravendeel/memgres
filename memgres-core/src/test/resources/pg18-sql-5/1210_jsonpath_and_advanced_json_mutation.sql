@@ -25,7 +25,7 @@ ORDER BY doc_id;
 -- columns: doc_id,matches
 -- row: 1|t
 -- row: 2|f
--- row: 3|
+-- row: 3|f
 -- end-expected
 SELECT doc_id,
        payload @@ '$.active == true' AS matches

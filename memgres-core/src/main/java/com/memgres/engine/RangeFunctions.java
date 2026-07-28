@@ -45,21 +45,39 @@ class RangeFunctions {
         return false;
     }
 
-    private static String formatTimestampForRange(Object val) {
-        if (val instanceof java.time.OffsetDateTime) {
-            java.time.OffsetDateTime odt = (java.time.OffsetDateTime) val;
-            java.time.format.DateTimeFormatter fmt = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ssxxx");
-            String formatted = odt.format(fmt);
-            if (formatted.endsWith(":00")) {
-                formatted = formatted.substring(0, formatted.length() - 3);
-            }
-            return formatted;
+    /**
+     * Build a range from the two bound values a constructor was given, reading each as a value of
+     * {@code rangeType}'s element type. Going through the range's own text form is what makes
+     * {@code tsrange(date, date)} come back as the pair of timestamps it actually holds.
+     */
+    private String buildRange(String rangeType, FunctionCallExpr fn, RowContext ctx) {
+        Object loObj = executor.evalExpr(fn.args().get(0), ctx);
+        Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
+        String bounds = fn.args().size() > 2 && executor.evalExpr(fn.args().get(2), ctx) != null
+                ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
+        if (bounds.length() != 2
+                || (bounds.charAt(0) != '[' && bounds.charAt(0) != '(')
+                || (bounds.charAt(1) != ']' && bounds.charAt(1) != ')')) {
+            throw new MemgresException(
+                    "range bound flags must be one of \"[]\", \"[)\", \"(]\", or \"()\"", "22P02");
         }
+        String lo = loObj == null ? "" : quoteForRange(loObj);
+        String hi = hiObj == null ? "" : quoteForRange(hiObj);
+        String text = bounds.charAt(0) + lo + "," + hi + bounds.charAt(1);
+        return RangeOperations.parse(text, rangeType).toString();
+    }
+
+    /** A bound written back into a range literal has to survive being read out of it again. */
+    private static String quoteForRange(Object val) {
+        String s;
         if (val instanceof java.time.LocalDateTime) {
-            java.time.LocalDateTime ldt = (java.time.LocalDateTime) val;
-            return ldt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            s = RangeOperations.formatTimestamp((java.time.LocalDateTime) val);
+        } else if (val instanceof java.time.OffsetDateTime) {
+            s = RangeOperations.formatTimestamptz((java.time.OffsetDateTime) val);
+        } else {
+            s = val.toString();
         }
-        return val.toString();
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
@@ -73,31 +91,10 @@ class RangeFunctions {
                 Integer hi = hiObj == null ? null : executor.toInt(hiObj);
                 return RangeOperations.int4rangeNullable(lo, hi, bounds).toString();
             }
-            case "daterange": {
-                Object loObj = executor.evalExpr(fn.args().get(0), ctx);
-                Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
-                String bounds = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
-                boolean li = bounds.charAt(0) == '[';
-                boolean ui = bounds.charAt(1) == ']';
-                String loStr = loObj == null ? "" : loObj.toString();
-                String hiStr = hiObj == null ? "" : hiObj.toString();
-                String lBracket = loObj == null ? "(" : (li ? "[" : "(");
-                String rBracket = hiObj == null ? ")" : (ui ? "]" : ")");
-                return lBracket + loStr + "," + hiStr + rBracket;
-            }
+            case "daterange":
             case "tsrange":
-            case "tstzrange": {
-                Object loObj = executor.evalExpr(fn.args().get(0), ctx);
-                Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
-                String bounds = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
-                boolean li = bounds.charAt(0) == '[';
-                boolean ui = bounds.charAt(1) == ']';
-                String loStr = loObj == null ? "" : formatTimestampForRange(loObj);
-                String hiStr = hiObj == null ? "" : formatTimestampForRange(hiObj);
-                String lBracket = loObj == null ? "(" : (li ? "[" : "(");
-                String rBracket = hiObj == null ? ")" : (ui ? "]" : ")");
-                return lBracket + "\"" + loStr + "\",\"" + hiStr + "\"" + rBracket;
-            }
+            case "tstzrange":
+                return buildRange(name, fn, ctx);
             case "lower_inc": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
@@ -274,25 +271,7 @@ class RangeFunctions {
                 }
                 if (rawRanges.isEmpty()) return "{}";
                 if (allInteger && !intRanges.isEmpty()) {
-                    intRanges.sort((a, b) -> Long.compare(a.effectiveLower(), b.effectiveLower()));
-                    List<RangeOperations.PgRange> merged = new ArrayList<>();
-                    merged.add(intRanges.get(0));
-                    for (int i = 1; i < intRanges.size(); i++) {
-                        RangeOperations.PgRange last = merged.get(merged.size() - 1);
-                        RangeOperations.PgRange curr = intRanges.get(i);
-                        if (last.effectiveUpper() >= curr.effectiveLower()) {
-                            merged.set(merged.size() - 1, RangeOperations.merge(last, curr));
-                        } else {
-                            merged.add(curr);
-                        }
-                    }
-                    StringBuilder sb2 = new StringBuilder("{");
-                    for (int i = 0; i < merged.size(); i++) {
-                        if (i > 0) sb2.append(",");
-                        sb2.append(merged.get(i));
-                    }
-                    sb2.append("}");
-                    return sb2.toString();
+                    return RangeOperations.formatMultirange(RangeOperations.mergeAndSort(intRanges));
                 }
                 StringBuilder sb = new StringBuilder("{");
                 for (int i = 0; i < rawRanges.size(); i++) {
@@ -304,16 +283,7 @@ class RangeFunctions {
             }
             case "numrange": {
                 if (fn.args().size() < 2) return null;
-                Object loObj = executor.evalExpr(fn.args().get(0), ctx);
-                Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
-                String bounds = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
-                boolean li = bounds.charAt(0) == '[';
-                boolean ui = bounds.charAt(1) == ']';
-                String loStr = loObj == null ? "" : loObj.toString();
-                String hiStr = hiObj == null ? "" : hiObj.toString();
-                String lBracket = loObj == null ? "(" : (li ? "[" : "(");
-                String rBracket = hiObj == null ? ")" : (ui ? "]" : ")");
-                return lBracket + loStr + "," + hiStr + rBracket;
+                return buildRange(name, fn, ctx);
             }
             default: {
                 // Check for user-defined range type constructors

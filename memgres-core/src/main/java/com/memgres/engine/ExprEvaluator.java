@@ -70,7 +70,11 @@ class ExprEvaluator {
             rejectUnequalRowArity((BinaryExpr) expr);
             return executor.binaryOpEvaluator.evalBinary(((BinaryExpr) expr), ctx);
         }
-        if (expr instanceof UnaryExpr) return evalUnaryValue(((UnaryExpr) expr).op(), evalExpr(((UnaryExpr) expr).operand(), ctx));
+        if (expr instanceof UnaryExpr) {
+            UnaryExpr un = (UnaryExpr) expr;
+            rejectUnaryOperatorOnText(un, ctx);
+            return evalUnaryValue(un.op(), evalExpr(un.operand(), ctx));
+        }
         if (expr instanceof FunctionCallExpr) {
             unifyVariadicArgumentTypes((FunctionCallExpr) expr);
             return executor.functionEvaluator.evalFunction(((FunctionCallExpr) expr), ctx);
@@ -132,14 +136,20 @@ class ExprEvaluator {
         if (expr instanceof AtTimeZoneExpr) {
             AtTimeZoneExpr attz = (AtTimeZoneExpr) expr;
             Object val = evalExpr(attz.expr(), ctx);
-            Object zoneVal = evalExpr(attz.zone(), ctx);
-            if (val == null) return null;
-            String zoneName = zoneVal.toString();
             ZoneId zid;
-            try {
-                zid = ZoneId.of(zoneName);
-            } catch (java.time.DateTimeException e) {
-                throw new MemgresException("time zone \"" + zoneName + "\" not recognized", "22023");
+            if (attz.zone() == null) {
+                // AT LOCAL (PG 17): the same conversion, against the session's TimeZone
+                zid = TypeCoercion.sessionZone();
+                if (val == null) return null;
+            } else {
+                Object zoneVal = evalExpr(attz.zone(), ctx);
+                if (val == null) return null;
+                String zoneName = zoneVal == null ? "null" : zoneVal.toString();
+                try {
+                    zid = ZoneId.of(zoneName);
+                } catch (java.time.DateTimeException e) {
+                    throw new MemgresException("time zone \"" + zoneName + "\" not recognized", "22023");
+                }
             }
             if (val instanceof OffsetDateTime) {
                 OffsetDateTime odt = (OffsetDateTime) val;
@@ -149,9 +159,14 @@ class ExprEvaluator {
                 LocalDateTime ldt = (LocalDateTime) val;
                 // timestamp -> timestamptz (interpret as in that zone)
                 return ldt.atZone(zid).toOffsetDateTime();
-            } else if (val instanceof LocalTime) {
-                LocalTime lt = (LocalTime) val;
-                return lt;
+            } else if (val instanceof java.time.LocalDate) {
+                // A date reaches the operator as a timestamptz at midnight, and converting it
+                // back into the same zone lands on that same midnight.
+                return ((java.time.LocalDate) val).atStartOfDay();
+            } else if (val instanceof LocalTime || TypeCoercion.looksLikeTimeTz(val)) {
+                // timetz keeps its instant and changes which offset it is written against; a
+                // plain time reaches the operator having already taken the session's offset.
+                return TypeCoercion.shiftTimeTzToZone(val, zid);
             }
             return val;
         }
@@ -165,7 +180,21 @@ class ExprEvaluator {
             IsBooleanExpr ib = (IsBooleanExpr) expr;
             Object val = evalExpr(ib.expr(), ctx);
             // These tests read a three-valued boolean, so a value that is not one has no answer:
-            // PG names the test and the type it was handed rather than coercing.
+            // PG names the test and the type it was handed rather than coercing. Which of the two
+            // errors it is depends on the declaration, not the value: a declared text is 42804
+            // while an untyped literal is coerced to boolean and fails on its own input.
+            if (isBooleanTest(ib.test())) {
+                String declared = executor.binaryOpEvaluator.declaredTypeForResolution(ib.expr(), ctx);
+                if (declared != null) {
+                    String canonical = DataType.canonicalName(declared);
+                    if (!"boolean".equals(canonical)) {
+                        throw new MemgresException("argument of " + booleanTestName(ib.test())
+                                + " must be type boolean, not type " + canonical, "42804");
+                    }
+                } else if (val instanceof String) {
+                    TypeCoercion.toBoolean(val);
+                }
+            }
             if (val != null && isBooleanTest(ib.test())
                     && !(val instanceof Boolean) && !(val instanceof String)) {
                 throw new MemgresException("argument of " + booleanTestName(ib.test())
@@ -212,6 +241,16 @@ class ExprEvaluator {
             if (val == null) return null;
             String fieldName = fa.field();
 
+            if (val instanceof RecordValue) {
+                // A record whose column names come from the call that built it, e.g. jsonb_each
+                RecordValue record = (RecordValue) val;
+                int idx = record.indexOf(fieldName);
+                if (idx < 0) {
+                    throw new MemgresException("could not identify column \"" + fieldName
+                            + "\" in record data type", "42703");
+                }
+                return record.valueAt(idx);
+            }
             if (val instanceof List<?>) {
                 List<?> list = (List<?>) val;
                 // If the result is a list (from _pg_expandarray), access by field name
@@ -988,7 +1027,9 @@ class ExprEvaluator {
             }
         }
         checkNumericSpecialToInteger(cast, val);
-        return executor.castEvaluator.applyCast(val, cast.typeName());
+        boolean unknownLiteral = cast.expr() instanceof Literal
+                && ((Literal) cast.expr()).literalType() == Literal.LiteralType.STRING;
+        return executor.castEvaluator.applyCast(val, cast.typeName(), unknownLiteral);
     }
 
     /**
@@ -1030,6 +1071,30 @@ class ExprEvaluator {
     /**
      * Evaluate a unary operation on an already-evaluated value.
      */
+    /**
+     * The arithmetic prefix operators are resolved from the operand's declared type just as the
+     * binary ones are, and PostgreSQL has no {@code @ text}: reading the value instead let
+     * {@code @ '-10'::text} answer -10, which is not even the absolute value it was asked for.
+     */
+    private void rejectUnaryOperatorOnText(UnaryExpr un, RowContext ctx) {
+        String symbol;
+        switch (un.op()) {
+            case ABS: symbol = "@"; break;
+            case SQRT: symbol = "|/"; break;
+            case CBRT: symbol = "||/"; break;
+            default: return;
+        }
+        if (!(un.operand() instanceof CastExpr)) return;
+        String declared = ((CastExpr) un.operand()).typeName();
+        if (declared == null) return;
+        String t = DataType.canonicalName(declared);
+        if (!"text".equals(t) && !"character varying".equals(t) && !"character".equals(t)
+                && !"name".equals(t) && !"boolean".equals(t)) return;
+        throw new MemgresException("operator does not exist: " + symbol + " " + t
+                + "\n  Hint: No operator matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
+    }
+
     Object evalUnaryValue(UnaryExpr.UnaryOp op, Object val) {
         switch (op) {
             case NOT: {
@@ -1445,7 +1510,7 @@ class ExprEvaluator {
                 Expression element = arrayElementOperand(other);
                 if (element != null) other = element;
             }
-            executor.binaryOpEvaluator.rejectMissingEqualityOperator(
+            executor.binaryOpEvaluator.rejectUnresolvableOperator(
                     new BinaryExpr(in.expr(),
                             in.negated() ? BinaryExpr.BinOp.NOT_EQUAL : BinaryExpr.BinOp.EQUAL,
                             other), ctx);
@@ -1550,6 +1615,13 @@ class ExprEvaluator {
     }
 
     private Object evalBetween(BetweenExpr bet, RowContext ctx) {
+        // BETWEEN is shorthand for a pair of comparisons, so PostgreSQL resolves ">=" and "<="
+        // against the declared types and names the one that failed -- "text >= integer" -- before
+        // it looks at a single value.
+        executor.binaryOpEvaluator.rejectUnresolvableOperator(
+                new BinaryExpr(bet.expr(), BinaryExpr.BinOp.GREATER_EQUAL, bet.low()), ctx);
+        executor.binaryOpEvaluator.rejectUnresolvableOperator(
+                new BinaryExpr(bet.expr(), BinaryExpr.BinOp.LESS_EQUAL, bet.high()), ctx);
         Object val = evalExpr(bet.expr(), ctx);
         Object low = evalExpr(bet.low(), ctx);
         Object high = evalExpr(bet.high(), ctx);
@@ -1841,7 +1913,7 @@ class ExprEvaluator {
         // "= ALL(array)" resolves "=" the same way; "<> ANY" resolves "<>", which point does have
         Expression element = arrayElementOperand(aaa.array());
         if (element != null) {
-            executor.binaryOpEvaluator.rejectMissingEqualityOperator(
+            executor.binaryOpEvaluator.rejectUnresolvableOperator(
                     new BinaryExpr(aaa.left(), aaa.op(), element), ctx);
         }
         // x = ANY(ARRAY[...]) resolves the same "=" a plain comparison does, so a type that has
@@ -2379,6 +2451,272 @@ class ExprEvaluator {
         }
     }
 
+    /** True for the network address types, whose operators answer in inet rather than in text. */
+    private static boolean isInet(DataType t) {
+        return t == DataType.INET || t == DataType.CIDR;
+    }
+
+    /** True for the geometric types: an operator over one of them answers in a shape. */
+    private static boolean isGeometric(DataType t) {
+        if (t == null) return false;
+        switch (t) {
+            case POINT: case LINE: case LSEG: case BOX: case PATH: case POLYGON: case CIRCLE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** True for the whole-number types, the only ones a date may be shifted by. */
+    private static boolean isWholeNumber(DataType t) {
+        if (t == null) return false;
+        switch (t) {
+            case SMALLINT: case INTEGER: case BIGINT:
+            case SMALLSERIAL: case SERIAL: case BIGSERIAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** Whichever of json and jsonb the pair is written in; the operators keep their own flavour. */
+    private static DataType jsonFlavour(DataType lt, DataType rt) {
+        if (lt == DataType.JSON || rt == DataType.JSON) return DataType.JSON;
+        return DataType.JSONB;
+    }
+
+    /**
+     * The type an operator answers in, read off its operands' declared types the way PostgreSQL
+     * reads it off the catalogue entry it resolved -- never off the value that comes back. Getting
+     * this wrong is not cosmetic: pgjdbc decodes a column by the type the server declared, so a
+     * {@code date} arriving under an {@code int4} descriptor makes getObject throw rather than
+     * return the date the engine computed.
+     *
+     * <p>A null operand type is one the query never wrote down -- an untyped literal or a NULL --
+     * which PostgreSQL resolves against the other side, so it does not drag the pair to text.
+     * Returns null when this table has no answer, leaving the caller's text default in place.
+     */
+    private static DataType binaryResultType(BinaryExpr.BinOp op, DataType lt, DataType rt) {
+        switch (op) {
+            // Every one of these asks a yes/no question, whatever its operands are made of
+            case EQUAL: case NOT_EQUAL: case LESS_THAN: case GREATER_THAN:
+            case LESS_EQUAL: case GREATER_EQUAL: case AND: case OR:
+            case IS_DISTINCT_FROM: case IS_NOT_DISTINCT_FROM:
+            case LIKE: case ILIKE: case SIMILAR_TO:
+            case REGEX_MATCH: case REGEX_IMATCH:
+            case NOT_REGEX_MATCH: case NOT_REGEX_IMATCH:
+            case CONTAINS: case CONTAINED_BY: case OVERLAP:
+            case TS_MATCH: case RANGE_ADJACENT:
+            case JSONB_EXISTS: case JSONB_EXISTS_ANY: case JSONB_EXISTS_ALL:
+            case JSONB_PATH_EXISTS_OP:
+            case INET_CONTAINS_EQUALS: case INET_CONTAINED_BY_EQUALS:
+            case APPROX_EQUAL: case GEO_BELOW: case GEO_ABOVE:
+            case GEO_NOT_EXTEND_RIGHT: case GEO_NOT_EXTEND_LEFT:
+            case GEO_NOT_EXTEND_ABOVE: case GEO_NOT_EXTEND_BELOW:
+            case GEO_INTERSECTS: case GEO_PARALLEL: case GEO_PERPENDICULAR:
+            case GEO_HORIZONTAL: case GEO_VERTICAL:
+                return DataType.BOOLEAN;
+            case DISTANCE:
+                return DataType.DOUBLE_PRECISION;
+            case GEO_CLOSEST_POINT:
+                return DataType.POINT;
+            case JSON_ARROW: case JSON_HASH_ARROW: case JSON_SUBSCRIPT: case JSON_DELETE_PATH:
+                return jsonFlavour(lt, rt);
+            case JSON_ARROW_TEXT: case JSON_HASH_ARROW_TEXT:
+                return DataType.TEXT;
+            case SHIFT_LEFT: case SHIFT_RIGHT:
+                // inet << inet asks whether one network sits inside the other; on integers and
+                // bit strings the same spelling shifts bits and keeps the left operand's type.
+                if (isInet(lt) || isInet(rt)) return DataType.BOOLEAN;
+                return lt != null ? lt : rt;
+            case BIT_AND: case BIT_OR: case BIT_XOR:
+                if (isInet(lt) || isInet(rt)) return DataType.INET;
+                if (lt == DataType.BIT || lt == DataType.VARBIT) return lt;
+                if (rt == DataType.BIT || rt == DataType.VARBIT) return rt;
+                return lt != null ? lt : rt;
+            case POWER:
+                // PostgreSQL has no integer ^, so a pair of integers resolves through float8
+                if (lt == DataType.NUMERIC || rt == DataType.NUMERIC) return DataType.NUMERIC;
+                return DataType.DOUBLE_PRECISION;
+            case CONCAT:
+                return concatResultType(lt, rt);
+            case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE: case MODULO:
+                return arithmeticResultType(op, lt, rt);
+            default:
+                return null;
+        }
+    }
+
+    /** The type {@code ||} answers in: an array, a document or a bit string keeps its own. */
+    private static DataType concatResultType(DataType lt, DataType rt) {
+        if (lt == DataType.BYTEA || rt == DataType.BYTEA) return DataType.BYTEA;
+        if (DataType.isArrayType(lt)) return lt;
+        if (DataType.isArrayType(rt)) return rt;
+        if (lt == DataType.JSONB || rt == DataType.JSONB) return DataType.JSONB;
+        if (lt == DataType.JSON || rt == DataType.JSON) return DataType.JSON;
+        if (lt == DataType.TSVECTOR || rt == DataType.TSVECTOR) return DataType.TSVECTOR;
+        if (lt == DataType.TSQUERY || rt == DataType.TSQUERY) return DataType.TSQUERY;
+        if (lt == DataType.HSTORE || rt == DataType.HSTORE) return DataType.HSTORE;
+        if (lt == DataType.BIT || lt == DataType.VARBIT
+                || rt == DataType.BIT || rt == DataType.VARBIT) return DataType.VARBIT;
+        // A range concatenated with anything resolves through anynonarray||text, so it is text
+        return DataType.TEXT;
+    }
+
+    /** The type {@code + - * / %} answer in, once the non-numeric families have had their say. */
+    private static DataType arithmeticResultType(BinaryExpr.BinOp op, DataType lt, DataType rt) {
+        // A range meets, joins or is cut by another range and stays that same range type.
+        // Describing the column as an integer instead handed the driver a value it could not
+        // read: "[5,10)" is no integer, so the row never arrived at all.
+        if (lt != null && isRangeType(lt) && (rt == null || lt == rt)) return lt;
+        if (rt != null && isRangeType(rt) && lt == null) return rt;
+
+        boolean add = op == BinaryExpr.BinOp.ADD;
+        boolean sub = op == BinaryExpr.BinOp.SUBTRACT;
+
+        // jsonb minus a key or a path is the document with that part taken out
+        if (sub && (lt == DataType.JSONB || lt == DataType.JSON)) return lt;
+
+        // an inet counts the addresses between two of them, and moves by a whole number otherwise
+        if (sub && isInet(lt) && isInet(rt)) return DataType.BIGINT;
+        if ((add || sub) && isInet(lt) && !isInet(rt)) return DataType.INET;
+        if (add && isInet(rt) && !isInet(lt)) return DataType.INET;
+
+        // a shape translated or scaled by a point is that same shape
+        if (isGeometric(lt)) return lt;
+        if (isGeometric(rt)) return rt;
+
+        if (lt == DataType.MONEY || rt == DataType.MONEY) {
+            if (lt == DataType.MONEY && rt == DataType.MONEY && op == BinaryExpr.BinOp.DIVIDE) {
+                return DataType.DOUBLE_PRECISION;
+            }
+            return DataType.MONEY;
+        }
+
+        DataType dt = dateTimeResultType(op, lt, rt);
+        if (dt != null) return dt;
+
+        // A range meets, joins or is cut by another range and stays that same range type.
+        // Describing it as an integer handed the driver a value it could not read -- "[5,10)" is
+        // no integer -- so the row never arrived at all.
+        if (lt != null && isRangeType(lt) && (rt == null || rt == lt)) return lt;
+        if (rt != null && isRangeType(rt) && lt == null) return rt;
+
+        if (lt == DataType.DOUBLE_PRECISION || rt == DataType.DOUBLE_PRECISION)
+            return DataType.DOUBLE_PRECISION;
+        if (lt == DataType.NUMERIC || rt == DataType.NUMERIC)
+            return DataType.NUMERIC;
+        // real has no arithmetic of its own opposite another type; PostgreSQL widens to float8
+        if (lt == DataType.REAL || rt == DataType.REAL) {
+            return lt == rt ? DataType.REAL : DataType.DOUBLE_PRECISION;
+        }
+        if (lt == DataType.BIGINT || rt == DataType.BIGINT)
+            return DataType.BIGINT;
+        return DataType.INTEGER;
+    }
+
+    /**
+     * Date and time arithmetic, whose result type is decided by the pair and never by the value:
+     * a date shifted by days is a date, by an interval a timestamp, and the gap between two
+     * timestamps is an interval. An operand type of null is an untyped literal, which PostgreSQL
+     * resolves to the interval or the date the other side's operator asks for.
+     */
+    private static DataType dateTimeResultType(BinaryExpr.BinOp op, DataType lt, DataType rt) {
+        boolean add = op == BinaryExpr.BinOp.ADD;
+        boolean sub = op == BinaryExpr.BinOp.SUBTRACT;
+        if (op == BinaryExpr.BinOp.MULTIPLY || op == BinaryExpr.BinOp.DIVIDE) {
+            // an interval scaled by a number is still an interval
+            return (lt == DataType.INTERVAL || rt == DataType.INTERVAL) ? DataType.INTERVAL : null;
+        }
+        if (!add && !sub) return null;
+        if (lt == DataType.INTERVAL && (rt == DataType.INTERVAL || rt == null)) return DataType.INTERVAL;
+        if (rt == DataType.INTERVAL && lt == null && add) return DataType.INTERVAL;
+        if (sub) {
+            if (lt == DataType.DATE && (rt == DataType.DATE || rt == null)) return DataType.INTEGER;
+            if (lt == DataType.TIMESTAMP && (rt == DataType.TIMESTAMP || rt == DataType.TIMESTAMPTZ))
+                return DataType.INTERVAL;
+            if (lt == DataType.TIMESTAMPTZ && (rt == DataType.TIMESTAMP || rt == DataType.TIMESTAMPTZ))
+                return DataType.INTERVAL;
+            if (lt == DataType.TIME && rt == DataType.TIME) return DataType.INTERVAL;
+        }
+        if (lt == DataType.DATE) {
+            if (rt == DataType.INTERVAL || rt == DataType.TIME) return DataType.TIMESTAMP;
+            if (rt == DataType.TIMETZ) return DataType.TIMESTAMPTZ;
+            if (isWholeNumber(rt)) return DataType.DATE;
+            return null;
+        }
+        if (rt == DataType.DATE && add) {
+            if (lt == DataType.INTERVAL || lt == DataType.TIME) return DataType.TIMESTAMP;
+            if (lt == DataType.TIMETZ) return DataType.TIMESTAMPTZ;
+            if (isWholeNumber(lt)) return DataType.DATE;
+            return null;
+        }
+        // a moment shifted by an interval -- named or not yet named -- is a moment of the same kind
+        if (isMoment(lt) && (rt == DataType.INTERVAL || rt == null)) return lt;
+        if (isMoment(rt) && lt == null && add) return rt;
+        if (isMoment(rt) && lt == DataType.INTERVAL && add) return rt;
+        return null;
+    }
+
+    /**
+     * The array type the array-building functions answer in. Each is declared over
+     * {@code anyarray}/{@code anyelement}, so the answer is the array type of whichever argument
+     * states one -- and an element argument states it just as well as the array does, which is how
+     * {@code array_append('{1,2}', 3)} comes out as an integer array rather than as text.
+     */
+    private DataType arrayFunctionResultType(String name, FunctionCallExpr fn,
+                                             List<RowContext.TableBinding> bindings) {
+        List<Expression> args = fn.args();
+        if (args == null || args.isEmpty()) return null;
+        if (name.equals("string_to_array") || name.equals("regexp_split_to_array")
+                || name.equals("tsvector_to_array") || name.equals("akeys") || name.equals("avals")) {
+            return DataType.TEXT_ARRAY;
+        }
+        if (name.equals("unnest")) {
+            DataType element = DataType.elementOf(inferTypeFromContext(args.get(0), bindings));
+            return element;
+        }
+        if (name.equals("array_fill")) {
+            return DataType.arrayOf(inferTypeFromContext(args.get(0), bindings));
+        }
+        int arrayArg;
+        int elementArg;
+        if (name.equals("array_append") || name.equals("array_remove")) {
+            arrayArg = 0; elementArg = 1;
+        } else if (name.equals("array_prepend")) {
+            arrayArg = 1; elementArg = 0;
+        } else if (name.equals("array_cat")) {
+            arrayArg = 0; elementArg = -1;
+        } else if (name.equals("array_replace")) {
+            arrayArg = 0; elementArg = 1;
+        } else if (name.equals("array_shuffle") || name.equals("array_sample")
+                || name.equals("array_reverse") || name.equals("trim_array")) {
+            arrayArg = 0; elementArg = -1;
+        } else {
+            return null;
+        }
+        if (arrayArg < args.size()) {
+            DataType declared = inferTypeFromContext(args.get(arrayArg), bindings);
+            if (DataType.isArrayType(declared)) return declared;
+        }
+        if (name.equals("array_cat") && args.size() > 1) {
+            DataType other = inferTypeFromContext(args.get(1), bindings);
+            if (DataType.isArrayType(other)) return other;
+        }
+        if (elementArg >= 0 && elementArg < args.size()) {
+            DataType element = inferTypeFromContext(args.get(elementArg), bindings);
+            DataType array = DataType.arrayOf(element);
+            if (array != null) return array;
+        }
+        return DataType.TEXT_ARRAY;
+    }
+
+    /** The types that name a moment on the clock or the calendar, other than a bare date. */
+    private static boolean isMoment(DataType t) {
+        return t == DataType.TIMESTAMP || t == DataType.TIMESTAMPTZ
+                || t == DataType.TIME || t == DataType.TIMETZ;
+    }
+
     DataType inferTypeFromContext(Expression expr, List<RowContext.TableBinding> bindings) {
         if (expr instanceof PrecomputedValueExpr) {
             PrecomputedValueExpr pre = (PrecomputedValueExpr) expr;
@@ -2443,19 +2781,41 @@ class ExprEvaluator {
         }
         if (expr instanceof UnaryExpr) {
             UnaryExpr un = (UnaryExpr) expr;
-            if (un.op() == UnaryExpr.UnaryOp.NEGATE || un.op() == UnaryExpr.UnaryOp.POSITIVE) {
-                DataType inner = inferTypeFromContext(un.operand(), bindings);
-                return inner;
+            switch (un.op()) {
+                case NEGATE:
+                case POSITIVE:
+                case ABS: {
+                    // @ and the signs answer in the operand's own type: @ -10 is an integer and
+                    // - interval '1 day' is an interval, not the text they were described as.
+                    // An operand with no type of its own is an unknown literal, which PostgreSQL
+                    // resolves through float8.
+                    DataType inner = inferTypeFromContext(un.operand(), bindings);
+                    return inner == null || inner == DataType.TEXT ? DataType.DOUBLE_PRECISION : inner;
+                }
+                case BIT_NOT: {
+                    // ~ inet is an inet and ~ B'101' a bit string; only integers give an integer.
+                    DataType inner = inferTypeFromContext(un.operand(), bindings);
+                    if (inner == DataType.CIDR) return DataType.INET;
+                    return inner;
+                }
+                case NOT:
+                case GEO_IS_HORIZONTAL:
+                case GEO_IS_VERTICAL:
+                    return DataType.BOOLEAN;
+                case SQRT:
+                case CBRT:
+                case GEO_LENGTH:
+                    return DataType.DOUBLE_PRECISION;
+                case GEO_NPOINTS:
+                    return DataType.INTEGER;
+                case GEO_CENTER:
+                    return DataType.POINT;
+                case HSTORE_TO_ARRAY:
+                case HSTORE_TO_MATRIX:
+                    return DataType.TEXT_ARRAY;
+                default:
+                    return DataType.TEXT;
             }
-            // @ is absolute value, in the operand's own type; |/ and ||/ are float8 roots.
-            if (un.op() == UnaryExpr.UnaryOp.ABS) {
-                DataType inner = inferTypeFromContext(un.operand(), bindings);
-                return inner == null || inner == DataType.TEXT ? DataType.DOUBLE_PRECISION : inner;
-            }
-            if (un.op() == UnaryExpr.UnaryOp.SQRT || un.op() == UnaryExpr.UnaryOp.CBRT) {
-                return DataType.DOUBLE_PRECISION;
-            }
-            return DataType.TEXT;
         }
         if (expr instanceof CustomOperatorExpr) {
             // Custom operators - can't infer return type without looking up the operator definition
@@ -2463,61 +2823,14 @@ class ExprEvaluator {
         }
         if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
-            // For arithmetic ops, infer from operands
-            if (bin.op() == BinaryExpr.BinOp.ADD || bin.op() == BinaryExpr.BinOp.SUBTRACT
-                    || bin.op() == BinaryExpr.BinOp.MULTIPLY || bin.op() == BinaryExpr.BinOp.DIVIDE
-                    || bin.op() == BinaryExpr.BinOp.MODULO) {
-                DataType leftType = inferTypeFromContext(bin.left(), bindings);
-                DataType rightType = inferTypeFromContext(bin.right(), bindings);
-                // A range meets, joins or is cut by another range and stays that same range type.
-                // Describing the column as an integer instead handed the driver a value it could
-                // not read: "[5,10)" is no integer, so the row never arrived at all. An untyped
-                // literal opposite a range is read as one, so it answers in that type too.
-                if (leftType != null && isRangeType(leftType)
-                        && (leftType == rightType || isUnknownLiteral(bin.right()))) {
-                    return leftType;
-                }
-                if (rightType != null && isRangeType(rightType) && isUnknownLiteral(bin.left())) {
-                    return rightType;
-                }
-                // If either is NUMERIC, result is NUMERIC (except double wins)
-                if (leftType == DataType.DOUBLE_PRECISION || rightType == DataType.DOUBLE_PRECISION)
-                    return DataType.DOUBLE_PRECISION;
-                if (leftType == DataType.NUMERIC || rightType == DataType.NUMERIC)
-                    return DataType.NUMERIC;
-                // real has no arithmetic of its own opposite an integer; PG widens to float8
-                if (leftType == DataType.REAL || rightType == DataType.REAL) {
-                    return leftType == rightType ? DataType.REAL : DataType.DOUBLE_PRECISION;
-                }
-                if (leftType == DataType.BIGINT || rightType == DataType.BIGINT)
-                    return DataType.BIGINT;
-                return DataType.INTEGER;
-            }
-            // ^ is numeric^numeric or float8^float8; anything untyped resolves to float8.
-            if (bin.op() == BinaryExpr.BinOp.POWER) {
-                DataType lt = inferTypeFromContext(bin.left(), bindings);
-                DataType rt = inferTypeFromContext(bin.right(), bindings);
-                return lt == DataType.NUMERIC || rt == DataType.NUMERIC
-                        ? DataType.NUMERIC : DataType.DOUBLE_PRECISION;
-            }
-            // Comparison and logical ops return BOOLEAN
-            if (bin.op() == BinaryExpr.BinOp.AND || bin.op() == BinaryExpr.BinOp.OR
-                    || bin.op() == BinaryExpr.BinOp.EQUAL || bin.op() == BinaryExpr.BinOp.NOT_EQUAL
-                    || bin.op() == BinaryExpr.BinOp.LESS_THAN || bin.op() == BinaryExpr.BinOp.GREATER_THAN
-                    || bin.op() == BinaryExpr.BinOp.LESS_EQUAL || bin.op() == BinaryExpr.BinOp.GREATER_EQUAL
-                    || bin.op() == BinaryExpr.BinOp.IS_DISTINCT_FROM || bin.op() == BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM
-                    || bin.op() == BinaryExpr.BinOp.SIMILAR_TO
-                    || bin.op() == BinaryExpr.BinOp.LIKE || bin.op() == BinaryExpr.BinOp.ILIKE) {
-                return DataType.BOOLEAN;
-            }
-            // Concatenation: bytea || bytea returns bytea, otherwise text
-            if (bin.op() == BinaryExpr.BinOp.CONCAT) {
-                DataType lt = inferTypeFromContext(bin.left(), bindings);
-                DataType rt = inferTypeFromContext(bin.right(), bindings);
-                if (lt == DataType.BYTEA || rt == DataType.BYTEA) return DataType.BYTEA;
-                return DataType.TEXT;
-            }
-            return DataType.TEXT;
+            DataType lt = inferTypeFromContext(bin.left(), bindings);
+            DataType rt = inferTypeFromContext(bin.right(), bindings);
+            // An untyped literal is PostgreSQL's unknown and takes the other operand's type,
+            // so it must not drag the pair back to text.
+            if (isUnknownLiteral(bin.left())) lt = null;
+            if (isUnknownLiteral(bin.right())) rt = null;
+            DataType resolved = binaryResultType(bin.op(), lt, rt);
+            return resolved != null ? resolved : DataType.TEXT;
         }
         if (expr instanceof FunctionCallExpr) {
             FunctionCallExpr fn = (FunctionCallExpr) expr;
@@ -2526,6 +2839,9 @@ class ExprEvaluator {
                     || name.equals("octet_length") || name.equals("bit_length")
                     || name.equals("position") || name.equals("strpos")
                     || name.equals("array_length") || name.equals("cardinality")
+                    || name.equals("array_ndims") || name.equals("array_upper")
+                    || name.equals("array_lower")
+                    || name.equals("num_nonnulls") || name.equals("num_nulls")
                     || name.equals("array_position")) return DataType.INTEGER;
             if (name.equals("array_positions")) return DataType.INT4_ARRAY;
             if (name.equals("sum") || name.equals("avg")) {
@@ -2559,8 +2875,9 @@ class ExprEvaluator {
                     || name.equals("md5") || name.equals("to_char") || name.equals("initcap")
                     || name.equals("translate") || name.equals("chr") || name.equals("format")
                     || name.equals("lpad") || name.equals("rpad") || name.equals("overlay")
-                    || name.equals("string_agg") || name.equals("regexp_replace")
-                    || name.equals("pg_typeof")) return DataType.TEXT;
+                    || name.equals("string_agg") || name.equals("regexp_replace")) return DataType.TEXT;
+            // pg_typeof answers with a type, and PostgreSQL declares it as one
+            if (name.equals("pg_typeof")) return DataType.REGTYPE;
             if (name.equals("now") || name.equals("current_timestamp")
                     || name.equals("statement_timestamp") || name.equals("clock_timestamp")
                     || name.equals("transaction_timestamp")) return DataType.TIMESTAMPTZ;
@@ -2583,12 +2900,21 @@ class ExprEvaluator {
                 return DataType.TIMESTAMP;
             }
             if (name.equals("coalesce") || name.equals("nullif") || name.equals("greatest") || name.equals("least")) {
+                // An untyped literal is read as whatever the other arguments settle on, so
+                // GREATEST('10', 9) is an integer -- taking the first argument's type made it text
+                for (Expression arg : fn.args()) {
+                    if (isUnknownLiteral(arg)) continue;
+                    DataType dt = inferTypeFromContext(arg, bindings);
+                    if (dt != null) return dt;
+                }
                 for (Expression arg : fn.args()) {
                     DataType dt = inferTypeFromContext(arg, bindings);
                     if (dt != null) return dt;
                 }
                 return DataType.TEXT;
             }
+            DataType arrayResult = arrayFunctionResultType(name, fn, bindings);
+            if (arrayResult != null) return arrayResult;
             if (name.equals("bool_and") || name.equals("bool_or") || name.equals("every")
                     || name.equals("has_database_privilege") || name.equals("has_schema_privilege")
                     || name.equals("has_table_privilege") || name.equals("has_column_privilege")
@@ -2773,6 +3099,10 @@ class ExprEvaluator {
             DataType inner = inferTypeFromContext(((AtTimeZoneExpr) expr).expr(), bindings);
             if (inner == DataType.TIMESTAMPTZ) return DataType.TIMESTAMP;
             if (inner == DataType.TIMESTAMP) return DataType.TIMESTAMPTZ;
+            // A date arrives as a timestamptz, so it comes back out as a timestamp; a time of
+            // either kind comes back as timetz.
+            if (inner == DataType.DATE) return DataType.TIMESTAMP;
+            if (inner == DataType.TIME) return DataType.TIMETZ;
             return inner != null ? inner : DataType.TIMESTAMP;
         }
         if (expr instanceof IsNullExpr) return DataType.BOOLEAN;
@@ -2803,7 +3133,17 @@ class ExprEvaluator {
             }
             return DataType.TEXT;
         }
-        if (expr instanceof ArrayExpr) return DataType.TEXT;
+        if (expr instanceof ArrayExpr) {
+            ArrayExpr arr = (ArrayExpr) expr;
+            // ROW(...) is a record, not an array, and has no single element type to speak of
+            if (arr.isRow()) return DataType.TEXT;
+            for (Expression element : arr.elements()) {
+                if (isUnknownLiteral(element)) continue;
+                DataType array = DataType.arrayOf(inferTypeFromContext(element, bindings));
+                if (array != null) return array;
+            }
+            return DataType.TEXT_ARRAY;
+        }
         return DataType.TEXT;
     }
 

@@ -45,6 +45,28 @@ class SelectSetOpExecutor {
         return executeSetOpInner(stmt, leftResult, rightResult);
     }
 
+    /**
+     * True when a branch writes a text type down for column {@code ci} -- {@code 'a'::text} and
+     * nothing else. Such a branch really is text and PostgreSQL reports the mismatch rather than
+     * coercing it away, where a bare literal is {@code unknown} and takes the other branch's type.
+     *
+     * <p>Only an explicit cast counts. Anything the engine merely inferred as text -- a function
+     * call, a subquery column, an expression -- keeps the coercion path, because refusing those
+     * on the strength of a defaulted type rejects SQL PostgreSQL runs.
+     */
+    private boolean writesTextTypeDown(Statement branch, int ci) {
+        if (!(branch instanceof SelectStmt)) return false;
+        List<SelectStmt.SelectTarget> targets = ((SelectStmt) branch).targets();
+        if (targets == null || ci >= targets.size()) return false;
+        Expression expr = targets.get(ci).expr();
+        if (!(expr instanceof CastExpr)) return false;
+        String name = ((CastExpr) expr).typeName();
+        if (name == null) return false;
+        DataType dt = DataType.fromPgName(DataType.canonicalName(name));
+        return dt == DataType.TEXT || dt == DataType.VARCHAR || dt == DataType.CHAR
+                || dt == DataType.NAME;
+    }
+
     private QueryResult executeSetOpInner(SetOpStmt stmt, QueryResult leftResult, QueryResult rightResult) {
         List<Column> columns = new ArrayList<>(leftResult.getColumns());
         if (columns.size() != rightResult.getColumns().size()) {
@@ -78,18 +100,23 @@ class SelectSetOpExecutor {
                     boolean rightIsText = rightType == DataType.TEXT || rightType == DataType.VARCHAR
                             || rightType == DataType.CHAR || rightType == DataType.NAME;
                     if (!leftIsText && !rightIsText) {
-                        throw new MemgresException(stmt.op().name() + " types " + leftType.getPgName() + " and "
-                                + rightType.getPgName() + " cannot be matched", "42804");
+                        throw new MemgresException(stmt.op().name() + " types "
+                                + leftType.toRegtypeDisplay() + " and "
+                                + rightType.toRegtypeDisplay() + " cannot be matched", "42804");
                     }
                     // One side is text-category, the other is not. In PostgreSQL, string
                     // literals and NULL have type "unknown" which is implicitly coercible to
                     // any type. Our engine uses TEXT for both unknown literals and actual text
-                    // columns. To distinguish: columns from real tables have tableOid > 0.
+                    // columns. To distinguish: columns from real tables have tableOid > 0,
+                    // and a branch whose query writes the type down -- 'a'::text -- is text in
+                    // its own right, so PostgreSQL reports the mismatch instead of coercing it.
                     Column textCol = leftIsText ? columns.get(ci) : rightResult.getColumns().get(ci);
-                    if (textCol.getTableOid() != 0) {
-                        // TEXT from a real table column — genuine type mismatch
-                        throw new MemgresException(stmt.op().name() + " types " + leftType.getPgName() + " and "
-                                + rightType.getPgName() + " cannot be matched", "42804");
+                    boolean writtenAsText = leftIsText
+                            ? writesTextTypeDown(stmt.left(), ci) : writesTextTypeDown(stmt.right(), ci);
+                    if (textCol.getTableOid() != 0 || writtenAsText) {
+                        throw new MemgresException(stmt.op().name() + " types "
+                                + leftType.toRegtypeDisplay() + " and "
+                                + rightType.toRegtypeDisplay() + " cannot be matched", "42804");
                     }
                     // TEXT from a computed expression or literal — attempt coercion
                     DataType targetType = leftIsText ? rightType : leftType;

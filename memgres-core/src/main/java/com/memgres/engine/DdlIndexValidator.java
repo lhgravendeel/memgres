@@ -37,6 +37,27 @@ final class DdlIndexValidator {
         }
     }
 
+    /**
+     * PostgreSQL's {@code INDEX_MAX_KEYS}: an index tuple has room for exactly this many
+     * attributes, so a wider index could not be built whatever the access method.
+     */
+    static final int MAX_INDEX_KEYS = 32;
+
+    /**
+     * Refuse an index — declared as one, or built to back a PRIMARY KEY or UNIQUE constraint —
+     * that names more attributes than an index tuple holds. PostgreSQL counts the key columns and
+     * the INCLUDE columns together, so 30 keys plus 3 included is over the limit as surely as 33
+     * keys are.
+     */
+    static void checkIndexColumnCount(List<String> keyColumns, List<String> includeColumns) {
+        int keys = keyColumns == null ? 0 : keyColumns.size();
+        int included = includeColumns == null ? 0 : includeColumns.size();
+        if (keys + included > MAX_INDEX_KEYS) {
+            throw new MemgresException("cannot use more than " + MAX_INDEX_KEYS
+                    + " columns in an index", "54011");
+        }
+    }
+
     private static final Map<String, AccessMethod> ACCESS_METHODS = new HashMap<>();
 
     static {
@@ -255,6 +276,9 @@ final class DdlIndexValidator {
      */
     static void validate(Table table, String method, boolean unique, List<String> columns,
                          List<String> columnOptions, List<String> includeColumns) {
+        // The width of the index tuple is settled from the statement alone, so PostgreSQL checks
+        // it before it looks the access method up.
+        checkIndexColumnCount(columns, includeColumns);
         String am = method != null ? method.toLowerCase() : "btree";
         AccessMethod amInfo = ACCESS_METHODS.get(am);
         if (amInfo == null) {

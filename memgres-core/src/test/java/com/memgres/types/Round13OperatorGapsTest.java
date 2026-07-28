@@ -190,8 +190,12 @@ class Round13OperatorGapsTest {
     /** jsonb_path_query_tz : timezone-aware path query. */
     @Test
     void jsonb_path_query_tz() throws SQLException {
-        assertEquals("\"2024-01-01T00:00:00+00:00\"",
+        // .datetime() with no template reads a bare date as a date, and PG renders it as one
+        assertEquals("\"2024-01-01\"",
                 scalarString("SELECT jsonb_path_query_tz('\"2024-01-01\"', '$.datetime()')::text"));
+        assertEquals("\"2024-01-01T00:00:00+00:00\"",
+                scalarString("SELECT jsonb_path_query_tz('\"2024-01-01T00:00:00+00:00\"',"
+                        + " '$.datetime()')::text"));
     }
 
     // =========================================================================

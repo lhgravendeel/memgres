@@ -313,9 +313,40 @@ public final class TypeCoercion {
             case TSQUERY:
                 if (value instanceof TsQuery) return value;
                 return TsQuery.parse(value.toString());
+            case INT4RANGE:
+            case INT8RANGE:
+            case NUMRANGE:
+            case DATERANGE:
+            case TSRANGE:
+            case TSTZRANGE:
+                // A range's column type names its element type, so the bounds are read and stored
+                // as values of it — the same normalisation an explicit cast performs.
+                return RangeOperations.parse(value.toString().trim(), targetType.getPgName())
+                        .toString();
+            case INT4MULTIRANGE:
+            case INT8MULTIRANGE:
+            case NUMMULTIRANGE:
+            case DATEMULTIRANGE:
+            case TSMULTIRANGE:
+            case TSTZMULTIRANGE:
+                return normalizeMultirangeForStorage(value.toString().trim(), targetType);
             default:
                 return value;
         }
+    }
+
+    private static String normalizeMultirangeForStorage(String text, DataType targetType) {
+        String rangeType = targetType.getPgName().replace("multirange", "range");
+        if (text.equalsIgnoreCase("empty")) return "{}";
+        if (RangeOperations.isRangeString(text)) {
+            RangeOperations.PgRange one = RangeOperations.parse(text, rangeType);
+            return one.isEmpty() ? "{}" : "{" + one + "}";
+        }
+        java.util.List<RangeOperations.PgRange> parts = new java.util.ArrayList<>();
+        for (RangeOperations.PgRange r : RangeOperations.parseMultirangeLiteral(text, rangeType)) {
+            if (!r.isEmpty()) parts.add(r);
+        }
+        return RangeOperations.formatMultirange(RangeOperations.mergeAndSort(parts));
     }
 
     /**
@@ -437,6 +468,21 @@ public final class TypeCoercion {
                 return value instanceof TsVector;
             case TSQUERY:
                 return value instanceof TsQuery;
+            case INT4RANGE:
+            case INT8RANGE:
+            case NUMRANGE:
+            case DATERANGE:
+            case TSRANGE:
+            case TSTZRANGE:
+            case INT4MULTIRANGE:
+            case INT8MULTIRANGE:
+            case NUMMULTIRANGE:
+            case DATEMULTIRANGE:
+            case TSMULTIRANGE:
+            case TSTZMULTIRANGE:
+                // A range arrives as text and stays text, but the text has to be the canonical
+                // form for the column's element type rather than whatever was written.
+                return false;
             default:
                 return value instanceof String;
         }
@@ -468,6 +514,11 @@ public final class TypeCoercion {
                 checkNumericTypmod(rounded, column.getPrecision(), column.getScale());
             }
             return rounded;
+        }
+        // interval(n): the column keeps only n fractional digits of its seconds
+        if (type == DataType.INTERVAL && column.getPrecision() != null && value instanceof PgInterval) {
+            IntervalTypmod typmod = IntervalTypmod.fromTypeSpec("interval(" + column.getPrecision() + ")");
+            if (typmod != null) return typmod.apply((PgInterval) value);
         }
         // BIT(n) / VARBIT(n) length enforcement
         if (type == DataType.BIT && value instanceof AstExecutor.PgBitString && column.getPrecision() != null) {
@@ -675,7 +726,14 @@ public final class TypeCoercion {
         if (lower.equals("nan")) {
             return Double.NaN;
         }
-        return Double.parseDouble(s);
+        try {
+            return Double.parseDouble(s);
+        } catch (NumberFormatException e) {
+            // float8's input function accepts the same non-decimal integer forms int4 does
+            java.math.BigInteger whole = parseIntegerText(s);
+            if (whole != null) return whole.doubleValue();
+            throw e;
+        }
     }
 
     public static PgMoney toMoney(Object val) {
@@ -793,6 +851,10 @@ public final class TypeCoercion {
         try {
             return new BigDecimal(s);
         } catch (NumberFormatException e) {
+            // numeric's input function reads the non-decimal integer forms and the underscore
+            // separator exactly as int4's does, so '0x2a'::numeric is 42 and not an error
+            java.math.BigInteger whole = parseIntegerText(s);
+            if (whole != null) return new BigDecimal(whole);
             throw new MemgresException("invalid input syntax for type numeric: \"" + val + "\"", "22P02");
         }
     }
@@ -1341,9 +1403,13 @@ public final class TypeCoercion {
                     try { return LocalTime.parse(timePart); } catch (DateTimeParseException e3) { /* fall through */ }
                 }
             }
-            // Use 22008 for well-formatted but out-of-range times (e.g. 25:00:00)
-            String errCode = s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*") ? "22008" : "22007";
-            throw new MemgresException("date/time field value out of range: \"" + val + "\"", errCode);
+            // Use 22008 for well-formatted but out-of-range times (e.g. 25:00:00); text that is
+            // no time at all gets PG's 22007 wording, which names the type it would not read as
+            if (!s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*")) {
+                throw new MemgresException(
+                        "invalid input syntax for type time: \"" + val + "\"", "22007");
+            }
+            throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
         }
     }
 
@@ -1426,6 +1492,54 @@ public final class TypeCoercion {
 
         String errCode = s.matches("\\d{1,2}:\\d{2}(:\\d{2})?.*") ? "22008" : "22007";
         throw new MemgresException("date/time field value out of range: \"" + val + "\"", errCode);
+    }
+
+    /** True when the value is a timetz -- memgres holds one as its printed HH:MM:SS±TZ text. */
+    public static boolean looksLikeTimeTz(Object val) {
+        return val instanceof String && isTimeTzString(((String) val).trim());
+    }
+
+    /**
+     * Rewrite a time against another zone, keeping the instant of day it names: a timetz is not
+     * moved, only written against a different offset. A plain time carries no offset of its own,
+     * so it takes the session's first, which is how PG reads {@code time AT TIME ZONE}.
+     */
+    public static String shiftTimeTzToZone(Object val, ZoneId zone) {
+        java.time.OffsetTime source = val instanceof LocalTime
+                ? ((LocalTime) val).atOffset(offsetOfZoneNow(sessionZone()))
+                : parseTimeTzText(toTimeTz(val));
+        return formatTimeTz(source.withOffsetSameInstant(offsetOfZoneNow(zone)));
+    }
+
+    /** A zone's offset as of the current statement; a named zone's offset moves with the date. */
+    private static ZoneOffset offsetOfZoneNow(ZoneId zone) {
+        return zone.getRules().getOffset(sessionInstant().toInstant());
+    }
+
+    /** Read back the HH:MM:SS±TZ text that {@link #toTimeTz} produces. */
+    private static java.time.OffsetTime parseTimeTzText(String s) {
+        int signIdx = -1;
+        for (int i = s.length() - 1; i > 0; i--) {
+            char c = s.charAt(i);
+            if (c == '+' || c == '-') { signIdx = i; break; }
+        }
+        if (signIdx < 0) return LocalTime.parse(s).atOffset(ZoneOffset.UTC);
+        return LocalTime.parse(s.substring(0, signIdx))
+                .atOffset(ZoneOffset.of(s.substring(signIdx)));
+    }
+
+    /** Print a timetz the way PG does: seconds always, offset minutes only when they matter. */
+    private static String formatTimeTz(java.time.OffsetTime ot) {
+        String timePart = ot.toLocalTime().toString();
+        if (timePart.length() == 5) timePart += ":00";
+        int totalSeconds = ot.getOffset().getTotalSeconds();
+        String sign = totalSeconds >= 0 ? "+" : "-";
+        int absSeconds = Math.abs(totalSeconds);
+        int hours = absSeconds / 3600;
+        int minutes = (absSeconds % 3600) / 60;
+        return timePart + sign + (minutes > 0
+                ? String.format("%02d:%02d", hours, minutes)
+                : String.format("%02d", hours));
     }
 
     /**
@@ -1568,6 +1682,14 @@ public final class TypeCoercion {
         // Try date-only
         try { return LocalDate.parse(s).atStartOfDay(); } catch (DateTimeParseException e) { /* try more */ }
         try { return OffsetDateTime.parse(s).toLocalDateTime(); } catch (Exception e) { /* ignore */ }
+        // A date may name an offset with no time of day: '2001-01-01+02'. A timestamp without
+        // time zone reads the offset and then discards it, the way it does a trailing zone name.
+        java.util.regex.Matcher dateOffset = DATE_ONLY_OFFSET.matcher(val.toString().trim());
+        if (dateOffset.matches()) {
+            try {
+                return LocalDate.parse(dateOffset.group(1)).atStartOfDay();
+            } catch (DateTimeParseException ignore) { /* fall through to the error below */ }
+        }
         // Use 22008 for well-formatted but out-of-range timestamps
         String errCode = val.toString().trim().matches("\\d{4}-\\d{2}-\\d{2}.*") ? "22008" : "22007";
         throw new MemgresException("invalid input syntax for type timestamp: \"" + val + "\"", errCode);
@@ -1624,12 +1746,45 @@ public final class TypeCoercion {
         try { return OffsetDateTime.parse(s); } catch (DateTimeParseException e) { /* try more */ }
         try { return LocalDateTime.parse(s).atZone(zone).toOffsetDateTime(); } catch (DateTimeParseException e) { /* try more */ }
         try { return LocalDate.parse(s).atStartOfDay(zone).toOffsetDateTime(); } catch (DateTimeParseException e) { /* ignore */ }
+        // A date may name its own offset with no time of day at all: '2001-01-01+02' is midnight
+        // in +02. Written without a space a leading '-' would be another date field, so PG only
+        // reads a negative offset when a space separates it.
+        java.util.regex.Matcher dateOffset = DATE_ONLY_OFFSET.matcher(val.toString().trim());
+        if (dateOffset.matches()) {
+            String offsetText = dateOffset.group(2) != null ? dateOffset.group(2) : dateOffset.group(3);
+            try {
+                return LocalDate.parse(dateOffset.group(1)).atStartOfDay()
+                        .atOffset(ZoneOffset.of(offsetText));
+            } catch (RuntimeException ignore) { /* fall through to the error below */ }
+        }
         // Use 22008 "out of range" for well-formatted but out-of-range dates (e.g., 2024-02-30);
         // garbage input gets 22007 with PG's "invalid input syntax" wording.
         if (val.toString().trim().matches("\\d{4}-\\d{2}-\\d{2}.*")) {
+            // A whole date followed by something that is not a time of day is a syntax problem,
+            // not a range one -- PG rejects '2001-01-01-05' with 22007.
+            if (isValidDatePrefixWithTrailer(val.toString().trim())) {
+                throw new MemgresException(
+                        "invalid input syntax for type timestamp with time zone: \"" + val + "\"", "22007");
+            }
             throw new MemgresException("date/time field value out of range: \"" + val + "\"", "22008");
         }
         throw new MemgresException("invalid input syntax for type timestamp with time zone: \"" + val + "\"", "22007");
+    }
+
+    /** A yyyy-MM-dd with an offset and no time of day; a bare '-' offset needs a space before it. */
+    private static final java.util.regex.Pattern DATE_ONLY_OFFSET = java.util.regex.Pattern.compile(
+            "^(\\d{4}-\\d{2}-\\d{2})(?:\\s+([+-]\\d{1,2}(?::?\\d{2})?)|(\\+\\d{1,2}(?::?\\d{2})?))$");
+
+    /** True when the leading ten characters are a real date and something else follows it. */
+    private static boolean isValidDatePrefixWithTrailer(String s) {
+        if (s.length() <= 10) return false;
+        try {
+            LocalDate.parse(s.substring(0, 10));
+        } catch (DateTimeParseException e) {
+            return false;
+        }
+        // Only an offset-shaped trailer: anything else keeps the range wording it had before
+        return s.substring(10).matches("[+-]\\d{1,2}(?::?\\d{2})?");
     }
 
     /** Pattern for a date, optionally followed by a time-of-day, followed by a trailing zone name/abbreviation. */

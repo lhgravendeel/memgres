@@ -92,7 +92,8 @@ class FromFunctionResolver {
         if (fname.equals("pg_indexam_has_property")) return resolvePgIndexamHasProperty(alias, evalArgs);
         if (fname.equals("pg_available_extension_versions")) return resolvePgAvailableExtensionVersions(alias);
         if (fname.equals("pg_show_all_settings")) return resolvePgShowAllSettings(alias);
-        if (fname.equals("unnest")) return resolveUnnest(alias, colAliases, evalArgs, funcFrom.withOrdinality());
+        if (fname.equals("unnest")) return resolveUnnest(alias, colAliases, evalArgs,
+                funcFrom.withOrdinality(), funcFrom.args());
         if (fname.equals("_pg_expandarray")) return resolveExpandArray(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
             return resolveJsonEach(fname, alias, colAliases, evalArgs);
@@ -625,7 +626,16 @@ class FromFunctionResolver {
     // ---- unnest ----
 
     private List<RowContext> resolveUnnest(String alias, List<String> colAliases, List<Object> evalArgs,
-                                           boolean withOrdinality) {
+                                           boolean withOrdinality, List<Expression> argExprs) {
+        // unnest is declared three times over -- anyarray, anymultirange and tsvector -- so an
+        // argument with no type of its own fits all three equally and PostgreSQL will not choose.
+        if (argExprs != null && argExprs.size() == 1 && evalArgs.size() == 1
+                && argExprs.get(0) instanceof Literal
+                && ((Literal) argExprs.get(0)).literalType() == Literal.LiteralType.STRING) {
+            throw new MemgresException("function unnest(unknown) is not unique"
+                    + "\n  Hint: Could not choose a best candidate function."
+                    + " You might need to add explicit type casts.", "42725");
+        }
         if (evalArgs.isEmpty()) {
             throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
         }
@@ -651,7 +661,11 @@ class FromFunctionResolver {
 
         String colName = firstColAlias(colAliases, alias);
         List<Column> cols = new ArrayList<>();
-        cols.add(new Column(colName, DataType.TEXT, true, false, null));
+        // The rows unnest produces are the array's elements, so the column carries the element
+        // type: an int4[] unnests to int4, not to the text the driver could not decode.
+        DataType elementType = argExprs == null || argExprs.isEmpty() ? null
+                : DataType.elementOf(executor.exprEvaluator.inferExprType(argExprs.get(0)));
+        cols.add(new Column(colName, elementType != null ? elementType : DataType.TEXT, true, false, null));
         // The WITH ORDINALITY clause decides; a short alias list just leaves the extra
         // column with its default name rather than dropping it
         boolean hasOrdinality = withOrdinality || (colAliases != null && colAliases.size() >= 2);
@@ -720,7 +734,7 @@ class FromFunctionResolver {
             JsonFunctions.requireJsonEachObject(fname, json);
             try {
                 boolean isText = fname.contains("_text");
-                Map<String, String> pairs = JsonOperations.parseObjectKeys(json);
+                Map<String, String> pairs = JsonFunctions.eachMembers(fname, json);
                 for (Map.Entry<String, String> entry : pairs.entrySet()) {
                     String value = entry.getValue();
                     if (isText && value != null && value.startsWith("\"") && value.endsWith("\"")) {
@@ -1048,7 +1062,7 @@ class FromFunctionResolver {
         if (json != null) {
             String s = json.toString().trim();
             JsonFunctions.requireJsonObject(fname, s);
-            for (String key : JsonOperations.parseObjectKeys(s).keySet()) {
+            for (String key : JsonFunctions.eachMembers(fname, s).keySet()) {
                 Object[] row = new Object[]{key};
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));

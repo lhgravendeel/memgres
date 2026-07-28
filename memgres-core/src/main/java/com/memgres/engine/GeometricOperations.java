@@ -1794,6 +1794,20 @@ public final class GeometricOperations {
         return new PgPolygon(pts);
     }
 
+    /**
+     * Two paths joined end to end. PostgreSQL's path concatenation refuses a closed path -- a
+     * loop has no free end to attach anything to -- and answers NULL rather than a shape, so a
+     * closed path plus anything is NULL and never the translation a path-plus-point would give.
+     */
+    public static String pathConcat(String left, String right) {
+        PgPath a = parsePath(left);
+        PgPath b = parsePath(right);
+        if (a.closed || b.closed) return null;
+        List<PgPoint> pts = new ArrayList<>(a.points);
+        pts.addAll(b.points);
+        return format(new PgPath(pts, false));
+    }
+
     // String-based arithmetic: geom + point, geom - point, geom * point, geom / point
     public static String add(String left, String right) {
         Object lGeom = autoDetect(left);

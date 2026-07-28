@@ -285,12 +285,13 @@ public class ExpressionParser {
         } else if (name.equalsIgnoreCase("INTERVAL")) {
             // Handle INTERVAL qualifiers: INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, etc.
             // Also INTERVAL YEAR, INTERVAL HOUR, etc. (single field)
+            // The qualifier is part of the type's identity, so it is spelled one way regardless
+            // of how it was written: "interval day to second", never "interval day TO second".
             if (checkIntervalField()) {
-                sb.append(" ").append(advance().value()); // consume field keyword
+                sb.append(" ").append(advance().value().toLowerCase()); // consume field keyword
                 if (checkKeyword("TO") || checkIdentCI("TO")) {
-                    sb.append(" ").append(advance().value()); // consume TO
-                    // Consume the target field keyword
-                    sb.append(" ").append(readIdentifier());
+                    advance(); // consume TO
+                    sb.append(" to ").append(readIdentifier().toLowerCase());
                 }
             }
         } else if (name.equalsIgnoreCase("BIT") && checkKeyword("VARYING")) {
@@ -1039,6 +1040,10 @@ public class ExpressionParser {
             } else if (matchKeywords("AT", "TIME", "ZONE")) {
                 Expression zone = parsePrimary();
                 expr = new AtTimeZoneExpr(expr, zone);
+            } else if (matchKeywords("AT", "LOCAL")) {
+                // PG 17's AT LOCAL is AT TIME ZONE with the session's TimeZone, which the
+                // evaluator reads when the zone expression is absent.
+                expr = new AtTimeZoneExpr(expr, null);
             } else if (matchKeyword("COLLATE")) {
                 // COLLATE postfix: validate collation name and wrap in CollateExpr.
                 if (isClauseKeyword()) {
@@ -1247,6 +1252,9 @@ public class ExpressionParser {
                         String val = advance().value();
                         return new CastExpr(Literal.ofString(val), "time");
                     }
+                    // TIME WITH/WITHOUT TIME ZONE 'value', the spelling TIMESTAMP already accepts
+                    Expression timeLiteral = specialFormParser.parseQualifiedTimeLiteral();
+                    if (timeLiteral != null) return timeLiteral;
                     break;
                 }
                 case "TIMESTAMP": {
@@ -1496,6 +1504,26 @@ public class ExpressionParser {
     }
 
     /**
+     * PostgreSQL's {@code FUNC_MAX_ARGS}: a pg_proc entry has room for this many argument types,
+     * so no function call — variadic ones included — may carry more.
+     */
+    private static final int MAX_FUNCTION_ARGS = 100;
+
+    /**
+     * Refuse a function call with more arguments than PostgreSQL can pass. This is deliberately
+     * confined to real function calls: {@code COALESCE}, {@code GREATEST}, {@code LEAST},
+     * {@code NULLIF} and the XML forms are grammar productions of their own in PostgreSQL rather
+     * than {@code FuncCall} nodes, they never reach {@code ParseFuncOrColumn}, and a hundred-odd
+     * arguments to those is accepted. They are parsed elsewhere here for the same reason.
+     */
+    private static void checkFunctionArgCount(int argCount) {
+        if (argCount > MAX_FUNCTION_ARGS) {
+            throw new com.memgres.engine.MemgresException("cannot pass more than "
+                    + MAX_FUNCTION_ARGS + " arguments to a function", "54023");
+        }
+    }
+
+    /**
      * Parse a function call expression: name(...) with optional DISTINCT, ORDER BY,
      * FILTER, WITHIN GROUP, and OVER clauses. DRYs unqualified and schema-qualified function calls.
      */
@@ -1528,6 +1556,7 @@ public class ExpressionParser {
             }
             expect(TokenType.RIGHT_PAREN);
         }
+        checkFunctionArgCount(args.size());
 
         // IGNORE NULLS / RESPECT NULLS: PG 18 does not support this syntax.
         // Reject with syntax error to match PG 18 behavior.
