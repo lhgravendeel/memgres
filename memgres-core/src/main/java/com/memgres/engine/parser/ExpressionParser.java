@@ -436,15 +436,23 @@ public class ExpressionParser {
      */
     protected boolean lastColumnListHadExpression;
 
+    /**
+     * The parsed form of each expression entry of the last {@link #parseColumnOrExpressionList()},
+     * so a caller that has to judge what was written — an aggregate in an ON CONFLICT index
+     * expression, say — can read the tree instead of the reconstructed text.
+     */
+    protected List<Expression> lastColumnListExpressions;
+
     protected List<String> parseColumnOrExpressionList() {
         List<String> list = new ArrayList<>();
+        List<Expression> parsed = new ArrayList<>();
         boolean anyExpr = false;
         do {
             if (check(TokenType.LEFT_PAREN)) {
                 anyExpr = true;
                 expect(TokenType.LEFT_PAREN);
                 int exprStart = pos;
-                parseExpression();
+                parsed.add(parseExpression());
                 StringBuilder sb = new StringBuilder();
                 for (int i = exprStart; i < pos; i++) {
                     if (i > exprStart) {
@@ -464,6 +472,7 @@ public class ExpressionParser {
             }
         } while (match(TokenType.COMMA));
         lastColumnListHadExpression = anyExpr;
+        lastColumnListExpressions = parsed;
         return list;
     }
 

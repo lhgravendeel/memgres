@@ -194,6 +194,33 @@ class DmlExecutor {
     private void validateOnConflictTarget(InsertStmt stmt, Table table) {
         InsertStmt.OnConflict oc = stmt.onConflict();
         if (oc == null) return;
+        // The conflict target names an index, and an index is built from one row at a time; the
+        // action it triggers is an UPDATE of that one row. Neither has a group to aggregate or a
+        // result to be numbered against, so PostgreSQL names the clause the same way it does for
+        // a CREATE INDEX or a plain UPDATE — and it settles all of this before it touches a row.
+        // The arbiter columns are read first, as PostgreSQL reads them: a target that names no
+        // column of the relation is that error, not whatever the action would also have been.
+        if (oc.columns() != null) {
+            for (String col : oc.columns()) {
+                if (table.getColumnIndex(col) < 0) {
+                    throw new MemgresException("column \"" + col + "\" of relation \""
+                            + table.getName() + "\" does not exist", "42703");
+                }
+            }
+        }
+        PlacementCheck placement = executor.selectExecutor.placementCheck;
+        if (oc.conflictExpressionAsts() != null) {
+            for (Expression target : oc.conflictExpressionAsts()) {
+                placement.reject(target, "index expressions");
+            }
+        }
+        placement.reject(oc.whereClause(), "index predicates");
+        if (oc.doUpdate() != null) {
+            for (InsertStmt.SetClause set : oc.doUpdate()) {
+                placement.reject(set.value(), "UPDATE");
+            }
+        }
+        placement.reject(oc.doUpdateWhereClause(), "WHERE");
         if (oc.constraint() != null) {
             StoredConstraint named = null;
             for (StoredConstraint sc : table.getConstraints()) {
@@ -2048,6 +2075,7 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
+        checkMergePlacement(stmt);
 
         // Validate: source cannot be the same unaliased table as target
         if (stmt.source() instanceof SelectStmt.TableRef) {
@@ -3053,6 +3081,42 @@ class DmlExecutor {
     }
 
     /**
+     * Every clause of a MERGE that is read one row at a time: the condition that pairs a source
+     * row with a target row, the condition that chooses which action fires, and the action itself.
+     * PostgreSQL names the ON clause a JOIN condition, the WHEN condition its own thing, and an
+     * action by the command it is — the same names it uses for a plain join, UPDATE and INSERT.
+     */
+    private void checkMergePlacement(MergeStmt stmt) {
+        PlacementCheck placement = executor.selectExecutor.placementCheck;
+        placement.reject(stmt.onCondition(), "JOIN conditions");
+        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            Expression when = null;
+            List<InsertStmt.SetClause> sets = null;
+            List<Expression> values = null;
+            if (clause instanceof MergeStmt.WhenMatched) {
+                MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
+                when = wm.andCondition();
+                sets = wm.setClauses();
+            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                MergeStmt.WhenNotMatchedBySource ws = (MergeStmt.WhenNotMatchedBySource) clause;
+                when = ws.andCondition();
+                sets = ws.setClauses();
+            } else if (clause instanceof MergeStmt.WhenNotMatched) {
+                MergeStmt.WhenNotMatched wn = (MergeStmt.WhenNotMatched) clause;
+                when = wn.andCondition();
+                values = wn.values();
+            }
+            placement.reject(when, "MERGE WHEN conditions");
+            if (sets != null) {
+                for (InsertStmt.SetClause set : sets) placement.reject(set.value(), "UPDATE");
+            }
+            if (values != null) {
+                for (Expression value : values) placement.reject(value, "VALUES");
+            }
+        }
+    }
+
+    /**
      * An UPDATE's assignments and WHERE, both of which PostgreSQL reads per row.
      *
      * <p>The two clauses carry different names in the message: an aggregate in the SET list is
@@ -3075,12 +3139,7 @@ class DmlExecutor {
         for (SelectStmt.SelectTarget target : returning) {
             // RETURNING reports the rows the statement touched one at a time; there is no
             // group and no window frame for an aggregate or a window function to run over.
-            if (executor.selectExecutor.containsAggregate(target.expr())) {
-                throw new MemgresException("aggregate functions are not allowed in RETURNING", "42803");
-            }
-            if (executor.selectExecutor.containsWindowFunction(target.expr())) {
-                throw new MemgresException("window functions are not allowed in RETURNING", "42P20");
-            }
+            executor.selectExecutor.placementCheck.reject(target.expr(), "RETURNING");
             if (target.expr() instanceof WildcardExpr) continue;
             if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();

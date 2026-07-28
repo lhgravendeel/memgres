@@ -860,7 +860,7 @@ class DdlParser {
             parser.expectKeyword("AS");
             int viewParens = Math.max(0, parser.countLeadingParensBeforeQuery());
             parser.consumeLeadingParens(viewParens);
-            Statement query = parser.tryParseSetOp(parser.parseSelect());
+            Statement query = parser.tryParseSetOp(parseViewBody());
             parser.consumeTrailingParens(viewParens);
             boolean withData = true;
             if (parser.matchKeyword("WITH")) {
@@ -889,7 +889,7 @@ class DdlParser {
         parser.expectKeyword("AS");
         int viewParens2 = Math.max(0, parser.countLeadingParensBeforeQuery());
         parser.consumeLeadingParens(viewParens2);
-        Statement query = parser.tryParseSetOp(parser.parseSelect());
+        Statement query = parser.tryParseSetOp(parseViewBody());
         parser.consumeTrailingParens(viewParens2);
 
         String checkOption = null;
@@ -902,6 +902,16 @@ class DdlParser {
         }
 
         return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption, withOptions);
+    }
+
+    /**
+     * A view's body. It is usually a SELECT, but a bare VALUES list is a query in its own right
+     * and PostgreSQL accepts one — {@code CREATE VIEW v AS VALUES (1), (2)} defines a two-row
+     * view — so the same body parser the standalone statement uses is used here.
+     */
+    private Statement parseViewBody() {
+        if (parser.checkKeyword("VALUES")) return parser.parseValuesBody();
+        return parser.parseSelect();
     }
 
     private Map<String, String> parseViewWithOptions() {
@@ -1575,6 +1585,23 @@ class DdlParser {
             return "'" + value + "'";
         }
 
+        // Anything else is an expression. PostgreSQL evaluates a partition bound when the
+        // partition is created, so FOR VALUES FROM (abs(-1)) and FROM (1 + 1) are ordinary bounds,
+        // and a bound that has no value then is reported for what is wrong with it rather than as
+        // a syntax error. The source text is carried under a marker; the executor evaluates it.
+        if (isBoundExpression(parser)) {
+            int exprStart = parser.pos;
+            parser.parseExpression();
+            StringBuilder sb = new StringBuilder(Parser.BOUND_EXPRESSION_MARKER);
+            for (int i = exprStart; i < parser.pos; i++) {
+                Token t = parser.tokens.get(i);
+                if (i > exprStart) sb.append(' ');
+                sb.append(t.type() == TokenType.STRING_LITERAL
+                        ? "'" + t.value().replace("'", "''") + "'" : t.value());
+            }
+            return sb.toString();
+        }
+
         // Plain literal with optional cast
         Token valueTok = parser.advance();
         String value = valueTok.value();
@@ -1584,6 +1611,23 @@ class DdlParser {
             return "'" + value + "'";
         }
         return value;
+    }
+
+    /**
+     * Whether the bound at this position is more than one literal token: a call, or a literal
+     * followed by an operator. A bound that ends at a comma, the closing paren or a cast is the
+     * plain literal the caller reads directly.
+     */
+    private static boolean isBoundExpression(Parser parser) {
+        Token cur = parser.peek();
+        Token next = parser.pos + 1 < parser.tokens.size() ? parser.tokens.get(parser.pos + 1) : null;
+        if (next == null) return false;
+        if ((cur.type() == TokenType.KEYWORD || cur.type() == TokenType.IDENTIFIER)
+                && next.type() == TokenType.LEFT_PAREN) {
+            return true;
+        }
+        return next.type() != TokenType.COMMA && next.type() != TokenType.RIGHT_PAREN
+                && next.type() != TokenType.CAST;
     }
 
     private static void skipBoundCast(Parser parser) {

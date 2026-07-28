@@ -1594,8 +1594,10 @@ class SelectExecutor {
 
     /**
      * The checks PG makes over a FROM clause before a single row is read: two items that would
-     * answer to the same name, a join condition that is not a per-row predicate, a USING column
-     * named twice, and a LATERAL item that reaches across a join it cannot see past.
+     * answer to the same name, a USING column named twice, and a LATERAL item that reaches across
+     * a join it cannot see past. A join condition that is not a per-row predicate is judged where
+     * the join is executed instead, which is early enough that it is reported rather than
+     * evaluated.
      */
     private void validateFromClause(List<SelectStmt.FromItem> from) {
         if (from == null) return;
@@ -1615,9 +1617,6 @@ class SelectExecutor {
             collectAndValidate(join.right(), rightNames);
             for (String n : leftNames.values()) addExposed(exposed, n);
             for (String n : rightNames.values()) addExposed(exposed, n);
-            if (join.on() != null) {
-                placementCheck.reject(join.on(), "JOIN conditions");
-            }
             if (join.using() != null) {
                 Set<String> seen = new HashSet<>();
                 for (String col : join.using()) {

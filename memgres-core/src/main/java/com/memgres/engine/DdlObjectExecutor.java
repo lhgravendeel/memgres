@@ -965,6 +965,16 @@ class DdlObjectExecutor {
 
         validateTableRefsInStatement(parsed);
 
+        // A SQL function's body is analysed when the function is written, not when it is called,
+        // so a clause that cannot hold an aggregate or a window call is judged here — the same
+        // judgement a view body gets, and for the same reason: storing it only defers the error.
+        if (parsed instanceof SelectStmt) {
+            SelectStmt sel = (SelectStmt) parsed;
+            PlacementCheck placement = executor.selectExecutor.placementCheck;
+            if (sel.targets() != null) placement.rejectWindowCallWithoutOver(sel);
+            placement.reject(sel.where(), "WHERE");
+        }
+
         if (parsed instanceof SelectStmt && ((SelectStmt) parsed).from() != null) {
             SelectStmt sel = (SelectStmt) parsed;
             for (SelectStmt.FromItem fromItem : sel.from()) {
@@ -2561,6 +2571,7 @@ class DdlObjectExecutor {
                 } catch (Exception ignored) {
                     continue;
                 }
+                executor.selectExecutor.placementCheck.rejectSubquery(expr, "index expression");
                 executor.selectExecutor.placementCheck.reject(expr, "index expressions");
             }
         }
@@ -2571,10 +2582,7 @@ class DdlObjectExecutor {
             } catch (Exception ignored) {
                 return;
             }
-            if (AstWalk.anyMatch(pred, n -> n instanceof SubqueryExpr || n instanceof ExistsExpr
-                    || n instanceof AnyAllExpr || n instanceof ArraySubqueryExpr)) {
-                throw PgErrors.notImplemented("cannot use subquery in index predicate");
-            }
+            executor.selectExecutor.placementCheck.rejectSubquery(pred, "index predicate");
             executor.selectExecutor.placementCheck.reject(pred, "index predicates");
         }
     }

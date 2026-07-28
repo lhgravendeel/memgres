@@ -72,9 +72,10 @@ final class GroupByValidator {
         // downstream compares like with like.
         List<Expression> grouped = resolveItems(stmt.groupBy(), targets, bindings);
         for (Expression g : grouped) {
-            if (select.containsAggregate(g)) {
-                throw new MemgresException("aggregate functions are not allowed in GROUP BY", "42803");
-            }
+            // The groups are formed by reading this expression per input row, so nothing that
+            // only has a value once the groups exist may stand in it — and PostgreSQL names
+            // which kind of call that was.
+            select.placementCheck.reject(g, "GROUP BY");
         }
 
         List<Expression> determining = grouped;

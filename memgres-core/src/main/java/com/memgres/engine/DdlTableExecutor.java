@@ -344,6 +344,8 @@ class DdlTableExecutor {
                 if (tc.type() == TableConstraint.ConstraintType.CHECK) {
                     // A CHECK is tested against the row being written, on its own; it can see no
                     // other row, so nothing in it may need a group or a finished result.
+                    executor.selectExecutor.placementCheck.rejectSubquery(
+                            tc.checkExpr(), "check constraint");
                     executor.selectExecutor.placementCheck.reject(tc.checkExpr(), "check constraints");
                     DdlDefinitionChecks.requireBooleanPredicate(tc.checkExpr(), table, "CHECK");
                 }
@@ -555,10 +557,47 @@ class DdlTableExecutor {
     }
 
     /**
+     * A bound written as an expression rather than a literal, reduced to the literal it is worth.
+     *
+     * <p>PostgreSQL settles a partition bound when the partition is created, so it may be any
+     * expression that has a value then — {@code abs(-1)}, {@code 1 + 1} — and it may not be one
+     * that depends on a row or on other rows. An aggregate or a window call there is refused by
+     * the same walk and under the same clause name every other definition uses.
+     */
+    private List<String> evaluateBoundExpressions(List<String> bounds) {
+        String marker = com.memgres.engine.parser.Parser.BOUND_EXPRESSION_MARKER;
+        boolean any = false;
+        for (String bound : bounds) {
+            if (bound != null && bound.startsWith(marker)) any = true;
+        }
+        if (!any) return bounds;
+        List<String> resolved = new ArrayList<>(bounds.size());
+        for (String bound : bounds) {
+            if (bound == null || !bound.startsWith(marker)) {
+                resolved.add(bound);
+                continue;
+            }
+            String text = bound.substring(marker.length());
+            Expression expr = com.memgres.engine.parser.Parser.parseExpression(text);
+            executor.selectExecutor.placementCheck.reject(expr, "partition bound");
+            Object value = executor.evalExpr(expr, new RowContext(Cols.listOf()));
+            if (value == null) {
+                resolved.add("NULL");
+            } else if (value instanceof Number || value instanceof Boolean) {
+                resolved.add(value.toString());
+            } else {
+                resolved.add("'" + value.toString().replace("'", "''") + "'");
+            }
+        }
+        return resolved;
+    }
+
+    /**
      * Apply partition bounds (FROM/IN/HASH/DEFAULT) to a partition, validating against siblings.
      * Shared between CREATE TABLE PARTITION OF and ALTER TABLE ATTACH PARTITION.
      */
     void applyPartitionBounds(Table partition, Table parent, List<String> bounds, String partitionName) {
+        bounds = evaluateBoundExpressions(bounds);
         String boundType = bounds.get(0);
         String strategy = parent.getPartitionStrategy();
         if (boundType.equals("DEFAULT")) {

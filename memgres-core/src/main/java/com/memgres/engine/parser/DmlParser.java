@@ -121,6 +121,7 @@ class DmlParser {
     InsertStmt.OnConflict parseOnConflict() {
         List<String> conflictColumns = null;
         List<String> conflictExpressions = null;
+        List<Expression> conflictExpressionAsts = null;
         String constraintName = null;
         Expression conflictWhere = null;
 
@@ -134,6 +135,7 @@ class DmlParser {
             List<String> entries = parser.parseColumnOrExpressionList();
             if (parser.lastColumnListHadExpression) {
                 conflictExpressions = entries;
+                conflictExpressionAsts = parser.lastColumnListExpressions;
             } else {
                 conflictColumns = entries;
             }
@@ -148,7 +150,8 @@ class DmlParser {
 
         parser.expectKeyword("DO");
         if (parser.matchKeyword("NOTHING")) {
-            return new InsertStmt.OnConflict(conflictColumns, constraintName, true, null, conflictWhere, conflictExpressions);
+            return new InsertStmt.OnConflict(conflictColumns, constraintName, true, null,
+                    conflictWhere, conflictExpressions, null, conflictExpressionAsts);
         }
 
         parser.expectKeyword("UPDATE");
@@ -159,7 +162,8 @@ class DmlParser {
         if (parser.matchKeyword("WHERE")) {
             doUpdateWhere = parser.parseExpression();
         }
-        return new InsertStmt.OnConflict(conflictColumns, constraintName, false, sets, conflictWhere, conflictExpressions, doUpdateWhere);
+        return new InsertStmt.OnConflict(conflictColumns, constraintName, false, sets,
+                conflictWhere, conflictExpressions, doUpdateWhere, conflictExpressionAsts);
     }
 
     UpdateStmt parseUpdate() {
