@@ -10,6 +10,10 @@ public final class CreateDomainStmt implements Statement {
     public final boolean notNull;
     public final Expression checkExpr;
     public final String constraintName; // explicit constraint name for CHECK, or null
+    private String collation;           // COLLATE clause, or null
+
+    public String collation() { return collation; }
+    public void setCollation(String collation) { this.collation = collation; }
 
     public CreateDomainStmt(
             String name,

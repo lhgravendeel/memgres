@@ -618,6 +618,26 @@ class SessionExecutor {
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
 
+        if (name.equals("alter_aggregate")) {
+            String[] parts = stmt.value().split("\0", -1);
+            java.util.List<String> argTypes = parts[1].isEmpty()
+                    ? Cols.listOf() : java.util.Arrays.asList(parts[1].split("\1"));
+            PgAggregate agg = executor.database.getAggregate(parts[0]);
+            if (agg == null || !DdlObjectExecutor.aggregateArgsMatch(agg, argTypes)) {
+                throw new MemgresException("aggregate " + parts[0] + "("
+                        + DdlObjectExecutor.canonicalTypeList(argTypes) + ") does not exist", "42883");
+            }
+            if ("rename".equals(parts[2])) {
+                executor.database.removeAggregate(parts[0]);
+                PgAggregate renamed = new PgAggregate(parts[3], agg.getSfunc(), agg.getStype(),
+                        agg.getInitcond(), agg.getFinalfunc(), agg.getCombinefunc(), agg.getSortop(),
+                        agg.getArgTypes());
+                renamed.setSchemaName(agg.getSchemaName());
+                executor.database.addAggregate(renamed);
+            }
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+
         // CREATE STATISTICS
         if (name.equals("create_statistics")) {
             String[] parts = stmt.value().split("\0", -1);
@@ -627,30 +647,39 @@ class SessionExecutor {
             String kindsStr = parts.length > 3 ? parts[3] : "";
             java.util.List<String> cols = colsStr.isEmpty() ? Cols.listOf() : java.util.Arrays.asList(colsStr.split(","));
             java.util.List<String> kinds = kindsStr.isEmpty() ? Cols.listOf() : java.util.Arrays.asList(kindsStr.split(","));
+            boolean ifNotExists = parts.length > 4 && "1".equals(parts[4]);
+            if (ifNotExists && executor.database.getExtendedStatistic(statName) != null) {
+                if (executor.session != null) {
+                    executor.session.addNotice("NOTICE", "42710",
+                            "statistics object \"" + statName + "\" already exists, skipping", null);
+                }
+                return QueryResult.command(QueryResult.Type.SET, 0);
+            }
+            validateStatisticsDefinition(statName, tableName, cols, kinds);
             ExtendedStatistic stat = new ExtendedStatistic(statName, tableName, cols, kinds);
             executor.database.addExtendedStatistic(stat);
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("alter_statistics_rename")) {
             String[] parts = stmt.value().split("\0", 2);
-            ExtendedStatistic stat = executor.database.getExtendedStatistic(parts[0]);
-            if (stat != null) {
-                executor.database.removeExtendedStatistic(parts[0]);
-                stat.setName(parts[1]);
-                executor.database.addExtendedStatistic(stat);
-            }
+            ExtendedStatistic stat = requireStatistic(parts[0]);
+            executor.database.removeExtendedStatistic(parts[0]);
+            stat.setName(parts[1]);
+            executor.database.addExtendedStatistic(stat);
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("alter_statistics_target")) {
             String[] parts = stmt.value().split("\0", 2);
-            ExtendedStatistic stat = executor.database.getExtendedStatistic(parts[0]);
-            if (stat != null) {
-                stat.setStattarget(Integer.parseInt(parts[1]));
-            }
+            requireStatistic(parts[0]).setStattarget(Integer.parseInt(parts[1]));
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
         if (name.equals("drop_statistics")) {
-            executor.database.removeExtendedStatistic(stmt.value());
+            String[] parts = stmt.value().split("\0", -1);
+            boolean ifExists = parts.length > 1 && "1".equals(parts[1]);
+            if (!ifExists || executor.database.getExtendedStatistic(parts[0]) != null) {
+                requireStatistic(parts[0]);
+                executor.database.removeExtendedStatistic(parts[0]);
+            }
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
 
@@ -746,10 +775,20 @@ class SessionExecutor {
                 String namesStr = val.substring(0, colonIdx);
                 String mode = val.substring(colonIdx + 1);
                 boolean deferred = "DEFERRED".equalsIgnoreCase(mode);
-                if (executor.session != null) {
-                    if ("ALL".equals(namesStr)) {
+                if ("ALL".equals(namesStr)) {
+                    if (executor.session != null) {
                         executor.session.setAllConstraintsDeferred(deferred);
-                    } else {
+                    }
+                } else {
+                    // A name that matches no constraint would silently do nothing, leaving the
+                    // caller believing it had changed when a constraint fires.
+                    for (String cn : namesStr.split(",")) {
+                        String constraintName = cn.trim();
+                        if (!constraintExists(constraintName)) {
+                            throw PgErrors.undefinedObject("constraint", constraintName);
+                        }
+                    }
+                    if (executor.session != null) {
                         for (String cn : namesStr.split(",")) {
                             executor.session.setConstraintDeferred(cn.trim(), deferred);
                         }
@@ -1037,6 +1076,20 @@ class SessionExecutor {
     private static final Set<String> TABLE_PRIVILEGES = Cols.setOf(
             "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN", "ALL");
 
+    /** The privileges a column can carry; the rest are table-wide only. */
+    private static final Set<String> COLUMN_PRIVILEGES = Cols.setOf(
+            "SELECT", "INSERT", "UPDATE", "REFERENCES", "ALL");
+
+    /**
+     * Every privilege keyword the grammar knows. A name outside this set is not "you may not
+     * grant that here" but a syntax error, and PostgreSQL reports it as one — lower-cased,
+     * because the parser has already folded it.
+     */
+    private static final Set<String> KNOWN_PRIVILEGES = Cols.setOf(
+            "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
+            "EXECUTE", "USAGE", "CREATE", "TEMPORARY", "TEMP", "CONNECT", "SET", "ALTER SYSTEM",
+            "RULE", "ALL");
+
     QueryResult executeGrant(GrantStmt s) {
         // Validate GRANTED BY grantor matches current user
         if (s.grantor() != null) {
@@ -1119,10 +1172,28 @@ class SessionExecutor {
         }
         // Additional TABLE grant validations
         if (s.objectType() != null && s.objectType().equals("TABLE") && s.objectName() != null) {
-            // Validate privilege types for tables
+            boolean columnLevel = s.columns() != null && !s.columns().isEmpty();
             for (String priv : s.privileges()) {
-                if (!TABLE_PRIVILEGES.contains(priv)) {
-                    throw new MemgresException("invalid privilege type " + priv + " for table", "0LP01");
+                if (!KNOWN_PRIVILEGES.contains(priv)) {
+                    throw PgErrors.syntax("unrecognized privilege type \"" + priv.toLowerCase() + "\"");
+                }
+                if (columnLevel) {
+                    if (!COLUMN_PRIVILEGES.contains(priv)) {
+                        throw new MemgresException("invalid privilege type " + priv + " for column", "0LP01");
+                    }
+                } else if (!TABLE_PRIVILEGES.contains(priv)) {
+                    // USAGE is a sequence right, so it survives the first check PG makes on a
+                    // relation target and is rejected by the later, table-specific one.
+                    String kind = priv.equals("USAGE") ? "table" : "relation";
+                    throw new MemgresException("invalid privilege type " + priv + " for " + kind, "0LP01");
+                }
+            }
+            // A grant option is a property of a role, and PUBLIC is not one.
+            if (s.withGrantOption() && s.grantees() != null) {
+                for (String grantee : s.grantees()) {
+                    if (grantee.equalsIgnoreCase("public")) {
+                        throw new MemgresException("grant options can only be granted to roles", "0LP01");
+                    }
                 }
             }
             // Validate column-level privileges: check column exists
@@ -2222,6 +2293,71 @@ class SessionExecutor {
             executor.session.removeCursor(stmt.cursorName());
         }
         return QueryResult.message(QueryResult.Type.SET, "CLOSE CURSOR");
+    }
+
+    /** True when some table in the database carries a constraint of this name. */
+    private boolean constraintExists(String name) {
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table table : schema.getTables().values()) {
+                if (table.getConstraint(name) != null) return true;
+            }
+        }
+        return false;
+    }
+
+    // ---- CREATE / ALTER / DROP STATISTICS ----
+
+    /** The statistics kinds PG 18 can build. */
+    private static final Set<String> STATISTICS_KINDS =
+            Cols.setOf("ndistinct", "dependencies", "mcv");
+
+    private ExtendedStatistic requireStatistic(String statName) {
+        ExtendedStatistic stat = executor.database.getExtendedStatistic(statName);
+        if (stat == null) {
+            throw new MemgresException(
+                    "statistics object \"" + statName + "\" does not exist", "42704");
+        }
+        return stat;
+    }
+
+    /**
+     * Extended statistics describe a correlation between columns of one table, so anything the
+     * planner could not read them back from — an unknown kind, a column that is not there, a
+     * single column — is rejected at definition time rather than stored and ignored.
+     */
+    private void validateStatisticsDefinition(String statName, String tableName,
+                                              List<String> cols, List<String> kinds) {
+        for (String kind : kinds) {
+            if (!STATISTICS_KINDS.contains(kind.toLowerCase())) {
+                throw new MemgresException(
+                        "unrecognized statistics kind \"" + kind + "\"", "42601");
+            }
+        }
+        if (executor.database.getView(tableName) != null) {
+            throw new MemgresException(
+                    "cannot define statistics for relation \"" + tableName + "\"", "42809");
+        }
+        Table table = executor.resolveTable(executor.defaultSchema(), tableName);
+        if (executor.database.getExtendedStatistic(statName) != null) {
+            throw new MemgresException(
+                    "statistics object \"" + statName + "\" already exists", "42710");
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        int plainColumns = 0;
+        for (String col : cols) {
+            if (col.startsWith("(")) continue; // an expression, not a column reference
+            if (table.getColumnIndex(col) < 0) {
+                throw new MemgresException("column \"" + col + "\" does not exist", "42703");
+            }
+            if (!seen.add(col.toLowerCase())) {
+                throw new MemgresException(
+                        "duplicate column name in statistics definition", "42701");
+            }
+            plainColumns++;
+        }
+        if (plainColumns == cols.size() && cols.size() < 2) {
+            throw new MemgresException("extended statistics require at least 2 columns", "42P17");
+        }
     }
 
     private boolean isRoleSuperuser(String role) {

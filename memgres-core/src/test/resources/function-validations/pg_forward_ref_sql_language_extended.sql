@@ -182,6 +182,9 @@ AS $fn$
   SELECT 'a' COLLATE q05_missing_collation
 $fn$;
 
+-- An operator's name is built from symbols, so a word where the name belongs is a syntax
+-- error at the "(" that follows it -- PostgreSQL answers this the same way.
+-- expect-error: 42601
 CREATE OPERATOR q05_plus_plus (
   LEFTARG = text,
   RIGHTARG = text,

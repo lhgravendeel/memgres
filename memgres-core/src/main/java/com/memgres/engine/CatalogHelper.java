@@ -142,6 +142,18 @@ public final class CatalogHelper {
                 return "USER-DEFINED";
             case XID:
                 return "xid";
+            case OID:
+                return "oid";
+            case REGPROC:
+                return "regproc";
+            case REGCLASS:
+                return "regclass";
+            case REGTYPE:
+                return "regtype";
+            case OIDVECTOR:
+                return "oidvector";
+            case INT2VECTOR:
+                return "int2vector";
             case HSTORE:
                 return "hstore";
             default:

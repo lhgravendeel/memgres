@@ -45,6 +45,11 @@ class ExtensionsDDLCoverageTest {
         assertDoesNotThrow(() -> exec(sql));
     }
 
+    private void assertSqlState(String expectedState, String sql) {
+        SQLException e = assertThrows(SQLException.class, () -> exec(sql), sql);
+        assertEquals(expectedState, e.getSQLState(), sql + " -> " + e.getMessage());
+    }
+
     // ========================================================================
     // 73. Rules
     // ========================================================================
@@ -68,9 +73,12 @@ class ExtensionsDDLCoverageTest {
     }
 
     @Test
-    void rule_create_on_select_do_instead_nothing() {
+    void rule_create_on_select_rejected_for_table() {
         assertNoError("CREATE TABLE rule_tbl4 (id INT)");
-        assertNoError("CREATE RULE rule_no_select AS ON SELECT TO rule_tbl4 DO INSTEAD NOTHING");
+        // An ON SELECT rule is how a view is represented, so a table may not carry one.
+        SQLException e = assertThrows(SQLException.class,
+                () -> exec("CREATE RULE rule_no_select AS ON SELECT TO rule_tbl4 DO INSTEAD NOTHING"));
+        assertEquals("42809", e.getSQLState());
     }
 
     @Test
@@ -244,9 +252,11 @@ class ExtensionsDDLCoverageTest {
     // 76. Casts
     // ========================================================================
 
+    // WITHOUT FUNCTION claims the two types are the same bytes, so PG only takes it between
+    // types of identical storage — integer and text, or two integer widths, are not.
     @Test
     void cast_create_without_function() {
-        assertNoError("CREATE CAST (INTEGER AS TEXT) WITHOUT FUNCTION");
+        assertSqlState("42P17", "CREATE CAST (INTEGER AS TEXT) WITHOUT FUNCTION");
     }
 
     @Test
@@ -256,22 +266,22 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void cast_create_as_assignment() {
-        assertNoError("CREATE CAST (BIGINT AS INTEGER) WITHOUT FUNCTION AS ASSIGNMENT");
+        assertSqlState("42P17", "CREATE CAST (BIGINT AS INTEGER) WITHOUT FUNCTION AS ASSIGNMENT");
     }
 
     @Test
     void cast_create_as_implicit() {
-        assertNoError("CREATE CAST (SMALLINT AS INTEGER) WITHOUT FUNCTION AS IMPLICIT");
+        assertSqlState("42P17", "CREATE CAST (SMALLINT AS INTEGER) WITHOUT FUNCTION AS IMPLICIT");
     }
 
     @Test
     void cast_create_with_function() {
-        assertNoError("CREATE CAST (VARCHAR AS INTEGER) WITH FUNCTION pg_catalog.int4(VARCHAR)");
+        assertSqlState("42883", "CREATE CAST (VARCHAR AS INTEGER) WITH FUNCTION pg_catalog.int4(VARCHAR)");
     }
 
     @Test
     void cast_drop() {
-        assertNoError("DROP CAST (INTEGER AS TEXT)");
+        assertSqlState("42704", "DROP CAST (INTEGER AS TEXT)");
     }
 
     @Test

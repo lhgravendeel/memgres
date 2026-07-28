@@ -121,11 +121,24 @@ public enum DataType {
     // OID type
     OID(26, "oid"),
 
+    // Object-identifier aliases. Catalog columns holding a function or relation reference are
+    // these types in PG, not text, so a query comparing one to 0 or joining on it resolves.
+    REGPROC(24, "regproc"),
+    REGCLASS(2205, "regclass"),
+    REGTYPE(2206, "regtype"),
+
+    // The 0-based vector types the catalogs use for argument and key lists
+    INT2VECTOR(22, "int2vector"),
+    OIDVECTOR(30, "oidvector"),
+
     // Transaction ID type
     XID(28, "xid"),
 
     // Record (composite) type
     RECORD(2249, "record"),
+
+    // Pseudo-type returned by a function declared RETURNS void
+    VOID(2278, "void"),
 
     // Custom enum placeholder; actual enum types are resolved by name
     ENUM(0, "enum");
@@ -191,6 +204,8 @@ public enum DataType {
             case "bool":
             case "boolean":
                 return BOOLEAN;
+            case "void":
+                return VOID;
             case "date":
                 return DATE;
             case "timestamp":
@@ -371,5 +386,27 @@ public enum DataType {
             case ACLITEM_ARRAY: return "aclitem[]";
             default: return pgName;
         }
+    }
+
+    /** Type names that fromPgName folds onto another type; their own spelling is canonical. */
+    private static final java.util.Set<String> ALIASED_ONTO_OTHER_TYPE =
+            new java.util.HashSet<>(java.util.Arrays.asList("regclass", "regtype", "regproc", "citext"));
+
+    /**
+     * The name PostgreSQL uses for a type in messages and catalogs: {@code int} is reported as
+     * {@code integer}, {@code float8} as {@code double precision}. Unknown names (user-defined
+     * types) are returned lowercased and otherwise unchanged.
+     */
+    public static String canonicalName(String typeName) {
+        if (typeName == null) return null;
+        String lower = typeName.trim().toLowerCase();
+        if (lower.isEmpty() || ALIASED_ONTO_OTHER_TYPE.contains(lower)) return lower;
+        int paren = lower.indexOf('(');
+        String base = paren > 0 ? lower.substring(0, paren).trim() : lower;
+        boolean array = base.endsWith("[]");
+        if (array) base = base.substring(0, base.length() - 2).trim();
+        DataType dt = fromPgName(base);
+        String canon = dt != null ? dt.toRegtypeDisplay() : base;
+        return array ? canon + "[]" : canon;
     }
 }

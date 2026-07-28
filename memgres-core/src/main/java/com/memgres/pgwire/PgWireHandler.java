@@ -117,6 +117,15 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, PgWireMessage msg) {
+        cancelIdleInTransactionTimeout();
+        try {
+            dispatch(ctx, msg);
+        } finally {
+            armIdleInTransactionTimeout(ctx);
+        }
+    }
+
+    private void dispatch(ChannelHandlerContext ctx, PgWireMessage msg) {
         if (errorPendingUntilSync) {
             switch (msg.getType()) {
                 case QUERY: {
@@ -204,6 +213,40 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 LOG.warn("[PROTO] COPY message {} received outside copy mode", msg.getType());
                 break;
         }
+    }
+
+    // ---- idle_in_transaction_session_timeout ----
+
+    /** Armed while the client sits idle holding an open transaction; null the rest of the time. */
+    private io.netty.util.concurrent.ScheduledFuture<?> idleInTransactionTask;
+
+    private void cancelIdleInTransactionTimeout() {
+        if (idleInTransactionTask != null) {
+            idleInTransactionTask.cancel(false);
+            idleInTransactionTask = null;
+        }
+    }
+
+    /**
+     * A transaction left open holds locks and pins the oldest snapshot, so PG puts a limit on how
+     * long a client may sit on one and drops the connection when it is exceeded. The clock only
+     * runs between messages: it is restarted whenever the client says something.
+     */
+    private void armIdleInTransactionTimeout(final ChannelHandlerContext ctx) {
+        if (session == null || !session.isInTransaction() || !ctx.channel().isActive()) return;
+        long timeoutMs = GucSettings.parseTimeoutMillis(
+                session.getGucSettings().get("idle_in_transaction_session_timeout"));
+        if (timeoutMs <= 0) return;
+        idleInTransactionTask = ctx.executor().schedule(new Runnable() {
+            @Override
+            public void run() {
+                idleInTransactionTask = null;
+                if (session == null || !session.isInTransaction()) return;
+                session.rollback();
+                sendFatal(ctx, "25P03", "terminating connection due to idle-in-transaction timeout");
+                ctx.close();
+            }
+        }, timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     // ---- Connection lifecycle ----
@@ -1243,6 +1286,32 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         errorPendingUntilSync = true;
     }
 
+    /** A connection the server is about to drop; PG reports these at FATAL, not ERROR. */
+    private static void sendFatal(ChannelHandlerContext ctx, String sqlState, String message) {
+        LOG.warn("[PROTO] Sending FATAL ErrorResponse: sqlState={} msg={}", sqlState, message);
+        ByteBuf buf = ctx.alloc().buffer();
+        buf.writeByte('E');
+        int lengthIdx = buf.writerIndex();
+        buf.writeInt(0);
+        buf.writeByte('S');
+        PgWireValueFormatter.writeCString(buf, "FATAL");
+        buf.writeByte('V');
+        PgWireValueFormatter.writeCString(buf, "FATAL");
+        buf.writeByte('C');
+        PgWireValueFormatter.writeCString(buf, sqlState);
+        buf.writeByte('M');
+        PgWireValueFormatter.writeCString(buf, message);
+        buf.writeByte('F');
+        PgWireValueFormatter.writeCString(buf, "postgres.c");
+        buf.writeByte('L');
+        PgWireValueFormatter.writeCString(buf, "1");
+        buf.writeByte('R');
+        PgWireValueFormatter.writeCString(buf, "ProcessInterrupts");
+        buf.writeByte(0);
+        buf.setInt(lengthIdx, buf.writerIndex() - lengthIdx);
+        ctx.writeAndFlush(buf);
+    }
+
     private static void sendError(ChannelHandlerContext ctx, String sqlState, String message, boolean isExtendedProtocol) {
         LOG.warn("[PROTO] Sending ErrorResponse: sqlState={} extended={} msg={}", sqlState, isExtendedProtocol, message);
         ByteBuf buf = ctx.alloc().buffer();
@@ -1443,6 +1512,9 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         // caseDepth counts nested CASE expressions whose END should not close the block.
         boolean inBeginAtomic = false;
         int caseDepth = 0;
+        // A multi-action rule body — DO ALSO ( a; b; ) — puts semicolons inside parentheses,
+        // where they separate the rule's actions rather than one statement from the next.
+        int parenDepth = 0;
 
         for (int i = 0; i < sql.length(); i++) {
             char c = sql.charAt(i);
@@ -1539,7 +1611,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                 current.append(sql, i, eol);
                 i = eol - 1;
             } else if (c == ';') {
-                if (inBeginAtomic) {
+                if (inBeginAtomic || parenDepth > 0) {
                     // Inside BEGIN ATOMIC block — semicolons are part of the body, not statement separators
                     current.append(c);
                 } else {
@@ -1550,6 +1622,8 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
                     caseDepth = 0;
                 }
             } else {
+                if (c == '(') parenDepth++;
+                else if (c == ')' && parenDepth > 0) parenDepth--;
                 // Detect BEGIN ATOMIC, CASE, and END keywords to track block nesting
                 if (!inString && Character.isLetter(c)) {
                     if (inBeginAtomic) {
@@ -1591,6 +1665,7 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        cancelIdleInTransactionTimeout();
         if (session != null) session.close();
         if (connectionRegistered) {
             database.unregisterConnection();

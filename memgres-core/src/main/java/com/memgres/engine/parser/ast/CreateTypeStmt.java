@@ -11,6 +11,10 @@ public final class CreateTypeStmt implements Statement {
     public final List<String> enumLabels;
     public final List<CompositeField> compositeFields;
     public final String rangeSubtype;  // For CREATE TYPE ... AS RANGE (SUBTYPE = ...)
+    private boolean shell;             // CREATE TYPE name; — a placeholder with no definition yet
+
+    public boolean shell() { return shell; }
+    public void setShell(boolean shell) { this.shell = shell; }
 
     public CreateTypeStmt(String name, List<String> enumLabels, List<CompositeField> compositeFields) {
         this(name, enumLabels, compositeFields, null);

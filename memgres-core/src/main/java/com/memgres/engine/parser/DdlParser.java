@@ -1,6 +1,7 @@
 package com.memgres.engine.parser;
 
 import com.memgres.engine.MemgresException;
+import com.memgres.engine.PgErrors;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -61,7 +62,7 @@ class DdlParser {
         if (parser.matchKeyword("FUNCTION")) return functionParser.parseCreateFunction(orReplace, false);
         if (parser.matchKeyword("PROCEDURE")) return functionParser.parseCreateFunction(orReplace, true);
         if (parser.matchKeyword("TRIGGER")) return parseCreateTrigger(orReplace);
-        if (parser.matchKeywords("CONSTRAINT", "TRIGGER")) return parseCreateTrigger(false);
+        if (parser.matchKeywords("CONSTRAINT", "TRIGGER")) return parseCreateTrigger(false, true);
         if (parser.matchKeyword("EXTENSION")) return parseCreateExtension();
         if (parser.matchKeyword("INDEX")) return indexParser.parseCreateIndex(unique, false);
         if (parser.matchKeyword("VIEW")) return parseCreateView(orReplace, false);
@@ -89,7 +90,7 @@ class DdlParser {
         if (orReplace && parser.matchKeyword("VIEW")) return parseCreateView(true, false);
         if (orReplace && parser.matchKeyword("TRIGGER")) return parseCreateTrigger(true);
         if (parser.matchKeyword("GROUP")) return roleParser.parseCreateRole(false);
-        if (parser.matchKeyword("RULE")) return parseCreateRule();
+        if (parser.matchKeyword("RULE")) return parseCreateRule(orReplace);
 
         if (parser.matchKeyword("AGGREGATE")) return parseCreateAggregate();
 
@@ -166,6 +167,19 @@ class DdlParser {
     }
 
     // ---- DROP dispatcher ----
+
+    /** The characters PostgreSQL builds an operator name from; a schema may qualify it. */
+    private static final String OPERATOR_NAME_CHARS = "+-*/<>=~!@#%^&|`?";
+
+    private static boolean isOperatorSymbolName(String name) {
+        if (name == null || name.isEmpty()) return false;
+        String bare = name.substring(name.lastIndexOf('.') + 1);
+        if (bare.isEmpty()) return false;
+        for (int i = 0; i < bare.length(); i++) {
+            if (OPERATOR_NAME_CHARS.indexOf(bare.charAt(i)) < 0) return false;
+        }
+        return true;
+    }
 
     Statement parseDrop() {
         parser.expectKeyword("DROP");
@@ -305,7 +319,7 @@ class DdlParser {
             String statName = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) statName = parser.readIdentifier();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_statistics", statName);
+            return new SetStmt("drop_statistics", statName + "\0" + (dropIfExists ? "1" : "0"));
         }
         else throw new ParseException("Unsupported DROP target", parser.peek());
 
@@ -329,6 +343,7 @@ class DdlParser {
         }
 
         String name;
+        String qualifier = null;
         if (objectType == DropStmt.ObjectType.OPERATOR) {
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.LEFT_PAREN) && !parser.check(TokenType.SEMICOLON)
@@ -336,10 +351,20 @@ class DdlParser {
                 sb.append(parser.advance().value());
             }
             name = sb.toString().trim();
+            // An operator is named in symbols, so a word here is not a name this statement can
+            // have. PostgreSQL cannot parse it either and reports the token that follows.
+            if (!isOperatorSymbolName(name)) {
+                throw new ParseException("operator name must be symbolic", parser.peek());
+            }
         } else {
             name = parser.readIdentifier();
-            if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) {
+                qualifier = name;
+                name = parser.readIdentifier();
+            }
         }
+        // Only routines carry the qualifier onward; the other object kinds still key by bare name.
+        String dropSchema = objectType == DropStmt.ObjectType.FUNCTION ? qualifier : null;
 
         java.util.List<String> funcParamTypes = null;
         if ((objectType == DropStmt.ObjectType.FUNCTION || objectType == DropStmt.ObjectType.AGGREGATE)
@@ -398,7 +423,7 @@ class DdlParser {
         boolean cascade = parser.matchKeyword("CASCADE");
         parser.matchKeyword("RESTRICT");
 
-        return new DropStmt(objectType, name, onTable, ifExists, cascade, funcParamTypes);
+        return new DropStmt(objectType, name, onTable, ifExists, cascade, funcParamTypes, dropSchema);
     }
 
     /**
@@ -611,8 +636,9 @@ class DdlParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_noop", "ok");
         }
+        if (parser.matchKeyword("AGGREGATE")) return parseAlterAggregate();
         // No-op ALTER targets
-        if (parser.matchKeyword("AGGREGATE") || parser.matchKeyword("COLLATION")
+        if (parser.matchKeyword("COLLATION")
                 || parser.matchKeyword("RULE") || parser.matchKeyword("CONVERSION")
                 || parser.matchKeyword("TABLESPACE")
                 || parser.matchKeyword("LANGUAGE")
@@ -627,7 +653,7 @@ class DdlParser {
         parser.expectKeyword("TABLE");
 
         boolean ifExists = parser.matchKeywords("IF", "EXISTS");
-        parser.matchKeyword("ONLY");
+        boolean only = parser.matchKeyword("ONLY");
         String schema = null;
         String table = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) { schema = table; table = parser.readIdentifier(); }
@@ -637,19 +663,32 @@ class DdlParser {
             actions.add(alterActionParser.parseAlterAction());
         } while (parser.match(TokenType.COMMA));
 
-        return new AlterTableStmt(schema, table, actions, ifExists);
+        return new AlterTableStmt(schema, table, actions, ifExists, only);
     }
 
     // ---- CREATE TRIGGER ----
 
     CreateTriggerStmt parseCreateTrigger(boolean orReplace) {
+        return parseCreateTrigger(orReplace, false);
+    }
+
+    /**
+     * A constraint trigger is a deferred check on a completed row change, so PG's grammar admits
+     * only {@code AFTER ... FOR EACH ROW} — the other spellings are not a definition it rejects
+     * later but a sentence the grammar never had, which is why they come back as syntax errors.
+     */
+    CreateTriggerStmt parseCreateTrigger(boolean orReplace, boolean constraint) {
         String name = parser.readIdentifier();
 
+        Token timingToken = parser.peek();
         String timing;
         if (parser.matchKeyword("BEFORE")) timing = "BEFORE";
         else if (parser.matchKeyword("AFTER")) timing = "AFTER";
         else if (parser.matchKeywords("INSTEAD", "OF")) timing = "INSTEAD OF";
         else throw new ParseException("Expected BEFORE, AFTER, or INSTEAD OF", parser.peek());
+        if (constraint && !"AFTER".equals(timing)) {
+            throw new ParseException("syntax error at or near \"" + timingToken.value() + "\"", timingToken);
+        }
 
         List<String> events = new ArrayList<>();
         List<String> updateOfColumns = new ArrayList<>();
@@ -698,10 +737,14 @@ class DdlParser {
         parser.expectKeyword("FOR");
         parser.matchKeyword("EACH");
         boolean forEachRow = true;
+        Token levelToken = parser.peek();
         if (parser.matchKeyword("STATEMENT")) {
             forEachRow = false;
         } else {
             parser.expectKeyword("ROW");
+        }
+        if (constraint && !forEachRow) {
+            throw new ParseException("syntax error at or near \"" + levelToken.value() + "\"", levelToken);
         }
 
         String whenClause = null;
@@ -902,6 +945,13 @@ class DdlParser {
     CreateTypeStmt parseCreateType() {
         String name = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        // CREATE TYPE name; with no definition is a shell type — the documented first step of
+        // defining a base type, and the name a base type's I/O functions refer to.
+        if (!parser.checkKeyword("AS")) {
+            CreateTypeStmt shell = new CreateTypeStmt(name, null, null);
+            shell.setShell(true);
+            return shell;
+        }
         parser.expectKeyword("AS");
         if (parser.matchKeyword("ENUM")) {
             parser.expect(TokenType.LEFT_PAREN);
@@ -925,6 +975,9 @@ class DdlParser {
                 }
             }
             parser.expect(TokenType.RIGHT_PAREN);
+            if (rangeSubtype == null) {
+                throw PgErrors.syntax("type attribute \"subtype\" is required");
+            }
             return new CreateTypeStmt(name, null, null, rangeSubtype);
         }
         parser.expect(TokenType.LEFT_PAREN);
@@ -970,16 +1023,21 @@ class DdlParser {
         // Parse argument types: CREATE AGGREGATE name ( argtype [, ...] ) ( ... )
         // or CREATE AGGREGATE name ( ORDER BY argtype ) for ordered-set aggregates
         List<String> argTypes = new ArrayList<>();
+        // Arguments before ORDER BY are the direct arguments of an ordered-set aggregate; they
+        // are not passed to the transition function, so the two groups have to stay apart.
+        int directArgCount = -1;
         if (parser.match(TokenType.LEFT_PAREN)) {
             // Check for ORDER BY (ordered-set aggregate) or * or type list
             if (parser.matchKeyword("ORDER")) {
                 parser.matchKeyword("BY");
+                directArgCount = 0;
             }
             while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
                 // Handle ORDER BY appearing mid-list (ordered-set aggregates)
                 if (parser.checkKeyword("ORDER")) {
                     parser.advance(); // consume ORDER
                     parser.matchKeyword("BY"); // consume BY
+                    directArgCount = argTypes.size();
                     continue;
                 }
                 if (parser.check(TokenType.STAR)) {
@@ -1061,11 +1119,8 @@ class DdlParser {
             parser.expect(TokenType.RIGHT_PAREN);
         }
 
-        if (sfunc == null || stype == null) {
-            // Incomplete aggregate — treat as no-op (some dumps have partial aggregates)
-            return new SetStmt("create_noop", "ok");
-        }
-        return new CreateAggregateStmt(name, argTypes, sfunc, stype, initcond, finalfunc, combinefunc, sortop);
+        return new CreateAggregateStmt(name, argTypes, directArgCount, sfunc, stype, initcond,
+                finalfunc, combinefunc, sortop);
     }
 
     /**
@@ -1080,19 +1135,29 @@ class DdlParser {
     }
 
     CreateRuleStmt parseCreateRule() {
+        return parseCreateRule(false);
+    }
+
+    CreateRuleStmt parseCreateRule(boolean orReplace) {
         String name = parser.readIdentifier();
         parser.expectKeyword("AS");
         parser.expectKeyword("ON");
+        Token eventToken = parser.peek();
         String event = parser.readIdentifier().toUpperCase();
+        if (!"SELECT".equals(event) && !"INSERT".equals(event)
+                && !"UPDATE".equals(event) && !"DELETE".equals(event)) {
+            throw new ParseException("unrecognized rule event", eventToken);
+        }
         parser.expectKeyword("TO");
         String table = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) table = parser.readIdentifier();
+        StringBuilder where = new StringBuilder();
         if (parser.matchKeyword("WHERE")) {
             int depth = 0;
             while (!parser.isAtEnd() && !(parser.checkKeyword("DO") && depth == 0)) {
                 if (parser.check(TokenType.LEFT_PAREN)) depth++;
                 if (parser.check(TokenType.RIGHT_PAREN)) depth--;
-                parser.advance();
+                where.append(ruleCommandToken(parser.advance())).append(' ');
             }
         }
         parser.expectKeyword("DO");
@@ -1100,17 +1165,53 @@ class DdlParser {
         if (parser.matchKeyword("INSTEAD")) action = "INSTEAD";
         else if (parser.matchKeyword("ALSO")) action = "ALSO";
         else action = "ALSO";
-        String command;
+        List<String> commands = new ArrayList<>();
         if (parser.matchKeyword("NOTHING")) {
-            command = "NOTHING";
+            commands.add("NOTHING");
+        } else if (parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance();
+            parseRuleActionList(commands);
         } else {
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
                 sb.append(ruleCommandToken(parser.advance())).append(' ');
             }
-            command = sb.toString().trim();
+            if (sb.length() > 0) commands.add(sb.toString().trim());
         }
-        return new CreateRuleStmt(name, event, table, action, command);
+        return new CreateRuleStmt(name, event, table, action, commands,
+                where.length() == 0 ? null : where.toString().trim(), orReplace);
+    }
+
+    /**
+     * The parenthesised form of a rule action holds several statements separated by semicolons,
+     * so the closing parenthesis — not the first semicolon — ends the rule. Running off the end
+     * of the input means the parenthesis was never closed.
+     */
+    private void parseRuleActionList(List<String> commands) {
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        while (true) {
+            if (parser.isAtEnd()) throw PgErrors.syntax("syntax error at end of input");
+            if (depth == 0 && parser.check(TokenType.RIGHT_PAREN)) {
+                parser.advance();
+                break;
+            }
+            if (parser.check(TokenType.SEMICOLON)) {
+                parser.advance();
+                if (sb.length() > 0) {
+                    commands.add(sb.toString().trim());
+                    sb.setLength(0);
+                }
+                continue;
+            }
+            if (sb.length() == 0 && parser.checkKeyword("NOTHING")) {
+                throw new ParseException("NOTHING is not a rule action here", parser.peek());
+            }
+            if (parser.check(TokenType.LEFT_PAREN)) depth++;
+            else if (parser.check(TokenType.RIGHT_PAREN)) depth--;
+            sb.append(ruleCommandToken(parser.advance())).append(' ');
+        }
+        if (sb.length() > 0) commands.add(sb.toString().trim());
     }
 
     /**
@@ -1148,20 +1249,46 @@ class DdlParser {
         String baseType = parser.parseTypeName();
         Expression defaultExpr = null;
         boolean notNull = false;
+        boolean sawNotNull = false, sawNull = false, sawDefault = false;
         Expression checkExpr = null;
         String constraintName = null;
+        String collation = null;
+        if (parser.matchKeyword("COLLATE")) {
+            collation = parser.readIdentifierOrString();
+            ExpressionParser.validateCollationStatic(collation, parser.peek());
+        }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            if (parser.matchKeyword("DEFAULT")) { defaultExpr = parser.parseExpression(); }
-            else if (parser.matchKeywords("NOT", "NULL")) { notNull = true; }
-            else if (parser.matchKeyword("NULL")) { notNull = false; }
+            if (parser.matchKeyword("DEFAULT")) {
+                if (sawDefault) throw PgErrors.syntax("multiple default expressions");
+                sawDefault = true;
+                defaultExpr = parser.parseExpression();
+            }
+            else if (parser.matchKeywords("NOT", "NULL")) { notNull = true; sawNotNull = true; }
+            else if (parser.matchKeyword("NULL")) { notNull = false; sawNull = true; }
             else if (parser.matchKeyword("CHECK")) {
                 parser.expect(TokenType.LEFT_PAREN);
                 checkExpr = parser.parseExpression();
                 parser.expect(TokenType.RIGHT_PAREN);
             } else if (parser.matchKeyword("CONSTRAINT")) { constraintName = parser.readIdentifier(); }
+            // A domain has no rows, so the table-level constraint forms are meaningless on one.
+            else if (parser.checkKeyword("UNIQUE")) {
+                throw PgErrors.syntax("unique constraints not possible for domains");
+            }
+            else if (parser.checkKeyword("PRIMARY") && parser.checkKeywordAt(1, "KEY")) {
+                throw PgErrors.syntax("primary key constraints not possible for domains");
+            }
+            else if (parser.checkKeyword("REFERENCES")) {
+                throw PgErrors.syntax("foreign key constraints not possible for domains");
+            }
             else { break; }
+            if (sawNotNull && sawNull) {
+                throw PgErrors.syntax("conflicting NULL/NOT NULL constraints");
+            }
         }
-        return new CreateDomainStmt(name, baseType, defaultExpr, notNull, checkExpr, constraintName);
+        CreateDomainStmt domainStmt =
+                new CreateDomainStmt(name, baseType, defaultExpr, notNull, checkExpr, constraintName);
+        domainStmt.setCollation(collation);
+        return domainStmt;
     }
 
     // ---- SEQUENCE ----
@@ -1216,24 +1343,31 @@ class DdlParser {
         Boolean[] cycle = {null};
         Integer[] cache = {null};
         String[] asType = {null};
-        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, null, null);
+        String[] ownedByTable = {null}, ownedByColumn = {null};
+        parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, ownedByTable, ownedByColumn);
         CreateSequenceStmt stmt = new CreateSequenceStmt(name, ifNotExists, startWith[0], incrementBy[0], minValue[0], maxValue[0], cycle[0], temporary);
         stmt.setCache(cache[0]);
         stmt.setAsType(asType[0]);
+        stmt.setOwnedBy(ownedByTable[0], ownedByColumn[0]);
         return stmt;
     }
 
     AlterSequenceStmt parseAlterSequence() {
+        boolean ifExists = parser.matchKeywords("IF", "EXISTS");
         String name = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
         if (parser.matchKeywords("RENAME", "TO")) {
-            return AlterSequenceStmt.renameTo(name, parser.readIdentifier());
+            AlterSequenceStmt renamed = AlterSequenceStmt.renameTo(name, parser.readIdentifier());
+            renamed.setIfExists(ifExists);
+            return renamed;
         }
         boolean restart = false;
         Long restartWith = null;
         Long[] startWith = {null}, incrementBy = {null}, minValue = {null}, maxValue = {null};
         Boolean[] cycle = {null};
         String[] ownedByTable = {null}, ownedByColumn = {null};
+        String[] asType = {null};
+        Integer[] cache = {null};
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeyword("RESTART")) {
                 restart = true;
@@ -1242,14 +1376,20 @@ class DdlParser {
                 continue;
             }
             if (parser.matchKeywords("OWNER", "TO")) {
-                return new AlterSequenceStmt(name, parser.readIdentifier());
+                AlterSequenceStmt owned = new AlterSequenceStmt(name, parser.readIdentifier());
+                owned.setIfExists(ifExists);
+                return owned;
             }
             int saved = parser.pos;
-            Integer[] cache = {null};
-            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, null, ownedByTable, ownedByColumn);
+            parseSequenceOptions(startWith, incrementBy, minValue, maxValue, cycle, cache, asType, ownedByTable, ownedByColumn);
             if (parser.pos == saved) break;
         }
-        return new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0], maxValue[0], startWith[0], cycle[0], null, null, ownedByTable[0], ownedByColumn[0]);
+        AlterSequenceStmt stmt = new AlterSequenceStmt(name, restart, restartWith, incrementBy[0], minValue[0],
+                maxValue[0], startWith[0], cycle[0], null, null, ownedByTable[0], ownedByColumn[0]);
+        stmt.setIfExists(ifExists);
+        stmt.setCache(cache[0]);
+        stmt.setAsType(asType[0]);
+        return stmt;
     }
 
     // ---- TRUNCATE ----
@@ -1472,6 +1612,13 @@ class DdlParser {
             }
         }
         String name = opName.toString().trim();
+        // The grammar only accepts a symbolic operator name here, so a word is a syntax error
+        // at the parenthesis that follows it, exactly as PG reports it.
+        for (int i = 0; i < name.length(); i++) {
+            if ("+-*/<>=~!@#%^&|`?".indexOf(name.charAt(i)) < 0) {
+                throw new com.memgres.engine.MemgresException("syntax error at or near \"(\"", "42601");
+            }
+        }
 
         parser.expect(TokenType.LEFT_PAREN);
 
@@ -2039,8 +2186,12 @@ class DdlParser {
         }
         List<String> tags = null;
         if (parser.matchKeyword("WHEN")) {
-            // WHEN TAG IN ('tag1', 'tag2', ...)
-            parser.readIdentifier(); // TAG
+            // WHEN TAG IN ('tag1', 'tag2', ...); TAG is the only filter variable PG defines
+            String filterVar = parser.readIdentifier();
+            if (!"tag".equalsIgnoreCase(filterVar)) {
+                throw new com.memgres.engine.MemgresException(
+                        "unrecognized filter variable \"" + filterVar.toLowerCase() + "\"", "42601");
+            }
             parser.expectKeyword("IN");
             parser.match(TokenType.LEFT_PAREN);
             tags = new ArrayList<>();
@@ -2152,10 +2303,31 @@ class DdlParser {
         String tableName = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier();
 
-        // Encode: "create_statistics:name:table:col1,col2:kind1,kind2"
+        // Encode: "create_statistics:name:table:col1,col2:kind1,kind2:ifNotExists"
         String kindsStr = kinds.isEmpty() ? "" : String.join(",", kinds);
         String colsStr = String.join(",", columns);
-        return new SetStmt("create_statistics", name + "\0" + tableName + "\0" + colsStr + "\0" + kindsStr);
+        return new SetStmt("create_statistics", name + "\0" + tableName + "\0" + colsStr + "\0"
+                + kindsStr + "\0" + (ifNotExists ? "1" : "0"));
+    }
+
+    // ---- ALTER AGGREGATE ----
+
+    Statement parseAlterAggregate() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        List<String> argTypes = new ArrayList<>();
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            argTypes = parseFunctionDropParamTypes();
+        }
+        String action = "noop";
+        String newName = "";
+        if (parser.matchKeywords("RENAME", "TO")) {
+            action = "rename";
+            newName = parser.readIdentifier();
+        }
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_aggregate",
+                name + "\0" + String.join("\1", argTypes) + "\0" + action + "\0" + newName);
     }
 
     // ---- ALTER STATISTICS ----
@@ -2574,19 +2746,18 @@ class DdlParser {
         parser.expect(TokenType.RIGHT_PAREN);
 
         String functionName = null;
+        List<String> funcArgTypes = null;
+        boolean withInout = false;
         if (parser.matchKeyword("WITH")) {
             if (parser.matchKeyword("FUNCTION")) {
                 functionName = parser.readIdentifier();
-                // consume optional argument list
-                if (parser.match(TokenType.LEFT_PAREN)) {
-                    while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                        parser.advance();
-                    }
-                    parser.expect(TokenType.RIGHT_PAREN);
+                if (parser.match(TokenType.DOT)) functionName += "." + parser.readIdentifier();
+                if (parser.check(TokenType.LEFT_PAREN)) {
+                    funcArgTypes = parseFunctionDropParamTypes();
                 }
             } else if (parser.matchKeyword("INOUT")) {
                 // WITH INOUT: I/O conversion cast
-                functionName = null;
+                withInout = true;
             }
         } else if (parser.matchKeywords("WITHOUT", "FUNCTION")) {
             functionName = null;
@@ -2601,6 +2772,6 @@ class DdlParser {
             }
         }
 
-        return new CreateCastStmt(sourceType, targetType, functionName, castContext);
+        return new CreateCastStmt(sourceType, targetType, functionName, funcArgTypes, withInout, castContext);
     }
 }

@@ -32,7 +32,7 @@ public class PgWireServer {
 
     public int start(int port, String bindAddress) {
         bossGroup = new NioEventLoopGroup(1);
-        workerGroup = new NioEventLoopGroup();
+        workerGroup = new NioEventLoopGroup(0, new DeepStackThreadFactory());
 
         try {
             ServerBootstrap b = new ServerBootstrap();
@@ -59,6 +59,28 @@ public class PgWireServer {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Failed to start PgWire server", e);
+        }
+    }
+
+    /**
+     * Statements run on the worker thread that read them, so a worker's stack is the ceiling on
+     * how deep a recursive PL/pgSQL call, view expansion or trigger chain can go. The platform
+     * default is around a megabyte, which runs out after a couple of hundred PL/pgSQL frames —
+     * far short of what PostgreSQL manages. Reserving a larger stack (address space, committed
+     * only as it is used) puts the engine's own depth limits in charge instead.
+     */
+    private static final class DeepStackThreadFactory implements java.util.concurrent.ThreadFactory {
+        private static final long STACK_BYTES = 32L * 1024 * 1024;
+        private final java.util.concurrent.atomic.AtomicInteger seq =
+                new java.util.concurrent.atomic.AtomicInteger();
+
+        @Override
+        public Thread newThread(Runnable r) {
+            // FastThreadLocalThread so Netty's thread-local fast path still applies.
+            Thread t = new io.netty.util.concurrent.FastThreadLocalThread(
+                    null, r, "memgres-pgwire-" + seq.incrementAndGet(), STACK_BYTES);
+            t.setDaemon(false);
+            return t;
         }
     }
 

@@ -43,7 +43,7 @@ class SelectAggregateEvaluator {
 
         for (List<Expression> groupingSet : groupingSets) {
             List<Expression> effectiveGroupBy = new ArrayList<>(fixedGroupBy);
-            effectiveGroupBy.addAll(groupingSet);
+            effectiveGroupBy.addAll(resolveGroupByRefs(groupingSet, stmt));
 
             Set<String> groupingSetColNames = new HashSet<>();
             for (Expression e : effectiveGroupBy) {
@@ -217,6 +217,35 @@ class SelectAggregateEvaluator {
         return ctx;
     }
 
+    /**
+     * Replace output-column ordinals and output aliases used as grouping expressions with the
+     * select-list expression they name. Applies to every grouping element, including the ones
+     * inside GROUPING SETS / ROLLUP / CUBE.
+     */
+    private List<Expression> resolveGroupByRefs(List<Expression> groupBy, SelectStmt stmt) {
+        if (groupBy == null) return null;
+        List<Expression> resolved = new ArrayList<>(groupBy);
+        for (int i = 0; i < resolved.size(); i++) {
+            Expression expr = resolved.get(i);
+            if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
+                Literal lit = (Literal) expr;
+                int ordinal = Integer.parseInt(lit.value());
+                if (ordinal >= 1 && ordinal <= stmt.targets().size()) {
+                    resolved.set(i, stmt.targets().get(ordinal - 1).expr());
+                }
+            } else if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
+                ColumnRef colRef = (ColumnRef) expr;
+                for (SelectStmt.SelectTarget target : stmt.targets()) {
+                    if (target.alias() != null && target.alias().equalsIgnoreCase(colRef.column())) {
+                        resolved.set(i, target.expr());
+                        break;
+                    }
+                }
+            }
+        }
+        return resolved;
+    }
+
     QueryResult executeAggregateSelect(SelectStmt stmt, List<RowContext> contexts,
                                         List<RowContext.TableBinding> baseBindings) {
         if (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty()) {
@@ -224,28 +253,7 @@ class SelectAggregateEvaluator {
         }
 
         // Resolve GROUP BY ordinals and aliases
-        List<Expression> resolvedGroupBy = stmt.groupBy();
-        if (resolvedGroupBy != null) {
-            resolvedGroupBy = new ArrayList<>(resolvedGroupBy);
-            for (int i = 0; i < resolvedGroupBy.size(); i++) {
-                Expression expr = resolvedGroupBy.get(i);
-                if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
-                    Literal lit = (Literal) expr;
-                    int ordinal = Integer.parseInt(lit.value());
-                    if (ordinal >= 1 && ordinal <= stmt.targets().size()) {
-                        resolvedGroupBy.set(i, stmt.targets().get(ordinal - 1).expr());
-                    }
-                } else if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
-                    ColumnRef colRef = (ColumnRef) expr;
-                    for (SelectStmt.SelectTarget target : stmt.targets()) {
-                        if (target.alias() != null && target.alias().equalsIgnoreCase(colRef.column())) {
-                            resolvedGroupBy.set(i, target.expr());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        List<Expression> resolvedGroupBy = resolveGroupByRefs(stmt.groupBy(), stmt);
 
         boolean hasGroupBy = resolvedGroupBy != null && !resolvedGroupBy.isEmpty();
         List<List<RowContext>> groups;
@@ -755,9 +763,56 @@ class SelectAggregateEvaluator {
                 return (double) (countLE + 1) / (vals.size() + 1);
             }
             default: {
-                return null; 
+                throw notAnOrderedSetAggregate(osa, group);
             }
         }
+    }
+
+    /**
+     * WITHIN GROUP only exists for the ordered-set aggregates. PG resolves an ordinary aggregate
+     * written this way against the direct arguments plus the WITHIN GROUP ones, and reports that
+     * no such function exists; only a call with no direct arguments at all is named outright.
+     */
+    private MemgresException notAnOrderedSetAggregate(OrderedSetAggExpr osa, List<RowContext> group) {
+        String name = osa.funcName().toLowerCase();
+        boolean starOnly = osa.args().isEmpty()
+                || (osa.args().size() == 1 && osa.args().get(0) instanceof ColumnRef
+                    && "*".equals(((ColumnRef) osa.args().get(0)).column()));
+        if (starOnly) {
+            return PgErrors.wrongObjectType(
+                    name + " is not an ordered-set aggregate, so it cannot have WITHIN GROUP");
+        }
+        RowContext sample = group.isEmpty() ? null : group.get(0);
+        StringBuilder types = new StringBuilder();
+        for (Expression a : osa.args()) {
+            if (types.length() > 0) types.append(", ");
+            types.append(argTypeName(a, sample));
+        }
+        if (osa.withinGroupOrderBy() != null) {
+            for (SelectStmt.OrderByItem item : osa.withinGroupOrderBy()) {
+                if (types.length() > 0) types.append(", ");
+                types.append(argTypeName(item.expr(), sample));
+            }
+        }
+        MemgresException e = new MemgresException(
+                "function " + name + "(" + types + ") does not exist", "42883");
+        e.setHint("No function matches the given name and argument types. "
+                + "You might need to add explicit type casts.");
+        return e;
+    }
+
+    /** PG leaves a bare quoted literal as "unknown" until a resolved call forces its type. */
+    private String argTypeName(Expression expr, RowContext sample) {
+        if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.STRING) {
+            return "unknown";
+        }
+        Object v;
+        try {
+            v = executor.evalExpr(expr, sample);
+        } catch (RuntimeException ex) {
+            return "unknown";
+        }
+        return v == null ? "unknown" : TypeCoercion.inferType(v).toRegtypeDisplay();
     }
 
     // ---- Core aggregate evaluation ----
@@ -1148,7 +1203,12 @@ class SelectAggregateEvaluator {
                 for (RowContext r : group) {
                     Object k = executor.evalExpr(fn.args().get(0), r);
                     Object v = executor.evalExpr(fn.args().get(1), r);
-                    if (k == null) continue;
+                    // Dropping the row would silently lose it; PG refuses a NULL key outright
+                    if (k == null) {
+                        throw name.equals("jsonb_object_agg")
+                                ? PgErrors.invalidParameter("field name must not be null")
+                                : new MemgresException("null value not allowed for object key", "22004");
+                    }
                     if (!first) sb.append(", ");
                     first = false;
                     sb.append("\"").append(k.toString().replace("\"", "\\\"")).append("\": ");
@@ -1283,7 +1343,9 @@ class SelectAggregateEvaluator {
             case "grouping": {
                 Set<String> currentGroupSet = currentGroupingSetColumns.get();
                 if (currentGroupSet == null) {
-                    throw new MemgresException("GROUPING is not supported without GROUPING SETS, ROLLUP, or CUBE", "42803");
+                    throw new MemgresException(
+                            "arguments to GROUPING must be grouping expressions of the associated query level",
+                            "42803");
                 }
                 // Result is a bitmask: bit i (from the left, most significant first) is 1
                 // if argument i is NOT grouped in the current grouping set.
