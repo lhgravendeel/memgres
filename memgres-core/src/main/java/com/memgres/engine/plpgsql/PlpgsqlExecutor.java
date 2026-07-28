@@ -197,17 +197,32 @@ public class PlpgsqlExecutor {
         this.currentFunctionParams = null;
         Scope scope = new Scope(null);
         scope.declare("found", false);
-        if (session != null) session.enterNestedExecution();
+        if (session != null) session.enterRoutine();
         try {
-            executeBlock(block, scope);
-        } catch (ReturnSignal rs) {
-            // DO blocks can RETURN but the value is discarded
+            if (session != null) session.enterNestedExecution();
+            try {
+                executeBlock(block, scope);
+            } catch (ReturnSignal rs) {
+                // DO blocks can RETURN but the value is discarded
+            } finally {
+                if (session != null) session.exitNestedExecution();
+            }
         } finally {
-            if (session != null) session.exitNestedExecution();
+            if (session != null) session.exitRoutine();
         }
     }
 
     public Object executeFunction(PgFunction function, List<Object> args) {
+        // Checked before any of the call's setup, so a rejected call leaves nothing to unwind.
+        if (session != null) session.enterRoutine();
+        try {
+            return executeFunctionCall(function, args);
+        } finally {
+            if (session != null) session.exitRoutine();
+        }
+    }
+
+    private Object executeFunctionCall(PgFunction function, List<Object> args) {
         this.isProcedureExecution = function.isProcedure();
         this.currentFunctionName = function.getName();
         // Track function call depth: when inside a non-procedure function, transaction control is forbidden
@@ -514,6 +529,18 @@ public class PlpgsqlExecutor {
      */
     public Object[] executeTriggerFunction(PgFunction function, Object[] newRow, Object[] oldRow,
                                            Table table, PgTrigger trigger) {
+        // A trigger that writes to its own table fires itself again; the nesting is bounded here
+        // so it is reported the way PostgreSQL reports it instead of exhausting the Java stack.
+        if (session != null) session.enterTriggerCall();
+        try {
+            return executeTriggerFunctionCall(function, newRow, oldRow, table, trigger);
+        } finally {
+            if (session != null) session.exitTriggerCall();
+        }
+    }
+
+    private Object[] executeTriggerFunctionCall(PgFunction function, Object[] newRow, Object[] oldRow,
+                                                Table table, PgTrigger trigger) {
         PlpgsqlStatement.Block block = PlpgsqlParser.parse(function.getBody());
         this.currentFunctionName = function.getName();
         this.currentFunctionParams = new java.util.HashSet<>(); // trigger functions take no parameters

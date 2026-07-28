@@ -21,6 +21,171 @@ class CatalogCoreBuilder {
         this.oids = oids;
     }
 
+    /**
+     * The array types the catalog registers: {array OID, element OID, typname, typalign}.
+     * The name is spelled out rather than derived, because an element type memgres does not
+     * carry in {@link DataType} would otherwise produce a name like {@code _18} that exists in
+     * no PostgreSQL and resolves nowhere else.
+     */
+    private static final Object[][] STD_ARRAYS = {
+            {1009, 25, "_text", "i"},
+            {1007, 23, "_int4", "i"},
+            {1034, 1033, "_aclitem", "d"},
+            {1000, 16, "_bool", "i"},
+            {1005, 21, "_int2", "i"},
+            {1016, 20, "_int8", "d"},
+            {1021, 700, "_float4", "i"},
+            {1022, 701, "_float8", "d"},
+            {1231, 1700, "_numeric", "i"},
+            {1015, 1043, "_varchar", "i"},
+            {1014, 1042, "_bpchar", "i"},
+            {1003, 19, "_name", "i"},
+            {1182, 1082, "_date", "i"},
+            {1115, 1114, "_timestamp", "d"},
+            {1185, 1184, "_timestamptz", "d"},
+            {1183, 1083, "_time", "d"},
+            {1270, 1266, "_timetz", "d"},
+            {2951, 2950, "_uuid", "i"},
+            {1001, 17, "_bytea", "i"},
+            {1187, 1186, "_interval", "d"},
+            {199, 114, "_json", "i"},
+            {3807, 3802, "_jsonb", "i"},
+            {1041, 869, "_inet", "i"},
+            {1028, 26, "_oid", "i"},
+            {1008, 24, "_regproc", "i"},
+            {2210, 2205, "_regclass", "i"},
+            {2211, 2206, "_regtype", "i"},
+            {1002, 18, "_char", "i"},
+            {1011, 28, "_xid", "i"},
+            {1006, 22, "_int2vector", "i"},
+            {1013, 30, "_oidvector", "i"},
+            {791, 790, "_money", "d"},
+            {1561, 1560, "_bit", "i"},
+            {1563, 1562, "_varbit", "i"},
+            {651, 650, "_cidr", "i"},
+            {1040, 829, "_macaddr", "i"},
+            {775, 774, "_macaddr8", "i"},
+            {3643, 3614, "_tsvector", "i"},
+            {3645, 3615, "_tsquery", "i"},
+            {143, 142, "_xml", "i"},
+            {1017, 600, "_point", "d"},
+            {1018, 601, "_lseg", "d"},
+            {1019, 602, "_path", "d"},
+            {1020, 603, "_box", "d"},
+            {1027, 604, "_polygon", "d"},
+            {719, 718, "_circle", "d"},
+            {629, 628, "_line", "d"},
+            {3905, 3904, "_int4range", "i"},
+            {3907, 3906, "_numrange", "i"},
+            {3909, 3908, "_tsrange", "d"},
+            {3911, 3910, "_tstzrange", "d"},
+            {3913, 3912, "_daterange", "i"},
+            {3927, 3926, "_int8range", "d"},
+            {6150, 4451, "_int4multirange", "i"},
+            {6151, 4532, "_int8multirange", "d"},
+            {6152, 4533, "_nummultirange", "i"},
+            {6153, 4534, "_datemultirange", "i"},
+            {6155, 4535, "_tsmultirange", "d"},
+            {6157, 4536, "_tstzmultirange", "d"},
+    };
+
+    /** element type OID -> its array type OID, for pg_type.typarray. */
+    private static final Map<Integer, Integer> ARRAY_OF;
+
+    /** Built-in names PostgreSQL declares a signature for; see {@link BuiltinFunctionSignatures}. */
+    private static final Set<String> SIGNED_BUILTINS;
+
+    /**
+     * Types whose I/O functions are not spelled {@code <typname>in}. PG names them after the
+     * implementation rather than the type, and a regproc column that reports the wrong name is
+     * as useless to a tool as one that reports none.
+     */
+    private static final Map<String, String> IO_BASE;
+
+    /** Types that carry a typmod modifier, keyed by typname -> typmod function prefix. */
+    private static final Map<String, String> TYPMOD_IO;
+
+    /** Types with a dedicated typanalyze function. */
+    private static final Map<String, String> TYPANALYZE;
+
+    static {
+        Map<Integer, Integer> arrayOf = new HashMap<>();
+        for (Object[] a : STD_ARRAYS) arrayOf.put((Integer) a[1], (Integer) a[0]);
+        ARRAY_OF = Collections.unmodifiableMap(arrayOf);
+
+        Set<String> signed = new HashSet<>();
+        for (String[] sig : BuiltinFunctionSignatures.SIGNATURES) signed.add(sig[0]);
+        SIGNED_BUILTINS = Collections.unmodifiableSet(signed);
+
+        Map<String, String> io = new HashMap<>();
+        for (String t : new String[]{"bit", "box", "cidr", "circle", "date", "inet", "interval",
+                "json", "jsonb", "line", "lseg", "macaddr", "macaddr8", "numeric", "path", "point",
+                "time", "timestamp", "timestamptz", "timetz", "uuid", "varbit", "xml", "hstore"}) {
+            io.put(t, t + "_");
+        }
+        io.put("money", "cash_");
+        io.put("polygon", "poly_");
+        for (String t : new String[]{"int4range", "int8range", "numrange", "daterange",
+                "tsrange", "tstzrange"}) {
+            io.put(t, "range_");
+        }
+        for (String t : new String[]{"int4multirange", "int8multirange", "nummultirange",
+                "datemultirange", "tsmultirange", "tstzmultirange"}) {
+            io.put(t, "multirange_");
+        }
+        IO_BASE = Collections.unmodifiableMap(io);
+
+        Map<String, String> typmod = new HashMap<>();
+        for (String t : new String[]{"bit", "varbit", "bpchar", "varchar", "numeric", "interval",
+                "time", "timestamp", "timestamptz", "timetz"}) {
+            typmod.put(t, t + "typmod");
+        }
+        TYPMOD_IO = Collections.unmodifiableMap(typmod);
+
+        Map<String, String> analyze = new HashMap<>();
+        for (String t : new String[]{"int4range", "int8range", "numrange", "daterange",
+                "tsrange", "tstzrange"}) {
+            analyze.put(t, "range_typanalyze");
+        }
+        for (String t : new String[]{"int4multirange", "int8multirange", "nummultirange",
+                "datemultirange", "tsmultirange", "tstzmultirange"}) {
+            analyze.put(t, "multirange_typanalyze");
+        }
+        analyze.put("tsvector", "ts_typanalyze");
+        TYPANALYZE = Collections.unmodifiableMap(analyze);
+    }
+
+    /** The prefix PG's I/O functions for this type are named with. */
+    private static String ioBaseName(String typname) {
+        String base = IO_BASE.get(typname);
+        return base != null ? base : typname;
+    }
+
+    /**
+     * A regproc value: prints as the function's name and compares as its OID, so both
+     * {@code typinput::text} and {@code typinput = 0} behave the way PG's regproc column does.
+     * A null or "-" name is PG's InvalidOid.
+     */
+    private RegprocValue regproc(String name) {
+        if (name == null || "-".equals(name)) return new RegprocValue(0, "-");
+        return new RegprocValue(oids.oid("proc:" + name), name);
+    }
+
+    /**
+     * An oidvector built from PG's space-separated spelling. Held as a vector rather than a
+     * string so {@code array_length(proargtypes, 1)} and {@code 0 = ANY (proargtypes)} — the
+     * shape catalog-reading tools use — resolve the way they do against PG.
+     */
+    private static PgVector oidvector(String spaceSeparated) {
+        List<Object> elems = new ArrayList<>();
+        if (spaceSeparated != null && !spaceSeparated.isEmpty()) {
+            for (String part : spaceSeparated.trim().split("\\s+")) {
+                if (!part.isEmpty()) elems.add(Integer.parseInt(part));
+            }
+        }
+        return new PgVector(elems);
+    }
+
     /** Resolve the schema that owns a given sequence via the schemaObjectRegistry. */
     private static String resolveSequenceSchema(Database database, String seqName) {
         for (Map.Entry<String, Schema> entry : database.getSchemas().entrySet()) {
@@ -34,20 +199,20 @@ class CatalogCoreBuilder {
 
     Table buildPgClass() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
+                colNN("oid", DataType.OID),
                 colNN("relname", DataType.TEXT),
-                colNN("relnamespace", DataType.INTEGER),
-                col("reltype", DataType.INTEGER),
-                col("reloftype", DataType.INTEGER),
-                colNN("relowner", DataType.INTEGER),
-                col("relam", DataType.INTEGER),
-                col("relfilenode", DataType.INTEGER),
-                col("reltablespace", DataType.INTEGER),
+                colNN("relnamespace", DataType.OID),
+                col("reltype", DataType.OID),
+                col("reloftype", DataType.OID),
+                colNN("relowner", DataType.OID),
+                col("relam", DataType.OID),
+                col("relfilenode", DataType.OID),
+                col("reltablespace", DataType.OID),
                 col("relpages", DataType.INTEGER),
                 col("reltuples", DataType.DOUBLE_PRECISION),
                 col("relallvisible", DataType.INTEGER),
                 col("relallfrozen", DataType.INTEGER),
-                col("reltoastrelid", DataType.INTEGER),
+                col("reltoastrelid", DataType.OID),
                 col("relhasindex", DataType.BOOLEAN),
                 col("relisshared", DataType.BOOLEAN),
                 col("relpersistence", DataType.CHAR),
@@ -63,7 +228,7 @@ class CatalogCoreBuilder {
                 col("relispopulated", DataType.BOOLEAN),
                 col("relreplident", DataType.CHAR),
                 col("relispartition", DataType.BOOLEAN),
-                col("relrewrite", DataType.INTEGER),
+                col("relrewrite", DataType.OID),
                 col("relfrozenxid", DataType.INTEGER),
                 col("relminmxid", DataType.INTEGER),
                 col("relacl", DataType.ACLITEM_ARRAY),
@@ -481,9 +646,9 @@ class CatalogCoreBuilder {
 
     Table buildPgAttribute() {
         List<Column> cols = Cols.listOf(
-                colNN("attrelid", DataType.INTEGER),
+                colNN("attrelid", DataType.OID),
                 colNN("attname", DataType.TEXT),
-                colNN("atttypid", DataType.INTEGER),
+                colNN("atttypid", DataType.OID),
                 colNN("attnum", DataType.SMALLINT),
                 colNN("attnotnull", DataType.BOOLEAN),
                 col("atttypmod", DataType.INTEGER),
@@ -933,10 +1098,10 @@ class CatalogCoreBuilder {
 
     Table buildPgType() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
+                colNN("oid", DataType.OID),
                 colNN("typname", DataType.TEXT),
-                colNN("typnamespace", DataType.INTEGER),
-                col("typowner", DataType.INTEGER),
+                colNN("typnamespace", DataType.OID),
+                col("typowner", DataType.OID),
                 col("typlen", DataType.SMALLINT),
                 col("typbyval", DataType.BOOLEAN),
                 col("typtype", DataType.CHAR),
@@ -944,24 +1109,24 @@ class CatalogCoreBuilder {
                 col("typispreferred", DataType.BOOLEAN),
                 col("typisdefined", DataType.BOOLEAN),
                 col("typdelim", DataType.CHAR),
-                col("typrelid", DataType.INTEGER),
-                col("typsubscript", DataType.TEXT),
-                col("typelem", DataType.INTEGER),
-                col("typarray", DataType.INTEGER),
-                col("typinput", DataType.TEXT),
-                col("typoutput", DataType.TEXT),
-                col("typreceive", DataType.TEXT),
-                col("typsend", DataType.TEXT),
-                col("typmodin", DataType.TEXT),
-                col("typmodout", DataType.TEXT),
-                col("typanalyze", DataType.TEXT),
+                col("typrelid", DataType.OID),
+                col("typsubscript", DataType.REGPROC),
+                col("typelem", DataType.OID),
+                col("typarray", DataType.OID),
+                col("typinput", DataType.REGPROC),
+                col("typoutput", DataType.REGPROC),
+                col("typreceive", DataType.REGPROC),
+                col("typsend", DataType.REGPROC),
+                col("typmodin", DataType.REGPROC),
+                col("typmodout", DataType.REGPROC),
+                col("typanalyze", DataType.REGPROC),
                 col("typalign", DataType.CHAR),
                 col("typstorage", DataType.CHAR),
                 col("typnotnull", DataType.BOOLEAN),
-                col("typbasetype", DataType.INTEGER),
+                col("typbasetype", DataType.OID),
                 col("typtypmod", DataType.INTEGER),
                 col("typndims", DataType.INTEGER),
-                col("typcollation", DataType.INTEGER),
+                col("typcollation", DataType.OID),
                 col("typdefaultbin", DataType.TEXT),
                 col("typdefault", DataType.TEXT),
                 col("typacl", DataType.ACLITEM_ARRAY),
@@ -987,7 +1152,14 @@ class CatalogCoreBuilder {
                 case DOUBLE_PRECISION:
                 case NUMERIC:
                 case MONEY:
+                case REGPROC:
+                case REGCLASS:
+                case REGTYPE:
                     cat = "N";
+                    break;
+                case INT2VECTOR:
+                case OIDVECTOR:
+                    cat = "A";
                     break;
                 case BOOLEAN:
                     cat = "B";
@@ -1032,6 +1204,11 @@ class CatalogCoreBuilder {
                 case NAME:
                     typlen = (short) 64;
                     break;
+                case REGPROC:
+                case REGCLASS:
+                case REGTYPE:
+                    typlen = (short) 4;
+                    break;
                 default:
                     typlen = (short) -1;
                     break;
@@ -1050,19 +1227,10 @@ class CatalogCoreBuilder {
             }
             // Collation OID: only for string types
             int collation = (cat.equals("S")) ? 100 : 0;
-            // typarray: point base types to their array type OID
-            int typarray;
-            switch (dt) {
-                case TEXT:
-                    typarray = 1009;
-                    break;
-                case INTEGER:
-                    typarray = 1007;
-                    break;
-                default:
-                    typarray = 0;
-                    break;
-            }
+            // A driver that does not hardcode an array OID discovers array support by following
+            // typarray from the element type (pgjdbc's TypeInfoCache does exactly this), so every
+            // element whose array type is registered has to point back at it.
+            int typarray = ARRAY_OF.containsKey(dt.getOid()) ? ARRAY_OF.get(dt.getOid()) : 0;
             // typbyval: passed by value for small fixed-size types
             boolean typbyval;
             switch (dt) {
@@ -1070,6 +1238,9 @@ class CatalogCoreBuilder {
                 case SMALLINT:
                 case INTEGER:
                 case REAL:
+                case REGPROC:
+                case REGCLASS:
+                case REGTYPE:
                     typbyval = true;
                     break;
                 case BIGINT:
@@ -1134,167 +1305,96 @@ class CatalogCoreBuilder {
                 typtype = "r";
                 cat = "R";
             }
+            // A vector holds elements, and PG records which: 0-based int2vector/oidvector carry
+            // typelem the same way an array type does.
+            int typelem = dt == DataType.INT2VECTOR ? DataType.SMALLINT.getOid()
+                    : dt == DataType.OIDVECTOR ? DataType.OID.getOid() : 0;
+            Object subscript = (dt == DataType.INT2VECTOR || dt == DataType.OIDVECTOR)
+                    ? regproc("array_subscript_handler") : regproc(null);
+            String io = ioBaseName(pgName);
             table.insertRow(new Object[]{
                     dt.getOid(), pgName, pgCatalogOid,
                     10,          // typowner
                     typlen, typbyval, typtype, cat, isPreferred, true, ",",
                     0,           // typrelid
-                    null,        // typsubscript
-                    0,           // typelem
+                    subscript,
+                    typelem,
                     typarray,
-                    pgName + "in", pgName + "out",       // typinput, typoutput
-                    pgName + "recv", pgName + "send",    // typreceive, typsend
-                    "-", "-", "-",                        // typmodin, typmodout, typanalyze
+                    regproc(io + "in"), regproc(io + "out"),       // typinput, typoutput
+                    regproc(io + "recv"), regproc(io + "send"),    // typreceive, typsend
+                    regproc(TYPMOD_IO.get(pgName) == null ? null : TYPMOD_IO.get(pgName) + "in"),
+                    regproc(TYPMOD_IO.get(pgName) == null ? null : TYPMOD_IO.get(pgName) + "out"),
+                    regproc(TYPANALYZE.get(pgName)),
                     typalign, typstorage,
                     false, 0, -1, 0, collation,          // typnotnull, typbasetype, typtypmod, typndims, typcollation
                     null, null, null, 1                   // typdefaultbin, typdefault, typacl, xmin
             });
         }
 
-        // Array types, manually added with correct typelem and typcategory='A'
-        // _text (OID 1009): text[]
-        table.insertRow(new Object[]{
-                1009, "_text", pgCatalogOid, 10,
-                (short) -1, false, "b", "A", false, true, ",",
-                0, "array_subscript_handler", 25, 0,
-                "array_in", "array_out", "array_recv", "array_send",
-                "-", "-", "-", "d", "x",
-                false, 0, -1, 0, 100, null, null, null, 1
-        });
-        // _int4 (OID 1007): integer[]
-        table.insertRow(new Object[]{
-                1007, "_int4", pgCatalogOid, 10,
-                (short) -1, false, "b", "A", false, true, ",",
-                0, "array_subscript_handler", 23, 0,
-                "array_in", "array_out", "array_recv", "array_send",
-                "-", "-", "-", "i", "x",
-                false, 0, -1, 0, 0, null, null, null, 1
-        });
         // aclitem base type (OID 1033)
         table.insertRow(new Object[]{
                 1033, "aclitem", pgCatalogOid, 10,
                 (short) 12, false, "b", "U", false, true, ",",
-                0, null, 0, 1034,
-                "aclitemin", "aclitemout", "-", "-",
-                "-", "-", "-", "i", "p",
-                false, 0, -1, 0, 0, null, null, null, 1
-        });
-        // _aclitem (OID 1034): aclitem[]
-        table.insertRow(new Object[]{
-                1034, "_aclitem", pgCatalogOid, 10,
-                (short) -1, false, "b", "A", false, true, ",",
-                0, "array_subscript_handler", 1033, 0,
-                "array_in", "array_out", "array_recv", "array_send",
-                "-", "-", "-", "i", "x",
+                0, regproc(null), 0, 1034,
+                regproc("aclitemin"), regproc("aclitemout"), regproc(null), regproc(null),
+                regproc(null), regproc(null), regproc(null), "i", "p",
                 false, 0, -1, 0, 0, null, null, null, 1
         });
 
-        // Remaining standard array types (typcategory='A', typelem -> element OID). Without a
-        // pg_type row pgjdbc can only classify an array column when it *hardcodes* the array OID;
-        // types it doesn't hardcode (notably _jsonb) otherwise resolve to Types.OTHER and come back
-        // as a single PGobject instead of a java.sql.Array. Rows here make the classification data-
-        // driven so those columns decode as arrays. (_text/_int4/_aclitem are added individually
-        // above; enum arrays are added per-enum below.)
-        int[][] stdArrays = {
-                {1000, 16},   // _bool
-                {1005, 21},   // _int2
-                {1016, 20},   // _int8
-                {1021, 700},  // _float4
-                {1022, 701},  // _float8
-                {1231, 1700}, // _numeric
-                {1015, 1043}, // _varchar
-                {1014, 1042}, // _bpchar
-                {1003, 19},   // _name
-                {1182, 1082}, // _date
-                {1115, 1114}, // _timestamp
-                {1185, 1184}, // _timestamptz
-                {1183, 1083}, // _time
-                {1270, 1266}, // _timetz
-                {2951, 2950}, // _uuid
-                {1001, 17},   // _bytea
-                {1187, 1186}, // _interval
-                {199, 114},   // _json
-                {3807, 3802}, // _jsonb
-                {1041, 869},  // _inet
-                {1028, 26},   // _oid
-                {1008, 24},   // _regproc
-                {2210, 2205}, // _regclass
-                {2211, 2206}, // _regtype
-                {1002, 18},   // _char
-                {791, 790},   // _money
-                {1561, 1560}, // _bit
-                {1563, 1562}, // _varbit
-                {651, 650},   // _cidr
-                {1040, 829},  // _macaddr
-                {775, 774},   // _macaddr8
-                {3643, 3614}, // _tsvector
-                {3645, 3615}, // _tsquery
-                {143, 142},   // _xml
-                {1017, 600},  // _point
-                {1018, 601},  // _lseg
-                {1019, 602},  // _path
-                {1020, 603},  // _box
-                {1027, 604},  // _polygon
-                {719, 718},   // _circle
-                {629, 628},   // _line
-                {3905, 3904}, // _int4range
-                {3907, 3906}, // _numrange
-                {3909, 3908}, // _tsrange
-                {3911, 3910}, // _tstzrange
-                {3913, 3912}, // _daterange
-                {3927, 3926}, // _int8range
-                {6150, 4451}, // _int4multirange
-                {6151, 4532}, // _int8multirange
-                {6152, 4533}, // _nummultirange
-                {6153, 4534}, // _datemultirange
-                {6155, 4535}, // _tsmultirange
-                {6157, 4536}, // _tstzmultirange
-        };
-        for (int[] a : stdArrays) {
-            int arrOid = a[0];
-            int elemOid = a[1];
-            DataType arrDt = DataType.fromOid(arrOid);
-            // An array type is named for what it holds, so fall back to the element's name rather
-            // than to its OID — a tool looking for _bit would not find a type called _1560.
-            String arrName;
-            if (arrDt != null) {
-                arrName = arrDt.getPgName();
-            } else {
-                DataType elemDt = DataType.fromOid(elemOid);
-                arrName = elemDt != null ? "_" + elemDt.getPgName() : "_" + elemOid;
-            }
+        // Standard array types (typcategory='A', typelem -> element OID). Without a pg_type row
+        // pgjdbc can only classify an array column when it *hardcodes* the array OID; types it
+        // doesn't hardcode (notably _jsonb) otherwise resolve to Types.OTHER and come back as a
+        // single PGobject instead of a java.sql.Array. Rows here make the classification data-
+        // driven so those columns decode as arrays. (Enum arrays are added per-enum below.)
+        for (Object[] a : STD_ARRAYS) {
+            int arrOid = (Integer) a[0];
+            int elemOid = (Integer) a[1];
+            String arrName = (String) a[2];
             int arrCollation = (elemOid == 25 || elemOid == 1043 || elemOid == 1042 || elemOid == 19) ? 100 : 0;
+            String align = (String) a[3];
             table.insertRow(new Object[]{
                     arrOid, arrName, pgCatalogOid, 10,
                     (short) -1, false, "b", "A", false, true, ",",
-                    0, "array_subscript_handler", elemOid, 0,
-                    "array_in", "array_out", "array_recv", "array_send",
-                    "-", "-", "-", "i", "x",
+                    0, regproc("array_subscript_handler"), elemOid, 0,
+                    regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
+                    regproc(null), regproc(null), regproc("array_typanalyze"), align, "x",
                     false, 0, -1, 0, arrCollation, null, null, null, 1
             });
         }
 
-        // Pseudo-types: trigger, event_trigger, void, record, etc.
+        // Pseudo-types: trigger, event_trigger, void, record, the polymorphic family, etc.
+        // Columns: name, oid, typlen, typalign, typstorage. The container-shaped polymorphic
+        // types (anyarray and the range/multirange forms) are varlena, like what they stand for.
         String[][] pseudoTypes = {
-                {"trigger", "2279"},
-                {"event_trigger", "3838"},
-                {"void", "2278"},
-                {"record", "2249"},
-                {"any", "2276"},
-                {"anyelement", "2283"},
-                {"anyarray", "2277"},
-                {"internal", "2281"},
-                {"cstring", "2275"},
+                {"trigger", "2279", "4", "i", "p"},
+                {"event_trigger", "3838", "4", "i", "p"},
+                {"void", "2278", "4", "i", "p"},
+                {"record", "2249", "4", "i", "p"},
+                {"any", "2276", "4", "i", "p"},
+                {"anyelement", "2283", "4", "i", "p"},
+                {"anyarray", "2277", "-1", "d", "x"},
+                {"anynonarray", "2776", "4", "i", "p"},
+                {"anyenum", "3500", "4", "i", "p"},
+                {"anyrange", "3831", "-1", "d", "x"},
+                {"anymultirange", "4537", "-1", "d", "x"},
+                {"anycompatible", "5077", "4", "i", "p"},
+                {"anycompatiblearray", "5078", "-1", "d", "x"},
+                {"anycompatiblenonarray", "5079", "4", "i", "p"},
+                {"anycompatiblerange", "5080", "-1", "d", "x"},
+                {"anycompatiblemultirange", "4538", "-1", "d", "x"},
+                {"internal", "2281", "4", "i", "p"},
+                {"cstring", "2275", "4", "i", "p"},
         };
         for (String[] pt : pseudoTypes) {
             String ptName = pt[0];
             int ptOid = Integer.parseInt(pt[1]);
+            short ptLen = Short.parseShort(pt[2]);
             table.insertRow(new Object[]{
                     ptOid, ptName, pgCatalogOid, 10,
-                    (short) 4, true, "p", "P", false, true, ",",
-                    0, null, 0, 0,
-                    ptName + "_in", ptName + "_out", "-", "-",
-                    "-", "-", "-", "i", "p",
+                    ptLen, ptLen > 0, "p", "P", false, true, ",",
+                    0, regproc(null), 0, 0,
+                    regproc(ptName + "_in"), regproc(ptName + "_out"), regproc(null), regproc(null),
+                    regproc(null), regproc(null), regproc(null), pt[3], pt[4],
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
@@ -1321,17 +1421,17 @@ class CatalogCoreBuilder {
             table.insertRow(new Object[]{
                     enumOid, ce.getName(), enumNsOid, 10,
                     (short) 4, true, "e", "E", false, true, ",",
-                    0, null, 0, enumArrayOid,
-                    "enum_in", "enum_out", "enum_recv", "enum_send",
-                    "-", "-", "-", "i", "p",
+                    0, regproc(null), 0, enumArrayOid,
+                    regproc("enum_in"), regproc("enum_out"), regproc("enum_recv"), regproc("enum_send"),
+                    regproc(null), regproc(null), regproc(null), "i", "p",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
             table.insertRow(new Object[]{
                     enumArrayOid, "_" + ce.getName(), enumNsOid, 10,
                     (short) -1, false, "b", "A", false, true, ",",
-                    0, "array_subscript_handler", enumOid, 0,
-                    "array_in", "array_out", "array_recv", "array_send",
-                    "-", "-", "-", "i", "x",
+                    0, regproc("array_subscript_handler"), enumOid, 0,
+                    regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
+                    regproc(null), regproc(null), regproc("array_typanalyze"), "i", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
@@ -1345,9 +1445,21 @@ class CatalogCoreBuilder {
             table.insertRow(new Object[]{
                     oids.oid("type:" + ctName), ctName, ctNsOid, 10,
                     (short) -1, false, "c", "C", false, true, ",",
-                    ctRelOid, null, 0, 0,
-                    "record_in", "record_out", "record_recv", "record_send",
-                    "-", "-", "-", "d", "x",
+                    ctRelOid, regproc(null), 0, 0,
+                    regproc("record_in"), regproc("record_out"), regproc("record_recv"), regproc("record_send"),
+                    regproc(null), regproc(null), regproc(null), "d", "x",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+        }
+
+        // Shell types: a name reserved but not yet defined, so typisdefined is false
+        for (String shellName : database.getShellTypes()) {
+            table.insertRow(new Object[]{
+                    oids.oid("type:" + shellName), shellName, oids.oid("ns:public"), 10,
+                    (short) 4, false, "p", "P", false, false, ",",
+                    0, null, 0, 0,
+                    "shell_in", "shell_out", "-", "-",
+                    "-", "-", "-", "i", "p",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
@@ -1366,9 +1478,9 @@ class CatalogCoreBuilder {
                 table.insertRow(new Object[]{
                         oids.oid("type:" + schemaName + "." + relName), relName, relNsOid, 10,
                         (short) -1, false, "c", "C", false, true, ",",
-                        oids.oid("rel:" + schemaName + "." + relName), null, 0, 0,
-                        "record_in", "record_out", "record_recv", "record_send",
-                        "-", "-", "-", "d", "x",
+                        oids.oid("rel:" + schemaName + "." + relName), regproc(null), 0, 0,
+                        regproc("record_in"), regproc("record_out"), regproc("record_recv"), regproc("record_send"),
+                        regproc(null), regproc(null), regproc(null), "d", "x",
                         false, 0, -1, 0, 0, null, null, null, 1
                 });
             }
@@ -1420,9 +1532,9 @@ class CatalogCoreBuilder {
             table.insertRow(new Object[]{
                     oids.oid("type:" + dom.getName()), dom.getName(), domNsOid, 10,
                     (short) -1, false, "d", baseTypeCat, false, true, ",",
-                    0, null, 0, 0,
-                    "domain_in", "domain_out", "domain_recv", "domain_send",
-                    "-", "-", "-", "i", "x",
+                    0, regproc(null), 0, 0,
+                    regproc("domain_in"), regproc("domain_out"), regproc("domain_recv"), regproc("domain_send"),
+                    regproc(null), regproc(null), regproc(null), "i", "x",
                     dom.isNotNull(), baseTypeOid, -1, 0, 0, null,
                     dom.getDefaultValue(), null, 1
             });
@@ -1435,9 +1547,9 @@ class CatalogCoreBuilder {
             table.insertRow(new Object[]{
                     oids.oid("type:" + rangeName), rangeName, rangeNsOid, 10,
                     (short) -1, false, "r", "R", false, true, ",",
-                    0, null, 0, 0,
-                    "range_in", "range_out", "range_recv", "range_send",
-                    "-", "-", "-", "d", "x",
+                    0, regproc(null), 0, 0,
+                    regproc("range_in"), regproc("range_out"), regproc("range_recv"), regproc("range_send"),
+                    regproc(null), regproc(null), regproc("range_typanalyze"), "d", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
@@ -1447,9 +1559,9 @@ class CatalogCoreBuilder {
 
     Table buildPgNamespace() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
+                colNN("oid", DataType.OID),
                 colNN("nspname", DataType.TEXT),
-                colNN("nspowner", DataType.INTEGER),
+                colNN("nspowner", DataType.OID),
                 col("xmin", DataType.INTEGER),
                 col("nspacl", DataType.ACLITEM_ARRAY)
         );
@@ -1471,8 +1583,8 @@ class CatalogCoreBuilder {
 
     Table buildPgEnum() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("enumtypid", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("enumtypid", DataType.OID),
                 colNN("enumsortorder", DataType.DOUBLE_PRECISION),
                 colNN("enumlabel", DataType.TEXT)
         );
@@ -1494,14 +1606,14 @@ class CatalogCoreBuilder {
 
     Table buildPgProc() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
+                colNN("oid", DataType.OID),
                 colNN("proname", DataType.TEXT),
-                colNN("pronamespace", DataType.INTEGER),
-                col("proowner", DataType.INTEGER),
-                col("prolang", DataType.INTEGER),
+                colNN("pronamespace", DataType.OID),
+                col("proowner", DataType.OID),
+                col("prolang", DataType.OID),
                 col("procost", DataType.DOUBLE_PRECISION),
                 col("prorows", DataType.DOUBLE_PRECISION),
-                col("provariadic", DataType.INTEGER),
+                col("provariadic", DataType.OID),
                 col("prosupport", DataType.TEXT),
                 col("prokind", DataType.CHAR),
                 col("prosecdef", DataType.BOOLEAN),
@@ -1512,8 +1624,8 @@ class CatalogCoreBuilder {
                 col("proparallel", DataType.CHAR),
                 col("pronargs", DataType.SMALLINT),
                 col("pronargdefaults", DataType.SMALLINT),
-                col("prorettype", DataType.INTEGER),
-                col("proargtypes", DataType.TEXT),
+                col("prorettype", DataType.OID),
+                col("proargtypes", DataType.OIDVECTOR),
                 col("proallargtypes", DataType.TEXT),
                 col("proargmodes", DataType.TEXT),
                 col("proargnames", DataType.TEXT),
@@ -1541,7 +1653,7 @@ class CatalogCoreBuilder {
                     oids.oid("proc:" + h), h, pgCatalogNs, 10, hLang, 1.0, 0.0,
                     0, "-", "f", false, false, true, false, "v", "u",
                     (short) 1, (short) 0, amHandlerType,
-                    "2281", null, null, null, null, null,
+                    oidvector("2281"), null, null, null, null, null,
                     h, null, null, null, null, 1
             });
         }
@@ -1557,7 +1669,7 @@ class CatalogCoreBuilder {
                     oids.oid("proc:" + v), v, pgCatalogNs, 10, internalLangOid, 1.0, 0.0,
                     0, "-", "f", false, false, true, false, "v", "u",
                     (short) 1, (short) 0, voidType,
-                    "26", null, null, null, null, null,
+                    oidvector("26"), null, null, null, null, null,
                     v, null, null, null, null, 1
             });
         }
@@ -1566,7 +1678,7 @@ class CatalogCoreBuilder {
                 oids.oid("proc:plpgsql_call_handler"), "plpgsql_call_handler", pgCatalogNs, 10,
                 cLangOid, 1.0, 0.0, 0, "-", "f", false, false, true, false, "v", "u",
                 (short) 0, (short) 0, langHandlerType,
-                null, null, null, null, null, null,
+                oidvector(""), null, null, null, null, null,
                 "plpgsql_call_handler", null, null, null, null, 1
         });
         // PL/pgSQL inline handler: returns void, takes internal arg
@@ -1574,7 +1686,7 @@ class CatalogCoreBuilder {
                 oids.oid("proc:plpgsql_inline_handler"), "plpgsql_inline_handler", pgCatalogNs, 10,
                 cLangOid, 1.0, 0.0, 0, "-", "f", false, false, true, false, "v", "u",
                 (short) 1, (short) 0, voidType,
-                "2281", null, null, null, null, null,
+                oidvector("2281"), null, null, null, null, null,
                 "plpgsql_inline_handler", null, null, null, null, 1
         });
         // PL/pgSQL validator: returns void, takes oid arg
@@ -1582,7 +1694,7 @@ class CatalogCoreBuilder {
                 oids.oid("proc:plpgsql_validator"), "plpgsql_validator", pgCatalogNs, 10,
                 cLangOid, 1.0, 0.0, 0, "-", "f", false, false, true, false, "v", "u",
                 (short) 1, (short) 0, voidType,
-                "26", null, null, null, null, null,
+                oidvector("26"), null, null, null, null, null,
                 "plpgsql_validator", null, null, null, null, 1
         });
 
@@ -1598,7 +1710,7 @@ class CatalogCoreBuilder {
                     aggProcOid, aggName, pgCatalogNs, 10, internalLangOid, 1.0, 0.0,
                     0, "-", "a", false, false, false, false, "i", "u",
                     (short) 1, (short) 0, retType,
-                    String.valueOf(anyType), null, null, null, null, null,
+                    oidvector(String.valueOf(anyType)), null, null, null, null, null,
                     aggName, null, null, null, null, 1
             });
         }
@@ -1639,12 +1751,20 @@ class CatalogCoreBuilder {
             String kind = fn.isProcedure() ? "p" : "f";
             // Count arguments and build proargnames, proargmodes, proallargtypes
             short nargs = 0;
-            String argTypes = null;
+            StringBuilder argTypesBuilder = new StringBuilder();
             String proargnames = null;
             String proargmodes = null;
             String proallargtypes = null;
             if (fn.getParams() != null && !fn.getParams().isEmpty()) {
                 nargs = (short) fn.getParams().size();
+                // proargtypes lists the IN arguments; an OUT-only parameter is carried by
+                // proallargtypes instead, exactly as PG splits them.
+                for (PgFunction.Param p : fn.getParams()) {
+                    String mode = p.mode() == null ? "in" : p.mode().toLowerCase();
+                    if (mode.equals("out")) continue;
+                    if (argTypesBuilder.length() > 0) argTypesBuilder.append(' ');
+                    argTypesBuilder.append(resolveTypeOidByName(p.typeName()));
+                }
                 // Build proargnames: {name1,name2,...} — populated when any param has a name
                 boolean hasNames = fn.getParams().stream().anyMatch(p -> p.name() != null && !p.name().isEmpty());
                 if (hasNames) {
@@ -1712,6 +1832,10 @@ class CatalogCoreBuilder {
             }
             // prosqlbody: populated for BEGIN ATOMIC functions
             String prosqlbody = fn.isAtomicBody() ? fn.getBody() : null;
+            // A procedure returns void in PG's catalog; a function without a declared return
+            // type is deriving one from its OUT parameters, which makes it a record.
+            int retType = fn.getReturnType() != null ? resolveTypeOidByName(fn.getReturnType())
+                    : (fn.isProcedure() ? 2278 : 2249);
             // Use unique OID key for overloaded functions (append param count)
             int idx = overloadIndex.merge(fn.getName(), 0, (a, b) -> a + 1);
             String oidKey = idx == 0 ? "proc:" + fn.getName() : "proc:" + fn.getName() + "#" + idx;
@@ -1721,8 +1845,9 @@ class CatalogCoreBuilder {
                     fn.isSecurityDefiner(), fn.isLeakproof(), fn.isStrict(), false,
                     fn.getVolatility() != null ? fn.getVolatility().substring(0, 1).toLowerCase() : "v",
                     fn.getParallel() != null ? fn.getParallel().substring(0, 1).toLowerCase() : "u",
-                    nargs, (short) 0, 0,
-                    argTypes, proallargtypes, proargmodes, proargnames, proargdefaults, null,
+                    nargs, (short) 0, retType,
+                    oidvector(argTypesBuilder.toString()), proallargtypes, proargmodes, proargnames,
+                    proargdefaults, null,
                     fn.getBody(), null, prosqlbody, proconfig, null, 1
             });
         }
@@ -1740,7 +1865,7 @@ class CatalogCoreBuilder {
                     internalLangOid, 1.0, 0.0, 0, "-", "f",
                     false, false, false, false, "v", "u",
                     (short) 0, (short) 0, voidType,
-                    null, null, null, null, null, null,
+                    oidvector(""), null, null, null, null, null,
                     etHelper, null, null, null, null, 1
             });
         }
@@ -1762,12 +1887,14 @@ class CatalogCoreBuilder {
                 "unicode_version", "unicode_assigned"
         };
         for (String extFn : extensionFunctions) {
+            // A name PostgreSQL declares a signature for is registered from that signature below
+            if (SIGNED_BUILTINS.contains(extFn)) continue;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + extFn), extFn, pgCatalogNs, 10,
                     internalLangOid, 1.0, 0.0, 0, "-", "f",
                     false, false, false, false, "i", "u",
                     (short) 0, (short) 0, 0,
-                    null, null, null, null, null, null,
+                    oidvector(""), null, null, null, null, null,
                     extFn, null, null, null, null, 1
             });
         }
@@ -1792,12 +1919,13 @@ class CatalogCoreBuilder {
                 "pg_wal_replay_resume"
         };
         for (String replFn : replicationFunctions) {
+            if (SIGNED_BUILTINS.contains(replFn)) continue;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + replFn), replFn, pgCatalogNs, 10,
                     internalLangOid, 1.0, 0.0, 0, "-", "f",
                     false, false, false, false, "v", "u",
                     (short) 0, (short) 0, 0,
-                    null, null, null, null, null, null,
+                    oidvector(""), null, null, null, null, null,
                     replFn, null, null, null, null, 1
             });
         }
@@ -1809,7 +1937,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, false, false, "s", "u",
                 (short) 3, (short) 0, 16, // returns boolean (OID 16)
-                "26 26 25", null, null, null, null, null,
+                oidvector("26 26 25"), null, null, null, null, null,
                 "has_largeobject_privilege", null, null, null, null, 1
         });
         // has_largeobject_privilege(user name, loid oid, privilege text) → boolean
@@ -1818,7 +1946,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, false, false, "s", "u",
                 (short) 3, (short) 0, 16, // returns boolean (OID 16)
-                "19 26 25", null, null, null, null, null,
+                oidvector("19 26 25"), null, null, null, null, null,
                 "has_largeobject_privilege", null, null, null, null, 1
         });
         // has_largeobject_privilege(loid oid, privilege text) → boolean (current user)
@@ -1827,7 +1955,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, false, false, "s", "u",
                 (short) 2, (short) 0, 16, // returns boolean (OID 16)
-                "26 25", null, null, null, null, null,
+                oidvector("26 25"), null, null, null, null, null,
                 "has_largeobject_privilege", null, null, null, null, 1
         });
         // lo_export(loid oid, filename text) → int4
@@ -1836,7 +1964,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, false, false, "v", "u",
                 (short) 2, (short) 0, 23, // returns int4 (OID 23)
-                "26 25", null, null, null, null, null,
+                oidvector("26 25"), null, null, null, null, null,
                 "lo_export", null, null, null, null, 1
         });
         // lo_import(filename text) → oid
@@ -1845,7 +1973,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, false, false, "v", "u",
                 (short) 1, (short) 0, 26, // returns oid (OID 26)
-                "25", null, null, null, null, null,
+                oidvector("25"), null, null, null, null, null,
                 "lo_import", null, null, null, null, 1
         });
         // lo_import(filename text, loid oid) → oid (2-arg overload)
@@ -1854,7 +1982,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, false, false, "v", "u",
                 (short) 2, (short) 0, 26, // returns oid (OID 26)
-                "25 26", null, null, null, null, null,
+                oidvector("25 26"), null, null, null, null, null,
                 "lo_import", null, null, null, null, 1
         });
         // lo_truncate64(fd int4, len int8) → int4
@@ -1863,7 +1991,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, false, false, "v", "u",
                 (short) 2, (short) 0, 23, // returns int4 (OID 23)
-                "23 20", null, null, null, null, null,
+                oidvector("23 20"), null, null, null, null, null,
                 "lo_truncate64", null, null, null, null, 1
         });
 
@@ -1874,7 +2002,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, true, false, "i", "s",
                 (short) 1, (short) 0, 1184, // returns timestamptz (OID 1184)
-                "2950", null, null, null, null, null,
+                oidvector("2950"), null, null, null, null, null,
                 "uuid_extract_timestamp", null, null, null, null, 1
         });
         // uuid_extract_version(uuid) → int4
@@ -1883,7 +2011,7 @@ class CatalogCoreBuilder {
                 internalLangOid, 1.0, 0.0, 0, "-", "f",
                 false, false, true, false, "i", "s",
                 (short) 1, (short) 0, 23, // returns int4 (OID 23)
-                "2950", null, null, null, null, null,
+                oidvector("2950"), null, null, null, null, null,
                 "uuid_extract_version", null, null, null, null, 1
         });
 
@@ -1898,7 +2026,7 @@ class CatalogCoreBuilder {
                     internalLangOid, 1.0, 0.0, 0, "-", "f",
                     false, false, true, true, "s", "u",
                     (short) 0, (short) 0, 2249, // returns record (OID 2249)
-                    null, null, null, null, null, null,
+                    oidvector(""), null, null, null, null, null,
                     ctlFn, null, null, null, null, 1
             });
         }
@@ -1916,7 +2044,7 @@ class CatalogCoreBuilder {
                     oids.oid("lang:internal"), 1.0, 0.0, 0, "-", "a",
                     false, false, false, false, "i", "u",
                     aggNargs, (short) 0, 0,
-                    null, null, null, null, null, null,
+                    oidvector(""), null, null, null, null, null,
                     null, null, null, null, null, 1
             });
         }
@@ -1931,14 +2059,41 @@ class CatalogCoreBuilder {
                 alreadyListed.add(existing[1].toString().toLowerCase());
             }
         }
+        // A row is a claim about what the server can do, and a name with no signature behind it
+        // is a claim nothing can act on: overload resolution, pg_get_function_arguments and a
+        // client deciding how to bind a call all read the argument and return types, so each
+        // overload PostgreSQL declares is registered with the types it declares.
+        Map<String, Integer> signatureIndex = new HashMap<>();
+        Set<String> signed = new HashSet<>();
+        for (String[] sig : BuiltinFunctionSignatures.SIGNATURES) {
+            String name = sig[0];
+            if (alreadyListed.contains(name.toLowerCase())) continue;
+            signed.add(name.toLowerCase());
+            String[] args = sig[2].isEmpty() ? new String[0] : sig[2].split(" ");
+            int idx = signatureIndex.merge(name, 0, (a, b) -> a + 1);
+            String oidKey = idx == 0 ? "proc:" + name : "proc:" + name + "#sig" + idx;
+            table.insertRow(new Object[]{
+                    oids.oid(oidKey), name, pgCatalogNs, 10,
+                    internalLangOid, 1.0, sig[3].charAt(0) == 't' ? 1000.0 : 0.0,
+                    0, "-", "f",
+                    false, false, false, sig[3].charAt(0) == 't',
+                    String.valueOf(sig[3].charAt(1)), "u",
+                    (short) args.length, (short) 0, Integer.parseInt(sig[1]),
+                    oidvector(sig[2]), null, null, null, null, null,
+                    name, null, null, null, null, 1
+            });
+        }
+        // Names memgres evaluates that PostgreSQL has no signature for keep a bare row: without
+        // one the function works when called but is invisible to anything that asks first.
         for (String builtin : BuiltinFunctionNames.NAMES) {
+            if (signed.contains(builtin.toLowerCase())) continue;
             if (!alreadyListed.add(builtin.toLowerCase())) continue;
             table.insertRow(new Object[]{
                     oids.oid("proc:" + builtin), builtin, pgCatalogNs, 10,
                     internalLangOid, 1.0, 0.0, 0, "-", "f",
                     false, false, false, false, "i", "u",
                     (short) 0, (short) 0, 0,
-                    null, null, null, null, null, null,
+                    oidvector(""), null, null, null, null, null,
                     builtin, null, null, null, null, 1
             });
         }

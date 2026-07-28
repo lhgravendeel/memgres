@@ -386,6 +386,12 @@ class SelectParser {
                     winFrame = parser.parseWindowFrame();
                 }
                 parser.expect(TokenType.RIGHT_PAREN);
+                for (SelectStmt.WindowDef existing : windowDefs) {
+                    if (existing.name().equalsIgnoreCase(winName)) {
+                        throw new com.memgres.engine.MemgresException(
+                                "window \"" + winName + "\" is already defined", "42P20");
+                    }
+                }
                 windowDefs.add(new SelectStmt.WindowDef(winName, winRefName, winPartitionBy, winOrderBy, winFrame));
             } while (parser.match(TokenType.COMMA));
         }
@@ -736,9 +742,9 @@ class SelectParser {
     }
 
     /**
-     * Parse a GROUP BY list that may include GROUPING SETS, ROLLUP, or CUBE.
-     * Returns null if the GROUP BY is a simple expression list (handled separately),
-     * or a list-of-lists representing the grouping sets.
+     * Parse a GROUP BY list that may include GROUPING SETS, ROLLUP, CUBE, or the empty
+     * grouping set (). Returns null if the GROUP BY is a simple expression list (handled
+     * separately), or a list-of-lists representing the grouping sets.
      * Also handles mixed: GROUP BY a, GROUPING SETS ((b), ()) -> cross product.
      */
     List<List<Expression>> parseGroupByClause() {
@@ -750,13 +756,21 @@ class SelectParser {
             return parseRollupOrCube();
         }
         // Check if any element in the comma-separated list is GROUPING SETS/ROLLUP/CUBE
-        // by scanning ahead for those keywords at the top level
-        int saved = parser.pos;
+        // or the empty grouping set (), by scanning ahead at the top level
         boolean hasGroupingSets = false;
         int depth = 0;
         for (int i = parser.pos; i < parser.tokens.size(); i++) {
             Token t = parser.tokens.get(i);
-            if (t.type() == TokenType.LEFT_PAREN) { depth++; continue; }
+            if (t.type() == TokenType.LEFT_PAREN) {
+                // "()" at the top level is the empty grouping set, not a parenthesised expression
+                if (depth == 0 && i + 1 < parser.tokens.size()
+                        && parser.tokens.get(i + 1).type() == TokenType.RIGHT_PAREN) {
+                    hasGroupingSets = true;
+                    break;
+                }
+                depth++;
+                continue;
+            }
             if (t.type() == TokenType.RIGHT_PAREN) { depth--; if (depth < 0) break; continue; }
             if (depth > 0) continue;
             // Stop at clause keywords
@@ -785,6 +799,12 @@ class SelectParser {
                 parts.add(parseGroupingSetsOnly());
             } else if (parser.checkKeyword("ROLLUP") || parser.checkKeyword("CUBE")) {
                 parts.add(parseRollupOrCube());
+            } else if (checkEmptyGroupingSet()) {
+                parser.advance(); // (
+                parser.advance(); // )
+                List<List<Expression>> emptySet = new ArrayList<>();
+                emptySet.add(new ArrayList<Expression>());
+                parts.add(emptySet);
             } else {
                 Expression expr = parser.parseExpression();
                 List<List<Expression>> singleColSet = new ArrayList<>();
@@ -814,25 +834,66 @@ class SelectParser {
         return result;
     }
 
-    /** Parse GROUPING SETS ((...), ...) and return as list of sets. */
+    /** True when the parser sits on "()", the empty grouping set. */
+    private boolean checkEmptyGroupingSet() {
+        return parser.check(TokenType.LEFT_PAREN)
+                && parser.pos + 1 < parser.tokens.size()
+                && parser.tokens.get(parser.pos + 1).type() == TokenType.RIGHT_PAREN;
+    }
+
+    /**
+     * Parse GROUPING SETS (...) and return as list of sets. An element is either the empty
+     * set (), a parenthesised list of expressions, a nested ROLLUP/CUBE/GROUPING SETS that
+     * contributes several sets, or — the ordinary spelling — a bare expression standing for
+     * a one-element set.
+     */
     List<List<Expression>> parseGroupingSetsOnly() {
         parser.expectKeyword("GROUPING");
         parser.expectKeyword("SETS");
         parser.expect(TokenType.LEFT_PAREN);
+        if (parser.check(TokenType.RIGHT_PAREN)) {
+            // GROUPING SETS () lists no sets at all; PG rejects it as a syntax error
+            throw new ParseException("syntax error at or near \")\"", parser.peek());
+        }
         List<List<Expression>> sets = new ArrayList<>();
         do {
-            parser.expect(TokenType.LEFT_PAREN);
-            List<Expression> set = new ArrayList<>();
-            if (!parser.check(TokenType.RIGHT_PAREN)) {
-                // May contain nested tuples e.g. GROUPING SETS ((a,b), (a), ())
-                // Or a single expression
-                set.addAll(parser.parseExpressionList());
+            if (parser.checkKeyword("GROUPING") && parser.checkKeywordAt(1, "SETS")) {
+                sets.addAll(parseGroupingSetsOnly());
+            } else if (parser.checkKeyword("ROLLUP") || parser.checkKeyword("CUBE")) {
+                sets.addAll(parseRollupOrCube());
+            } else {
+                List<Expression> set = parseGroupingSetElement();
+                sets.add(set);
             }
-            parser.expect(TokenType.RIGHT_PAREN);
-            sets.add(set);
         } while (parser.match(TokenType.COMMA));
         parser.expect(TokenType.RIGHT_PAREN);
         return sets;
+    }
+
+    /**
+     * One non-nested element of a GROUPING SETS list: "(a, b)" groups on both columns,
+     * "()" on none, and a bare "a" on that one expression.
+     */
+    private List<Expression> parseGroupingSetElement() {
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            int saved = parser.position();
+            parser.advance();
+            List<Expression> set = new ArrayList<>();
+            if (!parser.check(TokenType.RIGHT_PAREN)) {
+                set.addAll(parser.parseExpressionList());
+            }
+            // Only a "(...)" that ends the element is a set; "(a)+1" is an ordinary expression
+            if (parser.check(TokenType.RIGHT_PAREN)) {
+                parser.advance();
+                if (parser.check(TokenType.COMMA) || parser.check(TokenType.RIGHT_PAREN)) {
+                    return set;
+                }
+            }
+            parser.resetPosition(saved);
+        }
+        List<Expression> single = new ArrayList<>();
+        single.add(parser.parseExpression());
+        return single;
     }
 
     /** Parse ROLLUP(...) or CUBE(...) and expand to grouping sets. */
@@ -840,17 +901,13 @@ class SelectParser {
         boolean isCube = parser.checkKeyword("CUBE");
         parser.advance(); // consume ROLLUP or CUBE
         parser.expect(TokenType.LEFT_PAREN);
-        List<Expression> cols = new ArrayList<>();
-        if (!parser.check(TokenType.RIGHT_PAREN)) {
-            // May contain comma-separated expressions or tuples
-            cols.addAll(parser.parseExpressionList());
-        }
-        parser.expect(TokenType.RIGHT_PAREN);
-
-        if (cols.isEmpty()) {
+        if (parser.check(TokenType.RIGHT_PAREN)) {
             // ROLLUP() / CUBE() with no args; PG 18 rejects this as syntax error (42601)
+            // and points at the closing paren, so report before consuming it
             throw new ParseException("syntax error at or near \")\"", parser.peek());
         }
+        List<Expression> cols = new ArrayList<>(parser.parseExpressionList());
+        parser.expect(TokenType.RIGHT_PAREN);
 
         if (isCube) {
             // CUBE(a,b) = GROUPING SETS ((a,b),(a),(b),())
@@ -951,6 +1008,19 @@ class SelectParser {
             items.add(parseFromItem());
         }
         return items;
+    }
+
+    /**
+     * The word PG's parser chokes on when a data-modifying statement is written where only a
+     * query belongs: INTO after INSERT, SET after UPDATE's target, FROM after DELETE.
+     */
+    private String firstReservedWordAfterDmlVerb() {
+        for (int i = parser.pos; i < parser.tokens.size() && i < parser.pos + 8; i++) {
+            String word = parser.tokens.get(i).value().toUpperCase();
+            if (word.equals("INTO") || word.equals("SET") || word.equals("FROM")) return word;
+        }
+        return parser.pos + 1 < parser.tokens.size()
+                ? parser.tokens.get(parser.pos + 1).value() : parser.peek().value();
     }
 
     SelectStmt.FromItem parseFromItem() {
@@ -1206,32 +1276,13 @@ class SelectParser {
                 if (parser.checkKeyword("VALUES")) {
                     // A VALUES list may be the left arm of a set operation, not only the whole body
                     subStmt = tryParseSetOp(parseValuesBody());
-                } else if (parser.checkKeyword("UPDATE")) {
-                    subStmt = parser.parseUpdate();
-                } else if (parser.checkKeyword("DELETE")) {
-                    subStmt = parser.parseDelete();
-                } else if (parser.checkKeyword("INSERT")) {
-                    subStmt = parser.parseInsert();
-                    // PG rejects RETURNING NEW/OLD in INSERT subqueries
-                    if (subStmt instanceof com.memgres.engine.parser.ast.InsertStmt) {
-                        com.memgres.engine.parser.ast.InsertStmt ins = (com.memgres.engine.parser.ast.InsertStmt) subStmt;
-                        if (ins.returning() != null) {
-                            for (SelectStmt.SelectTarget rt : ins.returning()) {
-                                Expression retExpr = rt.expr();
-                                if (retExpr instanceof WildcardExpr) {
-                                    WildcardExpr we = (WildcardExpr) retExpr;
-                                    if (we.table() != null && (we.table().equalsIgnoreCase("NEW") || we.table().equalsIgnoreCase("OLD"))) {
-                                        throw new com.memgres.engine.MemgresException("syntax error at or near \"INTO\"", "42601");
-                                    }
-                                } else if (retExpr instanceof ColumnRef) {
-                                    ColumnRef cr = (ColumnRef) retExpr;
-                                    if (cr.table() != null && (cr.table().equalsIgnoreCase("NEW") || cr.table().equalsIgnoreCase("OLD"))) {
-                                        throw new com.memgres.engine.MemgresException("syntax error at or near \"INTO\"", "42601");
-                                    }
-                                }
-                            }
-                        }
-                    }
+                } else if (parser.checkKeyword("UPDATE") || parser.checkKeyword("DELETE")
+                        || parser.checkKeyword("INSERT")) {
+                    // Only a top-level CTE may modify data. PG's grammar has no production for a
+                    // write here at all, so it reads the verb as a name and fails on the first
+                    // reserved word after it; report the same token.
+                    throw new com.memgres.engine.MemgresException(
+                            "syntax error at or near \"" + firstReservedWordAfterDmlVerb() + "\"", "42601");
                 } else if (parser.check(TokenType.LEFT_PAREN)) {
                     // Parenthesized SELECT union: ((SELECT ...) UNION ALL (SELECT ...))
                     // or multi-wrapped arms: ((SELECT ...)) UNION ((SELECT ...))

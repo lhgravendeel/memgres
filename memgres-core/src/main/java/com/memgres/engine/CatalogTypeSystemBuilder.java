@@ -156,221 +156,27 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgCast() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), colNN("castsource", DataType.INTEGER),
-                colNN("casttarget", DataType.INTEGER), col("castfunc", DataType.INTEGER),
+                colNN("oid", DataType.OID), colNN("castsource", DataType.OID),
+                colNN("casttarget", DataType.OID), col("castfunc", DataType.OID),
                 col("castcontext", DataType.CHAR), col("castmethod", DataType.CHAR),
                 col("xmin", DataType.INTEGER));
         Table table = new Table("pg_cast", cols);
-        // Populate with common PG casts. castcontext: 'e'=explicit, 'a'=assignment, 'i'=implicit
-        // castmethod: 'f'=function, 'b'=binary-coercible, 'i'=I/O conversion
-        int castOid = 5000; // starting OID for casts
-        // Numeric casts
-        int INT2 = 21, INT4 = 23, INT8 = 20, FLOAT4 = 700, FLOAT8 = 701, NUMERIC = 1700;
-        int TEXT = 25, VARCHAR = 1043, CHAR = 18, BPCHAR = 1042, NAME = 19;
-        int BOOL = 16, OID = 26, DATE = 1082, TIME = 1083, TIMESTAMP = 1114, TIMESTAMPTZ = 1184;
-        int INTERVAL = 1186, UUID = 2950, JSON = 114, JSONB = 3802, BYTEA = 17, INET = 869, CIDR = 650;
-        int XML = 142, REGCLASS = 2205, REGTYPE = 2206, REGPROC = 24, REGOPER = 2203;
-        int REGPROCEDURE = 2202, REGOPERATOR = 2204;
-        // Integer promotions (implicit)
-        int[][] implicitCasts = {
-            {INT2, INT4}, {INT2, INT8}, {INT2, FLOAT4}, {INT2, FLOAT8}, {INT2, NUMERIC},
-            {INT4, INT8}, {INT4, FLOAT8}, {INT4, NUMERIC},
-            {INT8, NUMERIC},
-            {FLOAT4, FLOAT8},
-            {INT4, FLOAT4}, // actually assignment in PG but common
-        };
-        for (int[] c : implicitCasts) {
-            table.insertRow(new Object[]{castOid++, c[0], c[1], 0, "i", "b", 1});
-        }
-        // Assignment casts
-        int[][] assignCasts = {
-            {INT4, INT2}, {INT8, INT4}, {INT8, INT2},
-            {FLOAT4, INT4}, {FLOAT4, INT2}, {FLOAT8, INT4}, {FLOAT8, INT2}, {FLOAT8, INT8}, {FLOAT8, FLOAT4},
-            {NUMERIC, INT2}, {NUMERIC, INT4}, {NUMERIC, INT8}, {NUMERIC, FLOAT4}, {NUMERIC, FLOAT8},
-            {TEXT, VARCHAR}, {TEXT, BPCHAR}, {TEXT, CHAR}, {TEXT, NAME},
-            {VARCHAR, TEXT}, {BPCHAR, TEXT}, {CHAR, TEXT}, {NAME, TEXT},
-            {VARCHAR, BPCHAR}, {VARCHAR, CHAR}, {VARCHAR, NAME},
-            {BPCHAR, VARCHAR}, {BPCHAR, CHAR}, {BPCHAR, NAME},
-        };
-        for (int[] c : assignCasts) {
-            table.insertRow(new Object[]{castOid++, c[0], c[1], 0, "a", "b", 1});
-        }
-        // Explicit casts
-        int[][] explicitCasts = {
-            {BOOL, INT4}, {INT4, BOOL},
-            {TEXT, INT4}, {TEXT, INT8}, {TEXT, INT2}, {TEXT, FLOAT4}, {TEXT, FLOAT8}, {TEXT, NUMERIC},
-            {TEXT, BOOL}, {TEXT, DATE}, {TEXT, TIMESTAMP}, {TEXT, TIMESTAMPTZ}, {TEXT, INTERVAL},
-            {TEXT, UUID}, {TEXT, JSON}, {TEXT, JSONB}, {TEXT, INET}, {TEXT, CIDR}, {TEXT, XML},
-            {INT4, TEXT}, {INT8, TEXT}, {INT2, TEXT}, {FLOAT4, TEXT}, {FLOAT8, TEXT}, {NUMERIC, TEXT},
-            {BOOL, TEXT}, {DATE, TEXT}, {TIMESTAMP, TEXT}, {TIMESTAMPTZ, TEXT}, {INTERVAL, TEXT},
-            {UUID, TEXT}, {JSON, TEXT}, {JSONB, TEXT}, {INET, TEXT}, {CIDR, TEXT}, {XML, TEXT},
-            {TIMESTAMP, DATE}, {TIMESTAMP, TIME},
-            {TIMESTAMPTZ, DATE}, {TIMESTAMPTZ, TIMESTAMP}, {TIMESTAMPTZ, TIME},
-            {INTERVAL, TIME},
-            {JSON, JSONB}, {JSONB, JSON},
-            {INET, CIDR}, {CIDR, INET},
-            {BYTEA, TEXT}, {TEXT, BYTEA},
-            // reg* types
-            {INT4, REGCLASS}, {INT4, REGTYPE}, {INT4, REGPROC}, {INT4, REGOPER},
-            {INT4, REGPROCEDURE}, {INT4, REGOPERATOR},
-            {REGCLASS, INT4}, {REGTYPE, INT4}, {REGPROC, INT4}, {REGOPER, INT4},
-            {REGPROCEDURE, INT4}, {REGOPERATOR, INT4},
-            {REGCLASS, OID}, {REGTYPE, OID}, {REGPROC, OID}, {REGOPER, OID},
-            {OID, REGCLASS}, {OID, REGTYPE}, {OID, REGPROC}, {OID, REGOPER},
-            {OID, INT4}, {INT4, OID}, {INT8, OID}, {OID, INT8},
-            {TEXT, REGCLASS}, {REGCLASS, TEXT},
-        };
-        for (int[] c : explicitCasts) {
-            table.insertRow(new Object[]{castOid++, c[0], c[1], 0, "e", "i", 1});
+        // Exactly the conversions PostgreSQL registers between the types memgres models. A row
+        // here is a claim the server will perform the conversion, and an implicit row changes
+        // what the server accepts without being asked, so nothing is added on a guess.
+        int castOid = 5000;
+        for (Object[] c : PgCastTable.CASTS) {
+            table.insertRow(new Object[]{castOid++, c[0], c[1], c[2], c[3], c[4], 1});
         }
 
-        // Additional type OIDs for PG18 completeness
-        int TIMETZ = 1266, MONEY = 790;
-        int BIT_T = 1560, VARBIT_T = 1562;
-        int POINT = 600, LINE_T = 628, LSEG_T = 601, PG_BOX = 603, PG_PATH = 602, POLYGON_T = 604, CIRCLE_T = 718;
-        int TSVECTOR = 3614, TSQUERY = 3615;
-        int INT4RANGE = 3904, INT8RANGE = 3926, NUMRANGE = 3906, DATERANGE = 3912, TSRANGE = 3908, TSTZRANGE = 3910;
-        int INT4MULTIRANGE = 4451, INT8MULTIRANGE = 4532, NUMMULTIRANGE = 4533, DATEMULTIRANGE = 4534, TSMULTIRANGE = 4535, TSTZMULTIRANGE = 4536;
-        int REGCONFIG = 3734, REGDICTIONARY = 3769, REGNAMESPACE = 4089, REGROLE = 4096;
-        int XID = 28, CID = 29, TID = 27, MACADDR = 829, MACADDR8 = 774;
-        int INT2VECTOR = 22, OIDVECTOR = 30, REFCURSOR = 1790;
-
-        // ---- Implicit casts (missing promotions) ----
-        int[][] moreImplicit = {
-            {INT8, FLOAT4}, {INT8, FLOAT8},
-            {FLOAT4, NUMERIC}, {FLOAT8, NUMERIC},
-            {TIME, TIMETZ},
-            {TIMESTAMP, TIMESTAMPTZ},
-            // Range → Multirange implicit casts (PG 14+)
-            {INT4RANGE, INT4MULTIRANGE}, {INT8RANGE, INT8MULTIRANGE},
-            {NUMRANGE, NUMMULTIRANGE}, {DATERANGE, DATEMULTIRANGE},
-            {TSRANGE, TSMULTIRANGE}, {TSTZRANGE, TSTZMULTIRANGE},
-            {DATE, TIMESTAMPTZ},
-            {DATE, TIMESTAMP},
-            {BIT_T, VARBIT_T},
-        };
-        for (int[] c : moreImplicit) table.insertRow(new Object[]{castOid++, c[0], c[1], 0, "i", "b", 1});
-
-        // ---- Assignment casts (missing) ----
-        int[][] moreAssign = {
-            {NUMERIC, MONEY}, {INT4, MONEY}, {INT8, MONEY},
-            {MONEY, NUMERIC}, {MONEY, INT4}, {MONEY, INT8},
-            {BIT_T, INT4}, {BIT_T, INT8}, {INT4, BIT_T}, {INT8, BIT_T},
-            {TIMETZ, TIME},
-            {INTERVAL, INTERVAL},
-            {TIMESTAMP, TIMESTAMP},
-            {TIMESTAMPTZ, TIMESTAMPTZ},
-            {TIME, TIME},
-            {TIMETZ, TIMETZ},
-            {BIT_T, BIT_T},
-            {VARBIT_T, VARBIT_T},
-            {VARCHAR, VARCHAR},
-            {BPCHAR, BPCHAR},
-            {NUMERIC, NUMERIC},
-        };
-        for (int[] c : moreAssign) table.insertRow(new Object[]{castOid++, c[0], c[1], 0, "a", "f", 1});
-
-        // ---- Explicit / I/O casts (large batch) ----
-        int[][] moreExplicit = {
-            {TIME, INTERVAL},
-            {TEXT, TIME}, {TIME, TEXT}, {TEXT, TIMETZ}, {TIMETZ, TEXT},
-            {TIMETZ, TIMESTAMPTZ},
-
-            // Money
-            {TEXT, MONEY}, {MONEY, TEXT},
-
-            // Bit string
-            {TEXT, BIT_T}, {BIT_T, TEXT}, {TEXT, VARBIT_T}, {VARBIT_T, TEXT},
-
-            // Geometric
-            {TEXT, POINT}, {POINT, TEXT},
-            {TEXT, LINE_T}, {LINE_T, TEXT},
-            {TEXT, LSEG_T}, {LSEG_T, TEXT},
-            {TEXT, PG_BOX}, {PG_BOX, TEXT},
-            {TEXT, PG_PATH}, {PG_PATH, TEXT},
-            {TEXT, POLYGON_T}, {POLYGON_T, TEXT},
-            {TEXT, CIRCLE_T}, {CIRCLE_T, TEXT},
-            {PG_BOX, POINT}, {PG_BOX, LSEG_T}, {PG_BOX, CIRCLE_T}, {PG_BOX, POLYGON_T},
-            {POINT, PG_BOX},
-            {LSEG_T, POINT},
-            {POLYGON_T, POINT}, {POLYGON_T, PG_BOX}, {POLYGON_T, CIRCLE_T}, {POLYGON_T, PG_PATH},
-            {CIRCLE_T, POINT}, {CIRCLE_T, PG_BOX}, {CIRCLE_T, POLYGON_T},
-            {PG_PATH, POLYGON_T}, {PG_PATH, POINT},
-
-            // Full-text search
-            {TEXT, TSVECTOR}, {TSVECTOR, TEXT},
-            {TEXT, TSQUERY}, {TSQUERY, TEXT},
-            {TEXT, REGCONFIG}, {REGCONFIG, TEXT},
-            {TEXT, REGDICTIONARY}, {REGDICTIONARY, TEXT},
-
-            // Range types
-            {TEXT, INT4RANGE}, {INT4RANGE, TEXT},
-            {TEXT, INT8RANGE}, {INT8RANGE, TEXT},
-            {TEXT, NUMRANGE}, {NUMRANGE, TEXT},
-            {TEXT, DATERANGE}, {DATERANGE, TEXT},
-            {TEXT, TSRANGE}, {TSRANGE, TEXT},
-            {TEXT, TSTZRANGE}, {TSTZRANGE, TEXT},
-
-            // Additional reg* types
-            {INT4, REGCONFIG}, {REGCONFIG, INT4}, {REGCONFIG, OID}, {OID, REGCONFIG},
-            {INT4, REGDICTIONARY}, {REGDICTIONARY, INT4}, {REGDICTIONARY, OID}, {OID, REGDICTIONARY},
-            {INT4, REGNAMESPACE}, {REGNAMESPACE, INT4}, {REGNAMESPACE, OID}, {OID, REGNAMESPACE},
-            {TEXT, REGNAMESPACE}, {REGNAMESPACE, TEXT},
-            {INT4, REGROLE}, {REGROLE, INT4}, {REGROLE, OID}, {OID, REGROLE},
-            {TEXT, REGROLE}, {REGROLE, TEXT},
-            {TEXT, REGTYPE}, {REGTYPE, TEXT},
-            {TEXT, REGPROC}, {REGPROC, TEXT},
-            {TEXT, REGOPER}, {REGOPER, TEXT},
-            {TEXT, REGPROCEDURE}, {REGPROCEDURE, TEXT},
-            {TEXT, REGOPERATOR}, {REGOPERATOR, TEXT},
-
-            // OID related
-            {OID, REGPROCEDURE}, {REGPROCEDURE, OID},
-            {OID, REGOPERATOR}, {REGOPERATOR, OID},
-            {INT2, OID},
-
-            // XID/CID/TID
-            {XID, INT4}, {XID, INT8}, {INT4, XID}, {TEXT, XID}, {XID, TEXT},
-            {CID, INT4}, {INT4, CID}, {TEXT, CID}, {CID, TEXT},
-            {TID, TEXT}, {TEXT, TID},
-
-            // MACADDR
-            {TEXT, MACADDR}, {MACADDR, TEXT},
-            {MACADDR, MACADDR8}, {MACADDR8, MACADDR},
-            {TEXT, MACADDR8}, {MACADDR8, TEXT},
-
-            // Vectors
-            {INT2VECTOR, TEXT}, {TEXT, INT2VECTOR},
-            {OIDVECTOR, TEXT}, {TEXT, OIDVECTOR},
-
-            // Boolean extras
-            {BOOL, INT2}, {INT2, BOOL},
-
-            // NAME conversions
-            {NAME, INT4}, {NAME, INT8},
-
-            // REFCURSOR
-            {TEXT, REFCURSOR}, {REFCURSOR, TEXT},
-
-            // MONEY from float — PG does not allow direct float→money cast
-            // {FLOAT4, MONEY}, {FLOAT8, MONEY},
-
-            // JSONB from other types
-            {INT2, JSONB}, {INT4, JSONB}, {INT8, JSONB}, {FLOAT4, JSONB}, {FLOAT8, JSONB},
-            {NUMERIC, JSONB}, {BOOL, JSONB},
-
-            // Bytea
-            {BYTEA, INT4}, {INT4, BYTEA},
-        };
-        for (int[] c : moreExplicit) table.insertRow(new Object[]{castOid++, c[0], c[1], 0, "e", "i", 1});
-
-        // User-defined casts
+        // User-defined casts (CREATE CAST)
         for (Object[] uc : database.getUserDefinedCasts()) {
             table.insertRow(new Object[]{castOid++, uc[0], uc[1], uc[2], uc[3], uc[4], 1});
         }
 
         return table;
     }
+
 
     Table buildPgOperator() {
         List<Column> cols = Cols.listOf(

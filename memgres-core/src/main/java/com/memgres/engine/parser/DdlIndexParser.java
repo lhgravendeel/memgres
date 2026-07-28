@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.PgErrors;
 import com.memgres.engine.parser.ast.*;
 
 import java.util.ArrayList;
@@ -46,7 +47,7 @@ class DdlIndexParser {
         List<String> includeColumns = null;
         if (parser.matchKeyword("INCLUDE")) {
             parser.expect(TokenType.LEFT_PAREN);
-            includeColumns = parser.parseIdentifierList();
+            includeColumns = parseIncludeColumnList();
             parser.expect(TokenType.RIGHT_PAREN);
         }
 
@@ -91,6 +92,32 @@ class DdlIndexParser {
                 method, includeColumns, whereClause, columnOptions, nullsNotDistinct);
     }
 
+    /**
+     * INCLUDE accepts only plain column names, but an expression parses far enough that the
+     * executor can reject it with PostgreSQL's own "expressions are not supported" message
+     * instead of a syntax error.
+     */
+    private List<String> parseIncludeColumnList() {
+        List<String> cols = new ArrayList<>();
+        do {
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                StringBuilder expr = new StringBuilder();
+                int depth = 0;
+                do {
+                    Token t = parser.advance();
+                    if (t.type() == TokenType.LEFT_PAREN) depth++;
+                    else if (t.type() == TokenType.RIGHT_PAREN) depth--;
+                    if (expr.length() > 0) expr.append(' ');
+                    expr.append(indexTokenValue(t));
+                } while (depth > 0 && !parser.isAtEnd());
+                cols.add(expr.toString().trim());
+            } else {
+                cols.add(parser.readIdentifier());
+            }
+        } while (parser.match(TokenType.COMMA));
+        return cols;
+    }
+
     /** Parsed column options list, populated by parseIndexColumnList. */
     List<String> lastColumnOptions;
 
@@ -100,6 +127,13 @@ class DdlIndexParser {
         do {
             String col;
             if (parser.check(TokenType.LEFT_PAREN)) {
+                // An index key is an ordinary expression; PostgreSQL's grammar has no production
+                // for a query here, so a leading SELECT is a syntax error rather than a subquery.
+                int parens = parser.countLeadingParensBeforeQuery();
+                if (parens > 0) {
+                    parser.consumeLeadingParens(parens);
+                    throw PgErrors.syntax("syntax error at or near \"" + parser.peek().value() + "\"");
+                }
                 StringBuilder expr = new StringBuilder();
                 int depth = 0;
                 do {

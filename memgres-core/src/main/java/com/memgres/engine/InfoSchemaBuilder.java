@@ -117,9 +117,233 @@ public class InfoSchemaBuilder {
                 return buildIsApplicableRoles();
             case "role_table_grants":
                 return buildIsRoleTableGrants();
-            default:
-                return CatalogHelper.emptyTable(tableName);
+            case "information_schema_catalog_name": {
+                Table t = declaredView(tableName);
+                t.insertRow(new Object[]{catalogName()});
+                return t;
+            }
+            case "character_sets": {
+                Table t = declaredView(tableName);
+                // PG reports the database encoding as a single anonymous character set
+                t.insertRow(new Object[]{null, null, "UTF8", "UCS", "UTF8",
+                        catalogName(), "pg_catalog", "en_US.UTF-8"});
+                return t;
+            }
+            default: {
+                // A view listed in information_schema.tables has to answer for the columns the
+                // standard says it has: a name with nothing behind it is worse than a gap,
+                // because a tool that finds a gap falls back and one that finds a false claim
+                // proceeds and fails on the first column it reads.
+                Table declared = declaredView(tableName);
+                return declared != null ? declared : CatalogHelper.emptyTable(tableName);
+            }
         }
+    }
+
+    /**
+     * A view memgres lists but has no rows to put in yet, built with the columns PostgreSQL
+     * declares for it so naming one resolves instead of failing with 42703.
+     */
+    private Table declaredView(String tableName) {
+        String[] colNames = DECLARED_VIEW_COLUMNS.get(tableName);
+        if (colNames == null) return null;
+        List<Column> cols = new ArrayList<>();
+        for (String spec : colNames) {
+            // "name:type" — the information_schema types are name, character varying and integer
+            int colon = spec.indexOf(':');
+            String name = colon < 0 ? spec : spec.substring(0, colon);
+            DataType type = colon < 0 ? DataType.NAME
+                    : "i".equals(spec.substring(colon + 1)) ? DataType.INTEGER : DataType.VARCHAR;
+            cols.add(new Column(name, type, true, false, null));
+        }
+        return new Table(tableName, cols);
+    }
+
+    /**
+     * The columns PostgreSQL declares for the information_schema views memgres lists but does not
+     * yet populate. Unsuffixed names are {@code name}, ":v" is {@code character varying} and
+     * ":i" is {@code integer} — the only three types these views use.
+     */
+    private static final Map<String, String[]> DECLARED_VIEW_COLUMNS;
+
+    static {
+        Map<String, String[]> m = new LinkedHashMap<>();
+        m.put("administrable_role_authorizations", new String[]{
+                "grantee", "role_name", "is_grantable:v"});
+        m.put("attributes", new String[]{
+                "udt_catalog", "udt_schema", "udt_name", "attribute_name", "ordinal_position:i",
+                "attribute_default:v", "is_nullable:v", "data_type:v", "character_maximum_length:i",
+                "character_octet_length:i", "character_set_catalog", "character_set_schema",
+                "character_set_name", "collation_catalog", "collation_schema", "collation_name",
+                "numeric_precision:i", "numeric_precision_radix:i", "numeric_scale:i",
+                "datetime_precision:i", "interval_type:v", "interval_precision:i",
+                "attribute_udt_catalog", "attribute_udt_schema", "attribute_udt_name",
+                "scope_catalog", "scope_schema", "scope_name", "maximum_cardinality:i",
+                "dtd_identifier", "is_derived_reference_attribute:v"});
+        m.put("character_sets", new String[]{
+                "character_set_catalog", "character_set_schema", "character_set_name",
+                "character_repertoire", "form_of_use", "default_collate_catalog",
+                "default_collate_schema", "default_collate_name"});
+        m.put("check_constraint_routine_usage", new String[]{
+                "constraint_catalog", "constraint_schema", "constraint_name",
+                "specific_catalog", "specific_schema", "specific_name"});
+        m.put("collation_character_set_applicability", new String[]{
+                "collation_catalog", "collation_schema", "collation_name",
+                "character_set_catalog", "character_set_schema", "character_set_name"});
+        m.put("column_column_usage", new String[]{
+                "table_catalog", "table_schema", "table_name", "column_name", "dependent_column"});
+        m.put("column_domain_usage", new String[]{
+                "domain_catalog", "domain_schema", "domain_name",
+                "table_catalog", "table_schema", "table_name", "column_name"});
+        m.put("column_options", new String[]{
+                "table_catalog", "table_schema", "table_name", "column_name",
+                "option_name", "option_value:v"});
+        m.put("column_privileges", new String[]{
+                "grantor", "grantee", "table_catalog", "table_schema", "table_name",
+                "column_name", "privilege_type:v", "is_grantable:v"});
+        m.put("column_udt_usage", new String[]{
+                "udt_catalog", "udt_schema", "udt_name",
+                "table_catalog", "table_schema", "table_name", "column_name"});
+        m.put("data_type_privileges", new String[]{
+                "object_catalog", "object_schema", "object_name", "object_type:v",
+                "dtd_identifier"});
+        m.put("domain_constraints", new String[]{
+                "constraint_catalog", "constraint_schema", "constraint_name",
+                "domain_catalog", "domain_schema", "domain_name",
+                "is_deferrable:v", "initially_deferred:v"});
+        m.put("domain_udt_usage", new String[]{
+                "udt_catalog", "udt_schema", "udt_name",
+                "domain_catalog", "domain_schema", "domain_name"});
+        m.put("element_types", new String[]{
+                "object_catalog", "object_schema", "object_name", "object_type:v",
+                "collection_type_identifier", "data_type:v", "character_maximum_length:i",
+                "character_octet_length:i", "character_set_catalog", "character_set_schema",
+                "character_set_name", "collation_catalog", "collation_schema", "collation_name",
+                "numeric_precision:i", "numeric_precision_radix:i", "numeric_scale:i",
+                "datetime_precision:i", "interval_type:v", "interval_precision:i",
+                "udt_catalog", "udt_schema", "udt_name", "scope_catalog", "scope_schema",
+                "scope_name", "maximum_cardinality:i", "dtd_identifier"});
+        m.put("foreign_data_wrapper_options", new String[]{
+                "foreign_data_wrapper_catalog", "foreign_data_wrapper_name",
+                "option_name", "option_value:v"});
+        m.put("foreign_data_wrappers", new String[]{
+                "foreign_data_wrapper_catalog", "foreign_data_wrapper_name",
+                "authorization_identifier", "library_name:v", "foreign_data_wrapper_language:v"});
+        m.put("foreign_server_options", new String[]{
+                "foreign_server_catalog", "foreign_server_name", "option_name", "option_value:v"});
+        m.put("foreign_servers", new String[]{
+                "foreign_server_catalog", "foreign_server_name", "foreign_data_wrapper_catalog",
+                "foreign_data_wrapper_name", "foreign_server_type:v", "foreign_server_version:v",
+                "authorization_identifier"});
+        m.put("foreign_table_options", new String[]{
+                "foreign_table_catalog", "foreign_table_schema", "foreign_table_name",
+                "option_name", "option_value:v"});
+        m.put("foreign_tables", new String[]{
+                "foreign_table_catalog", "foreign_table_schema", "foreign_table_name",
+                "foreign_server_catalog", "foreign_server_name"});
+        m.put("information_schema_catalog_name", new String[]{"catalog_name"});
+        m.put("role_column_grants", new String[]{
+                "grantor", "grantee", "table_catalog", "table_schema", "table_name",
+                "column_name", "privilege_type:v", "is_grantable:v"});
+        m.put("role_routine_grants", new String[]{
+                "grantor", "grantee", "specific_catalog", "specific_schema", "specific_name",
+                "routine_catalog", "routine_schema", "routine_name",
+                "privilege_type:v", "is_grantable:v"});
+        m.put("role_udt_grants", new String[]{
+                "grantor", "grantee", "udt_catalog", "udt_schema", "udt_name",
+                "privilege_type:v", "is_grantable:v"});
+        m.put("role_usage_grants", new String[]{
+                "grantor", "grantee", "object_catalog", "object_schema", "object_name",
+                "object_type:v", "privilege_type:v", "is_grantable:v"});
+        m.put("routine_column_usage", new String[]{
+                "specific_catalog", "specific_schema", "specific_name",
+                "routine_catalog", "routine_schema", "routine_name",
+                "table_catalog", "table_schema", "table_name", "column_name"});
+        m.put("routine_privileges", new String[]{
+                "grantor", "grantee", "specific_catalog", "specific_schema", "specific_name",
+                "routine_catalog", "routine_schema", "routine_name",
+                "privilege_type:v", "is_grantable:v"});
+        m.put("routine_routine_usage", new String[]{
+                "specific_catalog", "specific_schema", "specific_name",
+                "routine_catalog", "routine_schema", "routine_name"});
+        m.put("routine_sequence_usage", new String[]{
+                "specific_catalog", "specific_schema", "specific_name",
+                "routine_catalog", "routine_schema", "routine_name",
+                "sequence_catalog", "sequence_schema", "sequence_name"});
+        m.put("routine_table_usage", new String[]{
+                "specific_catalog", "specific_schema", "specific_name",
+                "routine_catalog", "routine_schema", "routine_name",
+                "table_catalog", "table_schema", "table_name"});
+        m.put("sql_features", new String[]{
+                "feature_id:v", "feature_name:v", "sub_feature_id:v", "sub_feature_name:v",
+                "is_supported:v", "is_verified_by:v", "comments:v"});
+        m.put("sql_implementation_info", new String[]{
+                "implementation_info_id:v", "implementation_info_name:v", "integer_value:i",
+                "character_value:v", "comments:v"});
+        m.put("sql_parts", new String[]{
+                "feature_id:v", "feature_name:v", "is_supported:v", "is_verified_by:v",
+                "comments:v"});
+        m.put("sql_sizing", new String[]{
+                "sizing_id:i", "sizing_name:v", "supported_value:i", "comments:v"});
+        m.put("table_privileges", new String[]{
+                "grantor", "grantee", "table_catalog", "table_schema", "table_name",
+                "privilege_type:v", "is_grantable:v", "with_hierarchy:v"});
+        m.put("transforms", new String[]{
+                "udt_catalog", "udt_schema", "udt_name", "specific_catalog", "specific_schema",
+                "specific_name", "group_name", "transform_type:v"});
+        m.put("triggered_update_columns", new String[]{
+                "trigger_catalog", "trigger_schema", "trigger_name", "event_object_catalog",
+                "event_object_schema", "event_object_table", "event_object_column"});
+        m.put("udt_privileges", new String[]{
+                "grantor", "grantee", "udt_catalog", "udt_schema", "udt_name",
+                "privilege_type:v", "is_grantable:v"});
+        m.put("usage_privileges", new String[]{
+                "grantor", "grantee", "object_catalog", "object_schema", "object_name",
+                "object_type:v", "privilege_type:v", "is_grantable:v"});
+        m.put("user_defined_types", new String[]{
+                "user_defined_type_catalog", "user_defined_type_schema", "user_defined_type_name",
+                "user_defined_type_category:v", "is_instantiable:v", "is_final:v",
+                "ordering_form:v", "ordering_category:v", "ordering_routine_catalog",
+                "ordering_routine_schema", "ordering_routine_name", "reference_type:v",
+                "data_type:v", "character_maximum_length:i", "character_octet_length:i",
+                "character_set_catalog", "character_set_schema", "character_set_name",
+                "collation_catalog", "collation_schema", "collation_name", "numeric_precision:i",
+                "numeric_precision_radix:i", "numeric_scale:i", "datetime_precision:i",
+                "interval_type:v", "interval_precision:i", "source_dtd_identifier",
+                "ref_dtd_identifier"});
+        m.put("user_mapping_options", new String[]{
+                "authorization_identifier", "foreign_server_catalog", "foreign_server_name",
+                "option_name", "option_value:v"});
+        m.put("user_mappings", new String[]{
+                "authorization_identifier", "foreign_server_catalog", "foreign_server_name"});
+        m.put("view_column_usage", new String[]{
+                "view_catalog", "view_schema", "view_name",
+                "table_catalog", "table_schema", "table_name", "column_name"});
+        m.put("view_routine_usage", new String[]{
+                "table_catalog", "table_schema", "table_name",
+                "specific_catalog", "specific_schema", "specific_name"});
+        m.put("view_table_usage", new String[]{
+                "view_catalog", "view_schema", "view_name",
+                "table_catalog", "table_schema", "table_name"});
+        // The underscore-prefixed helper views PG's own information_schema is built on
+        m.put("_pg_foreign_data_wrappers", new String[]{
+                "oid", "fdwowner", "fdwoptions", "foreign_data_wrapper_catalog",
+                "foreign_data_wrapper_name", "authorization_identifier",
+                "foreign_data_wrapper_language:v"});
+        m.put("_pg_foreign_servers", new String[]{
+                "oid", "srvoptions", "foreign_server_catalog", "foreign_server_name",
+                "foreign_data_wrapper_catalog", "foreign_data_wrapper_name",
+                "foreign_server_type:v", "foreign_server_version:v", "authorization_identifier"});
+        m.put("_pg_foreign_table_columns", new String[]{
+                "nspname", "relname", "attname", "attfdwoptions"});
+        m.put("_pg_foreign_tables", new String[]{
+                "foreign_table_catalog", "foreign_table_schema", "foreign_table_name",
+                "ftoptions", "foreign_server_catalog", "foreign_server_name",
+                "authorization_identifier"});
+        m.put("_pg_user_mappings", new String[]{
+                "oid", "umoptions", "umuser", "authorization_identifier",
+                "foreign_server_catalog", "foreign_server_name", "srvowner"});
+        DECLARED_VIEW_COLUMNS = Collections.unmodifiableMap(m);
     }
 
     private Table buildIsTables() {
@@ -169,6 +393,7 @@ public class InfoSchemaBuilder {
     }
 
     private Table buildIsColumns() {
+        Session savedSession = currentSession;
         List<Column> cols = Cols.listOf(
                 new Column("table_catalog", DataType.TEXT, true, false, null),
                 new Column("table_schema", DataType.TEXT, true, false, null),
@@ -248,8 +473,29 @@ public class InfoSchemaBuilder {
             }
         }
 
+        // information_schema describes its own views here too, so a tool that reads the listing
+        // in information_schema.tables can go on to ask what columns those views have.
+        if (!buildingIsColumns) {
+            buildingIsColumns = true;
+            try {
+                for (String isView : INFORMATION_SCHEMA_VIEWS) {
+                    Table view = "columns".equals(isView) ? table : build(isView, currentSession);
+                    if (view != null && !view.getColumns().isEmpty()
+                            && !"dummy".equals(view.getColumns().get(0).getName())) {
+                        addColumnsForTable(table, "information_schema", view, false);
+                    }
+                }
+            } finally {
+                buildingIsColumns = false;
+                this.currentSession = savedSession;
+            }
+        }
+
         return table;
     }
+
+    /** Guards the self-description pass in {@link #buildIsColumns} against re-entering itself. */
+    private boolean buildingIsColumns;
 
     /** Add column entries for a table to the information_schema.columns table. */
     private void addColumnsForTable(Table isTable, String schemaName, Table t, boolean isUserTable) {

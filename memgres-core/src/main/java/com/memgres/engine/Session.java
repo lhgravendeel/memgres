@@ -477,62 +477,80 @@ public class Session {
                     "25P02");
         }
 
-        // statement_timeout: schedule a thread interrupt if timeout > 0
+        // statement_timeout: arm a deadline for this statement. PG re-reads the setting at the
+        // start of every statement, so a SET is never limited by the value it is installing, and
+        // transaction commands run unlimited.
         long timeoutMs = 0;
         if (!isTransactionCmd) {
             String timeoutVal = gucSettings.get("statement_timeout");
             timeoutMs = GucSettings.parseTimeoutMillis(timeoutVal);
         }
 
-        Thread execThread = Thread.currentThread();
+        final Thread execThread = Thread.currentThread();
+        final StatementCancel.Token outerToken = StatementCancel.current();
+        final StatementCancel.Token token = new StatementCancel.Token();
+        StatementCancel.bind(token);
         ScheduledFuture<?> timeoutTask = null;
         if (timeoutMs > 0) {
-            final Thread t = execThread;
-            timeoutTask = TIMEOUT_SCHEDULER.schedule(t::interrupt, timeoutMs, TimeUnit.MILLISECONDS);
+            timeoutTask = TIMEOUT_SCHEDULER.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    token.request(StatementCancel.TIMEOUT_MESSAGE);
+                    // Evaluation loops poll the token; a statement parked in a sleep or a lock
+                    // wait is not looking at anything and needs the interrupt to come out.
+                    execThread.interrupt();
+                }
+            }, timeoutMs, TimeUnit.MILLISECONDS);
         }
 
         executingStatement = true;
         try {
             QueryResult result = executor.execute(sql, parameters);
-            // If thread was interrupted but returned normally, clear and ignore
-            // (the timeout fired after the statement completed)
-            Thread.interrupted(); // clear interrupt flag
+            // A timeout that arrives after the statement has already produced its answer is too
+            // late to cancel anything: PG reports the answer.
             resetAutocommitTxId();
             return result;
-        } catch (MemgresException e) {
-            Thread.interrupted(); // clear interrupt flag
+        } catch (RuntimeException e) {
             if (status == TransactionStatus.IN_TRANSACTION) {
                 status = TransactionStatus.FAILED;
             }
+            RuntimeException reported = reportedFailure(e, token);
             // For deadlock (40P01), automatically release this session's row locks so the
             // waiting session can proceed (mirrors PostgreSQL's automatic victim rollback).
-            if ("40P01".equals(e.getSqlState())) {
+            if (reported instanceof MemgresException
+                    && "40P01".equals(((MemgresException) reported).getSqlState())) {
                 database.unlockAllRows(this);
             }
-            throw e;
-        } catch (RuntimeException e) {
-            Thread.interrupted(); // clear interrupt flag
-            if (status == TransactionStatus.IN_TRANSACTION) {
-                status = TransactionStatus.FAILED;
-            }
-            // If the execution thread was interrupted (by our timeout or by cancel),
-            // wrap the exception as a query_canceled error (SQLSTATE 57014)
-            if (e.getCause() instanceof InterruptedException
-                    || e instanceof MemgresException && "57014".equals(((MemgresException) e).getSqlState())) {
-                MemgresException me = (MemgresException) e;
-                MemgresException canceled = new MemgresException("canceling statement due to statement timeout", "57014");
-                if (status == TransactionStatus.IN_TRANSACTION) {
-                    status = TransactionStatus.FAILED;
-                }
-                throw canceled;
-            }
-            throw e;
+            throw reported;
         } finally {
             executingStatement = false;
-            if (timeoutTask != null) {
-                timeoutTask.cancel(false);
+            if (timeoutTask != null && !timeoutTask.cancel(false)) {
+                // Too late to cancel: the task is already interrupting us. Let it finish, or the
+                // interrupt lands after the clear below and kills the next statement instead.
+                try {
+                    timeoutTask.get();
+                } catch (Exception ignored) {
+                    // Cancelled or interrupted while waiting; either way the task is done.
+                }
             }
+            StatementCancel.bind(outerToken);
+            // The interrupt was ours. Leaving it set would cancel whatever runs next on this thread.
+            Thread.interrupted();
         }
+    }
+
+    /**
+     * The error to report for a statement that failed while a cancel was pending.
+     *
+     * <p>Whatever a loop happened to throw on the way out, a cancelled statement reports PG's
+     * cancellation error. A genuine failure is passed through untouched: PG reports the error the
+     * statement really hit, not the timeout that arrived a moment behind it.
+     */
+    private static RuntimeException reportedFailure(RuntimeException e, StatementCancel.Token token) {
+        if (!token.isRequested()) return e;
+        boolean fromCancel = e.getCause() instanceof InterruptedException
+                || (e instanceof MemgresException && "57014".equals(((MemgresException) e).getSqlState()));
+        return fromCancel ? new MemgresException(token.message(), "57014") : e;
     }
 
     /**
@@ -1320,6 +1338,40 @@ public class Session {
 
     public boolean isInNestedExecution() {
         return nestedExecutionDepth > 0;
+    }
+
+    // ---- Recursion depth (PostgreSQL's max_stack_depth) ----
+
+    /** Routine bodies — functions, procedures, DO blocks — currently on the call chain. */
+    private int routineDepth;
+    /** Trigger firings currently on the call chain. */
+    private int triggerDepth;
+
+    /**
+     * Recursion that never terminates has to be reported as PostgreSQL reports it — {@code 54001}
+     * naming the limit — rather than left to exhaust the Java stack, which surfaces as an internal
+     * error from wherever the stack happened to give out.
+     */
+    public void enterRoutine() {
+        if (routineDepth >= PgErrors.MAX_ROUTINE_DEPTH) {
+            throw PgErrors.stackDepthExceeded();
+        }
+        routineDepth++;
+    }
+
+    public void exitRoutine() {
+        if (routineDepth > 0) routineDepth--;
+    }
+
+    public void enterTriggerCall() {
+        if (triggerDepth >= PgErrors.MAX_TRIGGER_DEPTH) {
+            throw PgErrors.stackDepthExceeded();
+        }
+        triggerDepth++;
+    }
+
+    public void exitTriggerCall() {
+        if (triggerDepth > 0) triggerDepth--;
     }
 
     public void registerStatementEndDrop(String schema, String tableName) {

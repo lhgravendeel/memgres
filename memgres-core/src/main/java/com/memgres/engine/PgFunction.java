@@ -85,6 +85,26 @@ public class PgFunction {
     public String getBody() { return body; }
     public String getLanguage() { return language; }
     public List<Param> getParams() { return params; }
+
+    /** True when the declared result is {@code record} or {@code SETOF record}. */
+    public boolean declaresRecordResult() {
+        if (returnType == null) return false;
+        String bare = returnType.trim();
+        if (bare.length() > 6 && bare.substring(0, 6).equalsIgnoreCase("SETOF ")) {
+            bare = bare.substring(6).trim();
+        }
+        return "record".equalsIgnoreCase(bare);
+    }
+
+    /** True when the signature already names the result columns, as OUT or TABLE parameters. */
+    public boolean hasOutParams() {
+        for (Param p : params) {
+            String mode = p.mode() != null ? p.mode().toUpperCase() : "IN";
+            if ("OUT".equals(mode) || "INOUT".equals(mode) || "TABLE".equals(mode)) return true;
+        }
+        return false;
+    }
+
     public boolean isProcedure() { return procedure; }
     public String getSchemaName() { return schemaName; }
     public void setSchemaName(String schema) { this.schemaName = schema; }

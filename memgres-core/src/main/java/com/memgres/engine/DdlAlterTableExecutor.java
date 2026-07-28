@@ -241,14 +241,7 @@ class DdlAlterTableExecutor {
             executeDropColumn(dropCol, table, stmt, schemaName);
         } else if (action instanceof AlterTableStmt.RenameColumn) {
             AlterTableStmt.RenameColumn rename = (AlterTableStmt.RenameColumn) action;
-            if (table.getColumnIndex(rename.newName()) >= 0) {
-                throw new MemgresException("column \"" + rename.newName() + "\" of relation \"" + stmt.table() + "\" already exists", "42701");
-            }
-            table.renameColumn(rename.oldName(), rename.newName());
-            rewriteIncomingForeignKeys(stmt.table(), schemaName, rename.oldName(), rename.newName());
-            rewriteIndexMetadata(stmt.table(), schemaName, rename.oldName(), rename.newName());
-            rewriteDependentViews(stmt.table(), rename.oldName(), rename.newName());
-            executor.recordUndo(new Session.RenameColumnUndo(schemaName, stmt.table(), rename.newName(), rename.oldName()));
+            executeRenameColumn(rename, table, stmt, schemaName);
         } else if (action instanceof AlterTableStmt.SetReplicaIdentity) {
             table.setReplicaIdentity(((AlterTableStmt.SetReplicaIdentity) action).identity());
         } else if (action instanceof AlterTableStmt.RenameTable) {
@@ -289,8 +282,13 @@ class DdlAlterTableExecutor {
             executeAttachPartition(attach, table, stmt, schemaName);
         } else if (action instanceof AlterTableStmt.DetachPartition) {
             AlterTableStmt.DetachPartition detach = (AlterTableStmt.DetachPartition) action;
+            requirePartitionedTable(table, stmt.table(), "DETACH PARTITION");
             String detachSchemaName = detach.partitionSchema() != null ? detach.partitionSchema() : schemaName;
             Table partition = executor.resolveTable(detachSchemaName, detach.partitionName());
+            if (!table.getPartitions().contains(partition)) {
+                throw new MemgresException("relation \"" + detach.partitionName()
+                        + "\" is not a partition of relation \"" + stmt.table() + "\"", "42P01");
+            }
             table.removePartition(partition);
             partition.setPartitionParent(null);
             partition.clearPartitionBounds();
@@ -306,21 +304,8 @@ class DdlAlterTableExecutor {
                     oldConstraint.getCheckExpr(), oldConstraint.getReferencesTable(),
                     oldConstraint.getReferencesColumns(), oldConstraint.getOnDelete(), oldConstraint.getOnUpdate());
             table.addConstraint(newConstraint);
-        } else if (action instanceof AlterTableStmt.AlterConstraintEnforced) {
-            AlterTableStmt.AlterConstraintEnforced ace = (AlterTableStmt.AlterConstraintEnforced) action;
-            StoredConstraint sc = table.getConstraint(ace.constraintName());
-            if (sc == null) {
-                throw new MemgresException("constraint \"" + ace.constraintName() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
-            }
-            // PG 18: only FOREIGN KEY constraints support ALTER CONSTRAINT ... [NOT] ENFORCED.
-            // CHECK, UNIQUE, PRIMARY KEY, and EXCLUDE constraints cannot be toggled.
-            if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) {
-                throw new MemgresException(
-                        "cannot alter enforceability of constraint \"" + ace.constraintName()
-                                + "\" of relation \"" + stmt.table() + "\"",
-                        "42809");
-            }
-            sc.setNotEnforced(ace.notEnforced());
+        } else if (action instanceof AlterTableStmt.AlterConstraintAttrs) {
+            executeAlterConstraint((AlterTableStmt.AlterConstraintAttrs) action, table, stmt);
         } else if (action instanceof AlterTableStmt.SetSchema) {
             AlterTableStmt.SetSchema setSchema = (AlterTableStmt.SetSchema) action;
             Schema oldSchema = executor.database.getSchema(schemaName);
@@ -337,11 +322,25 @@ class DdlAlterTableExecutor {
         } else if (action instanceof AlterTableStmt.Inherit) {
             AlterTableStmt.Inherit inherit = (AlterTableStmt.Inherit) action;
             Table parentTable = executor.resolveTable(schemaName, inherit.parentTable());
+            // Circularity first: a loop is what PostgreSQL names even when the columns are also
+            // wrong, and the walk covers a longer loop than a single parent check can see.
+            rejectInheritanceCycle(table, parentTable, stmt.table(), inherit.parentTable());
+            if (parentTable.getChildren().contains(table)) {
+                throw new MemgresException("relation \"" + inherit.parentTable()
+                        + "\" would be inherited from more than once", "42P07");
+            }
+            // A child has to be able to stand in for its parent, so every parent column must be
+            // present with the same type before the link is made.
+            validateInheritedColumns(parentTable, table, stmt.table());
             table.setParentTable(parentTable);
             parentTable.addChild(table);
         } else if (action instanceof AlterTableStmt.NoInherit) {
             AlterTableStmt.NoInherit noInherit = (AlterTableStmt.NoInherit) action;
             Table parentTable = executor.resolveTable(schemaName, noInherit.parentTable());
+            if (!parentTable.getChildren().contains(table)) {
+                throw new MemgresException("relation \"" + noInherit.parentTable()
+                        + "\" is not a parent of relation \"" + stmt.table() + "\"", "42P01");
+            }
             parentTable.removeChild(table);
             table.setParentTable(null);
         } else if (action instanceof AlterTableStmt.DisableTrigger) {
@@ -350,6 +349,12 @@ class DdlAlterTableExecutor {
         } else if (action instanceof AlterTableStmt.EnableTrigger) {
             AlterTableStmt.EnableTrigger et = (AlterTableStmt.EnableTrigger) action;
             setTriggerEnabled(table, et.triggerName(), false);
+        } else if (action instanceof AlterTableStmt.SetRuleEnabled) {
+            AlterTableStmt.SetRuleEnabled sr = (AlterTableStmt.SetRuleEnabled) action;
+            if (!executor.database.setRuleEnabled(sr.ruleName(), stmt.table(), sr.enabled())) {
+                throw new MemgresException("rule \"" + sr.ruleName() + "\" for relation \""
+                        + stmt.table() + "\" does not exist", "42704");
+            }
         } else if (action instanceof AlterTableStmt.SetStorageParams) {
             // no-op
         } else if (action instanceof AlterTableStmt.SetLogged) {
@@ -365,6 +370,13 @@ class DdlAlterTableExecutor {
         if (table.getColumnIndex(def.name()) >= 0) {
             if (addCol.ifNotExists()) return;
             throw new MemgresException("column \"" + def.name() + "\" of relation \"" + stmt.table() + "\" already exists", "42701");
+        }
+        DdlDefinitionChecks.rejectSystemColumnName(def.name());
+        DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
+        // A child that lacks one of its parent's columns cannot stand in for the parent, so PG
+        // refuses to add a column to a parent alone.
+        if (stmt.only() && !childRelations(table).isEmpty()) {
+            throw new MemgresException("column must be added to child tables too", "42P16");
         }
 
         DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(def.typeName(), null);
@@ -548,6 +560,110 @@ class DdlAlterTableExecutor {
                 }
             }
         }
+
+        propagateAddColumn(table, col, evaluatedDefault);
+    }
+
+    /**
+     * Children and partitions of a table hold their own copy of its column list, so a column
+     * added to a parent has to reach each of them. Without this the parent advertises a column
+     * its own children cannot answer for, and a read through the parent finds nothing there.
+     */
+    private void propagateAddColumn(Table parent, Column col, Object defaultValue) {
+        for (Table child : childRelations(parent)) {
+            if (child.getColumnIndex(col.getName()) >= 0) continue;
+            Column copy = col.withName(col.getName());
+            child.addColumn(copy, defaultValue);
+            propagateAddColumn(child, copy, defaultValue);
+        }
+    }
+
+    /** The relations that mirror this table's column list: inheritance children and partitions. */
+    private static List<Table> childRelations(Table table) {
+        List<Table> out = new ArrayList<>(table.getChildren());
+        for (Table partition : table.getPartitions()) {
+            if (!out.contains(partition)) out.add(partition);
+        }
+        return out;
+    }
+
+    /**
+     * True when the column is one the table gets from a parent. PG records this as
+     * {@code attinhcount}; here it is reconstructed by looking up the ancestor chain, which is
+     * equivalent because a child always carries every one of its parent's columns.
+     */
+    private static boolean isInheritedColumn(Table table, String column) {
+        for (Table parent = parentOf(table); parent != null; parent = parentOf(parent)) {
+            if (parent.getColumnIndex(column) >= 0) return true;
+        }
+        return false;
+    }
+
+    private static Table parentOf(Table table) {
+        return table.getParentTable() != null ? table.getParentTable() : table.getPartitionParent();
+    }
+
+    /**
+     * A table can only be attached to a parent if it already has every one of the parent's
+     * columns, with the same type — otherwise the hierarchy could not be read through the parent.
+     */
+    private void validateInheritedColumns(Table parent, Table child, String childName) {
+        for (Column pc : parent.getColumns()) {
+            int idx = child.getColumnIndex(pc.getName());
+            if (idx < 0) {
+                throw PgErrors.datatypeMismatch("child table is missing column \""
+                        + pc.getName() + "\"");
+            }
+            if (!sameColumnType(pc, child.getColumns().get(idx))) {
+                throw PgErrors.datatypeMismatch("child table \"" + childName
+                        + "\" has different type for column \"" + pc.getName() + "\"");
+            }
+        }
+    }
+
+    private void executeRenameColumn(AlterTableStmt.RenameColumn rename, Table table,
+                                      AlterTableStmt stmt, String schemaName) {
+        if (table.getColumnIndex(rename.oldName()) < 0) {
+            throw new MemgresException("column \"" + rename.oldName() + "\" does not exist", "42703");
+        }
+        if (table.getColumnIndex(rename.newName()) >= 0) {
+            throw new MemgresException("column \"" + rename.newName() + "\" of relation \""
+                    + stmt.table() + "\" already exists", "42701");
+        }
+        DdlDefinitionChecks.rejectSystemColumnName(rename.newName());
+        // An inherited column is the parent's; renaming it on the child alone, or on the parent
+        // alone, would leave the two disagreeing about the same column.
+        if (isInheritedColumn(table, rename.oldName())) {
+            throw new MemgresException("cannot rename inherited column \""
+                    + rename.oldName() + "\"", "42P16");
+        }
+        if (stmt.only() && !childRelations(table).isEmpty()) {
+            throw new MemgresException("inherited column \"" + rename.oldName()
+                    + "\" must be renamed in child tables too", "42P16");
+        }
+        table.renameColumn(rename.oldName(), rename.newName());
+        propagateRenameColumn(table, rename.oldName(), rename.newName());
+        rewriteIncomingForeignKeys(stmt.table(), schemaName, rename.oldName(), rename.newName());
+        rewriteIndexMetadata(stmt.table(), schemaName, rename.oldName(), rename.newName());
+        rewriteDependentViews(stmt.table(), rename.oldName(), rename.newName());
+        executor.recordUndo(new Session.RenameColumnUndo(schemaName, stmt.table(),
+                rename.newName(), rename.oldName()));
+    }
+
+    private void propagateDropColumn(Table parent, String column) {
+        for (Table child : childRelations(parent)) {
+            if (child.getColumnIndex(column) < 0) continue;
+            child.removeColumn(column);
+            propagateDropColumn(child, column);
+        }
+    }
+
+    private void propagateRenameColumn(Table parent, String oldName, String newName) {
+        for (Table child : childRelations(parent)) {
+            if (child.getColumnIndex(oldName) < 0) continue;
+            child.renameColumn(oldName, newName);
+            propagateRenameColumn(child, oldName, newName);
+        }
     }
 
     private void executeDropColumn(AlterTableStmt.DropColumn dropCol, Table table,
@@ -559,6 +675,12 @@ class DdlAlterTableExecutor {
         if (colIdx < 0) {
             throw new MemgresException("column \"" + dropCol.column()
                     + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
+        }
+        // An inherited column belongs to the parent; dropping it from the child alone would
+        // leave a child that cannot answer for its parent's shape.
+        if (isInheritedColumn(table, dropCol.column())) {
+            throw new MemgresException("cannot drop inherited column \""
+                    + dropCol.column() + "\"", "42P16");
         }
         // Check for dependent generated columns
         String colNameLower = dropCol.column().toLowerCase();
@@ -612,6 +734,9 @@ class DdlAlterTableExecutor {
         }
         executor.recordUndo(new Session.DropColumnUndo(schemaName, stmt.table(), droppedCol, colIdx, colValues));
         table.removeColumn(dropCol.column());
+        // Without ONLY the parent's shape is the hierarchy's shape, so the column goes from the
+        // children too; with ONLY the children keep it as a column of their own.
+        if (!stmt.only()) propagateDropColumn(table, dropCol.column());
         // Drop incoming FOREIGN KEY constraints that referenced the dropped column (reached only
         // with CASCADE, or when the FK's own columns also contained the dropped column).
         for (Schema sch : executor.database.getSchemas().values()) {
@@ -769,7 +894,20 @@ class DdlAlterTableExecutor {
             }
             table.alterColumnNullable(alterCol.column(), false);
         } else if (alterCol.action() instanceof AlterTableStmt.DropNotNull) {
+            requireColumn(table, alterCol.column(), stmt.table());
+            // A primary key column can never hold a null, so a catalog saying it may is a
+            // contradiction with the constraint that still rejects one.
+            if (isPrimaryKeyColumn(table, alterCol.column())) {
+                throw new MemgresException("column \"" + alterCol.column()
+                        + "\" is in a primary key", "42P16");
+            }
             table.alterColumnNullable(alterCol.column(), true);
+        } else if (alterCol.action() instanceof AlterTableStmt.DropIdentity) {
+            executeDropIdentity((AlterTableStmt.DropIdentity) alterCol.action(),
+                    alterCol.column(), table, stmt);
+        } else if (alterCol.action() instanceof AlterTableStmt.DropExpression) {
+            executeDropExpression((AlterTableStmt.DropExpression) alterCol.action(),
+                    alterCol.column(), table, stmt);
         } else if (alterCol.action() instanceof AlterTableStmt.SetStatistics) {
             AlterTableStmt.SetStatistics ss = (AlterTableStmt.SetStatistics) alterCol.action();
             int colIdx = table.getColumnIndex(alterCol.column());
@@ -777,31 +915,83 @@ class DdlAlterTableExecutor {
             table.getColumns().get(colIdx).setAttStattarget((short) ss.target());
         } else if (alterCol.action() instanceof AlterTableStmt.SetStorage) {
             AlterTableStmt.SetStorage ss = (AlterTableStmt.SetStorage) alterCol.action();
-            int colIdx = table.getColumnIndex(alterCol.column());
-            if (colIdx < 0) throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
-            String storageCode;
-            switch (ss.storageType().toUpperCase()) {
-                case "PLAIN": storageCode = "p"; break;
-                case "EXTERNAL": storageCode = "e"; break;
-                case "EXTENDED": storageCode = "x"; break;
-                case "MAIN": storageCode = "m"; break;
-                default: storageCode = "p"; break;
-            }
-            table.getColumns().get(colIdx).setAttStorageOverride(storageCode);
+            Column col = requireColumn(table, alterCol.column(), stmt.table());
+            col.setAttStorageOverride(DdlDefinitionChecks.storageCode(ss.storageType(), col));
         } else if (alterCol.action() instanceof AlterTableStmt.SetCompression) {
             AlterTableStmt.SetCompression sc = (AlterTableStmt.SetCompression) alterCol.action();
-            int colIdx = table.getColumnIndex(alterCol.column());
-            if (colIdx < 0) throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
-            String compressionCode;
-            switch (sc.method().toLowerCase()) {
-                case "pglz": compressionCode = "p"; break;
-                case "lz4": compressionCode = "l"; break;
-                default: compressionCode = ""; break;
-            }
-            table.getColumns().get(colIdx).setAttCompression(compressionCode);
+            Column col = requireColumn(table, alterCol.column(), stmt.table());
+            col.setAttCompression(DdlDefinitionChecks.compressionCode(sc.method(), col));
         } else if (alterCol.action() instanceof AlterTableStmt.ColumnNoOp) {
             // no-op
         }
+    }
+
+    /** The named column, or {@code 42703} spelled the way PostgreSQL spells it. */
+    private static Column requireColumn(Table table, String column, String tableName) {
+        int idx = table.getColumnIndex(column);
+        if (idx < 0) {
+            throw new MemgresException("column \"" + column + "\" of relation \""
+                    + tableName + "\" does not exist", "42703");
+        }
+        return table.getColumns().get(idx);
+    }
+
+    /** True when the column is part of the table's PRIMARY KEY, however that key was declared. */
+    private static boolean isPrimaryKeyColumn(Table table, String column) {
+        int idx = table.getColumnIndex(column);
+        if (idx >= 0 && table.getColumns().get(idx).isPrimaryKey()) return true;
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                    && StoredConstraint.containsIgnoreCase(sc.getColumns(), column)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * DROP IDENTITY, unlike DROP DEFAULT, complains when there is no identity to drop — the
+     * statement's whole purpose is to remove one, so silence would hide a mistaken column name.
+     */
+    private void executeDropIdentity(AlterTableStmt.DropIdentity action, String column,
+                                      Table table, AlterTableStmt stmt) {
+        Column col = requireColumn(table, column, stmt.table());
+        if (!isIdentityColumn(col)) {
+            if (action.ifExists()) return;
+            throw new MemgresException("column \"" + column + "\" of relation \""
+                    + stmt.table() + "\" is not an identity column", "55000");
+        }
+        table.alterColumnDefault(column, null);
+    }
+
+    /**
+     * DROP EXPRESSION turns a stored generated column into an ordinary one, keeping the values
+     * already computed. A virtual column has no stored values to keep, so PG does not offer it.
+     */
+    private void executeDropExpression(AlterTableStmt.DropExpression action, String column,
+                                        Table table, AlterTableStmt stmt) {
+        Column col = requireColumn(table, column, stmt.table());
+        if (col.getGeneratedExpr() == null) {
+            if (action.ifExists()) return;
+            throw new MemgresException("column \"" + column + "\" of relation \""
+                    + stmt.table() + "\" is not a generated column", "55000");
+        }
+        if (col.isVirtual()) {
+            throw PgErrors.notImplemented(
+                    "ALTER TABLE / DROP EXPRESSION is not supported for virtual generated columns");
+        }
+        int idx = table.getColumnIndex(column);
+        table.getColumns().set(idx, col.withGeneratedExpr(null));
+    }
+
+    /**
+     * True when the column really is an identity column. A SERIAL column is deliberately not one:
+     * it has a sequence behind it, but PostgreSQL keeps the two concepts apart and DROP IDENTITY
+     * on a serial column is an error there.
+     */
+    private static boolean isIdentityColumn(Column col) {
+        String def = col.getDefaultValue();
+        return def != null && def.startsWith("__identity__");
     }
 
     private void executeSetType(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetType setType,
@@ -945,7 +1135,34 @@ class DdlAlterTableExecutor {
         } else if (defaultVal.contains("__identity__")) {
             handleIdentity(alterCol.column(), defaultVal, table, stmt);
         } else {
+            Column col = requireColumn(table, alterCol.column(), stmt.table());
+            DdlDefinitionChecks.validateDefaultExpression(setDefault.expr());
+            // The default has to be a value the column can hold, or every insert that relies on
+            // it fails on a statement that never mentions the column.
+            if (DdlDefinitionChecks.isEvaluableAtDefinitionTime(setDefault.expr())) {
+                Object value = executor.evaluateDefault(defaultVal, col.getType());
+                if (value != null) checkDefaultFits(value, col, alterCol.column(), setDefault.expr());
+            }
             table.alterColumnDefault(alterCol.column(), defaultVal);
+        }
+    }
+
+    /**
+     * Confirm the evaluated default is storable in the column. Which error that is depends on the
+     * expression: a bare string literal is of type unknown, so a bad one is invalid input for the
+     * column's type, while an expression that already has a type is a type mismatch instead.
+     */
+    private void checkDefaultFits(Object value, Column col, String columnName, Expression expr) {
+        try {
+            TypeCoercion.coerceForStorage(value, col);
+        } catch (MemgresException e) {
+            String exprType = DdlDefinitionChecks.runtimeTypeName(value);
+            if (exprType != null && !DdlDefinitionChecks.isUntypedLiteral(expr)) {
+                throw PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
+                        + col.getType().toRegtypeDisplay()
+                        + " but default expression is of type " + exprType);
+            }
+            throw e;
         }
     }
 
@@ -993,6 +1210,21 @@ class DdlAlterTableExecutor {
     private void handleIdentity(String column, String defaultVal, Table table, AlterTableStmt stmt) {
         String marker = DdlExecutor.extractMarker(defaultVal);
         boolean isSetGenerated = defaultVal.contains("__identity__:always") || defaultVal.contains("__identity__:bydefault");
+
+        if (marker.contains(":add:")) {
+            Column target = requireColumn(table, column, stmt.table());
+            if (isIdentityColumn(target)) {
+                throw new MemgresException("column \"" + column + "\" of relation \""
+                        + stmt.table() + "\" is already an identity column", "55000");
+            }
+            DdlDefinitionChecks.requireIdentityType(target.getType());
+            // Identity fills the column for every row, so a column that still admits nulls
+            // would contradict what identity guarantees.
+            if (target.isNullable()) {
+                throw new MemgresException("column \"" + column + "\" of relation \"" + stmt.table()
+                        + "\" must be declared NOT NULL before identity can be added", "55000");
+            }
+        }
 
         if (isSetGenerated) {
             int ci = table.getColumnIndex(column);
@@ -1103,6 +1335,11 @@ class DdlAlterTableExecutor {
             return;
         }
 
+        if (addConstraint.constraint().type() == TableConstraint.ConstraintType.CHECK) {
+            DdlDefinitionChecks.requireBooleanPredicate(
+                    addConstraint.constraint().checkExpr(), table, "CHECK");
+        }
+
         List<String> rawCols = addConstraint.constraint().columns();
         boolean isUsingIndex = rawCols != null && rawCols.size() == 1 && rawCols.get(0).startsWith("__using_index__:");
         if (isUsingIndex) {
@@ -1114,16 +1351,20 @@ class DdlAlterTableExecutor {
             sc.setPromotedFromIndex(true);
         }
         if (sc != null) {
+            // For FK constraints without explicit schema, default to the table's schema
+            if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
+                    && sc.getReferencesSchema() == null && sc.getReferencesTable() != null) {
+                sc.setReferencesSchema(schemaName);
+            }
+            // PG checks the key's definition before it looks for a name collision.
+            if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
+                ddl.validateForeignKeyDefinition(sc, table, schemaName);
+            }
             if (sc.getName() != null && table.getConstraint(sc.getName()) != null) {
                 throw new MemgresException("constraint \"" + sc.getName() + "\" for relation \"" + stmt.table() + "\" already exists", "42710");
             }
             if (addConstraint.notValid()) {
                 sc.setConvalidated(false);
-            }
-            // For FK constraints without explicit schema, default to the table's schema
-            if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
-                    && sc.getReferencesSchema() == null && sc.getReferencesTable() != null) {
-                sc.setReferencesSchema(schemaName);
             }
             if (!sc.isNotEnforced() && !addConstraint.notValid()) {
                 if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
@@ -1249,6 +1490,37 @@ class DdlAlterTableExecutor {
         }
     }
 
+    /**
+     * Which constraint kinds accept which attributes is what PostgreSQL checks here, and it
+     * checks it per attribute named rather than per statement: deferrability belongs to foreign
+     * keys, inheritability to not-null constraints, enforceability to foreign keys.
+     */
+    private void executeAlterConstraint(AlterTableStmt.AlterConstraintAttrs ac, Table table,
+                                        AlterTableStmt stmt) {
+        StoredConstraint sc = table.getConstraint(ac.constraintName());
+        if (sc == null) {
+            throw new MemgresException("constraint \"" + ac.constraintName() + "\" of relation \""
+                    + stmt.table() + "\" does not exist", "42704");
+        }
+        boolean isForeignKey = sc.getType() == StoredConstraint.Type.FOREIGN_KEY;
+        if ((ac.deferrable() != null || ac.initiallyDeferred() != null) && !isForeignKey) {
+            throw PgErrors.wrongObjectType("constraint \"" + ac.constraintName() + "\" of relation \""
+                    + stmt.table() + "\" is not a foreign key constraint");
+        }
+        // memgres has no stored NOT NULL constraint object, so inheritability never applies.
+        if (ac.alterInheritability()) {
+            throw PgErrors.wrongObjectType("constraint \"" + ac.constraintName() + "\" of relation \""
+                    + stmt.table() + "\" is not a not-null constraint");
+        }
+        if (ac.enforced() != null && !isForeignKey) {
+            throw PgErrors.wrongObjectType("cannot alter enforceability of constraint \""
+                    + ac.constraintName() + "\" of relation \"" + stmt.table() + "\"");
+        }
+        if (ac.deferrable() != null) sc.setDeferrable(ac.deferrable());
+        if (ac.initiallyDeferred() != null) sc.setInitiallyDeferred(ac.initiallyDeferred());
+        if (ac.enforced() != null) sc.setNotEnforced(!ac.enforced());
+    }
+
     private void executeValidateConstraint(AlterTableStmt.ValidateConstraint vc, Table table,
                                             AlterTableStmt stmt) {
         StoredConstraint sc = table.getConstraint(vc.constraintName());
@@ -1270,24 +1542,107 @@ class DdlAlterTableExecutor {
 
     private void executeAttachPartition(AlterTableStmt.AttachPartition attach, Table table,
                                          AlterTableStmt stmt, String schemaName) {
+        requirePartitionedTable(table, stmt.table(), "ATTACH PARTITION");
         String partSchemaName = attach.partitionSchema() != null ? attach.partitionSchema() : schemaName;
+        rejectNonTableRelation(attach.partitionName(), "ATTACH PARTITION");
         Table partition = executor.resolveTable(partSchemaName, attach.partitionName());
+        rejectInheritanceCycle(partition, table, attach.partitionName(), stmt.table());
         if (table.getPartitions().contains(partition)) {
             throw new MemgresException("table \"" + attach.partitionName()
                     + "\" is already a partition of \"" + stmt.table() + "\"", "42809");
         }
-        // C4a: Validate column compatibility (names and types must match parent)
-        validatePartitionColumns(table, partition, attach.partitionName());
-        // Validate bounds before attaching, so overlapping bounds (42P17) don't leave
+        // A table can belong to one parent only; attaching it a second time would give it two
+        // routing paths, and detaching either would leave the other pointing at nothing.
+        if (partition.getPartitionParent() != null) {
+            throw PgErrors.wrongObjectType("\"" + attach.partitionName() + "\" is already a partition");
+        }
+        // Validate bounds before attaching, so a rejected bound (42P16/42P17) doesn't leave
         // the table half-attached to the parent's routing list
         if (attach.bounds() != null && !attach.bounds().isEmpty()) {
             ddl.tableExecutor.applyPartitionBounds(partition, table, attach.bounds(), attach.partitionName());
         }
+        // C4a: Validate column compatibility (names and types must match parent)
+        validatePartitionColumns(table, partition, attach.partitionName());
         // C4b: Validate existing rows satisfy partition bounds
         validateExistingRowBounds(partition, table, attach.partitionName());
+        // Rows the default partition absorbed only because nothing else claimed them would now
+        // belong to the new partition, so the default's constraint no longer holds for them.
+        validateDefaultPartitionRows(table, partition, attach.partitionName());
         partition.setPartitionParent(table);
         partition.setParentColumnRemap(buildParentColumnRemap(table, partition));
         table.addPartition(partition);
+    }
+
+    /** ATTACH/DETACH PARTITION only apply to a partitioned table. */
+    private void requirePartitionedTable(Table table, String relation, String action) {
+        if (table.getPartitionStrategy() != null) return;
+        MemgresException ex = new MemgresException("ALTER action " + action
+                + " cannot be performed on relation \"" + relation + "\"", "42809");
+        ex.setDetail("This operation is not supported for tables.");
+        throw ex;
+    }
+
+    /** A view named as the partition of an ATTACH is refused before it resolves to a base table. */
+    private void rejectNonTableRelation(String name, String action) {
+        Database.ViewDef view = executor.database.getView(name);
+        if (view == null) return;
+        MemgresException ex = new MemgresException("ALTER action " + action
+                + " cannot be performed on relation \"" + name + "\"", "42809");
+        ex.setDetail(view.materialized
+                ? "This operation is not supported for materialized views."
+                : "This operation is not supported for views.");
+        throw ex;
+    }
+
+    /**
+     * A default partition holds exactly the rows no other partition claims. Attaching a partition
+     * narrows that set, so any row the default is holding which the new bounds would now cover
+     * makes the default's own constraint false.
+     */
+    private void validateDefaultPartitionRows(Table parent, Table incoming, String partName) {
+        String strategy = parent.getPartitionStrategy();
+        if (strategy == null) return;
+        String partCol = parent.getPartitionColumn();
+        if (partCol == null) return;
+        for (Table existing : parent.getPartitions()) {
+            if (!existing.isDefaultPartition() || existing.getRows().isEmpty()) continue;
+            int colIdx = existing.getColumnIndex(partCol);
+            if (colIdx < 0) continue;
+            for (Object[] row : existing.getRows()) {
+                if (rowSatisfiesBounds(row[colIdx], incoming, strategy)) {
+                    throw new MemgresException("updated partition constraint for default partition \""
+                            + existing.getName() + "\" would be violated by some row", "23514");
+                }
+            }
+        }
+    }
+
+    /**
+     * Refuse to make {@code child} a child of {@code parent} when the parent already sits below
+     * the child in the hierarchy — inheritance and partitioning share one graph, so either link
+     * can close a loop. Storing the link instead would leave a cyclic catalog, and every later
+     * walk of it (a SELECT on either table, DROP TABLE, a pg_inherits query) would run until the
+     * stack was gone, leaving the tables unusable and undroppable.
+     */
+    private static void rejectInheritanceCycle(Table child, Table parent,
+                                               String childName, String parentName) {
+        Set<Table> seen = Collections.newSetFromMap(new IdentityHashMap<Table, Boolean>());
+        if (isSelfOrDescendant(parent, child, seen)) {
+            throw PgErrors.circularInheritance(childName, parentName);
+        }
+    }
+
+    /** True when {@code candidate} is {@code root} itself or sits anywhere beneath it. */
+    private static boolean isSelfOrDescendant(Table candidate, Table root, Set<Table> seen) {
+        if (candidate == root) return true;
+        if (!seen.add(root)) return false;
+        for (Table c : root.getChildren()) {
+            if (isSelfOrDescendant(candidate, c, seen)) return true;
+        }
+        for (Table p : root.getPartitions()) {
+            if (isSelfOrDescendant(candidate, p, seen)) return true;
+        }
+        return false;
     }
 
     /**
@@ -1429,16 +1784,24 @@ class DdlAlterTableExecutor {
 
     private void setTriggerEnabled(Table table, String triggerName, boolean disabled) {
         List<PgTrigger> triggers = executor.database.getTriggersForTable(table.getName());
-        if ("ALL".equalsIgnoreCase(triggerName)) {
+        // ALL and USER are group selectors, not names, and match nothing without complaint.
+        if ("ALL".equalsIgnoreCase(triggerName) || "USER".equalsIgnoreCase(triggerName)) {
             for (PgTrigger t : triggers) {
                 t.setDisabled(disabled);
             }
-        } else {
-            for (PgTrigger t : triggers) {
-                if (t.getName().equalsIgnoreCase(triggerName)) {
-                    t.setDisabled(disabled);
-                }
+            return;
+        }
+        boolean found = false;
+        for (PgTrigger t : triggers) {
+            if (t.getName().equalsIgnoreCase(triggerName)) {
+                t.setDisabled(disabled);
+                found = true;
             }
+        }
+        // Quietly doing nothing here reads as success to the caller who asked for the trigger off.
+        if (!found) {
+            throw new MemgresException("trigger \"" + triggerName + "\" for table \""
+                    + table.getName() + "\" does not exist", "42704");
         }
     }
 
