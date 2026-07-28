@@ -29,8 +29,18 @@ class ExprEvaluator {
      */
     static final class PrecomputedValueExpr implements Expression {
         private final Object value;
-        PrecomputedValueExpr(Object value) { this.value = value; }
+        /**
+         * The type the replaced expression was declared to have, where the value alone cannot
+         * say: a numeric NaN and a float8 NaN are the same Double. Null when unknown.
+         */
+        private final DataType declaredType;
+        PrecomputedValueExpr(Object value) { this(value, null); }
+        PrecomputedValueExpr(Object value, DataType declaredType) {
+            this.value = value;
+            this.declaredType = declaredType;
+        }
         Object value() { return value; }
+        DataType declaredType() { return declaredType; }
     }
 
     // ---- Main expression dispatcher ----
@@ -358,8 +368,13 @@ class ExprEvaluator {
                     catch (NumberFormatException e2) { return new java.math.BigDecimal(lit.value()); }
                 }
             }
-            case FLOAT:
+            case FLOAT: {
+                // INSERT ... SELECT re-wraps each computed value as a literal, so a numeric NaN
+                // or infinity reaches here spelled out; BigDecimal has no form for any of them.
+                Double special = NumericLimits.specialNumericOrNull(lit.value());
+                if (special != null) return special;
                 return new java.math.BigDecimal(lit.value());
+            }
             case STRING:
                 return lit.value();
             case BIT_STRING: {
@@ -1039,6 +1054,8 @@ class ExprEvaluator {
         if (t.equals("int") || t.equals("int4") || t.equals("integer")) return "integer";
         if (t.equals("int8") || t.equals("bigint")) return "bigint";
         if (t.equals("int2") || t.equals("smallint")) return "smallint";
+        // PG's numeric-to-money conversion goes through bigint, and reports that type by name
+        if (t.equals("money")) return "bigint";
         return null;
     }
 
@@ -1134,13 +1151,13 @@ class ExprEvaluator {
                 if (val == null) return null;
                 double d = toDouble(val);
                 if (d < 0) throw new MemgresException("cannot take square root of a negative number", "2201F");
-                double r = Math.sqrt(d);
-                return r == Math.floor(r) && !Double.isInfinite(r) ? (long) r : r;
+                // |/ is float8 only, so the answer stays a double rather than collapsing to an
+                // integer whose text form (16331239353195370) is not what float8 prints.
+                return Double.valueOf(Math.sqrt(d));
             }
             case CBRT: {
                 if (val == null) return null;
-                double r = Math.cbrt(toDouble(val));
-                return r == Math.floor(r) && !Double.isInfinite(r) ? (long) r : r;
+                return Double.valueOf(Math.cbrt(toDouble(val)));
             }
             case GEO_IS_HORIZONTAL: {
                 if (val == null) return null;
@@ -2579,10 +2596,20 @@ class ExprEvaluator {
         DataType dt = dateTimeResultType(op, lt, rt);
         if (dt != null) return dt;
 
+        // A range meets, joins or is cut by another range and stays that same range type.
+        // Describing it as an integer handed the driver a value it could not read -- "[5,10)" is
+        // no integer -- so the row never arrived at all.
+        if (lt != null && isRangeType(lt) && (rt == null || rt == lt)) return lt;
+        if (rt != null && isRangeType(rt) && lt == null) return rt;
+
         if (lt == DataType.DOUBLE_PRECISION || rt == DataType.DOUBLE_PRECISION)
             return DataType.DOUBLE_PRECISION;
         if (lt == DataType.NUMERIC || rt == DataType.NUMERIC)
             return DataType.NUMERIC;
+        // real has no arithmetic of its own opposite another type; PostgreSQL widens to float8
+        if (lt == DataType.REAL || rt == DataType.REAL) {
+            return lt == rt ? DataType.REAL : DataType.DOUBLE_PRECISION;
+        }
         if (lt == DataType.BIGINT || rt == DataType.BIGINT)
             return DataType.BIGINT;
         return DataType.INTEGER;
@@ -2691,6 +2718,11 @@ class ExprEvaluator {
     }
 
     DataType inferTypeFromContext(Expression expr, List<RowContext.TableBinding> bindings) {
+        if (expr instanceof PrecomputedValueExpr) {
+            PrecomputedValueExpr pre = (PrecomputedValueExpr) expr;
+            if (pre.declaredType() != null) return pre.declaredType();
+            return pre.value() == null ? null : TypeCoercion.inferType(pre.value());
+        }
         if (expr instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) expr;
             for (RowContext.TableBinding b : bindings) {
@@ -2752,10 +2784,14 @@ class ExprEvaluator {
             switch (un.op()) {
                 case NEGATE:
                 case POSITIVE:
-                case ABS:
+                case ABS: {
                     // @ and the signs answer in the operand's own type: @ -10 is an integer and
                     // - interval '1 day' is an interval, not the text they were described as.
-                    return inferTypeFromContext(un.operand(), bindings);
+                    // An operand with no type of its own is an unknown literal, which PostgreSQL
+                    // resolves through float8.
+                    DataType inner = inferTypeFromContext(un.operand(), bindings);
+                    return inner == null || inner == DataType.TEXT ? DataType.DOUBLE_PRECISION : inner;
+                }
                 case BIT_NOT: {
                     // ~ inet is an inet and ~ B'101' a bit string; only integers give an integer.
                     DataType inner = inferTypeFromContext(un.operand(), bindings);
@@ -2808,7 +2844,25 @@ class ExprEvaluator {
                     || name.equals("num_nonnulls") || name.equals("num_nulls")
                     || name.equals("array_position")) return DataType.INTEGER;
             if (name.equals("array_positions")) return DataType.INT4_ARRAY;
-            if (name.equals("sum") || name.equals("avg")) return DataType.NUMERIC;
+            if (name.equals("sum") || name.equals("avg")) {
+                DataType dt = fn.args().isEmpty() ? null : inferTypeFromContext(fn.args().get(0), bindings);
+                if (dt == DataType.DOUBLE_PRECISION) return DataType.DOUBLE_PRECISION;
+                if (dt == DataType.REAL) {
+                    // sum(real) stays real; avg(real) widens, which is where PG puts the line
+                    return name.equals("sum") ? DataType.REAL : DataType.DOUBLE_PRECISION;
+                }
+                if (dt == DataType.INTERVAL) return DataType.INTERVAL;
+                if (dt == DataType.MONEY) return DataType.MONEY;
+                if (name.equals("sum") && (dt == DataType.SMALLINT || dt == DataType.INTEGER
+                        || dt == DataType.SERIAL || dt == DataType.SMALLSERIAL)) return DataType.BIGINT;
+                return DataType.NUMERIC;
+            }
+            if (name.equals("var_pop") || name.equals("var_samp") || name.equals("variance")
+                    || name.equals("stddev") || name.equals("stddev_pop") || name.equals("stddev_samp")) {
+                DataType dt = fn.args().isEmpty() ? null : inferTypeFromContext(fn.args().get(0), bindings);
+                return dt == DataType.DOUBLE_PRECISION || dt == DataType.REAL
+                        ? DataType.DOUBLE_PRECISION : DataType.NUMERIC;
+            }
             if (name.equals("max") || name.equals("min")) {
                 if (!fn.args().isEmpty()) return inferTypeFromContext(fn.args().get(0), bindings);
                 return DataType.TEXT;
@@ -2872,15 +2926,61 @@ class ExprEvaluator {
                     || name.equals("pg_is_in_recovery") || name.equals("pg_is_wal_replay_paused")
                     || name.equals("pg_has_role")
                     || name.equals("overlaps")) return DataType.BOOLEAN;
-            if (name.equals("abs") || name.equals("ceil") || name.equals("floor")
+            // abs and unary negation answer in the argument's own type; an untyped argument
+            // resolves to float8, the preferred type of the numeric category.
+            if (name.equals("abs")) {
+                DataType dt = fn.args().isEmpty() ? null : inferTypeFromContext(fn.args().get(0), bindings);
+                return dt == null || dt == DataType.TEXT ? DataType.DOUBLE_PRECISION : dt;
+            }
+            // These have a numeric form and a float8 form. A numeric argument keeps the answer
+            // numeric; an integer, a real or an untyped literal all resolve to float8, which
+            // is why round('2.5') rounds half to even and answers 2 rather than 3.
+            if (name.equals("ceil") || name.equals("ceiling") || name.equals("floor")
                     || name.equals("round") || name.equals("trunc") || name.equals("sign")
-                    || name.equals("mod") || name.equals("power") || name.equals("sqrt")
-                    || name.equals("cbrt") || name.equals("exp") || name.equals("ln")
-                    || name.equals("log") || name.equals("div")) return DataType.NUMERIC;
+                    || name.equals("power") || name.equals("pow") || name.equals("sqrt")
+                    || name.equals("exp") || name.equals("ln")
+                    || name.equals("log") || name.equals("log10")) {
+                DataType dt = fn.args().isEmpty() ? null : inferTypeFromContext(fn.args().get(0), bindings);
+                if (name.equals("trunc") && (dt == DataType.MACADDR || dt == DataType.MACADDR8)) return dt;
+                // round(numeric, int), trunc(numeric, int) and log(numeric, numeric) are the
+                // only two-argument forms, and all three are numeric only
+                if (fn.args().size() > 1 && (name.equals("round") || name.equals("trunc")
+                        || name.equals("log"))) {
+                    return DataType.NUMERIC;
+                }
+                return dt == DataType.NUMERIC ? DataType.NUMERIC : DataType.DOUBLE_PRECISION;
+            }
+            if (name.equals("div")) return DataType.NUMERIC;
+            if (name.equals("mod")) {
+                DataType a = fn.args().isEmpty() ? null : inferTypeFromContext(fn.args().get(0), bindings);
+                DataType b = fn.args().size() < 2 ? null : inferTypeFromContext(fn.args().get(1), bindings);
+                if (a == null || a == DataType.TEXT) a = b;
+                if (b == null || b == DataType.TEXT) b = a;
+                if (a == null || b == null) return DataType.NUMERIC;
+                return TypeCoercion.promoteNumeric(a, b);
+            }
+            if (name.equals("gcd") || name.equals("lcm")) {
+                DataType a = fn.args().isEmpty() ? null : inferTypeFromContext(fn.args().get(0), bindings);
+                DataType b = fn.args().size() < 2 ? null : inferTypeFromContext(fn.args().get(1), bindings);
+                if (a == DataType.NUMERIC || b == DataType.NUMERIC) return DataType.NUMERIC;
+                if (a == DataType.BIGINT || b == DataType.BIGINT) return DataType.BIGINT;
+                if (a == DataType.SMALLINT && b == DataType.SMALLINT) return DataType.SMALLINT;
+                return DataType.INTEGER;
+            }
+            if (name.equals("factorial") || name.equals("trim_scale")) return DataType.NUMERIC;
+            if (name.equals("scale") || name.equals("min_scale")
+                    || name.equals("width_bucket")) return DataType.INTEGER;
             if (name.equals("random") || name.equals("pi") || name.equals("degrees")
-                    || name.equals("radians") || name.equals("sin") || name.equals("cos")
-                    || name.equals("tan") || name.equals("asin") || name.equals("acos")
-                    || name.equals("atan") || name.equals("atan2")) return DataType.DOUBLE_PRECISION;
+                    || name.equals("radians") || name.equals("cbrt")
+                    || name.equals("sin") || name.equals("cos")
+                    || name.equals("tan") || name.equals("cot") || name.equals("asin")
+                    || name.equals("acos") || name.equals("atan") || name.equals("atan2")
+                    || name.equals("sind") || name.equals("cosd") || name.equals("tand")
+                    || name.equals("cotd") || name.equals("asind") || name.equals("acosd")
+                    || name.equals("atand") || name.equals("atan2d")
+                    || name.equals("sinh") || name.equals("cosh") || name.equals("tanh")
+                    || name.equals("asinh") || name.equals("acosh") || name.equals("atanh")
+                    || name.equals("random_normal")) return DataType.DOUBLE_PRECISION;
             // ts_rank/ts_rank_cd return float4 (OID 700), not text.
             if (name.equals("ts_rank") || name.equals("ts_rank_cd")) return DataType.REAL;
             if (name.equals("array_sample") || name.equals("array_shuffle")) {

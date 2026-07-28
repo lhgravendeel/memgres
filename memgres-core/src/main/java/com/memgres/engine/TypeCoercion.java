@@ -233,16 +233,33 @@ public final class TypeCoercion {
             case BIGINT:
             case BIGSERIAL:
                 return toLong(value);
-            case REAL:
-                return toFloat(value);
-            case DOUBLE_PRECISION:
-                return toDouble(value);
-            case NUMERIC: {
-                // PG numeric supports NaN, represented as Double.NaN
-                if (value instanceof String && ((String) value).trim().equalsIgnoreCase("NaN")) {
-                    String s = (String) value;
-                    return Double.NaN;
+            case REAL: {
+                Float f = toFloat(value);
+                // A real column that answers Infinity for a stored 1e39 has lost what it was
+                // given, so the value is refused on the way in the way PG refuses it.
+                if (f.isInfinite() && !isInfiniteInput(value)) {
+                    throw outOfFloatRange(value, "real", false);
                 }
+                if (NumericLimits.underflowedToZero(value, f.doubleValue())) {
+                    throw outOfFloatRange(value, "real", true);
+                }
+                return f;
+            }
+            case DOUBLE_PRECISION: {
+                Double d = toDouble(value);
+                if (d.isInfinite() && !isInfiniteInput(value)) {
+                    throw outOfFloatRange(value, "double precision", false);
+                }
+                if (NumericLimits.underflowedToZero(value, d.doubleValue())) {
+                    throw outOfFloatRange(value, "double precision", true);
+                }
+                return d;
+            }
+            case NUMERIC: {
+                // PG's numeric carries NaN and both infinities; memgres holds them as the
+                // matching Double, and they must survive a store as readily as a cast.
+                Double special = NumericLimits.specialNumericOrNull(value);
+                if (special != null) return special;
                 return toBigDecimal(value);
             }
             case MONEY:
@@ -414,7 +431,9 @@ public final class TypeCoercion {
             case DOUBLE_PRECISION:
                 return value instanceof Double;
             case NUMERIC:
-                return value instanceof BigDecimal;
+                // NaN and the infinities have no BigDecimal form and are carried as Doubles;
+                // they are already numeric values and need no further conversion.
+                return value instanceof BigDecimal || NumericLimits.isSpecial(value);
             case MONEY:
                 return value instanceof PgMoney;
             case BOOLEAN:
@@ -658,6 +677,27 @@ public final class TypeCoercion {
         return (long) rounded;
     }
 
+    /**
+     * The out-of-range PG reports for a value that will not fit a float type. A value that
+     * arrived as a float is being narrowed by an operator, which PG names by the operation;
+     * anything else is an input value, which PG quotes.
+     */
+    private static MemgresException outOfFloatRange(Object value, String typeName, boolean underflow) {
+        if (value instanceof Double || value instanceof Float) {
+            return underflow ? NumericLimits.floatUnderflow() : NumericLimits.floatOverflow();
+        }
+        return NumericLimits.outOfRangeForType(value, typeName);
+    }
+
+    /** True when the input was already an infinity, so narrowing it is not an overflow. */
+    private static boolean isInfiniteInput(Object val) {
+        if (val instanceof Double) return ((Double) val).isInfinite();
+        if (val instanceof Float) return ((Float) val).isInfinite();
+        if (!(val instanceof String)) return false;
+        Double special = NumericLimits.specialNumericOrNull(val);
+        return special != null && special.isInfinite();
+    }
+
     static Float toFloat(Object val) {
         if (val instanceof Number) return ((Number) val).floatValue();
         String s = val.toString().trim();
@@ -713,10 +753,20 @@ public final class TypeCoercion {
         // bound the value must stay under, so the check runs for a negative digit count too.
         BigDecimal limit = BigDecimal.ONE.movePointRight(intDigits);
         if (rounded.abs().compareTo(limit) >= 0) {
+            // PG writes the bound as a power of ten except at the exponent zero, where it says 1.
+            String bound = intDigits == 0 ? "1" : "10^" + intDigits;
             throw new MemgresException("numeric field overflow"
                     + "\n  Detail: A field with precision " + precision + ", scale " + scale
-                    + " must round to an absolute value less than 10^" + intDigits + ".", "22003");
+                    + " must round to an absolute value less than " + bound + ".", "22003");
         }
+    }
+
+    /** A declared numeric(p,s) has no room for NaN or an infinity, and PG says which it was. */
+    public static void rejectSpecialForTypmod(double special, int precision, int scale) {
+        String what = Double.isNaN(special) ? "NaN" : "an infinite value";
+        throw new MemgresException("numeric field overflow"
+                + "\n  Detail: A field with precision " + precision + ", scale " + scale
+                + " cannot hold " + what + ".", "22003");
     }
 
     /** Longest a varchar or char may declare: PG packs the length into a typmod capped here. */

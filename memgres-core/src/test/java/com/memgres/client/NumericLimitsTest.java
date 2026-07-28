@@ -314,15 +314,17 @@ class NumericLimitsTest {
     }
 
     @Test void everything_inside_the_domain_still_answers() throws Exception {
-        assertEquals("1", one("SELECT power(0::numeric, 0)"));
-        assertEquals("8", one("SELECT power(2::numeric, 3)"));
-        assertEquals("-8", one("SELECT power(-2::numeric, 3)"));
+        // PG's numeric power and two-argument log answer with a defined 16-decimal scale;
+        // the float8 forms print the shortest round-tripping digits instead.
+        assertEquals("1.0000000000000000", one("SELECT power(0::numeric, 0)"));
+        assertEquals("8.0000000000000000", one("SELECT power(2::numeric, 3)"));
+        assertEquals("-8.0000000000000000", one("SELECT power(-2::numeric, 3)"));
         assertEquals("1", one("SELECT power('NaN'::float8, 0::float8)"));
         assertEquals("1024", one("SELECT 2 ^ 10"));
         assertEquals("0", one("SELECT ln(1)"));
         assertEquals("2", one("SELECT log(100)"));
         assertEquals("2", one("SELECT log10(100)"));
-        assertEquals("10", one("SELECT log(2, 1024)"));
+        assertEquals("10.0000000000000000", one("SELECT log(2, 1024)"));
         assertEquals("3", one("SELECT sqrt(9)"));
         assertEquals("0", one("SELECT asin(0)"));
         assertEquals("0", one("SELECT acos(1)"));
