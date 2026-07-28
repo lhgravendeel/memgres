@@ -309,8 +309,10 @@ class SelectParser {
         if (parser.matchKeywords("GROUP", "BY")) {
             if (sawOrderBy) throw new ParseException("syntax error at or near \"GROUP\"", parser.peek());
             if (sawLimit) throw new ParseException("syntax error at or near \"GROUP\"", parser.peek());
-            // GROUP BY DISTINCT: consume the optional DISTINCT modifier (deduplicates grouping sets)
+            // GROUP BY takes the same set quantifier SELECT does: DISTINCT drops grouping sets
+            // the specification produces more than once, ALL (the default) keeps every one.
             boolean groupByDistinct = parser.matchKeyword("DISTINCT");
+            if (!groupByDistinct) parser.matchKeyword("ALL");
             // Parse potentially multiple GROUP BY elements that may include GROUPING SETS/ROLLUP/CUBE
             groupingSets = parseGroupByClause();
             if (groupingSets != null) {
@@ -319,8 +321,11 @@ class SelectParser {
                     List<List<Expression>> deduped = new ArrayList<>();
                     java.util.Set<String> seenSets = new java.util.LinkedHashSet<>();
                     for (List<Expression> gs : groupingSets) {
-                        String key = gs.toString();
-                        if (seenSets.add(key)) deduped.add(gs);
+                        // A set is what it contains, so the key ignores the order it was written in.
+                        List<String> parts = new ArrayList<>();
+                        for (Expression e : gs) parts.add(String.valueOf(e));
+                        java.util.Collections.sort(parts);
+                        if (seenSets.add(parts.toString())) deduped.add(gs);
                     }
                     groupingSets = deduped;
                 }
@@ -745,16 +750,14 @@ class SelectParser {
      * Parse a GROUP BY list that may include GROUPING SETS, ROLLUP, CUBE, or the empty
      * grouping set (). Returns null if the GROUP BY is a simple expression list (handled
      * separately), or a list-of-lists representing the grouping sets.
-     * Also handles mixed: GROUP BY a, GROUPING SETS ((b), ()) -> cross product.
+     *
+     * <p>Every element of the list contributes a list of grouping sets — one for a plain
+     * expression, several for GROUPING SETS / ROLLUP / CUBE — and the query groups by the
+     * <em>Cartesian product</em> of those lists, not by the first of them. So
+     * {@code GROUP BY ROLLUP(a), ROLLUP(b)} has the four sets {@code (a,b), (a), (b), ()},
+     * and {@code GROUP BY a, GROUPING SETS ((b), ())} has {@code (a,b)} and {@code (a)}.
      */
     List<List<Expression>> parseGroupByClause() {
-        // Check if the first token is GROUPING SETS / ROLLUP / CUBE
-        if (parser.checkKeyword("GROUPING") && parser.checkKeywordAt(1, "SETS")) {
-            return parseGroupingSetsOnly();
-        }
-        if (parser.checkKeyword("ROLLUP") || parser.checkKeyword("CUBE")) {
-            return parseRollupOrCube();
-        }
         // Check if any element in the comma-separated list is GROUPING SETS/ROLLUP/CUBE
         // or the empty grouping set (), by scanning ahead at the top level
         boolean hasGroupingSets = false;
@@ -826,12 +829,27 @@ class SelectParser {
                 for (List<Expression> setFromPart : part) {
                     List<Expression> combined = new ArrayList<>(existing);
                     combined.addAll(setFromPart);
-                    newResult.add(combined);
+                    newResult.add(dedupeWithinSet(combined));
                 }
             }
             result = newResult;
         }
         return result;
+    }
+
+    /**
+     * One grouping set with repeated expressions dropped. Grouping by the same expression twice
+     * partitions the rows exactly as grouping by it once does, and PostgreSQL folds the repeat
+     * away: that is why the six sets of {@code ROLLUP(a), ROLLUP(a,b)} include {@code (a,a,b)}
+     * as a plain {@code (a,b)}, and why GROUP BY DISTINCT can then recognise it as a duplicate.
+     */
+    private static List<Expression> dedupeWithinSet(List<Expression> set) {
+        List<Expression> out = new ArrayList<>(set.size());
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (Expression e : set) {
+            if (seen.add(String.valueOf(e))) out.add(e);
+        }
+        return out;
     }
 
     /** True when the parser sits on "()", the empty grouping set. */

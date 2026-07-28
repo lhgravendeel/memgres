@@ -17,12 +17,48 @@ class SelectAggregateEvaluator {
     private final SelectExecutor select;
     private final AstExecutor executor;
 
-    // Thread-local for passing current grouping set to grouping() function
-    private final ThreadLocal<Set<String>> currentGroupingSetColumns = new ThreadLocal<>();
+    // What GROUPING() reads: the grouping expressions of the set being emitted right now.
+    private final ThreadLocal<GroupingScope> groupingScope = new ThreadLocal<>();
 
     SelectAggregateEvaluator(SelectExecutor select) {
         this.select = select;
         this.executor = select.executor;
+    }
+
+    /**
+     * The grouping set a row is being emitted for, in the form GROUPING() compares against.
+     *
+     * <p>Held per evaluation rather than per query because a scalar sub-select in the select
+     * list may itself group; each pipeline saves the enclosing scope and puts it back, so the
+     * outer GROUPING() still sees the outer query's set.
+     */
+    private static final class GroupingScope {
+        final Set<String> forms;
+        final List<RowContext.TableBinding> bindings;
+
+        GroupingScope(Set<String> forms, List<RowContext.TableBinding> bindings) {
+            this.forms = forms;
+            this.bindings = bindings;
+        }
+    }
+
+    /**
+     * The comparable forms of the expressions a grouping set groups by. A composite element
+     * {@code (a, b)} counts as its members, which is how GROUPING() and the select list read it.
+     */
+    private static Set<String> groupingForms(List<Expression> groupBy,
+                                             List<RowContext.TableBinding> bindings) {
+        Set<String> forms = new HashSet<>();
+        if (groupBy == null) return forms;
+        for (Expression e : groupBy) {
+            forms.add(GroupByValidator.canon(e, bindings));
+            if (e instanceof ArrayExpr && ((ArrayExpr) e).isRow()) {
+                for (Expression el : ((ArrayExpr) e).elements()) {
+                    forms.add(GroupByValidator.canon(el, bindings));
+                }
+            }
+        }
+        return forms;
     }
 
     /**
@@ -126,20 +162,8 @@ class SelectAggregateEvaluator {
             List<Expression> effectiveGroupBy = new ArrayList<>(fixedGroupBy);
             effectiveGroupBy.addAll(resolveGroupByRefs(groupingSet, stmt, baseBindings));
 
-            Set<String> groupingSetColNames = new HashSet<>();
-            for (Expression e : effectiveGroupBy) {
-                if (e instanceof ColumnRef) groupingSetColNames.add(((ColumnRef) e).column().toLowerCase());
-                else groupingSetColNames.add(executor.exprToAlias(e).toLowerCase());
-                // Composite grouping element like (a, b): its member columns are grouped
-                // individually as far as GROUPING() and the select list are concerned.
-                if (e instanceof ArrayExpr && ((ArrayExpr) e).isRow()) {
-                    for (Expression el : ((ArrayExpr) e).elements()) {
-                        if (el instanceof ColumnRef) groupingSetColNames.add(((ColumnRef) el).column().toLowerCase());
-                        else groupingSetColNames.add(executor.exprToAlias(el).toLowerCase());
-                    }
-                }
-            }
-            currentGroupingSetColumns.set(groupingSetColNames);
+            groupingScope.set(new GroupingScope(
+                    groupingForms(effectiveGroupBy, baseBindings), baseBindings));
 
             // Column names that are functionally grouped in this grouping set. Select-list
             // expressions built over these columns evaluate against the group's key values;
@@ -193,7 +217,6 @@ class SelectAggregateEvaluator {
                 windows.recordRow(group, maskedRep);
             }
         }
-        currentGroupingSetColumns.set(null);
 
         // A window over grouping sets runs over every row every set produced, as one result.
         windows.apply(resultColumns, allResultRows);
@@ -359,13 +382,27 @@ class SelectAggregateEvaluator {
 
     QueryResult executeAggregateSelect(SelectStmt stmt, List<RowContext> contexts,
                                         List<RowContext.TableBinding> baseBindings) {
-        if (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty()) {
-            return executeGroupingSetsSelect(stmt, contexts, baseBindings);
+        GroupingScope enclosing = groupingScope.get();
+        try {
+            if (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty()) {
+                return executeGroupingSetsSelect(stmt, contexts, baseBindings);
+            }
+            // Resolve GROUP BY ordinals and aliases
+            List<Expression> resolvedGroupBy = resolveGroupByRefs(stmt.groupBy(), stmt, baseBindings);
+            // A plain GROUP BY has one grouping set, the one it names, and GROUPING() answers
+            // for it as readily as for a set of GROUPING SETS: every listed expression is
+            // grouped, so the answer is 0 and anything else is an error.
+            groupingScope.set(new GroupingScope(
+                    groupingForms(resolvedGroupBy, baseBindings), baseBindings));
+            return executePlainAggregateSelect(stmt, contexts, baseBindings, resolvedGroupBy);
+        } finally {
+            groupingScope.set(enclosing);
         }
+    }
 
-        // Resolve GROUP BY ordinals and aliases
-        List<Expression> resolvedGroupBy = resolveGroupByRefs(stmt.groupBy(), stmt, baseBindings);
-
+    private QueryResult executePlainAggregateSelect(SelectStmt stmt, List<RowContext> contexts,
+                                                    List<RowContext.TableBinding> baseBindings,
+                                                    List<Expression> resolvedGroupBy) {
         boolean hasGroupBy = resolvedGroupBy != null && !resolvedGroupBy.isEmpty();
         List<List<RowContext>> groups;
 
@@ -1535,22 +1572,21 @@ class SelectAggregateEvaluator {
                         .setScale(16, RoundingMode.HALF_UP));
             }
             case "grouping": {
-                Set<String> currentGroupSet = currentGroupingSetColumns.get();
-                if (currentGroupSet == null) {
+                GroupingScope scope = groupingScope.get();
+                if (scope == null) {
                     throw new MemgresException(
                             "arguments to GROUPING must be grouping expressions of the associated query level",
                             "42803");
                 }
-                // Result is a bitmask: bit i (from the left, most significant first) is 1
+                // Result is an int4 bitmask: bit i (from the left, most significant first) is 1
                 // if argument i is NOT grouped in the current grouping set.
                 // grouping(a, b) over ROLLUP(a, b): detail rows 0, a-subtotals 1, grand total 3.
                 int mask = 0;
                 for (Expression arg : fn.args()) {
-                    String colName = arg instanceof ColumnRef ? ((ColumnRef) arg).column().toLowerCase() :
-                            executor.exprToAlias(arg).toLowerCase();
-                    mask = (mask << 1) | (currentGroupSet.contains(colName) ? 0 : 1);
+                    String form = GroupByValidator.canon(arg, scope.bindings);
+                    mask = (mask << 1) | (scope.forms.contains(form) ? 0 : 1);
                 }
-                return mask;
+                return Integer.valueOf(mask);
             }
             case "corr": {
                 RegressionData rd = RegressionData.compute(group, fn.args(), executor);

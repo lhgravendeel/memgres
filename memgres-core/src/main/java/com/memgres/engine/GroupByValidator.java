@@ -257,6 +257,18 @@ final class GroupByValidator {
             if (node instanceof Statement) return;
             if (node instanceof Expression) {
                 Expression expr = (Expression) node;
+                // GROUPING reports whether the current grouping set includes the expression it
+                // names, so what it names has to be one the query groups by — in a plain
+                // GROUP BY just as much as under GROUPING SETS, where it always answers 0.
+                if (isGroupingCall(expr)) {
+                    for (Expression arg : ((com.memgres.engine.parser.ast.FunctionCallExpr) expr).args()) {
+                        if (!groupedForms.contains(canon(arg, bindings))) {
+                            throw new MemgresException("arguments to GROUPING must be grouping "
+                                    + "expressions of the associated query level", "42803");
+                        }
+                    }
+                    return;
+                }
                 // An aggregate consumes whatever it reads, including its FILTER and ORDER BY.
                 if (isAggregateCall(expr)) return;
                 if (groupedForms.contains(canon(expr, bindings))) return;
@@ -291,6 +303,28 @@ final class GroupByValidator {
             }
             return true;
         }
+    }
+
+    /** True when a GROUPING(...) call stands anywhere in this query level's own tree. */
+    static boolean containsGroupingCall(Object node) {
+        if (node == null) return false;
+        // A nested query does its own grouping, and its GROUPING belongs to it.
+        if (node instanceof Statement) return false;
+        if (node instanceof Expression && isGroupingCall((Expression) node)) return true;
+        final boolean[] found = {false};
+        AstWalk.forEachChild(node, new java.util.function.Consumer<Object>() {
+            public void accept(Object child) {
+                if (!found[0] && containsGroupingCall(child)) found[0] = true;
+            }
+        });
+        return found[0];
+    }
+
+    /** True for a call to GROUPING(...), whichever schema it is written with. */
+    static boolean isGroupingCall(Expression expr) {
+        if (!(expr instanceof com.memgres.engine.parser.ast.FunctionCallExpr)) return false;
+        String name = ((com.memgres.engine.parser.ast.FunctionCallExpr) expr).name();
+        return name != null && "grouping".equals(FunctionEvaluator.stripSchemaPrefix(name.toLowerCase()));
     }
 
     private boolean isAggregateCall(Expression expr) {
@@ -352,7 +386,7 @@ final class GroupByValidator {
      * per-node-type visitor: the set of expression classes grows, and a visitor that stops
      * covering one silently starts accepting ungrouped columns inside it.
      */
-    private static String canon(Object node, List<RowContext.TableBinding> bindings) {
+    static String canon(Object node, List<RowContext.TableBinding> bindings) {
         if (node == null) return "~";
         if (node instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) node;

@@ -2841,6 +2841,7 @@ class ExprEvaluator {
                     || name.equals("array_ndims") || name.equals("array_upper")
                     || name.equals("array_lower")
                     || name.equals("num_nonnulls") || name.equals("num_nulls")
+                    || name.equals("grouping")
                     || name.equals("array_position")) return DataType.INTEGER;
             if (name.equals("array_positions")) return DataType.INT4_ARRAY;
             if (name.equals("sum") || name.equals("avg")) {

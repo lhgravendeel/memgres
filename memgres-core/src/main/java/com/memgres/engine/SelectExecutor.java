@@ -112,7 +112,7 @@ class SelectExecutor {
             validateDistinctOn(stmt);
             windowEvaluator.validateWindowUsage(stmt);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
-                    || (stmt.having() != null && containsAggregate(stmt.having()));
+                    || stmt.having() != null;
             if (hasAgg) {
                 Table virtualTable = new Table("__virtual__",
                         Cols.listOf(new Column("__dummy__", DataType.INTEGER, true, false, null)));
@@ -272,6 +272,11 @@ class SelectExecutor {
                 throw new MemgresException("window functions are not allowed in WHERE", "42P20");
             }
             if (containsAggregate(stmt.where())) {
+                // GROUPING reads the grouping rather than the rows, and PostgreSQL names it as
+                // its own kind of operation where it may not stand.
+                if (GroupByValidator.containsGroupingCall(stmt.where())) {
+                    throw new MemgresException("grouping operations are not allowed in WHERE", "42803");
+                }
                 throw new MemgresException("aggregate functions are not allowed in WHERE", "42803");
             }
             // Pre-flight type validation of WHERE clause (PG checks at plan time)
@@ -313,7 +318,12 @@ class SelectExecutor {
                 hasAggregateInOrderBy(stmt.orderBy()) ||
                 hasAggregateInWindowDefs(stmt.windowDefs());
 
-        if (hasGroupBy || hasGroupingSets || hasAggregates) {
+        // HAVING makes the query grouped whether or not anything in it aggregates: with no
+        // GROUP BY the whole table is one group, so the query answers at most one row and its
+        // select list is judged against that group. WHERE does not change that — the group is
+        // there even when no row reaches it, which is why "WHERE false HAVING true" still
+        // answers one row.
+        if (hasGroupBy || hasGroupingSets || hasAggregates || stmt.having() != null) {
             // A star stands for the columns it expands to, and grouping is judged — and GROUP BY
             // ordinals counted — over those columns, not over the star itself.
             SelectStmt grouped = stmt;
