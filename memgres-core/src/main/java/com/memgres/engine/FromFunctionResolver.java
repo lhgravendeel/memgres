@@ -171,6 +171,7 @@ class FromFunctionResolver {
                 cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
             }
             Table virtualTable = new Table(alias, cols);
+            List<Object[]> rows = new ArrayList<>();
             List<RowContext> contexts = new ArrayList<>();
             java.time.OffsetDateTime cur = tzStart;
             long ord = 1;
@@ -178,13 +179,14 @@ class FromFunctionResolver {
                 if ((guard & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (ascending ? cur.isAfter(tzStop) : cur.isBefore(tzStop)) break;
                 Object[] row = hasOrdinality ? new Object[]{cur, ord++} : new Object[]{cur};
-                virtualTable.insertRow(row);
+                rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
                 java.time.OffsetDateTime next = ivStep.addTo(cur);
                 if (next.isEqual(cur)) break;
                 cur = next;
                 if (guard == MAX_SERIES_ROWS - 1) throw seriesTooLarge();
             }
+            virtualTable.replaceAllRows(rows);
             return contexts;
         }
         // Date/timestamp overload
@@ -203,6 +205,7 @@ class FromFunctionResolver {
                 cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
             }
             Table virtualTable = new Table(alias, cols);
+            List<Object[]> rows = new ArrayList<>();
             List<RowContext> contexts = new ArrayList<>();
             java.time.LocalDateTime cur = dtStart;
             long ord = 1;
@@ -211,13 +214,14 @@ class FromFunctionResolver {
                 if (ascending ? cur.isAfter(dtStop) : cur.isBefore(dtStop)) break;
                 Object val = dateInput ? cur.atZone(java.time.ZoneOffset.UTC).toOffsetDateTime() : cur;
                 Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
-                virtualTable.insertRow(row);
+                rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
                 java.time.LocalDateTime next = ivStep.addTo(cur);
                 if (next.isEqual(cur)) break;
                 cur = next;
                 if (guard == MAX_SERIES_ROWS - 1) throw seriesTooLarge();
             }
+            virtualTable.replaceAllRows(rows);
             return contexts;
         }
         // Numeric overload: a fractional bound or step must not be truncated to bigint
@@ -235,6 +239,7 @@ class FromFunctionResolver {
                 numCols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
             }
             Table numTable = new Table(alias, numCols);
+            List<Object[]> numRows = new ArrayList<>();
             List<RowContext> numContexts = new ArrayList<>();
             boolean up = nStep.signum() > 0;
             long numOrd = 1;
@@ -244,10 +249,12 @@ class FromFunctionResolver {
                  up ? v.compareTo(nStop) <= 0 : v.compareTo(nStop) >= 0;
                  v = v.add(nStep)) {
                 if ((numProduced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
+                if (numRows.size() >= MAX_SERIES_ROWS) throw seriesTooLarge();
                 Object[] row = hasOrdinality ? new Object[]{v, numOrd++} : new Object[]{v};
-                numTable.insertRow(row);
+                numRows.add(row);
                 numContexts.add(new RowContext(numTable, alias, row));
             }
+            numTable.replaceAllRows(numRows);
             return numContexts;
         }
         try {
@@ -267,26 +274,30 @@ class FromFunctionResolver {
             cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
         }
         Table virtualTable = new Table(alias, cols);
+        List<Object[]> rows = new ArrayList<>();
         List<RowContext> contexts = new ArrayList<>();
         long ord = 1;
         long produced = 0;
-        if (step > 0) {
-            for (long v = start; v <= stop; v += step) {
+        if (step != 0) {
+            boolean ascending = step > 0;
+            long v = start;
+            while (ascending ? v <= stop : v >= stop) {
                 if ((produced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
+                if (rows.size() >= MAX_SERIES_ROWS) throw seriesTooLarge();
                 Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
                 Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
-                virtualTable.insertRow(row);
+                rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
-            }
-        } else if (step < 0) {
-            for (long v = start; v >= stop; v += step) {
-                if ((produced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
-                Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
-                Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
-                virtualTable.insertRow(row);
-                contexts.add(new RowContext(virtualTable, alias, row));
+                long next = v + step;
+                // A series that runs to the edge of bigint wraps on its last step; the loop
+                // condition would then hold again and never end.
+                if (((v ^ next) & (step ^ next)) < 0) break;
+                v = next;
             }
         }
+        // Publish the rows in one go: Table.insertRow copies the whole row list on every call, so
+        // filling a large series through it is quadratic and five million rows never finished.
+        virtualTable.replaceAllRows(rows);
         return contexts;
     }
 
