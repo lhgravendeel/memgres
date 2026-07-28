@@ -213,6 +213,13 @@ public final class JsonOperations {
         return json != null && json.trim().startsWith("[");
     }
 
+    /** True when the JSON text is a quoted string rather than a number, boolean or container. */
+    public static boolean isString(String json) {
+        if (json == null) return false;
+        String t = json.trim();
+        return t.length() >= 2 && t.charAt(0) == '"' && t.charAt(t.length() - 1) == '"';
+    }
+
     /**
      * True when the JSON text is a scalar — a string, number, boolean or null. PG names this
      * shape in the errors it raises for an operation that needs a container.
@@ -645,11 +652,23 @@ public final class JsonOperations {
     // ---- JSON parsing helpers ----
 
     public static Map<String, String> parseObjectKeys(String json) {
-        Map<String, String> result = new TreeMap<>((a, b) -> {
+        return parseObject(json, new TreeMap<String, String>((a, b) -> {
             // PG jsonb key ordering: shorter keys first, then lexicographic
             if (a.length() != b.length()) return Integer.compare(a.length(), b.length());
             return a.compareTo(b);
-        });
+        }));
+    }
+
+    /**
+     * The members of an object in the order the text lists them. jsonb reorders its keys when it
+     * stores them, but the json type keeps the document as written, so anything that walks a json
+     * value has to walk it in that order.
+     */
+    public static Map<String, String> parseObjectKeysInOrder(String json) {
+        return parseObject(json, new java.util.LinkedHashMap<String, String>());
+    }
+
+    private static Map<String, String> parseObject(String json, Map<String, String> result) {
         json = json.trim();
         if (!json.startsWith("{") || !json.endsWith("}")) return result;
         String inner = json.substring(1, json.length() - 1).trim();

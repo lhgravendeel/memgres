@@ -2744,10 +2744,6 @@ class FunctionEvaluator {
         return jsonFunctions.evaluateJsonPathAll(json, path);
     }
 
-    Boolean evaluateJsonPathPredicate(String json, String path) {
-        return jsonFunctions.evaluateJsonPathPredicate(json, path);
-    }
-
     boolean evaluateJsonPathExists(String json, String path) {
         return jsonFunctions.evaluateJsonPathExists(json, path);
     }
@@ -2757,6 +2753,7 @@ class FunctionEvaluator {
      * that does not have the shape the path asks for makes them NULL rather than an error.
      */
     Boolean evaluateJsonPathExistsSilent(String json, String path) {
+        json = JsonOperations.normalizeJsonb(json);
         try {
             return jsonFunctions.evaluateJsonPathExists(json, path);
         } catch (MemgresException e) {
@@ -2765,9 +2762,15 @@ class FunctionEvaluator {
         }
     }
 
-    Boolean evaluateJsonPathPredicateSilent(String json, String path) {
+    /**
+     * The @@ operator is jsonb_path_match with the silent flag always on, so a path that does not
+     * produce a single boolean makes it NULL rather than raising.
+     */
+    Boolean evaluateJsonPathMatchSilent(String json, String path) {
+        json = JsonOperations.normalizeJsonb(json);
         try {
-            return jsonFunctions.evaluateJsonPathPredicate(json, path);
+            Object result = jsonFunctions.evalPathMatch(json, path);
+            return result instanceof Boolean ? (Boolean) result : null;
         } catch (MemgresException e) {
             if (!JsonFunctions.isSuppressible(e)) throw e;
             return null;

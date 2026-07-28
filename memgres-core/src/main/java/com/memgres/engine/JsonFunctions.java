@@ -57,6 +57,15 @@ class JsonFunctions {
                 + (JsonOperations.isArray(json) ? "an array" : "a scalar"), "22023");
     }
 
+    /**
+     * The members a json_each or json_object_keys call walks. The jsonb family sees the keys in
+     * the order jsonb stores them; the json family sees the document as it was written.
+     */
+    static Map<String, String> eachMembers(String name, String json) {
+        return name.startsWith("jsonb_")
+                ? JsonOperations.parseObjectKeys(json) : JsonOperations.parseObjectKeysInOrder(json);
+    }
+
     /** json_each words its refusal as deconstruction, jsonb_each as a call on a non-object. */
     static void requireJsonEachObject(String name, String json) {
         if (JsonOperations.isObject(json)) return;
@@ -236,7 +245,7 @@ class JsonFunctions {
                 boolean silent = fn.args().size() > 3
                         && executor.isTruthy(executor.evalExpr(fn.args().get(3), ctx));
                 try {
-                    return evalPathMatch(jsonVal.toString(), path);
+                    return evalPathMatch(JsonOperations.normalizeJsonb(jsonVal.toString()), path);
                 } catch (MemgresException e) {
                     if (!silent || !isSuppressible(e)) throw e;
                     return null;
@@ -322,14 +331,31 @@ class JsonFunctions {
                 }
                 return elements; // Return as List for SRF expansion
             }
+            case "json_each":
+            case "jsonb_each":
+            case "json_each_text":
+            case "jsonb_each_text": {
+                Object json = executor.evalExpr(fn.args().get(0), ctx);
+                // A set-returning function given NULL produces no rows at all
+                if (json == null) return new ArrayList<>();
+                String s = json.toString().trim();
+                requireJsonEachObject(name, s);
+                boolean asText = name.endsWith("_text");
+                List<Object> rows = new ArrayList<>();
+                for (Map.Entry<String, String> entry : eachMembers(name, s).entrySet()) {
+                    String value = entry.getValue() == null ? null : entry.getValue().trim();
+                    rows.add(RecordValue.of("key", entry.getKey(), "value",
+                            asText ? JsonOperations.jsonValueToText(value) : value));
+                }
+                return rows; // Return as List for SRF expansion
+            }
             case "jsonb_object_keys":
             case "json_object_keys": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
                 if (json == null) return new ArrayList<>();
                 String s = json.toString().trim();
                 requireJsonObject(name, s);
-                Map<String, String> map = JsonOperations.parseObjectKeys(s);
-                return new ArrayList<>(map.keySet());
+                return new ArrayList<>(eachMembers(name, s).keySet());
             }
             case "jsonb_set": {
                 Object json = executor.evalExpr(fn.args().get(0), ctx);
@@ -657,6 +683,20 @@ class JsonFunctions {
     }
 
     /**
+     * The column names a record-returning built-in produces, or null when the expression does not
+     * call one. {@code (jsonb_each(x)).*} has to know the shape before a row has been read.
+     */
+    static List<String> recordFieldNames(Expression expr) {
+        if (!(expr instanceof FunctionCallExpr)) return null;
+        String name = FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) expr).name().toLowerCase());
+        if (name.equals("json_each") || name.equals("jsonb_each")
+                || name.equals("json_each_text") || name.equals("jsonb_each_text")) {
+            return Cols.listOf("key", "value");
+        }
+        return null;
+    }
+
+    /**
      * A jsonpath may open with a {@code strict} or {@code lax} mode word. lax is the default and
      * the mode only changes how a missing step is reported, so the word is consumed here and the
      * strictness recorded for the evaluator.
@@ -709,43 +749,6 @@ class JsonFunctions {
                 && Character.isWhitespace(p.charAt(6));
     }
 
-    /**
-     * Strict mode makes a step that finds nothing an error instead of an empty result, and
-     * refuses to auto-unwrap a scalar for an array accessor. Lax mode -- the default -- simply
-     * returns no rows, which is what the general evaluator does.
-     */
-    private List<String> evaluateStrictJsonPath(String json, String path) {
-        String rest = path.startsWith("$") ? path.substring(1) : path;
-        String node = json.trim();
-        int i = 0;
-        while (i < rest.length()) {
-            char c = rest.charAt(i);
-            if (c == '.') {
-                i++;
-                int start = i;
-                while (i < rest.length() && rest.charAt(i) != '.' && rest.charAt(i) != '[') i++;
-                String key = rest.substring(start, i);
-                if (key.isEmpty() || key.equals("*")) break;
-                String child = JsonOperations.extractKey(node, key);
-                if (child == null) {
-                    throw new MemgresException(
-                            "JSON object does not contain key \"" + key + "\"", "2203A");
-                }
-                node = child.trim();
-            } else if (c == '[') {
-                if (!node.startsWith("[")) {
-                    throw new MemgresException(
-                            "jsonpath wildcard array accessor can only be applied to an array", "2203A");
-                }
-                break;
-            } else {
-                break;
-            }
-        }
-        // Everything the strict walk did not consume is handled by the general evaluator
-        return evaluateLaxJsonPath(json, path);
-    }
-
     List<String> evaluateJsonPathAll(String json, String path) {
         final boolean strict = isStrictJsonPath(path);
         path = stripJsonPathMode(path);
@@ -753,13 +756,11 @@ class JsonFunctions {
             final String doc = json;
             return JsonPathArithmetic.evaluate(path, new JsonPathArithmetic.PathEvaluator() {
                 @Override public List<String> evaluate(String operandPath) {
-                    return strict ? evaluateStrictJsonPath(doc, operandPath)
-                            : evaluateLaxJsonPath(doc, operandPath);
+                    return evaluateJsonPath(doc, operandPath, strict);
                 }
             });
         }
-        if (strict) return evaluateStrictJsonPath(json, path);
-        return evaluateLaxJsonPath(json, path);
+        return evaluateJsonPath(json, path, strict);
     }
 
     /**
@@ -802,6 +803,10 @@ class JsonFunctions {
         }
         boolean silent = fn.args().size() > 3
                 && executor.isTruthy(executor.evalExpr(fn.args().get(3), ctx));
+        // The document argument is jsonb, so a literal written any other way is read as jsonb
+        // first: what the path selects out of it is printed the way jsonb prints, not the way the
+        // literal happened to be spaced.
+        String document = JsonOperations.normalizeJsonb(jsonVal.toString());
         // The mode word is part of the path; check the shape after it. An expression may open
         // with an operand of its own, so only something that is neither is a syntax error.
         String bodyPath = stripJsonPathMode(path);
@@ -810,38 +815,62 @@ class JsonFunctions {
             throw new MemgresException("syntax error at or near \""
                     + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
         }
-        return new PathCall(jsonVal.toString(), path, silent);
+        return new PathCall(document, path, silent);
     }
 
-    /** jsonb_path_match: the path has to produce one boolean. */
-    private Object evalPathMatch(String json, String path) {
+    /**
+     * jsonb_path_match: the path has to produce exactly one boolean. A path that produces a
+     * number, nothing at all, or more than one item is not a mistake PG guesses its way past --
+     * a caller asking "does this match" gets told the question had no single answer.
+     */
+    Object evalPathMatch(String json, String path) {
         // Handle exists(...) syntax
         if (path.startsWith("exists(") && path.endsWith(")")) {
             return evaluateJsonPathExists(json, path.substring(7, path.length() - 1).trim());
         }
-        // Handle predicate expressions like $.a == 2
-        // Check if the path contains a comparison operator at the top level
-        String[] compOps = {"==", "!=", ">=", "<=", ">", "<"};
-        for (String op : compOps) {
-            if (path.contains(op)) return evaluateJsonPathPredicate(json, path);
-        }
+        if (isTopLevelPredicate(path)) return evaluateJsonPathPredicate(json, path);
         // The mode word is part of the path; check the shape after it
         String bodyPath = stripJsonPathMode(path);
         if (!bodyPath.startsWith("$") && !bodyPath.startsWith("@")) {
             throw new MemgresException("syntax error at or near \""
                     + bodyPath.substring(0, Math.min(3, bodyPath.length())) + "\" of jsonpath input", "42601");
         }
-        Object result = evaluateJsonPath(json, path);
-        if (result == null) return null;
-        if (result instanceof Boolean) return result;
-        String rs = result.toString().trim();
-        if (rs.equals("true")) return true;
-        if (rs.equals("false")) return false;
-        // jsonb_path_match result must be boolean; SQLSTATE 22038
-        throw new MemgresException("jsonpath item method .boolean() can only be applied to a boolean, numeric, or string JSON item", "22038");
+        List<String> results = evaluateJsonPathAll(json, path);
+        if (results.size() == 1) {
+            String rs = results.get(0).trim();
+            if (rs.equals("true")) return true;
+            if (rs.equals("false")) return false;
+        }
+        throw new MemgresException("single boolean result is expected", "22038");
     }
 
-    private List<String> evaluateLaxJsonPath(String json, String path) {
+    /** True when the path is a comparison rather than a path that selects items. */
+    private static boolean isTopLevelPredicate(String path) {
+        return findTopLevelComparison(path) != null;
+    }
+
+    /** The comparison operator and its position in the path, or null when there is none. */
+    private static String[] findTopLevelComparison(String path) {
+        String[] ops = {"==", "!=", ">=", "<=", ">", "<"};
+        for (String op : ops) {
+            int depth = 0;
+            boolean inString = false;
+            for (int i = 0; i + op.length() <= path.length(); i++) {
+                char c = path.charAt(i);
+                if (c == '\\' && inString) { i++; continue; }
+                if (c == '"') { inString = !inString; continue; }
+                if (inString) continue;
+                if (c == '(' || c == '[' || c == '{') depth++;
+                else if (c == ')' || c == ']' || c == '}') depth--;
+                else if (depth == 0 && path.startsWith(op, i)) {
+                    return new String[]{op, Integer.toString(i)};
+                }
+            }
+        }
+        return null;
+    }
+
+    private List<String> evaluateJsonPath(String json, String path, boolean strict) {
         // PG does not support recursive descent ($..key) — throw syntax error
         if (path.contains("..")) {
             throw new MemgresException("syntax error at or near \".\" of jsonpath input", "42601");
@@ -916,34 +945,11 @@ class JsonFunctions {
                             }
                         }
                         current = next;
-                    } else if (key.equals("datetime()")) {
-                        // .datetime() method: convert date/datetime strings to ISO datetime with timezone
-                        List<String> next = new ArrayList<>();
-                        for (String node : current) {
-                            node = node.trim();
-                            String unquoted = node;
-                            if (unquoted.startsWith("\"") && unquoted.endsWith("\"")) {
-                                unquoted = unquoted.substring(1, unquoted.length() - 1);
-                            }
-                            // If it's a date-only string (yyyy-MM-dd), expand to full datetime with timezone
-                            if (unquoted.matches("\\d{4}-\\d{2}-\\d{2}") ) {
-                                next.add("\"" + unquoted + "T00:00:00+00:00\"");
-                            } else if (unquoted.endsWith("Z")) {
-                                // Convert trailing Z to +00:00
-                                String withoutZ = unquoted.substring(0, unquoted.length() - 1);
-                                next.add("\"" + withoutZ + "+00:00\"");
-                            } else {
-                                // Already has timezone or other format — pass through
-                                next.add(node);
-                            }
-                        }
-                        current = next;
+                    } else if (JsonPathItems.isMethod(key)) {
+                        current = JsonPathItems.apply(key, current, strict);
                     } else {
                         List<String> next = new ArrayList<>();
-                        for (String node : current) {
-                            String extracted = JsonOperations.extractKey(node, key);
-                            if (extracted != null) next.add(extracted.trim());
-                        }
+                        for (String node : current) applyMember(node.trim(), key, strict, next);
                         current = next;
                     }
                 }
@@ -960,6 +966,10 @@ class JsonFunctions {
                         if (node.startsWith("[")) {
                             List<String> elems = JsonOperations.parseArrayElements(node);
                             for (String e : elems) next.add(e.trim());
+                        } else if (strict) {
+                            throw new MemgresException(
+                                    "jsonpath wildcard array accessor can only be applied to an array",
+                                    "22039");
                         } else {
                             // lax mode treats a non-array as a one-element array before indexing
                             next.add(node);
@@ -967,18 +977,9 @@ class JsonFunctions {
                     }
                     current = next;
                 } else {
-                    try {
-                        int idx = Integer.parseInt(idxStr);
-                        List<String> next = new ArrayList<>();
-                        for (String node : current) {
-                            node = node.trim();
-                            if (node.startsWith("[")) {
-                                String elem = JsonOperations.extractArrayElement(node, idx);
-                                if (elem != null) next.add(elem.trim());
-                            }
-                        }
-                        current = next;
-                    } catch (NumberFormatException e) { /* skip */ }
+                    List<int[]> ranges = parseSubscripts(idxStr);
+                    // A subscript this evaluator cannot read is left alone rather than guessed at
+                    if (ranges != null) current = applySubscripts(current, ranges, strict);
                 }
             } else {
                 i++;
@@ -1001,13 +1002,135 @@ class JsonFunctions {
         if (postFilterPath != null && !postFilterPath.isEmpty()) {
             List<String> postResults = new ArrayList<>();
             for (String node : current) {
-                List<String> r = evaluateJsonPathAll(node, "$" + postFilterPath);
-                postResults.addAll(r);
+                postResults.addAll(evaluateJsonPath(node, "$" + postFilterPath, strict));
             }
             current = postResults;
         }
 
         return current;
+    }
+
+    /**
+     * A member accessor wants an object. lax mode looks inside an array once, so a path written
+     * for one object also reads a list of them; strict mode says the document is not shaped the
+     * way the path claims rather than quietly matching nothing.
+     */
+    private void applyMember(String node, String key, boolean strict, List<String> out) {
+        if (JsonOperations.isObject(node)) {
+            String extracted = JsonOperations.extractKey(node, key);
+            if (extracted != null) {
+                out.add(extracted.trim());
+            } else if (strict) {
+                throw new MemgresException(
+                        "JSON object does not contain key \"" + key + "\"", "2203A");
+            }
+            return;
+        }
+        if (strict) {
+            throw new MemgresException(
+                    "jsonpath member accessor can only be applied to an object", "2203A");
+        }
+        if (JsonOperations.isArray(node)) {
+            for (String element : JsonOperations.parseArrayElements(node)) {
+                String elem = element.trim();
+                if (!JsonOperations.isObject(elem)) continue;
+                String extracted = JsonOperations.extractKey(elem, key);
+                if (extracted != null) out.add(extracted.trim());
+            }
+        }
+    }
+
+    /**
+     * The subscripts of one accessor, e.g. {@code [0, 2 to last]}. Each range is held as four
+     * numbers -- whether the start counts from {@code last} and by how much, then the same for
+     * the end -- because {@code last} is only known once the array being indexed is.
+     *
+     * @return null when the text is not a subscript list this evaluator understands
+     */
+    private static List<int[]> parseSubscripts(String text) {
+        List<int[]> ranges = new ArrayList<>();
+        for (String part : splitJsonPairs(text)) {
+            String item = part.trim();
+            if (item.isEmpty()) return null;
+            int toIdx = indexOfToKeyword(item);
+            String fromText = toIdx < 0 ? item : item.substring(0, toIdx).trim();
+            String endText = toIdx < 0 ? item : item.substring(toIdx + 2).trim();
+            int[] from = parseSubscriptBound(fromText);
+            int[] end = parseSubscriptBound(endText);
+            if (from == null || end == null) return null;
+            ranges.add(new int[]{from[0], from[1], end[0], end[1]});
+        }
+        return ranges.isEmpty() ? null : ranges;
+    }
+
+    /** The position of the {@code to} keyword separating a range's two bounds, or -1. */
+    private static int indexOfToKeyword(String item) {
+        for (int i = 1; i + 2 < item.length(); i++) {
+            if (!Character.isWhitespace(item.charAt(i - 1))) continue;
+            if (!item.regionMatches(true, i, "to", 0, 2)) continue;
+            if (!Character.isWhitespace(item.charAt(i + 2))) continue;
+            return i;
+        }
+        return -1;
+    }
+
+    /** A bound is an integer, {@code last}, or {@code last} shifted by an integer. */
+    private static int[] parseSubscriptBound(String text) {
+        String s = text.trim();
+        if (s.regionMatches(true, 0, "last", 0, 4)) {
+            String rest = s.substring(4).trim();
+            if (rest.isEmpty()) return new int[]{1, 0};
+            char sign = rest.charAt(0);
+            if (sign != '+' && sign != '-') return null;
+            try {
+                int offset = Integer.parseInt(rest.substring(1).trim());
+                return new int[]{1, sign == '-' ? -offset : offset};
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        try {
+            return new int[]{0, Integer.parseInt(s)};
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * lax mode clamps a subscript to what the array holds and treats a non-array as an array of
+     * one; strict mode refuses both, because a path that names element 5 of a three-element array
+     * has misread the document.
+     */
+    private List<String> applySubscripts(List<String> nodes, List<int[]> ranges, boolean strict) {
+        List<String> next = new ArrayList<>();
+        for (String raw : nodes) {
+            String node = raw.trim();
+            List<String> elements;
+            if (JsonOperations.isArray(node)) {
+                elements = JsonOperations.parseArrayElements(node);
+            } else if (strict) {
+                throw new MemgresException(
+                        "jsonpath array accessor can only be applied to an array", "22039");
+            } else {
+                elements = Cols.listOf(node);
+            }
+            int size = elements.size();
+            for (int[] range : ranges) {
+                int from = range[0] == 1 ? size - 1 + range[1] : range[1];
+                int to = range[2] == 1 ? size - 1 + range[3] : range[3];
+                if (strict) {
+                    if (from < 0 || from > to || to >= size) {
+                        throw new MemgresException(
+                                "jsonpath array subscript is out of bounds", "22033");
+                    }
+                } else {
+                    if (from < 0) from = 0;
+                    if (to > size - 1) to = size - 1;
+                }
+                for (int k = from; k <= to; k++) next.add(elements.get(k).trim());
+            }
+        }
+        return next;
     }
 
     private boolean evaluateJsonPathFilter(String nodeJson, String filter) {
@@ -1116,132 +1239,83 @@ class JsonFunctions {
         return -1;
     }
 
+    /**
+     * A jsonpath comparison compares every item the left side produces against the right, and is
+     * true as soon as one pair matches. A step that cannot be walked -- a missing key under
+     * strict, a subscript past the end -- makes the answer unknown rather than an error, which is
+     * why {@code jsonb_path_match} on a strict path that misses answers NULL instead of failing.
+     */
     Boolean evaluateJsonPathPredicate(String json, String path) {
-        String[] ops = {"==", "!=", ">=", "<=", ">", "<"};
-        for (String op : ops) {
-            int depth = 0;
-            for (int i = 0; i < path.length() - op.length() + 1; i++) {
-                char c = path.charAt(i);
-                if (c == '(' || c == '[' || c == '{') depth++;
-                else if (c == ')' || c == ']' || c == '}') depth--;
-                else if (depth == 0 && path.startsWith(op, i)) {
-                    String leftExpr = path.substring(0, i).trim();
-                    String rightExpr = path.substring(i + op.length()).trim();
-                    List<String> leftResults = evaluateJsonPathAll(json, leftExpr);
-                    if (leftResults.isEmpty()) return null;
-                    String leftVal = leftResults.get(0).trim();
-                    String rightVal = rightExpr.trim();
-                    // Handle .datetime() method on the right-hand side literal
-                    if (rightVal.endsWith(".datetime()")) {
-                        String rawRight = rightVal.substring(0, rightVal.length() - ".datetime()".length()).trim();
-                        if (rawRight.startsWith("\"") && rawRight.endsWith("\"")) {
-                            String dateStr = rawRight.substring(1, rawRight.length() - 1);
-                            if (dateStr.matches("\\d{4}-\\d{2}-\\d{2}")) {
-                                rightVal = "\"" + dateStr + "T00:00:00+00:00\"";
-                            } else if (dateStr.endsWith("Z")) {
-                                rightVal = "\"" + dateStr.substring(0, dateStr.length() - 1) + "+00:00\"";
-                            } else {
-                                rightVal = rawRight;
-                            }
-                        }
-                    }
-                    if (rightVal.startsWith("\"") && rightVal.endsWith("\"")) {
-                        rightVal = rightVal.substring(1, rightVal.length() - 1);
-                        if (leftVal.startsWith("\"") && leftVal.endsWith("\"")) {
-                            leftVal = leftVal.substring(1, leftVal.length() - 1);
-                        }
-                        int cmp = leftVal.compareTo(rightVal);
-                        switch (op) {
-                            case "==":
-                                return cmp == 0;
-                            case "!=":
-                                return cmp != 0;
-                            case ">":
-                                return cmp > 0;
-                            case "<":
-                                return cmp < 0;
-                            case ">=":
-                                return cmp >= 0;
-                            case "<=":
-                                return cmp <= 0;
-                            default:
-                                return false;
-                        }
-                    }
-                    try {
-                        double leftNum = Double.parseDouble(leftVal);
-                        double rightNum = Double.parseDouble(rightVal);
-                        switch (op) {
-                            case "==":
-                                return leftNum == rightNum;
-                            case "!=":
-                                return leftNum != rightNum;
-                            case ">":
-                                return leftNum > rightNum;
-                            case "<":
-                                return leftNum < rightNum;
-                            case ">=":
-                                return leftNum >= rightNum;
-                            case "<=":
-                                return leftNum <= rightNum;
-                            default:
-                                return false;
-                        }
-                    } catch (NumberFormatException e) {
-                        int cmp = leftVal.compareTo(rightVal);
-                        switch (op) {
-                            case "==":
-                                return cmp == 0;
-                            case "!=":
-                                return cmp != 0;
-                            default:
-                                return false;
-                        }
-                    }
-                }
-            }
+        String[] found = findTopLevelComparison(path);
+        if (found == null) return false;
+        String op = found[0];
+        int at = Integer.parseInt(found[1]);
+        String leftExpr = path.substring(0, at).trim();
+        String rightVal = normalizePredicateLiteral(path.substring(at + op.length()).trim());
+        List<String> leftResults;
+        try {
+            leftResults = evaluateJsonPathAll(json, leftExpr);
+        } catch (MemgresException e) {
+            if (!isSuppressible(e)) throw e;
+            return null;
+        }
+        for (String left : leftResults) {
+            if (compareJsonValues(left.trim(), rightVal, op)) return true;
         }
         return false;
     }
 
-    boolean evaluateJsonPathExists(String json, String path) {
-        if (path.equals("$")) return true;
-        // Check if this is a predicate expression (contains comparison operators at top level)
-        String[] compOps = {"==", "!=", ">=", "<=", ">", "<"};
-        boolean isPredicate = false;
-        for (String op : compOps) {
-            // Check for comparison operators at depth 0
-            int depth = 0;
-            for (int i = 0; i < path.length() - op.length() + 1; i++) {
-                char c = path.charAt(i);
-                if (c == '(' || c == '[' || c == '{') depth++;
-                else if (c == ')' || c == ']' || c == '}') depth--;
-                else if (depth == 0 && path.startsWith(op, i)) {
-                    isPredicate = true;
-                    break;
-                }
-            }
-            if (isPredicate) break;
-        }
-        if (isPredicate) {
-            // Strip .datetime() method calls — they convert JSON strings to datetime for comparison.
-            // ISO datetime strings compare correctly as strings, so just strip the method call.
-            String cleanPath = path.replace(".datetime()", "");
-            Boolean result = evaluateJsonPathPredicate(json, cleanPath);
-            return result != null && result;
-        }
-        List<String> results = evaluateJsonPathAll(json, path);
-        return !results.isEmpty();
+    /** The right-hand side of a comparison is a literal; only .datetime() reshapes one. */
+    private static String normalizePredicateLiteral(String rightExpr) {
+        String rightVal = rightExpr.trim();
+        if (!rightVal.endsWith(".datetime()")) return rightVal;
+        String raw = rightVal.substring(0, rightVal.length() - ".datetime()".length()).trim();
+        return JsonOperations.isString(raw) ? JsonPathItems.datetime(raw) : raw;
     }
 
-    private Object evaluateJsonPath(String json, String path) {
-        if (path.equals("$")) return json;
-        List<String> results = evaluateJsonPathAll(json, path);
-        if (results.isEmpty()) return null;
-        String r = results.get(0).trim();
-        if (r.equals("true")) return true;
-        if (r.equals("false")) return false;
-        return r;
+    private static boolean compareJsonValues(String leftVal, String rightVal, String op) {
+        if (JsonOperations.isString(rightVal)) {
+            String right = rightVal.substring(1, rightVal.length() - 1);
+            String left = JsonOperations.isString(leftVal)
+                    ? leftVal.substring(1, leftVal.length() - 1) : leftVal;
+            return compareTo(left.compareTo(right), op);
+        }
+        try {
+            double leftNum = Double.parseDouble(leftVal);
+            double rightNum = Double.parseDouble(rightVal);
+            return compareTo(Double.compare(leftNum, rightNum), op);
+        } catch (NumberFormatException e) {
+            int cmp = leftVal.compareTo(rightVal);
+            if (op.equals("==")) return cmp == 0;
+            if (op.equals("!=")) return cmp != 0;
+            return false;
+        }
+    }
+
+    private static boolean compareTo(int cmp, String op) {
+        switch (op) {
+            case "==": return cmp == 0;
+            case "!=": return cmp != 0;
+            case ">": return cmp > 0;
+            case "<": return cmp < 0;
+            case ">=": return cmp >= 0;
+            case "<=": return cmp <= 0;
+            default: return false;
+        }
+    }
+
+    /**
+     * A whole path made of a comparison always produces one item -- true, false or unknown -- so
+     * it always exists. Only a path that selects items can select none; that is the case @? and
+     * jsonb_path_exists are asked about.
+     */
+    boolean evaluateJsonPathExists(String json, String path) {
+        if (path.equals("$")) return true;
+        if (isTopLevelPredicate(path)) {
+            evaluateJsonPathPredicate(json, path);
+            return true;
+        }
+        return !evaluateJsonPathAll(json, path).isEmpty();
     }
 
     private List<String> parsePathArg(Object pathArg) {
@@ -1288,8 +1362,8 @@ class JsonFunctions {
         return single;
     }
 
-    /** Split JSON object interior into key:value pairs, respecting nesting. */
-    private List<String> splitJsonPairs(String s) {
+    /** Split on the commas of one nesting level: object members, or a subscript list. */
+    private static List<String> splitJsonPairs(String s) {
         List<String> pairs = new ArrayList<>();
         int depth = 0;
         boolean inString = false;

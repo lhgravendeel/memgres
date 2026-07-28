@@ -599,7 +599,7 @@ class BinaryOpEvaluator {
         // operator was written, and a jsonpath predicate is never a tsquery.
         if (bin.op() == BinaryExpr.BinOp.TS_MATCH && left != null && right != null
                 && isJsonbExpression(bin.left(), ctx)) {
-            return executor.functionEvaluator.evaluateJsonPathPredicateSilent(
+            return executor.functionEvaluator.evaluateJsonPathMatchSilent(
                     left.toString().trim(), right.toString().trim());
         }
 
@@ -1331,7 +1331,7 @@ class BinaryOpEvaluator {
                     String ls = left.toString().trim();
                     if (ls.startsWith("{") || ls.startsWith("[")) {
                         String path = right.toString().trim();
-                        return executor.functionEvaluator.evaluateJsonPathPredicateSilent(ls, path);
+                        return executor.functionEvaluator.evaluateJsonPathMatchSilent(ls, path);
                     }
                 }
                 // NULL @@ tsquery or tsvector @@ NULL → NULL (not false)
@@ -2441,7 +2441,7 @@ class BinaryOpEvaluator {
                     String ls = left.toString().trim();
                     if (ls.startsWith("{") || ls.startsWith("[")) {
                         String path = right.toString().trim();
-                        return executor.functionEvaluator.evaluateJsonPathPredicateSilent(ls, path);
+                        return executor.functionEvaluator.evaluateJsonPathMatchSilent(ls, path);
                     }
                 }
                 // NULL @@ tsquery or tsvector @@ NULL → NULL (not false)

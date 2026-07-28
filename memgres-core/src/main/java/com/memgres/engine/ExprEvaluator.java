@@ -202,6 +202,16 @@ class ExprEvaluator {
             if (val == null) return null;
             String fieldName = fa.field();
 
+            if (val instanceof RecordValue) {
+                // A record whose column names come from the call that built it, e.g. jsonb_each
+                RecordValue record = (RecordValue) val;
+                int idx = record.indexOf(fieldName);
+                if (idx < 0) {
+                    throw new MemgresException("could not identify column \"" + fieldName
+                            + "\" in record data type", "42703");
+                }
+                return record.valueAt(idx);
+            }
             if (val instanceof List<?>) {
                 List<?> list = (List<?>) val;
                 // If the result is a list (from _pg_expandarray), access by field name
