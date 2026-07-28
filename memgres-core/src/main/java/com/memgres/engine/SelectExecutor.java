@@ -143,6 +143,7 @@ class SelectExecutor {
             rejectSrfInAggregates(stmt);
             validateDistinctOn(stmt);
             windowEvaluator.validateWindowUsage(stmt, null);
+            windowEvaluator.validateAfterWhere(stmt);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
                     || stmt.having() != null;
             if (hasAgg) {
@@ -330,6 +331,11 @@ class SelectExecutor {
                 }
             }
         }
+
+        // Everything WHERE stands in front of. PostgreSQL reads WHERE before HAVING, the window
+        // definitions, ORDER BY, GROUP BY, LIMIT and OFFSET, so what it says about a query wrong
+        // in two clauses is what the earlier one is wrong about.
+        windowEvaluator.validateAfterWhere(stmt);
 
         // Check if this query uses aggregation
         boolean hasGroupBy = stmt.groupBy() != null && !stmt.groupBy().isEmpty();
@@ -1606,6 +1612,60 @@ class SelectExecutor {
         for (SelectStmt.FromItem item : from) {
             collectAndValidate(item, exposed);
         }
+    }
+
+    /**
+     * Judges the grouping of a query that is being stored rather than run.
+     *
+     * <p>A SQL function's body is analysed when the function is written — PostgreSQL parses and
+     * analyses every statement in it at CREATE FUNCTION time, which is why
+     * {@code CREATE FUNCTION f() RETURNS text AS $$ SELECT b FROM t GROUP BY a $$ LANGUAGE sql} is
+     * refused there and not at the first call. (A PL/pgSQL body is not: its statements are
+     * strings the PL handler plans on first execution, so the same query inside one is accepted
+     * and fails when the function runs.)
+     *
+     * <p>The rule itself is the one a running SELECT gets, asked with the two things it needs and
+     * nothing else supplies: the select targets with stars expanded, and the relations the FROM
+     * clause names. It is asked only when all of those are available and the query is grouped at
+     * all — a scope this cannot read is a scope it does not judge, because refusing a body
+     * PostgreSQL stores is worse than storing one it refuses.
+     */
+    void validateStoredQueryGrouping(SelectStmt stmt) {
+        if (stmt.from() == null || stmt.from().isEmpty()) return;
+        // A CTE name is not a relation this can look up, so a body that defines one is left alone.
+        if (stmt.withClauses() != null && !stmt.withClauses().isEmpty()) return;
+        boolean grouped = (stmt.groupBy() != null && !stmt.groupBy().isEmpty())
+                || (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty())
+                || stmt.having() != null
+                || hasAggregateInTargets(stmt.targets())
+                || hasAggregateInOrderBy(stmt.orderBy())
+                || hasAggregateInWindowDefs(stmt.windowDefs());
+        if (!grouped) return;
+        List<RowContext.TableBinding> bindings;
+        try {
+            bindings = executor.fromResolver.resolveTableBindings(stmt.from());
+        } catch (RuntimeException e) {
+            return;
+        }
+        if (bindings.isEmpty()) return;
+        for (RowContext.TableBinding binding : bindings) {
+            if (binding.table() == null) return;
+        }
+        List<SelectStmt.SelectTarget> targets = expandTargetsForOrdinals(stmt.targets(), bindings);
+        SelectStmt judged = targets != stmt.targets() ? stmt.withTargets(targets) : stmt;
+        groupByValidator.validate(judged, targets, bindings);
+    }
+
+    /**
+     * The names one join exposes, checked before its ON condition is read.
+     *
+     * <p>PostgreSQL adds both arms of a join to the namespace and rejects a name that is already
+     * there before it analyses the condition, so {@code t x JOIN u x ON count(*) = 1} is the
+     * duplicate name rather than the misplaced aggregate. The whole-FROM check runs later and
+     * would find the same clash, but by then the condition has already been judged.
+     */
+    void validateJoinNames(SelectStmt.JoinFrom join) {
+        collectAndValidate(join, new LinkedHashMap<String, String>());
     }
 
     /** Records the names {@code item} exposes to the query, validating it on the way down. */

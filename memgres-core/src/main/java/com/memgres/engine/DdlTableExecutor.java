@@ -580,6 +580,11 @@ class DdlTableExecutor {
             String text = bound.substring(marker.length());
             Expression expr = com.memgres.engine.parser.Parser.parseExpression(text);
             executor.selectExecutor.placementCheck.reject(expr, "partition bound");
+            // A bound is settled once, with no row to read and no query to read one from, so a
+            // column reference and a sub-select are both refused for what they are rather than
+            // reported as a name nothing answers for.
+            rejectColumnReferenceInBound(expr);
+            executor.selectExecutor.placementCheck.rejectSubquery(expr, "partition bound");
             Object value = executor.evalExpr(expr, new RowContext(Cols.listOf()));
             if (value == null) {
                 resolved.add("NULL");
@@ -590,6 +595,14 @@ class DdlTableExecutor {
             }
         }
         return resolved;
+    }
+
+    /** The same refusal the bound parser makes for a bare name, for one written inside an expression. */
+    private static void rejectColumnReferenceInBound(Expression expr) {
+        if (AstWalk.anyMatch(expr, n -> n instanceof com.memgres.engine.parser.ast.ColumnRef)) {
+            throw new MemgresException(
+                    "cannot use column reference in partition bound expression", "0A000");
+        }
     }
 
     /**

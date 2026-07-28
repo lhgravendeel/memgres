@@ -74,7 +74,8 @@ class DmlParser {
                 values.add(parser.parseExpressionList());
                 parser.expect(TokenType.RIGHT_PAREN);
             } while (parser.match(TokenType.COMMA));
-        } else if (parser.checkKeyword("SELECT") || parser.checkKeyword("WITH")) {
+        } else if (parser.checkKeyword("SELECT") || parser.checkKeyword("WITH")
+                || parser.checkKeyword("TABLE")) {
             // Parse SELECT which may include UNION/INTERSECT/EXCEPT
             selectStmt = parser.tryParseSetOp(parser.parseSelect());
         } else if (parser.check(TokenType.LEFT_PAREN)) {

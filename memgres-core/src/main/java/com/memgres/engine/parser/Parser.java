@@ -128,7 +128,9 @@ public class Parser extends ExpressionParser {
                     stmt = selectParser.parseValues();
                     break;
                 case "TABLE":
-                    stmt = selectParser.parseTableCommand();
+                    // Read as a query rather than as a bare relation name, so the ORDER BY and
+                    // LIMIT PostgreSQL allows after one are read here too.
+                    stmt = selectParser.parseSelectFull();
                     break;
                 case "INSERT":
                     stmt = dmlParser.parseInsert();

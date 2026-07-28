@@ -220,6 +220,11 @@ class SelectParser {
      * Parse the SELECT body (without WITH clause). Used by both parseSelect() and parseWithStatement().
      */
     Statement parseSelectBody() {
+        // TABLE t is one of PostgreSQL's simple_select productions, alongside SELECT and VALUES,
+        // so it is a query wherever a query may stand: a view body, a set-operation arm, a CTE, a
+        // sub-select, an INSERT source. Reading it here rather than only as a statement is what
+        // makes it one, because every one of those callers arrives through this method.
+        if (parser.checkKeyword("TABLE")) return parseTableQuery();
         parser.expectKeyword("SELECT");
 
         boolean distinct = false;
@@ -1126,6 +1131,7 @@ class SelectParser {
         if (second.type() == TokenType.KEYWORD) {
             String kw = second.value();
             return kw.equals("SELECT") || kw.equals("VALUES") || kw.equals("WITH")
+                    || kw.equals("TABLE")
                     || kw.equals("UPDATE") || kw.equals("DELETE") || kw.equals("INSERT");
         }
         // Check for nested parens: ((SELECT ...) UNION ALL ...)
@@ -1648,6 +1654,96 @@ class SelectParser {
      */
     Expression parseLimitOffsetExpr() {
         return parser.parseExpression();
+    }
+
+    /**
+     * {@code TABLE t} with the clauses PostgreSQL's {@code select_no_parens} hangs off a query
+     * rather than off a select list: ORDER BY, LIMIT/OFFSET/FETCH and row locking. WHERE, GROUP BY
+     * and HAVING are not among them — {@code TABLE t WHERE ...} is a syntax error there too.
+     */
+    private SelectStmt parseTableQuery() {
+        SelectStmt base = parseTableCommand();
+
+        List<SelectStmt.OrderByItem> orderBy = null;
+        if (parser.checkKeyword("ORDER")) {
+            if (!parser.matchKeywords("ORDER", "BY")) {
+                throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                        parser.peek());
+            }
+            orderBy = parser.parseOrderByList();
+        }
+        Expression limit = null;
+        if (parser.matchKeyword("LIMIT") && !parser.matchKeyword("ALL")) {
+            limit = parseLimitOffsetExpr();
+        }
+        Expression offset = null;
+        if (parser.matchKeyword("OFFSET")) {
+            offset = parseLimitOffsetExpr();
+            parser.matchKeyword("ROW");
+            parser.matchKeyword("ROWS");
+        }
+        boolean withTies = false;
+        if (parser.matchKeyword("FETCH")) {
+            parser.matchKeyword("FIRST");
+            parser.matchKeyword("NEXT");
+            limit = parser.checkKeyword("ROW") || parser.checkKeyword("ROWS")
+                    ? Literal.ofInt("1") : parseLimitOffsetExpr();
+            parser.matchKeyword("ROW");
+            parser.matchKeyword("ROWS");
+            if (parser.matchKeyword("WITH")) {
+                parser.expectKeyword("TIES");
+                if (orderBy == null || orderBy.isEmpty()) {
+                    throw new com.memgres.engine.MemgresException(
+                            "WITH TIES cannot be specified without ORDER BY clause", "42601");
+                }
+                withTies = true;
+            } else {
+                parser.matchKeyword("ONLY");
+            }
+        }
+        SelectStmt.LockClause lockClause = parseRowLockClause();
+
+        return new SelectStmt(false, null, base.targets(), base.from(), null, null, null, null,
+                orderBy, limit, offset, null, null, lockClause, withTies);
+    }
+
+    /** FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE, with its options. */
+    private SelectStmt.LockClause parseRowLockClause() {
+        String lockMode = null;
+        boolean nowait = false;
+        boolean skipLocked = false;
+        List<String> ofTables = new ArrayList<>();
+        while (parser.checkKeyword("FOR")) {
+            parser.advance();
+            if (parser.matchKeyword("NO")) {
+                parser.matchKeyword("KEY");
+                parser.matchKeyword("UPDATE");
+                lockMode = "NO KEY UPDATE";
+            } else if (parser.matchKeyword("KEY")) {
+                parser.matchKeyword("SHARE");
+                lockMode = "KEY SHARE";
+            } else if (parser.matchKeyword("UPDATE")) {
+                lockMode = "UPDATE";
+            } else if (parser.matchKeyword("SHARE")) {
+                lockMode = "SHARE";
+            } else {
+                throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                        parser.peek());
+            }
+            if (parser.matchKeyword("OF")) {
+                ofTables = new ArrayList<>();
+                ofTables.add(parser.readIdentifier());
+                while (parser.match(TokenType.COMMA)) ofTables.add(parser.readIdentifier());
+            }
+            if (parser.matchKeyword("NOWAIT")) {
+                nowait = true;
+            } else if (parser.matchKeyword("SKIP")) {
+                parser.matchKeyword("LOCKED");
+                skipLocked = true;
+            }
+        }
+        return lockMode == null ? null
+                : new SelectStmt.LockClause(lockMode, nowait, skipLocked, ofTables);
     }
 
     SelectStmt parseTableCommand() {

@@ -337,19 +337,25 @@ final class PlacementCheck {
         AstWalk.forEachChild(node, this::rejectWindowCallWithoutOver);
     }
 
-    /** Every clause of a query that is read in the query's own scope, for the OVER-clause check. */
-    void rejectWindowCallWithoutOver(SelectStmt stmt) {
+    /**
+     * The select list, which PostgreSQL analyses before WHERE.
+     *
+     * <p>The OVER-clause check is split at WHERE rather than run over the whole query at once
+     * because PostgreSQL raises it while it transforms each clause, in the order it transforms
+     * them — FROM, then the select list, then WHERE, then HAVING, the window definitions, ORDER
+     * BY, GROUP BY and last LIMIT and OFFSET. A single pass ahead of the rest reports whichever
+     * bare window call it happens to reach first, so {@code SELECT * FROM t WHERE count(*) > 1 AND
+     * row_number() = 1} named the window call where PostgreSQL names the aggregate: within WHERE
+     * both kinds are found by one left-to-right walk, and count(*) is written first.
+     */
+    void rejectWindowCallWithoutOverInTargets(SelectStmt stmt) {
+        if (stmt.targets() == null) return;
         for (SelectStmt.SelectTarget target : stmt.targets()) rejectWindowCallWithoutOver(target.expr());
-        rejectWindowCallWithoutOver(stmt.where());
-        if (stmt.groupBy() != null) {
-            for (Expression g : stmt.groupBy()) rejectWindowCallWithoutOver(g);
-        }
+    }
+
+    /** The clauses read after WHERE, in the order PostgreSQL reads them. */
+    void rejectWindowCallWithoutOverAfterWhere(SelectStmt stmt) {
         rejectWindowCallWithoutOver(stmt.having());
-        if (stmt.orderBy() != null) {
-            for (SelectStmt.OrderByItem item : stmt.orderBy()) rejectWindowCallWithoutOver(item.expr());
-        }
-        rejectWindowCallWithoutOver(stmt.limit());
-        rejectWindowCallWithoutOver(stmt.offset());
         // A named window is a specification like any other, and is read even when nothing
         // references it.
         if (stmt.windowDefs() != null) {
@@ -362,5 +368,13 @@ final class PlacementCheck {
                 }
             }
         }
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem item : stmt.orderBy()) rejectWindowCallWithoutOver(item.expr());
+        }
+        if (stmt.groupBy() != null) {
+            for (Expression g : stmt.groupBy()) rejectWindowCallWithoutOver(g);
+        }
+        rejectWindowCallWithoutOver(stmt.limit());
+        rejectWindowCallWithoutOver(stmt.offset());
     }
 }

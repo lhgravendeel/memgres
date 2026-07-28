@@ -111,7 +111,7 @@ public class ExpressionParser {
     }
 
     private static final java.util.Set<String> QUERY_START_KEYWORDS = Cols.setOf(
-            "SELECT", "WITH", "VALUES", "INSERT", "UPDATE", "DELETE", "MERGE");
+            "SELECT", "WITH", "VALUES", "TABLE", "INSERT", "UPDATE", "DELETE", "MERGE");
 
     /**
      * Scans ahead through consecutive LEFT_PAREN tokens to check if a query keyword

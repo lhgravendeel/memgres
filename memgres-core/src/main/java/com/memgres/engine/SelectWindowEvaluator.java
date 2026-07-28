@@ -385,25 +385,10 @@ class SelectWindowEvaluator {
      */
     void validateWindowUsage(SelectStmt stmt, List<RowContext.TableBinding> bindings) {
         // A window function written as a plain call is a window function all the same, and saying
-        // so is more use than reporting a function nobody spelled wrong as missing.
-        select.placementCheck.rejectWindowCallWithoutOver(stmt);
-        if (stmt.groupBy() != null) {
-            for (Expression g : stmt.groupBy()) {
-                if (select.containsWindowFunction(g)) {
-                    throw new MemgresException("window functions are not allowed in GROUP BY", "42P20");
-                }
-            }
-        }
-        // HAVING chooses which groups survive, and a window runs over the groups that did, so a
-        // window function there would have to be computed before the rows it computes over exist.
-        if (stmt.having() != null && select.containsWindowFunction(stmt.having())) {
-            throw new MemgresException("window functions are not allowed in HAVING", "42P20");
-        }
-        // LIMIT and OFFSET are read once for the whole query, before any row has a position in a
-        // window to be measured against and before any group has been collected to aggregate. A
-        // sub-select there may of course aggregate: it is a query of its own with its own rows.
-        select.placementCheck.reject(stmt.limit(), "LIMIT");
-        select.placementCheck.reject(stmt.offset(), "OFFSET");
+        // so is more use than reporting a function nobody spelled wrong as missing. Only the
+        // select list is judged here; the clauses PostgreSQL reads after WHERE are judged after
+        // WHERE, by {@link #validateAfterWhere}.
+        select.placementCheck.rejectWindowCallWithoutOverInTargets(stmt);
         for (SelectStmt.SelectTarget target : stmt.targets()) {
             validateCallPlacement(target.expr(), false);
         }
@@ -465,6 +450,35 @@ class SelectWindowEvaluator {
             }
             validateFrame(resolveNamedWindow(wf, defs), bindings);
         }
+    }
+
+    /**
+     * The clauses PostgreSQL analyses after WHERE, judged after WHERE.
+     *
+     * <p>Which clause a query is refused for is the clause PostgreSQL reaches first, and it reads
+     * WHERE before HAVING, the window definitions, ORDER BY, GROUP BY and — last of all — LIMIT
+     * and OFFSET. Running these ahead of the WHERE walk named LIMIT for
+     * {@code WHERE count(*) > 1 LIMIT count(*)}, where PostgreSQL names WHERE.
+     */
+    void validateAfterWhere(SelectStmt stmt) {
+        select.placementCheck.rejectWindowCallWithoutOverAfterWhere(stmt);
+        // HAVING chooses which groups survive, and a window runs over the groups that did, so a
+        // window function there would have to be computed before the rows it computes over exist.
+        if (stmt.having() != null && select.containsWindowFunction(stmt.having())) {
+            throw new MemgresException("window functions are not allowed in HAVING", "42P20");
+        }
+        if (stmt.groupBy() != null) {
+            for (Expression g : stmt.groupBy()) {
+                if (select.containsWindowFunction(g)) {
+                    throw new MemgresException("window functions are not allowed in GROUP BY", "42P20");
+                }
+            }
+        }
+        // LIMIT and OFFSET are read once for the whole query, before any row has a position in a
+        // window to be measured against and before any group has been collected to aggregate. A
+        // sub-select there may of course aggregate: it is a query of its own with its own rows.
+        select.placementCheck.reject(stmt.limit(), "LIMIT");
+        select.placementCheck.reject(stmt.offset(), "OFFSET");
     }
 
     /** A stand-in call carrying a named window's ORDER BY, so its frame can be judged the same way. */

@@ -1604,6 +1604,7 @@ class DdlParser {
 
         // Plain literal with optional cast
         Token valueTok = parser.advance();
+        rejectColumnReferenceBound(valueTok);
         String value = valueTok.value();
         skipBoundCast(parser);
         if (valueTok.type() == TokenType.STRING_LITERAL
@@ -1611,6 +1612,34 @@ class DdlParser {
             return "'" + value + "'";
         }
         return value;
+    }
+
+    /**
+     * A bound is a value the partition is given once, not something read off a row, so a name in
+     * one is a column reference and PostgreSQL says so — {@code FOR VALUES FROM (id) TO (10)} and
+     * {@code FOR VALUES IN (sad)} alike, the second being why an enum label has to be quoted here.
+     *
+     * <p>Only an identifier is refused. A keyword that stands for a value of its own —
+     * MINVALUE, MAXVALUE, NULL, TRUE, FALSE, {@code current_date} — is a value, not a name.
+     */
+    static void rejectColumnReferenceBound(Token tok) {
+        if (tok.type() == TokenType.IDENTIFIER || tok.type() == TokenType.QUOTED_IDENTIFIER) {
+            throw new com.memgres.engine.MemgresException(
+                    "cannot use column reference in partition bound expression", "0A000");
+        }
+    }
+
+    /**
+     * MODULUS and REMAINDER take an integer literal and nothing else: PostgreSQL's grammar has
+     * {@code Iconst} there, so anything else is a syntax error rather than a bad bound.
+     */
+    static String readHashBoundInteger(Parser parser) {
+        Token tok = parser.peek();
+        if (tok.type() != TokenType.INTEGER_LITERAL) {
+            throw new com.memgres.engine.MemgresException(
+                    "syntax error at or near \"" + tok.value() + "\"", "42601");
+        }
+        return parser.advance().value();
     }
 
     /**
