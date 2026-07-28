@@ -317,6 +317,18 @@ class CastEvaluator {
             if (s.length() > n) return s.substring(0, n);
             return String.format("%-" + n + "s", s);
         }
+        // An interval type carries its field qualifier and its fractional-seconds precision in
+        // the type name, and both change the value: the qualifier decides what an unlabelled
+        // number in the literal counts and which fields survive, the precision how many
+        // fractional digits do. Both have to be seen before the text is read, not after.
+        if (!lowerSpec.endsWith("[]")) {
+            IntervalTypmod intervalTypmod = IntervalTypmod.fromTypeSpec(lowerSpec);
+            if (intervalTypmod != null) {
+                if (val instanceof PgInterval) return intervalTypmod.apply((PgInterval) val);
+                if (val instanceof String) return PgInterval.parse((String) val, intervalTypmod);
+                return intervalTypmod.apply(TypeCoercion.toInterval(val));
+            }
+        }
         String typeName = typeSpec.toLowerCase().replaceAll("\\(.*\\)", "").trim();
         // Handle array casting: when value is a List or PG array literal string, cast each element
         boolean isArrayCast = typeName.contains("[]");
@@ -576,21 +588,8 @@ class CastEvaluator {
             case "timestamptz":
             case "timestamp with time zone":
                 return TypeCoercion.toOffsetDateTime(val, sessionInterpretationZone());
-            case "interval":
-            case "interval year to month":
-            case "interval day to second":
-            case "interval year":
-            case "interval month":
-            case "interval day":
-            case "interval hour":
-            case "interval minute":
-            case "interval second":
-            case "interval day to hour":
-            case "interval day to minute":
-            case "interval hour to minute":
-            case "interval hour to second":
-            case "interval minute to second":
-                return TypeCoercion.toInterval(val);
+            // "interval", with or without a qualifier, is handled above where the qualifier can
+            // still reach the literal's text.
             case "money":
                 // PG does not allow direct float→money cast (must go through numeric first)
                 if (val instanceof Double || val instanceof Float) {

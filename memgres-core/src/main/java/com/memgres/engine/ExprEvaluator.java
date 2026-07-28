@@ -122,14 +122,20 @@ class ExprEvaluator {
         if (expr instanceof AtTimeZoneExpr) {
             AtTimeZoneExpr attz = (AtTimeZoneExpr) expr;
             Object val = evalExpr(attz.expr(), ctx);
-            Object zoneVal = evalExpr(attz.zone(), ctx);
-            if (val == null) return null;
-            String zoneName = zoneVal.toString();
             ZoneId zid;
-            try {
-                zid = ZoneId.of(zoneName);
-            } catch (java.time.DateTimeException e) {
-                throw new MemgresException("time zone \"" + zoneName + "\" not recognized", "22023");
+            if (attz.zone() == null) {
+                // AT LOCAL (PG 17): the same conversion, against the session's TimeZone
+                zid = TypeCoercion.sessionZone();
+                if (val == null) return null;
+            } else {
+                Object zoneVal = evalExpr(attz.zone(), ctx);
+                if (val == null) return null;
+                String zoneName = zoneVal == null ? "null" : zoneVal.toString();
+                try {
+                    zid = ZoneId.of(zoneName);
+                } catch (java.time.DateTimeException e) {
+                    throw new MemgresException("time zone \"" + zoneName + "\" not recognized", "22023");
+                }
             }
             if (val instanceof OffsetDateTime) {
                 OffsetDateTime odt = (OffsetDateTime) val;
@@ -139,9 +145,14 @@ class ExprEvaluator {
                 LocalDateTime ldt = (LocalDateTime) val;
                 // timestamp -> timestamptz (interpret as in that zone)
                 return ldt.atZone(zid).toOffsetDateTime();
-            } else if (val instanceof LocalTime) {
-                LocalTime lt = (LocalTime) val;
-                return lt;
+            } else if (val instanceof java.time.LocalDate) {
+                // A date reaches the operator as a timestamptz at midnight, and converting it
+                // back into the same zone lands on that same midnight.
+                return ((java.time.LocalDate) val).atStartOfDay();
+            } else if (val instanceof LocalTime || TypeCoercion.looksLikeTimeTz(val)) {
+                // timetz keeps its instant and changes which offset it is written against; a
+                // plain time reaches the operator having already taken the session's offset.
+                return TypeCoercion.shiftTimeTzToZone(val, zid);
             }
             return val;
         }
@@ -2668,6 +2679,10 @@ class ExprEvaluator {
             DataType inner = inferTypeFromContext(((AtTimeZoneExpr) expr).expr(), bindings);
             if (inner == DataType.TIMESTAMPTZ) return DataType.TIMESTAMP;
             if (inner == DataType.TIMESTAMP) return DataType.TIMESTAMPTZ;
+            // A date arrives as a timestamptz, so it comes back out as a timestamp; a time of
+            // either kind comes back as timetz.
+            if (inner == DataType.DATE) return DataType.TIMESTAMP;
+            if (inner == DataType.TIME) return DataType.TIMETZ;
             return inner != null ? inner : DataType.TIMESTAMP;
         }
         if (expr instanceof IsNullExpr) return DataType.BOOLEAN;
