@@ -67,6 +67,9 @@ class ExprEvaluator {
         if (expr instanceof ColumnRef) return evalColumnRef(((ColumnRef) expr), ctx);
         if (expr instanceof BinaryExpr) {
             rejectUnequalRowArity((BinaryExpr) expr);
+            if (isRowSubqueryComparison((BinaryExpr) expr)) {
+                return evalRowSubqueryComparison((BinaryExpr) expr, ctx);
+            }
             return executor.binaryOpEvaluator.evalBinary(((BinaryExpr) expr), ctx);
         }
         if (expr instanceof UnaryExpr) {
@@ -1806,18 +1809,104 @@ class ExprEvaluator {
         if (outerCtx != null) executor.outerContextStack.push(outerCtx);
         try {
             QueryResult result = executor.executeStatement(sq.subquery());
+            // How wide a scalar subquery is, is a property of its select list and not of the rows
+            // it happens to return, so PostgreSQL refuses a second column before it looks at any
+            // row -- including when there are none. Reading the width off the first row instead
+            // let SELECT (SELECT 1, 2 WHERE false) answer NULL, and reported "more than one row"
+            // for a query whose real fault was its width.
+            rejectWideSubquery(result);
             if (result.getRows().isEmpty()) return null;
             if (result.getRows().size() > 1) {
                 throw new MemgresException("more than one row returned by a subquery used as an expression", "21000");
             }
             Object[] firstRow = result.getRows().get(0);
-            if (firstRow.length > 1) {
-                throw new MemgresException("subquery must return only one column", "42601");
-            }
             if (firstRow.length > 0) return firstRow[0];
             return null;
         } finally {
             if (outerCtx != null) executor.outerContextStack.pop();
+        }
+    }
+
+    /** A subquery standing where one value is expected may have only one column. */
+    static void rejectWideSubquery(QueryResult result) {
+        if (result.getColumns() != null && result.getColumns().size() > 1) {
+            throw new MemgresException("subquery must return only one column", "42601");
+        }
+    }
+
+    /**
+     * A row constructor compared against a subquery reads the whole subquery row, not just its
+     * first column: {@code (1, 2) = (SELECT 1, 2)} is a row comparison and true. Sending the
+     * subquery down the scalar path refused it as too wide, so a legitimate row comparison came
+     * back as an error while a genuinely wide scalar subquery was let through.
+     *
+     * <p>Only the six ordered comparisons take this reading. IS DISTINCT FROM does not -- measured
+     * against PostgreSQL 18, which refuses a wide subquery there -- and neither does a subquery
+     * written on the left.
+     */
+    private static boolean isRowSubqueryComparison(BinaryExpr bin) {
+        if (!(bin.right() instanceof SubqueryExpr)) return false;
+        if (!(bin.left() instanceof ArrayExpr) || !((ArrayExpr) bin.left()).isRow()) return false;
+        switch (bin.op()) {
+            case EQUAL: case NOT_EQUAL:
+            case LESS_THAN: case GREATER_THAN: case LESS_EQUAL: case GREATER_EQUAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private Object evalRowSubqueryComparison(BinaryExpr bin, RowContext ctx) {
+        ArrayExpr leftRow = (ArrayExpr) bin.left();
+        SubqueryExpr sq = (SubqueryExpr) bin.right();
+        if (ctx != null) executor.outerContextStack.push(ctx);
+        QueryResult result;
+        try {
+            result = executor.executeStatement(sq.subquery());
+        } finally {
+            if (ctx != null) executor.outerContextStack.pop();
+        }
+        int want = leftRow.elements().size();
+        int got = result.getColumns() == null ? 0 : result.getColumns().size();
+        // The widths have to agree for the comparison to exist at all, so PostgreSQL settles them
+        // before it looks at a row -- an empty subquery of the wrong width is still refused.
+        if (got < want) throw new MemgresException("subquery has too few columns", "42601");
+        if (got > want) throw new MemgresException("subquery has too many columns", "42601");
+        rejectRowSubqueryTypeMismatch(bin, leftRow, result);
+        if (result.getRows().isEmpty()) return null;
+        if (result.getRows().size() > 1) {
+            throw new MemgresException("more than one row returned by a subquery used as an expression", "21000");
+        }
+        Object leftVal = evalExpr(leftRow, ctx);
+        List<Object> rightValues = new ArrayList<>(Arrays.asList(result.getRows().get(0)));
+        return executor.binaryOpEvaluator.evalBinaryValues(bin.op(), leftVal,
+                new AstExecutor.PgRow(rightValues));
+    }
+
+    /**
+     * Entry by entry the comparison has to have an operator, and PostgreSQL resolves that from the
+     * declared types before any row is read. Only a literal that carries its own type is judged
+     * here: a bare string literal is untyped and takes whatever the other side is, and anything
+     * the engine merely inferred a type for would refuse a comparison PostgreSQL makes.
+     */
+    private void rejectRowSubqueryTypeMismatch(BinaryExpr bin, ArrayExpr leftRow, QueryResult result) {
+        for (int i = 0; i < leftRow.elements().size(); i++) {
+            Expression element = leftRow.elements().get(i);
+            if (!(element instanceof Literal)) continue;
+            Literal.LiteralType kind = ((Literal) element).literalType();
+            if (kind != Literal.LiteralType.INTEGER && kind != Literal.LiteralType.FLOAT
+                    && kind != Literal.LiteralType.BOOLEAN) {
+                continue;
+            }
+            DataType leftType = executor.inferExprType(element);
+            DataType rightType = result.getColumns().get(i).getType();
+            if (leftType == null || rightType == null || leftType == rightType) continue;
+            TypeCoercion.TypeCategory leftCat = TypeCoercion.categoryOf(leftType);
+            TypeCoercion.TypeCategory rightCat = TypeCoercion.categoryOf(rightType);
+            if (leftCat == null || rightCat == null || leftCat == rightCat) continue;
+            throw new MemgresException("operator does not exist: " + leftType.toRegtypeDisplay()
+                    + " " + BinaryOpEvaluator.opSymbol(bin.op()) + " " + rightType.toRegtypeDisplay(),
+                    "42883");
         }
     }
 

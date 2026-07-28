@@ -235,6 +235,7 @@ class SelectSetOpExecutor {
         }
 
         // ORDER BY on set operation result
+        validateOrderBy(stmt, columns);
         if (stmt.orderBy() != null && !stmt.orderBy().isEmpty()) {
             resultRows.sort((a, b) -> {
                 for (SelectStmt.OrderByItem item : stmt.orderBy()) {
@@ -268,23 +269,124 @@ class SelectSetOpExecutor {
             });
         }
 
-        // OFFSET + LIMIT
+        // OFFSET + LIMIT. A set operation reads them exactly as a plain SELECT does, so it uses
+        // the same reader: a negative one is refused rather than silently reordering the result,
+        // a fractional one is rounded, and one too large for an int no longer wraps.
         if (stmt.offset() != null) {
-            int off = executor.toInt(executor.evalExpr(stmt.offset(), null));
-            if (off > 0 && off < resultRows.size()) {
-                resultRows = new ArrayList<>(resultRows.subList(off, resultRows.size()));
-            } else if (off >= resultRows.size()) {
+            long off = select.limitOffsetValue(stmt.offset(), false);
+            if (off >= resultRows.size()) {
                 resultRows = Cols.listOf();
+            } else if (off > 0) {
+                resultRows = new ArrayList<>(resultRows.subList((int) off, resultRows.size()));
             }
         }
         if (stmt.limit() != null) {
-            int lim = executor.toInt(executor.evalExpr(stmt.limit(), null));
-            if (lim < resultRows.size()) {
-                resultRows = new ArrayList<>(resultRows.subList(0, lim));
+            long lim = select.limitOffsetValue(stmt.limit(), true);
+            if (lim >= 0 && lim < resultRows.size()) {
+                resultRows = new ArrayList<>(resultRows.subList(0, (int) lim));
             }
         }
 
         return QueryResult.select(columns, resultRows);
+    }
+
+    /**
+     * The ORDER BY of a set operation sees the output columns and nothing else: there is no
+     * relation left to read a name from once the arms have been combined, so PostgreSQL accepts
+     * only an output column name or its position. Anything else it refuses, and the refusals
+     * differ by shape -- an ordinal out of range is out of range, a bare non-integer constant
+     * names no column at all, a qualified name has no FROM entry to qualify against, an unknown
+     * bare name is a missing column, and everything else is an expression the clause does not
+     * take. Sorting by whatever happened to match and ignoring the rest let ORDER BY 5 pass; and
+     * because the OFFSET beside it was read with neither a sign check nor a rounding, OFFSET -1
+     * changed the row order instead of raising.
+     */
+    private void validateOrderBy(SetOpStmt stmt, List<Column> columns) {
+        if (stmt.orderBy() == null) return;
+        for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+            Expression expr = item.expr();
+            boolean collated = expr instanceof CollateExpr;
+            if (collated) expr = ((CollateExpr) expr).expr();
+
+            Integer pos = GroupByValidator.integerConstant(expr);
+            if (pos != null) {
+                // COLLATE binds to the constant itself, not to the column it would have named,
+                // so the collation is asked of an integer and PostgreSQL says integers have none.
+                if (collated) {
+                    throw new MemgresException("collations are not supported by type integer", "42804");
+                }
+                if (pos < 1 || pos > columns.size()) {
+                    throw new MemgresException(
+                            "ORDER BY position " + pos + " is not in select list", "42P10");
+                }
+                continue;
+            }
+            if (expr instanceof Literal) {
+                throw new MemgresException("non-integer constant in ORDER BY", "42601");
+            }
+            // Every name written anywhere in the item is looked up before the clause is judged as
+            // a whole, so ORDER BY a + 1 over arms that have no a is a missing column and not an
+            // unsupported expression.
+            ColumnRef unresolved = unresolvedColumnRef(expr, columns);
+            if (unresolved != null) {
+                if (unresolved.table() != null) {
+                    throw new MemgresException("missing FROM-clause entry for table \""
+                            + unresolved.table() + "\"", "42P01");
+                }
+                throw new MemgresException(
+                        "column \"" + unresolved.column() + "\" does not exist", "42703");
+            }
+            if (expr instanceof ColumnRef) {
+                Column named = namedColumn(columns, ((ColumnRef) expr).column());
+                if (!collated) continue;
+                if (named != null && !isCollatable(named.getType())) {
+                    throw new MemgresException("collations are not supported by type "
+                            + named.getType().toRegtypeDisplay(), "42804");
+                }
+            }
+            throw new MemgresException("invalid UNION/INTERSECT/EXCEPT ORDER BY clause", "0A000");
+        }
+    }
+
+    private static Column namedColumn(List<Column> columns, String name) {
+        for (Column column : columns) {
+            if (column.getName().equalsIgnoreCase(name)) return column;
+        }
+        return null;
+    }
+
+    /**
+     * The first name in {@code node} that the output columns do not account for, or null. A
+     * qualified name never does, because a set operation leaves no relation to qualify against.
+     * A subquery written inside the item brings its own scope, so nothing under one is judged
+     * here -- ORDER BY (SELECT max(a) FROM t) is an unsupported expression, not a missing a.
+     */
+    private static ColumnRef unresolvedColumnRef(Object node, final List<Column> columns) {
+        if (node == null) return null;
+        if (node instanceof SubqueryExpr || node instanceof ExistsExpr
+                || node instanceof ArraySubqueryExpr || node instanceof Statement) {
+            return null;
+        }
+        if (node instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) node;
+            if (ref.table() != null) return ref;
+            return namedColumn(columns, ref.column()) == null ? ref : null;
+        }
+        final ColumnRef[] found = new ColumnRef[1];
+        AstWalk.forEachChild(node, new java.util.function.Consumer<Object>() {
+            @Override
+            public void accept(Object child) {
+                if (found[0] != null) return;
+                found[0] = unresolvedColumnRef(child, columns);
+            }
+        });
+        return found[0];
+    }
+
+    /** Only the string types carry a collation; a collation asked of any other type is an error. */
+    private static boolean isCollatable(DataType type) {
+        return type == DataType.TEXT || type == DataType.VARCHAR || type == DataType.CHAR
+                || type == DataType.NAME;
     }
 
     static DataType widenNumericSetOp(DataType a, DataType b) {
