@@ -43,7 +43,7 @@ class SelectAggregateEvaluator {
 
         for (List<Expression> groupingSet : groupingSets) {
             List<Expression> effectiveGroupBy = new ArrayList<>(fixedGroupBy);
-            effectiveGroupBy.addAll(resolveGroupByRefs(groupingSet, stmt));
+            effectiveGroupBy.addAll(resolveGroupByRefs(groupingSet, stmt, baseBindings));
 
             Set<String> groupingSetColNames = new HashSet<>();
             for (Expression e : effectiveGroupBy) {
@@ -67,6 +67,8 @@ class SelectAggregateEvaluator {
             for (Expression e : effectiveGroupBy) {
                 collectColumnNames(e, groupedColumnNames);
             }
+            GroupByValidator.addFunctionallyDeterminedColumns(
+                    effectiveGroupBy, baseBindings, groupedColumnNames);
 
             List<List<RowContext>> groups;
             if (effectiveGroupBy.isEmpty()) {
@@ -222,7 +224,8 @@ class SelectAggregateEvaluator {
      * select-list expression they name. Applies to every grouping element, including the ones
      * inside GROUPING SETS / ROLLUP / CUBE.
      */
-    private List<Expression> resolveGroupByRefs(List<Expression> groupBy, SelectStmt stmt) {
+    private List<Expression> resolveGroupByRefs(List<Expression> groupBy, SelectStmt stmt,
+                                                List<RowContext.TableBinding> bindings) {
         if (groupBy == null) return null;
         List<Expression> resolved = new ArrayList<>(groupBy);
         for (int i = 0; i < resolved.size(); i++) {
@@ -235,6 +238,11 @@ class SelectAggregateEvaluator {
                 }
             } else if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
                 ColumnRef colRef = (ColumnRef) expr;
+                // A bare name in GROUP BY is a FROM column when one has that name; only a name
+                // no relation exposes falls back to an output alias. Reading the alias first
+                // groups by the wrong expression whenever an alias shadows a column -- for
+                // SELECT b AS a ... GROUP BY a, PostgreSQL groups by a and memgres grouped by b.
+                if (namesInputColumn(colRef, bindings)) continue;
                 for (SelectStmt.SelectTarget target : stmt.targets()) {
                     if (target.alias() != null && target.alias().equalsIgnoreCase(colRef.column())) {
                         resolved.set(i, target.expr());
@@ -246,6 +254,14 @@ class SelectAggregateEvaluator {
         return resolved;
     }
 
+    private static boolean namesInputColumn(ColumnRef ref, List<RowContext.TableBinding> bindings) {
+        if (bindings == null || ref.column() == null) return false;
+        for (RowContext.TableBinding binding : bindings) {
+            if (binding.table() != null && binding.table().getColumnIndex(ref.column()) >= 0) return true;
+        }
+        return false;
+    }
+
     QueryResult executeAggregateSelect(SelectStmt stmt, List<RowContext> contexts,
                                         List<RowContext.TableBinding> baseBindings) {
         if (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty()) {
@@ -253,7 +269,7 @@ class SelectAggregateEvaluator {
         }
 
         // Resolve GROUP BY ordinals and aliases
-        List<Expression> resolvedGroupBy = resolveGroupByRefs(stmt.groupBy(), stmt);
+        List<Expression> resolvedGroupBy = resolveGroupByRefs(stmt.groupBy(), stmt, baseBindings);
 
         boolean hasGroupBy = resolvedGroupBy != null && !resolvedGroupBy.isEmpty();
         List<List<RowContext>> groups;
@@ -281,6 +297,10 @@ class SelectAggregateEvaluator {
             resultColumns.add(executor.buildResultColumn(alias, target.expr(), baseBindings));
         }
         List<Object[]> resultRows = new ArrayList<>();
+        // The group each surviving row came from, so ORDER BY over an expression that is not an
+        // output column can still be evaluated. Tracked alongside the rows rather than by index
+        // into groups: HAVING drops groups, and the indexes stop lining up as soon as it does.
+        Map<Object[], List<RowContext>> rowGroups = new IdentityHashMap<>();
 
         for (List<RowContext> group : groups) {
             RowContext representative = group.isEmpty() ? null : group.get(0);
@@ -301,6 +321,7 @@ class SelectAggregateEvaluator {
             }
 
             resultRows.add(row);
+            rowGroups.put(row, group);
         }
 
         if (groups.isEmpty() && !hasGroupBy) {
@@ -340,31 +361,34 @@ class SelectAggregateEvaluator {
         List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
         Map<Object[], Object[]> orderByValues = null;
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
-            // Check if any ORDER BY expr needs aggregate evaluation
-            boolean needsAggEval = false;
+            // An ORDER BY key that is not an output column has to be computed per group, whether
+            // it is an aggregate (ORDER BY count(*)) or a grouped expression the select list
+            // happens not to carry (GROUP BY a+0 ORDER BY a+0). Sorting by the first output
+            // column instead, as this did for the latter, silently returns the wrong order.
+            boolean needsGroupEval = false;
             for (SelectStmt.OrderByItem item : resolvedOrderBy) {
-                int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
-                if (colIdx < 0 && select.containsAggregate(item.expr())) {
-                    needsAggEval = true;
+                if (select.resolveOrderByToColumnIndex(item.expr(), stmt.targets()) < 0) {
+                    needsGroupEval = true;
                     break;
                 }
             }
-            if (needsAggEval && !groups.isEmpty()) {
+            if (needsGroupEval && !resultRows.isEmpty()) {
                 orderByValues = new IdentityHashMap<>();
-                for (int gi = 0; gi < groups.size() && gi < resultRows.size(); gi++) {
-                    List<RowContext> group = groups.get(gi);
+                for (Object[] resultRow : resultRows) {
+                    List<RowContext> group = rowGroups.get(resultRow);
+                    if (group == null) continue;
                     RowContext rep = group.isEmpty() ? null : group.get(0);
                     Object[] obVals = new Object[resolvedOrderBy.size()];
                     for (int oi = 0; oi < resolvedOrderBy.size(); oi++) {
                         SelectStmt.OrderByItem item = resolvedOrderBy.get(oi);
                         int colIdx = select.resolveOrderByToColumnIndex(item.expr(), stmt.targets());
                         if (colIdx >= 0) {
-                            obVals[oi] = resultRows.get(gi)[colIdx];
+                            obVals[oi] = resultRow[colIdx];
                         } else {
                             obVals[oi] = evalAggregateExpr(item.expr(), group, rep);
                         }
                     }
-                    orderByValues.put(resultRows.get(gi), obVals);
+                    orderByValues.put(resultRow, obVals);
                 }
             }
             final Map<Object[], Object[]> finalOrderByValues = orderByValues;
@@ -457,6 +481,13 @@ class SelectAggregateEvaluator {
             return executor.functionEvaluator.evalFunction(fn, representative);
         } else if (expr instanceof BinaryExpr) {
             BinaryExpr bin = (BinaryExpr) expr;
+            // Splitting an operator into "evaluate each side, then combine the values" only
+            // exists so that an aggregate nested inside one side is folded first. Without one
+            // it loses whatever the operator needs beyond its two values -- an array subscript
+            // over a grouped array column came back NULL -- so evaluate the whole thing at once.
+            if (!select.containsAggregate(bin)) {
+                return representative != null ? executor.evalExpr(bin, representative) : null;
+            }
             if (bin.op() == BinaryExpr.BinOp.AND) {
                 Object left = evalAggregateExpr(bin.left(), group, representative);
                 if (Boolean.FALSE.equals(left)) return false;

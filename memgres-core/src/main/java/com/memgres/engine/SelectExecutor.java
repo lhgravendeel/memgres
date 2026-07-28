@@ -21,6 +21,7 @@ class SelectExecutor {
     final SelectWindowEvaluator windowEvaluator;
     final SelectCteExecutor cteExecutor;
     final SelectSetOpExecutor setOpExecutor;
+    final GroupByValidator groupByValidator;
 
     /** Check if a column name is a PostgreSQL system column. */
     static boolean isSystemColumn(String name) {
@@ -59,6 +60,7 @@ class SelectExecutor {
         this.windowEvaluator = new SelectWindowEvaluator(this);
         this.cteExecutor = new SelectCteExecutor(this);
         this.setOpExecutor = new SelectSetOpExecutor(this);
+        this.groupByValidator = new GroupByValidator(this);
     }
 
     // ---- SELECT ----
@@ -309,149 +311,14 @@ class SelectExecutor {
                 hasAggregateInOrderBy(stmt.orderBy());
 
         if (hasGroupBy || hasGroupingSets || hasAggregates) {
-            // PG allows DISTINCT ON with GROUP BY and aggregates — DISTINCT ON is applied after grouping
-            // Validate: non-aggregate columns must be in GROUP BY
-            // GROUP BY () (and any grouping-set spec whose sets are all empty) collapses the
-            // input to a single row, so the select list is as constrained as with no GROUP BY
-            if (!hasGroupBy && (hasGroupingSets || hasAggregates)) {
-                for (SelectStmt.SelectTarget target : stmt.targets()) {
-                    if (!isAggregateOrConstant(target.expr())) {
-                        String colName = target.expr() instanceof ColumnRef
-                                ? qualifyColumn((ColumnRef) target.expr(), baseBindings)
-                                : executor.exprToAlias(target.expr());
-                        throw new MemgresException(
-                                "column \"" + colName + "\" must appear in the GROUP BY clause or be used in an aggregate function",
-                                "42803");
-                    }
-                }
-                // HAVING is evaluated once over the single implicit group, so a bare column
-                // there is as ungrouped as one in the select list.
-                if (stmt.having() != null) {
-                    for (ColumnRef cr : ungroupedColumnRefs(stmt.having())) {
-                        if (!resolvesToColumn(cr, baseBindings)) continue;
-                        throw new MemgresException("column \"" + qualifyColumn(cr, baseBindings)
-                                + "\" must appear in the GROUP BY clause or be used in an aggregate function",
-                                "42803");
-                    }
-                }
-                // Validate ORDER BY: non-aggregate columns are not allowed without GROUP BY
-                if (stmt.orderBy() != null) {
-                    for (SelectStmt.OrderByItem ob : stmt.orderBy()) {
-                        Expression obExpr = ob.expr();
-                        if (obExpr instanceof Literal && ((Literal) obExpr).literalType() == Literal.LiteralType.INTEGER) continue;
-                        if (!isAggregateOrConstant(obExpr)) {
-                            String colName = obExpr instanceof ColumnRef ? ((ColumnRef) obExpr).column()
-                                    : executor.exprToAlias(obExpr);
-                            // Check if it matches a target alias that is an aggregate
-                            boolean matchesAggTarget = false;
-                            for (SelectStmt.SelectTarget t : stmt.targets()) {
-                                if (t.alias() != null && t.alias().equalsIgnoreCase(colName) && isAggregateOrConstant(t.expr())) {
-                                    matchesAggTarget = true;
-                                    break;
-                                }
-                            }
-                            if (!matchesAggTarget) {
-                                String tableName = obExpr instanceof ColumnRef && ((ColumnRef) obExpr).table() != null
-                                        ? ((ColumnRef) obExpr).table() + "." + colName : colName;
-                                throw new MemgresException(
-                                        "column \"" + tableName + "\" must appear in the GROUP BY clause or be used in an aggregate function",
-                                        "42803");
-                            }
-                        }
-                    }
-                }
-            }
-            // Validate: aggregates not allowed in GROUP BY
-            if (hasGroupBy) {
-                for (Expression gExpr : stmt.groupBy()) {
-                    if (containsAggregate(gExpr)) {
-                        throw new MemgresException("aggregate functions are not allowed in GROUP BY", "42803");
-                    }
-                }
-                boolean groupByIsSimple = stmt.groupBy().stream().allMatch(g ->
-                        g instanceof ColumnRef || (g instanceof Literal && ((Literal) g).literalType() == Literal.LiteralType.INTEGER));
-                if (groupByIsSimple) {
-                    Set<String> groupedExprs = new java.util.HashSet<>();
-                    for (Expression gExpr : stmt.groupBy()) {
-                        if (gExpr instanceof Literal && ((Literal) gExpr).literalType() == Literal.LiteralType.INTEGER) {
-                            Literal lit = (Literal) gExpr;
-                            int ordinal = Integer.parseInt(lit.value());
-                            if (ordinal >= 1 && ordinal <= stmt.targets().size()) {
-                                Expression targetExpr = stmt.targets().get(ordinal - 1).expr();
-                                groupedExprs.add(targetExpr.toString().toLowerCase());
-                                if (targetExpr instanceof ColumnRef) groupedExprs.add(((ColumnRef) targetExpr).column().toLowerCase());
-                                String alias = stmt.targets().get(ordinal - 1).alias();
-                                if (alias != null) groupedExprs.add(alias.toLowerCase());
-                            }
-                        } else {
-                            groupedExprs.add(gExpr.toString().toLowerCase());
-                            if (gExpr instanceof ColumnRef) groupedExprs.add(((ColumnRef) gExpr).column().toLowerCase());
-                            if (gExpr instanceof ColumnRef) {
-                                ColumnRef cr2 = (ColumnRef) gExpr;
-                                for (SelectStmt.SelectTarget t : stmt.targets()) {
-                                    if (cr2.column().equalsIgnoreCase(t.alias())) {
-                                        groupedExprs.add(t.expr().toString().toLowerCase());
-                                        if (t.expr() instanceof ColumnRef) groupedExprs.add(((ColumnRef) t.expr()).column().toLowerCase());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    for (SelectStmt.SelectTarget target : stmt.targets()) {
-                        if (target.expr() instanceof WildcardExpr) continue;
-                        if (!isAggregateOrConstant(target.expr())) {
-                            String colName = executor.exprToAlias(target.expr());
-                            String alias = target.alias();
-                            if (!groupedExprs.contains(colName.toLowerCase())
-                                    && !groupedExprs.contains(target.expr().toString().toLowerCase())
-                                    && !(alias != null && groupedExprs.contains(alias.toLowerCase()))
-                                    && !allColumnRefsCoveredByGroupBy(target.expr(), groupedExprs)) {
-                                throw new MemgresException("column \"" + (target.expr() instanceof ColumnRef
-                                            ? qualifyColumn((ColumnRef) target.expr(), baseBindings) : colName)
-                                        + "\" must appear in the GROUP BY clause or be used in an aggregate function",
-                                        "42803");
-                            }
-                        }
-                    }
-                    // HAVING is evaluated per group, so a bare column there needs grouping too
-                    if (stmt.having() != null) {
-                        for (ColumnRef cr : ungroupedColumnRefs(stmt.having())) {
-                            String col = cr.column().toLowerCase();
-                            String qualified = cr.table() != null
-                                    ? cr.table().toLowerCase() + "." + col : col;
-                            if (groupedExprs.contains(col) || groupedExprs.contains(qualified)) continue;
-                            // A name that is not a column at all is an undefined-column error,
-                            // which normal evaluation reports; do not pre-empt it here
-                            if (!resolvesToColumn(cr, baseBindings)) continue;
-                            throw new MemgresException("column \"" + qualifyColumn(cr, baseBindings)
-                                    + "\" must appear in the GROUP BY clause or be used in an aggregate function",
-                                    "42803");
-                        }
-                    }
-                    if (stmt.orderBy() != null) {
-                        Set<String> targetExprs = new java.util.HashSet<>();
-                        for (SelectStmt.SelectTarget t : stmt.targets()) {
-                            targetExprs.add(executor.exprToAlias(t.expr()).toLowerCase());
-                            if (t.alias() != null) targetExprs.add(t.alias().toLowerCase());
-                            if (t.expr() instanceof ColumnRef) targetExprs.add(((ColumnRef) t.expr()).column().toLowerCase());
-                        }
-                        for (SelectStmt.OrderByItem ob : stmt.orderBy()) {
-                            Expression obExpr = ob.expr();
-                            if (obExpr instanceof Literal && ((Literal) obExpr).literalType() == Literal.LiteralType.INTEGER) continue;
-                            if (!isAggregateOrConstant(obExpr) && obExpr instanceof ColumnRef) {
-                                ColumnRef cr = (ColumnRef) obExpr;
-                                String colName = cr.column().toLowerCase();
-                                if (!groupedExprs.contains(colName) && !targetExprs.contains(colName)) {
-                                    throw new MemgresException(
-                                        "column \"" + cr.column() + "\" must appear in the GROUP BY clause or be used in an aggregate function",
-                                        "42803");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return aggregateEvaluator.executeAggregateSelect(stmt, contexts, baseBindings);
+            // A star stands for the columns it expands to, and grouping is judged — and GROUP BY
+            // ordinals counted — over those columns, not over the star itself.
+            SelectStmt grouped = stmt;
+            List<SelectStmt.SelectTarget> groupedTargets =
+                    expandTargetsForOrdinals(stmt.targets(), baseBindings);
+            if (groupedTargets != stmt.targets()) grouped = stmt.withTargets(groupedTargets);
+            groupByValidator.validate(grouped, groupedTargets, baseBindings);
+            return aggregateEvaluator.executeAggregateSelect(grouped, contexts, baseBindings);
         }
 
         // Check for window functions in targets
@@ -768,76 +635,6 @@ class SelectExecutor {
         for (SelectStmt.SelectTarget target : targets) {
             if (containsWindowFunction(target.expr())) return true;
         }
-        return false;
-    }
-
-    /** Check if an expression is an aggregate call, a constant, or composed entirely of aggregates/constants. */
-    boolean isAggregateOrConstant(Expression expr) {
-        if (expr instanceof Literal) return true;
-        if (expr instanceof OrderedSetAggExpr) return true;
-        if (expr instanceof FunctionCallExpr) return isAggregateFunction(((FunctionCallExpr) expr).name()) || ((FunctionCallExpr) expr).args().stream().allMatch(this::isAggregateOrConstant);
-        if (expr instanceof CastExpr) return isAggregateOrConstant(((CastExpr) expr).expr());
-        if (expr instanceof IsJsonExpr) return isAggregateOrConstant(((IsJsonExpr) expr).expr());
-        if (expr instanceof IsNullExpr) return isAggregateOrConstant(((IsNullExpr) expr).expr());
-        if (expr instanceof BinaryExpr) return isAggregateOrConstant(((BinaryExpr) expr).left()) && isAggregateOrConstant(((BinaryExpr) expr).right());
-        if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() == null || isAggregateOrConstant(c.left())) && isAggregateOrConstant(c.right()); }
-        if (expr instanceof UnaryExpr) return isAggregateOrConstant(((UnaryExpr) expr).operand());
-        if (expr instanceof SubqueryExpr) return true;
-        if (expr instanceof ExistsExpr) return true;
-        if (expr instanceof WindowFuncExpr) return true;
-        if (expr instanceof InExpr) return isAggregateOrConstant(((InExpr) expr).expr());
-        if (expr instanceof CaseExpr) {
-            CaseExpr c = (CaseExpr) expr;
-            if (c.operand() != null && !isAggregateOrConstant(c.operand())) return false;
-            for (CaseExpr.WhenClause when : c.whenClauses()) {
-                if (!isAggregateOrConstant(when.condition()) || !isAggregateOrConstant(when.result())) return false;
-            }
-            return c.elseExpr() == null || isAggregateOrConstant(c.elseExpr());
-        }
-        return false;
-    }
-
-    private boolean allColumnRefsCoveredByGroupBy(Expression expr, Set<String> groupedExprs) {
-        if (expr instanceof Literal) return true;
-        if (expr instanceof ColumnRef) {
-            ColumnRef cr = (ColumnRef) expr;
-            String col = cr.column().toLowerCase();
-            if (groupedExprs.contains(col)) return true;
-            if (cr.table() != null) {
-                String qualified = cr.table().toLowerCase() + "." + col;
-                return groupedExprs.contains(qualified);
-            }
-            return false;
-        }
-        if (expr instanceof FunctionCallExpr) {
-            FunctionCallExpr fn = (FunctionCallExpr) expr;
-            if (isAggregateFunction(fn.name())) return true;
-            return fn.args().stream().allMatch(a -> allColumnRefsCoveredByGroupBy(a, groupedExprs));
-        }
-        if (expr instanceof CastExpr) return allColumnRefsCoveredByGroupBy(((CastExpr) expr).expr(), groupedExprs);
-        if (expr instanceof BinaryExpr) return allColumnRefsCoveredByGroupBy(((BinaryExpr) expr).left(), groupedExprs)
-                && allColumnRefsCoveredByGroupBy(((BinaryExpr) expr).right(), groupedExprs);
-        if (expr instanceof CustomOperatorExpr) { CustomOperatorExpr c = (CustomOperatorExpr) expr; return (c.left() == null || allColumnRefsCoveredByGroupBy(c.left(), groupedExprs)) && allColumnRefsCoveredByGroupBy(c.right(), groupedExprs); }
-        if (expr instanceof UnaryExpr) return allColumnRefsCoveredByGroupBy(((UnaryExpr) expr).operand(), groupedExprs);
-        if (expr instanceof CaseExpr) {
-            CaseExpr c = (CaseExpr) expr;
-            if (c.operand() != null && !allColumnRefsCoveredByGroupBy(c.operand(), groupedExprs)) return false;
-            for (CaseExpr.WhenClause when : c.whenClauses()) {
-                if (!allColumnRefsCoveredByGroupBy(when.condition(), groupedExprs)
-                        || !allColumnRefsCoveredByGroupBy(when.result(), groupedExprs)) return false;
-            }
-            return c.elseExpr() == null || allColumnRefsCoveredByGroupBy(c.elseExpr(), groupedExprs);
-        }
-        if (expr instanceof SubqueryExpr) return true;
-        if (expr instanceof ExistsExpr) return true;
-        if (expr instanceof WindowFuncExpr) return true;
-        if (expr instanceof OrderedSetAggExpr) return true;
-        if (expr instanceof IsNullExpr) return allColumnRefsCoveredByGroupBy(((IsNullExpr) expr).expr(), groupedExprs);
-        if (expr instanceof InExpr) return allColumnRefsCoveredByGroupBy(((InExpr) expr).expr(), groupedExprs);
-        if (expr instanceof BetweenExpr) return allColumnRefsCoveredByGroupBy(((BetweenExpr) expr).expr(), groupedExprs);
-        if (expr instanceof IsBooleanExpr) return allColumnRefsCoveredByGroupBy(((IsBooleanExpr) expr).expr(), groupedExprs);
-        if (expr instanceof FieldAccessExpr) return allColumnRefsCoveredByGroupBy(((FieldAccessExpr) expr).expr(), groupedExprs);
-        if (expr instanceof CollateExpr) return allColumnRefsCoveredByGroupBy(((CollateExpr) expr).expr(), groupedExprs);
         return false;
     }
 
@@ -1577,52 +1374,6 @@ class SelectExecutor {
                 collectUsingColumns(Cols.listOf(jf.right()), result);
             }
         }
-    }
-
-    /** Every column reference in the expression that is not already inside an aggregate call. */
-    private List<ColumnRef> ungroupedColumnRefs(Expression expr) {
-        List<ColumnRef> out = new ArrayList<>();
-        collectUngroupedColumnRefs(expr, out);
-        return out;
-    }
-
-    private void collectUngroupedColumnRefs(Object node, List<ColumnRef> out) {
-        if (node == null) return;
-        if (node instanceof ColumnRef) {
-            out.add((ColumnRef) node);
-            return;
-        }
-        if (node instanceof FunctionCallExpr) {
-            FunctionCallExpr fc = (FunctionCallExpr) node;
-            String name = FunctionEvaluator.stripSchemaPrefix(fc.name().toLowerCase());
-            // Built-in or user-defined, an aggregate consumes its arguments
-            if (AGGREGATE_FUNCTIONS.contains(name) || executor.database.getAggregate(name) != null) return;
-        }
-        // A nested query has its own FROM and its own grouping rules
-        if (node instanceof com.memgres.engine.parser.ast.Statement) return;
-        AstWalk.forEachChild(node, child -> collectUngroupedColumnRefs(child, out));
-    }
-
-    /** True when the reference names a real column of one of the query's relations. */
-    private static boolean resolvesToColumn(ColumnRef cr, List<RowContext.TableBinding> bindings) {
-        if (bindings == null) return false;
-        for (RowContext.TableBinding b : bindings) {
-            if (b.table() != null && b.table().getColumnIndex(cr.column()) >= 0) return true;
-        }
-        return false;
-    }
-
-    /** PG names the offending column as table.column when the reference resolves to one. */
-    private static String qualifyColumn(ColumnRef cr, List<RowContext.TableBinding> bindings) {
-        if (cr.table() != null) return cr.table() + "." + cr.column();
-        if (bindings != null) {
-            for (RowContext.TableBinding b : bindings) {
-                if (b.table() != null && b.table().getColumnIndex(cr.column()) >= 0) {
-                    return (b.alias() != null ? b.alias() : b.table().getName()) + "." + cr.column();
-                }
-            }
-        }
-        return cr.column();
     }
 
     private boolean isSrfCall(Expression expr) {

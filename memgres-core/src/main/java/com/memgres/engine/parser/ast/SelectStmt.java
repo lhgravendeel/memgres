@@ -613,6 +613,12 @@ public final class SelectStmt implements Statement {
         }
     }
 
+    /** The same statement with a different select list, for star expansion. */
+    public SelectStmt withTargets(List<SelectTarget> newTargets) {
+        return new SelectStmt(distinct, distinctOn, newTargets, from, where, groupBy, having,
+                windowDefs, orderBy, limit, offset, withClauses, groupingSets, lockClause, withTies);
+    }
+
     public boolean distinct() { return distinct; }
     public List<Expression> distinctOn() { return distinctOn; }
     public List<SelectTarget> targets() { return targets; }
