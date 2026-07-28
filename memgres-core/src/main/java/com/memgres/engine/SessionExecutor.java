@@ -775,10 +775,20 @@ class SessionExecutor {
                 String namesStr = val.substring(0, colonIdx);
                 String mode = val.substring(colonIdx + 1);
                 boolean deferred = "DEFERRED".equalsIgnoreCase(mode);
-                if (executor.session != null) {
-                    if ("ALL".equals(namesStr)) {
+                if ("ALL".equals(namesStr)) {
+                    if (executor.session != null) {
                         executor.session.setAllConstraintsDeferred(deferred);
-                    } else {
+                    }
+                } else {
+                    // A name that matches no constraint would silently do nothing, leaving the
+                    // caller believing it had changed when a constraint fires.
+                    for (String cn : namesStr.split(",")) {
+                        String constraintName = cn.trim();
+                        if (!constraintExists(constraintName)) {
+                            throw PgErrors.undefinedObject("constraint", constraintName);
+                        }
+                    }
+                    if (executor.session != null) {
                         for (String cn : namesStr.split(",")) {
                             executor.session.setConstraintDeferred(cn.trim(), deferred);
                         }
@@ -1066,6 +1076,20 @@ class SessionExecutor {
     private static final Set<String> TABLE_PRIVILEGES = Cols.setOf(
             "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN", "ALL");
 
+    /** The privileges a column can carry; the rest are table-wide only. */
+    private static final Set<String> COLUMN_PRIVILEGES = Cols.setOf(
+            "SELECT", "INSERT", "UPDATE", "REFERENCES", "ALL");
+
+    /**
+     * Every privilege keyword the grammar knows. A name outside this set is not "you may not
+     * grant that here" but a syntax error, and PostgreSQL reports it as one — lower-cased,
+     * because the parser has already folded it.
+     */
+    private static final Set<String> KNOWN_PRIVILEGES = Cols.setOf(
+            "SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN",
+            "EXECUTE", "USAGE", "CREATE", "TEMPORARY", "TEMP", "CONNECT", "SET", "ALTER SYSTEM",
+            "RULE", "ALL");
+
     QueryResult executeGrant(GrantStmt s) {
         // Validate GRANTED BY grantor matches current user
         if (s.grantor() != null) {
@@ -1148,10 +1172,28 @@ class SessionExecutor {
         }
         // Additional TABLE grant validations
         if (s.objectType() != null && s.objectType().equals("TABLE") && s.objectName() != null) {
-            // Validate privilege types for tables
+            boolean columnLevel = s.columns() != null && !s.columns().isEmpty();
             for (String priv : s.privileges()) {
-                if (!TABLE_PRIVILEGES.contains(priv)) {
-                    throw new MemgresException("invalid privilege type " + priv + " for table", "0LP01");
+                if (!KNOWN_PRIVILEGES.contains(priv)) {
+                    throw PgErrors.syntax("unrecognized privilege type \"" + priv.toLowerCase() + "\"");
+                }
+                if (columnLevel) {
+                    if (!COLUMN_PRIVILEGES.contains(priv)) {
+                        throw new MemgresException("invalid privilege type " + priv + " for column", "0LP01");
+                    }
+                } else if (!TABLE_PRIVILEGES.contains(priv)) {
+                    // USAGE is a sequence right, so it survives the first check PG makes on a
+                    // relation target and is rejected by the later, table-specific one.
+                    String kind = priv.equals("USAGE") ? "table" : "relation";
+                    throw new MemgresException("invalid privilege type " + priv + " for " + kind, "0LP01");
+                }
+            }
+            // A grant option is a property of a role, and PUBLIC is not one.
+            if (s.withGrantOption() && s.grantees() != null) {
+                for (String grantee : s.grantees()) {
+                    if (grantee.equalsIgnoreCase("public")) {
+                        throw new MemgresException("grant options can only be granted to roles", "0LP01");
+                    }
                 }
             }
             // Validate column-level privileges: check column exists
@@ -2251,6 +2293,16 @@ class SessionExecutor {
             executor.session.removeCursor(stmt.cursorName());
         }
         return QueryResult.message(QueryResult.Type.SET, "CLOSE CURSOR");
+    }
+
+    /** True when some table in the database carries a constraint of this name. */
+    private boolean constraintExists(String name) {
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table table : schema.getTables().values()) {
+                if (table.getConstraint(name) != null) return true;
+            }
+        }
+        return false;
     }
 
     // ---- CREATE / ALTER / DROP STATISTICS ----

@@ -12,6 +12,32 @@ import java.util.*;
 class StringFunctions {
 
     /**
+     * PostgreSQL builds each of these results in a single allocation, so it refuses up front any
+     * request that could not fit in one rather than trying and running the backend out of memory.
+     * The ceiling is MaxAllocSize less the varlena header; a pad length is in characters, which
+     * UTF-8 can widen fourfold, while repeat() counts the bytes it is about to write.
+     */
+    private static final int MAX_RESULT_BYTES = 0x3fffffff - 4;
+    private static final int MAX_PAD_LENGTH = MAX_RESULT_BYTES / 4;
+
+    private static MemgresException requestedLengthTooLarge() {
+        return new MemgresException("requested length too large", "54000");
+    }
+
+    /** Bytes {@code s} occupies in UTF-8, which is the length PostgreSQL budgets against. */
+    private static long utf8Length(String s) {
+        long n = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < 0x80) n += 1;
+            else if (c < 0x800) n += 2;
+            else if (Character.isHighSurrogate(c)) { n += 4; i++; }
+            else n += 3;
+        }
+        return n;
+    }
+
+    /**
      * PostgreSQL declares these routines with an {@code integer} count and has no {@code bigint}
      * overload, so a wider count is a function that does not exist rather than a value to narrow.
      * Narrowing it silently turned a count of four billion into an empty string.
@@ -491,7 +517,10 @@ class StringFunctions {
                 }
                 String s = str.toString();
                 if (s.length() >= len) return s.substring(0, len);
-                if (fill.isEmpty()) return s; // avoid infinite loop
+                // Nothing to pad with, so PG shortens the request to the input itself — which is
+                // also why an outsized length with an empty fill is not a length error.
+                if (fill.isEmpty()) return s;
+                if (len > MAX_PAD_LENGTH) throw requestedLengthTooLarge();
                 StringBuilder sb = new StringBuilder();
                 while (sb.length() + s.length() < len) {
                     sb.append(fill);
@@ -513,6 +542,10 @@ class StringFunctions {
                 }
                 String s = str.toString();
                 if (s.length() >= len) return s.substring(0, len);
+                // Nothing to pad with: PG shortens the request to the input itself, and without
+                // that the loop below appends an empty string forever.
+                if (fill.isEmpty()) return s;
+                if (len > MAX_PAD_LENGTH) throw requestedLengthTooLarge();
                 StringBuilder sb = new StringBuilder(s);
                 while (sb.length() < len) {
                     sb.append(fill);
@@ -566,7 +599,11 @@ class StringFunctions {
                 Integer nBox = countArgument(fn, ctx, 1, "repeat");
                 if (nBox == null) return null;
                 int n = nBox;
-                return Strs.repeat(str.toString(), Math.max(0, n));
+                String body = str.toString();
+                if ((long) Math.max(0, n) * utf8Length(body) > MAX_RESULT_BYTES) {
+                    throw requestedLengthTooLarge();
+                }
+                return Strs.repeat(body, Math.max(0, n));
             }
             case "reverse": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);

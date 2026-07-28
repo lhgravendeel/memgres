@@ -375,7 +375,34 @@ class DdlAdminExecutor {
     // ---- CREATE POLICY ----
 
     QueryResult executeCreatePolicy(CreatePolicyStmt stmt) {
+        // A view has no row security, so a policy on one would be recorded and never applied —
+        // and a reader of the schema would conclude the view is protected when it is not.
+        if (executor.database.hasView(stmt.table())) {
+            throw PgErrors.wrongObjectType("\"" + stmt.table() + "\" is not a table");
+        }
         Table table = executor.resolveTable("public", stmt.table());
+        for (RlsPolicy existing : table.getRlsPolicies()) {
+            if (existing.getName().equalsIgnoreCase(stmt.name())) {
+                throw new MemgresException("policy \"" + stmt.name() + "\" for table \""
+                        + stmt.table() + "\" already exists", "42710");
+            }
+        }
+        if (stmt.roles() != null) {
+            for (String role : stmt.roles()) {
+                if (role.equalsIgnoreCase("public") || role.equalsIgnoreCase("current_user")
+                        || role.equalsIgnoreCase("session_user") || role.equalsIgnoreCase("current_role")) {
+                    continue;
+                }
+                if (!executor.database.hasRole(role)) {
+                    throw PgErrors.undefinedObject("role", role);
+                }
+            }
+        }
+        DdlDefinitionChecks.requireBooleanPredicate(stmt.usingExpr(), table, "POLICY");
+        DdlDefinitionChecks.requireBooleanPredicate(stmt.withCheckExpr(), table, "POLICY");
+        StoredExprCheck check = StoredExprCheck.forPolicy(table);
+        check.check(stmt.usingExpr());
+        check.check(stmt.withCheckExpr());
         table.addRlsPolicy(new RlsPolicy(stmt.name(), stmt.command(),
                 stmt.usingExpr(), stmt.withCheckExpr(), stmt.roles(), stmt.policyType()));
         return QueryResult.message(QueryResult.Type.SET, "CREATE POLICY");
@@ -546,21 +573,66 @@ class DdlAdminExecutor {
     QueryResult executeCreateRule(CreateRuleStmt s) {
         // Validate target table/view exists
         executor.resolveTable(executor.defaultSchema(), s.table());
+        checkRuleDefinition(s);
+        String joined = String.join(Database.RULE_ACTION_SEPARATOR, s.commands());
         // Store INSTEAD NOTHING rules for enforcement
         if ("INSTEAD".equals(s.action()) && "NOTHING".equals(s.command())) {
             executor.database.addRule(s.table(), s.event(), "INSTEAD_NOTHING");
-        } else if ("INSTEAD".equals(s.action()) && s.command() != null && !s.command().isEmpty()) {
-            executor.database.addRule(s.table(), s.event(), "INSTEAD:" + s.command());
-        } else if ("ALSO".equals(s.action()) && s.command() != null && !s.command().isEmpty()) {
-            executor.database.addRule(s.table(), s.event(), "ALSO:" + s.command());
+        } else if ("INSTEAD".equals(s.action()) && !joined.isEmpty()) {
+            executor.database.addRule(s.table(), s.event(), "INSTEAD:" + joined);
+        } else if ("ALSO".equals(s.action()) && !joined.isEmpty()) {
+            executor.database.addRule(s.table(), s.event(), "ALSO:" + joined);
         }
         // Track rule name with full definition for pg_rules
         executor.database.addRuleByName(s.name(), s.table(), s.event());
         // Store rule definition for pg_rules view
         String definition = "CREATE RULE " + s.name() + " AS ON " + s.event() + " TO " + s.table()
-                + " DO " + s.action() + " " + (s.command() != null ? s.command() : "NOTHING") + ";";
+                + " DO " + s.action() + " " + (s.commands().isEmpty() ? "NOTHING"
+                        : String.join("; ", s.commands())) + ";";
         executor.database.addRuleDefinition(s.name(), s.table(), definition);
         return QueryResult.message(QueryResult.Type.SET, "CREATE RULE");
+    }
+
+    /**
+     * An ON SELECT rule is how PostgreSQL represents a view, so a table may not carry one: its
+     * own storage and the rule would both claim to define what the relation contains. The OLD/NEW
+     * restrictions follow from the event — an INSERT has no prior row, a DELETE has no new one.
+     */
+    private void checkRuleDefinition(CreateRuleStmt s) {
+        if ("SELECT".equals(s.event()) && !executor.database.hasView(s.table())) {
+            if (s.whereClause() != null) {
+                // The qualification of an ON SELECT rule is resolved against OLD, which a
+                // SELECT rule has no row for.
+                throw PgErrors.invalidObjectState("ON SELECT rule cannot use OLD");
+            }
+            throw PgErrors.wrongObjectType(
+                    "relation \"" + s.table() + "\" cannot have ON SELECT rules");
+        }
+        if (!s.orReplace() && executor.database.hasRule(s.name(), s.table())) {
+            throw new MemgresException("rule \"" + s.name() + "\" for relation \""
+                    + s.table() + "\" already exists", "42710");
+        }
+        String forbidden = "INSERT".equals(s.event()) ? "OLD" : "DELETE".equals(s.event()) ? "NEW" : null;
+        if (forbidden == null) return;
+        for (String action : s.commands()) {
+            if (referencesRowAlias(action, forbidden)) {
+                throw PgErrors.invalidObjectState(
+                        "ON " + s.event() + " rule cannot use " + forbidden);
+            }
+        }
+    }
+
+    /** True when a rule action names {@code OLD.x} or {@code NEW.x} anywhere inside it. */
+    private static boolean referencesRowAlias(String action, String alias) {
+        com.memgres.engine.parser.ast.Statement parsed;
+        try {
+            parsed = com.memgres.engine.parser.Parser.parse(action);
+        } catch (RuntimeException e) {
+            return false; // an action this engine cannot parse is reported when the rule fires
+        }
+        return AstWalk.anyMatch(parsed, n -> n instanceof ColumnRef
+                && ((ColumnRef) n).table() != null
+                && ((ColumnRef) n).table().equalsIgnoreCase(alias));
     }
 
     // ---- CREATE SCHEMA ----

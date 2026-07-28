@@ -1435,12 +1435,21 @@ class TransactionCursorLockCoverageTest {
 
     @Test
     void testSetConstraintsNamedDeferred() throws SQLException {
+        exec("CREATE TABLE t1 (id INTEGER, CONSTRAINT myconstraint UNIQUE (id) DEFERRABLE)");
         exec("SET CONSTRAINTS myconstraint DEFERRED");
     }
 
     @Test
     void testSetConstraintsNamedImmediate() throws SQLException {
+        exec("CREATE TABLE t1 (id INTEGER, CONSTRAINT myconstraint UNIQUE (id) DEFERRABLE)");
         exec("SET CONSTRAINTS myconstraint IMMEDIATE");
+    }
+
+    @Test
+    void testSetConstraintsUnknownNameRejected() {
+        SQLException e = assertThrows(SQLException.class,
+                () -> exec("SET CONSTRAINTS myconstraint DEFERRED"));
+        assertEquals("42704", e.getSQLState());
     }
 
     @Test

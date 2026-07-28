@@ -30,6 +30,12 @@ public class PlpgsqlExecutor {
     private int exceptionBlockDepth;
     // Track current function name for PG_EXCEPTION_CONTEXT
     private String currentFunctionName;
+
+    /**
+     * How an identifier that names both a variable and a column is resolved: PG's default is
+     * "error", and the {@code #variable_conflict} pragma at the top of a body changes it.
+     */
+    private String variableConflict = "error";
     // Parameter names (lower-cased) of the current function. In PG, the hidden outer block
     // labeled with the function name contains ONLY the parameters, so function-name
     // qualification (funcname.x) resolves parameters but never body-DECLAREd variables.
@@ -64,8 +70,20 @@ public class PlpgsqlExecutor {
         final java.util.Set<String> outputOnlyVars = new java.util.HashSet<>();
         final Scope parent;
         int lastRowCount = 0;
+        /** Label of the block that opened this scope, so {@code label.var} can reach it. */
+        String label;
 
         Scope(Scope parent) { this.parent = parent; }
+
+        /** The scope opened by the block carrying this label, or null when no block has it. */
+        Scope labeled(String name) {
+            Scope s = this;
+            while (s != null) {
+                if (name.equalsIgnoreCase(s.label)) return s;
+                s = s.parent;
+            }
+            return null;
+        }
 
         Object get(String name) {
             String key = name.toLowerCase();
@@ -157,17 +175,32 @@ public class PlpgsqlExecutor {
         this.currentFunctionParams = null;
         Scope scope = new Scope(null);
         scope.declare("found", false);
-        if (session != null) session.enterNestedExecution();
+        if (session != null) session.enterRoutine();
         try {
-            executeBlock(block, scope);
-        } catch (ReturnSignal rs) {
-            // DO blocks can RETURN but the value is discarded
+            if (session != null) session.enterNestedExecution();
+            try {
+                executeBlock(block, scope);
+            } catch (ReturnSignal rs) {
+                // DO blocks can RETURN but the value is discarded
+            } finally {
+                if (session != null) session.exitNestedExecution();
+            }
         } finally {
-            if (session != null) session.exitNestedExecution();
+            if (session != null) session.exitRoutine();
         }
     }
 
     public Object executeFunction(PgFunction function, List<Object> args) {
+        // Checked before any of the call's setup, so a rejected call leaves nothing to unwind.
+        if (session != null) session.enterRoutine();
+        try {
+            return executeFunctionCall(function, args);
+        } finally {
+            if (session != null) session.exitRoutine();
+        }
+    }
+
+    private Object executeFunctionCall(PgFunction function, List<Object> args) {
         this.isProcedureExecution = function.isProcedure();
         this.currentFunctionName = function.getName();
         // Track function call depth: when inside a non-procedure function, transaction control is forbidden
@@ -476,6 +509,18 @@ public class PlpgsqlExecutor {
      */
     public Object[] executeTriggerFunction(PgFunction function, Object[] newRow, Object[] oldRow,
                                            Table table, PgTrigger trigger) {
+        // A trigger that writes to its own table fires itself again; the nesting is bounded here
+        // so it is reported the way PostgreSQL reports it instead of exhausting the Java stack.
+        if (session != null) session.enterTriggerCall();
+        try {
+            return executeTriggerFunctionCall(function, newRow, oldRow, table, trigger);
+        } finally {
+            if (session != null) session.exitTriggerCall();
+        }
+    }
+
+    private Object[] executeTriggerFunctionCall(PgFunction function, Object[] newRow, Object[] oldRow,
+                                                Table table, PgTrigger trigger) {
         PlpgsqlStatement.Block block = PlpgsqlParser.parse(function.getBody());
         this.currentFunctionName = function.getName();
         this.currentFunctionParams = new java.util.HashSet<>(); // trigger functions take no parameters
@@ -594,7 +639,11 @@ public class PlpgsqlExecutor {
      * after its END, not unwinding the whole function.
      */
     private void executeBlock(PlpgsqlStatement.Block block, Scope scope) {
+        if (block.variableConflict() != null) {
+            variableConflict = block.variableConflict();
+        }
         if (block.label() != null) {
+            if (scope.label == null) scope.label = block.label();
             try {
                 executeBlockBody(block, scope);
             } catch (ExitSignal e) {
@@ -607,9 +656,16 @@ public class PlpgsqlExecutor {
 
     private void executeBlockBody(PlpgsqlStatement.Block block, Scope scope) {
         for (PlpgsqlStatement.VarDeclaration decl : block.declarations()) {
+            if (decl.isCursor() && decl.cursorQuery() != null && !decl.cursorQuery().isEmpty()) {
+                // A bound cursor keeps its query so OPEN can run it, with or without arguments
+                scope.declareTyped(decl.name(),
+                        new BoundCursor(decl.name(), decl.cursorQuery(), decl.cursorParams()),
+                        decl.typeName());
+                continue;
+            }
             Object defaultVal = null;
             if (decl.defaultExpr() != null) {
-                defaultVal = evalExpr(decl.defaultExpr(), scope);
+                defaultVal = evalDeclarationDefault(decl, scope);
             }
             scope.declareTyped(decl.name(), defaultVal, decl.typeName());
         }
@@ -698,6 +754,19 @@ public class PlpgsqlExecutor {
     }
 
     /**
+     * An array-typed variable must hold an array rather than the text of one, or a later
+     * subscript would have nothing to index into; PG coerces every initialiser to the declared
+     * type, and it is the array case that a raw evaluation gets wrong.
+     */
+    private Object evalDeclarationDefault(PlpgsqlStatement.VarDeclaration decl, Scope scope) {
+        String type = decl.typeName();
+        if (type != null && type.endsWith("[]")) {
+            return evalExpr("CAST(" + decl.defaultExpr() + " AS " + type + ")", scope);
+        }
+        return evalExpr(decl.defaultExpr(), scope);
+    }
+
+    /**
      * Release a subtransaction savepoint and commit the implicit transaction if one was started.
      * Called after a PL/pgSQL EXCEPTION handler completes (normally or via RETURN).
      */
@@ -723,6 +792,8 @@ public class PlpgsqlExecutor {
         } else if (stmt instanceof PlpgsqlStatement.Assignment) {
             PlpgsqlStatement.Assignment a = (PlpgsqlStatement.Assignment) stmt;
             executeAssignment(a, scope);
+        } else if (stmt instanceof PlpgsqlStatement.SubscriptAssignment) {
+            executeSubscriptAssignment((PlpgsqlStatement.SubscriptAssignment) stmt, scope);
         } else if (stmt instanceof PlpgsqlStatement.CaseStmt) {
             PlpgsqlStatement.CaseStmt c = (PlpgsqlStatement.CaseStmt) stmt;
             executeCase(c, scope);
@@ -1307,8 +1378,8 @@ public class PlpgsqlExecutor {
 
     private void executeRaise(PlpgsqlStatement.RaiseStmt stmt, Scope scope) {
         // Bare RAISE: re-raise the current exception
-        if (stmt.format() == null && stmt.argExprs().isEmpty() && stmt.errcode() == null
-                && stmt.level().equals("EXCEPTION")) {
+        if (stmt.format() == null && stmt.messageExpr() == null && stmt.argExprs().isEmpty()
+                && stmt.errcode() == null && stmt.level().equals("EXCEPTION")) {
             String sqlState = scope.has("sqlstate") ? String.valueOf(scope.get("sqlstate")) : "P0001";
             String msg = scope.has("sqlerrm") ? String.valueOf(scope.get("sqlerrm")) : "PL/pgSQL exception";
             MemgresException ex = new MemgresException(msg, sqlState);
@@ -1322,8 +1393,19 @@ public class PlpgsqlExecutor {
             throw ex;
         }
 
-        String message = formatRaiseMessage(stmt.format(), stmt.argExprs(), scope);
-        String hint = stmt.hint();
+        // Every USING option value is an expression, so it is evaluated here rather than being
+        // taken from the parse as a literal.
+        String message = stmt.messageExpr() != null
+                ? asText(evalExpr(stmt.messageExpr(), scope))
+                : formatRaiseMessage(stmt.format(), stmt.argExprs(), scope);
+        String hint = asText(evalExpr(stmt.hint(), scope));
+        String detail = asText(evalExpr(stmt.detail(), scope));
+        String errcode = asText(evalExpr(stmt.errcode(), scope));
+        String column = asText(evalExpr(stmt.column(), scope));
+        String constraint = asText(evalExpr(stmt.constraint(), scope));
+        String datatype = asText(evalExpr(stmt.datatype(), scope));
+        String table = asText(evalExpr(stmt.table(), scope));
+        String schema = asText(evalExpr(stmt.schema(), scope));
         switch (stmt.level()) {
             case "NOTICE":
             case "WARNING":
@@ -1332,7 +1414,7 @@ public class PlpgsqlExecutor {
                 LOG.info("PL/pgSQL {}: {}", stmt.level(), message);
                 if (session != null) {
                     // PG default: WARNING→01000, NOTICE/INFO/LOG→00000
-                    String sqlState = stmt.errcode() != null ? conditionToSqlState(stmt.errcode())
+                    String sqlState = errcode != null ? conditionToSqlState(errcode)
                             : ("WARNING".equals(stmt.level()) ? "01000" : "00000");
                     session.addNotice(stmt.level(), sqlState, message, hint);
                 }
@@ -1340,21 +1422,21 @@ public class PlpgsqlExecutor {
             case "DEBUG":
                 LOG.debug("PL/pgSQL {}: {}", stmt.level(), message);
                 if (session != null) {
-                    String sqlState = stmt.errcode() != null ? conditionToSqlState(stmt.errcode()) : "00000";
+                    String sqlState = errcode != null ? conditionToSqlState(errcode) : "00000";
                     session.addNotice(stmt.level(), sqlState, message, hint);
                 }
                 break;
             case "EXCEPTION": {
                 String sqlState = "P0001";
-                if (stmt.errcode() != null) sqlState = conditionToSqlState(stmt.errcode());
+                if (errcode != null) sqlState = conditionToSqlState(errcode);
                 MemgresException ex = new MemgresException(message != null ? message : "PL/pgSQL exception", sqlState);
-                if (stmt.detail() != null) ex.setDetail(stmt.detail());
+                if (detail != null) ex.setDetail(detail);
                 if (hint != null) ex.setHint(hint);
-                if (stmt.column() != null) ex.setColumn(stmt.column());
-                if (stmt.constraint() != null) ex.setConstraint(stmt.constraint());
-                if (stmt.datatype() != null) ex.setDatatype(stmt.datatype());
-                if (stmt.table() != null) ex.setTable(stmt.table());
-                if (stmt.schema() != null) ex.setSchema(stmt.schema());
+                if (column != null) ex.setColumn(column);
+                if (constraint != null) ex.setConstraint(constraint);
+                if (datatype != null) ex.setDatatype(datatype);
+                if (table != null) ex.setTable(table);
+                if (schema != null) ex.setSchema(schema);
                 // Record context at throw time for PG_EXCEPTION_CONTEXT
                 if (currentFunctionName != null) {
                     ex.setPgContext("PL/pgSQL function " + currentFunctionName + "() line 1 at RAISE");
@@ -1366,15 +1448,19 @@ public class PlpgsqlExecutor {
                 String condState = conditionToSqlState(stmt.level().toLowerCase());
                 if (!condState.equals("P0001") || stmt.level().contains("_")) {
                     String msg = message != null ? message : stmt.level().replace("_", " ");
-                    if (stmt.errcode() != null) condState = conditionToSqlState(stmt.errcode());
+                    if (errcode != null) condState = conditionToSqlState(errcode);
                     MemgresException ex = new MemgresException(msg, condState);
-                    if (stmt.detail() != null) ex.setDetail(stmt.detail());
+                    if (detail != null) ex.setDetail(detail);
                     if (hint != null) ex.setHint(hint);
                     throw ex;
                 }
                 break;
             }
         }
+    }
+
+    private String asText(Object val) {
+        return val == null ? null : String.valueOf(val);
     }
 
     private String formatRaiseMessage(String format, List<String> argExprs, Scope scope) {
@@ -1710,7 +1796,139 @@ public class PlpgsqlExecutor {
             throw new MemgresException("\"" + target + "\" is not a known variable", "42601");
         }
         rejectCompositeIntoScalar(scope.declaredType(target), value);
-        scope.set(target, value);
+        // A row stored in a composite variable is kept by field name, so r.f reads it back
+        scope.set(target, coerceParamValue(value, scope.declaredType(target)));
+    }
+
+    /**
+     * Assign through subscripts, as in {@code a[2] := 99} or {@code a[1].x := 9}. PG rebuilds the
+     * whole array value, extending it with NULLs when the subscript is past the end, so the
+     * container is copied and written back rather than mutated in place.
+     */
+    private void executeSubscriptAssignment(PlpgsqlStatement.SubscriptAssignment stmt, Scope scope) {
+        String base = stmt.baseName();
+        if (!scope.has(base)) {
+            throw new MemgresException("\"" + base + "\" is not a known variable", "42601");
+        }
+        List<PlpgsqlStatement.TargetStep> steps = stmt.steps();
+        PlpgsqlStatement.TargetStep last = steps.get(steps.size() - 1);
+        String declared = scope.declaredType(base);
+        String elementType = declared != null && declared.endsWith("[]")
+                ? declared.substring(0, declared.length() - 2) : null;
+
+        Object value;
+        if (!last.isField() && elementType != null) {
+            // A slice takes a whole array; a single subscript takes one element. Casting here is
+            // what turns '{8,9}' into an array rather than leaving it as its text.
+            String castTo = last.isSlice() ? declared : elementType;
+            value = evalExpr("CAST(" + stmt.valueExpr() + " AS " + castTo + ")", scope);
+        } else {
+            value = evalExpr(stmt.valueExpr(), scope);
+        }
+
+        Object current = scope.get(base);
+        if (elementType != null && current != null && !(current instanceof List)) {
+            // The variable may still hold the text of an array, which has no element to write to
+            current = evalExpr("CAST(" + base + " AS " + declared + ")", scope);
+        }
+        scope.set(base, applyTargetSteps(current, declared, steps, 0, value, scope));
+    }
+
+    private Object applyTargetSteps(Object container, String containerType,
+                                    List<PlpgsqlStatement.TargetStep> steps,
+                                    int idx, Object value, Scope scope) {
+        PlpgsqlStatement.TargetStep step = steps.get(idx);
+        boolean last = idx == steps.size() - 1;
+
+        if (step.isField()) {
+            Map<String, Object> map = toMutableRecord(container, containerType);
+            String field = step.field.toLowerCase();
+            Object child = last ? value
+                    : applyTargetSteps(map.get(field), fieldType(containerType, field),
+                            steps, idx + 1, value, scope);
+            map.put(field, child);
+            return map;
+        }
+
+        String elementType = containerType != null && containerType.endsWith("[]")
+                ? containerType.substring(0, containerType.length() - 2) : null;
+        List<Object> list = toMutableArray(container);
+        if (step.isSlice()) {
+            int lower = toInt(evalExpr(step.index, scope));
+            int upper = toInt(evalExpr(step.upper, scope));
+            List<Object> replacement = toMutableArray(value);
+            for (int i = lower; i <= upper; i++) {
+                setArrayElement(list, i, i - lower < replacement.size() ? replacement.get(i - lower) : null);
+            }
+            return list;
+        }
+
+        int index = toInt(evalExpr(step.index, scope));
+        Object existing = (index >= 1 && index <= list.size()) ? list.get(index - 1) : null;
+        // A multi-dimensional array subscripts into itself, so the element keeps the array type
+        String childType = last ? null
+                : (steps.get(idx + 1).isField() ? elementType : containerType);
+        Object child = last ? value
+                : applyTargetSteps(existing, childType, steps, idx + 1, value, scope);
+        setArrayElement(list, index, child);
+        return list;
+    }
+
+    private String fieldType(String rowType, String field) {
+        if (rowType == null) return null;
+        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
+                database.getRowType(rowType);
+        if (fields == null) return null;
+        for (com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f : fields) {
+            if (f.name().equalsIgnoreCase(field)) return f.typeName();
+        }
+        return null;
+    }
+
+    /** Store at a 1-based subscript, padding with NULLs the way PG extends an array. */
+    private void setArrayElement(List<Object> list, int index, Object value) {
+        if (index < 1) {
+            throw new MemgresException("array subscript out of range", "2202E");
+        }
+        while (list.size() < index) list.add(null);
+        list.set(index - 1, value);
+    }
+
+    private List<Object> toMutableArray(Object val) {
+        if (val instanceof List) return new ArrayList<Object>((List<?>) val);
+        if (val == null) return new ArrayList<Object>();
+        List<Object> single = new ArrayList<Object>();
+        single.add(val);
+        return single;
+    }
+
+    /**
+     * Read a composite value as a field map so one field can be replaced. The row type supplies
+     * the names, without which a stored row would lose the fields the assignment does not touch.
+     */
+    private Map<String, Object> toMutableRecord(Object val, String rowType) {
+        if (val instanceof Map) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> map = (Map<String, Object>) val;
+            return new LinkedHashMap<String, Object>(map);
+        }
+        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
+                rowType != null ? database.getRowType(rowType) : null;
+        Map<String, Object> map = new LinkedHashMap<String, Object>();
+        List<Object> values = null;
+        if (val instanceof AstExecutor.PgRow) {
+            values = new ArrayList<Object>(((AstExecutor.PgRow) val).values());
+        } else if (val instanceof String && fields != null) {
+            AstExecutor.PgRow parsed = astExecutor.parseCompositeToRow((String) val, rowType);
+            if (parsed != null) values = new ArrayList<Object>(parsed.values());
+        }
+        if (values == null) values = new ArrayList<Object>();
+        for (int i = 0; i < Math.max(values.size(), fields != null ? fields.size() : 0); i++) {
+            String name = fields != null && i < fields.size()
+                    ? fields.get(i).name().toLowerCase() : ("f" + (i + 1));
+            map.put(name, i < values.size() ? values.get(i) : null);
+        }
+        return map;
     }
 
     /**
@@ -1863,16 +2081,25 @@ public class PlpgsqlExecutor {
 
     private void executeOpenCursor(PlpgsqlStatement.OpenCursorStmt stmt, Scope scope) {
         String sql = stmt.sql();
+        Object bound = scope.get(stmt.cursorName());
+        Scope argScope = scope;
         if (sql == null) {
-            Object existing = scope.get(stmt.cursorName());
-            if (existing instanceof String) sql = (String) existing;
+            if (bound instanceof BoundCursor) {
+                BoundCursor cursor = (BoundCursor) bound;
+                sql = cursor.sql;
+                argScope = bindCursorArgs(cursor, stmt, scope);
+            } else if (bound instanceof String) {
+                sql = (String) bound;
+            }
+        } else if (!stmt.argExprs().isEmpty()) {
+            throw new MemgresException(
+                    "cursor \"" + stmt.cursorName() + "\" has no arguments", "42601");
         }
         if (sql != null) {
             // A refcursor variable holds its portal name; PG generates one when it has none
-            Object bound = scope.get(stmt.cursorName());
             String portal = bound instanceof String && !((String) bound).trim().isEmpty()
                     ? ((String) bound).trim() : stmt.cursorName();
-            sql = substituteVariables(sql, scope);
+            sql = substituteVariables(sql, argScope);
             QueryResult result = astExecutor.execute(sql);
             scope.set(stmt.cursorName(), new CursorState(result, portal));
             // Register the portal with the session so the caller can FETCH from it after the
@@ -1886,32 +2113,68 @@ public class PlpgsqlExecutor {
         }
     }
 
+    /**
+     * Bind the arguments of {@code OPEN c(...)} onto a scope of its own, so that the cursor's
+     * parameters resolve while its query runs without leaking into the calling block.
+     */
+    private Scope bindCursorArgs(BoundCursor cursor, PlpgsqlStatement.OpenCursorStmt stmt, Scope scope) {
+        List<String> params = cursor.params;
+        if (params.isEmpty() && stmt.argExprs().isEmpty()) return scope;
+        // The argument list was already checked against the declaration when the body was parsed
+        Scope argScope = new Scope(scope);
+        Object[] bound = new Object[params.size()];
+        for (int i = 0; i < stmt.argExprs().size(); i++) {
+            String name = stmt.argNames().get(i);
+            int slot = i;
+            if (name != null) {
+                for (int p = 0; p < params.size(); p++) {
+                    if (params.get(p).equalsIgnoreCase(name)) { slot = p; break; }
+                }
+            }
+            if (slot < params.size()) {
+                bound[slot] = evalExpr(stmt.argExprs().get(i), scope);
+            }
+        }
+        for (int p = 0; p < params.size(); p++) {
+            argScope.declare(params.get(p), bound[p]);
+        }
+        return argScope;
+    }
+
     private void executeFetch(PlpgsqlStatement.FetchStmt stmt, Scope scope) {
         Object cursorObj = scope.get(stmt.cursorName());
-        if (cursorObj instanceof CursorState) {
-            CursorState cursor = (CursorState) cursorObj;
-            if (cursor.position < cursor.result.getRows().size()) {
-                Object[] row = cursor.result.getRows().get(cursor.position++);
-                if (stmt.intoVars() != null) {
-                    if (stmt.intoVars().size() > 1) {
-                        // Multiple INTO variables: assign each column to its corresponding variable
-                        for (int i = 0; i < stmt.intoVars().size() && i < row.length; i++) {
-                            scope.set(stmt.intoVars().get(i), row[i]);
-                        }
-                    } else if (row.length == 1) {
-                        scope.set(stmt.intoVars().get(0), row[0]);
-                    } else {
-                        Map<String, Object> record = new LinkedHashMap<>();
-                        for (int i = 0; i < cursor.result.getColumns().size(); i++) {
-                            record.put(cursor.result.getColumns().get(i).getName().toLowerCase(), row[i]);
-                        }
-                        scope.set(stmt.intoVars().get(0), record);
+        if (!(cursorObj instanceof CursorState)) {
+            // An unopened cursor variable still holds no portal, which is what PG reports
+            throw new MemgresException(
+                    "cursor variable \"" + stmt.cursorName() + "\" is null", "22004");
+        }
+        CursorState cursor = (CursorState) cursorObj;
+        int count = 1;
+        if (stmt.countExpr() != null) {
+            Object countVal = evalExpr(stmt.countExpr(), scope);
+            count = countVal == null ? 1 : toInt(countVal);
+        }
+        Object[] row = cursor.move(stmt.direction(), count);
+        if (row != null) {
+            if (stmt.intoVars() != null) {
+                if (stmt.intoVars().size() > 1) {
+                    // Multiple INTO variables: assign each column to its corresponding variable
+                    for (int i = 0; i < stmt.intoVars().size() && i < row.length; i++) {
+                        scope.set(stmt.intoVars().get(i), row[i]);
                     }
+                } else if (row.length == 1) {
+                    scope.set(stmt.intoVars().get(0), row[0]);
+                } else {
+                    Map<String, Object> record = new LinkedHashMap<>();
+                    for (int i = 0; i < cursor.result.getColumns().size(); i++) {
+                        record.put(cursor.result.getColumns().get(i).getName().toLowerCase(), row[i]);
+                    }
+                    scope.set(stmt.intoVars().get(0), record);
                 }
-                scope.set("found", true);
-            } else {
-                scope.set("found", false);
             }
+            scope.set("found", true);
+        } else {
+            scope.set("found", false);
         }
     }
 
@@ -1919,14 +2182,50 @@ public class PlpgsqlExecutor {
         scope.set(stmt.cursorName(), null);
     }
 
+    /** A cursor declared with a query, before it is opened. */
+    private static class BoundCursor {
+        final String name;
+        final String sql;
+        final List<String> params;
+        BoundCursor(String name, String sql, List<String> params) {
+            this.name = name;
+            this.sql = sql;
+            this.params = params;
+        }
+        @Override public String toString() { return name; }
+    }
+
     private static class CursorState {
         final QueryResult result;
         /** The portal name this cursor is registered under, which is also its text value. */
         final String portal;
+        /**
+         * PG's cursor position: 0 before the first row, n+1 past the last, otherwise the 1-based
+         * index of the current row. Backward and absolute movement need the "before"/"after"
+         * states, which a plain next-row index cannot express.
+         */
         int position = 0;
         CursorState(QueryResult result, String portal) {
             this.result = result;
             this.portal = portal;
+        }
+
+        /** Reposition as the direction says and return the row landed on, or null for none. */
+        Object[] move(String direction, int count) {
+            int n = result.getRows().size();
+            int target;
+            if ("PRIOR".equals(direction)) target = position - 1;
+            else if ("FIRST".equals(direction)) target = 1;
+            else if ("LAST".equals(direction)) target = n;
+            else if ("ABSOLUTE".equals(direction)) target = count >= 0 ? count : n + 1 + count;
+            else if ("RELATIVE".equals(direction)) target = position + count;
+            else if ("BACKWARD".equals(direction)) target = position - count;
+            else if ("FORWARD".equals(direction)) target = position + count;
+            else target = position + 1; // NEXT
+            if (target < 0) target = 0;
+            if (target > n) target = n + 1;
+            position = target;
+            return (target >= 1 && target <= n) ? result.getRows().get(target - 1) : null;
         }
 
         /** A refcursor renders as its portal name, so RETURN c hands back a usable name. */
@@ -2091,6 +2390,22 @@ public class PlpgsqlExecutor {
                 if (t.type() == TokenType.LEFT_PAREN) substDepth++;
                 else if (t.type() == TokenType.RIGHT_PAREN) substDepth--;
 
+                // A block label qualifies its own variables, which is the only way to reach one
+                // that an inner block shadows.
+                if ((t.type() == TokenType.IDENTIFIER || t.type() == TokenType.KEYWORD)
+                        && i + 2 < tokens.size()
+                        && tokens.get(i + 1).type() == TokenType.DOT
+                        && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
+                            || tokens.get(i + 2).type() == TokenType.KEYWORD)
+                        && !scan.tableRefNames.contains(t.value().toLowerCase())) {
+                    Scope labeled = scope.labeled(t.value());
+                    if (labeled != null && labeled.has(tokens.get(i + 2).value())) {
+                        appendValue(sb, labeled.get(tokens.get(i + 2).value()));
+                        i += 2;
+                        continue;
+                    }
+                }
+
                 // Handle function-name-qualified reference: funcname.x. In PG, the hidden outer
                 // block labeled with the function name contains ONLY the parameters, so this
                 // resolves parameters but never body-DECLAREd variables — those fall through to
@@ -2224,12 +2539,16 @@ public class PlpgsqlExecutor {
                             conflictsWithColumn = true;
                         }
                         if (conflictsWithColumn) {
-                            if (!columnWins) {
+                            // #variable_conflict names the winner; without it PG reports the
+                            // ambiguity, and a SQL-language body always lets the column win.
+                            if (!columnWins && "error".equals(variableConflict)) {
                                 throw new MemgresException(
                                         "column reference \"" + lowerName + "\" is ambiguous", "42702");
                             }
-                            appendTokenToSb(sb, t);
-                            continue;
+                            if (columnWins || "use_column".equals(variableConflict)) {
+                                appendTokenToSb(sb, t);
+                                continue;
+                            }
                         }
                         Object val = scope.get(t.value());
                         // Handle String[] with direct subscript: TG_ARGV[0]
@@ -2575,6 +2894,12 @@ public class PlpgsqlExecutor {
                 sb.append("]");
             }
             else if (elem instanceof Number || elem instanceof Boolean) sb.append(elem);
+            else if (elem instanceof Map) {
+                // A composite element must stay a row rather than become its Java toString
+                StringBuilder elemSb = new StringBuilder();
+                appendValue(elemSb, elem);
+                sb.append(elemSb.toString().trim());
+            }
             else sb.append("'").append(elem.toString().replace("'", "''")).append("'");
         }
     }
@@ -2614,7 +2939,7 @@ public class PlpgsqlExecutor {
         String type = typeName.toLowerCase().trim();
         // Convert PgRow to a Map when the parameter type is a composite type
         if (val instanceof AstExecutor.PgRow) {
-            List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = database.getCompositeType(type);
+            List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields = database.getRowType(type);
             if (fields != null) {
                 AstExecutor.PgRow row = (AstExecutor.PgRow) val;
                 Map<String, Object> record = new LinkedHashMap<>();

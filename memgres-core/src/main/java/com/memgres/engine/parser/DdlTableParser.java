@@ -13,6 +13,11 @@ import java.util.List;
  * extracted from DdlParser.
  */
 class DdlTableParser {
+    /** The properties LIKE can copy. Anything else is a syntax error, not a silently ignored word. */
+    private static final java.util.Set<String> LIKE_OPTIONS = Cols.setOf(
+            "ALL", "COMMENTS", "COMPRESSION", "CONSTRAINTS", "DEFAULTS", "GENERATED",
+            "IDENTITY", "INDEXES", "STATISTICS", "STORAGE");
+
     private final Parser parser;
     private final List<TableConstraint> pendingColumnChecks = new ArrayList<>();
 
@@ -120,7 +125,11 @@ class DdlTableParser {
                 StringBuilder likeOpts = new StringBuilder();
                 while (parser.matchKeyword("INCLUDING") || parser.matchKeyword("EXCLUDING")) {
                     boolean including = parser.tokens.get(parser.pos - 1).value().equals("INCLUDING");
+                    Token optToken = parser.peek();
                     String what = parser.readIdentifier().toUpperCase();
+                    if (!LIKE_OPTIONS.contains(what)) {
+                        throw new ParseException("syntax error", optToken);
+                    }
                     if (including) {
                         if (likeOpts.length() > 0) likeOpts.append(",");
                         likeOpts.append(what);
@@ -190,7 +199,10 @@ class DdlTableParser {
                 onCommitAction = "DROP";
             } else if (parser.matchKeywords("DELETE", "ROWS")) {
                 onCommitAction = "DELETE ROWS";
-            } else if (parser.matchKeywords("PRESERVE", "ROWS")) {
+            } else {
+                // PRESERVE is not reserved, so it arrives as a plain identifier.
+                parser.readIdentifier();
+                parser.matchKeyword("ROWS");
                 onCommitAction = "PRESERVE ROWS";
             }
         }
@@ -306,14 +318,14 @@ class DdlTableParser {
                 // MATCH FULL | MATCH PARTIAL | MATCH SIMPLE
                 if (parser.matchKeyword("MATCH")) {
                     if (parser.matchKeyword("FULL")) colRefMatchType = "FULL";
-                    else if (parser.matchKeyword("PARTIAL")) colRefMatchType = "PARTIAL";
+                    else if (parser.matchKeyword("PARTIAL")) colRefMatchType = matchPartial();
                     else if (parser.matchKeyword("SIMPLE")) colRefMatchType = "SIMPLE";
                 }
                 while (parser.matchKeyword("ON")) {
                     if (parser.matchKeyword("DELETE")) {
-                        refOnDelete = parseReferentialAction();
+                        refOnDelete = parseReferentialAction(true);
                     } else if (parser.matchKeyword("UPDATE")) {
-                        refOnUpdate = parseReferentialAction();
+                        refOnUpdate = parseReferentialAction(false);
                     }
                 }
                 if (parser.matchKeyword("DEFERRABLE")) {
@@ -400,6 +412,7 @@ class DdlTableParser {
             }
             if (parser.matchKeyword("COLLATE")) {
                 if (!parser.isClauseKeyword()) {
+                    com.memgres.engine.DdlDefinitionChecks.rejectUncollatableType(typeName);
                     String collation = parser.readIdentifier();
                     if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
                     ExpressionParser.validateCollationStatic(collation, parser.peek());
@@ -603,13 +616,13 @@ class DdlTableParser {
             String fkMatchType = null;
             if (parser.matchKeyword("MATCH")) {
                 if (parser.matchKeyword("FULL")) fkMatchType = "FULL";
-                else if (parser.matchKeyword("PARTIAL")) fkMatchType = "PARTIAL";
+                else if (parser.matchKeyword("PARTIAL")) fkMatchType = matchPartial();
                 else if (parser.matchKeyword("SIMPLE")) fkMatchType = "SIMPLE";
             }
             String onDelete = null, onUpdate = null;
             while (parser.matchKeyword("ON")) {
-                if (parser.matchKeyword("DELETE")) onDelete = parseReferentialAction();
-                else if (parser.matchKeyword("UPDATE")) onUpdate = parseReferentialAction();
+                if (parser.matchKeyword("DELETE")) onDelete = parseReferentialAction(true);
+                else if (parser.matchKeyword("UPDATE")) onUpdate = parseReferentialAction(false);
             }
             boolean fkDeferrable = false;
             boolean fkInitiallyDeferred = false;
@@ -689,29 +702,50 @@ class DdlTableParser {
         throw new ParseException("Expected constraint type", parser.peek());
     }
 
-    String parseReferentialAction() {
+    /**
+     * PostgreSQL has never implemented MATCH PARTIAL and rejects it in the grammar. Accepting it
+     * would leave the constraint's semantics undefined — there would be no reference behaviour to
+     * match — so it is rejected here too, with PostgreSQL's own wording.
+     */
+    private String matchPartial() {
+        throw new MemgresException("MATCH PARTIAL not yet implemented", "0A000");
+    }
+
+    /**
+     * @param onDelete true for ON DELETE, false for ON UPDATE; a column list is only accepted
+     *                 on ON DELETE, exactly as PostgreSQL's grammar has it since PG 15
+     */
+    String parseReferentialAction(boolean onDelete) {
         if (parser.matchKeyword("CASCADE")) return "CASCADE";
         if (parser.matchKeywords("SET", "NULL")) {
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance(); // consume '('
-                StringBuilder colList = new StringBuilder();
-                while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
-                    if (colList.length() > 0) colList.append(",");
-                    colList.append(parser.readIdentifier());
-                    parser.match(TokenType.COMMA);
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
-                return "SET NULL:" + colList.toString();
-            }
-            return "SET NULL";
+            String cols = parseReferentialActionColumns("SET NULL", onDelete);
+            return cols == null ? "SET NULL" : "SET NULL:" + cols;
         }
         if (parser.matchKeywords("SET", "DEFAULT")) {
-            if (parser.check(TokenType.LEFT_PAREN)) { consumeUntilParen(parser); }
-            return "SET DEFAULT";
+            String cols = parseReferentialActionColumns("SET DEFAULT", onDelete);
+            return cols == null ? "SET DEFAULT" : "SET DEFAULT:" + cols;
         }
         if (parser.matchKeyword("RESTRICT")) return "RESTRICT";
         if (parser.matchKeywords("NO", "ACTION")) return "NO ACTION";
         throw new ParseException("Expected referential action", parser.peek());
+    }
+
+    /** Parse the optional column list of SET NULL / SET DEFAULT; returns null when absent. */
+    private String parseReferentialActionColumns(String action, boolean onDelete) {
+        if (!parser.check(TokenType.LEFT_PAREN)) return null;
+        if (!onDelete) {
+            throw new MemgresException("a column list with " + action
+                    + " is only supported for ON DELETE actions", "0A000");
+        }
+        parser.advance(); // consume '('
+        StringBuilder colList = new StringBuilder();
+        while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+            if (colList.length() > 0) colList.append(",");
+            colList.append(parser.readIdentifier());
+            parser.match(TokenType.COMMA);
+        }
+        parser.expect(TokenType.RIGHT_PAREN);
+        return colList.toString();
     }
 
     /** Parse optional [NOT] ENFORCED clause (PG 18). Returns true if NOT ENFORCED. */

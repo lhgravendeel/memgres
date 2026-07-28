@@ -16,6 +16,16 @@ public final class AlterSequenceStmt implements Statement {
     public final String renameTo;
     public final String ownedByTable;
     public final String ownedByColumn;
+    private boolean ifExists;
+    private Integer cache;
+    private String asType;
+
+    public boolean ifExists() { return ifExists; }
+    public void setIfExists(boolean ifExists) { this.ifExists = ifExists; }
+    public Integer getCache() { return cache; }
+    public void setCache(Integer cache) { this.cache = cache; }
+    public String getAsType() { return asType; }
+    public void setAsType(String asType) { this.asType = asType; }
 
     public AlterSequenceStmt(
             String name,

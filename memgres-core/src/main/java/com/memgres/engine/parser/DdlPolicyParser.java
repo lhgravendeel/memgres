@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.PgErrors;
 import com.memgres.engine.parser.ast.*;
 
 import java.util.ArrayList;
@@ -23,7 +24,12 @@ class DdlPolicyParser {
         // AS {PERMISSIVE|RESTRICTIVE}
         String policyType = "PERMISSIVE";
         if (parser.matchKeyword("AS")) {
-            policyType = parser.advance().value().toUpperCase();
+            Token typeToken = parser.advance();
+            policyType = typeToken.value().toUpperCase();
+            if (!"PERMISSIVE".equals(policyType) && !"RESTRICTIVE".equals(policyType)) {
+                throw PgErrors.syntax("unrecognized row security option \""
+                        + typeToken.value().toLowerCase() + "\"");
+            }
         }
 
         String command = "ALL";
@@ -46,6 +52,14 @@ class DdlPolicyParser {
         }
 
         Expression[] exprs = parseUsingWithCheck();
+        // Which clause a policy may carry follows from the command it guards: a SELECT or DELETE
+        // creates no row to check, and an INSERT has no existing row to test with USING.
+        if (exprs[1] != null && ("SELECT".equals(command) || "DELETE".equals(command))) {
+            throw PgErrors.syntax("WITH CHECK cannot be applied to SELECT or DELETE");
+        }
+        if (exprs[0] != null && "INSERT".equals(command)) {
+            throw PgErrors.syntax("only WITH CHECK expression allowed for INSERT");
+        }
         return new CreatePolicyStmt(name, table, command, exprs[0], exprs[1], policyType, roles);
     }
 
@@ -75,6 +89,12 @@ class DdlPolicyParser {
                 throw new ParseException("syntax error at or near \"" + cmdToken.value() + "\"", cmdToken);
             }
             return new AlterPolicyStmt(name, table, newName, null, null);
+        }
+
+        // The command a policy guards is fixed when it is created; only the roles and the
+        // expressions can be altered.
+        if (parser.checkKeyword("FOR")) {
+            throw new ParseException("policy command cannot be altered", parser.peek());
         }
 
         // Skip TO role clause

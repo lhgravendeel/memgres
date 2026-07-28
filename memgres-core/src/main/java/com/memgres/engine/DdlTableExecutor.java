@@ -32,6 +32,11 @@ class DdlTableExecutor {
         if ("pg_catalog".equalsIgnoreCase(schemaName) || "information_schema".equalsIgnoreCase(schemaName)) {
             throw new MemgresException("permission denied for schema " + schemaName, "42501");
         }
+        // ON COMMIT describes what happens to the rows at the end of the transaction that made
+        // them, which only means anything for a table that lives no longer than the session.
+        if (stmt.onCommitAction() != null && !stmt.temporary()) {
+            throw new MemgresException("ON COMMIT can only be used on temporary tables", "42P16");
+        }
         Schema schema = executor.database.getOrCreateSchema(schemaName);
 
         if (schema.getTable(stmt.name()) != null) {
@@ -112,6 +117,8 @@ class DdlTableExecutor {
             if (!definedColumnNames.add(def.name().toLowerCase())) {
                 throw new MemgresException("column \"" + def.name() + "\" specified more than once", "42701");
             }
+            DdlDefinitionChecks.rejectSystemColumnName(def.name());
+            DdlDefinitionChecks.validateDefaultExpression(def.defaultExpr());
 
             DdlExecutor.ResolvedType resolved = ddl.resolveColumnType(def.typeName(), def.precision());
             DataType dataType = resolved.dataType();
@@ -126,6 +133,15 @@ class DdlTableExecutor {
 
             // GENERATED AS IDENTITY
             if (def.identity() != null) {
+                // Identity is fed by a sequence, so both the type and the absence of a competing
+                // DEFAULT have to hold before the sequence is created.
+                DdlDefinitionChecks.requireIdentityType(dataType);
+                if (def.defaultExpr() != null
+                        || dataType == DataType.SERIAL || dataType == DataType.BIGSERIAL
+                        || dataType == DataType.SMALLSERIAL) {
+                    throw PgErrors.syntax("both default and identity specified for column \""
+                            + def.name() + "\" of table \"" + stmt.name() + "\"");
+                }
                 notNull = true;
                 String seqName = stmt.name() + "_" + def.name() + "_seq";
                 Sequence seq = new Sequence(seqName, def.identityStart(), def.identityIncrement(), null, null);
@@ -178,8 +194,8 @@ class DdlTableExecutor {
                         try {
                             new java.math.BigDecimal(strVal);
                         } catch (NumberFormatException e) {
-                            throw new MemgresException("invalid input syntax for type " + dataType.getPgName()
-                                    + ": \"" + strVal + "\"", "22P02");
+                            throw new MemgresException("invalid input syntax for type "
+                                    + dataType.toRegtypeDisplay() + ": \"" + strVal + "\"", "22P02");
                         }
                     }
                 }
@@ -229,6 +245,7 @@ class DdlTableExecutor {
 
         // Validate generated column expressions
         validateGeneratedColumns(stmt.columns(), columns);
+        rejectKeysOnVirtualColumns(stmt, columns);
 
         Table table = new Table(stmt.name(), columns);
         if (stmt.unlogged()) table.setUnlogged(true);
@@ -310,12 +327,20 @@ class DdlTableExecutor {
                     }
                     continue;
                 }
+                if (tc.type() == TableConstraint.ConstraintType.CHECK) {
+                    DdlDefinitionChecks.requireBooleanPredicate(tc.checkExpr(), table, "CHECK");
+                }
                 StoredConstraint sc = ddl.convertTableConstraint(stmt.name(), tc);
                 if (sc != null) {
                     // For FK constraints without explicit schema, set the schema from the table's schema
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY
                             && sc.getReferencesSchema() == null && sc.getReferencesTable() != null) {
+                        Table refTable = ddl.resolveTableOrNull(sc.getReferencesTable());
+                        if (refTable != null) checkTempPermanentReference(schemaName, refTable);
                         sc.setReferencesSchema(schemaName);
+                    }
+                    if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
+                        ddl.validateForeignKeyDefinition(sc, table, schemaName);
                     }
                     table.addConstraint(sc);
                     ddl.registerExcludeIndex(schemaName, stmt.name(), sc);
@@ -363,6 +388,60 @@ class DdlTableExecutor {
         // M11: Apply ALTER DEFAULT PRIVILEGES to newly created table
         applyDefaultPrivileges(schemaName, stmt.name(), executor.currentRole());
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /**
+     * A VIRTUAL generated column is recomputed on every read and never stored, so there is
+     * nothing for a unique index to hold; PostgreSQL refuses to key on one. Checked before the
+     * table exists, so a rejected definition leaves nothing behind.
+     */
+    private void rejectKeysOnVirtualColumns(CreateTableStmt stmt, List<Column> columns) {
+        Set<String> virtual = new HashSet<>();
+        for (Column c : columns) {
+            if (c.getGeneratedExpr() != null && c.isVirtual()) {
+                virtual.add(c.getName().toLowerCase());
+            }
+        }
+        if (virtual.isEmpty()) return;
+        for (ColumnDef def : stmt.columns()) {
+            if (!virtual.contains(def.name().toLowerCase())) continue;
+            if (def.primaryKey()) throw virtualKeyError(true);
+            if (def.unique()) throw virtualKeyError(false);
+        }
+        if (stmt.constraints() == null) return;
+        for (TableConstraint tc : stmt.constraints()) {
+            boolean pk = tc.type() == TableConstraint.ConstraintType.PRIMARY_KEY;
+            boolean uq = tc.type() == TableConstraint.ConstraintType.UNIQUE;
+            if ((!pk && !uq) || tc.columns() == null) continue;
+            for (String col : tc.columns()) {
+                if (virtual.contains(col.toLowerCase())) throw virtualKeyError(pk);
+            }
+        }
+    }
+
+    private static MemgresException virtualKeyError(boolean primaryKey) {
+        return PgErrors.notImplemented(primaryKey
+                ? "primary keys on virtual generated columns are not supported"
+                : "unique constraints on virtual generated columns are not supported");
+    }
+
+    /**
+     * A temporary table disappears at session end, so a foreign key across that boundary either
+     * outlives its target or holds a permanent table hostage to one session. PostgreSQL refuses
+     * both directions.
+     */
+    void checkTempPermanentReference(String schemaName, Table refTable) {
+        boolean sourceTemp = isTempSchema(schemaName);
+        boolean targetTemp = isTempSchema(findSchemaNameOf(refTable, schemaName));
+        if (sourceTemp == targetTemp) return;
+        throw new MemgresException(sourceTemp
+                ? "constraints on temporary tables may reference only temporary tables"
+                : "constraints on permanent tables may reference only permanent tables", "42P16");
+    }
+
+    /** True for the per-session temp schema, whatever suffix this session's is named with. */
+    static boolean isTempSchema(String schemaName) {
+        return schemaName != null && schemaName.toLowerCase().startsWith("pg_temp");
     }
 
     /** M11: Apply default privileges from ALTER DEFAULT PRIVILEGES to a newly created table. */
@@ -464,13 +543,36 @@ class DdlTableExecutor {
      */
     void applyPartitionBounds(Table partition, Table parent, List<String> bounds, String partitionName) {
         String boundType = bounds.get(0);
+        String strategy = parent.getPartitionStrategy();
         if (boundType.equals("DEFAULT")) {
+            if ("HASH".equalsIgnoreCase(strategy)) {
+                throw new MemgresException(
+                        "a hash-partitioned table may not have a default partition", "42P16");
+            }
+            for (Table existingPart : parent.getPartitions()) {
+                if (existingPart == partition) continue;
+                if (existingPart.isDefaultPartition()) {
+                    throw new MemgresException("partition \"" + partitionName
+                            + "\" conflicts with existing default partition \""
+                            + existingPart.getName() + "\"", "42P17");
+                }
+            }
             partition.setDefaultPartition(true);
         } else if (boundType.equals("FROM") && bounds.size() >= 4) {
+            requireStrategy(strategy, "RANGE");
             // bounds format: FROM, v1[, v2, ...], TO, v1[, v2, ...]
             int toIdx = bounds.indexOf("TO");
             if (toIdx < 0) toIdx = 2; // defensive; parser always emits TO
             List<Column> keyCols = partitionKeyColumns(parent);
+            int keyCount = keyCols != null ? keyCols.size() : toIdx - 1;
+            if (toIdx - 1 != keyCount) {
+                throw new MemgresException(
+                        "FROM must specify exactly one value per partitioning column", "42P16");
+            }
+            if (bounds.size() - toIdx - 1 != keyCount) {
+                throw new MemgresException(
+                        "TO must specify exactly one value per partitioning column", "42P16");
+            }
             List<Object> lowerVals = new ArrayList<>();
             for (int i = 1; i < toIdx; i++) {
                 lowerVals.add(coerceBoundToKeyType(DdlExecutor.parseBoundValue(bounds.get(i)), keyCols, i - 1));
@@ -481,6 +583,14 @@ class DdlTableExecutor {
             }
             Object newLow = lowerVals.size() == 1 ? lowerVals.get(0) : lowerVals;
             Object newHigh = upperVals.size() == 1 ? upperVals.get(0) : upperVals;
+            // A partition whose lower bound is not below its upper bound can never receive a row
+            if (DdlExecutor.comparePartitionBound(newLow, newHigh) >= 0) {
+                MemgresException ex = new MemgresException("empty range bound specified for partition \""
+                        + partitionName + "\"", "42P17");
+                ex.setDetail("Specified lower bound (" + formatBound(lowerVals)
+                        + ") is greater than or equal to upper bound (" + formatBound(upperVals) + ").");
+                throw ex;
+            }
             // Check for overlap with existing RANGE partitions
             for (Table existingPart : parent.getPartitions()) {
                 if (existingPart == partition) continue;
@@ -510,6 +620,7 @@ class DdlTableExecutor {
             }
             partition.setPartitionBounds(newLow, newHigh);
         } else if (boundType.equals("IN")) {
+            requireStrategy(strategy, "LIST");
             List<Column> keyCols = partitionKeyColumns(parent);
             List<Object> values = new ArrayList<>();
             for (int i = 1; i < bounds.size(); i++) {
@@ -536,10 +647,12 @@ class DdlTableExecutor {
             }
             partition.setPartitionValues(values);
         } else if (boundType.equals("HASH") && bounds.size() >= 3) {
+            requireStrategy(strategy, "HASH");
             int modulus = Integer.parseInt(bounds.get(1));
             int remainder = Integer.parseInt(bounds.get(2));
             if (modulus <= 0) {
-                throw new MemgresException("modulus for hash partition must be a positive integer", "22023");
+                throw new MemgresException(
+                        "modulus for hash partition must be an integer value greater than zero", "42P16");
             }
             if (remainder < 0 || remainder >= modulus) {
                 throw new MemgresException("remainder for hash partition must be less than modulus", "42P16");
@@ -591,53 +704,43 @@ class DdlTableExecutor {
         if (keyCols == null || keyIndex < 0 || keyIndex >= keyCols.size()) return value;
         try {
             return TypeCoercion.coerce(value, keyCols.get(keyIndex).getType());
+        } catch (MemgresException e) {
+            // Keeping a bound this engine could not read as the key's type would leave a
+            // partition that routing can never match; PG rejects the definition instead.
+            throw e;
         } catch (Exception e) {
             return value;
         }
     }
 
+    /** The bound form must match the parent's partitioning strategy. */
+    private static void requireStrategy(String actual, String required) {
+        if (actual == null || actual.equalsIgnoreCase(required)) return;
+        throw new MemgresException("invalid bound specification for a "
+                + actual.toLowerCase() + " partition", "42P16");
+    }
+
+    /** Render a bound tuple the way PostgreSQL spells it in the empty-range detail line. */
+    private static String formatBound(List<Object> values) {
+        StringBuilder sb = new StringBuilder();
+        for (Object v : values) {
+            if (sb.length() > 0) sb.append(", ");
+            if (v == PartitionBound.MINVALUE) sb.append("MINVALUE");
+            else if (v == PartitionBound.MAXVALUE) sb.append("MAXVALUE");
+            else if (v == null) sb.append("NULL");
+            else if (v instanceof String) sb.append('\'').append(v).append('\'');
+            else sb.append(v);
+        }
+        return sb.toString();
+    }
+
     private void addColumnForeignKey(Table table, ColumnDef def, String schemaName, String tableName) {
         String refTableName = def.referencesTable();
         String refSchemaName = null;
-        Table refTable = null;
         if (refTableName.contains(".")) {
             String[] parts = refTableName.split("\\.", 2);
             refSchemaName = parts[0];
             refTableName = parts[1]; // bare table name
-            try { refTable = executor.resolveTable(refSchemaName, refTableName); } catch (MemgresException ignored) {}
-        }
-        if (refTable == null) {
-            try { refTable = executor.resolveTable(schemaName, refTableName); } catch (MemgresException ignored) {}
-            if (refTable != null && refSchemaName == null) refSchemaName = schemaName;
-        }
-        if (refTable == null) refTable = ddl.resolveTableOrNull(refTableName);
-        if (refTable == null) {
-            throw new MemgresException("relation \"" + refTableName + "\" does not exist", "42P01");
-        }
-        if (def.referencesColumn() != null && refTable.getColumnIndex(def.referencesColumn()) < 0) {
-            throw new MemgresException("column \"" + def.referencesColumn() + "\" referenced in foreign key constraint does not exist", "42703");
-        }
-        // Validate that the referenced column has a unique/PK constraint
-        if (def.referencesColumn() != null) {
-            int refColIdx = refTable.getColumnIndex(def.referencesColumn());
-            if (refColIdx >= 0) {
-                Column refCol = refTable.getColumns().get(refColIdx);
-                // Check if there's a unique or PK constraint on the referenced column
-                boolean hasUnique = refCol.isPrimaryKey();
-                if (!hasUnique) {
-                    for (StoredConstraint sc : refTable.getConstraints()) {
-                        if ((sc.getType() == StoredConstraint.Type.UNIQUE || sc.getType() == StoredConstraint.Type.PRIMARY_KEY)
-                                && sc.getColumns().size() == 1
-                                && sc.getColumns().get(0).equalsIgnoreCase(def.referencesColumn())) {
-                            hasUnique = true;
-                            break;
-                        }
-                    }
-                }
-                if (!hasUnique) {
-                    throw new MemgresException("there is no unique constraint matching given keys for referenced table \"" + refTableName + "\"", "42830");
-                }
-            }
         }
         List<String> refCols = def.referencesColumn() != null
                 ? Cols.listOf(def.referencesColumn()) : Cols.listOf();
@@ -655,6 +758,7 @@ class DdlTableExecutor {
         if (def.refMatchType() != null) fk.setMatchType(def.refMatchType());
         fk.setOnDeleteSetNullColumns(StoredConstraint.parseSetNullColumns(def.refOnDelete()));
         fk.setOnUpdateSetNullColumns(StoredConstraint.parseSetNullColumns(def.refOnUpdate()));
+        ddl.validateForeignKeyDefinition(fk, table, schemaName);
         table.addConstraint(fk);
     }
 
@@ -954,8 +1058,40 @@ class DdlTableExecutor {
         }
     }
 
+    /** Resolve one name of a TRUNCATE list the same way the main loop does, without throwing. */
+    private Table resolveTruncateTarget(String tableName) {
+        String bareName = tableName;
+        List<String> searchSchemas;
+        if (tableName.contains(".")) {
+            int dot = tableName.indexOf('.');
+            searchSchemas = Cols.listOf(tableName.substring(0, dot));
+            bareName = tableName.substring(dot + 1);
+        } else {
+            String defSchema = executor.defaultSchema();
+            searchSchemas = defSchema.equals("public") ? Cols.listOf("public") : Cols.listOf(defSchema, "public");
+        }
+        for (String schemaName : searchSchemas) {
+            Schema schema = executor.database.getSchema(schemaName);
+            if (schema == null) continue;
+            Table table = schema.getTable(bareName);
+            if (table != null) return table;
+        }
+        return null;
+    }
+
     QueryResult executeTruncate(TruncateStmt stmt) {
         int totalCount = 0;
+        // PG lets one TRUNCATE name every table in a reference graph, and then nothing is left
+        // dangling. Resolve the whole list first so a referencing table listed alongside its
+        // parent does not block the parent, which is how fixture teardown clears related tables.
+        Set<Table> alsoTruncating = Collections.newSetFromMap(new IdentityHashMap<Table, Boolean>());
+        for (String name : stmt.tables()) {
+            Table t = resolveTruncateTarget(name);
+            if (t == null) continue;
+            List<Table> tree = new ArrayList<>();
+            DmlPartitionHelper.collectAllPartitionTables(t, tree);
+            alsoTruncating.addAll(tree);
+        }
         for (int tableIdx = 0; tableIdx < stmt.tables().size(); tableIdx++) {
             String tableName = stmt.tables().get(tableIdx);
             boolean truncateOnly = stmt.only(tableIdx);
@@ -1002,6 +1138,7 @@ class DdlTableExecutor {
                             for (Schema s : executor.database.getSchemas().values()) {
                                 for (Table otherTable : s.getTables().values()) {
                                     if (otherTable == table) continue;
+                                    if (alsoTruncating.contains(otherTable)) continue;
                                     for (StoredConstraint sc : otherTable.getConstraints()) {
                                         if (sc.getType() != StoredConstraint.Type.FOREIGN_KEY) continue;
                                         if (sc.isNotEnforced()) continue;
@@ -1118,7 +1255,14 @@ class DdlTableExecutor {
 
         QueryResult result = executor.executeStatement(stmt.query());
         List<Column> columns = new ArrayList<>();
+        // The query's output names become the table's column names, so they have to satisfy the
+        // same rules a column list does — a repeated or system name is rejected here, not later.
+        Set<String> seenNames = new HashSet<>();
         for (Column srcCol : result.getColumns()) {
+            DdlDefinitionChecks.rejectSystemColumnName(srcCol.getName());
+            if (!seenNames.add(srcCol.getName().toLowerCase())) {
+                throw PgErrors.duplicateColumn(srcCol.getName());
+            }
             columns.add(new Column(srcCol.getName(), srcCol.getType(), true, false, null,
                     srcCol.getEnumTypeName(), srcCol.getPrecision(), srcCol.getScale(), null));
         }

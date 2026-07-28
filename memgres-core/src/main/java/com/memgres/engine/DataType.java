@@ -121,6 +121,16 @@ public enum DataType {
     // OID type
     OID(26, "oid"),
 
+    // Object-identifier aliases. Catalog columns holding a function or relation reference are
+    // these types in PG, not text, so a query comparing one to 0 or joining on it resolves.
+    REGPROC(24, "regproc"),
+    REGCLASS(2205, "regclass"),
+    REGTYPE(2206, "regtype"),
+
+    // The 0-based vector types the catalogs use for argument and key lists
+    INT2VECTOR(22, "int2vector"),
+    OIDVECTOR(30, "oidvector"),
+
     // Transaction ID type
     XID(28, "xid"),
 
