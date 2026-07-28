@@ -738,40 +738,14 @@ public final class TypeCoercion {
         return val.toString();
     }
 
-    /** Normalize JSONB: canonical form with sorted keys, deduplication (last wins), space after : and , (PG behavior). */
+    /**
+     * Normalize JSONB: canonical form with sorted keys, deduplication (last wins), space after
+     * : and , (PG behavior). Keys are held decoded and escaped again here, so this goes through
+     * the one writer that knows how.
+     */
     public static String normalizeJsonb(String json) {
         if (json == null) return null;
-        json = json.trim();
-        if (json.startsWith("{")) {
-            // Parse into map (LinkedHashMap preserves insertion order, last put wins = dedup)
-            Map<String, String> map = JsonOperations.parseObjectKeys(json);
-            // Sort keys alphabetically and normalize values recursively
-            TreeMap<String, String> sorted = new TreeMap<>();
-            for (Map.Entry<String, String> e : map.entrySet()) {
-                sorted.put(e.getKey(), normalizeJsonb(e.getValue()));
-            }
-            StringBuilder sb = new StringBuilder("{");
-            boolean first = true;
-            for (Map.Entry<String, String> e : sorted.entrySet()) {
-                if (!first) sb.append(", ");
-                sb.append("\"").append(e.getKey()).append("\": ").append(e.getValue());
-                first = false;
-            }
-            sb.append("}");
-            return sb.toString();
-        }
-        if (json.startsWith("[")) {
-            List<String> elems = JsonOperations.parseArrayElements(json);
-            StringBuilder sb = new StringBuilder("[");
-            for (int i = 0; i < elems.size(); i++) {
-                if (i > 0) sb.append(", ");
-                sb.append(normalizeJsonb(elems.get(i)));
-            }
-            sb.append("]");
-            return sb.toString();
-        }
-        // Scalar values: return as-is (numbers, strings, booleans, null)
-        return json;
+        return JsonOperations.normalizeJsonb(JsonOperations.canonicalizeJsonbStrings(json.trim()));
     }
 
     /** Format a Java List as a PG array string: {elem1,elem2,...} */

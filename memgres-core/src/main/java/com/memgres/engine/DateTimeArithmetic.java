@@ -304,6 +304,11 @@ class DateTimeArithmetic {
                     }
                     return acc;
                 }
+                // An integer deletes by position and text deletes by key: they are different
+                // operators in PG, and only one of them applies to a given container.
+                if (right instanceof Number) {
+                    return JsonOperations.deleteIndex(ls, ((Number) right).intValue());
+                }
                 return JsonOperations.deleteKey(ls, right.toString());
             }
         }
