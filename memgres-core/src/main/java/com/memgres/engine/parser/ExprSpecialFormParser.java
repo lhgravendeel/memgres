@@ -1022,10 +1022,22 @@ class ExprSpecialFormParser {
         boolean nullOnNull = false;
         // PG 18 uses colon syntax: JSON_OBJECT('key' : value, ...)
         // Also supports VALUE keyword: JSON_OBJECT('key' VALUE value, ...)
+        Expression first = ep.parseExpression();
+        // The older json_object(text[]) and json_object(text[], text[]) are ordinary function
+        // calls that happen to share the keyword's name; neither pairs its arguments with a colon.
+        if (!ep.check(TokenType.COLON) && !ep.checkKeyword("VALUE")) {
+            List<Expression> callArgs = new ArrayList<>();
+            callArgs.add(first);
+            while (ep.match(TokenType.COMMA)) callArgs.add(ep.parseExpression());
+            ep.expect(TokenType.RIGHT_PAREN);
+            return new FunctionCallExpr("json_object", callArgs);
+        }
+        boolean firstPair = true;
         do {
             Expression key;
             Expression val;
-            key = ep.parseExpression();
+            key = firstPair ? first : ep.parseExpression();
+            firstPair = false;
             if (!ep.match(TokenType.COLON)) {
                 ep.expectKeyword("VALUE");
             }

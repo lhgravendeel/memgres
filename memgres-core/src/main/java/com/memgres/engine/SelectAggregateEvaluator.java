@@ -494,6 +494,7 @@ class SelectAggregateEvaluator {
         } else if (expr instanceof CastExpr) {
             CastExpr cast = (CastExpr) expr;
             Object val = evalAggregateExpr(cast.expr(), group, representative);
+            executor.checkNumericSpecialToInteger(cast, val);
             return executor.castEvaluator.applyCast(val, cast.typeName());
         } else if (expr instanceof IsJsonExpr) {
             IsJsonExpr ij = (IsJsonExpr) expr;
@@ -862,6 +863,9 @@ class SelectAggregateEvaluator {
                 boolean allInts = true;
                 boolean isMoney = false;
                 boolean sawNotANumber = false;
+                boolean sawPosInf = false;
+                boolean sawNegInf = false;
+                boolean allFloat4 = true;
                 BigDecimal bdSum = BigDecimal.ZERO;
                 try {
                     if (fn.distinct()) {
@@ -870,7 +874,13 @@ class SelectAggregateEvaluator {
                             Object val = executor.evalExpr(arg, ctx);
                             if (val == null || !seenKeys.add(distinctKey(val))) continue;
                             hasValue = true;
-                            if (isNotANumber(val)) { sawNotANumber = true; continue; }
+                            if (!(val instanceof Float)) allFloat4 = false;
+                            if (isSpecialNumber(val)) {
+                                if (Double.isNaN(((Number) val).doubleValue())) sawNotANumber = true;
+                                else if (((Number) val).doubleValue() > 0) sawPosInf = true;
+                                else sawNegInf = true;
+                                continue;
+                            }
                             if (val instanceof PgMoney) isMoney = true;
                             bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                             if (!(val instanceof Integer || val instanceof Long)) allInts = false;
@@ -880,7 +890,13 @@ class SelectAggregateEvaluator {
                             Object val = executor.evalExpr(arg, ctx);
                             if (val != null) {
                                 hasValue = true;
-                                if (isNotANumber(val)) { sawNotANumber = true; continue; }
+                                if (!(val instanceof Float)) allFloat4 = false;
+                                if (isSpecialNumber(val)) {
+                                    if (Double.isNaN(((Number) val).doubleValue())) sawNotANumber = true;
+                                    else if (((Number) val).doubleValue() > 0) sawPosInf = true;
+                                    else sawNegInf = true;
+                                    continue;
+                                }
                                 if (val instanceof PgMoney) isMoney = true;
                                 bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                                 if (!(val instanceof Integer || val instanceof Long)) allInts = false;
@@ -891,9 +907,11 @@ class SelectAggregateEvaluator {
                     throw new MemgresException("function sum(text) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
                 }
                 if (!hasValue) return null;
-                // NaN is contagious through numeric aggregation, as it is in PG.
-                if (sawNotANumber) return Double.NaN;
+                Double sumSpecial = specialTotal(sawNotANumber, sawPosInf, sawNegInf);
+                if (sumSpecial != null) return allFloat4 ? (Object) Float.valueOf(sumSpecial.floatValue()) : sumSpecial;
                 if (isMoney) return new PgMoney(bdSum);
+                // sum(real) is real in PG, so a total outside real's range overflows there
+                if (allFloat4) return NumericLimits.checkFloat4Total(bdSum.doubleValue());
                 // sum(double precision) is float8 in PG, not numeric
                 if (isFloatArgument(arg, group)) return bdSum.doubleValue();
                 if (allInts) {
@@ -908,13 +926,20 @@ class SelectAggregateEvaluator {
                 BigDecimal bdSum = BigDecimal.ZERO;
                 long count = 0;
                 boolean avgSawNotANumber = false;
+                boolean avgSawPosInf = false;
+                boolean avgSawNegInf = false;
                 if (fn.distinct()) {
                     Set<String> seenKeys = new HashSet<>();
                     for (RowContext ctx : group) {
                         Object val = executor.evalExpr(arg, ctx);
                         if (val == null || !seenKeys.add(distinctKey(val))) continue;
                         count++;
-                        if (isNotANumber(val)) { avgSawNotANumber = true; continue; }
+                        if (isSpecialNumber(val)) {
+                            if (Double.isNaN(((Number) val).doubleValue())) avgSawNotANumber = true;
+                            else if (((Number) val).doubleValue() > 0) avgSawPosInf = true;
+                            else avgSawNegInf = true;
+                            continue;
+                        }
                         bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                     }
                 } else {
@@ -922,14 +947,19 @@ class SelectAggregateEvaluator {
                         Object val = executor.evalExpr(arg, ctx);
                         if (val != null) {
                             count++;
-                            if (isNotANumber(val)) { avgSawNotANumber = true; continue; }
+                            if (isSpecialNumber(val)) {
+                                if (Double.isNaN(((Number) val).doubleValue())) avgSawNotANumber = true;
+                                else if (((Number) val).doubleValue() > 0) avgSawPosInf = true;
+                                else avgSawNegInf = true;
+                                continue;
+                            }
                             bdSum = bdSum.add(SelectExecutor.toBigDecimal(val));
                         }
                     }
                 }
                 if (count == 0) return null;
-                // NaN is contagious through numeric aggregation, as it is in PG.
-                if (avgSawNotANumber) return Double.NaN;
+                Double avgSpecial = specialTotal(avgSawNotANumber, avgSawPosInf, avgSawNegInf);
+                if (avgSpecial != null) return avgSpecial;
                 if (isFloatArgument(arg, group)) return bdSum.doubleValue() / count;
                 BigDecimal result = bdSum.divide(BigDecimal.valueOf(count), 16, RoundingMode.HALF_UP);
                 return result;
@@ -1200,7 +1230,9 @@ class SelectAggregateEvaluator {
             case "json_object_agg":
             case "jsonb_object_agg": {
                 if (group.isEmpty()) return null;
-                StringBuilder sb = new StringBuilder("{");
+                // json prints the object the way its own text output does, padded and with
+                // spaces round the colon; jsonb is normalized below and loses the padding again
+                StringBuilder sb = new StringBuilder("{ ");
                 boolean first = true;
                 for (RowContext r : group) {
                     Object k = executor.evalExpr(fn.args().get(0), r);
@@ -1213,13 +1245,13 @@ class SelectAggregateEvaluator {
                     }
                     if (!first) sb.append(", ");
                     first = false;
-                    sb.append("\"").append(k.toString().replace("\"", "\\\"")).append("\": ");
+                    sb.append("\"").append(k.toString().replace("\"", "\\\"")).append("\" : ");
                     if (v == null) sb.append("null");
                     else if (v instanceof Number) sb.append(v);
                     else if (v instanceof Boolean) sb.append(v);
                     else sb.append("\"").append(v.toString().replace("\"", "\\\"")).append("\"");
                 }
-                sb.append("}");
+                sb.append(" }");
                 String result = sb.toString();
                 if (name.equals("jsonb_object_agg")) {
                     result = JsonOperations.normalizeJsonb(result);
@@ -1545,17 +1577,30 @@ class SelectAggregateEvaluator {
     // ---- DRY helpers ----
 
     /**
+     * True for a NaN or an infinity, none of which has a BigDecimal form. They are accumulated
+     * apart from the running total and then decide the result on their own, the way they do in
+     * PG: a NaN poisons the sum, and two opposing infinities cancel into one.
+     */
+    private static boolean isSpecialNumber(Object val) {
+        return NumericLimits.isSpecial(val);
+    }
+
+    /**
+     * The value a sum or an average takes when specials were seen, or null when the ordinary
+     * total stands. Every finite addend is irrelevant once an infinity is in the group.
+     */
+    private static Double specialTotal(boolean sawNaN, boolean sawPosInf, boolean sawNegInf) {
+        if (sawNaN || (sawPosInf && sawNegInf)) return Double.valueOf(Double.NaN);
+        if (sawPosInf) return Double.valueOf(Double.POSITIVE_INFINITY);
+        if (sawNegInf) return Double.valueOf(Double.NEGATIVE_INFINITY);
+        return null;
+    }
+
+    /**
      * Dedup key for DISTINCT aggregates with value semantics: numeric values that compare
      * equal map to the same key even when their representations differ (numeric 1.0 vs 1.00,
      * or int 1 vs numeric 1.0), matching PostgreSQL's equality-based DISTINCT.
      */
-    /** True for the float NaN value, which has no BigDecimal form and poisons any numeric sum. */
-    private static boolean isNotANumber(Object val) {
-        if (val instanceof Double) return ((Double) val).isNaN();
-        if (val instanceof Float) return ((Float) val).isNaN();
-        return false;
-    }
-
     private static String distinctKey(Object val) {
         // bytea dedups by byte sequence, not array identity
         if (val instanceof byte[]) return RowKey.valueKey(val);

@@ -972,7 +972,33 @@ class ExprEvaluator {
                 return null;
             }
         }
+        checkNumericSpecialToInteger(cast, val);
         return executor.castEvaluator.applyCast(val, cast.typeName());
+    }
+
+    /**
+     * PG's numeric knows NaN and both infinities, and none of them has an integer form. It says
+     * so outright, where the same value arriving from float8 is reported as a range error --
+     * so the source's own type decides which error this is.
+     */
+    void checkNumericSpecialToInteger(CastExpr cast, Object val) {
+        if (!NumericLimits.isSpecial(val)) return;
+        String target = integerTypeName(cast.typeName());
+        if (target == null) return;
+        if (inferExprType(cast.expr()) != DataType.NUMERIC) return;
+        double d = ((Number) val).doubleValue();
+        throw new MemgresException(
+                "cannot convert " + (Double.isNaN(d) ? "NaN" : "infinity") + " to " + target, "0A000");
+    }
+
+    /** The name PG uses for an integer cast target, or null when the target is not one. */
+    private static String integerTypeName(String typeName) {
+        if (typeName == null) return null;
+        String t = typeName.toLowerCase().trim();
+        if (t.equals("int") || t.equals("int4") || t.equals("integer")) return "integer";
+        if (t.equals("int8") || t.equals("bigint")) return "bigint";
+        if (t.equals("int2") || t.equals("smallint")) return "smallint";
+        return null;
     }
 
     /** True when an expression is declared to produce json or jsonb. */
@@ -995,8 +1021,8 @@ class ExprEvaluator {
             }
             case NEGATE: {
                 if (val == null) return null;
-                if (val instanceof Integer) return -((Integer) val);
-                if (val instanceof Long) return -((Long) val);
+                Object negated = NumericLimits.negateExact(val);
+                if (negated != null) return negated;
                 if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val).negate();
                 if (val instanceof Double) return -((Double) val);
                 if (val instanceof Float) return -((Float) val);
@@ -1036,12 +1062,8 @@ class ExprEvaluator {
             }
             case ABS: {
                 if (val == null) return null;
-                if (val instanceof Integer) return Math.abs(((Integer) val));
-                if (val instanceof Long) return Math.abs(((Long) val));
-                if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val).abs();
-                if (val instanceof Double) return Math.abs(((Double) val));
-                if (val instanceof Float) return Math.abs(((Float) val));
-                return val;
+                Object absolute = NumericLimits.absExact(val);
+                return absolute != null ? absolute : val;
             }
             case SQRT: {
                 if (val == null) return null;
@@ -2054,6 +2076,13 @@ class ExprEvaluator {
                 throw bme;
             }
         }
+        // PG's float4 operators return float4. Computing in double and keeping the wide result
+        // would let a real column hold a value real cannot represent, so narrow back and check.
+        if (left instanceof Float && right instanceof Float) {
+            double lf = ((Float) left).doubleValue();
+            double rf = ((Float) right).doubleValue();
+            return NumericLimits.checkFloat4(doubleOp.apply(lf, rf), lf, rf);
+        }
         double result = doubleOp.apply(toDouble(left), toDouble(right));
         // Check for overflow: non-infinite inputs producing infinite result
         if (Double.isInfinite(result) && !Double.isInfinite(toDouble(left)) && !Double.isInfinite(toDouble(right))) {
@@ -2456,6 +2485,10 @@ class ExprEvaluator {
                 // timestamptz value advertised/decoded as DATE corrupts pgjdbc's binary decode).
                 if (fn.args().size() >= 2) {
                     DataType dt = inferTypeFromContext(fn.args().get(1), bindings);
+                    // PG has no date_trunc over date or time; a date resolves through the
+                    // timestamptz form and a time through the interval one
+                    if (dt == DataType.DATE) return DataType.TIMESTAMPTZ;
+                    if (dt == DataType.TIME) return DataType.INTERVAL;
                     if (dt != null) return dt;
                 }
                 return DataType.TIMESTAMP;

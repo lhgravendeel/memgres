@@ -108,6 +108,8 @@ class FromFunctionResolver {
         if (fname.equals("jsonb_array_elements") || fname.equals("json_array_elements") ||
             fname.equals("jsonb_array_elements_text") || fname.equals("json_array_elements_text"))
             return resolveJsonArrayElements(fname, alias, colAliases, evalArgs);
+        if (fname.equals("jsonb_object_keys") || fname.equals("json_object_keys"))
+            return resolveJsonObjectKeys(fname, alias, colAliases, evalArgs);
         if (fname.equals("pg_options_to_table") || fname.equals("pg_catalog.pg_options_to_table"))
             return resolvePgOptionsToTable(alias, colAliases, evalArgs);
         if (fname.equals("pg_get_sequence_data") || fname.equals("pg_catalog.pg_get_sequence_data"))
@@ -696,6 +698,7 @@ class FromFunctionResolver {
         List<RowContext> contexts = new ArrayList<>();
         if (jsonVal != null) {
             String json = jsonVal.toString().trim();
+            JsonFunctions.requireJsonEachObject(fname, json);
             try {
                 boolean isText = fname.contains("_text");
                 Map<String, String> pairs = JsonOperations.parseObjectKeys(json);
@@ -1000,18 +1003,36 @@ class FromFunctionResolver {
         List<RowContext> contexts = new ArrayList<>();
         if (json != null) {
             String s = json.toString().trim();
-            if (s.startsWith("[")) {
-                List<String> elements = JsonOperations.parseArrayElements(s);
-                long ord = 1;
-                for (String elem : elements) {
-                    String val = elem.trim();
-                    if (textMode && val.startsWith("\"") && val.endsWith("\"")) {
-                        val = val.substring(1, val.length() - 1);
-                    }
-                    Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
-                    virtualTable.insertRow(row);
-                    contexts.add(new RowContext(virtualTable, alias, row));
-                }
+            JsonFunctions.requireJsonArray(fname, s);
+            List<String> elements = JsonOperations.parseArrayElements(s);
+            long ord = 1;
+            for (String elem : elements) {
+                String val = elem.trim();
+                if (textMode) val = JsonOperations.jsonValueToText(val);
+                Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
+                virtualTable.insertRow(row);
+                contexts.add(new RowContext(virtualTable, alias, row));
+            }
+        }
+        return contexts;
+    }
+
+    // ---- jsonb_object_keys / json_object_keys ----
+
+    private List<RowContext> resolveJsonObjectKeys(String fname, String alias, List<String> colAliases,
+                                                   List<Object> evalArgs) {
+        if (evalArgs.isEmpty()) throw new MemgresException("function " + fname + "() requires 1 argument", "42883");
+        Table virtualTable = new Table(alias, Cols.listOf(
+                new Column(firstColAlias(colAliases, fname), DataType.TEXT, true, false, null)));
+        List<RowContext> contexts = new ArrayList<>();
+        Object json = evalArgs.get(0);
+        if (json != null) {
+            String s = json.toString().trim();
+            JsonFunctions.requireJsonObject(fname, s);
+            for (String key : JsonOperations.parseObjectKeys(s).keySet()) {
+                Object[] row = new Object[]{key};
+                virtualTable.insertRow(row);
+                contexts.add(new RowContext(virtualTable, alias, row));
             }
         }
         return contexts;

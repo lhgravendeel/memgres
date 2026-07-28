@@ -58,7 +58,7 @@ final class BuiltinFunctionNames {
             "justify_hours", "justify_interval", "kb", "lag", "last_value", "lastval", "lead", "least",
             "left", "length", "line", "ln", "lo_close", "lo_creat", "lo_create", "lo_export",
             "lo_from_bytea", "lo_get", "lo_import", "lo_lseek", "lo_open", "lo_put", "lo_tell",
-            "lo_truncate", "lo_unlink", "localtime", "localtimestamp", "log", "loread", "lower",
+            "lo_truncate", "lo_unlink", "localtime", "localtimestamp", "log", "log10", "loread", "lower",
             "lowrite", "lpad", "lseg", "ltrim", "macaddr", "macaddr8", "make_date", "make_interval",
             "make_time", "make_timestamp", "make_timestamptz", "max", "mb", "md5", "merge_action",
             "microsecond", "microseconds", "millennia", "millennium", "millisecond", "milliseconds",
