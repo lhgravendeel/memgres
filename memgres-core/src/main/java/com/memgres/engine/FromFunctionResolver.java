@@ -43,6 +43,12 @@ class FromFunctionResolver {
      * to FROM-function aliases, never to ordinary table/subquery/VALUES/CTE aliases.
      */
     List<RowContext> resolveFunctionFrom(SelectStmt.FunctionFrom funcFrom) {
+        // A FROM item is what the query reads, so its arguments are settled before there is any
+        // row to group or to number. PostgreSQL says so before it even looks the function up,
+        // and a TABLESAMPLE percentage — carried here as a function item — is the same clause.
+        for (Expression arg : funcFrom.args()) {
+            executor.selectExecutor.placementCheck.reject(arg, "functions in FROM");
+        }
         List<RowContext> contexts = doResolveFunctionFrom(funcFrom);
         checkColumnAliasCount(funcFrom, contexts);
         // TABLESAMPLE binds the real stored table; never flag persistent tables.

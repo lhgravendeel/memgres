@@ -421,9 +421,21 @@ class SelectWindowEvaluator {
         }
         if (calls.isEmpty() && (defs == null || defs.isEmpty())) return;
 
-        // A named window is checked even when nothing references it, as PostgreSQL does.
+        // A named window is checked even when nothing references it, as PostgreSQL does. What it
+        // partitions and orders by is read once per result row, so an aggregate there is ordinary;
+        // only another window call has nothing to be numbered against yet.
         if (defs != null) {
             for (SelectStmt.WindowDef def : defs) {
+                if (def.partitionBy() != null) {
+                    for (Expression p : def.partitionBy()) {
+                        select.placementCheck.rejectWindowCall(p, "window definitions");
+                    }
+                }
+                if (def.orderBy() != null) {
+                    for (SelectStmt.OrderByItem o : def.orderBy()) {
+                        select.placementCheck.rejectWindowCall(o.expr(), "window definitions");
+                    }
+                }
                 SelectStmt.WindowDef resolved = resolveWindowDef(def, defs);
                 validateFrameOffsets(def.frame(), namedWindowCall(resolved), bindings);
             }
@@ -624,13 +636,7 @@ class SelectWindowEvaluator {
     }
 
     private void rejectMisplacedCallsInFilter(Expression filter) {
-        if (filter == null) return;
-        if (select.containsWindowFunction(filter)) {
-            throw new MemgresException("window functions are not allowed in FILTER", "42P20");
-        }
-        if (select.containsAggregate(filter)) {
-            throw new MemgresException("aggregate functions are not allowed in FILTER", "42803");
-        }
+        select.placementCheck.reject(filter, "FILTER");
     }
 
     /** Collect every window function in an expression, including ones nested inside another. */
@@ -690,10 +696,7 @@ class SelectWindowEvaluator {
         if (!isOffsetBound(bound) || bound.offset() == null) return;
         Expression offset = bound.offset();
         if (select.containsWindowFunction(offset)) throw windowInWindowDefinition();
-        if (select.containsAggregate(offset)) {
-            throw new MemgresException(
-                    "aggregate functions are not allowed in window " + type, "42803");
-        }
+        select.placementCheck.reject(offset, "window " + type);
         // PostgreSQL resolves the offset's type before it asks whether the offset is constant,
         // so an offset of the wrong type is that error and not "must not contain variables".
         checkOffsetType(offset, type, wf, bindings);

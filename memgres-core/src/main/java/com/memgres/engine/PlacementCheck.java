@@ -1,11 +1,15 @@
 package com.memgres.engine;
 
+import com.memgres.engine.parser.ast.AnyAllExpr;
+import com.memgres.engine.parser.ast.ArraySubqueryExpr;
 import com.memgres.engine.parser.ast.ColumnRef;
+import com.memgres.engine.parser.ast.ExistsExpr;
 import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.FunctionCallExpr;
 import com.memgres.engine.parser.ast.OrderedSetAggExpr;
 import com.memgres.engine.parser.ast.SelectStmt;
 import com.memgres.engine.parser.ast.Statement;
+import com.memgres.engine.parser.ast.SubqueryExpr;
 import com.memgres.engine.parser.ast.WindowFuncExpr;
 
 import java.util.ArrayList;
@@ -52,54 +56,127 @@ final class PlacementCheck {
         this.select = select;
     }
 
+    /** What a node is, when it is one of the calls a clause may forbid. */
+    private enum Kind { WINDOW, NO_OVER, WITHIN_GROUP, GROUPING, AGGREGATE }
+
     /**
-     * Rejects a window call, then an aggregate, written anywhere in {@code node}'s own scope.
+     * Rejects the first misplaced call written anywhere in {@code node}'s own scope.
      *
-     * <p>The window call is reported first because an aggregate inside an OVER clause belongs to
-     * the window specification: the call that may not stand here at all is the window one.
+     * <p>One walk finds all four kinds, and the first one reached decides the message, because
+     * PostgreSQL analyses an expression as it reads it: {@code WHERE count(*) > 1 AND rank() = 1}
+     * complains about the aggregate and the same two the other way round about the missing OVER.
+     * A window call encloses whatever its OVER clause reads, so an aggregate under one is reached
+     * second and the window call is still what gets named.
      *
-     * <p>GROUPING is carried in the same set as the aggregates because it is evaluated at the same
+     * <p>GROUPING is found by the same walk as the aggregates because it is evaluated at the same
      * point, but it reads the grouping rather than the rows, and PostgreSQL keeps a parallel set of
-     * messages naming it as its own kind of operation.
+     * messages naming it as its own kind of operation. So does a window function written without
+     * OVER: PostgreSQL knows what it is and says the OVER clause is what is missing.
      *
      * @param clause the clause name PostgreSQL puts in the message ("WHERE", "VALUES", ...)
      */
     void reject(Object node, String clause) {
-        if (node == null) return;
-        if (findInScope(node, true) != null) {
-            throw new MemgresException("window functions are not allowed in " + clause, "42P20");
-        }
-        Object aggregate = findInScope(node, false);
-        if (aggregate != null) {
-            String kind = aggregate instanceof Expression
-                    && GroupByValidator.isGroupingCall((Expression) aggregate)
-                    ? "grouping operations" : "aggregate functions";
-            throw new MemgresException(kind + " are not allowed in " + clause, "42803");
-        }
+        Object found = findInScope(node, false);
+        if (found != null) throw misplaced(found, clause);
     }
 
     /**
-     * The first window call (or aggregate) in the tree, not descending into a nested query.
-     * Written as an explicit search rather than {@link AstWalk#anyMatch} because that walk has no
-     * way to refuse a subtree, and refusing the subtree is the whole scope rule.
+     * Rejects a window call only. A window specification is read once per result row, so an
+     * aggregate in one is ordinary — {@code WINDOW w AS (PARTITION BY count(*))} over a grouped
+     * query partitions by the group's count — while a window call in one would have to be numbered
+     * against the rows it is helping to define.
      */
-    private Object findInScope(Object node, boolean windows) {
+    void rejectWindowCall(Object node, String clause) {
+        Object found = findInScope(node, true);
+        if (found != null) throw misplaced(found, clause);
+    }
+
+    /**
+     * The first misplaced call in the tree, not descending into a nested query. Written as an
+     * explicit search rather than {@link AstWalk#anyMatch} because that walk has no way to refuse a
+     * subtree, and refusing the subtree is the whole scope rule.
+     */
+    private Object findInScope(Object node, boolean windowsOnly) {
         if (node == null || node instanceof Statement) return null;
-        if (windows ? node instanceof WindowFuncExpr : isAggregateCall(node)) return node;
+        if (kindOf(node, windowsOnly) != null) return node;
         Object[] found = new Object[1];
         AstWalk.forEachChild(node, child -> {
             if (found[0] == null) {
-                Object hit = findInScope(child, windows);
+                Object hit = findInScope(child, windowsOnly);
                 if (hit != null) found[0] = hit;
             }
         });
         return found[0];
     }
 
-    private boolean isAggregateCall(Object node) {
-        if (node instanceof OrderedSetAggExpr) return true;
-        return node instanceof FunctionCallExpr
-                && select.isAggregateFunction(((FunctionCallExpr) node).name());
+    private Kind kindOf(Object node, boolean windowsOnly) {
+        if (node instanceof WindowFuncExpr) return Kind.WINDOW;
+        if (node instanceof FunctionCallExpr) {
+            FunctionCallExpr fn = (FunctionCallExpr) node;
+            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(Locale.ROOT));
+            // A function the user declared under one of these names is that function, not the
+            // built-in window one.
+            if (!select.hasUserFunction(name)) {
+                if (HYPOTHETICAL_SET_FUNCTIONS.contains(name)) {
+                    return fn.args().isEmpty() ? Kind.NO_OVER : Kind.WITHIN_GROUP;
+                }
+                if (WINDOW_ONLY_FUNCTIONS.contains(name)) return Kind.NO_OVER;
+            }
+            if (windowsOnly) return null;
+            if (GroupByValidator.isGroupingCall(fn)) return Kind.GROUPING;
+            if (select.isAggregateFunction(fn.name())) return Kind.AGGREGATE;
+            return null;
+        }
+        if (!windowsOnly && node instanceof OrderedSetAggExpr) return Kind.AGGREGATE;
+        return null;
+    }
+
+    private MemgresException misplaced(Object node, String clause) {
+        Kind kind = kindOf(node, false);
+        if (kind == Kind.WINDOW) {
+            return new MemgresException("window functions are not allowed in " + clause, "42P20");
+        }
+        if (kind == Kind.GROUPING) {
+            return new MemgresException(
+                    "grouping operations are not allowed in " + clause, "42803");
+        }
+        if (kind == Kind.AGGREGATE) {
+            return new MemgresException(
+                    "aggregate functions are not allowed in " + clause, "42803");
+        }
+        return missingClause(node, kind);
+    }
+
+    /**
+     * What a window function written as a plain call is missing. The four hypothetical-set names
+     * are ordered-set aggregates as well as window functions, so with arguments what they lack is
+     * WITHIN GROUP and without them it is OVER; PostgreSQL distinguishes the two and so does this.
+     * Neither message names the clause, so this needs no clause to name.
+     */
+    private static MemgresException missingClause(Object node, Kind kind) {
+        String name = FunctionEvaluator.stripSchemaPrefix(
+                ((FunctionCallExpr) node).name().toLowerCase(Locale.ROOT));
+        return new MemgresException(kind == Kind.WITHIN_GROUP
+                ? "WITHIN GROUP is required for ordered-set aggregate " + name
+                : "window function " + name + " requires an OVER clause", "42809");
+    }
+
+    // ---- Sub-queries where a definition may not hold one ----
+
+    /**
+     * Rejects a sub-query written in a definition that is stored and replayed per row. A CHECK
+     * constraint and an index expression are evaluated against one row with no query around them,
+     * so PostgreSQL refuses to store one that would have to read another relation — the walk in
+     * {@link #reject} deliberately stops at a nested query, which is why this is asked separately.
+     *
+     * @param what the phrase PostgreSQL completes "cannot use subquery in ..." with
+     */
+    void rejectSubquery(Object node, String what) {
+        if (node == null) return;
+        if (AstWalk.anyMatch(node, n -> n instanceof SubqueryExpr || n instanceof ExistsExpr
+                || n instanceof AnyAllExpr || n instanceof ArraySubqueryExpr)) {
+            throw PgErrors.notImplemented("cannot use subquery in " + what);
+        }
     }
 
     // ---- Aggregates that belong to an enclosing query level ----
@@ -146,6 +223,12 @@ final class PlacementCheck {
         }
         if (node instanceof Statement) return;
         AstWalk.forEachChild(node, child -> collectNestedSelects(child, out));
+    }
+
+    private boolean isAggregateCall(Object node) {
+        if (node instanceof OrderedSetAggExpr) return true;
+        return node instanceof FunctionCallExpr
+                && select.isAggregateFunction(((FunctionCallExpr) node).name());
     }
 
     private void collectAggregatesInScope(Object node, List<Object> out) {
@@ -243,30 +326,14 @@ final class PlacementCheck {
     }
 
     /**
-     * Rejects a window function written as a plain call. The four hypothetical-set names are also
-     * ordered-set aggregates, so with arguments what they are missing is WITHIN GROUP and without
-     * them it is OVER; PostgreSQL distinguishes the two and so does this.
+     * Rejects a window function written as a plain call, anywhere in the tree — including inside
+     * another window call's own specification, which is why this is a walk of its own rather than
+     * the one {@link #reject} uses, which stops at the enclosing window call.
      */
     void rejectWindowCallWithoutOver(Object node) {
         if (node == null || node instanceof Statement) return;
-        if (node instanceof FunctionCallExpr) {
-            FunctionCallExpr fn = (FunctionCallExpr) node;
-            String name = FunctionEvaluator.stripSchemaPrefix(fn.name().toLowerCase(Locale.ROOT));
-            // A function the user declared under one of these names is that function, not the
-            // built-in window one.
-            if (!select.hasUserFunction(name)) {
-                if (HYPOTHETICAL_SET_FUNCTIONS.contains(name)) {
-                    throw new MemgresException(fn.args().isEmpty()
-                            ? "window function " + name + " requires an OVER clause"
-                            : "WITHIN GROUP is required for ordered-set aggregate " + name,
-                            "42809");
-                }
-                if (WINDOW_ONLY_FUNCTIONS.contains(name)) {
-                    throw new MemgresException(
-                            "window function " + name + " requires an OVER clause", "42809");
-                }
-            }
-        }
+        Kind kind = kindOf(node, true);
+        if (kind == Kind.NO_OVER || kind == Kind.WITHIN_GROUP) throw missingClause(node, kind);
         AstWalk.forEachChild(node, this::rejectWindowCallWithoutOver);
     }
 
@@ -283,5 +350,17 @@ final class PlacementCheck {
         }
         rejectWindowCallWithoutOver(stmt.limit());
         rejectWindowCallWithoutOver(stmt.offset());
+        // A named window is a specification like any other, and is read even when nothing
+        // references it.
+        if (stmt.windowDefs() != null) {
+            for (SelectStmt.WindowDef def : stmt.windowDefs()) {
+                if (def.partitionBy() != null) {
+                    for (Expression p : def.partitionBy()) rejectWindowCallWithoutOver(p);
+                }
+                if (def.orderBy() != null) {
+                    for (SelectStmt.OrderByItem o : def.orderBy()) rejectWindowCallWithoutOver(o.expr());
+                }
+            }
+        }
     }
 }

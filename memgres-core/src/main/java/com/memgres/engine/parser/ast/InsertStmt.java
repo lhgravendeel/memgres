@@ -83,6 +83,11 @@ public final class InsertStmt implements Statement {
         public final Expression whereClause;
         public final List<String> conflictExpressions;
         public final Expression doUpdateWhereClause;
+        /**
+         * The same expression targets as {@link #conflictExpressions}, parsed. The text form is
+         * what matches a stored index's own text; the tree is what a check of the statement reads.
+         */
+        public final List<Expression> conflictExpressionAsts;
 
         public OnConflict(
                 List<String> columns,
@@ -104,6 +109,20 @@ public final class InsertStmt implements Statement {
                 List<String> conflictExpressions,
                 Expression doUpdateWhereClause
         ) {
+            this(columns, constraint, doNothing, doUpdate, whereClause, conflictExpressions,
+                    doUpdateWhereClause, null);
+        }
+
+        public OnConflict(
+                List<String> columns,
+                String constraint,
+                boolean doNothing,
+                List<SetClause> doUpdate,
+                Expression whereClause,
+                List<String> conflictExpressions,
+                Expression doUpdateWhereClause,
+                List<Expression> conflictExpressionAsts
+        ) {
             this.columns = columns;
             this.constraint = constraint;
             this.doNothing = doNothing;
@@ -111,6 +130,7 @@ public final class InsertStmt implements Statement {
             this.whereClause = whereClause;
             this.conflictExpressions = conflictExpressions;
             this.doUpdateWhereClause = doUpdateWhereClause;
+            this.conflictExpressionAsts = conflictExpressionAsts;
         }
 
         /** Convenience constructor without WHERE clause. */
@@ -129,6 +149,7 @@ public final class InsertStmt implements Statement {
         public Expression whereClause() { return whereClause; }
         public List<String> conflictExpressions() { return conflictExpressions; }
         public Expression doUpdateWhereClause() { return doUpdateWhereClause; }
+        public List<Expression> conflictExpressionAsts() { return conflictExpressionAsts; }
 
         @Override
         public boolean equals(Object o) {
