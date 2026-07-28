@@ -919,13 +919,22 @@ class SelectExecutor {
      * LIMIT and OFFSET are bigint in PostgreSQL. Narrowing them to int made any value above
      * 2^31 wrap negative and then fail its own sign check, reporting a negative limit for a
      * number the caller wrote as positive.
+     *
+     * <p>A fractional argument is cast to bigint rather than truncated, so LIMIT 1.5 is two rows
+     * and OFFSET 0.5 skips one. numeric rounds half away from zero and float8 rounds half to
+     * even, which is what the two casts do; and the sign is judged after the rounding, so
+     * LIMIT -0.4 is a limit of zero rather than a negative one.
      */
-    private long limitOffsetValue(Expression expr, boolean isLimit) {
+    long limitOffsetValue(Expression expr, boolean isLimit) {
         Object raw = executor.evalExpr(expr, null);
         if (raw == null) return -1; // NULL means "no limit", as in PG
         long value;
         try {
-            value = executor.toLong(raw);
+            value = raw instanceof java.math.BigDecimal
+                    ? roundToBigint((java.math.BigDecimal) raw)
+                    : raw instanceof Double || raw instanceof Float
+                            ? (long) Math.rint(((Number) raw).doubleValue())
+                            : executor.toLong(raw);
         } catch (NumberFormatException e) {
             throw new MemgresException(
                     "invalid input syntax for type bigint: \"" + raw + "\"", "22P02");
@@ -935,6 +944,11 @@ class SelectExecutor {
                     isLimit ? "2201W" : "2201X");
         }
         return value;
+    }
+
+    /** numeric to bigint, rounding half away from zero as the cast does. */
+    private static long roundToBigint(java.math.BigDecimal value) {
+        return value.setScale(0, java.math.RoundingMode.HALF_UP).longValue();
     }
 
     /** Clamp a bigint row count down to something a list index can hold. */
@@ -1341,6 +1355,11 @@ class SelectExecutor {
     // ---- SELECT without FROM ----
 
     private QueryResult executeSelectExpressions(SelectStmt stmt) {
+        // A FROM-less SELECT has one row and nothing to sort, but its ORDER BY is still analysed:
+        // an ordinal outside the select list is out of range and a constant that is not an
+        // integer names no column. Skipping the resolve here let SELECT 1 AS a ORDER BY NULL
+        // through where every other shape of SELECT already refused it.
+        resolveOrderBy(stmt.orderBy(), stmt.targets());
         if (hasWindowFunctionInTargets(stmt.targets())) {
             Table virtualTable = new Table("__virtual__",
                     Cols.listOf(new Column("__dummy__", DataType.INTEGER, true, false, null)));

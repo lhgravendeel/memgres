@@ -2008,6 +2008,10 @@ class BinaryOpEvaluator {
     /**
      * Map a BinaryExpr.BinOp to its operator symbol string for user-defined operator lookup.
      */
+    static String opSymbol(BinaryExpr.BinOp op) {
+        return binOpToSymbol(op);
+    }
+
     private static String binOpToSymbol(BinaryExpr.BinOp op) {
         switch (op) {
             case ADD: return "+";

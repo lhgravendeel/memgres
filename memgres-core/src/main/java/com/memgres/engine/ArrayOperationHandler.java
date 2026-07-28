@@ -408,6 +408,9 @@ class ArrayOperationHandler {
         if (outerCtx != null) executor.outerContextStack.push(outerCtx);
         try {
             QueryResult result = executor.executeStatement(asq.subquery());
+            // ARRAY(...) collects one column into an array, so a second column has nowhere to go.
+            // Taking row[0] and dropping the rest turned ARRAY(SELECT 1, 2) into {1} silently.
+            ExprEvaluator.rejectWideSubquery(result);
             List<Object> list = new ArrayList<>();
             for (Object[] row : result.getRows()) {
                 list.add(row.length > 0 ? row[0] : null);
