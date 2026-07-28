@@ -39,10 +39,8 @@ class MathFunctions {
                 }
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
-                if (arg instanceof Integer) return Math.abs(((Integer) arg));
-                if (arg instanceof Long) return Math.abs(((Long) arg));
-                if (arg instanceof BigDecimal) return ((BigDecimal) arg).abs();
-                return Math.abs(executor.toDouble(arg));
+                Object absolute = NumericLimits.absExact(arg);
+                return absolute != null ? absolute : Math.abs(executor.toDouble(arg));
             }
             case "ceil":
             case "ceiling":
@@ -113,6 +111,11 @@ class MathFunctions {
                 Object b = executor.evalExpr(fn.args().get(1), ctx);
                 if (a == null || b == null) return null;
                 if (a instanceof Integer && b instanceof Integer) return ((Integer) a) % ((Integer) b);
+                // A numeric NaN or infinity is carried as the matching double, which has no
+                // BigDecimal form; IEEE remainder gives the NaN PG's numeric_mod also returns.
+                if (NumericLimits.isSpecial(a) || NumericLimits.isSpecial(b)) {
+                    return executor.toDouble(a) % executor.toDouble(b);
+                }
                 if (a instanceof BigDecimal || b instanceof BigDecimal) {
                     BigDecimal bdA = a instanceof BigDecimal ? (BigDecimal) a : new BigDecimal(a.toString());
                     BigDecimal bdB = b instanceof BigDecimal ? (BigDecimal) b : new BigDecimal(b.toString());
@@ -125,7 +128,10 @@ class MathFunctions {
                 Object base = executor.evalExpr(fn.args().get(0), ctx);
                 Object exp = executor.evalExpr(fn.args().get(1), ctx);
                 if (base == null || exp == null) return null;
-                return numericResult(Math.pow(executor.toDouble(base), executor.toDouble(exp)));
+                double b = executor.toDouble(base);
+                double e = executor.toDouble(exp);
+                NumericLimits.checkPowerDomain(b, e);
+                return numericResult(Math.pow(b, e));
             }
             case "sqrt": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
@@ -140,27 +146,33 @@ class MathFunctions {
             }
             case "cbrt":
                 return mathUnary(fn, ctx, Math::cbrt);
+            case "log10":
             case "log": {
                 // log(base, x) or log(x) [base 10]
                 if (fn.args().size() == 1) {
                     Object arg = executor.evalExpr(fn.args().get(0), ctx);
                     if (arg == null) return null;
                     double dv = executor.toDouble(arg);
-                    if (dv == 0) throw new MemgresException("cannot take logarithm of zero", "2201E");
-                    if (dv < 0) throw new MemgresException("cannot take logarithm of a negative number", "2201E");
+                    NumericLimits.checkLogDomain(dv);
                     return numericResult(Math.log10(dv));
                 }
                 Object base = executor.evalExpr(fn.args().get(0), ctx);
                 Object val = executor.evalExpr(fn.args().get(1), ctx);
                 if (base == null || val == null) return null;
-                return numericResult(Math.log(executor.toDouble(val)) / Math.log(executor.toDouble(base)));
+                double bd = executor.toDouble(base);
+                double vd = executor.toDouble(val);
+                NumericLimits.checkLogDomain(bd);
+                NumericLimits.checkLogDomain(vd);
+                double lnBase = Math.log(bd);
+                // PG's log(base, x) is ln(x)/ln(base), so a base of one divides by zero
+                if (lnBase == 0) throw new MemgresException("division by zero", "22012");
+                return numericResult(Math.log(vd) / lnBase);
             }
             case "ln": {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 double dv = executor.toDouble(arg);
-                if (dv == 0) throw new MemgresException("cannot take logarithm of zero", "2201E");
-                if (dv < 0) throw new MemgresException("cannot take logarithm of a negative number", "2201F");
+                NumericLimits.checkLogDomain(dv);
                 return numericResult(Math.log(dv));
             }
             case "exp":
@@ -169,6 +181,7 @@ class MathFunctions {
                 Object arg = executor.evalExpr(fn.args().get(0), ctx);
                 if (arg == null) return null;
                 double d = executor.toDouble(arg);
+                if (Double.isNaN(d)) return d;
                 return d > 0 ? 1 : (d < 0 ? -1 : 0);
             }
             case "pi":
@@ -184,9 +197,9 @@ class MathFunctions {
             case "tan":
                 return mathUnary(fn, ctx, Math::tan);
             case "asin":
-                return mathUnary(fn, ctx, Math::asin);
+                return mathUnary(fn, ctx, x -> { NumericLimits.checkUnitInterval(x); return Math.asin(x); });
             case "acos":
-                return mathUnary(fn, ctx, Math::acos);
+                return mathUnary(fn, ctx, x -> { NumericLimits.checkUnitInterval(x); return Math.acos(x); });
             case "atan":
                 return mathUnary(fn, ctx, Math::atan);
             case "atan2": {
@@ -258,27 +271,34 @@ class MathFunctions {
                 return executor.toLong(a) / executor.toLong(b);
             }
             case "gcd": {
-                long a = executor.toLong(executor.evalExpr(fn.args().get(0), ctx));
-                long b = executor.toLong(executor.evalExpr(fn.args().get(1), ctx));
+                Object av = executor.evalExpr(fn.args().get(0), ctx);
+                Object bv = executor.evalExpr(fn.args().get(1), ctx);
+                if (av == null || bv == null) return null;
+                long a = executor.toLong(av);
+                long b = executor.toLong(bv);
                 while (b != 0) { long t = b; b = a % b; a = t; }
-                return Math.abs(a);
+                // gcd is |a|, which the two's-complement minimum cannot represent
+                return NumericLimits.narrowToIntegerType(NumericLimits.absExactLong(a, av, bv), av, bv);
             }
             case "lcm": {
-                long a = executor.toLong(executor.evalExpr(fn.args().get(0), ctx));
-                long b = executor.toLong(executor.evalExpr(fn.args().get(1), ctx));
-                if (a == 0 || b == 0) return 0L;
+                Object av = executor.evalExpr(fn.args().get(0), ctx);
+                Object bv = executor.evalExpr(fn.args().get(1), ctx);
+                if (av == null || bv == null) return null;
+                long a = executor.toLong(av);
+                long b = executor.toLong(bv);
+                if (a == 0 || b == 0) return NumericLimits.narrowToIntegerType(0L, av, bv);
                 long gcd = a;
                 long temp = b;
                 while (temp != 0) { long t = temp; temp = gcd % temp; gcd = t; }
-                long div = a / gcd;
-                // Check for overflow: use Math.multiplyHigh or manual check
                 long result;
                 try {
-                    result = Math.multiplyExact(Math.abs(div), Math.abs(b));
+                    result = Math.multiplyExact(
+                            NumericLimits.absExactLong(a / gcd, av, bv),
+                            NumericLimits.absExactLong(b, av, bv));
                 } catch (ArithmeticException e) {
-                    throw new MemgresException("bigint out of range", "22003");
+                    throw NumericLimits.integerOutOfRange(NumericLimits.widestIntegerType(av, bv));
                 }
-                return result;
+                return NumericLimits.narrowToIntegerType(result, av, bv);
             }
             case "scale": {
                 // PG: scale(numeric) -> integer: number of decimal digits in the fractional part.

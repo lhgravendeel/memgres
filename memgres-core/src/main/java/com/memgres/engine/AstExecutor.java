@@ -493,6 +493,10 @@ public class AstExecutor {
         return castEvaluator.applyCast(val, typeSpec);
     }
 
+    void checkNumericSpecialToInteger(CastExpr cast, Object val) {
+        exprEvaluator.checkNumericSpecialToInteger(cast, val);
+    }
+
     /**
      * Coerce a value to a named type the way an assignment would, so a PL/pgSQL variable of a
      * domain carries the domain's constraints rather than only its name.
@@ -539,15 +543,6 @@ public class AstExecutor {
 
     Object evalUnaryValue(UnaryExpr.UnaryOp op, Object val) {
         return exprEvaluator.evalUnaryValue(op, val);
-    }
-
-    List<Object> parsePostgresArrayLiteral(String s) {
-        return arrayOperationHandler.parsePostgresArrayLiteral(s);
-    }
-
-    /** Raw-string variant: unquoted elements keep their original text (see ArrayOperationHandler). */
-    List<Object> parsePostgresArrayLiteralRaw(String s) {
-        return arrayOperationHandler.parsePostgresArrayLiteral(s, true);
     }
 
     void validateCaseBranchTypesForPrepare(CaseExpr c) {

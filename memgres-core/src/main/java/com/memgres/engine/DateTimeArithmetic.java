@@ -304,6 +304,11 @@ class DateTimeArithmetic {
                     }
                     return acc;
                 }
+                // An integer deletes by position and text deletes by key: they are different
+                // operators in PG, and only one of them applies to a given container.
+                if (right instanceof Number) {
+                    return JsonOperations.deleteIndex(ls, ((Number) right).intValue());
+                }
                 return JsonOperations.deleteKey(ls, right.toString());
             }
         }
@@ -345,7 +350,15 @@ class DateTimeArithmetic {
         // interval * number
         if (left instanceof PgInterval && right instanceof Number) return ((PgInterval) left).multiply(((Number) right).doubleValue());
         if (left instanceof Number && right instanceof PgInterval) return ((PgInterval) right).multiply(((Number) left).doubleValue());
-        return executor.numericOp(left, right, (a, b) -> a * b, Math::multiplyExact, java.math.BigDecimal::multiply);
+        Object product = executor.numericOp(left, right, (a, b) -> a * b, Math::multiplyExact, java.math.BigDecimal::multiply);
+        // A product of two non-zero float8 operands that lands on zero has underflowed; PG
+        // reports that rather than returning a zero the inputs cannot justify.
+        if (product instanceof Double && ((Double) product).doubleValue() == 0
+                && left instanceof Number && right instanceof Number
+                && ((Number) left).doubleValue() != 0 && ((Number) right).doubleValue() != 0) {
+            throw NumericLimits.floatUnderflow();
+        }
+        return product;
     }
 
     /**

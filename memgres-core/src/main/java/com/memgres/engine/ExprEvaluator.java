@@ -972,7 +972,33 @@ class ExprEvaluator {
                 return null;
             }
         }
+        checkNumericSpecialToInteger(cast, val);
         return executor.castEvaluator.applyCast(val, cast.typeName());
+    }
+
+    /**
+     * PG's numeric knows NaN and both infinities, and none of them has an integer form. It says
+     * so outright, where the same value arriving from float8 is reported as a range error --
+     * so the source's own type decides which error this is.
+     */
+    void checkNumericSpecialToInteger(CastExpr cast, Object val) {
+        if (!NumericLimits.isSpecial(val)) return;
+        String target = integerTypeName(cast.typeName());
+        if (target == null) return;
+        if (inferExprType(cast.expr()) != DataType.NUMERIC) return;
+        double d = ((Number) val).doubleValue();
+        throw new MemgresException(
+                "cannot convert " + (Double.isNaN(d) ? "NaN" : "infinity") + " to " + target, "0A000");
+    }
+
+    /** The name PG uses for an integer cast target, or null when the target is not one. */
+    private static String integerTypeName(String typeName) {
+        if (typeName == null) return null;
+        String t = typeName.toLowerCase().trim();
+        if (t.equals("int") || t.equals("int4") || t.equals("integer")) return "integer";
+        if (t.equals("int8") || t.equals("bigint")) return "bigint";
+        if (t.equals("int2") || t.equals("smallint")) return "smallint";
+        return null;
     }
 
     /** True when an expression is declared to produce json or jsonb. */
@@ -995,8 +1021,8 @@ class ExprEvaluator {
             }
             case NEGATE: {
                 if (val == null) return null;
-                if (val instanceof Integer) return -((Integer) val);
-                if (val instanceof Long) return -((Long) val);
+                Object negated = NumericLimits.negateExact(val);
+                if (negated != null) return negated;
                 if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val).negate();
                 if (val instanceof Double) return -((Double) val);
                 if (val instanceof Float) return -((Float) val);
@@ -1036,12 +1062,8 @@ class ExprEvaluator {
             }
             case ABS: {
                 if (val == null) return null;
-                if (val instanceof Integer) return Math.abs(((Integer) val));
-                if (val instanceof Long) return Math.abs(((Long) val));
-                if (val instanceof java.math.BigDecimal) return ((java.math.BigDecimal) val).abs();
-                if (val instanceof Double) return Math.abs(((Double) val));
-                if (val instanceof Float) return Math.abs(((Float) val));
-                return val;
+                Object absolute = NumericLimits.absExact(val);
+                return absolute != null ? absolute : val;
             }
             case SQRT: {
                 if (val == null) return null;
@@ -2084,6 +2106,13 @@ class ExprEvaluator {
                 throw bme;
             }
         }
+        // PG's float4 operators return float4. Computing in double and keeping the wide result
+        // would let a real column hold a value real cannot represent, so narrow back and check.
+        if (left instanceof Float && right instanceof Float) {
+            double lf = ((Float) left).doubleValue();
+            double rf = ((Float) right).doubleValue();
+            return NumericLimits.checkFloat4(doubleOp.apply(lf, rf), lf, rf);
+        }
         double result = doubleOp.apply(toDouble(left), toDouble(right));
         // Check for overflow: non-infinite inputs producing infinite result
         if (Double.isInfinite(result) && !Double.isInfinite(toDouble(left)) && !Double.isInfinite(toDouble(right))) {
@@ -2314,6 +2343,25 @@ class ExprEvaluator {
 
     // ---- Type inference ----
 
+    /** True for a bare string literal, which PostgreSQL types from whatever sits opposite it. */
+    private static boolean isUnknownLiteral(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
+    /** True for the range and multirange types, whose operators answer in their own type. */
+    private static boolean isRangeType(DataType t) {
+        switch (t) {
+            case INT4RANGE: case INT8RANGE: case NUMRANGE:
+            case DATERANGE: case TSRANGE: case TSTZRANGE:
+            case INT4MULTIRANGE: case INT8MULTIRANGE: case NUMMULTIRANGE:
+            case DATEMULTIRANGE: case TSMULTIRANGE: case TSTZMULTIRANGE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     DataType inferTypeFromContext(Expression expr, List<RowContext.TableBinding> bindings) {
         if (expr instanceof ColumnRef) {
             ColumnRef ref = (ColumnRef) expr;
@@ -2391,6 +2439,17 @@ class ExprEvaluator {
                     || bin.op() == BinaryExpr.BinOp.MODULO) {
                 DataType leftType = inferTypeFromContext(bin.left(), bindings);
                 DataType rightType = inferTypeFromContext(bin.right(), bindings);
+                // A range meets, joins or is cut by another range and stays that same range type.
+                // Describing the column as an integer instead handed the driver a value it could
+                // not read: "[5,10)" is no integer, so the row never arrived at all. An untyped
+                // literal opposite a range is read as one, so it answers in that type too.
+                if (leftType != null && isRangeType(leftType)
+                        && (leftType == rightType || isUnknownLiteral(bin.right()))) {
+                    return leftType;
+                }
+                if (rightType != null && isRangeType(rightType) && isUnknownLiteral(bin.left())) {
+                    return rightType;
+                }
                 // If either is NUMERIC, result is NUMERIC (except double wins)
                 if (leftType == DataType.DOUBLE_PRECISION || rightType == DataType.DOUBLE_PRECISION)
                     return DataType.DOUBLE_PRECISION;
@@ -2456,6 +2515,10 @@ class ExprEvaluator {
                 // timestamptz value advertised/decoded as DATE corrupts pgjdbc's binary decode).
                 if (fn.args().size() >= 2) {
                     DataType dt = inferTypeFromContext(fn.args().get(1), bindings);
+                    // PG has no date_trunc over date or time; a date resolves through the
+                    // timestamptz form and a time through the interval one
+                    if (dt == DataType.DATE) return DataType.TIMESTAMPTZ;
+                    if (dt == DataType.TIME) return DataType.INTERVAL;
                     if (dt != null) return dt;
                 }
                 return DataType.TIMESTAMP;

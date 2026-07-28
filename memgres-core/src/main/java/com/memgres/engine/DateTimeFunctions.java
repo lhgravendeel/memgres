@@ -1,7 +1,6 @@
 package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.*;
-import com.memgres.engine.util.Strs;
 
 /**
  * Date/time function evaluation, extracted from FunctionEvaluator to reduce class size.
@@ -9,11 +8,50 @@ import com.memgres.engine.util.Strs;
 class DateTimeFunctions {
     private static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
-    /** Units below a day, which a date value cannot answer. */
-    private static final java.util.Set<String> SUB_DAY_UNITS = new java.util.HashSet<>(
-            java.util.Arrays.asList("hour", "hours", "minute", "minutes", "second", "seconds",
-                    "millisecond", "milliseconds", "microsecond", "microseconds",
-                    "timezone", "timezone_hour", "timezone_minute"));
+    /**
+     * PostgreSQL's interval-unit token table, keyed by spelling and valued by canonical unit.
+     * A spelling matches a token when the two agree on their first ten characters, which is
+     * why "microseconds" and "millenniums" are accepted while "microsecs" is not.
+     */
+    private static final java.util.Map<String, String> DELTA_UNITS = new java.util.HashMap<>();
+
+    /** The further units only the field-extracting functions read; date_trunc does not. */
+    private static final java.util.Map<String, String> FIELD_UNITS = new java.util.HashMap<>();
+
+    /** The reserved words among {@link #FIELD_UNITS}: of these only "epoch" ever has a value. */
+    private static final java.util.Set<String> RESERVED_UNITS = new java.util.HashSet<>(
+            java.util.Arrays.asList("epoch", "now", "today", "tomorrow", "yesterday",
+                    "infinity", "-infinity", "allballs"));
+
+    static {
+        alias(DELTA_UNITS, "microsecond", "microsecon", "us", "usec", "usecond", "useconds", "usecs");
+        alias(DELTA_UNITS, "millisecond", "millisecon", "ms", "msec", "msecond", "mseconds", "msecs");
+        alias(DELTA_UNITS, "second", "s", "sec", "second", "seconds", "secs");
+        alias(DELTA_UNITS, "minute", "m", "min", "mins", "minute", "minutes");
+        alias(DELTA_UNITS, "hour", "h", "hour", "hours", "hr", "hrs");
+        alias(DELTA_UNITS, "day", "d", "day", "days");
+        alias(DELTA_UNITS, "week", "w", "week", "weeks");
+        alias(DELTA_UNITS, "month", "mon", "mons", "month", "months");
+        alias(DELTA_UNITS, "quarter", "qtr", "quarter");
+        alias(DELTA_UNITS, "year", "y", "year", "years", "yr", "yrs");
+        alias(DELTA_UNITS, "decade", "dec", "decade", "decades", "decs");
+        alias(DELTA_UNITS, "century", "c", "cent", "centuries", "century");
+        alias(DELTA_UNITS, "millennium", "mil", "millennia", "millennium", "mils");
+        alias(DELTA_UNITS, "timezone", "timezone");
+        alias(DELTA_UNITS, "timezone_hour", "timezone_h");
+        alias(DELTA_UNITS, "timezone_minute", "timezone_m");
+
+        alias(FIELD_UNITS, "dow", "dow");
+        alias(FIELD_UNITS, "doy", "doy");
+        alias(FIELD_UNITS, "isodow", "isodow");
+        alias(FIELD_UNITS, "isoyear", "isoyear");
+        alias(FIELD_UNITS, "julian", "j", "jd", "julian");
+        for (String reserved : RESERVED_UNITS) FIELD_UNITS.put(reserved, reserved);
+    }
+
+    private static void alias(java.util.Map<String, String> table, String canonical, String... spellings) {
+        for (String spelling : spellings) table.put(spelling, canonical);
+    }
 
     private final AstExecutor executor;
 
@@ -47,15 +85,16 @@ class DateTimeFunctions {
             case "extract": {
                 Object fieldObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object source = executor.evalExpr(fn.args().get(1), ctx);
+                if (fieldObj == null) return null;
                 if (source instanceof Number && !(source instanceof Double)) {
                     throw new MemgresException("function date_part(unknown, integer) does not exist\n  Hint: No function matches the given name and argument types.", "42883");
                 }
-                String field = fieldObj.toString().toLowerCase();
-                return extractDatePart(field, source);
+                return extractDatePart(fieldObj.toString().toLowerCase(), source, name.equals("extract"));
             }
             case "date_trunc": {
                 Object fieldObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object source = executor.evalExpr(fn.args().get(1), ctx);
+                if (fieldObj == null) return null;
                 String field = fieldObj.toString().toLowerCase();
                 // A timestamptz truncates in the session's zone, or in the zone the third
                 // argument names: midnight is a local idea, not a UTC one.
@@ -137,15 +176,31 @@ class DateTimeFunctions {
                 Object intervalObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object sourceObj = executor.evalExpr(fn.args().get(1), ctx);
                 Object originObj = executor.evalExpr(fn.args().get(2), ctx);
+                if (intervalObj == null || sourceObj == null || originObj == null) return null;
                 PgInterval iv = TypeCoercion.toInterval(intervalObj);
+                // A month is not a fixed number of microseconds, so there is no bin width to
+                // count with; PG refuses the stride rather than picking a length for it.
+                if (iv.isInfinite() || iv.getMonths() != 0) {
+                    throw new MemgresException(
+                            "timestamps cannot be binned into intervals containing months or years", "0A000");
+                }
+                long strideMicros = iv.getDays() * 24L * 3600 * 1_000_000 + iv.getMicroseconds();
+                if (strideMicros <= 0) {
+                    throw new MemgresException("stride must be greater than zero", "22008");
+                }
+                if (sourceObj instanceof java.time.OffsetDateTime) {
+                    // A timestamptz bins on the instant line, so a zone with a non-hour offset
+                    // cannot shift which bin a value lands in
+                    java.time.Instant src = ((java.time.OffsetDateTime) sourceObj).toInstant();
+                    java.time.Instant org = TypeCoercion.toOffsetDateTime(originObj).toInstant();
+                    java.time.Instant binStart = org.plusNanos(
+                            binOffsetMicros(microsBetween(org, src), strideMicros) * 1000);
+                    return binStart.atZone(TypeCoercion.sessionZone()).toOffsetDateTime();
+                }
                 java.time.LocalDateTime source = TypeCoercion.toLocalDateTime(sourceObj);
                 java.time.LocalDateTime origin = TypeCoercion.toLocalDateTime(originObj);
-                long intervalMicros = iv.getDays() * 24L * 3600 * 1_000_000 + iv.getMicroseconds();
-                long sourceMicros = java.time.Duration.between(origin, source).toNanos() / 1000;
-                // Use Math.floorDiv to floor toward -infinity for pre-origin values
-                long bins = Math.floorDiv(sourceMicros, intervalMicros);
-                long binStartMicros = bins * intervalMicros;
-                return origin.plusNanos(binStartMicros * 1000);
+                return origin.plusNanos(
+                        binOffsetMicros(microsBetween(origin, source), strideMicros) * 1000);
             }
             case "make_interval": {
                 int years = 0, months = 0, weeks = 0, days = 0, hours = 0, mins = 0;
@@ -212,9 +267,9 @@ class DateTimeFunctions {
                 if (fn.args().size() < 2) {
                     return source.toString();
                 }
-                Object fmtVal = executor.evalExpr(fn.args().get(1), ctx);
-                if (fmtVal == null) return null;
-                String fmt = fmtVal.toString();
+                Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
+                if (fmtObj == null) return null; // to_char(x, NULL) is NULL, not a template error
+                String fmt = fmtObj.toString();
                 // An empty format leaves a number with nothing to print, while the date/time
                 // form of to_char returns NULL outright
                 if (fmt.isEmpty()) return (source instanceof Number) ? "" : null;
@@ -224,9 +279,10 @@ class DateTimeFunctions {
                 Object source = executor.evalExpr(fn.args().get(0), ctx);
                 if (source == null) return null;
                 if (fn.args().size() >= 2) {
-                    String dateStr = source.toString();
-                    String fmt = executor.evalExpr(fn.args().get(1), ctx).toString();
-                    return parseDateWithFormat(dateStr, fmt);
+                    Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
+                    if (fmtObj == null) return null;
+                    return DateTimeTemplate.parse(source.toString(), fmtObj.toString())
+                            .toLocalDate();
                 }
                 return TypeCoercion.toLocalDate(source);
             }
@@ -238,8 +294,10 @@ class DateTimeFunctions {
                     return java.time.OffsetDateTime.ofInstant(java.time.Instant.ofEpochSecond(n.longValue()), java.time.ZoneOffset.UTC);
                 }
                 if (fn.args().size() >= 2) {
-                    String fmt = executor.evalExpr(fn.args().get(1), ctx).toString();
-                    java.time.LocalDateTime ldt = parseTimestampWithFormat(source.toString(), fmt);
+                    Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
+                    if (fmtObj == null) return null;
+                    java.time.LocalDateTime ldt =
+                            DateTimeTemplate.parse(source.toString(), fmtObj.toString());
                     return ldt.atOffset(java.time.ZoneOffset.UTC);
                 }
                 return TypeCoercion.toOffsetDateTime(source);
@@ -316,197 +374,370 @@ class DateTimeFunctions {
         return new PgInterval(p.getYears() * 12 + p.getMonths(), p.getDays(), timeMicros);
     }
 
-    private Object extractDatePart(String field, Object source) {
-        if (source == null) return null;
-        if (source instanceof PgInterval) {
-            PgInterval iv = (PgInterval) source;
-            if (iv.isInfinite()) {
-                // Only epoch has a meaningful answer for an infinite interval
-                if (field.equals("epoch")) {
-                    return iv.isPositiveInfinity() ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY;
-                }
-                return java.math.BigDecimal.ZERO;
-            }
-            switch (field) {
-                case "year":
-                case "years":
-                    return java.math.BigDecimal.valueOf(iv.getMonths() / 12);
-                case "month":
-                case "months":
-                    return java.math.BigDecimal.valueOf(iv.getMonths() % 12);
-                case "day":
-                case "days":
-                    return java.math.BigDecimal.valueOf(iv.getDays());
-                case "hour":
-                case "hours":
-                    return java.math.BigDecimal.valueOf(iv.getMicroseconds() / 3_600_000_000L);
-                case "minute":
-                case "minutes":
-                    return java.math.BigDecimal.valueOf((iv.getMicroseconds() % 3_600_000_000L) / 60_000_000L);
-                case "second":
-                case "seconds":
-                    return java.math.BigDecimal.valueOf((iv.getMicroseconds() % 60_000_000L)).divide(java.math.BigDecimal.valueOf(1_000_000), 6, java.math.RoundingMode.HALF_UP).stripTrailingZeros();
-                case "epoch": {
-                    // PG splits the months: whole years count 365.25 days each, the leftover
-                    // months 30 days each. Always reported with 6 fractional digits.
-                    long totalSecs = (long) (iv.getMonths() / 12) * 31557600L
-                            + (long) (iv.getMonths() % 12) * 2592000L
-                            + (long) iv.getDays() * 86400L;
-                    java.math.BigDecimal secsPart = java.math.BigDecimal.valueOf(totalSecs);
-                    java.math.BigDecimal microsPart = java.math.BigDecimal.valueOf(iv.getMicroseconds())
-                            .divide(java.math.BigDecimal.valueOf(1_000_000), 6, java.math.RoundingMode.HALF_UP);
-                    return secsPart.add(microsPart).setScale(6, java.math.RoundingMode.HALF_UP);
-                }
-                default:
-                    throw new MemgresException("unit \"" + field + "\" not recognized for type interval", "22023");
-            }
+    /** Microseconds from {@code from} to {@code to}, without {@code Duration.toNanos}'s range. */
+    private static long microsBetween(java.time.temporal.Temporal from, java.time.temporal.Temporal to) {
+        java.time.Duration d = java.time.Duration.between(from, to);
+        return d.getSeconds() * 1_000_000L + d.getNano() / 1000;
+    }
+
+    /** How far past the origin the bin containing an offset starts; floors below the origin too. */
+    private static long binOffsetMicros(long offsetMicros, long strideMicros) {
+        return Math.floorDiv(offsetMicros, strideMicros) * strideMicros;
+    }
+
+    /** The text shape memgres writes a timetz in, which is how it carries the offset around. */
+    private static final java.util.regex.Pattern TIMETZ_TEXT =
+            java.util.regex.Pattern.compile("\\d{1,2}:\\d{2}:\\d{2}(\\.\\d+)?([+-]\\d{2})(:?\\d{2})?");
+
+    /** The timetz a value stands for, or null if it is not one. */
+    private static java.time.OffsetTime asOffsetTime(Object source) {
+        if (source instanceof java.time.OffsetTime) return (java.time.OffsetTime) source;
+        if (!(source instanceof String)) return null;
+        String s = ((String) source).trim();
+        java.util.regex.Matcher m = TIMETZ_TEXT.matcher(s);
+        if (!m.matches()) return null;
+        // ISO_OFFSET_TIME wants a whole offset, where memgres writes a bare hour for a whole one
+        if (m.group(3) == null) s = s + ":00";
+        try {
+            return java.time.OffsetTime.parse(s, java.time.format.DateTimeFormatter.ISO_OFFSET_TIME);
+        } catch (java.time.format.DateTimeParseException e) {
+            return null;
         }
-        Object originalSource = source;
+    }
+
+    /** The canonical unit a spelling names, or null when PostgreSQL would not recognise it. */
+    private static String resolveUnit(java.util.Map<String, String> table, String unit) {
+        return table.get(unit.length() > 10 ? unit.substring(0, 10) : unit);
+    }
+
+    /** The unit lookup the field-extracting functions do: the delta table, then the wider one. */
+    private static String fieldUnit(String unit) {
+        String canonical = resolveUnit(DELTA_UNITS, unit);
+        return canonical != null ? canonical : resolveUnit(FIELD_UNITS, unit);
+    }
+
+    /** The unit is a word PostgreSQL knows, but this type has no such field. */
+    private static MemgresException notSupported(String unit, String typeName) {
+        return new MemgresException("unit \"" + unit + "\" not supported for type " + typeName, "0A000");
+    }
+
+    /** The unit is not a word PostgreSQL knows at all. */
+    private static MemgresException notRecognized(String unit, String typeName) {
+        return new MemgresException("unit \"" + unit + "\" not recognized for type " + typeName, "22023");
+    }
+
+    /** extract() answers a numeric of a fixed scale where date_part() answers a float8. */
+    private static Object scaled(long micros, int scale, boolean extractForm) {
+        java.math.BigDecimal value = java.math.BigDecimal.valueOf(micros, scale);
+        return extractForm ? (Object) value : (Object) Double.valueOf(value.doubleValue());
+    }
+
+    private static Object whole(long value, boolean extractForm) {
+        return extractForm ? (Object) java.math.BigDecimal.valueOf(value) : (Object) Double.valueOf(value);
+    }
+
+    /**
+     * Fields of an infinite value: the ones that only ever grow answer infinity, the ones that
+     * cycle have no answer at all. PG spells both the same way for numeric and float8.
+     */
+    private static final java.util.Set<String> MONOTONIC_UNITS = new java.util.HashSet<>(
+            java.util.Arrays.asList("year", "decade", "century", "millennium", "isoyear",
+                    "julian", "epoch"));
+
+    /** As {@link #MONOTONIC_UNITS}, for an interval — which counts hours and days, not weeks. */
+    private static final java.util.Set<String> MONOTONIC_INTERVAL_UNITS = new java.util.HashSet<>(
+            java.util.Arrays.asList("year", "decade", "century", "millennium", "epoch",
+                    "hour", "day"));
+
+    private Object extractDatePart(String rawUnit, Object source, boolean extractForm) {
+        if (source == null) return null;
+        String unit = rawUnit.toLowerCase();
+        if (source instanceof PgInterval) return intervalField(unit, (PgInterval) source, extractForm);
+        if (source instanceof java.time.LocalTime) {
+            return timeField(unit, (java.time.LocalTime) source, null, extractForm);
+        }
+        java.time.OffsetTime ot = asOffsetTime(source);
+        if (ot != null) return timeField(unit, ot.toLocalTime(), ot.getOffset(), extractForm);
+        // extract() has an entry point of its own for date, which refuses every sub-day unit;
+        // date_part() has none, so a date reaches the timestamp code and answers zero for them.
+        if (extractForm && source instanceof java.time.LocalDate) {
+            return dateField(unit, (java.time.LocalDate) source);
+        }
+        return timestampField(unit, source, extractForm);
+    }
+
+    private Object timestampField(String unit, Object source, boolean extractForm) {
+        boolean tzAware = source instanceof java.time.OffsetDateTime;
+        String typeName = tzAware ? "timestamp with time zone" : "timestamp without time zone";
+        String canonical = fieldUnit(unit);
+        if (canonical == null) throw notRecognized(unit, typeName);
+
         java.time.LocalDateTime dt;
+        int offsetSeconds = 0;
         if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
-        else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
-        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).atZoneSameInstant(TypeCoercion.sessionZone()).toLocalDateTime();
-        else dt = TypeCoercion.toLocalDateTime(source);
+        else if (source instanceof java.time.LocalDateTime) dt = (java.time.LocalDateTime) source;
+        else if (tzAware) {
+            // PG resolves a timestamptz in the session zone before taking any field of it,
+            // so the offset reported is the session's at that instant, not the literal's
+            java.time.ZonedDateTime zoned = ((java.time.OffsetDateTime) source)
+                    .atZoneSameInstant(TypeCoercion.sessionZone());
+            dt = zoned.toLocalDateTime();
+            offsetSeconds = zoned.getOffset().getTotalSeconds();
+        } else dt = TypeCoercion.toLocalDateTime(source);
 
-        // A date has no time of day, so PG refuses the sub-day units outright rather than
-        // reporting the zero that midnight would give
-        if (originalSource instanceof java.time.LocalDate && SUB_DAY_UNITS.contains(field)) {
-            throw new MemgresException(
-                    "unit \"" + field + "\" not supported for type date", "0A000");
+        if (dt.equals(TypeCoercion.TIMESTAMP_INFINITY) || dt.equals(TypeCoercion.TIMESTAMP_NEG_INFINITY)) {
+            return infiniteField(canonical, MONOTONIC_UNITS, CYCLING_UNITS,
+                    dt.equals(TypeCoercion.TIMESTAMP_INFINITY), unit, typeName);
         }
 
-        switch (field) {
-            case "year":
-            case "years":
-                // PG has no year zero, so a BC proleptic year reports one lower
-                return java.math.BigDecimal.valueOf(
-                        dt.getYear() > 0 ? dt.getYear() : dt.getYear() - 1);
-            case "month":
-            case "months":
-                return java.math.BigDecimal.valueOf(dt.getMonthValue());
-            case "day":
-            case "days":
-                return java.math.BigDecimal.valueOf(dt.getDayOfMonth());
-            case "hour":
-            case "hours":
-                return java.math.BigDecimal.valueOf(dt.getHour());
-            case "minute":
-            case "minutes":
-                return java.math.BigDecimal.valueOf(dt.getMinute());
-            case "second":
-            case "seconds": {
-                long sec = dt.getSecond();
-                int nano = dt.getNano();
-                if (nano == 0) return java.math.BigDecimal.valueOf(sec);
-                return java.math.BigDecimal.valueOf(sec).add(java.math.BigDecimal.valueOf(nano, 9)).stripTrailingZeros();
-            }
-            case "dow":
-                return java.math.BigDecimal.valueOf(dt.getDayOfWeek().getValue() % 7);
-            case "doy":
-                return java.math.BigDecimal.valueOf(dt.getDayOfYear());
-            case "week":
-                return java.math.BigDecimal.valueOf(dt.get(java.time.temporal.IsoFields.WEEK_OF_WEEK_BASED_YEAR));
-            case "quarter":
-                return java.math.BigDecimal.valueOf((dt.getMonthValue() - 1) / 3 + 1);
-            case "epoch": {
-                long epochSec;
-                if (originalSource instanceof java.time.OffsetDateTime) {
-                    java.time.OffsetDateTime odt = (java.time.OffsetDateTime) originalSource;
-                    epochSec = odt.toEpochSecond();
-                } else {
-                    epochSec = dt.toEpochSecond(java.time.ZoneOffset.UTC);
-                }
-                int nano = dt.getNano();
-                if (nano == 0) return java.math.BigDecimal.valueOf(epochSec);
-                return java.math.BigDecimal.valueOf(epochSec).add(java.math.BigDecimal.valueOf(nano, 9)).setScale(6, java.math.RoundingMode.HALF_UP);
-            }
-            case "isodow":
-                return java.math.BigDecimal.valueOf(dt.getDayOfWeek().getValue());
-            case "isoyear":
-                return java.math.BigDecimal.valueOf(dt.get(java.time.temporal.IsoFields.WEEK_BASED_YEAR));
-            case "century":
-                return java.math.BigDecimal.valueOf(dt.getYear() > 0 ? (dt.getYear() - 1) / 100 + 1 : dt.getYear() / 100 - 1);
-            case "decade":
-                return java.math.BigDecimal.valueOf(dt.getYear() / 10);
-            case "millennium":
-                return java.math.BigDecimal.valueOf(dt.getYear() > 0 ? (dt.getYear() - 1) / 1000 + 1 : dt.getYear() / 1000 - 1);
-            case "microsecond":
-            case "microseconds":
-                return java.math.BigDecimal.valueOf(dt.getSecond() * 1_000_000L + dt.getNano() / 1000);
-            case "millisecond":
-            case "milliseconds":
-                return java.math.BigDecimal.valueOf(dt.getSecond() * 1000L + dt.getNano() / 1_000_000);
-            case "julian": {
-                // Julian Day Number: PostgreSQL uses midnight-based Julian days.
-                // Java's JulianFields.JULIAN_DAY also starts at midnight, so no
-                // offset adjustment is needed — just add the fractional time-of-day.
-                long julianDay = dt.toLocalDate().getLong(java.time.temporal.JulianFields.JULIAN_DAY);
-                long dayMicros = (dt.getHour() * 3600L + dt.getMinute() * 60L + dt.getSecond()) * 1_000_000L + dt.getNano() / 1000;
-                java.math.BigDecimal frac = java.math.BigDecimal.valueOf(dayMicros).divide(
-                        java.math.BigDecimal.valueOf(86400_000_000L), 6, java.math.RoundingMode.HALF_UP);
-                return java.math.BigDecimal.valueOf(julianDay)
-                        .add(frac).stripTrailingZeros();
-            }
+        long timeMicros = dt.toLocalTime().toNanoOfDay() / 1000;
+        long secondMicros = timeMicros % 60_000_000L;
+        if (canonical.equals("microsecond")) return whole(secondMicros, extractForm);
+        if (canonical.equals("millisecond")) return scaled(secondMicros, 3, extractForm);
+        if (canonical.equals("second")) return scaled(secondMicros, 6, extractForm);
+        if (canonical.equals("minute")) return whole(dt.getMinute(), extractForm);
+        if (canonical.equals("hour")) return whole(dt.getHour(), extractForm);
+        if (canonical.equals("epoch")) {
+            long epochSeconds = dt.toEpochSecond(java.time.ZoneOffset.ofTotalSeconds(offsetSeconds));
+            return scaled(epochSeconds * 1_000_000L + dt.getNano() / 1000, 6, extractForm);
+        }
+        if (canonical.equals("julian")) return julian(dt.toLocalDate(), timeMicros, extractForm);
+        if (canonical.equals("timezone")) {
+            if (!tzAware) throw notSupported(unit, typeName);
+            return whole(offsetSeconds, extractForm);
+        }
+        if (canonical.equals("timezone_hour")) {
+            if (!tzAware) throw notSupported(unit, typeName);
+            return whole(offsetSeconds / 3600, extractForm);
+        }
+        if (canonical.equals("timezone_minute")) {
+            if (!tzAware) throw notSupported(unit, typeName);
+            return whole((offsetSeconds % 3600) / 60, extractForm);
+        }
+        Long calendar = calendarField(canonical, dt.toLocalDate());
+        if (calendar == null) throw notSupported(unit, typeName);
+        return whole(calendar.longValue(), extractForm);
+    }
+
+    /** extract() over a date: PG's own function for it, which has no sub-day fields at all. */
+    private Object dateField(String unit, java.time.LocalDate date) {
+        String canonical = fieldUnit(unit);
+        if (canonical == null) throw notRecognized(unit, "date");
+        if (canonical.equals("epoch")) {
+            return java.math.BigDecimal.valueOf(date.toEpochDay() * 86400L);
+        }
+        if (canonical.equals("julian")) {
+            return java.math.BigDecimal.valueOf(
+                    date.getLong(java.time.temporal.JulianFields.JULIAN_DAY));
+        }
+        Long calendar = calendarField(canonical, date);
+        if (calendar == null) throw notSupported(unit, "date");
+        return java.math.BigDecimal.valueOf(calendar.longValue());
+    }
+
+    /** The fields a calendar date can answer, or null when this unit is not one of them. */
+    private static Long calendarField(String canonical, java.time.LocalDate date) {
+        int year = date.getYear();
+        switch (canonical) {
+            // PG has no year zero, so a BC proleptic year reports one lower
+            case "year": return (long) (year > 0 ? year : year - 1);
+            case "month": return (long) date.getMonthValue();
+            case "day": return (long) date.getDayOfMonth();
+            case "week": return (long) date.get(java.time.temporal.IsoFields.WEEK_OF_WEEK_BASED_YEAR);
+            case "quarter": return (long) ((date.getMonthValue() - 1) / 3 + 1);
+            case "dow": return (long) (date.getDayOfWeek().getValue() % 7);
+            case "doy": return (long) date.getDayOfYear();
+            case "isodow": return (long) date.getDayOfWeek().getValue();
+            case "isoyear": return (long) date.get(java.time.temporal.IsoFields.WEEK_BASED_YEAR);
+            case "decade": return (long) (year / 10);
+            case "century": return (long) (year > 0 ? (year - 1) / 100 + 1 : year / 100 - 1);
+            case "millennium": return (long) (year > 0 ? (year - 1) / 1000 + 1 : year / 1000 - 1);
+            default: return null;
+        }
+    }
+
+    /**
+     * The Julian day with the time of day as its fraction. PG divides in numeric for extract()
+     * and in double precision for date_part().
+     */
+    private static Object julian(java.time.LocalDate date, long timeMicros, boolean extractForm) {
+        long julianDay = date.getLong(java.time.temporal.JulianFields.JULIAN_DAY);
+        if (!extractForm) {
+            return Double.valueOf(julianDay + timeMicros / 86_400_000_000.0);
+        }
+        return java.math.BigDecimal.valueOf(julianDay).add(
+                java.math.BigDecimal.valueOf(timeMicros).divide(
+                        java.math.BigDecimal.valueOf(MICROS_PER_DAY),
+                        numericDivScale(timeMicros, MICROS_PER_DAY), java.math.RoundingMode.HALF_UP));
+    }
+
+    private static final long MICROS_PER_DAY = 86_400_000_000L;
+
+    /**
+     * The scale PG's numeric division would choose: sixteen significant digits past the
+     * estimated weight of the quotient, counted in the base-10000 digits numeric stores.
+     */
+    private static int numericDivScale(long numerator, long denominator) {
+        int quotientWeight = base10000Weight(numerator) - base10000Weight(denominator);
+        if (leadingGroup(numerator) <= leadingGroup(denominator)) quotientWeight--;
+        return Math.max(0, Math.min(1000, 16 - quotientWeight * 4));
+    }
+
+    private static int base10000Weight(long value) {
+        return value == 0 ? 0 : (Long.toString(Math.abs(value)).length() - 1) / 4;
+    }
+
+    private static long leadingGroup(long value) {
+        long abs = Math.abs(value);
+        for (int i = base10000Weight(value); i > 0; i--) abs /= 10000;
+        return abs;
+    }
+
+    private Object timeField(String unit, java.time.LocalTime time,
+                             java.time.ZoneOffset offset, boolean extractForm) {
+        String typeName = offset == null ? "time without time zone" : "time with time zone";
+        String canonical = fieldUnit(unit);
+        if (canonical == null) throw notRecognized(unit, typeName);
+        // A time answers no reserved word but epoch; the rest are not even the right kind of name
+        if (RESERVED_UNITS.contains(canonical) && !canonical.equals("epoch")) {
+            throw notRecognized(unit, typeName);
+        }
+        long dayMicros = time.toNanoOfDay() / 1000;
+        long secondMicros = dayMicros % 60_000_000L;
+        int offsetSeconds = offset == null ? 0 : offset.getTotalSeconds();
+        switch (canonical) {
+            case "microsecond": return whole(secondMicros, extractForm);
+            case "millisecond": return scaled(secondMicros, 3, extractForm);
+            case "second": return scaled(secondMicros, 6, extractForm);
+            case "minute": return whole(time.getMinute(), extractForm);
+            case "hour": return whole(time.getHour(), extractForm);
+            // A timetz's epoch is its time of day taken back to UTC
+            case "epoch": return scaled(dayMicros - offsetSeconds * 1_000_000L, 6, extractForm);
             case "timezone":
+                if (offset == null) throw notSupported(unit, typeName);
+                return whole(offsetSeconds, extractForm);
             case "timezone_hour":
-            case "timezone_minute": {
-                // PG converts timestamptz to session timezone first, so timezone fields
-                // reflect the session timezone, not the original literal offset.
-                // Memgres session timezone is UTC (offset 0).
-                int totalSeconds = 0;
-                if (originalSource instanceof java.time.OffsetTime) {
-                    // For timetz, use the actual offset from the value
-                    totalSeconds = ((java.time.OffsetTime) originalSource).getOffset().getTotalSeconds();
-                }
-                // For timestamptz (OffsetDateTime), session timezone applies (UTC = 0)
-                switch (field) {
-                    case "timezone":
-                        return java.math.BigDecimal.valueOf(totalSeconds);
-                    case "timezone_hour":
-                        return java.math.BigDecimal.valueOf(totalSeconds / 3600);
-                    case "timezone_minute":
-                        return java.math.BigDecimal.valueOf((totalSeconds % 3600) / 60);
-                    default:
-                        return java.math.BigDecimal.ZERO;
-                }
-            }
-            default:
-                throw new MemgresException("unit \"" + field + "\" not recognized for type timestamp without time zone", "22023");
+                if (offset == null) throw notSupported(unit, typeName);
+                return whole(offsetSeconds / 3600, extractForm);
+            case "timezone_minute":
+                if (offset == null) throw notSupported(unit, typeName);
+                return whole((offsetSeconds % 3600) / 60, extractForm);
+            default: throw notSupported(unit, typeName);
         }
     }
 
-    private Object truncateDate(String field, Object source) {
-        return truncateDate(field, source, TypeCoercion.sessionZone());
+    private Object intervalField(String unit, PgInterval iv, boolean extractForm) {
+        String canonical = fieldUnit(unit);
+        if (canonical == null) throw notRecognized(unit, "interval");
+        if (RESERVED_UNITS.contains(canonical) && !canonical.equals("epoch")) {
+            throw notRecognized(unit, "interval");
+        }
+        if (iv.isInfinite()) {
+            return infiniteField(canonical, MONOTONIC_INTERVAL_UNITS, CYCLING_INTERVAL_UNITS,
+                    iv.isPositiveInfinity(), unit, "interval");
+        }
+        int months = iv.getMonths();
+        long micros = iv.getMicroseconds();
+        long secondMicros = micros % 60_000_000L;
+        switch (canonical) {
+            case "microsecond": return whole(secondMicros, extractForm);
+            case "millisecond": return scaled(secondMicros, 3, extractForm);
+            case "second": return scaled(secondMicros, 6, extractForm);
+            case "minute": return whole((micros % 3_600_000_000L) / 60_000_000L, extractForm);
+            case "hour": return whole(micros / 3_600_000_000L, extractForm);
+            case "day": return whole(iv.getDays(), extractForm);
+            case "week": return whole(iv.getDays() / 7, extractForm);
+            case "month": return whole(months % 12, extractForm);
+            // The quarter counts away from zero in both directions, so -5 months is quarter -2
+            case "quarter": return whole(months % 12 / 3 + (months < 0 ? -1 : 1), extractForm);
+            case "year": return whole(months / 12, extractForm);
+            case "decade": return whole(months / 12 / 10, extractForm);
+            case "century": return whole(months / 12 / 100, extractForm);
+            case "millennium": return whole(months / 12 / 1000, extractForm);
+            case "epoch": {
+                // PG splits the months: whole years count 365.25 days each, the leftover
+                // months 30 days each. Always reported with 6 fractional digits.
+                long totalSecs = (long) (months / 12) * 31557600L
+                        + (long) (months % 12) * 2592000L
+                        + (long) iv.getDays() * 86400L;
+                return scaled(totalSecs * 1_000_000L + micros, 6, extractForm);
+            }
+            default: throw notSupported(unit, "interval");
+        }
     }
 
-    private Object truncateDate(String field, Object source, java.time.ZoneId zone) {
+    private static Object infiniteField(String canonical, java.util.Set<String> monotonic,
+                                        java.util.Set<String> cycling, boolean positive,
+                                        String unit, String typeName) {
+        if (monotonic.contains(canonical)) {
+            return positive ? Double.POSITIVE_INFINITY : Double.NEGATIVE_INFINITY;
+        }
+        // A cycling field of an infinite value has no answer; PG returns NULL rather than erroring
+        if (cycling.contains(canonical)) return null;
+        throw notSupported(unit, typeName);
+    }
+
+    /** Fields that repeat, and so say nothing about an infinite timestamp. */
+    private static final java.util.Set<String> CYCLING_UNITS = new java.util.HashSet<>(
+            java.util.Arrays.asList("microsecond", "millisecond", "second", "minute", "hour",
+                    "day", "month", "quarter", "week", "dow", "isodow", "doy",
+                    "timezone", "timezone_hour", "timezone_minute"));
+
+    /** As {@link #CYCLING_UNITS}, for an interval — whose hours and days keep counting up. */
+    private static final java.util.Set<String> CYCLING_INTERVAL_UNITS = new java.util.HashSet<>(
+            java.util.Arrays.asList("microsecond", "millisecond", "second", "minute",
+                    "month", "quarter", "week"));
+
+    private Object truncateDate(String rawUnit, Object source, java.time.ZoneId zone) {
         if (source == null) return null;
+        String unit = rawUnit.toLowerCase();
+        // PG has no date_trunc over timetz at all, and reaches the interval form for time
+        if (asOffsetTime(source) != null) {
+            throw new MemgresException("function date_trunc(unknown, time with time zone) does not exist"
+                    + "\n  Hint: No function matches the given name and argument types."
+                    + " You might need to add explicit type casts.", "42883");
+        }
+        if (source instanceof java.time.LocalTime) {
+            return truncateInterval(unit,
+                    new PgInterval(0, 0, ((java.time.LocalTime) source).toNanoOfDay() / 1000));
+        }
         // date_trunc(unit, interval) zeroes every field below the unit; there is no calendar
         // involved, so it is a separate rule from the timestamp one
-        if (source instanceof PgInterval) return truncateInterval(field, (PgInterval) source);
+        if (source instanceof PgInterval) return truncateInterval(unit, (PgInterval) source);
+        // A date has no date_trunc of its own either; PG resolves it to the timestamptz form
+        boolean fromDate = source instanceof java.time.LocalDate;
+        if (fromDate) {
+            java.time.LocalDate date = (java.time.LocalDate) source;
+            if (date.equals(java.time.LocalDate.MAX) || date.equals(java.time.LocalDate.MIN)) return date;
+            source = date.atStartOfDay(zone).toOffsetDateTime();
+        }
+        boolean tzAware = fromDate || source instanceof java.time.OffsetDateTime;
+        String typeName = tzAware ? "timestamp with time zone" : "timestamp without time zone";
+        String canonical = resolveUnit(DELTA_UNITS, unit);
+        if (canonical == null) throw notRecognized(unit, typeName);
+
         java.time.LocalDateTime dt;
-        boolean isDate = source instanceof java.time.LocalDate;
-        if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
-        else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
-        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).atZoneSameInstant(zone).toLocalDateTime();
-        else dt = TypeCoercion.toLocalDateTime(source);
+        if (source instanceof java.time.LocalDateTime) dt = (java.time.LocalDateTime) source;
+        else if (source instanceof java.time.OffsetDateTime) {
+            dt = ((java.time.OffsetDateTime) source).atZoneSameInstant(zone).toLocalDateTime();
+        } else dt = TypeCoercion.toLocalDateTime(source);
+        if (dt.equals(TypeCoercion.TIMESTAMP_INFINITY) || dt.equals(TypeCoercion.TIMESTAMP_NEG_INFINITY)) {
+            return source;
+        }
 
         java.time.LocalDateTime result;
-        switch (field) {
+        switch (canonical) {
             case "year":
                 result = java.time.LocalDateTime.of(dt.getYear(), 1, 1, 0, 0);
                 break;
             case "decade":
-            case "decades":
                 result = java.time.LocalDateTime.of(Math.floorDiv(dt.getYear(), 10) * 10, 1, 1, 0, 0);
                 break;
             case "century":
-            case "centuries":
                 // The first century runs 1..100, so 2026 truncates to 2001, not 2000
                 result = java.time.LocalDateTime.of(centuryStart(dt.getYear(), 100), 1, 1, 0, 0);
                 break;
             case "millennium":
-            case "millennia":
                 result = java.time.LocalDateTime.of(centuryStart(dt.getYear(), 1000), 1, 1, 0, 0);
                 break;
             case "quarter": {
@@ -533,18 +764,15 @@ class DateTimeFunctions {
                 result = dt.withNano(0);
                 break;
             case "millisecond":
-            case "milliseconds":
                 result = dt.withNano((dt.getNano() / 1_000_000) * 1_000_000);
                 break;
             case "microsecond":
-            case "microseconds":
                 result = dt.withNano((dt.getNano() / 1_000) * 1_000);
                 break;
             default:
-                throw new MemgresException("unit \"" + field + "\" not recognized for type timestamp", "22023");
+                throw notSupported(unit, typeName);
         }
-        if (isDate) return result.toLocalDate();
-        if (source instanceof java.time.OffsetDateTime) return result.atZone(zone).toOffsetDateTime();
+        if (tzAware) return result.atZone(zone).toOffsetDateTime();
         return result;
     }
 
@@ -554,212 +782,36 @@ class DateTimeFunctions {
     }
 
     /** Zero every interval field smaller than the requested unit. */
-    private Object truncateInterval(String field, PgInterval iv) {
+    private Object truncateInterval(String unit, PgInterval iv) {
+        String canonical = resolveUnit(DELTA_UNITS, unit);
+        if (canonical == null) throw notRecognized(unit, "interval");
         if (iv.isInfinite()) return iv;
         int months = iv.getMonths();
         int days = iv.getDays();
         long micros = iv.getMicroseconds();
-        switch (field) {
-            case "millennium": case "millennia": months -= months % 12000; days = 0; micros = 0; break;
-            case "century": case "centuries":    months -= months % 1200;  days = 0; micros = 0; break;
-            case "decade": case "decades":       months -= months % 120;   days = 0; micros = 0; break;
-            case "year": case "years":           months -= months % 12;    days = 0; micros = 0; break;
-            case "quarter": case "quarters":     months -= months % 3;     days = 0; micros = 0; break;
-            case "month": case "months":         days = 0; micros = 0; break;
-            case "day": case "days":             micros = 0; break;
-            case "hour": case "hours":           micros -= micros % 3_600_000_000L; break;
-            case "minute": case "minutes":       micros -= micros % 60_000_000L; break;
-            case "second": case "seconds":       micros -= micros % 1_000_000L; break;
-            case "millisecond": case "milliseconds": micros -= micros % 1_000L; break;
-            case "microsecond": case "microseconds": break;
+        switch (canonical) {
+            case "millennium": months -= months % 12000; days = 0; micros = 0; break;
+            case "century":    months -= months % 1200;  days = 0; micros = 0; break;
+            case "decade":     months -= months % 120;   days = 0; micros = 0; break;
+            case "year":       months -= months % 12;    days = 0; micros = 0; break;
+            case "quarter":    months -= months % 3;     days = 0; micros = 0; break;
+            case "month":      days = 0; micros = 0; break;
+            case "day":        micros = 0; break;
+            case "hour":       micros -= micros % 3_600_000_000L; break;
+            case "minute":     micros -= micros % 60_000_000L; break;
+            case "second":     micros -= micros % 1_000_000L; break;
+            case "millisecond": micros -= micros % 1_000L; break;
+            case "microsecond": break;
             default:
-                throw new MemgresException("unit \"" + field + "\" not recognized for type interval", "22023");
+                throw notSupported(unit, "interval");
         }
         return new PgInterval(months, days, micros);
     }
 
+    /** to_char dispatches on the value: a number takes the numeric templates, a date the others. */
     private String formatToChar(Object source, String fmt) {
-        java.time.LocalDateTime dt;
-        if (source instanceof java.time.LocalDate) dt = ((java.time.LocalDate) source).atStartOfDay();
-        else if (source instanceof java.time.LocalDateTime) dt = ((java.time.LocalDateTime) source);
-        else if (source instanceof java.time.OffsetDateTime) dt = ((java.time.OffsetDateTime) source).toLocalDateTime();
-        else if (source instanceof Number) {
-            Number n = (Number) source;
-            return formatNumber(n, fmt);
-        }
-        else dt = TypeCoercion.toLocalDateTime(source);
-
-        StringBuilder sb = new StringBuilder();
-        int i = 0;
-        while (i < fmt.length()) {
-            String rest = fmt.substring(i);
-            if (rest.startsWith("YYYY")) { sb.append(String.format("%04d", dt.getYear())); i += 4; }
-            else if (rest.startsWith("YY")) { sb.append(String.format("%02d", dt.getYear() % 100)); i += 2; }
-            else if (rest.startsWith("Month")) {
-                String mname = dt.getMonth().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH);
-                String formatted = mname.substring(0, 1).toUpperCase() + mname.substring(1).toLowerCase();
-                sb.append(String.format("%-9s", formatted));
-                i += 5;
-            }
-            else if (rest.startsWith("MONTH")) {
-                sb.append(dt.getMonth().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH).toUpperCase());
-                i += 5;
-            }
-            else if (rest.startsWith("month")) {
-                sb.append(dt.getMonth().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH).toLowerCase());
-                i += 5;
-            }
-            else if (rest.startsWith("Mon")) {
-                String mname = dt.getMonth().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH);
-                sb.append(mname.substring(0, 1).toUpperCase()).append(mname.substring(1).toLowerCase());
-                i += 3;
-            }
-            else if (rest.startsWith("MM")) { sb.append(String.format("%02d", dt.getMonthValue())); i += 2; }
-            else if (rest.startsWith("DD")) { sb.append(String.format("%02d", dt.getDayOfMonth())); i += 2; }
-            else if (rest.startsWith("Day")) {
-                String dname = dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH);
-                String formatted = dname.substring(0, 1).toUpperCase() + dname.substring(1).toLowerCase();
-                sb.append(String.format("%-9s", formatted));
-                i += 3;
-            }
-            else if (rest.startsWith("DAY")) {
-                sb.append(dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH).toUpperCase());
-                i += 3;
-            }
-            else if (rest.startsWith("day")) {
-                sb.append(dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.ENGLISH).toLowerCase());
-                i += 3;
-            }
-            else if (rest.startsWith("Dy")) {
-                String dname = dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH);
-                sb.append(dname.substring(0, 1).toUpperCase()).append(dname.substring(1).toLowerCase());
-                i += 2;
-            }
-            else if (rest.startsWith("DY")) {
-                sb.append(dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH).toUpperCase());
-                i += 2;
-            }
-            else if (rest.startsWith("dy")) {
-                sb.append(dt.getDayOfWeek().getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ENGLISH).toLowerCase());
-                i += 2;
-            }
-            else if (rest.startsWith("HH24")) { sb.append(String.format("%02d", dt.getHour())); i += 4; }
-            else if (rest.startsWith("HH12") || rest.startsWith("HH")) {
-                int h = dt.getHour() % 12; if (h == 0) h = 12;
-                sb.append(String.format("%02d", h));
-                i += rest.startsWith("HH12") ? 4 : 2;
-            }
-            else if (rest.startsWith("MI")) { sb.append(String.format("%02d", dt.getMinute())); i += 2; }
-            else if (rest.startsWith("SS")) { sb.append(String.format("%02d", dt.getSecond())); i += 2; }
-            else if (rest.startsWith("Q")) { sb.append((dt.getMonthValue() - 1) / 3 + 1); i += 1; }
-            else if (rest.startsWith("D")) {
-                int dow = dt.getDayOfWeek().getValue() % 7 + 1;
-                sb.append(dow);
-                i += 1;
-            }
-            else if (rest.startsWith("AM") || rest.startsWith("PM")) {
-                sb.append(dt.getHour() < 12 ? "AM" : "PM"); i += 2;
-            }
-            else if (rest.startsWith("am") || rest.startsWith("pm")) {
-                sb.append(dt.getHour() < 12 ? "am" : "pm"); i += 2;
-            }
-            else if (rest.startsWith("TZH")) {
-                if (source instanceof java.time.OffsetDateTime) {
-                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
-                    int totalSeconds = offset.getTotalSeconds();
-                    String sign = totalSeconds >= 0 ? "+" : "-";
-                    int hours = Math.abs(totalSeconds) / 3600;
-                    sb.append(String.format("%s%02d", sign, hours));
-                } else {
-                    sb.append("+00");
-                }
-                i += 3;
-            }
-            else if (rest.startsWith("TZM")) {
-                if (source instanceof java.time.OffsetDateTime) {
-                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
-                    int minutes = (Math.abs(offset.getTotalSeconds()) % 3600) / 60;
-                    sb.append(String.format("%02d", minutes));
-                } else {
-                    sb.append("00");
-                }
-                i += 3;
-            }
-            else if (rest.startsWith("TZ")) {
-                if (source instanceof java.time.OffsetDateTime) {
-                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
-                    if (offset.getTotalSeconds() == 0) {
-                        sb.append("UTC");
-                    } else {
-                        sb.append(offset.getId().replace("Z", "UTC"));
-                    }
-                } else {
-                    sb.append("UTC");
-                }
-                i += 2;
-            }
-            else if (rest.startsWith("OF")) {
-                if (source instanceof java.time.OffsetDateTime) {
-                    java.time.ZoneOffset offset = ((java.time.OffsetDateTime) source).getOffset();
-                    int totalSeconds = offset.getTotalSeconds();
-                    String sign = totalSeconds >= 0 ? "+" : "-";
-                    int absSeconds = Math.abs(totalSeconds);
-                    int hours = absSeconds / 3600;
-                    int minutes = (absSeconds % 3600) / 60;
-                    if (minutes != 0) {
-                        sb.append(String.format("%s%02d:%02d", sign, hours, minutes));
-                    } else {
-                        sb.append(String.format("%s%02d", sign, hours));
-                    }
-                } else {
-                    sb.append("+00");
-                }
-                i += 2;
-            }
-            else { sb.append(fmt.charAt(i)); i++; }
-        }
-        return sb.toString();
-    }
-
-    private java.time.LocalDate parseDateWithFormat(String dateStr, String pgFmt) {
-        String javaPattern = pgFmt
-                .replace("YYYY", "yyyy")
-                .replace("MM", "MM")
-                .replace("DD", "dd");
-        java.time.format.DateTimeFormatter strict = java.time.format.DateTimeFormatter
-                .ofPattern(javaPattern.replace("yyyy", "uuuu"))
-                .withResolverStyle(java.time.format.ResolverStyle.STRICT);
-        try {
-            return java.time.LocalDate.parse(dateStr, strict);
-        } catch (Exception strictFailed) {
-            // Either the text does not fit the pattern at all, or a field is out of range.
-            // A lenient parse tells the two apart: it clamps Feb 30 to Feb 28, and PG rejects
-            // exactly the inputs that a lenient parse has to clamp.
-            try {
-                java.time.LocalDate.parse(dateStr,
-                        java.time.format.DateTimeFormatter.ofPattern(javaPattern));
-            } catch (Exception notThisPattern) {
-                return TypeCoercion.toLocalDate(dateStr);
-            }
-            throw new MemgresException(
-                    "date/time field value out of range: \"" + dateStr + "\"", "22008");
-        }
-    }
-
-    private java.time.LocalDateTime parseTimestampWithFormat(String tsStr, String pgFmt) {
-        String javaPattern = pgFmt
-                .replace("YYYY", "yyyy")
-                .replace("MM", "MM")
-                .replace("DD", "dd")
-                .replace("HH24", "HH")
-                .replace("HH12", "hh")
-                .replace("MI", "mm")
-                .replace("SS", "ss");
-        try {
-            return java.time.LocalDateTime.parse(tsStr, java.time.format.DateTimeFormatter.ofPattern(javaPattern));
-        } catch (Exception e) {
-            return TypeCoercion.toLocalDateTime(tsStr);
-        }
+        if (source instanceof Number) return NumericTemplate.format((Number) source, fmt);
+        return DateTimeTemplate.toChar(source, fmt);
     }
 
     /**
@@ -797,95 +849,4 @@ class DateTimeFunctions {
         return negative ? value.negate() : value;
     }
 
-    private String formatNumber(Number n, String fmt) {
-        double val = n.doubleValue();
-        boolean negative = val < 0;
-        double absVal = Math.abs(val);
-
-        boolean fillMode = false;
-        String fmtWork = fmt;
-        if (fmtWork.toUpperCase().startsWith("FM")) {
-            fillMode = true;
-            fmtWork = fmtWork.substring(2);
-        }
-
-        boolean miSuffix = false;
-        if (fmtWork.toUpperCase().endsWith("MI")) {
-            miSuffix = true;
-            fmtWork = fmtWork.substring(0, fmtWork.length() - 2);
-        }
-
-        boolean prSuffix = false;
-        if (fmtWork.toUpperCase().endsWith("PR")) {
-            prSuffix = true;
-            fmtWork = fmtWork.substring(0, fmtWork.length() - 2);
-        }
-
-        int intDigits9 = 0, intDigits0 = 0, fracDigits = 0;
-        boolean hasDecimal = fmtWork.contains(".");
-        boolean hasComma = fmtWork.contains(",");
-        String intPart, fracPart = "";
-        if (hasDecimal) {
-            int dotIdx = fmtWork.indexOf('.');
-            intPart = fmtWork.substring(0, dotIdx);
-            fracPart = fmtWork.substring(dotIdx + 1);
-            fracDigits = fracPart.length();
-        } else {
-            intPart = fmtWork;
-        }
-        for (char c : intPart.toCharArray()) {
-            if (c == '9') intDigits9++;
-            else if (c == '0') intDigits0++;
-        }
-        int totalIntDigits = intDigits9 + intDigits0;
-
-        String formatted;
-        if (hasDecimal) {
-            formatted = String.format(java.util.Locale.US, "%." + fracDigits + "f", absVal);
-        } else {
-            formatted = String.valueOf((long) absVal);
-        }
-
-        String intStr, fracStr = "";
-        if (formatted.contains(".")) {
-            int dotIdx = formatted.indexOf('.');
-            intStr = formatted.substring(0, dotIdx);
-            fracStr = formatted.substring(dotIdx + 1);
-        } else {
-            intStr = formatted;
-        }
-
-        while (intStr.length() < totalIntDigits) {
-            intStr = (intDigits0 > 0 && intStr.length() < totalIntDigits) ? "0" + intStr : " " + intStr;
-        }
-
-        if (hasComma) {
-            StringBuilder grouped = new StringBuilder();
-            int count = 0;
-            for (int i = intStr.length() - 1; i >= 0; i--) {
-                char c = intStr.charAt(i);
-                if (c == ' ') {
-                    grouped.insert(0, c);
-                } else {
-                    if (count > 0 && count % 3 == 0) grouped.insert(0, ',');
-                    grouped.insert(0, c);
-                    count++;
-                }
-            }
-            intStr = grouped.toString();
-        }
-
-        StringBuilder result = new StringBuilder();
-        if (!fillMode) result.append(' ');
-        if (negative && !miSuffix && !prSuffix) result.append('-');
-        if (prSuffix && negative) result.append('<');
-        result.append(intStr);
-        if (hasDecimal) result.append('.').append(fracStr);
-        if (miSuffix) result.append(negative ? '-' : ' ');
-        if (prSuffix) result.append(negative ? '>' : ' ');
-
-        String res = result.toString();
-        if (fillMode) res = Strs.stripLeading(res);
-        return res;
-    }
 }

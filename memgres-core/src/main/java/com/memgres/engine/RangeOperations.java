@@ -595,6 +595,74 @@ public class RangeOperations {
     }
 
     /**
+     * Read the text form of a multirange the way PostgreSQL reads it: a brace-wrapped list of range
+     * literals, whitespace allowed around each. {@code empty} is a range like any other and is
+     * spelled out, so it belongs in the list rather than breaking it; it simply contributes nothing
+     * to the result. Anything else between the braces is a malformed literal.
+     */
+    public static java.util.List<PgRange> parseMultirangeLiteral(String text) {
+        java.util.List<PgRange> out = new java.util.ArrayList<PgRange>();
+        int p = skipSpace(text, 0);
+        if (p >= text.length() || text.charAt(p) != '{') throw malformedMultirange(text);
+        p++;
+        p = skipSpace(text, p);
+        if (p < text.length() && text.charAt(p) == '}') {
+            p++;
+        } else {
+            for (;;) {
+                p = skipSpace(text, p);
+                if (p >= text.length()) throw malformedMultirange(text);
+                char c = text.charAt(p);
+                if (c == '[' || c == '(') {
+                    int end = closingBracket(text, p);
+                    if (end < 0) throw malformedMultirange(text);
+                    out.add(parse(text.substring(p, end + 1)));
+                    p = end + 1;
+                } else if (text.regionMatches(true, p, "empty", 0, 5)) {
+                    out.add(new PgRange(null, null, true, false, true));
+                    p += 5;
+                } else {
+                    throw malformedMultirange(text);
+                }
+                p = skipSpace(text, p);
+                if (p < text.length() && text.charAt(p) == ',') {
+                    p++;
+                    continue;
+                }
+                if (p < text.length() && text.charAt(p) == '}') {
+                    p++;
+                    break;
+                }
+                throw malformedMultirange(text);
+            }
+        }
+        if (skipSpace(text, p) != text.length()) throw malformedMultirange(text);
+        return out;
+    }
+
+    private static int skipSpace(String s, int from) {
+        int p = from;
+        while (p < s.length() && Character.isWhitespace(s.charAt(p))) p++;
+        return p;
+    }
+
+    /** The bracket that closes the range starting at {@code from}, ignoring quoted bounds. */
+    private static int closingBracket(String s, int from) {
+        boolean inQuotes = false;
+        for (int i = from + 1; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\') { i++; continue; }
+            if (c == '"') { inQuotes = !inQuotes; continue; }
+            if (!inQuotes && (c == ')' || c == ']')) return i;
+        }
+        return -1;
+    }
+
+    private static MemgresException malformedMultirange(String text) {
+        return new MemgresException("malformed multirange literal: \"" + text + "\"", "22P02");
+    }
+
+    /**
      * Parse a multirange string like '{[1,4),[10,12)}' into a list of PgRange.
      */
     public static java.util.List<PgRange> parseMultirange(String s) {

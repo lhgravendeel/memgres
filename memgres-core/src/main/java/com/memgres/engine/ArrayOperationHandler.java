@@ -17,16 +17,6 @@ class ArrayOperationHandler {
     }
 
     /**
-     * True when text is spelled the way PostgreSQL spells an array value. An array cast reads its
-     * input as an array literal and nothing else, so {@code '3'::int[]} is a malformed literal
-     * rather than a one-element array — and {@code ARRAY[1,2] || '3'} is that same cast.
-     */
-    static boolean isArrayLiteralText(String text) {
-        String t = text.trim();
-        return t.length() >= 2 && t.charAt(0) == '{' && t.charAt(t.length() - 1) == '}';
-    }
-
-    /**
      * Concatenate two arrays. PostgreSQL joins two arrays of the same dimension end to end, but
      * appends an operand of one dimension less as a single element, so {@code {{1,2},{3,4}}} and
      * {@code {5,6}} make a three-row array rather than four loose values. An empty array has no
@@ -322,6 +312,7 @@ class ArrayOperationHandler {
             list.add(executor.evalExpr(elem, ctx));
         }
         if (arr.isRow()) return new AstExecutor.PgRow(list);
+        checkArrayDimensions(list);
         // Validate multi-dimensional array: all sub-arrays must have the same size
         if (!list.isEmpty() && list.get(0) instanceof List<?>) {
             int expectedSize = ((List<?>) list.get(0)).size();
@@ -333,6 +324,7 @@ class ArrayOperationHandler {
                 }
             }
         }
+        rejectMismatchedElementDimensions(arr, list, ctx);
         // Validate element type homogeneity
         if (!arr.isRow() && !list.isEmpty() && !(list.get(0) instanceof List<?>)) {
             Object firstNonNull = null;
@@ -354,6 +346,62 @@ class ArrayOperationHandler {
             }
         }
         return list;
+    }
+
+    /** PG stores an array's dimension count in a fixed-size header, capped at MAXDIM. */
+    private static final int MAX_ARRAY_DIMENSIONS = 6;
+
+    private static void checkArrayDimensions(List<Object> list) {
+        int dims = 1;
+        Object probe = list.isEmpty() ? null : list.get(0);
+        while (probe instanceof List<?>) {
+            dims++;
+            List<?> inner = (List<?>) probe;
+            probe = inner.isEmpty() ? null : inner.get(0);
+        }
+        if (dims > MAX_ARRAY_DIMENSIONS) {
+            throw new MemgresException("number of array dimensions (" + dims
+                    + ") exceeds the maximum allowed (" + MAX_ARRAY_DIMENSIONS + ")", "54000");
+        }
+    }
+
+    /**
+     * An ARRAY constructor whose elements are not all the same depth. PostgreSQL resolves the
+     * constructor's type from its elements, and an array beside a plain value is a pair of types it
+     * cannot reconcile. A NULL is a different matter: it takes the array type happily, but has no
+     * dimensions of its own once the array is built.
+     */
+    private void rejectMismatchedElementDimensions(ArrayExpr arr, List<Object> list, RowContext ctx) {
+        boolean anyArray = false;
+        for (Object v : list) {
+            if (v instanceof List<?>) { anyArray = true; break; }
+        }
+        if (!anyArray) return;
+        String arrayTypeName = null;
+        for (Object v : list) {
+            if (v instanceof List<?>) {
+                arrayTypeName = elementTypeNameOf((List<?>) v) + "[]";
+                break;
+            }
+        }
+        for (Object v : list) {
+            if (v instanceof List<?>) continue;
+            if (v == null) {
+                throw new MemgresException("multidimensional arrays must have array expressions"
+                        + " with matching dimensions", "2202E");
+            }
+            String scalar = AstExecutor.pgTypeNameOf(v);
+            boolean arrayFirst = list.get(0) instanceof List<?>;
+            throw new MemgresException("ARRAY types " + (arrayFirst ? arrayTypeName : scalar)
+                    + " and " + (arrayFirst ? scalar : arrayTypeName) + " cannot be matched", "42804");
+        }
+    }
+
+    /** The element type an array value carries, named from its first leaf. */
+    private static String elementTypeNameOf(List<?> array) {
+        Object first = firstNonNull(array);
+        while (first instanceof List<?>) first = firstNonNull((List<?>) first);
+        return AstExecutor.pgTypeNameOf(first);
     }
 
     Object evalArraySubquery(ArraySubqueryExpr asq, RowContext outerCtx) {
