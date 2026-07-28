@@ -569,7 +569,8 @@ class SelectParser {
         for (int i = 0; i < firstRow.size(); i++) {
             firstTargets.add(new SelectStmt.SelectTarget(firstRow.get(i), "column" + (i + 1)));
         }
-        SelectStmt first = new SelectStmt(false, firstTargets, null, null, null, null, null, null, null);
+        SelectStmt first = new SelectStmt(false, firstTargets, null, null, null, null, null, null, null)
+                .asValuesList();
 
         if (rows.size() == 1) {
             return first;
@@ -583,7 +584,8 @@ class SelectParser {
             for (int i = 0; i < row.size(); i++) {
                 rowTargets.add(new SelectStmt.SelectTarget(row.get(i), null));
             }
-            SelectStmt rowSelect = new SelectStmt(false, rowTargets, null, null, null, null, null, null, null);
+            SelectStmt rowSelect = new SelectStmt(false, rowTargets, null, null, null, null, null, null, null)
+                    .asValuesList();
             result = new SetOpStmt(result, SetOpStmt.SetOpType.UNION, true, rowSelect, null, null, null);
         }
         return result;

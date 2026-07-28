@@ -2561,10 +2561,7 @@ class DdlObjectExecutor {
                 } catch (Exception ignored) {
                     continue;
                 }
-                if (executor.selectExecutor.containsAggregate(expr)) {
-                    throw new MemgresException(
-                            "aggregate functions are not allowed in index expressions", "42803");
-                }
+                executor.selectExecutor.placementCheck.reject(expr, "index expressions");
             }
         }
         if (s.whereClause() != null) {
@@ -2578,10 +2575,7 @@ class DdlObjectExecutor {
                     || n instanceof AnyAllExpr || n instanceof ArraySubqueryExpr)) {
                 throw PgErrors.notImplemented("cannot use subquery in index predicate");
             }
-            if (executor.selectExecutor.containsAggregate(pred)) {
-                throw new MemgresException(
-                        "aggregate functions are not allowed in index predicates", "42803");
-            }
+            executor.selectExecutor.placementCheck.reject(pred, "index predicates");
         }
     }
 

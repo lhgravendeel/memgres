@@ -22,6 +22,7 @@ class SelectExecutor {
     final SelectCteExecutor cteExecutor;
     final SelectSetOpExecutor setOpExecutor;
     final GroupByValidator groupByValidator;
+    final PlacementCheck placementCheck;
 
     /** Check if a column name is a PostgreSQL system column. */
     static boolean isSystemColumn(String name) {
@@ -61,6 +62,28 @@ class SelectExecutor {
         this.cteExecutor = new SelectCteExecutor(this);
         this.setOpExecutor = new SelectSetOpExecutor(this);
         this.groupByValidator = new GroupByValidator(this);
+        this.placementCheck = new PlacementCheck(this);
+    }
+
+    /**
+     * The stored relation a FROM item names, or null for anything whose columns cannot be read
+     * from the catalog — a CTE, a view, a relation in another schema, a name that is not there.
+     * Callers use it to decide whether a scope is knowable, so null has to mean "do not assume".
+     */
+    Table lookupRelationOrNull(String schemaName, String name) {
+        if (name == null) return null;
+        String lower = name.toLowerCase();
+        for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
+            if (scope.containsKey(lower)) return null;
+        }
+        Schema schema = executor.database.getSchema(
+                schemaName != null ? schemaName : executor.defaultSchema());
+        return schema == null ? null : schema.getTable(name);
+    }
+
+    /** True when the user has declared a function under this name, built-ins aside. */
+    boolean hasUserFunction(String name) {
+        return executor.database.getFunction(name) != null;
     }
 
     // ---- SELECT ----
@@ -106,6 +129,15 @@ class SelectExecutor {
 
     private QueryResult executeSelectInner(SelectStmt stmt) {
         rejectMisplacedSrfs(stmt);
+        rejectLockOnCollapsedRows(stmt);
+        // A VALUES list is a query with no rows to read, so an aggregate or a window call in one
+        // has nothing to aggregate or to be numbered against; the parser records where the SELECT
+        // came from because after desugaring it is otherwise a FROM-less SELECT like any other.
+        if (stmt.fromValues()) {
+            for (SelectStmt.SelectTarget target : stmt.targets()) {
+                placementCheck.reject(target.expr(), "VALUES");
+            }
+        }
         // SELECT without FROM
         if (stmt.from() == null || stmt.from().isEmpty()) {
             rejectSrfInAggregates(stmt);
@@ -266,14 +298,7 @@ class SelectExecutor {
 
         // WHERE
         if (stmt.where() != null) {
-            // The window function is reported first: an aggregate inside its OVER clause belongs
-            // to the window, and PostgreSQL names the call that may not stand here at all.
-            if (containsWindowFunction(stmt.where())) {
-                throw new MemgresException("window functions are not allowed in WHERE", "42P20");
-            }
-            if (containsAggregate(stmt.where())) {
-                throw new MemgresException("aggregate functions are not allowed in WHERE", "42803");
-            }
+            placementCheck.reject(stmt.where(), "WHERE");
             // Pre-flight type validation of WHERE clause (PG checks at plan time)
             // Only validate for simple single-table SELECTs (not CTEs/subqueries/joins)
             if (simpleFrom && baseBindings.size() == 1 && !hasJoins
@@ -553,6 +578,59 @@ class SelectExecutor {
         }
 
         return QueryResult.select(resultColumns, resultRows);
+    }
+
+    /**
+     * A row lock names the rows it locks, so the query has to still have them.
+     *
+     * <p>{@code FOR UPDATE} locks the base-table row behind each output row. DISTINCT, GROUP BY,
+     * HAVING, an aggregate and a window function each turn many input rows into one output row —
+     * after them there is no longer one row to point a lock at, so PostgreSQL refuses the
+     * combination outright rather than locking some arbitrary member of the group. It reports the
+     * clauses in this order, and only the first one it meets.
+     *
+     * <p>A lock applies to the relations under it, so a sub-select in FROM is judged the same way
+     * unless {@code OF} named which relations to lock instead.
+     */
+    private void rejectLockOnCollapsedRows(SelectStmt stmt) {
+        SelectStmt.LockClause lock = stmt.lockClause();
+        if (lock == null) return;
+        checkLockable(stmt, lock, lock.ofTables() == null || lock.ofTables().isEmpty());
+    }
+
+    private void checkLockable(SelectStmt stmt, SelectStmt.LockClause lock, boolean descend) {
+        String mode = "FOR " + (lock.mode() == null ? "UPDATE" : lock.mode());
+        if (stmt.distinct()) throw lockNotAllowed(mode, "DISTINCT clause");
+        if ((stmt.groupBy() != null && !stmt.groupBy().isEmpty())
+                || (stmt.groupingSets() != null && !stmt.groupingSets().isEmpty())) {
+            throw lockNotAllowed(mode, "GROUP BY clause");
+        }
+        if (stmt.having() != null) throw lockNotAllowed(mode, "HAVING clause");
+        if (hasAggregateInTargets(stmt.targets()) || hasAggregateInOrderBy(stmt.orderBy())) {
+            throw lockNotAllowed(mode, "aggregate functions");
+        }
+        if (hasWindowFunctionInTargets(stmt.targets())
+                || (stmt.orderBy() != null && orderByHasWindowFunction(stmt.orderBy()))) {
+            throw lockNotAllowed(mode, "window functions");
+        }
+        if (!descend || stmt.from() == null) return;
+        for (SelectStmt.FromItem item : stmt.from()) {
+            if (item instanceof SelectStmt.SubqueryFrom) {
+                Statement inner = ((SelectStmt.SubqueryFrom) item).subquery();
+                if (inner instanceof SelectStmt) checkLockable((SelectStmt) inner, lock, true);
+            }
+        }
+    }
+
+    private boolean orderByHasWindowFunction(List<SelectStmt.OrderByItem> orderBy) {
+        for (SelectStmt.OrderByItem item : orderBy) {
+            if (containsWindowFunction(item.expr())) return true;
+        }
+        return false;
+    }
+
+    private static MemgresException lockNotAllowed(String mode, String what) {
+        return new MemgresException(mode + " is not allowed with " + what, "0A000");
     }
 
     // ---- Expression analysis helpers (shared across delegates) ----
@@ -1514,13 +1592,7 @@ class SelectExecutor {
             for (String n : leftNames.values()) addExposed(exposed, n);
             for (String n : rightNames.values()) addExposed(exposed, n);
             if (join.on() != null) {
-                // As in WHERE, the window function is named first when a condition holds both.
-                if (containsWindowFunction(join.on())) {
-                    throw new MemgresException("window functions are not allowed in JOIN conditions", "42P20");
-                }
-                if (containsAggregate(join.on())) {
-                    throw new MemgresException("aggregate functions are not allowed in JOIN conditions", "42803");
-                }
+                placementCheck.reject(join.on(), "JOIN conditions");
             }
             if (join.using() != null) {
                 Set<String> seen = new HashSet<>();

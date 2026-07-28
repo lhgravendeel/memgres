@@ -302,6 +302,15 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "insert into";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // A VALUES row is written out in full; it is not read from any relation, so there is
+        // nothing for an aggregate to aggregate or for a window call to be numbered against.
+        if (stmt.values() != null) {
+            for (List<Expression> valueRow : stmt.values()) {
+                for (Expression value : valueRow) {
+                    executor.selectExecutor.placementCheck.reject(value, "VALUES");
+                }
+            }
+        }
         // Capture view column mapping/order before any further resolveTable calls clobber them.
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -1180,6 +1189,9 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "update";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // An UPDATE names one row at a time; there is no group behind it to aggregate and no
+        // result to number a window against, in either the assignments or the WHERE.
+        checkUpdatePlacement(stmt, table);
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -1745,6 +1757,12 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // As for UPDATE: a DELETE's WHERE picks rows one at a time, so nothing in it may need a
+        // group or a finished result to have a value.
+        PlacementCheck placement = executor.selectExecutor.placementCheck;
+        placement.reject(stmt.where(), "WHERE");
+        placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table,
+                stmt.alias() != null ? stmt.alias() : stmt.table());
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -3032,6 +3050,23 @@ class DmlExecutor {
             return exprReferencesOldNew(be.expr()) || exprReferencesOldNew(be.low()) || exprReferencesOldNew(be.high());
         }
         return false;
+    }
+
+    /**
+     * An UPDATE's assignments and WHERE, both of which PostgreSQL reads per row.
+     *
+     * <p>The two clauses carry different names in the message: an aggregate in the SET list is
+     * reported as being "in UPDATE", the one in WHERE as being "in WHERE".
+     */
+    private void checkUpdatePlacement(UpdateStmt stmt, Table table) {
+        PlacementCheck placement = executor.selectExecutor.placementCheck;
+        String targetName = stmt.alias() != null ? stmt.alias() : stmt.table();
+        for (InsertStmt.SetClause set : stmt.setClauses()) {
+            placement.reject(set.value(), "UPDATE");
+            placement.rejectOuterLevelAggregate(set.value(), "UPDATE", table, targetName);
+        }
+        placement.reject(stmt.where(), "WHERE");
+        placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table, targetName);
     }
 
     /** Validate that all column references in RETURNING exist in the table. */
