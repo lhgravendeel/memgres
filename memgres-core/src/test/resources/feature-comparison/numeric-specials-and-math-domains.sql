@@ -91,7 +91,7 @@ SELECT trim_scale('NaN'::numeric)::text AS a,
 -- Ordinary numbers are untouched
 -- begin-expected
 -- columns: a | b | c
--- row: 3, 2, 1.1
+-- row: 3, 2, 1.23
 -- end-expected
 SELECT scale(1.230)::text AS a, min_scale(1.230)::text AS b, trim_scale(1.230)::text AS c;
 
@@ -775,6 +775,7 @@ SELECT id FROM nsm_g WHERE round(n) = 3;
 -- begin-expected
 -- columns: id
 -- row: 1
+-- row: 2
 -- end-expected
 SELECT id FROM nsm_g WHERE abs(i) >= 3 ORDER BY id;
 
@@ -802,7 +803,7 @@ SELECT round(d)::text AS a FROM nsm_g GROUP BY round(d) ORDER BY 1;
 SELECT sub.rn::text AS a FROM (SELECT round(n) AS rn FROM nsm_g) sub WHERE sub.rn >= 3;
 
 -- begin-expected
--- columns: a
+-- columns: rn
 -- row: 1
 -- row: 2
 -- row: 3
