@@ -18,7 +18,7 @@ DROP VIEW IF EXISTS dit_v CASCADE;
 DROP TYPE IF EXISTS dit_ct CASCADE;
 DROP SEQUENCE IF EXISTS dit_s CASCADE;
 
-CREATE TABLE dit_t (x int, y text, z int);
+CREATE TABLE dit_t (x int, y text, z int, arr int[]);
 INSERT INTO dit_t VALUES (1, 'a', 1), (2, 'b', 2);
 CREATE VIEW dit_v AS SELECT * FROM dit_t;
 CREATE INDEX dit_ix_exist ON dit_t (x);
@@ -45,7 +45,7 @@ CREATE INDEX dit_i ON dit_t USING gin (x) INCLUDE (y);
 CREATE UNIQUE INDEX dit_i ON dit_t USING brin (x);
 CREATE INDEX dit_i ON dit_t USING brin (x) INCLUDE (y);
 CREATE UNIQUE INDEX dit_i ON dit_t USING gist (x);
-CREATE INDEX dit_i ON dit_t USING gin (x DESC);
+CREATE INDEX dit_i ON dit_t USING gin (arr DESC);
 
 -- The access method is resolved before the index name is chosen
 CREATE INDEX dit_ix_exist ON dit_t USING nosuchmethod (x);
@@ -89,7 +89,7 @@ CREATE INDEX dit_i1 ON dit_t (x) INCLUDE (y);
 CREATE INDEX dit_i2 ON dit_t (x, y) INCLUDE (z);
 CREATE UNIQUE INDEX dit_i3 ON dit_t (x) INCLUDE (y);
 CREATE INDEX dit_i4 ON dit_t USING hash (x);
-CREATE INDEX dit_i5 ON dit_t USING gin (x);
+CREATE INDEX dit_i5 ON dit_t USING gin (arr);
 CREATE INDEX dit_i6 ON dit_t (lower(y));
 CREATE INDEX dit_i7 ON dit_t ((x + z));
 CREATE INDEX dit_i8 ON dit_t (x DESC NULLS LAST);

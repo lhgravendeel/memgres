@@ -26,7 +26,7 @@ class IndexTypeSequenceValidationTest {
                 memgres.getJdbcUrl() + "?preferQueryMode=simple",
                 memgres.getUser(), memgres.getPassword());
         conn.setAutoCommit(true);
-        exec("CREATE TABLE itsv_t (x int, y text, z int)");
+        exec("CREATE TABLE itsv_t (x int, y text, z int, arr int[], jb jsonb, p point)");
         exec("INSERT INTO itsv_t VALUES (1,'a',1),(2,'b',2)");
         exec("CREATE VIEW itsv_v AS SELECT * FROM itsv_t");
         exec("CREATE INDEX itsv_ix_exist ON itsv_t (x)");
@@ -131,6 +131,66 @@ class IndexTypeSequenceValidationTest {
                 "0A000", "access method \"hash\" does not support NULLS FIRST/LAST options");
     }
 
+    // ========================================================================
+    // CREATE INDEX — the access method needs an operator class for the type
+    // ========================================================================
+
+    @Test
+    void anAccessMethodWithNoDefaultOperatorClassForTheTypeIsRejected() {
+        // gin indexes the parts inside a value, so a plain integer gives it nothing to index.
+        // btree_gin adds these classes, but that is a contrib extension this engine does not have.
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (x)",
+                "42704", "data type integer has no default operator class for access method \"gin\"");
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (y)",
+                "42704", "data type text has no default operator class for access method \"gin\"");
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING spgist (x)",
+                "42704", "data type integer has no default operator class for access method \"spgist\"");
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING hash (p)",
+                "42704", "data type point has no default operator class for access method \"hash\"");
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING brin (p)",
+                "42704", "data type point has no default operator class for access method \"brin\"");
+        assertRejected("CREATE INDEX itsv_i ON itsv_t (p)",
+                "42704", "data type point has no default operator class for access method \"btree\"");
+    }
+
+    @Test
+    void theTypesEachAccessMethodDoesSupportStillIndex() {
+        assertAccepted("CREATE INDEX itsv_dop1 ON itsv_t USING gin (arr)");
+        assertAccepted("CREATE INDEX itsv_dop2 ON itsv_t USING gin (jb)");
+        assertAccepted("CREATE INDEX itsv_dop3 ON itsv_t USING hash (x)");
+        assertAccepted("CREATE INDEX itsv_dop4 ON itsv_t USING brin (x)");
+        assertAccepted("CREATE INDEX itsv_dop5 ON itsv_t USING spgist (y)");
+        assertAccepted("CREATE INDEX itsv_dop6 ON itsv_t USING gist (p)");
+        assertAccepted("CREATE INDEX itsv_dop7 ON itsv_t (x, y)");
+        // a varchar reaches the text class the way PG does, through binary coercion
+        assertAccepted("CREATE INDEX itsv_dop8 ON itsv_t ((y::varchar(10)))");
+    }
+
+    @Test
+    void anExplicitOperatorClassIsCheckedInsteadOfTheDefault() {
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (x nosuch_ops)",
+                "42704", "operator class \"nosuch_ops\" does not exist for access method \"gin\"");
+    }
+
+    @Test
+    void theOperatorClassIsCheckedBeforeTheOrderingOptions() {
+        // PG settles the class first, so an unsupported type is reported rather than the DESC
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (x DESC)",
+                "42704", "data type integer has no default operator class for access method \"gin\"");
+        // ... and where the class exists, the ordering option is what is wrong
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (arr DESC)",
+                "0A000", "access method \"gin\" does not support ASC/DESC options");
+    }
+
+    @Test
+    void theAccessMethodCapabilitiesAreCheckedBeforeTheOperatorClass() {
+        // both are wrong here; PG reports the capability
+        assertRejected("CREATE UNIQUE INDEX itsv_i ON itsv_t USING gin (x)",
+                "0A000", "access method \"gin\" does not support unique indexes");
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (x) INCLUDE (y)",
+                "0A000", "access method \"gin\" does not support included columns");
+    }
+
     @Test
     void capabilitiesAreCheckedInPostgresOrder() {
         // unique before multicolumn, included before multicolumn, included before ASC/DESC
@@ -151,7 +211,7 @@ class IndexTypeSequenceValidationTest {
                 "0A000", "access method \"gin\" does not support unique indexes");
         assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (x) INCLUDE (y)",
                 "0A000", "access method \"gin\" does not support included columns");
-        assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (x DESC)",
+        assertRejected("CREATE INDEX itsv_i ON itsv_t USING gin (arr DESC)",
                 "0A000", "access method \"gin\" does not support ASC/DESC options");
         assertRejected("CREATE UNIQUE INDEX itsv_i ON itsv_t USING brin (x)",
                 "0A000", "access method \"brin\" does not support unique indexes");
@@ -264,7 +324,7 @@ class IndexTypeSequenceValidationTest {
         assertAccepted("CREATE INDEX itsv_ok2 ON itsv_t (x, y) INCLUDE (z)");
         assertAccepted("CREATE UNIQUE INDEX itsv_ok3 ON itsv_t (x) INCLUDE (y)");
         assertAccepted("CREATE INDEX itsv_ok4 ON itsv_t USING hash (x)");
-        assertAccepted("CREATE INDEX itsv_ok5 ON itsv_t USING gin (x)");
+        assertAccepted("CREATE INDEX itsv_ok5 ON itsv_t USING gin (arr)");
         assertAccepted("CREATE INDEX itsv_ok6 ON itsv_t (lower(y))");
         assertAccepted("CREATE INDEX itsv_ok7 ON itsv_t ((x + z))");
         assertAccepted("CREATE INDEX itsv_ok8 ON itsv_t (x DESC NULLS LAST)");

@@ -3,6 +3,7 @@ package com.memgres.engine;
 import com.memgres.engine.util.Cols;
 
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -274,6 +275,7 @@ final class DdlIndexValidator {
             if (opts == null) opts = "";
             checkCollatable(table, columns.get(i), opts);
             checkOpclass(table, am, columns.get(i), opts);
+            checkDefaultOpclass(table, am, columns.get(i), opts);
             if (!amInfo.canOrder) {
                 if (opts.contains("DESC")) {
                     throw PgErrors.notImplemented(
@@ -325,6 +327,106 @@ final class DdlIndexValidator {
         if (STRING_FAMILY.contains(colType) && STRING_FAMILY.contains(accepts)) return;
         throw PgErrors.datatypeMismatch("operator class \"" + opclassName
                 + "\" does not accept data type " + colType);
+    }
+
+    /**
+     * The types each access method has a default operator class for, in a PostgreSQL 18 with no
+     * contrib extensions installed. Without an opclass the method has no operators to compare
+     * values with, so PostgreSQL refuses the index rather than build one it could never search.
+     *
+     * <p>Measured from {@code pg_opclass} rather than written from memory, and deliberately
+     * excluding classes owned by an extension: {@code btree_gin} and {@code btree_gist} add the
+     * scalar types to gin and gist, and a server with them installed accepts indexes this engine
+     * does not implement.
+     */
+    private static final Map<String, Set<String>> DEFAULT_OPCLASS_TYPES = new HashMap<>();
+
+    private static void defaults(String method, String... types) {
+        DEFAULT_OPCLASS_TYPES.put(method, Cols.setOf(types));
+    }
+
+    static {
+        // The scalar types, shared by the three methods that index values whole
+        String[] scalar = {
+            "\"char\"", "bigint", "bit", "bit varying", "boolean", "bytea", "character",
+            "character varying", "date", "double precision", "inet", "integer", "interval",
+            "macaddr", "macaddr8", "money", "name", "numeric", "oid", "oidvector", "pg_lsn",
+            "real", "smallint", "text", "tid", "time with time zone", "time without time zone",
+            "timestamp with time zone", "timestamp without time zone", "uuid", "xid", "xid8",
+            "jsonb", "tsquery", "tsvector", "record", "cid", "aclitem", "cidr",
+        };
+        // The polymorphic classes cover a whole family at once: an array, an enum or a range
+        // indexes through one of these rather than through a class of its own name.
+        Set<String> btree = new LinkedHashSet<>(Cols.setOf(scalar));
+        btree.remove("cid");
+        btree.remove("aclitem");
+        btree.addAll(Cols.setOf("anyarray", "anyenum", "anyrange", "anymultirange"));
+        DEFAULT_OPCLASS_TYPES.put("btree", btree);
+        Set<String> hash = new LinkedHashSet<>(Cols.setOf(scalar));
+        hash.remove("bit");
+        hash.remove("bit varying");
+        hash.remove("tsquery");
+        hash.remove("tsvector");
+        hash.remove("oidvector");
+        hash.remove("money");
+        hash.addAll(Cols.setOf("anyarray", "anyenum", "anyrange", "anymultirange"));
+        DEFAULT_OPCLASS_TYPES.put("hash", hash);
+        Set<String> brin = new LinkedHashSet<>(Cols.setOf(scalar));
+        brin.remove("boolean");
+        brin.remove("jsonb");
+        brin.remove("money");
+        brin.remove("tsquery");
+        brin.remove("tsvector");
+        brin.remove("record");
+        brin.remove("cid");
+        brin.remove("aclitem");
+        brin.remove("xid");
+        brin.add("box");
+        brin.add("anyrange");
+        DEFAULT_OPCLASS_TYPES.put("brin", brin);
+        // The three methods built for a particular shape of value index far fewer types
+        defaults("gin", "jsonb", "tsvector", "anyarray");
+        defaults("gist", "box", "circle", "point", "polygon", "tsquery", "tsvector",
+                "anyrange", "anymultirange");
+        defaults("spgist", "box", "inet", "point", "polygon", "text", "anyrange");
+    }
+
+    /**
+     * An indexed column needs an operator class the access method can use. Where none is named,
+     * the type must have a default one — {@code 42704} otherwise, naming the type and the method.
+     */
+    private static void checkDefaultOpclass(Table table, String am, String column, String opts) {
+        if (opts.contains("opclass:")) return;   // an explicit class is checked by checkOpclass
+        Set<String> supported = DEFAULT_OPCLASS_TYPES.get(am);
+        if (supported == null) return;
+        int colIdx = table.getColumnIndex(column);
+        if (colIdx < 0) return;   // an unknown column is reported by the caller's own check
+        Column col = table.getColumns().get(colIdx);
+        String colType = indexedTypeName(col);
+        // A type this engine cannot name is left alone: refusing a valid index is the worse
+        // failure of the two.
+        if (colType == null || supported.contains(colType)) return;
+        MemgresException ex = new MemgresException("data type " + colType
+                + " has no default operator class for access method \"" + am + "\"", "42704");
+        ex.setHint("You must specify an operator class for the index"
+                + " or define a default operator class for the data type.");
+        throw ex;
+    }
+
+    /**
+     * The type name to look an operator class up by. Arrays, enums and ranges all index through a
+     * polymorphic class, so they are answered by the family they belong to rather than by name.
+     */
+    private static String indexedTypeName(Column col) {
+        if (col.getArrayElementType() != null) return "anyarray";
+        if (col.getEnumTypeName() != null) return "anyenum";
+        if (col.getCompositeTypeName() != null || col.getDomainTypeName() != null) return null;
+        String name = CatalogHelper.pgTypeName(col.getType());
+        if (name != null && name.endsWith("[]")) return "anyarray";
+        if (name != null && (name.endsWith("range") || name.endsWith("multirange"))) {
+            return name.endsWith("multirange") ? "anymultirange" : "anyrange";
+        }
+        return name;
     }
 
     /** Included columns are stored verbatim: they cannot be expressions, and must exist. */
