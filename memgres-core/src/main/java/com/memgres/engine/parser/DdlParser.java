@@ -168,6 +168,19 @@ class DdlParser {
 
     // ---- DROP dispatcher ----
 
+    /** The characters PostgreSQL builds an operator name from; a schema may qualify it. */
+    private static final String OPERATOR_NAME_CHARS = "+-*/<>=~!@#%^&|`?";
+
+    private static boolean isOperatorSymbolName(String name) {
+        if (name == null || name.isEmpty()) return false;
+        String bare = name.substring(name.lastIndexOf('.') + 1);
+        if (bare.isEmpty()) return false;
+        for (int i = 0; i < bare.length(); i++) {
+            if (OPERATOR_NAME_CHARS.indexOf(bare.charAt(i)) < 0) return false;
+        }
+        return true;
+    }
+
     Statement parseDrop() {
         parser.expectKeyword("DROP");
 
@@ -338,6 +351,11 @@ class DdlParser {
                 sb.append(parser.advance().value());
             }
             name = sb.toString().trim();
+            // An operator is named in symbols, so a word here is not a name this statement can
+            // have. PostgreSQL cannot parse it either and reports the token that follows.
+            if (!isOperatorSymbolName(name)) {
+                throw new ParseException("operator name must be symbolic", parser.peek());
+            }
         } else {
             name = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) {

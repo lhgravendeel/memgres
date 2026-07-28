@@ -102,6 +102,11 @@ class ProgrammableObjectValidationTest {
                 "CREATE OPERATOR ==== (FUNCTION = pov_sfunc)");
         assertFails("42601", "syntax error at or near \"(\"",
                 "CREATE OPERATOR povop (LEFTARG = int, RIGHTARG = int, FUNCTION = pov_sfunc)");
+        // DROP names an operator the same way, so a word is no more a name there
+        assertFails("42601", "syntax error at or near \"(\"",
+                "DROP OPERATOR povop (int, int)");
+        assertFails("42601", "syntax error at or near \"(\"",
+                "DROP OPERATOR IF EXISTS povop (int, int)");
     }
 
     @Test
