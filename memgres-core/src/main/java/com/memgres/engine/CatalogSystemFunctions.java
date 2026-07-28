@@ -62,10 +62,20 @@ class CatalogSystemFunctions {
                 // partition, an aggregate over its group -- carries the type its own expression
                 // was declared to have. That declaration is exactly what pg_typeof asks for, and
                 // it is the only answer available when the fold produced NULL.
+                //
+                // It answers only where the value cannot: a numeric NaN and a float8 NaN are the
+                // same Double, so the declaration decides between them. Where the declaration
+                // contradicts the value outright -- an aggregate this engine has no declared
+                // result type for is guessed as text, while it computed a number -- the value is
+                // the better witness and the guess is discarded.
                 if (rawExpr instanceof ExprEvaluator.PrecomputedValueExpr) {
-                    DataType declared =
-                            ((ExprEvaluator.PrecomputedValueExpr) rawExpr).declaredType();
-                    if (declared != null) return pgTypeDisplayName(declared);
+                    ExprEvaluator.PrecomputedValueExpr pre =
+                            (ExprEvaluator.PrecomputedValueExpr) rawExpr;
+                    DataType declared = pre.declaredType();
+                    if (declared != null
+                            && (pre.value() == null || agreesWithValue(declared, pre.value()))) {
+                        return pgTypeDisplayName(declared);
+                    }
                 }
 
                 // Check if this is a system column reference (ctid, xmin, xmax, cmin, cmax, tableoid)
@@ -900,6 +910,23 @@ class CatalogSystemFunctions {
             default:
                 return false;
         }
+    }
+
+    /**
+     * Whether a declared type is believable next to the value that was actually computed. Only
+     * the coarse division is asked about — a number, a string, a boolean — because the finer
+     * distinctions are exactly what the declaration is there to settle.
+     */
+    private static boolean agreesWithValue(DataType declared, Object value) {
+        DataType actual = TypeCoercion.inferType(value);
+        if (actual == null) return true;
+        return isNumericType(declared) == isNumericType(actual)
+                && isStringType(declared) == isStringType(actual)
+                && (declared == DataType.BOOLEAN) == (actual == DataType.BOOLEAN);
+    }
+
+    private static boolean isStringType(DataType dt) {
+        return dt == DataType.TEXT || dt == DataType.VARCHAR || dt == DataType.CHAR;
     }
 
     static String pgTypeDisplayName(DataType dt) {

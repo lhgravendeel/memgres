@@ -1884,10 +1884,14 @@ class SelectAggregateEvaluator {
             }
             // A value that is not a number at all is the same missing function sum reports; it
             // used to escape the accumulation loop below as an internal parse failure (XX000).
-            try {
-                SelectExecutor.toBigDecimal(val);
-            } catch (RuntimeException e) {
-                throw noSuchAggregate(fname, arg, group);
+            // A number is aggregatable whatever it is worth, so NaN and the infinities are not
+            // asked to survive the trip through BigDecimal that they cannot make.
+            if (!(val instanceof Number)) {
+                try {
+                    SelectExecutor.toBigDecimal(val);
+                } catch (RuntimeException e) {
+                    throw noSuchAggregate(fname, arg, group);
+                }
             }
             return;
         }
