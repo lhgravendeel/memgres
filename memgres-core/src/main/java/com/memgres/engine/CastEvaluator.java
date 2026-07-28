@@ -545,6 +545,11 @@ class CastEvaluator {
                     String intervalStyle = (executor.session != null) ? executor.session.getGucSettings().get("intervalstyle") : "postgres";
                     return ((PgInterval) val).toString(intervalStyle);
                 }
+                // PG's numeric output never falls back on exponent notation, which is where
+                // BigDecimal goes for a negative scale (round(1.5, -1)) or a large one
+                if (val instanceof java.math.BigDecimal) {
+                    return ((java.math.BigDecimal) val).toPlainString();
+                }
                 return val.toString();
             }
             case "boolean":

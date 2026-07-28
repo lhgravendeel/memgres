@@ -392,17 +392,17 @@ class FromFunctionResolver {
         Object patternObj = evalArgs.get(1);
         if (strObj == null) return new ArrayList<>();
         String str = strObj.toString();
-        String pattern = patternObj != null ? patternObj.toString() : "";
-        String flags = evalArgs.size() > 2 && evalArgs.get(2) != null ? evalArgs.get(2).toString() : "";
-        int regexFlags = 0;
-        if (flags.contains("i")) regexFlags |= java.util.regex.Pattern.CASE_INSENSITIVE;
+        if (patternObj == null) return new ArrayList<>();
+        String pattern = patternObj.toString();
+        if (evalArgs.size() > 2 && evalArgs.get(2) == null) return new ArrayList<>();
+        String flags = evalArgs.size() > 2 ? evalArgs.get(2).toString() : "";
         String colName = firstColAlias(colAliases, alias);
         Column col = new Column(colName, DataType.TEXT, true, false, null);
         Table virtualTable = new Table(alias, Cols.listOf(col));
         List<RowContext> contexts = new ArrayList<>();
-        String[] parts = java.util.regex.Pattern.compile(pattern, regexFlags).split(str, -1);
+        List<String> parts = PgRegex.split(str,
+                PgRegex.compile(pattern, PgRegex.parseFlags(flags, false, "regexp_split_to_table")));
         for (String part : parts) {
-            if (part.isEmpty()) continue; // PG skips empty strings from split
             Object[] row = new Object[]{ part };
             virtualTable.insertRow(row);
             contexts.add(new RowContext(virtualTable, alias, row));
@@ -410,9 +410,26 @@ class FromFunctionResolver {
         return contexts;
     }
 
+    /**
+     * The elements along one dimension of an array, or null when the array has no such
+     * dimension — which is what {@code generate_subscripts} needs to know to stay empty.
+     */
+    private static List<Object> dimensionElements(Object arr, int dim) {
+        if (dim < 1) return null;
+        List<Object> elements = toElementList(arr);
+        if (dim == 1) return elements;
+        if (elements.isEmpty()) return null;
+        Object first = elements.get(0);
+        boolean nested = first instanceof List
+                || (first instanceof String && ((String) first).startsWith("{") && ((String) first).endsWith("}"));
+        if (!nested) return null;
+        return dimensionElements(first, dim - 1);
+    }
+
     private List<RowContext> resolveGenerateSubscripts(String alias, List<String> colAliases, List<Object> evalArgs) {
         if (evalArgs.isEmpty()) throw new MemgresException("function generate_subscripts() does not exist", "42883");
         Object arrObj = evalArgs.get(0);
+        if (evalArgs.size() > 1 && evalArgs.get(1) == null) return new ArrayList<>();
         int dim = evalArgs.size() > 1 ? executor.toInt(evalArgs.get(1)) : 1;
         boolean reverse = evalArgs.size() > 2 && executor.isTruthy(evalArgs.get(2));
 
@@ -427,10 +444,12 @@ class FromFunctionResolver {
             if (parts.length == 2) {
                 lowerBound = Integer.parseInt(parts[0].trim());
             }
-            elements = toElementList(content);
+            elements = dimensionElements(content, dim);
         } else {
-            elements = toElementList(arrObj);
+            elements = dimensionElements(arrObj, dim);
         }
+        // A dimension the array does not have yields no subscripts at all
+        if (elements == null) return new ArrayList<>();
 
         int lo = lowerBound;
         int hi = lo + elements.size() - 1;

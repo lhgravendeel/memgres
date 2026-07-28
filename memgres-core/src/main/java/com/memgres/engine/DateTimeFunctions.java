@@ -269,7 +269,11 @@ class DateTimeFunctions {
                 }
                 Object fmtObj = executor.evalExpr(fn.args().get(1), ctx);
                 if (fmtObj == null) return null; // to_char(x, NULL) is NULL, not a template error
-                return formatToChar(source, fmtObj.toString());
+                String fmt = fmtObj.toString();
+                // An empty format leaves a number with nothing to print, while the date/time
+                // form of to_char returns NULL outright
+                if (fmt.isEmpty()) return (source instanceof Number) ? "" : null;
+                return formatToChar(source, fmt);
             }
             case "to_date": {
                 Object source = executor.evalExpr(fn.args().get(0), ctx);

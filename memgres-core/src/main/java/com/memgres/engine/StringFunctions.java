@@ -384,6 +384,9 @@ class StringFunctions {
                 Object to = executor.evalExpr(fn.args().get(2), ctx);
                 // PG is strict here: a NULL in any argument makes the whole call NULL.
                 if (str == null || from == null || to == null) return null;
+                // There is nothing to find in an empty needle, so PG returns the input as it
+                // stands rather than wedging the replacement between every character.
+                if (from.toString().isEmpty()) return str.toString();
                 return str.toString().replace(from.toString(), to.toString());
             }
             case "substring":
@@ -429,13 +432,9 @@ class StringFunctions {
                         executor.toInt(arg1); // try as int first
                     } catch (Exception e) {
                         // Not an int, treat as regex pattern
-                        try {
-                            java.util.regex.Matcher m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern)).matcher(str.toString());
-                            // PG returns group 1 if it exists, else whole match
-                            return m.find() ? (m.groupCount() >= 1 && m.group(1) != null ? m.group(1) : m.group()) : null;
-                        } catch (java.util.regex.PatternSyntaxException pse) {
-                            throw new MemgresException("invalid regular expression: " + pse.getMessage(), "2201B");
-                        }
+                        java.util.regex.Matcher m = PgRegex.compile(pattern).matcher(str.toString());
+                        // PG returns group 1 if it exists, else whole match
+                        return m.find() ? (m.groupCount() >= 1 && m.group(1) != null ? m.group(1) : m.group()) : null;
                     }
                 }
                 Integer startBox = countArgument(fn, ctx, 1, name); // PG 1-based position
@@ -639,8 +638,11 @@ class StringFunctions {
                 // PG15+: regexp_replace(string, pattern, replacement, start, N [, flags])
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
                 if (str == null) return null;
-                String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                String replacement = String.valueOf(executor.evalExpr(fn.args().get(2), ctx));
+                Object patternVal = executor.evalExpr(fn.args().get(1), ctx);
+                Object replacementVal = executor.evalExpr(fn.args().get(2), ctx);
+                if (patternVal == null || replacementVal == null) return null;
+                String pattern = patternVal.toString();
+                String replacement = replacementVal.toString();
                 // PG's replacement text only gives meaning to \N and \&; the conversion to
                 // Java's syntax happens below, once the pattern's group count is known.
                 String flags = "";
@@ -657,16 +659,19 @@ class StringFunctions {
                             nth = executor.toInt(executor.evalExpr(fn.args().get(4), ctx));
                         }
                         if (fn.args().size() > 5) {
-                            flags = String.valueOf(executor.evalExpr(fn.args().get(5), ctx));
+                            Object flagsVal = executor.evalExpr(fn.args().get(5), ctx);
+                            if (flagsVal == null) return null;
+                            flags = flagsVal.toString();
                         }
                     } else {
-                        flags = String.valueOf(arg3);
+                        if (arg3 == null) return null;
+                        flags = arg3.toString();
                     }
                 }
-                int jflags = pgRegexFlags(flags);
+                PgRegex.Options opts = PgRegex.parseFlags(flags, true, name);
                 try {
                     String s = str.toString();
-                    java.util.regex.Pattern p = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags);
+                    java.util.regex.Pattern p = PgRegex.compile(pattern, opts);
                     // Convert \N backrefs now that the group count is known: a valid group
                     // becomes $N, a reference to a non-existent group substitutes empty (PG).
                     int groupCount = p.matcher("").groupCount();
@@ -698,7 +703,7 @@ class StringFunctions {
                         }
                     } else {
                         // Old form
-                        if (flags.contains("g")) {
+                        if (opts.global) {
                             return p.matcher(s).replaceAll(replacement);
                         }
                         return p.matcher(s).replaceFirst(replacement);
@@ -713,47 +718,24 @@ class StringFunctions {
             case "regexp_match":
             case "regexp_matches": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
-                if (str == null) return null;
-                String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                String flags = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : "";
-                int jflags = pgRegexFlags(flags);
-                boolean global = flags.contains("g");
-                java.util.regex.Matcher m;
-                try {
-                    m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(str.toString());
-                } catch (java.util.regex.PatternSyntaxException pse) {
-                    throw new MemgresException("invalid regular expression: " + pse.getDescription(), "2201B");
-                }
-                if (global && name.equals("regexp_matches")) {
+                Object patternVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (str == null || patternVal == null) return null;
+                Object flagsVal = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx) : "";
+                if (flagsVal == null) return null;
+                PgRegex.Options opts = PgRegex.parseFlags(flagsVal.toString(),
+                        name.equals("regexp_matches"), name);
+                java.util.regex.Matcher m =
+                        PgRegex.compile(patternVal.toString(), opts).matcher(str.toString());
+                if (opts.global) {
                     // Global flag: return List of all matches (SRF, one row per match)
                     List<Object> allMatches = new ArrayList<>();
                     while (m.find()) {
-                        StringBuilder sb = new StringBuilder("{");
-                        if (m.groupCount() > 0) {
-                            for (int gi = 1; gi <= m.groupCount(); gi++) {
-                                if (gi > 1) sb.append(",");
-                                sb.append(m.group(gi));
-                            }
-                        } else {
-                            sb.append(m.group(0));
-                        }
-                        sb.append("}");
-                        allMatches.add(sb.toString());
+                        allMatches.add(matchGroupArray(m));
                     }
                     return allMatches.isEmpty() ? null : allMatches;
                 }
                 if (m.find()) {
-                    StringBuilder sb = new StringBuilder("{");
-                    if (m.groupCount() > 0) {
-                        for (int gi = 1; gi <= m.groupCount(); gi++) {
-                            if (gi > 1) sb.append(",");
-                            sb.append(m.group(gi));
-                        }
-                    } else {
-                        sb.append(m.group(0));
-                    }
-                    sb.append("}");
-                    return sb.toString();
+                    return matchGroupArray(m);
                 }
                 return null;
             }
@@ -761,8 +743,8 @@ class StringFunctions {
                 // regexp_count(string, pattern [, start [, flags]])
                 // start is 1-based position to begin searching from
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
-                if (str == null) return null;
-                String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                Object patternVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (str == null || patternVal == null) return null;
                 int start = 1;
                 String flags = "";
                 if (fn.args().size() > 2) {
@@ -771,29 +753,33 @@ class StringFunctions {
                     start = executor.toInt(arg2);
                 }
                 if (fn.args().size() > 3) {
-                    flags = String.valueOf(executor.evalExpr(fn.args().get(3), ctx));
+                    Object flagsVal = executor.evalExpr(fn.args().get(3), ctx);
+                    if (flagsVal == null) return null;
+                    flags = flagsVal.toString();
                 }
-                int jflags = pgRegexFlags(flags);
                 String s = str.toString();
                 String searchStr = start > 1 ? s.substring(Math.min(start - 1, s.length())) : s;
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(searchStr);
+                java.util.regex.Matcher m = PgRegex.compile(patternVal.toString(),
+                        PgRegex.parseFlags(flags, false, name)).matcher(searchStr);
                 int count = 0;
                 while (m.find()) count++;
                 return count;
             }
             case "regexp_like": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
-                if (str == null) return false;
-                String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                String flags = fn.args().size() > 2 ? String.valueOf(executor.evalExpr(fn.args().get(2), ctx)) : "";
-                int jflags = pgRegexFlags(flags);
-                return java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(str.toString()).find();
+                Object patternVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (str == null || patternVal == null) return null;
+                Object flagsVal = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx) : "";
+                if (flagsVal == null) return null;
+                return PgRegex.compile(patternVal.toString(),
+                        PgRegex.parseFlags(flagsVal.toString(), false, name))
+                        .matcher(str.toString()).find();
             }
             case "regexp_substr": {
                 // regexp_substr(string, pattern [, start [, N [, flags [, subexpr]]]])
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
-                if (str == null) return null;
-                String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                Object patternVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (str == null || patternVal == null) return null;
                 int start = 1;
                 int nthMatch = 1;
                 String flags = "";
@@ -805,15 +791,17 @@ class StringFunctions {
                     nthMatch = executor.toInt(executor.evalExpr(fn.args().get(3), ctx));
                 }
                 if (fn.args().size() > 4) {
-                    flags = String.valueOf(executor.evalExpr(fn.args().get(4), ctx));
+                    Object flagsVal = executor.evalExpr(fn.args().get(4), ctx);
+                    if (flagsVal == null) return null;
+                    flags = flagsVal.toString();
                 }
                 if (fn.args().size() > 5) {
                     subexpr = executor.toInt(executor.evalExpr(fn.args().get(5), ctx));
                 }
-                int jflags = pgRegexFlags(flags);
                 String s = str.toString();
                 int offset = Math.min(start - 1, s.length());
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(s);
+                java.util.regex.Matcher m = PgRegex.compile(patternVal.toString(),
+                        PgRegex.parseFlags(flags, false, name)).matcher(s);
                 int found = 0;
                 int regionStart = offset;
                 while (m.find(regionStart)) {
@@ -833,8 +821,8 @@ class StringFunctions {
                 // flags: regex flags string
                 // subexpr: which capture group to return position of
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
-                if (str == null) return 0;
-                String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                Object patternVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (str == null || patternVal == null) return null;
                 int start = 1;
                 int nthMatch = 1;
                 int endOption = 0;
@@ -850,15 +838,17 @@ class StringFunctions {
                     endOption = executor.toInt(executor.evalExpr(fn.args().get(4), ctx));
                 }
                 if (fn.args().size() > 5) {
-                    flags = String.valueOf(executor.evalExpr(fn.args().get(5), ctx));
+                    Object flagsVal = executor.evalExpr(fn.args().get(5), ctx);
+                    if (flagsVal == null) return null;
+                    flags = flagsVal.toString();
                 }
                 if (fn.args().size() > 6) {
                     subexpr = executor.toInt(executor.evalExpr(fn.args().get(6), ctx));
                 }
-                int jflags = pgRegexFlags(flags);
                 String s = str.toString();
                 int offset = Math.min(start - 1, s.length());
-                java.util.regex.Matcher m = java.util.regex.Pattern.compile(BinaryOpEvaluator.pgRegexToJava(pattern), jflags).matcher(s);
+                java.util.regex.Matcher m = PgRegex.compile(patternVal.toString(),
+                        PgRegex.parseFlags(flags, false, name)).matcher(s);
                 int found = 0;
                 int regionStart = offset;
                 while (m.find(regionStart)) {
@@ -876,14 +866,20 @@ class StringFunctions {
             }
             case "regexp_split_to_array": {
                 Object str = executor.evalExpr(fn.args().get(0), ctx);
-                if (str == null) return null;
-                String pattern = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
-                String[] parts = str.toString().split(pattern, -1); // -1 preserves trailing empties
+                Object patternVal = executor.evalExpr(fn.args().get(1), ctx);
+                if (str == null || patternVal == null) return null;
+                String flags = "";
+                if (fn.args().size() > 2) {
+                    Object flagsVal = executor.evalExpr(fn.args().get(2), ctx);
+                    if (flagsVal == null) return null;
+                    flags = flagsVal.toString();
+                }
+                List<String> parts = PgRegex.split(str.toString(),
+                        PgRegex.compile(patternVal.toString(), PgRegex.parseFlags(flags, false, name)));
                 StringBuilder sb = new StringBuilder("{");
-                for (int i = 0; i < parts.length; i++) {
+                for (int i = 0; i < parts.size(); i++) {
                     if (i > 0) sb.append(",");
-                    if (parts[i].isEmpty()) sb.append("\"\"");
-                    else sb.append(parts[i]);
+                    sb.append(quoteArrayElement(parts.get(i)));
                 }
                 sb.append("}");
                 return sb.toString();
@@ -1065,8 +1061,15 @@ class StringFunctions {
                     }
                     return chars;
                 }
-                String[] parts = str.toString().split(java.util.regex.Pattern.quote(delim.toString()), -1);
-                List<Object> result = new ArrayList<>(Arrays.asList((Object[]) parts));
+                List<Object> result;
+                if (delim.toString().isEmpty()) {
+                    // An empty delimiter tells PG not to split at all
+                    result = new ArrayList<>();
+                    result.add(str.toString());
+                } else {
+                    String[] parts = str.toString().split(java.util.regex.Pattern.quote(delim.toString()), -1);
+                    result = new ArrayList<>(Arrays.asList((Object[]) parts));
+                }
                 if (fn.args().size() > 2) {
                     Object nullStr = executor.evalExpr(fn.args().get(2), ctx);
                     if (nullStr != null) {
@@ -1351,15 +1354,40 @@ class StringFunctions {
         return val.toString();
     }
 
-    /** Convert PG regex flag string to Java Pattern flags. Handles i, n, m, s, x. */
-    private static int pgRegexFlags(String flags) {
-        int jflags = 0;
-        if (flags.contains("i")) jflags |= java.util.regex.Pattern.CASE_INSENSITIVE;
-        if (flags.contains("n")) jflags |= java.util.regex.Pattern.MULTILINE; // PG 'n' = newline-sensitive
-        if (flags.contains("m")) jflags |= java.util.regex.Pattern.MULTILINE; // PG 'm' synonym
-        if (flags.contains("s")) jflags |= java.util.regex.Pattern.DOTALL;
-        if (flags.contains("x")) jflags |= java.util.regex.Pattern.COMMENTS;
-        return jflags;
+    /**
+     * The array one regexp match contributes: the capture groups when the pattern has any,
+     * otherwise the whole match — which is still an element when it is the empty string.
+     */
+    private static String matchGroupArray(java.util.regex.Matcher m) {
+        StringBuilder sb = new StringBuilder("{");
+        if (m.groupCount() > 0) {
+            for (int gi = 1; gi <= m.groupCount(); gi++) {
+                if (gi > 1) sb.append(",");
+                sb.append(quoteArrayElement(m.group(gi)));
+            }
+        } else {
+            sb.append(quoteArrayElement(m.group(0)));
+        }
+        return sb.append("}").toString();
+    }
+
+    /** Render one array element the way PG's array_out does, quoting only where it must. */
+    private static String quoteArrayElement(String value) {
+        if (value == null) return "NULL";
+        boolean needsQuotes = value.isEmpty() || value.equalsIgnoreCase("NULL");
+        for (int i = 0; i < value.length() && !needsQuotes; i++) {
+            char c = value.charAt(i);
+            needsQuotes = c == '{' || c == '}' || c == ',' || c == '"' || c == '\\'
+                    || Character.isWhitespace(c);
+        }
+        if (!needsQuotes) return value;
+        StringBuilder sb = new StringBuilder(value.length() + 2).append('"');
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '"' || c == '\\') sb.append('\\');
+            sb.append(c);
+        }
+        return sb.append('"').toString();
     }
 
     /**
@@ -1438,6 +1466,9 @@ class StringFunctions {
                 // Escaped character, treat next char as literal
                 sb.append(java.util.regex.Pattern.quote(pattern.substring(i + 1, i + 2)));
                 i += 2;
+            } else if (chStr.equals(esc)) {
+                // An escape with nothing left to escape is dropped, as PG's similar_escape does
+                i++;
             } else if (ch == '%') {
                 sb.append(".*");
                 i++;

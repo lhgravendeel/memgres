@@ -1015,7 +1015,8 @@ class SelectAggregateEvaluator {
                     }
                     return bos.toByteArray();
                 }
-                String delim = delimVal != null ? String.valueOf(delimVal) : ",";
+                // PG's aggregate treats a NULL separator as nothing at all, not as a default
+                String delim = delimVal != null ? String.valueOf(delimVal) : "";
                 StringBuilder sb = new StringBuilder();
                 for (int pi = 0; pi < parts.size(); pi++) {
                     if (pi > 0) sb.append(delim);
