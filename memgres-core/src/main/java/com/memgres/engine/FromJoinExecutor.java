@@ -84,7 +84,7 @@ class FromJoinExecutor {
                     RowContext rightCtx = new RowContext(virtualTable, alias, row);
                     RowContext merged = mergeContexts(leftCtx, rightCtx);
                     if (join.on() != null) {
-                        if (executor.isTruthy(executor.evalExpr(join.on(), merged))) {
+                        if (joinConditionHolds(join.on(), merged)) {
                             results.add(merged);
                             matched = true;
                         }
@@ -121,7 +121,7 @@ class FromJoinExecutor {
                 for (RowContext rightCtx : funcRows) {
                     RowContext merged = mergeContexts(leftCtx, rightCtx);
                     if (join.on() != null) {
-                        if (executor.isTruthy(executor.evalExpr(join.on(), merged))) {
+                        if (joinConditionHolds(join.on(), merged)) {
                             results.add(merged);
                             matched = true;
                         }
@@ -503,9 +503,22 @@ class FromJoinExecutor {
 
     // ---- Join condition matching ----
 
+    /**
+     * A join condition has to be a predicate. Left unchecked, a bare {@code ON a.id} would be
+     * read as always-true and quietly produce the whole cross product.
+     */
+    boolean joinConditionHolds(Expression on, RowContext merged) {
+        Object val = executor.evalExpr(on, merged);
+        if (val instanceof Number) {
+            throw PgErrors.datatypeMismatch("argument of JOIN/ON must be type boolean, not type "
+                    + TypeCoercion.inferType(val).toRegtypeDisplay());
+        }
+        return executor.isTruthy(val);
+    }
+
     private boolean matchesJoinCondition(RowContext merged, Expression on, List<String> using) {
         if (on != null) {
-            return executor.isTruthy(executor.evalExpr(on, merged));
+            return joinConditionHolds(on, merged);
         }
         if (using != null) {
             for (String col : using) {

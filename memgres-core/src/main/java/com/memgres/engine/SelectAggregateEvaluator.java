@@ -763,9 +763,56 @@ class SelectAggregateEvaluator {
                 return (double) (countLE + 1) / (vals.size() + 1);
             }
             default: {
-                return null; 
+                throw notAnOrderedSetAggregate(osa, group);
             }
         }
+    }
+
+    /**
+     * WITHIN GROUP only exists for the ordered-set aggregates. PG resolves an ordinary aggregate
+     * written this way against the direct arguments plus the WITHIN GROUP ones, and reports that
+     * no such function exists; only a call with no direct arguments at all is named outright.
+     */
+    private MemgresException notAnOrderedSetAggregate(OrderedSetAggExpr osa, List<RowContext> group) {
+        String name = osa.funcName().toLowerCase();
+        boolean starOnly = osa.args().isEmpty()
+                || (osa.args().size() == 1 && osa.args().get(0) instanceof ColumnRef
+                    && "*".equals(((ColumnRef) osa.args().get(0)).column()));
+        if (starOnly) {
+            return PgErrors.wrongObjectType(
+                    name + " is not an ordered-set aggregate, so it cannot have WITHIN GROUP");
+        }
+        RowContext sample = group.isEmpty() ? null : group.get(0);
+        StringBuilder types = new StringBuilder();
+        for (Expression a : osa.args()) {
+            if (types.length() > 0) types.append(", ");
+            types.append(argTypeName(a, sample));
+        }
+        if (osa.withinGroupOrderBy() != null) {
+            for (SelectStmt.OrderByItem item : osa.withinGroupOrderBy()) {
+                if (types.length() > 0) types.append(", ");
+                types.append(argTypeName(item.expr(), sample));
+            }
+        }
+        MemgresException e = new MemgresException(
+                "function " + name + "(" + types + ") does not exist", "42883");
+        e.setHint("No function matches the given name and argument types. "
+                + "You might need to add explicit type casts.");
+        return e;
+    }
+
+    /** PG leaves a bare quoted literal as "unknown" until a resolved call forces its type. */
+    private String argTypeName(Expression expr, RowContext sample) {
+        if (expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.STRING) {
+            return "unknown";
+        }
+        Object v;
+        try {
+            v = executor.evalExpr(expr, sample);
+        } catch (RuntimeException ex) {
+            return "unknown";
+        }
+        return v == null ? "unknown" : TypeCoercion.inferType(v).toRegtypeDisplay();
     }
 
     // ---- Core aggregate evaluation ----
@@ -1156,7 +1203,12 @@ class SelectAggregateEvaluator {
                 for (RowContext r : group) {
                     Object k = executor.evalExpr(fn.args().get(0), r);
                     Object v = executor.evalExpr(fn.args().get(1), r);
-                    if (k == null) continue;
+                    // Dropping the row would silently lose it; PG refuses a NULL key outright
+                    if (k == null) {
+                        throw name.equals("jsonb_object_agg")
+                                ? PgErrors.invalidParameter("field name must not be null")
+                                : new MemgresException("null value not allowed for object key", "22004");
+                    }
                     if (!first) sb.append(", ");
                     first = false;
                     sb.append("\"").append(k.toString().replace("\"", "\\\"")).append("\": ");

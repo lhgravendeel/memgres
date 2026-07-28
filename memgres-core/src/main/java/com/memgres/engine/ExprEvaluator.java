@@ -174,6 +174,16 @@ class ExprEvaluator {
         }
         if (expr instanceof FieldAccessExpr) {
             FieldAccessExpr fa = (FieldAccessExpr) expr;
+            // A function declared to return bare "record" carries no column names, so there is
+            // nothing for (f()).x to match — PG says so rather than evaluating the call.
+            if (fa.expr() instanceof FunctionCallExpr) {
+                PgFunction pf = executor.database.getFunction(FunctionEvaluator.stripSchemaPrefix(
+                        ((FunctionCallExpr) fa.expr()).name().toLowerCase()));
+                if (pf != null && pf.declaresRecordResult() && !pf.hasOutParams()) {
+                    throw new MemgresException("could not identify column \"" + fa.field()
+                            + "\" in record data type", "42703");
+                }
+            }
             // Composite field access: (expr).field
             Object val = evalExpr(fa.expr(), ctx);
             if (val == null) return null;

@@ -178,6 +178,7 @@ public class AstExecutor {
         try {
             Statement stmt = Parser.parse(sql);
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
+            rejectNestedDataModifyingCtes(stmt);
             return executeStatement(stmt);
         } finally {
             this.boundParameters = previousParams;
@@ -187,6 +188,53 @@ public class AstExecutor {
             TypeCoercion.setSessionZone(previousZone);
             TypeCoercion.setSessionInstant(previousInstant);
         }
+    }
+
+    /**
+     * A data-modifying statement may only appear in the statement's outermost WITH list. Deeper
+     * down neither when the write happens nor what the surrounding query sees is defined, so PG
+     * refuses to run the query at all rather than pick an order.
+     */
+    private static void rejectNestedDataModifyingCtes(Statement root) {
+        Set<Object> topLevel = Collections.newSetFromMap(new java.util.IdentityHashMap<Object, Boolean>());
+        collectTopLevelCtes(root, topLevel);
+        Object nested = AstWalk.findFirst(root, node -> {
+            List<SelectStmt.CommonTableExpr> ctes = ownCtes(node);
+            if (ctes == null || topLevel.contains(ctes)) return false;
+            for (SelectStmt.CommonTableExpr cte : ctes) {
+                if (isDataModifying(cte.query())) return true;
+            }
+            return false;
+        });
+        if (nested != null) {
+            throw PgErrors.notImplemented(
+                    "WITH clause containing a data-modifying statement must be at the top level");
+        }
+    }
+
+    /** The WITH lists that count as the statement's own, including each arm of a set operation. */
+    private static void collectTopLevelCtes(Statement stmt, Set<Object> out) {
+        if (stmt == null) return;
+        if (stmt instanceof SetOpStmt) {
+            collectTopLevelCtes(((SetOpStmt) stmt).left, out);
+            collectTopLevelCtes(((SetOpStmt) stmt).right, out);
+            return;
+        }
+        List<SelectStmt.CommonTableExpr> ctes = ownCtes(stmt);
+        if (ctes != null) out.add(ctes);
+    }
+
+    private static List<SelectStmt.CommonTableExpr> ownCtes(Object node) {
+        if (node instanceof SelectStmt) return ((SelectStmt) node).withClauses();
+        if (node instanceof InsertStmt) return ((InsertStmt) node).withClauses();
+        if (node instanceof UpdateStmt) return ((UpdateStmt) node).withClauses();
+        if (node instanceof DeleteStmt) return ((DeleteStmt) node).withClauses();
+        return null;
+    }
+
+    private static boolean isDataModifying(Statement stmt) {
+        return stmt instanceof InsertStmt || stmt instanceof UpdateStmt || stmt instanceof DeleteStmt
+                || stmt instanceof MergeStmt;
     }
 
     /**
