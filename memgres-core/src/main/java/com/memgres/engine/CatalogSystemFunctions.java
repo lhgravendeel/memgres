@@ -88,6 +88,20 @@ class CatalogSystemFunctions {
                     return "jsonb";
                 }
 
+                // A range, a shape, a document and a bit string are all carried as their own
+                // text, so the value that comes back cannot say which type produced it -- and
+                // pg_typeof is a question about the declaration in the first place. Only the
+                // types whose value is indistinguishable from text are answered this way; the
+                // rest keep the value-based reading, which knows a bigint from an integer.
+                if (rawExpr instanceof BinaryExpr || rawExpr instanceof FunctionCallExpr) {
+                    DataType inferred = executor.exprEvaluator.inferExprType(rawExpr);
+                    if (isTextCarriedType(inferred)) {
+                        DataType element = DataType.elementOf(inferred);
+                        return element != null ? pgTypeDisplayName(element) + "[]"
+                                : pgTypeDisplayName(inferred);
+                    }
+                }
+
                 if (rawExpr instanceof CastExpr) {
                     CastExpr cast = (CastExpr) rawExpr;
                     String tn = cast.typeName().toLowerCase().replaceAll("\\(.*\\)", "").trim();
@@ -812,6 +826,28 @@ class CatalogSystemFunctions {
             case "pb": return (long) (num * 1024L * 1024 * 1024 * 1024 * 1024);
             default:
                 throw new MemgresException("invalid size: \"" + sizeStr + "\"", "22023");
+        }
+    }
+
+    /**
+     * The types PostgreSQL stores as their own text, so an operator's result value cannot say
+     * which of them produced it. For these -- and only these -- pg_typeof answers from the
+     * declared type rather than from the value, which still knows a bigint from an integer.
+     */
+    private static boolean isTextCarriedType(DataType t) {
+        if (t == null) return false;
+        if (DataType.isArrayType(t)) return true;
+        switch (t) {
+            case INT4RANGE: case INT8RANGE: case NUMRANGE:
+            case DATERANGE: case TSRANGE: case TSTZRANGE:
+            case INT4MULTIRANGE: case INT8MULTIRANGE: case NUMMULTIRANGE:
+            case DATEMULTIRANGE: case TSMULTIRANGE: case TSTZMULTIRANGE:
+            case POINT: case LINE: case LSEG: case BOX: case PATH: case POLYGON: case CIRCLE:
+            case JSON: case JSONB: case TSVECTOR: case TSQUERY:
+            case BIT: case VARBIT: case INET: case CIDR:
+                return true;
+            default:
+                return false;
         }
     }
 

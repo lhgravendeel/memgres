@@ -183,6 +183,33 @@ class ExprSpecialFormParser {
         return new ColumnRef("timestamp");
     }
 
+    /**
+     * {@code TIME WITH TIME ZONE '10:00+02'} and its WITHOUT form, which are as much a typed
+     * literal as {@code TIMESTAMP WITH TIME ZONE '...'} is. Returns null, with the parser left
+     * where it started, when what follows TIME is not one of those spellings.
+     */
+    Expression parseQualifiedTimeLiteral() {
+        int saved = ep.pos;
+        ep.advance(); // consume TIME
+        String type;
+        if (ep.checkKeyword("WITH")) {
+            type = "timetz";
+        } else if (ep.checkKeyword("WITHOUT")) {
+            type = "time";
+        } else {
+            ep.pos = saved;
+            return null;
+        }
+        ep.advance();
+        if (ep.checkKeyword("TIME")) ep.advance();
+        if (ep.checkKeyword("ZONE")) ep.advance();
+        if (ep.pos < ep.tokens.size() && ep.tokens.get(ep.pos).type() == TokenType.STRING_LITERAL) {
+            return new CastExpr(Literal.ofString(ep.advance().value()), type);
+        }
+        ep.pos = saved;
+        return null;
+    }
+
     Expression parseSubstring() {
         ep.advance(); // consume SUBSTRING
         ep.expect(TokenType.LEFT_PAREN);

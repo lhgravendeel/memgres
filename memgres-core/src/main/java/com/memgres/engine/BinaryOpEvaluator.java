@@ -149,7 +149,89 @@ class BinaryOpEvaluator {
         String other = declaredOperandType(leftUntyped ? bin.right() : bin.left(), ctx);
         if (other == null) return null;
         if (other.endsWith("[]")) return other;
+        // || is resolved within a type only where that type carries one of its own. A range, an
+        // inet or a point does not, so PostgreSQL falls back to anynonarray || text and the
+        // literal stays the text it is -- reading it as a range instead refused a plain 'x'.
+        if (bin.op() == BinaryExpr.BinOp.CONCAT
+                && !other.equals("tsvector") && !other.equals("tsquery")) {
+            return null;
+        }
+        // @@ never takes two queries: a literal to the right of a tsquery is the document being
+        // searched, so it is read as a tsvector. Reading it as another tsquery made 'a b' -- a
+        // perfectly good document -- a syntax error.
+        if (bin.op() == BinaryExpr.BinOp.TS_MATCH && other.equals("tsquery")) {
+            return rightUntyped ? "tsvector" : null;
+        }
         return LITERAL_RESOLVABLE_TYPES.contains(other) ? other : null;
+    }
+
+    /**
+     * The type an untyped literal beside a date, time or interval operand is read as -- and the
+     * two ambiguities PostgreSQL refuses to guess at rather than resolve.
+     *
+     * <p>PostgreSQL resolves {@code timestamp + unknown} to {@code timestamp + interval} and
+     * {@code timestamp - unknown} to {@code timestamp - timestamp}, so the same literal is read
+     * two different ways depending on the sign. {@code date + unknown} fits both {@code date +
+     * integer} and {@code date + interval} equally well, so PostgreSQL stops with 42725 instead
+     * of picking one. Reading the literal as a number regardless is what made
+     * {@code date '2020-01-01' + '1'} answer 1 -- the date vanished entirely.
+     */
+    private String dateTimeLiteralTarget(BinaryExpr bin, RowContext ctx) {
+        BinaryExpr.BinOp op = bin.op();
+        boolean leftUntyped = isUntypedStringLiteral(bin.left());
+        boolean rightUntyped = isUntypedStringLiteral(bin.right());
+        if (leftUntyped == rightUntyped) return null;
+        String declared = declaredTypeForResolution(leftUntyped ? bin.right() : bin.left(), ctx);
+        String t = canonicalDateTimeType(declared);
+        if (t == null) return null;
+        boolean add = op == BinaryExpr.BinOp.ADD;
+        boolean sub = op == BinaryExpr.BinOp.SUBTRACT;
+        if (op == BinaryExpr.BinOp.MULTIPLY || op == BinaryExpr.BinOp.DIVIDE) {
+            // an interval scaled by an untyped literal reads it as the number it is
+            return t.equals("interval") ? "double precision" : null;
+        }
+        if (!add && !sub) return null;
+        if (t.equals("interval")) return "interval";
+        if (t.equals("date")) {
+            if (add) throw notUniqueOperator(leftUntyped ? "unknown" : "date", op,
+                    leftUntyped ? "date" : "unknown");
+            // date - unknown has only date - date to resolve to, so the literal is read as a date
+            return leftUntyped ? null : "date";
+        }
+        if (t.equals("timetz")) {
+            throw notUniqueOperator(leftUntyped ? "unknown" : "time with time zone", op,
+                    leftUntyped ? "time with time zone" : "unknown");
+        }
+        // timestamp, timestamptz and time: a literal added is an interval, one subtracted is
+        // another moment of the same kind
+        if (add) return "interval";
+        return leftUntyped ? null : t;
+    }
+
+    /** The 42725 PostgreSQL raises when two operators fit a pair of types equally well. */
+    private MemgresException notUniqueOperator(String lName, BinaryExpr.BinOp op, String rName) {
+        return new MemgresException("operator is not unique: " + lName + " "
+                + binOpToSymbol(op) + " " + rName
+                + "\n  Hint: Could not choose a best candidate operator."
+                + " You might need to add explicit type casts.", "42725");
+    }
+
+    /** The date/time type a declared name spells, or null when it names something else. */
+    private static String canonicalDateTimeType(String declared) {
+        if (declared == null) return null;
+        String t = declared.toLowerCase().trim();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        // "interval day to second" and the rest of the qualified spellings are still intervals
+        if (t.equals("interval") || t.startsWith("interval ")) return "interval";
+        switch (t) {
+            case "date": return "date";
+            case "timestamp": case "timestamp without time zone": return "timestamp";
+            case "timestamptz": case "timestamp with time zone": return "timestamptz";
+            case "time": case "time without time zone": return "time";
+            case "timetz": case "time with time zone": return "timetz";
+            default: return null;
+        }
     }
 
     /** True for text spelled as an array, with or without the lower bounds an array may carry. */
@@ -195,7 +277,7 @@ class BinaryOpEvaluator {
         boolean rRange = rDeclared != null
                 && (RANGE_TYPES.contains(rDeclared) || MULTIRANGE_TYPES.contains(rDeclared));
         if (lRange == rRange) return;
-        String scalar = typeWrittenInQuery(lRange ? bin.right() : bin.left());
+        String scalar = declaredTypeForResolution(lRange ? bin.right() : bin.left(), ctx);
         if (scalar == null || familyOf(scalar) == null) return;
         String subtype = rangeSubtype(lRange ? lDeclared : rDeclared);
         if (subtype == null || subtype.equals(pgName(scalar))) return;
@@ -308,44 +390,86 @@ class BinaryOpEvaluator {
         return null;
     }
 
-    /** The families an operator can be resolved within; PG has no operator across two of them. */
-    private enum TypeFamily { STRING, NUMERIC, BOOLEAN, JSON }
+    /**
+     * The families an operator can be resolved within; PostgreSQL has no operator across two of
+     * them. A date and a timestamp share one because PostgreSQL really does compare them; a time
+     * and an interval do not, and neither does a uuid and the text that spells it.
+     */
+    private enum TypeFamily {
+        STRING, NUMERIC, BOOLEAN, JSON, DATETIME, TIMEOFDAY, INTERVAL, UUID, NETWORK, BYTES
+    }
 
     /**
      * PostgreSQL resolves an operator against the declared types of its operands, and there is no
-     * {@code text = integer} or {@code text + integer} to resolve to — a query written that way is
-     * an error, not a comparison of a number with its spelling. Reading the values instead let
-     * {@code '5'::text = 5} answer true, so a query that fails in production passed here.
+     * {@code text = integer}, {@code text = date} or {@code uuid = text} to resolve to — a query
+     * written that way is an error, not a comparison of a value with its spelling. Reading the
+     * values instead let {@code '5'::text = 5} and {@code '2020-01-01'::text = date '2020-01-01'}
+     * answer true, so a query that fails in production passed here.
      *
      * <p>Only operands whose type is actually declared take part: a bare literal is {@code unknown}
      * and PostgreSQL resolves it against the other side, so {@code '5' = 5} stays legal.
      */
-    private void rejectCrossCategoryOperator(BinaryExpr bin, RowContext ctx) {
+    void rejectCrossCategoryOperator(BinaryExpr bin, RowContext ctx) {
         BinaryExpr.BinOp op = bin.op();
-        if (!isComparison(op) && !isArithmetic(op) && !resolvesThroughEquality(op)) return;
-        String lName = typeWrittenInQuery(bin.left());
-        String rName = typeWrittenInQuery(bin.right());
-        if (lName == null || rName == null) return;
-        TypeFamily lf = familyOf(lName);
-        TypeFamily rf = familyOf(rName);
+        boolean comparison = isComparison(op) || resolvesThroughEquality(op);
+        boolean arithmetic = isArithmetic(op);
+        if (!comparison && !arithmetic) return;
+        String lName = declaredTypeForResolution(bin.left(), ctx);
+        String rName = declaredTypeForResolution(bin.right(), ctx);
+        TypeFamily lf = lName == null ? null : familyOf(lName);
+        TypeFamily rf = rName == null ? null : familyOf(rName);
+
         if (lf == null || rf == null) return;
 
-        // json has no comparison or arithmetic operator of any kind, whatever sits opposite it
+        if (arithmetic) {
+            // Arithmetic lives in the numeric, date/time, network, geometric and range families.
+            // Text, booleans and json carry none of it, so a pair with one of those on either
+            // side has no operator to resolve to. Only pairs whose families are both known take
+            // part: hstore, tsquery and the other types this rule does not judge do carry
+            // arithmetic against text, and refusing those would reject SQL PostgreSQL runs.
+            boolean lBad = lf == TypeFamily.STRING || lf == TypeFamily.BOOLEAN || lf == TypeFamily.JSON;
+            boolean rBad = rf == TypeFamily.STRING || rf == TypeFamily.BOOLEAN || rf == TypeFamily.JSON;
+            if (!lBad && !rBad) return;
+            // pg_trgm declares a text % text of its own -- similarity, not a remainder -- so
+            // once that extension is installed the pair really does resolve to an operator.
+            if (op == BinaryExpr.BinOp.MODULO && lf == TypeFamily.STRING && rf == TypeFamily.STRING
+                    && executor.database.hasExtension("pg_trgm")) {
+                return;
+            }
+            throw missingOperator(pgName(lName), op, pgName(rName));
+        }
+
+        // json has no comparison operator of any kind, not even against another json
         boolean reject = (lf == TypeFamily.JSON || rf == TypeFamily.JSON) || lf != rf;
         if (!reject) return;
-        throw new MemgresException("operator does not exist: " + pgName(lName) + " "
-                + resolvedOperatorSymbol(op) + " " + pgName(rName)
+        throw missingOperator(pgName(lName), op, pgName(rName));
+    }
+
+    /** The 42883 PostgreSQL raises when no operator of that name takes that pair of types. */
+    private MemgresException missingOperator(String lName, BinaryExpr.BinOp op, String rName) {
+        return new MemgresException("operator does not exist: " + lName + " "
+                + resolvedOperatorSymbol(op) + " " + rName
                 + "\n  Hint: No operator matches the given name and argument types."
                 + " You might need to add explicit type casts.", "42883");
     }
 
+    /** Runs the declaration-only rules for an operator the parser spelled some other way. */
+    void rejectUnresolvableOperator(BinaryExpr bin, RowContext ctx) {
+        rejectMissingEqualityOperator(bin, ctx);
+        rejectCrossCategoryOperator(bin, ctx);
+    }
+
     /**
-     * The type an operand is given by the query text itself — a cast or a literal — and nothing
-     * inferred. A column's type is deliberately not consulted: a derived column out of a subquery
-     * carries whatever type the engine defaulted it to, and rejecting an operator on the strength
-     * of that refuses SQL PostgreSQL runs, which is worse than the permissiveness being fixed.
+     * The type an operand is declared to have for the purpose of resolving an operator: what the
+     * query wrote down — a cast or a literal — or, for a column, the type its table declares.
+     *
+     * <p>A derived column is deliberately excluded. Out of a subquery, a CTE or a set-returning
+     * function a column carries whatever type the engine defaulted it to, which is text far more
+     * often than it should be; refusing an operator on the strength of that rejects SQL
+     * PostgreSQL runs — {@code sub.rn >= 1} over a window function, say — and that is a worse
+     * failure than the permissiveness this rule removes.
      */
-    private static String typeWrittenInQuery(Expression expr) {
+    String declaredTypeForResolution(Expression expr, RowContext ctx) {
         if (expr instanceof CastExpr) {
             String name = ((CastExpr) expr).typeName();
             return name == null ? null : name.toLowerCase().trim();
@@ -358,12 +482,33 @@ class BinaryOpEvaluator {
                 default: return null;
             }
         }
+        if (expr instanceof ColumnRef && ctx != null) {
+            ColumnRef ref = (ColumnRef) expr;
+            for (RowContext.TableBinding b : ctx.getBindings()) {
+                if (!isBaseTable(b.table())) continue;
+                if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
+                        && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+                int idx = b.table().getColumnIndex(ref.column());
+                if (idx < 0) continue;
+                DataType t = b.table().getColumns().get(idx).getType();
+                return t == null ? null : t.getPgName();
+            }
+        }
         return null;
+    }
+
+    /**
+     * True when a binding is a table the catalogue actually holds, so its column types are the
+     * ones the user declared rather than ones the engine inferred while building a result.
+     */
+    private boolean isBaseTable(Table table) {
+        if (table == null || table.isFunctionResult() || table.isViewProjection()) return false;
+        return executor.resolveTableSafe(table.getName()) == table;
     }
 
     private static boolean isArithmetic(BinaryExpr.BinOp op) {
         switch (op) {
-            case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE:
+            case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE: case MODULO: case POWER:
                 return true;
             default:
                 return false;
@@ -375,6 +520,7 @@ class BinaryOpEvaluator {
         String t = typeName.toLowerCase().trim();
         int paren = t.indexOf('(');
         if (paren > 0) t = t.substring(0, paren).trim();
+        if (t.endsWith("[]")) return null;
         switch (t) {
             case "text": case "varchar": case "character varying": case "char":
             case "character": case "bpchar": case "name":
@@ -382,6 +528,7 @@ class BinaryOpEvaluator {
             case "smallint": case "integer": case "int": case "int2": case "int4": case "int8":
             case "bigint": case "numeric": case "decimal": case "real": case "double precision":
             case "float4": case "float8":
+            case "serial": case "bigserial": case "smallserial":
                 return TypeFamily.NUMERIC;
             case "boolean": case "bool":
                 return TypeFamily.BOOLEAN;
@@ -389,8 +536,23 @@ class BinaryOpEvaluator {
                 // json alone: it carries no comparison operators at all, not even equality.
                 // jsonb does have them, so it is deliberately left out of this rule.
                 return TypeFamily.JSON;
+            case "date": case "timestamp": case "timestamptz":
+            case "timestamp without time zone": case "timestamp with time zone":
+                // PostgreSQL really does compare a date with a timestamp, so they share a family
+                return TypeFamily.DATETIME;
+            case "time": case "timetz":
+            case "time without time zone": case "time with time zone":
+                return TypeFamily.TIMEOFDAY;
+            case "interval":
+                return TypeFamily.INTERVAL;
+            case "uuid":
+                return TypeFamily.UUID;
+            case "inet": case "cidr":
+                return TypeFamily.NETWORK;
+            case "bytea":
+                return TypeFamily.BYTES;
             default:
-                // Dates, intervals, arrays, geometry, ranges and the rest have their own operator
+                // Arrays, geometry, ranges, enums, domains and the rest have their own operator
                 // sets and cross-type rules; guessing at them would reject SQL PostgreSQL accepts.
                 return null;
         }
@@ -400,15 +562,19 @@ class BinaryOpEvaluator {
     private static String pgName(String typeName) {
         String t = typeName.toLowerCase().trim();
         switch (t) {
-            case "int": case "int4": return "integer";
-            case "int2": return "smallint";
-            case "int8": return "bigint";
+            case "int": case "int4": case "serial": return "integer";
+            case "int2": case "smallserial": return "smallint";
+            case "int8": case "bigserial": return "bigint";
             case "float8": return "double precision";
             case "float4": return "real";
             case "varchar": return "character varying";
             case "char": case "bpchar": return "character";
             case "bool": return "boolean";
             case "decimal": return "numeric";
+            case "timestamp": return "timestamp without time zone";
+            case "timestamptz": return "timestamp with time zone";
+            case "time": return "time without time zone";
+            case "timetz": return "time with time zone";
             default: return t;
         }
     }
@@ -540,6 +706,7 @@ class BinaryOpEvaluator {
         // read: PostgreSQL reports the operator it could not find even when that literal is text
         // the type could never have parsed.
         rejectMissingEqualityOperator(bin, ctx);
+        rejectCrossCategoryOperator(bin, ctx);
 
         Object left = executor.evalExpr(bin.left(), ctx);
         Object right = executor.evalExpr(bin.right(), ctx);
@@ -547,7 +714,8 @@ class BinaryOpEvaluator {
         // A bare string literal has no type of its own. PostgreSQL resolves it against the other
         // operand; guessing from its shape instead picks a type the query never mentioned, which
         // is how '192.168.1.1' next to an inet came out as a point.
-        String resolveTo = untypedLiteralTargetType(bin, ctx);
+        String resolveTo = dateTimeLiteralTarget(bin, ctx);
+        if (resolveTo == null) resolveTo = untypedLiteralTargetType(bin, ctx);
         if (resolveTo != null) {
             if (isUntypedStringLiteral(bin.left())) {
                 checkMultirangeLiteral(bin.op(), resolveTo, left);
@@ -558,9 +726,35 @@ class BinaryOpEvaluator {
             }
         }
 
-        rejectCrossCategoryOperator(bin, ctx);
         rejectRangeElementTypeMismatch(bin, ctx);
         rejectPhantomOperator(bin, ctx, left, right);
+
+        // Two paths added are joined, not translated: the second operand is a path and not the
+        // point a value-level reading took it for. Only the declared types can say which of the
+        // two operators was written, since both shapes are stored as parenthesised point lists.
+        if (bin.op() == BinaryExpr.BinOp.ADD && "path".equals(declaredOperandType(bin.left(), ctx))
+                && ("path".equals(declaredOperandType(bin.right(), ctx))
+                    || isUntypedStringLiteral(bin.right()))) {
+            if (left == null || right == null) return null;
+            return GeometricOperations.pathConcat(left.toString(), right.toString());
+        }
+
+        // A range has no || of its own, so PostgreSQL resolves the one written beside it to
+        // anynonarray || text and answers with the two spellings run together. Two declared
+        // ranges leave nothing for that rule to reach, and PostgreSQL says so.
+        if (bin.op() == BinaryExpr.BinOp.CONCAT) {
+            String lRange = declaredRangeTypeStrict(bin.left(), ctx);
+            String rRange = declaredRangeTypeStrict(bin.right(), ctx);
+            if (lRange != null && rRange != null) {
+                throw new MemgresException("operator does not exist: " + lRange + " || " + rRange
+                        + "\n  Hint: No operator matches the given name and argument types."
+                        + " You might need to add explicit type casts.", "42883");
+            }
+            if (lRange != null || rRange != null) {
+                if (left == null || right == null) return null;
+                return left.toString() + right.toString();
+            }
+        }
 
         // A range is stored as its text, so the values alone cannot tell one from a pair of dotted
         // numbers -- which is how numrange * numrange came out as inet * inet. Where the query
@@ -1994,6 +2188,13 @@ class BinaryOpEvaluator {
      * The range or multirange type an operand is declared to have. An untyped literal has already
      * been read as the type opposite it by the time this runs, so it counts as that type too.
      */
+    /** The range type an operand states outright, with no resolution from the other side. */
+    private String declaredRangeTypeStrict(Expression expr, RowContext ctx) {
+        String declared = declaredOperandType(expr, ctx);
+        if (declared == null) return null;
+        return RANGE_TYPES.contains(declared) || MULTIRANGE_TYPES.contains(declared) ? declared : null;
+    }
+
     private String declaredRangeType(Expression expr, Expression other, RowContext ctx) {
         String declared = declaredOperandType(expr, ctx);
         if (declared == null && isUntypedStringLiteral(expr)) declared = declaredOperandType(other, ctx);
