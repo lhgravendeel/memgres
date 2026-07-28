@@ -202,7 +202,7 @@ class ExprEvaluator {
             if (val instanceof AstExecutor.PgRow) {
                 AstExecutor.PgRow row = (AstExecutor.PgRow) val;
                 if (typeName != null) {
-                    List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+                    List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
                     if (fields != null) {
                         for (int i = 0; i < fields.size(); i++) {
                             if (fields.get(i).name().equalsIgnoreCase(fieldName)) {
@@ -224,7 +224,7 @@ class ExprEvaluator {
             if (val instanceof String && ((String) val).startsWith("(") && ((String) val).endsWith(")")) {
                 String s = (String) val;
                 if (typeName != null) {
-                    List<CreateTypeStmt.CompositeField> fields = executor.database.getCompositeType(typeName);
+                    List<CreateTypeStmt.CompositeField> fields = executor.database.getRowType(typeName);
                     if (fields != null) {
                         String[] parts = executor.splitCompositeString(s.substring(1, s.length() - 1));
                         for (int i = 0; i < fields.size(); i++) {

@@ -425,7 +425,7 @@ public class AstExecutor {
         return compositeTypeHandler.splitCompositeString(inner);
     }
 
-    PgRow parseCompositeToRow(String s, String typeName) {
+    public PgRow parseCompositeToRow(String s, String typeName) {
         return compositeTypeHandler.parseCompositeToRow(s, typeName);
     }
 
