@@ -309,8 +309,9 @@ class TimezoneJdbcTest {
             }
 
             // Verify via extract(epoch)
+            // extract() answers a numeric of six fractional digits, so PG prints 0.000000
             String epochVal = scalar("SELECT extract(epoch FROM ts) FROM tz_epoch WHERE id = 1");
-            assertEquals("0", epochVal, "Epoch extract should be 0");
+            assertEquals("0.000000", epochVal, "Epoch extract should be 0");
         } finally {
             exec("DROP TABLE tz_epoch");
         }
