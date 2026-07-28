@@ -163,9 +163,12 @@ class DdlAlterActionParser {
                 parser.expectKeyword("SECURITY");
                 return new AlterTableStmt.EnableRls();
             }
-            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER
+            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER / ENABLE RULE
             parser.matchKeyword("REPLICA");
             parser.matchKeyword("ALWAYS");
+            if (parser.matchKeyword("RULE")) {
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), true);
+            }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL
             return new AlterTableStmt.EnableTrigger(trigName);
@@ -176,7 +179,10 @@ class DdlAlterActionParser {
                 parser.expectKeyword("SECURITY");
                 return new AlterTableStmt.DisableRls();
             }
-            // DISABLE TRIGGER
+            // DISABLE RULE suspends a rule; without it the only way to stop one is to drop it.
+            if (parser.matchKeyword("RULE")) {
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), false);
+            }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL
             return new AlterTableStmt.DisableTrigger(trigName);

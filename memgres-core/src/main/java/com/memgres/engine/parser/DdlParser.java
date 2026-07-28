@@ -62,7 +62,7 @@ class DdlParser {
         if (parser.matchKeyword("FUNCTION")) return functionParser.parseCreateFunction(orReplace, false);
         if (parser.matchKeyword("PROCEDURE")) return functionParser.parseCreateFunction(orReplace, true);
         if (parser.matchKeyword("TRIGGER")) return parseCreateTrigger(orReplace);
-        if (parser.matchKeywords("CONSTRAINT", "TRIGGER")) return parseCreateTrigger(false);
+        if (parser.matchKeywords("CONSTRAINT", "TRIGGER")) return parseCreateTrigger(false, true);
         if (parser.matchKeyword("EXTENSION")) return parseCreateExtension();
         if (parser.matchKeyword("INDEX")) return indexParser.parseCreateIndex(unique, false);
         if (parser.matchKeyword("VIEW")) return parseCreateView(orReplace, false);
@@ -90,7 +90,7 @@ class DdlParser {
         if (orReplace && parser.matchKeyword("VIEW")) return parseCreateView(true, false);
         if (orReplace && parser.matchKeyword("TRIGGER")) return parseCreateTrigger(true);
         if (parser.matchKeyword("GROUP")) return roleParser.parseCreateRole(false);
-        if (parser.matchKeyword("RULE")) return parseCreateRule();
+        if (parser.matchKeyword("RULE")) return parseCreateRule(orReplace);
 
         if (parser.matchKeyword("AGGREGATE")) return parseCreateAggregate();
 
@@ -650,13 +650,26 @@ class DdlParser {
     // ---- CREATE TRIGGER ----
 
     CreateTriggerStmt parseCreateTrigger(boolean orReplace) {
+        return parseCreateTrigger(orReplace, false);
+    }
+
+    /**
+     * A constraint trigger is a deferred check on a completed row change, so PG's grammar admits
+     * only {@code AFTER ... FOR EACH ROW} — the other spellings are not a definition it rejects
+     * later but a sentence the grammar never had, which is why they come back as syntax errors.
+     */
+    CreateTriggerStmt parseCreateTrigger(boolean orReplace, boolean constraint) {
         String name = parser.readIdentifier();
 
+        Token timingToken = parser.peek();
         String timing;
         if (parser.matchKeyword("BEFORE")) timing = "BEFORE";
         else if (parser.matchKeyword("AFTER")) timing = "AFTER";
         else if (parser.matchKeywords("INSTEAD", "OF")) timing = "INSTEAD OF";
         else throw new ParseException("Expected BEFORE, AFTER, or INSTEAD OF", parser.peek());
+        if (constraint && !"AFTER".equals(timing)) {
+            throw new ParseException("syntax error at or near \"" + timingToken.value() + "\"", timingToken);
+        }
 
         List<String> events = new ArrayList<>();
         List<String> updateOfColumns = new ArrayList<>();
@@ -705,10 +718,14 @@ class DdlParser {
         parser.expectKeyword("FOR");
         parser.matchKeyword("EACH");
         boolean forEachRow = true;
+        Token levelToken = parser.peek();
         if (parser.matchKeyword("STATEMENT")) {
             forEachRow = false;
         } else {
             parser.expectKeyword("ROW");
+        }
+        if (constraint && !forEachRow) {
+            throw new ParseException("syntax error at or near \"" + levelToken.value() + "\"", levelToken);
         }
 
         String whenClause = null;
@@ -1097,19 +1114,29 @@ class DdlParser {
     }
 
     CreateRuleStmt parseCreateRule() {
+        return parseCreateRule(false);
+    }
+
+    CreateRuleStmt parseCreateRule(boolean orReplace) {
         String name = parser.readIdentifier();
         parser.expectKeyword("AS");
         parser.expectKeyword("ON");
+        Token eventToken = parser.peek();
         String event = parser.readIdentifier().toUpperCase();
+        if (!"SELECT".equals(event) && !"INSERT".equals(event)
+                && !"UPDATE".equals(event) && !"DELETE".equals(event)) {
+            throw new ParseException("unrecognized rule event", eventToken);
+        }
         parser.expectKeyword("TO");
         String table = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) table = parser.readIdentifier();
+        StringBuilder where = new StringBuilder();
         if (parser.matchKeyword("WHERE")) {
             int depth = 0;
             while (!parser.isAtEnd() && !(parser.checkKeyword("DO") && depth == 0)) {
                 if (parser.check(TokenType.LEFT_PAREN)) depth++;
                 if (parser.check(TokenType.RIGHT_PAREN)) depth--;
-                parser.advance();
+                where.append(ruleCommandToken(parser.advance())).append(' ');
             }
         }
         parser.expectKeyword("DO");
@@ -1117,17 +1144,53 @@ class DdlParser {
         if (parser.matchKeyword("INSTEAD")) action = "INSTEAD";
         else if (parser.matchKeyword("ALSO")) action = "ALSO";
         else action = "ALSO";
-        String command;
+        List<String> commands = new ArrayList<>();
         if (parser.matchKeyword("NOTHING")) {
-            command = "NOTHING";
+            commands.add("NOTHING");
+        } else if (parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance();
+            parseRuleActionList(commands);
         } else {
             StringBuilder sb = new StringBuilder();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
                 sb.append(ruleCommandToken(parser.advance())).append(' ');
             }
-            command = sb.toString().trim();
+            if (sb.length() > 0) commands.add(sb.toString().trim());
         }
-        return new CreateRuleStmt(name, event, table, action, command);
+        return new CreateRuleStmt(name, event, table, action, commands,
+                where.length() == 0 ? null : where.toString().trim(), orReplace);
+    }
+
+    /**
+     * The parenthesised form of a rule action holds several statements separated by semicolons,
+     * so the closing parenthesis — not the first semicolon — ends the rule. Running off the end
+     * of the input means the parenthesis was never closed.
+     */
+    private void parseRuleActionList(List<String> commands) {
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        while (true) {
+            if (parser.isAtEnd()) throw PgErrors.syntax("syntax error at end of input");
+            if (depth == 0 && parser.check(TokenType.RIGHT_PAREN)) {
+                parser.advance();
+                break;
+            }
+            if (parser.check(TokenType.SEMICOLON)) {
+                parser.advance();
+                if (sb.length() > 0) {
+                    commands.add(sb.toString().trim());
+                    sb.setLength(0);
+                }
+                continue;
+            }
+            if (sb.length() == 0 && parser.checkKeyword("NOTHING")) {
+                throw new ParseException("NOTHING is not a rule action here", parser.peek());
+            }
+            if (parser.check(TokenType.LEFT_PAREN)) depth++;
+            else if (parser.check(TokenType.RIGHT_PAREN)) depth--;
+            sb.append(ruleCommandToken(parser.advance())).append(' ');
+        }
+        if (sb.length() > 0) commands.add(sb.toString().trim());
     }
 
     /**
