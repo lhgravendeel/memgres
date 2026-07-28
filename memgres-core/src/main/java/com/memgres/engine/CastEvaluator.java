@@ -322,73 +322,25 @@ class CastEvaluator {
         boolean isArrayCast = typeName.contains("[]");
         typeName = typeName.replace("[]", "").trim();
         if (isArrayCast) {
-            String valStr = val instanceof String ? ((String) val).trim() : null;
-            // Handle custom lower-bound array: "[lo:hi]={...}", preserved as-is for subscript access
-            if (valStr != null && valStr.matches("\\[\\d+:\\d+\\]=\\{.*\\}")) {
-                // Parse bounds and validate
-                int eqIdx = valStr.indexOf('=');
-                String boundsStr = valStr.substring(0, eqIdx);
-                String content = valStr.substring(eqIdx + 1);
-                String[] parts = boundsStr.substring(1, boundsStr.length() - 1).split(":");
-                int lo = Integer.parseInt(parts[0].trim());
-                int hi = Integer.parseInt(parts[1].trim());
-                List<String> elems = parseArrayElements(content.substring(1, content.length() - 1));
-                if (lo > hi && !elems.isEmpty()) {
-                    throw new MemgresException("array lower bound must be less than or equal to upper bound", "2202E");
-                }
-                if (lo > hi) throw new MemgresException("wrong number of array subscripts", "2202E");
-                // Return as special string preserving bounds info
-                return valStr;
-            }
-            // Parse PG array literal string like '{1,2,3}' into a List
+            // Text becomes an array by being written as an array literal, never by being one
+            // element of one: PG reads '3'::int[] as a literal and fails to parse it.
             List<?> list;
+            ArrayLiteral literal = null;
             if (val instanceof List<?>) {
                 list = (List<?>) val;
-            } else if (valStr != null && ArrayOperationHandler.isArrayLiteralText(valStr)) {
-                String inner = valStr.substring(1, valStr.length() - 1).trim();
-                if (inner.isEmpty()) {
-                    list = Cols.listOf();
-                } else if (inner.startsWith("{")) {
-                    // Nested array (2D+): split on top-level commas respecting brace depth
-                    list = parseTopLevelArrayElements(inner);
-                } else {
-                    // Flat array: parse respecting PG array-literal quoting rules (element
-                    // double-quotes and escapes must be stripped, e.g. {"api","direct"} as
-                    // produced by JDBC Connection.createArrayOf wire encoding). Raw mode:
-                    // keep each element's original text (no numeric typing) so the
-                    // per-element target-type cast below sees the exact spelling
-                    // ({01,02}::text[] must stay "01","02", not 1,2).
-                    list = executor.parsePostgresArrayLiteralRaw(valStr);
-                }
-            } else if (valStr != null) {
-                // Text becomes an array by being written as an array literal, never by being one
-                // element of one: PG reads '3'::int[] as a literal and fails to parse it.
-                throw new MemgresException("malformed array literal: \"" + val + "\"", "22P02");
+            } else if (val instanceof String) {
+                literal = ArrayLiteral.parse((String) val);
+                list = literal.elements();
             } else {
                 list = null;
             }
             if (list != null) {
-                String elemType = typeName;
-                List<Object> castList = new ArrayList<>();
-                for (Object elem : list) {
-                    if (elem == null) castList.add(null);
-                    else if (elem instanceof List<?>) {
-                        // Multidimensional array: recursively cast each sub-array
-                        castList.add(applyCast(elem, elemType + "[]"));
-                    } else {
-                        // Do not trim: quoted elements may carry significant leading/trailing
-                        // whitespace (already normalized by the parser above for unquoted ones).
-                        String elemStr = elem instanceof String ? (String) elem : elem.toString();
-                        // If the element is itself a sub-array literal (e.g., "{1,2}"), cast as
-                        // elemType[] -- but for json/jsonb, braces open an object, not an array
-                        boolean jsonElement = elemType.equals("json") || elemType.equals("jsonb");
-                        if (!jsonElement && elemStr.startsWith("{") && elemStr.endsWith("}")
-                                && elem instanceof String) {
-                            castList.add(applyCast(elemStr, elemType + "[]"));
-                        } else {
-                            castList.add(applyCast(elem instanceof String ? elemStr : elem, elemType));
-                        }
-                    }
+                // The literal parser hands back nested lists for nested braces, so a String element
+                // is only ever an element -- a quoted "{1,2}" stays that text rather than becoming
+                // a sub-array. A List arriving from elsewhere still needs the older reading.
+                List<Object> castList = castArrayElements(list, typeName, literal == null);
+                if (literal != null && literal.hasCustomLowerBounds()) {
+                    return literal.boundsPrefix() + TypeCoercion.formatPgArray(castList);
                 }
                 return castList;
             }
@@ -785,14 +737,11 @@ class CastEvaluator {
                     return "{" + parsed.toString() + "}";
                 }
                 if (s.equalsIgnoreCase("empty")) return "{}";
-                // Multirange literal validation and canonicalization
-                if (!s.startsWith("{") || !s.endsWith("}")) throw new MemgresException("malformed multirange literal: \"" + s + "\"", "22P02");
-                String inner = s.substring(1, s.length() - 1);
-                if (inner.isEmpty()) return "{}";
-                // Parse, validate, and canonicalize (sort + merge overlapping)
+                // Multirange literal validation and canonicalization. The error names the value as
+                // it was written, whitespace and all, so the untrimmed text is what is read.
                 java.util.List<RangeOperations.PgRange> parsed = new java.util.ArrayList<>();
-                for (String part : inner.split(",(?=[\\[\\(])")) {
-                    RangeOperations.PgRange r = RangeOperations.parse(part.trim());
+                for (RangeOperations.PgRange r : RangeOperations.parseMultirangeLiteral(
+                        isTsMultirange ? s : val.toString())) {
                     if (!r.isEmpty()) parsed.add(r);
                 }
                 if (parsed.isEmpty()) return "{}";
@@ -1354,35 +1303,35 @@ class CastEvaluator {
     }
 
     /**
-     * Parse top-level elements from a nested array inner string like "{1,2},{3,4}".
-     * Splits on commas that are at brace depth 0 only.
+     * Cast every element of an array to the target element type.
+     *
+     * @param braceTextIsSubArray true when a String element spelled {@code {...}} should be read as
+     *        a nested array. Only values that reached here already parsed need that: the literal
+     *        parser has already told nesting apart from a quoted element that happens to look it.
      */
-    private static List<String> parseTopLevelArrayElements(String inner) {
-        List<String> result = new ArrayList<>();
-        int depth = 0;
-        int start = 0;
-        for (int i = 0; i < inner.length(); i++) {
-            char c = inner.charAt(i);
-            if (c == '{') depth++;
-            else if (c == '}') depth--;
-            else if (c == ',' && depth == 0) {
-                result.add(inner.substring(start, i).trim());
-                start = i + 1;
+    private List<Object> castArrayElements(List<?> list, String elemType,
+                                           boolean braceTextIsSubArray) {
+        List<Object> castList = new ArrayList<>();
+        for (Object elem : list) {
+            if (elem == null) {
+                castList.add(null);
+            } else if (elem instanceof List<?>) {
+                castList.add(castArrayElements((List<?>) elem, elemType, braceTextIsSubArray));
+            } else {
+                // Do not trim: quoted elements may carry significant leading/trailing whitespace
+                // (already normalized by the parser above for unquoted ones).
+                String elemStr = elem instanceof String ? (String) elem : elem.toString();
+                // For json/jsonb, braces open an object rather than a nested array
+                boolean jsonElement = elemType.equals("json") || elemType.equals("jsonb");
+                if (braceTextIsSubArray && !jsonElement && elem instanceof String
+                        && elemStr.startsWith("{") && elemStr.endsWith("}")) {
+                    castList.add(applyCast(elemStr, elemType + "[]"));
+                } else {
+                    castList.add(applyCast(elem instanceof String ? elemStr : elem, elemType));
+                }
             }
         }
-        result.add(inner.substring(start).trim());
-        return result;
-    }
-
-    /** Parse array elements from an inner string (between braces), handling quoted strings. */
-    private static List<String> parseArrayElements(String inner) {
-        List<String> result = new ArrayList<>();
-        if (inner == null || inner.trim().isEmpty()) return result;
-        // Simple split by comma (doesn't handle quoted strings perfectly but works for basic cases)
-        for (String part : inner.split(",", -1)) {
-            result.add(part.trim());
-        }
-        return result;
+        return castList;
     }
 
     /** Strip trailing zeros from the fractional-seconds part of a formatted timestamp/time string. */

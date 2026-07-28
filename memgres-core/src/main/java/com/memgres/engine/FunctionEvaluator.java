@@ -1063,14 +1063,9 @@ class FunctionEvaluator {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 int dim2 = fn.args().size() > 1 ? executor.toInt(executor.evalExpr(fn.args().get(1), ctx)) : 1;
                 if (dim2 < 1) return null;
-                // Handle custom lower-bound arrays: "[lb:ub]={...}" format
-                if (arr instanceof String && ((String) arr).matches("\\[\\d+:\\d+\\]=\\{.*\\}")) {
-                    String s = (String) arr;
-                    int eqIdx = s.indexOf('=');
-                    String boundsStr = s.substring(0, eqIdx);
-                    String[] parts = boundsStr.substring(1, boundsStr.length() - 1).split(":");
-                    if (dim2 == 1) return Integer.parseInt(parts[1].trim());
-                    return null;
+                int[][] upperBounds = arr instanceof String ? ArrayLiteral.statedBounds((String) arr) : null;
+                if (upperBounds != null) {
+                    return dim2 <= upperBounds[1].length ? (Object) upperBounds[1][dim2 - 1] : null;
                 }
                 if (arr instanceof List<?>) {
                     List<?> list = (List<?>) arr;
@@ -1094,14 +1089,9 @@ class FunctionEvaluator {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 int dim2 = fn.args().size() > 1 ? executor.toInt(executor.evalExpr(fn.args().get(1), ctx)) : 1;
                 if (dim2 < 1) return null;
-                // Handle custom lower-bound arrays: "[lb:ub]={...}" format
-                if (arr instanceof String && ((String) arr).matches("\\[\\d+:\\d+\\]=\\{.*\\}")) {
-                    String s = (String) arr;
-                    int eqIdx = s.indexOf('=');
-                    String boundsStr = s.substring(0, eqIdx);
-                    String[] parts = boundsStr.substring(1, boundsStr.length() - 1).split(":");
-                    if (dim2 == 1) return Integer.parseInt(parts[0].trim());
-                    return null;
+                int[][] lowerBounds = arr instanceof String ? ArrayLiteral.statedBounds((String) arr) : null;
+                if (lowerBounds != null) {
+                    return dim2 <= lowerBounds[0].length ? (Object) lowerBounds[0][dim2 - 1] : null;
                 }
                 if (arr instanceof List<?> && !((List<?>) arr).isEmpty()) {
                     List<?> list = (List<?>) arr;
@@ -1122,6 +1112,8 @@ class FunctionEvaluator {
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
+                int[][] ndimsBounds = arr instanceof String ? ArrayLiteral.statedBounds((String) arr) : null;
+                if (ndimsBounds != null) return ndimsBounds[0].length;
                 String s = arr instanceof String ? (String) arr : TypeCoercion.formatPgArray(arr instanceof List<?> ? (List<?>) arr : Cols.listOf(arr));
                 if (!s.startsWith("{")) return null;
                 int dims = 0;
@@ -1132,35 +1124,61 @@ class FunctionEvaluator {
                 return dims;
             }
             case "array_fill": {
-                Object fillVal = executor.evalExpr(fn.args().get(0), ctx);
-                Object dimsArg = executor.evalExpr(fn.args().get(1), ctx);
-                if (dimsArg == null) return null;
-                List<?> dimsList;
-                if (dimsArg instanceof List<?>) dimsList = (List<?>) dimsArg;
-                else if (dimsArg instanceof String && ((String) dimsArg).startsWith("{")) dimsList = parseSimplePgArray((String) dimsArg);
-                else return null;
-                String filled = buildFilledArray(fillVal, dimsList, 0);
-                if (fn.args().size() > 2) {
-                    Object lbArg = executor.evalExpr(fn.args().get(2), ctx);
-                    if (lbArg != null) {
-                        List<?> lbList;
-                        if (lbArg instanceof List<?>) lbList = (List<?>) lbArg;
-                        else if (lbArg instanceof String && ((String) lbArg).startsWith("{")) lbList = parseSimplePgArray((String) lbArg);
-                        else lbList = null;
-                        if (lbList != null) {
-                            StringBuilder prefix = new StringBuilder();
-                            for (int di = 0; di < dimsList.size(); di++) {
-                                int lb = di < lbList.size() ? ((Number) lbList.get(di)).intValue() : 1;
-                                int dimSize = ((Number) dimsList.get(di)).intValue();
-                                int ub = lb + dimSize - 1;
-                                prefix.append("[").append(lb).append(":").append(ub).append("]");
-                            }
-                            prefix.append("=");
-                            filled = prefix.toString() + filled;
-                        }
+                // array_fill is polymorphic in its first argument, so that argument has to have a
+                // type of its own -- a bare literal or NULL names none and PG cannot pick one.
+                if (fn.args().get(0) instanceof Literal) {
+                    Literal.LiteralType lt = ((Literal) fn.args().get(0)).literalType();
+                    if (lt == Literal.LiteralType.STRING || lt == Literal.LiteralType.NULL) {
+                        throw new MemgresException("could not determine polymorphic type because"
+                                + " input has type unknown", "42804");
                     }
                 }
-                return filled;
+                Object fillVal = executor.evalExpr(fn.args().get(0), ctx);
+                Object dimsArg = executor.evalExpr(fn.args().get(1), ctx);
+                // Neither the dimensions nor the lower bounds are strict arguments: a null one is
+                // an error rather than a null result, because there is no array to build from it.
+                if (dimsArg == null) throw new MemgresException(
+                        "dimension array or low bound array cannot be null", "22004");
+                List<?> dimsList = arrayFillBounds(dimsArg);
+                if (dimsList == null) return null;
+                List<?> lbList = null;
+                if (fn.args().size() > 2) {
+                    Object lbArg = executor.evalExpr(fn.args().get(2), ctx);
+                    if (lbArg == null) throw new MemgresException(
+                            "dimension array or low bound array cannot be null", "22004");
+                    lbList = arrayFillBounds(lbArg);
+                    if (lbList == null) return null;
+                    if (lbList.size() != dimsList.size()) {
+                        throw new MemgresException("wrong number of array subscripts", "2202E");
+                    }
+                }
+                if (dimsList.size() > 6) {
+                    throw new MemgresException("number of array dimensions (" + dimsList.size()
+                            + ") exceeds the maximum allowed (6)", "54000");
+                }
+                for (int di = 0; di < dimsList.size(); di++) {
+                    if (dimsList.get(di) == null || (lbList != null && lbList.get(di) == null)) {
+                        throw new MemgresException("dimension values cannot be null", "22004");
+                    }
+                    // A negative extent is not an empty array: PG computes the element count from
+                    // it and reports the size check that count fails.
+                    if (((Number) dimsList.get(di)).intValue() < 0) {
+                        throw new MemgresException(
+                                "array size exceeds the maximum allowed (134217727)", "54000");
+                    }
+                }
+                if (dimsList.isEmpty()) return "{}";
+                String filled = buildFilledArray(fillVal, dimsList, 0);
+                StringBuilder prefix = new StringBuilder();
+                boolean customBounds = false;
+                for (int di = 0; di < dimsList.size(); di++) {
+                    int lb = lbList == null ? 1 : ((Number) lbList.get(di)).intValue();
+                    if (lb != 1) customBounds = true;
+                    int ub = lb + ((Number) dimsList.get(di)).intValue() - 1;
+                    prefix.append("[").append(lb).append(":").append(ub).append("]");
+                }
+                // The bounds prefix is only written when a bound is not the default 1
+                return customBounds ? prefix.append("=").append(filled).toString() : filled;
             }
             case "trim_array": {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
@@ -1179,6 +1197,15 @@ class FunctionEvaluator {
                 requireDeclaredArrayArg(fn.args().get(0));
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr == null) return null;
+                int[][] statedDims = arr instanceof String ? ArrayLiteral.statedBounds((String) arr) : null;
+                if (statedDims != null) {
+                    StringBuilder stated = new StringBuilder();
+                    for (int di = 0; di < statedDims[0].length; di++) {
+                        stated.append('[').append(statedDims[0][di]).append(':')
+                                .append(statedDims[1][di]).append(']');
+                    }
+                    return stated.toString();
+                }
                 List<?> list = null;
                 if (arr instanceof List<?>) list = (List<?>) arr;
                 else if (arr instanceof String && ((String) arr).startsWith("{")) {
@@ -1259,7 +1286,7 @@ class FunctionEvaluator {
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr instanceof List<?>) return countLeafElements((List<?>) arr);
                 if (arr != null) {
-                    String s = arr.toString().trim();
+                    String s = pgArrayBody(arr.toString());
                     if (s.equals("{}")) return 0;
                     if (s.startsWith("{") && s.endsWith("}")) {
                         // Quote-aware count (commas inside quoted elements are not separators)
@@ -3159,12 +3186,7 @@ class FunctionEvaluator {
 
     /** The {@code {...}} part of an array's text form, with any {@code [lb:ub]=} prefix removed. */
     private static String pgArrayBody(String text) {
-        String s = text.trim();
-        if (s.startsWith("[")) {
-            int eq = s.indexOf("]=");
-            if (eq > 0) return s.substring(eq + 2).trim();
-        }
-        return s;
+        return ArrayLiteral.body(text);
     }
 
     /** The keys an {@code ?|}/{@code ?&} style argument names, from a text[] value or its text form. */
@@ -3230,6 +3252,15 @@ class FunctionEvaluator {
         return sb.toString();
     }
 
+    /** An array_fill dimension or lower-bound argument as a list, or null when it is not one. */
+    private static List<?> arrayFillBounds(Object arg) {
+        if (arg instanceof List<?>) return (List<?>) arg;
+        if (arg instanceof String && ((String) arg).startsWith("{")) {
+            return parseSimplePgArray((String) arg);
+        }
+        return null;
+    }
+
     /** Count elements in a PG array inner string, respecting quoted strings and braces. */
     static int countArrayElements(String inner) {
         if (inner.isEmpty()) return 0;
@@ -3260,7 +3291,9 @@ class FunctionEvaluator {
      */
     static List<Object> parseSimplePgArray(String s) {
         if (s == null) return Cols.listOf();
-        s = s.trim();
+        // An array with a lower bound other than 1 carries it in front of the braces; the elements
+        // themselves are written the same way, so the bounds are simply skipped here.
+        s = pgArrayBody(s);
         if (!s.startsWith("{") || !s.endsWith("}")) return Cols.listOf();
         int[] pos = {1};
         return parsePgArrayBody(s, pos);

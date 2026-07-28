@@ -172,8 +172,10 @@ class PgWireValueFormatter {
                     sb.append("\"").append(rowStr.replace("\"", "\\\"")).append("\"");
                 } else if (elem instanceof String) {
                     String s = (String) elem;
-                    if (s.startsWith("(") || s.contains(",") || s.contains("{") || s.contains("}") || s.contains("\"") || s.contains(" ") || s.isEmpty()) {
-                        sb.append("\"").append(s.replace("\"", "\\\"")).append("\"");
+                    // A backslash and the word NULL have to be quoted too: unquoted they read back
+                    // as an escape and as the SQL null, so the array would not survive a round trip.
+                    if (s.startsWith("(") || needsArrayQuote(s)) {
+                        sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
                     } else {
                         sb.append(s);
                     }
