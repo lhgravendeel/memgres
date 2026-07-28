@@ -429,9 +429,18 @@ class SelectWindowEvaluator {
             if (wf.distinct()) {
                 throw PgErrors.notImplemented("DISTINCT is not implemented for window functions");
             }
+            rejectOverOnPlainFunction(wf);
             for (Expression arg : wf.args()) {
                 if (select.containsWindowFunction(arg)) {
                     throw new MemgresException("window function calls cannot be nested", "42P20");
+                }
+                if (SelectExecutor.containsSrf(arg)) {
+                    MemgresException e = new MemgresException(
+                            "window function calls cannot contain set-returning function calls",
+                            "0A000");
+                    e.setHint("You might be able to move the set-returning function "
+                            + "into a LATERAL FROM item.");
+                    throw e;
                 }
             }
             if (wf.partitionBy() != null) {
@@ -450,6 +459,18 @@ class SelectWindowEvaluator {
             }
             validateFrame(resolveNamedWindow(wf, defs), bindings);
         }
+    }
+
+    /**
+     * OVER says "compute this over the rows of a window", which only a window function or an
+     * aggregate can be asked to do. Written on anything else it is not a missing function but a
+     * clause the function has no use for, and PostgreSQL says so rather than answering NULL.
+     */
+    private void rejectOverOnPlainFunction(WindowFuncExpr wf) {
+        String name = FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase());
+        if (PlacementCheck.isWindowFunctionName(name) || select.isAggregateFunction(name)) return;
+        throw new MemgresException("OVER specified, but " + name
+                + " is not a window function nor an aggregate function", "42809");
     }
 
     /**

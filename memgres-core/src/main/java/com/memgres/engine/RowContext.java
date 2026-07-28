@@ -154,6 +154,22 @@ public class RowContext {
     }
 
     /**
+     * A second context over the same row, whose bound values can be set independently of this
+     * one's. Used where one input row has to stand for several output rows -- a set-returning
+     * call in GROUP BY or ORDER BY produces one row per element and each needs its own binding.
+     */
+    public RowContext copy() {
+        RowContext copy = new RowContext(bindings);
+        copy.outerJoinNullPadded = outerJoinNullPadded;
+        copy.usingColumns = usingColumns;
+        copy.columnAliases = columnAliases;
+        if (boundValues != null) {
+            copy.boundValues = new java.util.IdentityHashMap<>(boundValues);
+        }
+        return copy;
+    }
+
+    /**
      * Find the binding for a given table name or alias. Follows PG scoping: an alias
      * hides the table's real name, so "SELECT pg_type.x FROM pg_type te" must NOT bind
      * the inner scan — the qualified reference either correlates to an outer query

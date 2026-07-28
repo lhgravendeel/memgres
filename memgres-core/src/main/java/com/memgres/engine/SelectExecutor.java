@@ -1149,9 +1149,8 @@ class SelectExecutor {
                 } else {
                     resultColumns.add(buildProjectedColumn(alias, expr, baseBindings));
                 }
-                FunctionCallExpr srfNode = findSrfCall(expr);
-                if (srfNode != null) {
-                    projections.add(ctx -> evalSrfExpandedTarget(expr, srfNode, ctx));
+                if (findSrfCall(expr) != null) {
+                    projections.add(ctx -> evalSrfExpandedTarget(expr, ctx));
                 } else {
                     projections.add(ctx -> executor.evalExpr(expr, ctx));
                 }
@@ -1456,7 +1455,7 @@ class SelectExecutor {
             DataType resultType = executor.inferExprType(target.expr());
             FunctionCallExpr srfNode = findSrfCall(target.expr());
             Object val = srfNode != null
-                    ? evalSrfExpandedTarget(target.expr(), srfNode, srfHostCtx)
+                    ? evalSrfExpandedTarget(target.expr(), srfHostCtx)
                     : executor.evalExpr(target.expr(), null);
             if (val instanceof byte[] && resultType == DataType.TEXT) {
                 resultType = DataType.BYTEA;
@@ -1592,23 +1591,69 @@ class SelectExecutor {
     }
 
     /**
-     * A set-returning function may only sit in the FROM clause or at the top of a select-list
-     * expression. PG rejects one buried in a conditional (which arm's rows would it produce?)
-     * or in a clause that filters rows rather than producing them.
+     * A set-returning function produces rows, so it may sit anywhere rows are still being
+     * produced -- the FROM clause, a select-list expression, GROUP BY, ORDER BY -- and nowhere
+     * that reads rows already produced. WHERE and a JOIN condition decide whether to keep a row
+     * and HAVING whether to keep a group, so neither has a set to expand; LIMIT and OFFSET are
+     * read once for the whole query. PG also refuses one buried in a conditional, since which
+     * arm's rows it would produce is undecidable.
      */
     private static void rejectMisplacedSrfs(SelectStmt stmt) {
         if (stmt.where() != null && containsSrf(stmt.where())) throw misplacedSrf("WHERE");
         if (stmt.having() != null && containsSrf(stmt.having())) throw misplacedSrf("HAVING");
-        if (stmt.groupBy() != null) {
-            for (Expression g : stmt.groupBy()) {
-                if (containsSrf(g)) throw misplacedSrf("GROUP BY");
-            }
-        }
+        if (stmt.limit() != null && containsSrf(stmt.limit())) throw misplacedSrf("LIMIT");
+        if (stmt.offset() != null && containsSrf(stmt.offset())) throw misplacedSrf("OFFSET");
+        rejectSrfsInJoinConditions(stmt.from());
         if (stmt.targets() != null) {
             for (SelectStmt.SelectTarget t : stmt.targets()) {
+                rejectSrfWhereOneBooleanIsWanted(t.expr());
                 String construct = conditionalHidingSrf(t.expr());
                 if (construct != null) throw misplacedSrf(construct);
             }
+        }
+    }
+
+    /**
+     * Somewhere that wants one boolean and gets a set, PostgreSQL names the kind of value rather
+     * than the placement rule: a WHEN condition, and either side of AND, OR and NOT (BETWEEN
+     * among them, which is an AND once written out). An SRF elsewhere in the same constructs --
+     * a CASE operand or result -- is the placement rule again and reported so.
+     */
+    private static void rejectSrfWhereOneBooleanIsWanted(Expression expr) {
+        Object found = AstWalk.findFirst(expr, node -> {
+            if (node instanceof CaseExpr) {
+                for (CaseExpr.WhenClause when : ((CaseExpr) node).whenClauses()) {
+                    if (containsSrf(when.condition())) return true;
+                }
+                return false;
+            }
+            if (node instanceof BetweenExpr) return containsSrf(node);
+            if (node instanceof BinaryExpr) {
+                BinaryExpr bin = (BinaryExpr) node;
+                if (bin.op() != BinaryExpr.BinOp.AND && bin.op() != BinaryExpr.BinOp.OR) return false;
+                return containsSrf(bin.left()) || containsSrf(bin.right());
+            }
+            if (node instanceof UnaryExpr) {
+                UnaryExpr un = (UnaryExpr) node;
+                return un.op() == UnaryExpr.UnaryOp.NOT && containsSrf(un.operand());
+            }
+            return false;
+        });
+        if (found == null) return;
+        String construct = found instanceof CaseExpr ? "CASE/WHEN"
+                : found instanceof BetweenExpr ? "AND"
+                : found instanceof UnaryExpr ? "NOT"
+                : ((BinaryExpr) found).op().name();
+        throw new MemgresException("argument of " + construct + " must not return a set", "42804");
+    }
+
+    private static void rejectSrfsInJoinConditions(List<SelectStmt.FromItem> fromItems) {
+        if (fromItems == null) return;
+        for (SelectStmt.FromItem item : fromItems) {
+            if (!(item instanceof SelectStmt.JoinFrom)) continue;
+            SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
+            if (jf.on() != null && containsSrf(jf.on())) throw misplacedSrf("JOIN conditions");
+            rejectSrfsInJoinConditions(Cols.listOf(jf.left(), jf.right()));
         }
     }
 
@@ -1861,13 +1906,37 @@ class SelectExecutor {
         }
     }
 
+    /**
+     * As {@link #containsSrf}, over the functions this database was told about rather than the
+     * built-in list: a function declared {@code RETURNS SETOF} or {@code RETURNS TABLE} returns
+     * a set for the same reason and cannot be an aggregate's argument either.
+     *
+     * <p>One returning bare {@code record} is left out. Its columns have no names until a caller
+     * supplies them, and a call written without them -- which is the only way one reaches an
+     * aggregate -- fails on the column before the set: PostgreSQL answers
+     * {@code could not identify column "y" in record data type}, and so does this.
+     */
+    private boolean containsUserSrf(Object node) {
+        if (node == null || node instanceof Statement) return false;
+        if (node instanceof FunctionCallExpr) {
+            PgFunction f = executor.database.getFunction(
+                    FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) node).name().toLowerCase()));
+            if (f != null && f.isSetReturning() && !f.declaresRecordResult()) return true;
+        }
+        boolean[] found = {false};
+        AstWalk.forEachChild(node, child -> {
+            if (!found[0] && containsUserSrf(child)) found[0] = true;
+        });
+        return found[0];
+    }
+
     private void rejectSrfInAggregates(Object node) {
         if (node == null) return;
         if (node instanceof FunctionCallExpr) {
             FunctionCallExpr fc = (FunctionCallExpr) node;
             if (isAggregateFunction(fc.name())) {
                 for (Expression arg : fc.args()) {
-                    if (containsSrf(arg)) {
+                    if (containsSrf(arg) || containsUserSrf(arg)) {
                         MemgresException e = new MemgresException(
                                 "aggregate function calls cannot contain set-returning function calls", "0A000");
                         e.setHint("You might be able to move the set-returning function "
@@ -1955,11 +2024,13 @@ class SelectExecutor {
                 ((FunctionCallExpr) found).name().toLowerCase()).toUpperCase();
     }
 
-    /** True when a set-returning call appears anywhere under this node. */
+    /**
+     * True when a set-returning call appears under this node as part of the node's own row.
+     * One inside a nested query belongs to that query, so {@code WHERE x IN (SELECT
+     * generate_series(1,2))} is not a set-returning call in WHERE.
+     */
     static boolean containsSrf(Object node) {
-        return AstWalk.anyMatch(node, n -> n instanceof FunctionCallExpr
-                && SRF_FUNCTIONS.contains(
-                        FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) n).name().toLowerCase())));
+        return !collectSrfCalls(node).isEmpty();
     }
 
     /** Conditional constructs PG evaluates lazily, and so refuses to expand a set inside. */
@@ -1967,66 +2038,156 @@ class SelectExecutor {
             new HashSet<>(Arrays.asList("coalesce", "nullif", "greatest", "least"));
 
     /**
-     * Recursively searches an expression tree for a nested set-returning function call, e.g.
-     * the {@code generate_series(...)} inside {@code day_start + interval '1h' * generate_series(0,23,2)}.
-     * PostgreSQL only allows one SRF per expression, so the first one found is returned.
-     * Returns {@code null} if the expression contains no SRF call at all.
+     * The first set-returning call this expression evaluates as part of its own row, or null.
+     * Only used to decide whether the expanding evaluation path is needed at all;
+     * {@link #collectSrfCalls} is what the expansion itself works from.
      */
     static FunctionCallExpr findSrfCall(Expression expr) {
-        if (expr == null) return null;
-        if (expr instanceof FunctionCallExpr) {
-            FunctionCallExpr fc = (FunctionCallExpr) expr;
-            if (SRF_FUNCTIONS.contains(FunctionEvaluator.stripSchemaPrefix(fc.name().toLowerCase()))) return fc;
-            for (Expression arg : fc.args()) {
-                FunctionCallExpr found = findSrfCall(arg);
-                if (found != null) return found;
-            }
-            return null;
-        }
-        if (expr instanceof CastExpr) return findSrfCall(((CastExpr) expr).expr());
-        if (expr instanceof BinaryExpr) {
-            FunctionCallExpr found = findSrfCall(((BinaryExpr) expr).left());
-            if (found != null) return found;
-            return findSrfCall(((BinaryExpr) expr).right());
-        }
-        if (expr instanceof UnaryExpr) return findSrfCall(((UnaryExpr) expr).operand());
-        if (expr instanceof com.memgres.engine.parser.ast.FieldAccessExpr) {
-            return findSrfCall(((com.memgres.engine.parser.ast.FieldAccessExpr) expr).expr());
-        }
-        if (expr instanceof CompositeStarExpr) {
-            return findSrfCall(((CompositeStarExpr) expr).expr());
-        }
-        return null;
+        List<FunctionCallExpr> found = collectSrfCalls(expr);
+        return found.isEmpty() ? null : found.get(0);
     }
 
     /**
-     * Evaluates a SELECT-list target expression that contains (possibly nested) the given SRF
-     * call node, returning a {@code List<Object>} — one evaluated value of the full target
-     * expression per element the SRF produces (PG 10+ ProjectSet semantics: an SRF anywhere in
-     * the SELECT list expands the whole row set, and every other part of that same target
-     * expression is (re)computed once per generated element, not copied verbatim).
+     * Every set-returning call this expression evaluates as part of its own row, in the order
+     * they are written.
+     *
+     * <p>Two boundaries make the list the right one to expand over. A call nested in another
+     * set-returning call's arguments is not collected: the enclosing call is what produces the
+     * row, and it runs once per element its argument yields. And the walk stops at a nested
+     * query, whose set-returning calls produce that query's rows and not this one's --
+     * {@code WHERE x IN (SELECT generate_series(1,2))} is ordinary SQL.
      */
-    private Object evalSrfExpandedTarget(Expression expr, FunctionCallExpr srfNode, RowContext ctx) {
-        Object srfRaw = executor.evalExpr(srfNode, ctx);
-        if (!(srfRaw instanceof List<?>)) {
-            // Defensive fallback: shouldn't happen since srfNode's name is a known SRF.
-            return executor.evalExpr(expr, ctx);
+    static List<FunctionCallExpr> collectSrfCalls(Object node) {
+        List<FunctionCallExpr> found = new ArrayList<>();
+        collectSrfCalls(node, found);
+        return found;
+    }
+
+    private static void collectSrfCalls(Object node, List<FunctionCallExpr> out) {
+        if (node == null || node instanceof Statement) return;
+        if (node instanceof FunctionCallExpr
+                && SRF_FUNCTIONS.contains(FunctionEvaluator.stripSchemaPrefix(
+                        ((FunctionCallExpr) node).name().toLowerCase()))) {
+            out.add((FunctionCallExpr) node);
+            return;
         }
-        List<?> elements = (List<?>) srfRaw;
-        if (srfNode == expr) {
-            // Bare top-level SRF target: the raw element list already IS the per-row values.
-            return elements;
+        AstWalk.forEachChild(node, child -> collectSrfCalls(child, out));
+    }
+
+    /**
+     * Evaluates a SELECT-list target expression containing set-returning calls, returning a
+     * {@code List<Object>} of one value of the whole expression per row it produces.
+     *
+     * <p>PostgreSQL runs the set-returning calls of one expression side by side rather than
+     * one inside the other: the row count is the longest of them and the shorter ones read NULL
+     * past their end, so {@code generate_series(1,2) + generate_series(10,12)} answers 11, 13
+     * and NULL. Everything else in the expression is recomputed once per row rather than copied.
+     */
+    private Object evalSrfExpandedTarget(Expression expr, RowContext ctx) {
+        List<FunctionCallExpr> srfs = collectSrfCalls(expr);
+        if (srfs.isEmpty()) return executor.evalExpr(expr, ctx);
+        List<List<Object>> sets = new ArrayList<>(srfs.size());
+        for (FunctionCallExpr srf : srfs) {
+            List<Object> values = srfValues(srf, ctx);
+            // Defensive: a call named like an SRF that did not answer a set expands nothing.
+            if (values == null) return executor.evalExpr(expr, ctx);
+            sets.add(values);
         }
-        List<Object> results = new ArrayList<>(elements.size());
-        for (Object element : elements) {
-            ctx.setBoundValue(srfNode, element);
+        if (srfs.size() == 1 && srfs.get(0) == expr) return sets.get(0);
+        int rows = 0;
+        for (List<Object> set : sets) rows = Math.max(rows, set.size());
+        List<Object> results = new ArrayList<>(rows);
+        for (int i = 0; i < rows; i++) {
+            bindSrfElements(srfs, sets, i, ctx);
             try {
                 results.add(executor.evalExpr(expr, ctx));
             } finally {
-                ctx.clearBoundValue(srfNode);
+                for (FunctionCallExpr srf : srfs) ctx.clearBoundValue(srf);
             }
         }
         return results;
+    }
+
+    /**
+     * The elements one set-returning call produces. A set among its own arguments is expanded
+     * first and the call runs once per element of it, its answers laid end to end -- which is
+     * how {@code generate_series(generate_series(1,2), 4)} produces 1,2,3,4 then 2,3,4.
+     * Null when the call did not answer a set after all.
+     */
+    private List<Object> srfValues(FunctionCallExpr srf, RowContext ctx) {
+        List<FunctionCallExpr> argSrfs = new ArrayList<>();
+        for (Expression arg : srf.args()) collectSrfCalls(arg, argSrfs);
+        if (argSrfs.isEmpty()) {
+            Object raw = executor.evalExpr(srf, ctx);
+            return raw instanceof List<?> ? new ArrayList<Object>((List<?>) raw) : null;
+        }
+        List<List<Object>> sets = new ArrayList<>(argSrfs.size());
+        for (FunctionCallExpr argSrf : argSrfs) {
+            List<Object> values = srfValues(argSrf, ctx);
+            if (values == null) return null;
+            sets.add(values);
+        }
+        int rows = 0;
+        for (List<Object> set : sets) rows = Math.max(rows, set.size());
+        List<Object> out = new ArrayList<>();
+        for (int i = 0; i < rows; i++) {
+            bindSrfElements(argSrfs, sets, i, ctx);
+            try {
+                Object raw = executor.evalExpr(srf, ctx);
+                if (!(raw instanceof List<?>)) return null;
+                out.addAll((List<?>) raw);
+            } finally {
+                for (FunctionCallExpr argSrf : argSrfs) ctx.clearBoundValue(argSrf);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * One context per row the set-returning calls in {@code exprs} produce out of each input
+     * context, with every call bound to its element of that row.
+     *
+     * <p>PostgreSQL expands the sets of a query below its grouping, so a set-returning call in
+     * GROUP BY multiplies the rows first and the grouping then sees ordinary values:
+     * {@code SELECT count(*) FROM one_row GROUP BY generate_series(1,2)} answers two groups of
+     * one. The contexts are returned unchanged when no such call is written.
+     */
+    List<RowContext> expandContextsForSrfs(List<Expression> exprs, List<RowContext> contexts) {
+        if (exprs == null || exprs.isEmpty()) return contexts;
+        List<FunctionCallExpr> srfs = new ArrayList<>();
+        for (Expression expr : exprs) srfs.addAll(collectSrfCalls(expr));
+        if (srfs.isEmpty()) return contexts;
+        List<RowContext> expanded = new ArrayList<>();
+        for (RowContext ctx : contexts) {
+            List<List<Object>> sets = new ArrayList<>(srfs.size());
+            int rows = 0;
+            for (FunctionCallExpr srf : srfs) {
+                List<Object> values = srfValues(srf, ctx);
+                // Defensive: a call that did not answer a set leaves the row as it was.
+                if (values == null) { sets = null; break; }
+                sets.add(values);
+                rows = Math.max(rows, values.size());
+            }
+            if (sets == null) {
+                expanded.add(ctx);
+                continue;
+            }
+            for (int i = 0; i < rows; i++) {
+                RowContext copy = ctx.copy();
+                bindSrfElements(srfs, sets, i, copy);
+                expanded.add(copy);
+            }
+        }
+        return expanded;
+    }
+
+    /** Binds each call to its {@code i}th element, or to NULL where its set has run out. */
+    private static void bindSrfElements(List<FunctionCallExpr> srfs, List<List<Object>> sets,
+                                        int i, RowContext ctx) {
+        for (int k = 0; k < srfs.size(); k++) {
+            List<Object> set = sets.get(k);
+            ctx.setBoundValue(srfs.get(k), i < set.size() ? set.get(i) : null);
+        }
     }
 
     /**
