@@ -180,8 +180,9 @@ class SelectExecutor {
         // Validate column references against table schema
         boolean simpleFrom = stmt.from().stream().allMatch(f -> f instanceof SelectStmt.TableRef);
         boolean hasJoins = stmt.from().stream().anyMatch(f -> f instanceof SelectStmt.JoinFrom);
-        Set<String> usingColumnsLower = new java.util.HashSet<>();
-        collectUsingColumns(stmt.from(), usingColumnsLower);
+        Map<String, Integer> usingMerges = new java.util.LinkedHashMap<>();
+        collectUsingColumns(stmt.from(), usingMerges);
+        Set<String> usingColumnsLower = new java.util.HashSet<>(usingMerges.keySet());
         if (!contexts.isEmpty()) {
             Set<String> ctxUsing = contexts.get(0).getUsingColumns();
             if (ctxUsing != null) usingColumnsLower.addAll(ctxUsing);
@@ -196,7 +197,9 @@ class SelectExecutor {
                         for (RowContext.TableBinding b : baseBindings) {
                             if (b.table().getColumnIndex(cr.column()) >= 0) matchCount++;
                         }
-                        if (matchCount > 1 && !usingColumnsLower.contains(cr.column().toLowerCase())) {
+                        Integer merged = usingMerges.get(cr.column().toLowerCase());
+                        int distinctSources = merged == null ? matchCount : matchCount - merged.intValue();
+                        if (distinctSources > 1) {
                             throw new MemgresException("column reference \"" + cr.column() + "\" is ambiguous", "42702");
                         }
                         if (matchCount == 0) {
@@ -258,8 +261,15 @@ class SelectExecutor {
                             }
                             throw new MemgresException("missing FROM-clause entry for table \"" + cr.table() + "\"", "42P01");
                         }
-                        if (!colFound && !mayResolveViaAttributeNotation) {
-                            MemgresException colEx = new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
+                        // A column a join merged is still readable through the relation it came
+                        // from, so a qualified reference to it is valid even though the shape
+                        // this check reads has already merged the column away.
+                        boolean mergedAway = usingMerges.containsKey(cr.column().toLowerCase());
+                        if (!colFound && !mayResolveViaAttributeNotation && !mergedAway) {
+                            // A qualified reference is named in full, the way RowContext names it
+                            // when the same lookup fails at evaluation time.
+                            MemgresException colEx = new MemgresException(
+                                    "column " + cr.table() + "." + cr.column() + " does not exist", "42703");
                             for (RowContext.TableBinding b : baseBindings) {
                                 String hint = RowContext.suggestClosestColumn(cr.column(), b.table());
                                 if (hint != null) { colEx.setHint(hint); break; }
@@ -1512,18 +1522,45 @@ class SelectExecutor {
         return rows;
     }
 
-    private void collectUsingColumns(List<SelectStmt.FromItem> fromItems, Set<String> result) {
+    /**
+     * How many times each column name is merged away by a join, counting both the columns a
+     * USING clause names and the ones a NATURAL join finds for itself.
+     *
+     * <p>A merged column is one column of the join's output however many relations contributed
+     * to it, so a name that appears in three relations under two merges is not ambiguous — while
+     * the same name in three relations under one merge still is. Counting rather than
+     * remembering a set is what keeps {@code t JOIN u USING (s) JOIN v ON true} ambiguous, as
+     * PostgreSQL has it, while {@code t NATURAL JOIN u NATURAL JOIN v} resolves.
+     */
+    private void collectUsingColumns(List<SelectStmt.FromItem> fromItems, Map<String, Integer> result) {
         if (fromItems == null) return;
         for (SelectStmt.FromItem item : fromItems) {
             if (item instanceof SelectStmt.JoinFrom) {
                 SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
                 if (jf.using() != null) {
-                    for (String col : jf.using()) result.add(col.toLowerCase());
+                    for (String col : jf.using()) countMerge(result, col);
+                } else if (isNaturalJoin(jf.joinType())) {
+                    for (String col : FromJoinExecutor.commonColumns(
+                            executor.fromResolver.resolveItemShape(jf.left()),
+                            executor.fromResolver.resolveItemShape(jf.right()))) {
+                        countMerge(result, col);
+                    }
                 }
                 collectUsingColumns(Cols.listOf(jf.left()), result);
                 collectUsingColumns(Cols.listOf(jf.right()), result);
             }
         }
+    }
+
+    private static void countMerge(Map<String, Integer> result, String col) {
+        String key = col.toLowerCase();
+        Integer prior = result.get(key);
+        result.put(key, prior == null ? 1 : prior + 1);
+    }
+
+    private static boolean isNaturalJoin(SelectStmt.JoinType type) {
+        return type == SelectStmt.JoinType.NATURAL || type == SelectStmt.JoinType.NATURAL_LEFT
+                || type == SelectStmt.JoinType.NATURAL_RIGHT || type == SelectStmt.JoinType.NATURAL_FULL;
     }
 
     private boolean isSrfCall(Expression expr) {
@@ -1608,7 +1645,7 @@ class SelectExecutor {
      */
     private void validateFromClause(List<SelectStmt.FromItem> from) {
         if (from == null) return;
-        Map<String, String> exposed = new LinkedHashMap<>();
+        Map<String, SelectStmt.FromItem> exposed = new LinkedHashMap<>();
         for (SelectStmt.FromItem item : from) {
             collectAndValidate(item, exposed);
         }
@@ -1665,19 +1702,19 @@ class SelectExecutor {
      * would find the same clash, but by then the condition has already been judged.
      */
     void validateJoinNames(SelectStmt.JoinFrom join) {
-        collectAndValidate(join, new LinkedHashMap<String, String>());
+        collectAndValidate(join, new LinkedHashMap<String, SelectStmt.FromItem>());
     }
 
     /** Records the names {@code item} exposes to the query, validating it on the way down. */
-    private void collectAndValidate(SelectStmt.FromItem item, Map<String, String> exposed) {
+    private void collectAndValidate(SelectStmt.FromItem item, Map<String, SelectStmt.FromItem> exposed) {
         if (item instanceof SelectStmt.JoinFrom) {
             SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
-            Map<String, String> leftNames = new LinkedHashMap<>();
+            Map<String, SelectStmt.FromItem> leftNames = new LinkedHashMap<>();
             collectAndValidate(join.left(), leftNames);
-            Map<String, String> rightNames = new LinkedHashMap<>();
+            Map<String, SelectStmt.FromItem> rightNames = new LinkedHashMap<>();
             collectAndValidate(join.right(), rightNames);
-            for (String n : leftNames.values()) addExposed(exposed, n);
-            for (String n : rightNames.values()) addExposed(exposed, n);
+            for (SelectStmt.FromItem n : leftNames.values()) addExposed(exposed, n);
+            for (SelectStmt.FromItem n : rightNames.values()) addExposed(exposed, n);
             if (join.using() != null) {
                 Set<String> seen = new HashSet<>();
                 for (String col : join.using()) {
@@ -1690,14 +1727,34 @@ class SelectExecutor {
             rejectLateralAcrossNullableSide(join, leftNames);
             return;
         }
-        String name = exposedName(item);
-        if (name != null) addExposed(exposed, name);
+        addExposed(exposed, item);
     }
 
-    private static void addExposed(Map<String, String> exposed, String name) {
-        if (exposed.put(name.toLowerCase(), name) != null) {
+    private void addExposed(Map<String, SelectStmt.FromItem> exposed, SelectStmt.FromItem item) {
+        String name = exposedName(item);
+        if (name == null) return;
+        SelectStmt.FromItem prior = exposed.put(name.toLowerCase(), item);
+        if (prior != null && !separateRelationsOfOneName(prior, item)) {
             throw new MemgresException("table name \"" + name + "\" specified more than once", "42712");
         }
+    }
+
+    /**
+     * The one case SQL lets two FROM items share a name: both are relations written without an
+     * alias, and they are different relations. {@code FROM public.t, other.t} is legal because
+     * either can still be reached by writing its schema; give either an alias, or let one of them
+     * be a WITH query or a subquery, and the name becomes the only way to reach it and the clash
+     * is real.
+     */
+    private boolean separateRelationsOfOneName(SelectStmt.FromItem a, SelectStmt.FromItem b) {
+        if (!(a instanceof SelectStmt.TableRef) || !(b instanceof SelectStmt.TableRef)) return false;
+        SelectStmt.TableRef ta = (SelectStmt.TableRef) a;
+        SelectStmt.TableRef tb = (SelectStmt.TableRef) b;
+        if (ta.alias() != null || tb.alias() != null) return false;
+        if (lookupCte(ta.table()) != null || lookupCte(tb.table()) != null) return false;
+        String sa = ta.schema() != null ? ta.schema() : executor.defaultSchema();
+        String sb = tb.schema() != null ? tb.schema() : executor.defaultSchema();
+        return !sa.equalsIgnoreCase(sb);
     }
 
     /** The name a FROM item answers to: its alias, or failing that the relation's own name. */
@@ -1722,7 +1779,7 @@ class SelectExecutor {
      * when it is evaluated the rows it would read from are not yet determined.
      */
     private static void rejectLateralAcrossNullableSide(SelectStmt.JoinFrom join,
-                                                       Map<String, String> leftNames) {
+                                                       Map<String, ?> leftNames) {
         SelectStmt.JoinType type = join.joinType();
         if (type != SelectStmt.JoinType.RIGHT && type != SelectStmt.JoinType.FULL
                 && type != SelectStmt.JoinType.NATURAL_RIGHT && type != SelectStmt.JoinType.NATURAL_FULL) {

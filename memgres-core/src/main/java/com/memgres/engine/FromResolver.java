@@ -17,6 +17,12 @@ class FromResolver {
     // Track the last resolved table info for LEFT JOIN null-padding when right side is empty
     Table lastResolvedRightTable;
     String lastResolvedRightAlias;
+    /**
+     * The WHERE of the query whose FROM is being resolved. A full join reads it: a WHERE that
+     * discards the null-padded rows makes the join an inner one, which lifts the restriction on
+     * what its condition may be. See {@code FromJoinExecutor.rejectUnmergeableFullJoin}.
+     */
+    Expression enclosingWhere;
 
     FromResolver(AstExecutor executor) {
         this.executor = executor;
@@ -30,6 +36,28 @@ class FromResolver {
         List<RowContext.TableBinding> bindings = new ArrayList<>();
         for (SelectStmt.FromItem item : fromItems) {
             resolveTableBindingsFromItem(item, bindings);
+        }
+        return bindings;
+    }
+
+    /**
+     * The names and columns a FROM item exposes, with every value null.
+     *
+     * <p>An outer join has to name-pad the side that contributed nothing: the whole point of
+     * {@code t1 RIGHT JOIN t2} is to answer with NULLs where {@code t1} has no match, and those
+     * rows must still answer to {@code t1}'s name. Taking the shape from the first row of the
+     * side only works while the side has a row; when it is empty — because the relation is empty,
+     * because a subquery filtered everything away, or because the condition is never true — the
+     * shape has to come from the FROM item itself.
+     */
+    List<RowContext.TableBinding> resolveItemShape(SelectStmt.FromItem item) {
+        List<RowContext.TableBinding> bindings = new ArrayList<>();
+        try {
+            resolveTableBindingsFromItem(item, bindings);
+        } catch (RuntimeException e) {
+            // The shape is a convenience, not the answer: a FROM item that cannot be described
+            // (an unreadable lateral, say) leaves the padding as it was before.
+            return Cols.listOf();
         }
         return bindings;
     }
@@ -86,7 +114,21 @@ class FromResolver {
             SelectStmt.JoinFrom joinFrom = (SelectStmt.JoinFrom) item;
             resolveTableBindingsFromItem(joinFrom.left(), bindings);
             int beforeRight = bindings.size();
-            resolveTableBindingsFromItem(joinFrom.right(), bindings);
+            // A LATERAL item reads the names to its left, so describing it needs those names in
+            // scope even when they carry no row — otherwise the describe fails and the lateral
+            // alias goes missing from a query that answers with no rows at all.
+            boolean lateralRight = joinFrom.right() instanceof SelectStmt.SubqueryFrom
+                    && ((SelectStmt.SubqueryFrom) joinFrom.right()).lateral();
+            if (lateralRight) {
+                executor.outerContextStack.push(new RowContext(new ArrayList<>(bindings)));
+                try {
+                    resolveTableBindingsFromItem(joinFrom.right(), bindings);
+                } finally {
+                    executor.outerContextStack.pop();
+                }
+            } else {
+                resolveTableBindingsFromItem(joinFrom.right(), bindings);
+            }
             // Apply USING column dedup for SELECT * / RowDescription
             if (joinFrom.using() != null && !joinFrom.using().isEmpty()) {
                 Set<String> usingLower = new HashSet<>();
@@ -195,6 +237,16 @@ class FromResolver {
      * Resolve FROM clause with optional WHERE pushdown for early filtering during cross-product.
      */
     List<RowContext> resolveFromClause(List<SelectStmt.FromItem> fromItems, Expression where) {
+        Expression priorWhere = enclosingWhere;
+        enclosingWhere = where;
+        try {
+            return resolveFromClauseInner(fromItems, where);
+        } finally {
+            enclosingWhere = priorWhere;
+        }
+    }
+
+    private List<RowContext> resolveFromClauseInner(List<SelectStmt.FromItem> fromItems, Expression where) {
         if (fromItems.size() == 1) {
             // For single-table queries, try index scan optimization
             if (where != null && fromItems.get(0) instanceof SelectStmt.TableRef) {

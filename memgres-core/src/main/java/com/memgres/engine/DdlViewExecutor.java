@@ -13,7 +13,7 @@ import java.util.*;
 class DdlViewExecutor {
     /** Errors about the query itself rather than about the rows it happens to read. */
     private static final Set<String> ANALYSIS_ERRORS =
-            Cols.setOf("42803", "42P10", "42P20", "42601", "42809");
+            Cols.setOf("42803", "42P10", "42P20", "42601", "42809", "42712");
 
     private final DdlExecutor ddl;
     private final AstExecutor executor;

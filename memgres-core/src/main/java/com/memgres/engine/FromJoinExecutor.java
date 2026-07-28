@@ -44,28 +44,46 @@ class FromJoinExecutor {
 
         List<RowContext> rightContexts = fromResolver.resolveFromItem(join.right());
 
+        // The names each side answers to, whether or not it produced a row. An outer join pads
+        // the missing side with NULLs and those rows still carry that side's aliases.
+        List<RowContext.TableBinding> leftShape = shapeOf(join.left(), leftContexts);
+        List<RowContext.TableBinding> rightShape = shapeOf(join.right(), rightContexts);
+
+        if (join.joinType() == SelectStmt.JoinType.FULL) {
+            rejectUnmergeableFullJoin(join.on(), leftShape, rightShape);
+        }
+
         switch (join.joinType()) {
             case INNER:
                 return executeInnerJoin(leftContexts, rightContexts, join.on(), join.using());
             case LEFT:
-                return executeLeftJoin(leftContexts, rightContexts, join.on(), join.using());
+                return executeLeftJoin(leftContexts, rightContexts, join.on(), join.using(), rightShape);
             case RIGHT:
-                return executeRightJoin(leftContexts, rightContexts, join.on(), join.using());
+                return executeRightJoin(leftContexts, rightContexts, join.on(), join.using(), leftShape);
             case FULL:
-                return executeFullJoin(leftContexts, rightContexts, join.on(), join.using());
+                return executeFullJoin(leftContexts, rightContexts, join.on(), join.using(), leftShape, rightShape);
             case CROSS:
                 return executeCrossJoin(leftContexts, rightContexts);
             case NATURAL:
-                return executeNaturalJoin(leftContexts, rightContexts, SelectStmt.JoinType.INNER);
+                return executeNaturalJoin(leftContexts, rightContexts, SelectStmt.JoinType.INNER, leftShape, rightShape);
             case NATURAL_LEFT:
-                return executeNaturalJoin(leftContexts, rightContexts, SelectStmt.JoinType.LEFT);
+                return executeNaturalJoin(leftContexts, rightContexts, SelectStmt.JoinType.LEFT, leftShape, rightShape);
             case NATURAL_RIGHT:
-                return executeNaturalJoin(leftContexts, rightContexts, SelectStmt.JoinType.RIGHT);
+                return executeNaturalJoin(leftContexts, rightContexts, SelectStmt.JoinType.RIGHT, leftShape, rightShape);
             case NATURAL_FULL:
-                return executeNaturalJoin(leftContexts, rightContexts, SelectStmt.JoinType.FULL);
+                return executeNaturalJoin(leftContexts, rightContexts, SelectStmt.JoinType.FULL, leftShape, rightShape);
             default:
                 throw new IllegalStateException("Unknown join type: " + join.joinType());
         }
+    }
+
+    /**
+     * The bindings one side of a join exposes: those of its first row when it has one, and the
+     * FROM item's own shape when it has none.
+     */
+    private List<RowContext.TableBinding> shapeOf(SelectStmt.FromItem item, List<RowContext> contexts) {
+        if (!contexts.isEmpty()) return contexts.get(0).getBindings();
+        return fromResolver.resolveItemShape(item);
     }
 
     // ---- LATERAL JOIN ----
@@ -262,10 +280,13 @@ class FromJoinExecutor {
     // ---- LEFT JOIN ----
 
     private List<RowContext> executeLeftJoin(List<RowContext> left, List<RowContext> right,
-                                              Expression on, List<String> using) {
+                                              Expression on, List<String> using,
+                                              List<RowContext.TableBinding> rightShape) {
         List<RowContext.TableBinding> rightTemplate;
         if (!right.isEmpty()) {
             rightTemplate = right.get(0).getBindings();
+        } else if (rightShape != null && !rightShape.isEmpty()) {
+            rightTemplate = rightShape;
         } else if (fromResolver.lastResolvedRightTable != null) {
             rightTemplate = Cols.listOf(new RowContext.TableBinding(
                     fromResolver.lastResolvedRightTable, fromResolver.lastResolvedRightAlias,
@@ -373,10 +394,11 @@ class FromJoinExecutor {
     // ---- RIGHT JOIN ----
 
     private List<RowContext> executeRightJoin(List<RowContext> left, List<RowContext> right,
-                                               Expression on, List<String> using) {
+                                               Expression on, List<String> using,
+                                               List<RowContext.TableBinding> leftShape) {
         List<RowContext> result = new ArrayList<>();
         List<RowContext.TableBinding> leftTemplate = left.isEmpty() ?
-                Cols.listOf() : left.get(0).getBindings();
+                nullRowsOf(leftShape) : left.get(0).getBindings();
 
         for (RowContext r : right) {
             boolean matched = false;
@@ -397,12 +419,14 @@ class FromJoinExecutor {
     // ---- FULL JOIN ----
 
     private List<RowContext> executeFullJoin(List<RowContext> left, List<RowContext> right,
-                                              Expression on, List<String> using) {
+                                              Expression on, List<String> using,
+                                              List<RowContext.TableBinding> leftShape,
+                                              List<RowContext.TableBinding> rightShape) {
         List<RowContext> result = new ArrayList<>();
         List<RowContext.TableBinding> leftTemplate = left.isEmpty() ?
-                Cols.listOf() : left.get(0).getBindings();
+                nullRowsOf(leftShape) : left.get(0).getBindings();
         List<RowContext.TableBinding> rightTemplate = right.isEmpty() ?
-                Cols.listOf() : right.get(0).getBindings();
+                nullRowsOf(rightShape) : right.get(0).getBindings();
 
         Set<Integer> matchedRight = new HashSet<>();
 
@@ -445,40 +469,62 @@ class FromJoinExecutor {
 
     // ---- NATURAL JOIN ----
 
-    private List<RowContext> executeNaturalJoin(List<RowContext> left, List<RowContext> right, SelectStmt.JoinType subType) {
+    private List<RowContext> executeNaturalJoin(List<RowContext> left, List<RowContext> right,
+                                                 SelectStmt.JoinType subType,
+                                                 List<RowContext.TableBinding> leftShape,
+                                                 List<RowContext.TableBinding> rightShape) {
         if (left.isEmpty() && subType == SelectStmt.JoinType.INNER) return Cols.listOf();
         if (right.isEmpty() && subType == SelectStmt.JoinType.INNER) return Cols.listOf();
 
-        Set<String> leftCols = new HashSet<>();
-        if (!left.isEmpty()) {
-            for (RowContext.TableBinding b : left.get(0).getBindings()) {
-                for (Column c : b.table().getColumns()) leftCols.add(c.getName().toLowerCase());
-            }
-        }
-
-        List<String> commonCols = new ArrayList<>();
-        if (!right.isEmpty()) {
-            for (RowContext.TableBinding b : right.get(0).getBindings()) {
-                for (Column c : b.table().getColumns()) {
-                    if (leftCols.contains(c.getName().toLowerCase())) commonCols.add(c.getName());
-                }
-            }
-        }
+        List<String> commonCols = commonColumns(
+                left.isEmpty() ? leftShape : left.get(0).getBindings(),
+                right.isEmpty() ? rightShape : right.get(0).getBindings());
 
         List<String> using = commonCols.isEmpty() ? null : commonCols;
         switch (subType) {
             case LEFT:
-                return executeLeftJoin(left, right, null, using);
+                return executeLeftJoin(left, right, null, using, rightShape);
             case RIGHT:
-                return executeRightJoin(left, right, null, using);
+                return executeRightJoin(left, right, null, using, leftShape);
             case FULL:
-                return executeFullJoin(left, right, null, using);
+                return executeFullJoin(left, right, null, using, leftShape, rightShape);
             default:
                 return executeInnerJoin(left, right, null, using);
         }
     }
 
+    /** The column names a NATURAL join joins on: those both sides expose, in the right's order. */
+    static List<String> commonColumns(List<RowContext.TableBinding> leftShape,
+                                      List<RowContext.TableBinding> rightShape) {
+        Set<String> leftCols = new HashSet<>();
+        if (leftShape != null) {
+            for (RowContext.TableBinding b : leftShape) {
+                for (Column c : b.table().getColumns()) leftCols.add(c.getName().toLowerCase());
+            }
+        }
+        List<String> commonCols = new ArrayList<>();
+        if (rightShape != null) {
+            for (RowContext.TableBinding b : rightShape) {
+                for (Column c : b.table().getColumns()) {
+                    if (leftCols.contains(c.getName().toLowerCase())) commonCols.add(c.getName());
+                }
+            }
+        }
+        return commonCols;
+    }
+
     // ---- Merge / null-padding helpers ----
+
+    /** The same bindings with every value null — what a padded outer-join row looks like. */
+    private static List<RowContext.TableBinding> nullRowsOf(List<RowContext.TableBinding> shape) {
+        if (shape == null || shape.isEmpty()) return Cols.listOf();
+        List<RowContext.TableBinding> out = new ArrayList<>(shape.size());
+        for (RowContext.TableBinding b : shape) {
+            out.add(new RowContext.TableBinding(b.table(), b.alias(),
+                    new Object[b.table().getColumns().size()]));
+        }
+        return out;
+    }
 
     RowContext mergeContexts(RowContext left, RowContext right) {
         List<RowContext.TableBinding> merged = new ArrayList<>(left.getBindings());
@@ -507,6 +553,249 @@ class FromJoinExecutor {
         RowContext ctx = new RowContext(merged);
         ctx.setOuterJoinNullPadded(true);
         return ctx;
+    }
+
+    // ---- FULL JOIN condition admissibility ----
+
+    /**
+     * A FULL JOIN may only be asked what PostgreSQL can answer.
+     *
+     * <p>PostgreSQL has no nested-loop plan for a full join: it must either merge or hash the two
+     * sides, and both need an equality between one side's value and the other's. So it reads the
+     * ON condition as a list of AND-ed clauses and refuses the join unless one of them is such an
+     * equality — with the single exception that a condition which folds to a constant is fine,
+     * which is what makes {@code FULL JOIN ON true} and {@code ON false} legal. Anything else —
+     * an inequality, an OR, a condition naming only one side, {@code IS NOT DISTINCT FROM} — is
+     * {@code 0A000 FULL JOIN is only supported with merge-joinable or hash-joinable join
+     * conditions}, and an application that runs against both has to see the same refusal.
+     *
+     * <p>The check errs towards accepting: it fires only when no clause is recognisably a
+     * cross-side equality <em>and</em> no clause could fold to false, so a condition it cannot
+     * read is computed as before rather than refused.
+     */
+    private void rejectUnmergeableFullJoin(Expression on,
+                                           List<RowContext.TableBinding> leftShape,
+                                           List<RowContext.TableBinding> rightShape) {
+        // USING and NATURAL join on equality by construction, and a join whose sides could not be
+        // described is not one this check can judge.
+        if (on == null) return;
+        if (leftShape == null || leftShape.isEmpty() || rightShape == null || rightShape.isEmpty()) return;
+        // A WHERE that reads either side discards the rows that side was padded with, and
+        // PostgreSQL then plans the join as an inner one and asks nothing of its condition.
+        if (whereReads(fromResolver.enclosingWhere, leftShape, rightShape)) return;
+
+        // A name that reads from both sides is reported as ambiguous when the condition is
+        // resolved, which PostgreSQL does before it plans anything.
+        if (hasAmbiguousBareName(on, leftShape, rightShape)) return;
+
+        List<Expression> conjuncts = new ArrayList<>();
+        flattenAnd(on, conjuncts);
+        int joinClauses = 0;
+        for (Expression c : conjuncts) {
+            Expression clause = foldConstants(c);
+            if (clause == null) return;      // folds to something other than true: allowed
+            if (clause == ALWAYS_TRUE) continue;
+            joinClauses++;
+            if (isCrossSideEquality(clause, leftShape, rightShape)) return;
+        }
+        if (joinClauses == 0) return;
+        throw PgErrors.notImplemented(
+                "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions");
+    }
+
+    /** Stands for a clause that folded to true and so is not a clause at all. */
+    private static final Expression ALWAYS_TRUE = new Literal(Literal.LiteralType.BOOLEAN, "true");
+
+    /**
+     * What is left of a clause once the constants in it are folded, as PostgreSQL folds them
+     * before it plans: {@link #ALWAYS_TRUE} when nothing is left, null when the clause settles to
+     * anything else — false, null, or a value this cannot work out — and otherwise the clause.
+     */
+    private Expression foldConstants(Expression c) {
+        if (!mentionsRelation(c)) {
+            Object value;
+            try {
+                value = executor.evalExpr(c, null);
+            } catch (RuntimeException e) {
+                return null;
+            }
+            return Boolean.TRUE.equals(value) ? ALWAYS_TRUE : null;
+        }
+        if (c instanceof BinaryExpr && ((BinaryExpr) c).op() == BinaryExpr.BinOp.OR) {
+            List<Expression> disjuncts = new ArrayList<>();
+            flattenOr(c, disjuncts);
+            List<Expression> live = new ArrayList<>();
+            for (Expression d : disjuncts) {
+                if (mentionsRelation(d)) {
+                    live.add(d);
+                    continue;
+                }
+                Object value;
+                try {
+                    value = executor.evalExpr(d, null);
+                } catch (RuntimeException e) {
+                    return null;
+                }
+                // A true alternative makes the whole clause true; anything else — false, null —
+                // can never be the alternative that holds, and drops out of the condition.
+                if (Boolean.TRUE.equals(value)) return ALWAYS_TRUE;
+            }
+            if (live.isEmpty()) return null;
+            if (live.size() == 1) return foldConstants(live.get(0));
+        }
+        return c;
+    }
+
+    /** True when {@code where} names a column of either side of the join. */
+    private boolean whereReads(Expression where,
+                               List<RowContext.TableBinding> leftShape,
+                               List<RowContext.TableBinding> rightShape) {
+        if (where == null) return false;
+        final List<ColumnRef> refs = new ArrayList<>();
+        AstWalk.anyMatch(where, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                if (n instanceof ColumnRef) refs.add((ColumnRef) n);
+                return false;
+            }
+        });
+        for (ColumnRef ref : refs) {
+            if (ref.table() != null) {
+                if (namedIn(leftShape, ref.table()) || namedIn(rightShape, ref.table())) return true;
+            } else if (ref.column() != null
+                    && (hasColumn(leftShape, ref.column()) || hasColumn(rightShape, ref.column()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Splits a condition into the clauses AND joins, which is how PostgreSQL reads one. */
+    private static void flattenAnd(Expression e, List<Expression> out) {
+        if (e instanceof BinaryExpr && ((BinaryExpr) e).op() == BinaryExpr.BinOp.AND) {
+            flattenAnd(((BinaryExpr) e).left(), out);
+            flattenAnd(((BinaryExpr) e).right(), out);
+            return;
+        }
+        out.add(e);
+    }
+
+    private static void flattenOr(Expression e, List<Expression> out) {
+        if (e instanceof BinaryExpr && ((BinaryExpr) e).op() == BinaryExpr.BinOp.OR) {
+            flattenOr(((BinaryExpr) e).left(), out);
+            flattenOr(((BinaryExpr) e).right(), out);
+            return;
+        }
+        out.add(e);
+    }
+
+    /** True when the condition writes a bare name both sides answer to. */
+    private boolean hasAmbiguousBareName(Expression on,
+                                         List<RowContext.TableBinding> leftShape,
+                                         List<RowContext.TableBinding> rightShape) {
+        final List<ColumnRef> refs = new ArrayList<>();
+        AstWalk.anyMatch(on, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                if (n instanceof ColumnRef) refs.add((ColumnRef) n);
+                return false;
+            }
+        });
+        for (ColumnRef ref : refs) {
+            if (ref.table() == null && ref.column() != null
+                    && hasColumn(leftShape, ref.column()) && hasColumn(rightShape, ref.column())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** True when the expression reads anything from a row rather than standing on its own. */
+    private static boolean mentionsRelation(Expression e) {
+        return AstWalk.anyMatch(e, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                return n instanceof ColumnRef || n instanceof WildcardExpr
+                        || n instanceof CompositeStarExpr || n instanceof SelectStmt
+                        || n instanceof SetOpStmt || n instanceof ParamRef;
+            }
+        });
+    }
+
+    /** {@code x = y} with x reading only one side of the join and y only the other. */
+    private boolean isCrossSideEquality(Expression c,
+                                        List<RowContext.TableBinding> leftShape,
+                                        List<RowContext.TableBinding> rightShape) {
+        if (!(c instanceof BinaryExpr)) return false;
+        BinaryExpr bin = (BinaryExpr) c;
+        if (bin.op() != BinaryExpr.BinOp.EQUAL) return false;
+        int a = sideRead(bin.left(), leftShape, rightShape);
+        int b = sideRead(bin.right(), leftShape, rightShape);
+        return (a == SIDE_LEFT && b == SIDE_RIGHT) || (a == SIDE_RIGHT && b == SIDE_LEFT);
+    }
+
+    private static final int SIDE_NONE = 0;
+    private static final int SIDE_LEFT = 1;
+    private static final int SIDE_RIGHT = 2;
+    /** Reads from both sides, from neither, or from something this check cannot place. */
+    private static final int SIDE_MIXED = -1;
+
+    /** Which of the join's two sides an expression reads from, if exactly one of them. */
+    private int sideRead(Expression e,
+                         List<RowContext.TableBinding> leftShape,
+                         List<RowContext.TableBinding> rightShape) {
+        if (AstWalk.anyMatch(e, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                return n instanceof SelectStmt || n instanceof SetOpStmt || n instanceof ParamRef;
+            }
+        })) {
+            return SIDE_MIXED;
+        }
+        final List<ColumnRef> refs = new ArrayList<>();
+        AstWalk.anyMatch(e, new java.util.function.Predicate<Object>() {
+            @Override public boolean test(Object n) {
+                if (n instanceof ColumnRef) refs.add((ColumnRef) n);
+                return false;
+            }
+        });
+        int seen = SIDE_NONE;
+        for (ColumnRef ref : refs) {
+            int side = sideOfRef(ref, leftShape, rightShape);
+            if (side == SIDE_MIXED) return SIDE_MIXED;
+            seen |= side;
+        }
+        return seen == (SIDE_LEFT | SIDE_RIGHT) ? SIDE_MIXED : seen;
+    }
+
+    private int sideOfRef(ColumnRef ref,
+                          List<RowContext.TableBinding> leftShape,
+                          List<RowContext.TableBinding> rightShape) {
+        if (ref.table() != null) {
+            boolean inLeft = namedIn(leftShape, ref.table());
+            boolean inRight = namedIn(rightShape, ref.table());
+            if (inLeft && !inRight) return SIDE_LEFT;
+            if (inRight && !inLeft) return SIDE_RIGHT;
+            return SIDE_MIXED;
+        }
+        boolean inLeft = hasColumn(leftShape, ref.column());
+        boolean inRight = hasColumn(rightShape, ref.column());
+        if (inLeft && !inRight) return SIDE_LEFT;
+        if (inRight && !inLeft) return SIDE_RIGHT;
+        return SIDE_MIXED;
+    }
+
+    private static boolean namedIn(List<RowContext.TableBinding> shape, String name) {
+        for (RowContext.TableBinding b : shape) {
+            if (b.alias() != null ? b.alias().equalsIgnoreCase(name)
+                    : b.table().getName().equalsIgnoreCase(name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasColumn(List<RowContext.TableBinding> shape, String column) {
+        for (RowContext.TableBinding b : shape) {
+            if (b.table().getColumnIndex(column) >= 0) return true;
+        }
+        return false;
     }
 
     // ---- Join condition matching ----

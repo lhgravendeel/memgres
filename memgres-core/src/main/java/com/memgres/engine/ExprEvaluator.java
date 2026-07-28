@@ -573,9 +573,33 @@ class ExprEvaluator {
             if (savedHint != null) colEx.setHint(savedHint);
             throw colEx;
         } else {
-            // Schema-qualified reference (schema.table.column); CTEs are not schema-qualified,
-            // so a schema prefix means we're looking for a real table, not a CTE binding.
+            // Schema-qualified reference (schema.table.column). PostgreSQL resolves one against
+            // the FROM entry of that name when the entry is the relation the schema names; a CTE,
+            // a subquery alias or a relation from another schema is a FROM entry the schema
+            // prefix does not reach, and is reported as such rather than as a missing one.
             if (ref.schema() != null) {
+                RowContext.TableBinding reached = schemaPrefixReaches(ctx, ref.schema(), ref.table());
+                if (reached == null) {
+                    for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
+                        reached = schemaPrefixReaches(it.next(), ref.schema(), ref.table());
+                        if (reached != null) break;
+                    }
+                }
+                if (reached != null) {
+                    // Two schemas may hold a relation of the same name and both may be in the
+                    // FROM clause, so a reference the schema pins to the second of them is
+                    // answered from that one rather than from whichever the bare name finds first.
+                    RowContext.TableBinding byName = ctx == null ? null : ctx.getBinding(ref.table());
+                    if (reached != byName) {
+                        int idx = reached.table().getColumnIndex(ref.column());
+                        if (idx >= 0) return reached.row()[idx];
+                    }
+                    return evalColumnRef(new ColumnRef(null, ref.table(), ref.column()), ctx);
+                }
+                if (bindingNamed(ctx, ref.table())) {
+                    throw new MemgresException(
+                        "invalid reference to FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
+                }
                 throw new MemgresException(
                     "missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
             }
@@ -634,6 +658,63 @@ class ExprEvaluator {
             if (aliasHidingError != null) throw aliasHidingError;
             throw new MemgresException("missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
         }
+    }
+
+    /** True when {@code ctx} binds anything under {@code name}, whatever kind of thing it is. */
+    private static boolean bindingNamed(RowContext ctx, String name) {
+        return ctx != null && ctx.getBinding(name) != null;
+    }
+
+    /**
+     * Whether {@code schema.table} names the FROM entry {@code ctx} binds as {@code table}.
+     *
+     * <p>Only a relation can be reached through a schema: a WITH query and a subquery alias live
+     * in the query, not in a schema, so {@code public.c.n} against {@code WITH c AS (...)} is an
+     * invalid reference in PostgreSQL and not a resolution. A relation qualifies when the schema
+     * really holds it — the same table object the binding was built from for a table, and the
+     * recorded schema for a view or a system catalog, neither of which keeps its own table
+     * object once its rows have been read.
+     */
+    private RowContext.TableBinding schemaPrefixReaches(RowContext ctx, String schema, String table) {
+        if (ctx == null) return null;
+        List<RowContext.TableBinding> named = new ArrayList<>();
+        for (RowContext.TableBinding b : ctx.getBindings()) {
+            String exposed = b.alias() != null ? b.alias() : b.table().getName();
+            if (exposed.equalsIgnoreCase(table)) named.add(b);
+        }
+        if (named.isEmpty()) return null;
+        // A WITH query shadows a relation of the same name and is not reachable through a schema.
+        if (executor.selectExecutor.lookupCte(table) != null) return null;
+        // A schema that does not exist reaches nothing, however the name reads.
+        if (executor.database.getSchema(schema) == null && !"pg_temp".equalsIgnoreCase(schema)
+                && !SystemCatalog.isSystemCatalog(schema, table)) {
+            return null;
+        }
+        Table inSchema = null;
+        try {
+            inSchema = executor.resolveTable(schema, table, true);
+        } catch (MemgresException ignored) {
+            // Not a table of that schema; a view or a catalog may still answer to the name.
+        }
+        if (inSchema != null) {
+            for (RowContext.TableBinding b : named) {
+                if (b.table() == inSchema) return b;
+            }
+        }
+        Database.ViewDef view = executor.database.getView(table);
+        if (view != null && view.schemaName() != null && view.schemaName().equalsIgnoreCase(schema)) {
+            return named.get(0);
+        }
+        if (SystemCatalog.isSystemCatalog(schema, table)) {
+            // pg_catalog reaches its own relations, not a user table that happens to be in scope.
+            try {
+                executor.resolveTable(executor.defaultSchema(), table);
+                return null;
+            } catch (MemgresException notAUserTable) {
+                return named.get(0);
+            }
+        }
+        return null;
     }
 
     /** Sentinel returned by {@link #tryAttributeNotationFallback} when the fallback does not apply. */

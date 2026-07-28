@@ -1451,9 +1451,13 @@ public class ExpressionParser {
 
                 String name2 = readIdentifier();
 
-                // Check for schema.table.column
+                // Check for schema.table.column (or schema.table.*)
                 if (check(TokenType.DOT)) {
                     advance();
+                    if (check(TokenType.STAR)) {
+                        advance();
+                        return new WildcardExpr(name2);
+                    }
                     String name3 = readIdentifier();
                     return new ColumnRef(name, name2, name3);
                 }
