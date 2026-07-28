@@ -302,6 +302,12 @@ public class ExpressionParser {
         if (check(TokenType.LEFT_PAREN)) {
             advance();
             sb.append("(");
+            // A negative precision is out of range rather than unparseable, so it is read here
+            // and reported by the type's own bounds check
+            if (check(TokenType.MINUS)) {
+                advance();
+                sb.append("-");
+            }
             sb.append(advance().value()); // first number
             if (match(TokenType.COMMA)) {
                 sb.append(",");

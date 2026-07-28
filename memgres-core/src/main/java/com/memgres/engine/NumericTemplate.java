@@ -75,10 +75,25 @@ final class NumericTemplate {
         if (d.lsign == LSIGN_PRE && d.preLsignNum == d.pre) d.lsign = LSIGN_POST;
 
         boolean halfEven = value instanceof Double || value instanceof Float;
+        // Only a float carries NaN or an infinity; a BigDecimal that merely overflows double
+        // is an ordinary number the template lays out digit by digit.
+        double raw = halfEven ? value.doubleValue() : 0.0;
+        boolean isNan = Double.isNaN(raw);
+        boolean isInfinite = Double.isInfinite(raw);
         BigDecimal v = toDecimal(value);
 
         if (d.roman) return roman(v, d.fm, d.romanUpper);
         if (d.eeee) return exponential(v, d);
+
+        // NaN has no digits to lay out, so PG right-justifies the word in the field the
+        // template describes; an infinity is larger than any field, which is the overflow the
+        // template already reports as a row of #.
+        if (isNan) {
+            if (d.fm) return "NaN";
+            StringBuilder pad = new StringBuilder();
+            for (int i = 3; i < d.pre + 1; i++) pad.append(' ');
+            return pad + "NaN";
+        }
 
         int pre = d.pre;
         int post = d.post;
@@ -88,7 +103,7 @@ final class NumericTemplate {
             post = 0;
         }
         v = v.setScale(post, halfEven ? RoundingMode.HALF_EVEN : RoundingMode.HALF_UP);
-        boolean neg = v.signum() < 0;
+        boolean neg = isInfinite ? raw < 0 : v.signum() < 0;
         String plain = v.abs().toPlainString();
         int dot = plain.indexOf('.');
         String intStr = dot < 0 ? plain : plain.substring(0, dot);
@@ -96,7 +111,7 @@ final class NumericTemplate {
         while (frac.length() < post) frac.append('0');
         String fracStr = frac.toString();
 
-        boolean overflow = intStr.length() > pre;
+        boolean overflow = isInfinite || intStr.length() > pre;
         int outPreSpaces = overflow ? 0 : pre - intStr.length();
 
         int lastNonZeroFrac = -1;

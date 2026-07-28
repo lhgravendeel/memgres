@@ -1021,7 +1021,9 @@ class SqlStateCorrectnessV2Test {
     }
 
     @Test void numeric_overflow_gives_22003() {
-        assertSqlState("SELECT 10::numeric ^ 10000", "22003");
+        // 10^10000 is an ordinary numeric -- PostgreSQL holds 131072 integral digits -- so the
+        // overflow has to be asked for past that, not at a power double happens to lose.
+        assertSqlState("SELECT 10::numeric ^ 200000", "22003");
     }
 
     // ========================================================================

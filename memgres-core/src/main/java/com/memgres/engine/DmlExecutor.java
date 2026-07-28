@@ -369,7 +369,13 @@ class DmlExecutor {
                         exprRow.add(Literal.ofNull());
                     } else if (val instanceof Integer || val instanceof Long) {
                         exprRow.add(Literal.ofInt(val.toString()));
-                    } else if (val instanceof Double || val instanceof Float || val instanceof java.math.BigDecimal) {
+                    } else if (val instanceof Double || val instanceof Float) {
+                        // Keep the float width: a plain numeric literal would make an overflow on
+                        // the way into a real column read as an input error rather than the
+                        // narrowing PG reports, and would leave NaN with no numeric to become.
+                        exprRow.add(new CastExpr(Literal.ofFloat(val.toString()),
+                                val instanceof Float ? "float4" : "float8"));
+                    } else if (val instanceof java.math.BigDecimal) {
                         exprRow.add(Literal.ofFloat(val.toString()));
                     } else if (val instanceof Boolean) {
                         Boolean b = (Boolean) val;

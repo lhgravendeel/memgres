@@ -183,7 +183,24 @@ class CatalogSystemFunctions {
                                         : new ArrayList<RowContext.TableBinding>());
                         if (inferred != null) return pgTypeDisplayName(inferred);
                     }
+                    // abs(NULL::bigint) is still a bigint: the overload the call resolved to is
+                    // what names the type, not the value it happened to produce.
+                    if (rawExpr instanceof FunctionCallExpr) {
+                        DataType inferred = executor.exprEvaluator.inferTypeFromContext(
+                                rawExpr, ctx != null ? ctx.getBindings()
+                                        : new ArrayList<RowContext.TableBinding>());
+                        if (isNumericType(inferred)) return pgTypeDisplayName(inferred);
+                    }
                     return "unknown";
+                }
+
+                // NaN and the infinities are carried as Doubles whatever type produced them, so
+                // the expression's own type is what tells a numeric NaN from a float8 one.
+                if (NumericLimits.isSpecial(arg)) {
+                    DataType inferred = executor.exprEvaluator.inferTypeFromContext(
+                            rawExpr, ctx != null ? ctx.getBindings()
+                                    : new ArrayList<RowContext.TableBinding>());
+                    if (inferred == DataType.NUMERIC) return "numeric";
                 }
 
                 if (arg instanceof java.util.List<?>) {
@@ -812,6 +829,18 @@ class CatalogSystemFunctions {
             case "pb": return (long) (num * 1024L * 1024 * 1024 * 1024 * 1024);
             default:
                 throw new MemgresException("invalid size: \"" + sizeStr + "\"", "22023");
+        }
+    }
+
+    /** True for the types a math routine can resolve to, where inference is reliable. */
+    private static boolean isNumericType(DataType dt) {
+        if (dt == null) return false;
+        switch (dt) {
+            case SMALLINT: case INTEGER: case BIGINT:
+            case REAL: case DOUBLE_PRECISION: case NUMERIC:
+                return true;
+            default:
+                return false;
         }
     }
 

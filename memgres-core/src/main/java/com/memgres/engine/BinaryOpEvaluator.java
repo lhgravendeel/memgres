@@ -752,19 +752,23 @@ class BinaryOpEvaluator {
                     java.math.BigDecimal::remainder);
             case POWER: {
                 if (left == null || right == null) return null;
+                // PG has numeric^numeric and float8^float8 only: a numeric operand keeps the
+                // result numeric, computed in numeric so its last digit is numeric's rather
+                // than a double's; everything else answers in float8.
+                boolean numericPower = left instanceof java.math.BigDecimal
+                        || right instanceof java.math.BigDecimal;
+                if (numericPower && !NumericLimits.isSpecial(left) && !NumericLimits.isSpecial(right)) {
+                    return NumericMath.power(TypeCoercion.toBigDecimal(left),
+                            TypeCoercion.toBigDecimal(right));
+                }
                 double powBase = executor.toDouble(left);
                 double powExp = executor.toDouble(right);
                 NumericLimits.checkPowerDomain(powBase, powExp);
                 double result = Math.pow(powBase, powExp);
-                // Numeric overflow: if either operand is BigDecimal, check for infinity
-                if ((left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) && Double.isInfinite(result)) {
-                    throw new MemgresException("value overflows numeric format", "22003");
+                if (numericPower && Double.isInfinite(result)) {
+                    throw NumericLimits.valueOverflowsNumeric();
                 }
-                // PG has numeric^numeric and float8^float8 only: a numeric operand keeps the
-                // result numeric (padded to 17 significant digits), everything else is float8.
-                if (left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) {
-                    return numericPowerScale(result);
-                }
+                if (numericPower) return numericPowerScale(result);
                 return result;
             }
             case BIT_AND: {
@@ -2119,19 +2123,23 @@ class BinaryOpEvaluator {
                     java.math.BigDecimal::remainder);
             case POWER: {
                 if (left == null || right == null) return null;
+                // PG has numeric^numeric and float8^float8 only: a numeric operand keeps the
+                // result numeric, computed in numeric so its last digit is numeric's rather
+                // than a double's; everything else answers in float8.
+                boolean numericPower = left instanceof java.math.BigDecimal
+                        || right instanceof java.math.BigDecimal;
+                if (numericPower && !NumericLimits.isSpecial(left) && !NumericLimits.isSpecial(right)) {
+                    return NumericMath.power(TypeCoercion.toBigDecimal(left),
+                            TypeCoercion.toBigDecimal(right));
+                }
                 double powBase = executor.toDouble(left);
                 double powExp = executor.toDouble(right);
                 NumericLimits.checkPowerDomain(powBase, powExp);
                 double result = Math.pow(powBase, powExp);
-                // Numeric overflow: if either operand is BigDecimal, check for infinity
-                if ((left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) && Double.isInfinite(result)) {
-                    throw new MemgresException("value overflows numeric format", "22003");
+                if (numericPower && Double.isInfinite(result)) {
+                    throw NumericLimits.valueOverflowsNumeric();
                 }
-                // PG has numeric^numeric and float8^float8 only: a numeric operand keeps the
-                // result numeric (padded to 17 significant digits), everything else is float8.
-                if (left instanceof java.math.BigDecimal || right instanceof java.math.BigDecimal) {
-                    return numericPowerScale(result);
-                }
+                if (numericPower) return numericPowerScale(result);
                 return result;
             }
             case BIT_AND: {

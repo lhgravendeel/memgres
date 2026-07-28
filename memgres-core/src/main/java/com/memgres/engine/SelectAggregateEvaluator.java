@@ -446,7 +446,10 @@ class SelectAggregateEvaluator {
                         // here previously stringified every value (mtask-8 Group 5): LEAST('7.0',
                         // '10.0') compares as strings ("10.0" < "7.0" because '1' < '7'),
                         // silently returning the wrong (larger) value.
-                        resolvedArgs.add(new ExprEvaluator.PrecomputedValueExpr(val));
+                        resolvedArgs.add(new ExprEvaluator.PrecomputedValueExpr(val,
+                                executor.exprEvaluator.inferTypeFromContext(arg,
+                                        representative != null ? representative.getBindings()
+                                                : new ArrayList<RowContext.TableBinding>())));
                     }
                 }
                 return executor.functionEvaluator.evalFunction(new FunctionCallExpr(fn.name(), resolvedArgs, fn.distinct(), fn.star()), representative);
@@ -912,8 +915,9 @@ class SelectAggregateEvaluator {
                 if (isMoney) return new PgMoney(bdSum);
                 // sum(real) is real in PG, so a total outside real's range overflows there
                 if (allFloat4) return NumericLimits.checkFloat4Total(bdSum.doubleValue());
-                // sum(double precision) is float8 in PG, not numeric
-                if (isFloatArgument(arg, group)) return bdSum.doubleValue();
+                // sum(double precision) is float8 in PG, not numeric, so a total that leaves
+                // float8's range overflows there rather than becoming an infinity
+                if (isFloatArgument(arg, group)) return NumericLimits.checkFloat8Total(bdSum.doubleValue());
                 if (allInts) {
                     try { return bdSum.longValueExact(); } catch (ArithmeticException e) { /* fall through */ }
                 }
@@ -960,7 +964,9 @@ class SelectAggregateEvaluator {
                 if (count == 0) return null;
                 Double avgSpecial = specialTotal(avgSawNotANumber, avgSawPosInf, avgSawNegInf);
                 if (avgSpecial != null) return avgSpecial;
-                if (isFloatArgument(arg, group)) return bdSum.doubleValue() / count;
+                if (isFloatArgument(arg, group)) {
+                    return NumericLimits.checkFloat8Total(bdSum.doubleValue()) / count;
+                }
                 BigDecimal result = bdSum.divide(BigDecimal.valueOf(count), 16, RoundingMode.HALF_UP);
                 return result;
             }
@@ -1337,43 +1343,40 @@ class SelectAggregateEvaluator {
             }
             case "var_pop": {
                 if (group.isEmpty()) return null;
-                List<BigDecimal> vals = collectBigDecimals(fn.args().get(0), group);
+                Expression varArg = fn.args().get(0);
+                List<BigDecimal> vals = collectBigDecimals(varArg, group);
+                if (vals == null) return Double.valueOf(Double.NaN);
                 BigDecimal variance = computeVariance(vals, true);
-                return variance != null ? variance.setScale(16, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString() : null;
+                if (variance == null) return null;
+                if (isFloatArgument(varArg, group)) return variance.doubleValue();
+                return trimmed(variance.setScale(16, RoundingMode.HALF_UP));
             }
             case "var_samp":
             case "variance": {
                 if (group.isEmpty()) return null;
-                List<BigDecimal> vals = collectBigDecimals(fn.args().get(0), group);
+                Expression varArg = fn.args().get(0);
+                List<BigDecimal> vals = collectBigDecimals(varArg, group);
+                if (vals == null) return Double.valueOf(Double.NaN);
                 BigDecimal variance = computeVariance(vals, false);
                 if (variance == null) return null;
-                if (isFloatArgument(fn.args().get(0), group)) return variance.doubleValue();
-                return variance.setScale(16, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString();
+                if (isFloatArgument(varArg, group)) return variance.doubleValue();
+                return trimmed(variance.setScale(16, RoundingMode.HALF_UP));
             }
-            case "stddev_pop": {
-                if (group.isEmpty()) return null;
-                List<BigDecimal> vals = collectBigDecimals(fn.args().get(0), group);
-                BigDecimal variance = computeVariance(vals, true);
-                if (variance == null) return null;
-                BigDecimal stddev = new BigDecimal(Math.sqrt(variance.doubleValue()))
-                    .setScale(16, RoundingMode.HALF_UP);
-                return stddev.stripTrailingZeros().toPlainString();
-            }
+            case "stddev_pop":
             case "stddev_samp":
             case "stddev": {
                 if (group.isEmpty()) return null;
                 Expression arg = fn.args().get(0);
-                List<Double> vals = new ArrayList<>();
-                for (RowContext ctx : group) {
-                    Object v = executor.evalExpr(arg, ctx);
-                    if (v != null) vals.add(((Number) v).doubleValue());
-                }
-                if (vals.isEmpty() || vals.size() < 2) return null;
-                double mean = vals.stream().mapToDouble(d -> d).average().orElse(0);
-                double variance = vals.stream().mapToDouble(d -> (d - mean) * (d - mean)).sum() / (vals.size() - 1);
-                double sd = Math.sqrt(variance);
-                if (isFloatArgument(arg, group)) return sd;
-                return BigDecimal.valueOf(sd).stripTrailingZeros().toPlainString();
+                boolean population = "stddev_pop".equals(name);
+                List<BigDecimal> vals = collectBigDecimals(arg, group);
+                if (vals == null) return Double.valueOf(Double.NaN);
+                BigDecimal variance = computeVariance(vals, population);
+                if (variance == null) return null;
+                if (isFloatArgument(arg, group)) return Math.sqrt(variance.doubleValue());
+                // The square root is taken in numeric: a double one loses the last digit of a
+                // 17-significant-figure answer, which is exactly where PG's differs.
+                return trimmed(NumericMath.sqrt(variance.setScale(16, RoundingMode.HALF_UP))
+                        .setScale(16, RoundingMode.HALF_UP));
             }
             case "grouping": {
                 Set<String> currentGroupSet = currentGroupingSetColumns.get();
@@ -1746,16 +1749,26 @@ class SelectAggregateEvaluator {
         return false;
     }
 
-    /** Collect BigDecimal values from a group for a given expression, skipping nulls. */
+    /**
+     * Collect BigDecimal values from a group for a given expression, skipping nulls. Returns null
+     * when the group holds a NaN or an infinity, which have no BigDecimal form: the variance of a
+     * set containing one is NaN, and PG says so rather than failing to read the value.
+     */
     private List<BigDecimal> collectBigDecimals(Expression arg, List<RowContext> group) {
         List<BigDecimal> vals = new ArrayList<>();
         for (RowContext ctx : group) {
             Object v = executor.evalExpr(arg, ctx);
-            if (v != null) {
-                vals.add(v instanceof BigDecimal ? ((BigDecimal) v) : BigDecimal.valueOf(((Number) v).doubleValue()));
-            }
+            if (v == null) continue;
+            if (NumericLimits.isSpecial(v)) return null;
+            vals.add(v instanceof BigDecimal ? ((BigDecimal) v) : BigDecimal.valueOf(((Number) v).doubleValue()));
         }
         return vals;
+    }
+
+    /** Drop trailing fractional zeros without letting BigDecimal reach for 1E+2 notation. */
+    private static BigDecimal trimmed(BigDecimal v) {
+        BigDecimal stripped = v.stripTrailingZeros();
+        return stripped.scale() < 0 ? stripped.setScale(0) : stripped;
     }
 
     /** Compute variance (population or sample) from a list of BigDecimal values. */

@@ -186,10 +186,41 @@ final class NumericLimits {
         if (value < 0) throw new MemgresException("cannot take logarithm of a negative number", "2201E");
     }
 
+    /** The domain error PG raises for an argument outside a function's definition. */
+    static MemgresException inputOutOfRange() {
+        return new MemgresException("input is out of range", "22003");
+    }
+
     /** asin/acos are defined on [-1, 1]; PG raises outside it but passes NaN straight through. */
     static void checkUnitInterval(double value) {
         if (Double.isNaN(value)) return;
-        if (value < -1 || value > 1) throw new MemgresException("input is out of range", "22003");
+        if (value < -1 || value > 1) throw inputOutOfRange();
+    }
+
+    /**
+     * The result of a float8 {@code exp}. PG reports both ends rather than handing back the
+     * infinity or the zero the hardware produced: {@code exp(1000)} overflows and
+     * {@code exp(-1000)} underflows, while {@code exp(-Infinity)} is a legitimate zero.
+     */
+    static double checkExp(double result, double argument) {
+        if (Double.isInfinite(result) && !Double.isInfinite(argument)) throw floatOverflow();
+        if (result == 0 && argument != Double.NEGATIVE_INFINITY) throw floatUnderflow();
+        return result;
+    }
+
+    /**
+     * Narrow a float8 computation the way PG's float8 operators do: an infinity that neither
+     * operand brought with it is an overflow, and a zero that neither operand explains an
+     * underflow.
+     */
+    static double checkFloat8(double result, double left, double right) {
+        if (Double.isInfinite(result) && !Double.isInfinite(left) && !Double.isInfinite(right)) {
+            throw floatOverflow();
+        }
+        if (result == 0 && left != 0 && !Double.isInfinite(left) && !Double.isInfinite(right)) {
+            throw floatUnderflow();
+        }
+        return result;
     }
 
     // ---- float overflow and underflow ----
@@ -226,5 +257,46 @@ final class NumericLimits {
         float f = (float) result;
         if (Float.isInfinite(f) && !Double.isInfinite(result)) throw floatOverflow();
         return f;
+    }
+
+    /**
+     * Narrow a float8 aggregate's accumulator, which PG keeps in float8: a total that leaves
+     * float8's range is reported rather than stored as an infinity nobody put there.
+     */
+    static double checkFloat8Total(double result) {
+        if (Double.isInfinite(result)) throw floatOverflow();
+        return result;
+    }
+
+    /**
+     * How PostgreSQL writes the offending value in an out-of-range message: a numeric prints in
+     * plain decimal, so {@code 1e39} is reported as its forty digits rather than as {@code 1E+39}.
+     */
+    static String plainText(Object value) {
+        if (value instanceof BigDecimal) return ((BigDecimal) value).toPlainString();
+        return String.valueOf(value);
+    }
+
+    /** The message PG gives when an input value has no representation in the target float type. */
+    static MemgresException outOfRangeForType(Object value, String typeName) {
+        MemgresException e = new MemgresException(
+                "\"" + plainText(value) + "\" is out of range for type " + typeName, "22003");
+        e.setDatatype(typeName);
+        return e;
+    }
+
+    /**
+     * True when a non-zero input collapsed to zero converting into a float type. PG reports that
+     * as out of range rather than storing a zero the caller never wrote.
+     */
+    static boolean underflowedToZero(Object value, double converted) {
+        if (converted != 0) return false;
+        if (value instanceof BigDecimal) return ((BigDecimal) value).signum() != 0;
+        if (value instanceof Number) return false;   // a Number that reads as 0 really is 0
+        try {
+            return new BigDecimal(String.valueOf(value).trim()).signum() != 0;
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 }

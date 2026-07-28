@@ -283,18 +283,21 @@ class CastEvaluator {
         }
         // Handle numeric(precision, scale) and apply scale for proper formatting
         if (lowerSpec.startsWith("numeric(") || lowerSpec.startsWith("decimal(")) {
+            // A precision outside 1..1000 is not a field numeric could ever have, and PG says
+            // so before it looks at the value
+            TypeCoercion.checkDeclaredTypeLimits(lowerSpec);
             Double specialTypmod = NumericLimits.specialNumericOrNull(val);
-            if (specialTypmod != null) {
-                // NaN fits any numeric(p,s); an infinity is larger than every value the field
-                // could round to, so PG reports the same overflow it does for a huge number.
-                if (specialTypmod.isNaN()) return specialTypmod;
-                throw new MemgresException("numeric field overflow", "22003");
-            }
-            java.math.BigDecimal bd = NumericLimits.check(TypeCoercion.toBigDecimal(val));
             String params = lowerSpec.replaceAll(".*\\(([^)]+)\\).*", "$1");
             String[] parts = params.split(",");
             int precision = Integer.parseInt(parts[0].trim());
             int scale = parts.length >= 2 ? Integer.parseInt(parts[1].trim()) : 0;
+            if (specialTypmod != null) {
+                // NaN fits any numeric(p,s); an infinity is larger than every value the field
+                // could round to, so PG reports the same overflow it does for a huge number.
+                if (specialTypmod.isNaN()) return specialTypmod;
+                TypeCoercion.rejectSpecialForTypmod(specialTypmod.doubleValue(), precision, scale);
+            }
+            java.math.BigDecimal bd = NumericLimits.check(TypeCoercion.toBigDecimal(val));
             java.math.BigDecimal rounded = bd.setScale(scale, java.math.RoundingMode.HALF_UP);
             // PG checks the typmod after rounding: 99.995 rounds to 100.00, which no longer
             // fits numeric(4,2), so it overflows rather than silently widening
@@ -365,9 +368,17 @@ class CastEvaluator {
             case "float4": {
                 double dv = TypeCoercion.toDouble(val).doubleValue();
                 float fv = (float) dv;
-                if (Float.isInfinite(fv) && !Double.isInfinite(dv)
-                        && !(val instanceof String && isInfinityLiteral(((String) val).trim()))) {
-                    throw new MemgresException("\"" + val + "\" is out of range for type real", "22003");
+                boolean broughtInfinity = Double.isInfinite(dv)
+                        || (val instanceof String && isInfinityLiteral(((String) val).trim()));
+                if (Float.isInfinite(fv) && !broughtInfinity) {
+                    // A float8 that no longer fits float4 is a narrowing overflow, which PG
+                    // reports by the operation rather than by quoting the value.
+                    if (val instanceof Double || val instanceof Float) throw NumericLimits.floatOverflow();
+                    throw NumericLimits.outOfRangeForType(val, "real");
+                }
+                if (NumericLimits.underflowedToZero(val, fv)) {
+                    if (val instanceof Double || val instanceof Float) throw NumericLimits.floatUnderflow();
+                    throw NumericLimits.outOfRangeForType(val, "real");
                 }
                 return fv;
             }
@@ -376,10 +387,14 @@ class CastEvaluator {
             case "float": {
                 try {
                     Double dv = TypeCoercion.toDouble(val);
-                    if (dv.isInfinite() && !(val instanceof Double && ((Double) val).isInfinite())
-                            && !(val instanceof Float && ((Float) val).isInfinite())
-                            && !(val instanceof String && isInfinityLiteral(((String) val).trim()))) {
-                        throw new MemgresException("\"" + val + "\" is out of range for type double precision", "22003");
+                    boolean broughtInfinity = (val instanceof Double && ((Double) val).isInfinite())
+                            || (val instanceof Float && ((Float) val).isInfinite())
+                            || (val instanceof String && isInfinityLiteral(((String) val).trim()));
+                    if (dv.isInfinite() && !broughtInfinity) {
+                        throw NumericLimits.outOfRangeForType(val, "double precision");
+                    }
+                    if (NumericLimits.underflowedToZero(val, dv.doubleValue())) {
+                        throw NumericLimits.outOfRangeForType(val, "double precision");
                     }
                     return dv;
                 } catch (NumberFormatException e) {
