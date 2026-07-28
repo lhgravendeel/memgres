@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -330,7 +331,7 @@ class ExprSpecialFormParser {
 
         if (!ep.check(TokenType.LEFT_PAREN)) {
             String windowName = ep.readIdentifier();
-            return new WindowFuncExpr(name, args, distinct, star, null, null, null, windowName, ignoreNulls, fromLast, filter);
+            return new WindowFuncExpr(name, args, distinct, star, null, null, null, windowName, ignoreNulls, fromLast, filter, false);
         }
 
         ep.expect(TokenType.LEFT_PAREN);
@@ -360,7 +361,7 @@ class ExprSpecialFormParser {
 
         ep.expect(TokenType.RIGHT_PAREN);
         return new WindowFuncExpr(name, args, distinct, star, partitionBy, orderBy, frame,
-                baseWindow, ignoreNulls, fromLast, filter);
+                baseWindow, ignoreNulls, fromLast, filter, baseWindow != null);
     }
 
     WindowFuncExpr.FrameClause parseWindowFrame() {
@@ -398,7 +399,38 @@ class ExprSpecialFormParser {
             }
         }
 
+        rejectImpossibleFrame(start, end);
         return new WindowFuncExpr.FrameClause(frameType, start, end, excludeMode);
+    }
+
+    /**
+     * A frame whose start is after its end contains no rows under any reading, so PostgreSQL
+     * rejects the shape while parsing rather than computing an answer from it. The order of the
+     * checks below is the order PostgreSQL applies them, which is what picks the message.
+     */
+    private static void rejectImpossibleFrame(WindowFuncExpr.FrameBound start, WindowFuncExpr.FrameBound end) {
+        WindowFuncExpr.FrameBoundType s = start.boundType();
+        WindowFuncExpr.FrameBoundType e = end.boundType();
+        if (s == WindowFuncExpr.FrameBoundType.UNBOUNDED_FOLLOWING) {
+            throw windowingError("frame start cannot be UNBOUNDED FOLLOWING");
+        }
+        if (e == WindowFuncExpr.FrameBoundType.UNBOUNDED_PRECEDING) {
+            throw windowingError("frame end cannot be UNBOUNDED PRECEDING");
+        }
+        if (s == WindowFuncExpr.FrameBoundType.CURRENT_ROW
+                && e == WindowFuncExpr.FrameBoundType.PRECEDING) {
+            throw windowingError("frame starting from current row cannot have preceding rows");
+        }
+        if (s == WindowFuncExpr.FrameBoundType.FOLLOWING
+                && (e == WindowFuncExpr.FrameBoundType.PRECEDING
+                    || e == WindowFuncExpr.FrameBoundType.CURRENT_ROW)) {
+            throw windowingError("frame starting from following row cannot have preceding rows");
+        }
+    }
+
+    /** {@code 42P20} — the window specification itself is invalid. */
+    private static MemgresException windowingError(String message) {
+        return new MemgresException(message, "42P20");
     }
 
     private WindowFuncExpr.FrameBound parseFrameBound() {
@@ -411,12 +443,18 @@ class ExprSpecialFormParser {
             ep.expectKeyword("ROW");
             return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.CURRENT_ROW, null);
         }
-        // Parse offset expression including ::type casts (e.g. '1 day'::interval)
+        // Parse offset expression including ::type casts (e.g. '1 day'::interval).
+        // A sign is part of the offset: PostgreSQL parses "-1 PRECEDING" and rejects it as a
+        // negative size at run time, not as a syntax error.
+        boolean negated = false;
+        if (ep.match(TokenType.MINUS)) negated = true;
+        else ep.match(TokenType.PLUS);
         Expression offset = ep.parsePrimary();
         while (ep.match(TokenType.CAST)) {
             String typeName = ep.parseTypeName();
             offset = new CastExpr(offset, typeName);
         }
+        if (negated) offset = new UnaryExpr(UnaryExpr.UnaryOp.NEGATE, offset);
         if (ep.matchKeyword("PRECEDING")) return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.PRECEDING, offset);
         ep.expectKeyword("FOLLOWING");
         return new WindowFuncExpr.FrameBound(WindowFuncExpr.FrameBoundType.FOLLOWING, offset);

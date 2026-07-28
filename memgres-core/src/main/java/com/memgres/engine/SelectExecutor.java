@@ -105,6 +105,7 @@ class SelectExecutor {
         rejectMisplacedSrfs(stmt);
         // SELECT without FROM
         if (stmt.from() == null || stmt.from().isEmpty()) {
+            windowEvaluator.validateWindowUsage(stmt);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
                     || (stmt.having() != null && containsAggregate(stmt.having()));
             if (hasAgg) {
@@ -120,6 +121,10 @@ class SelectExecutor {
         }
 
         List<RowContext> contexts = executor.fromResolver.resolveFromClause(stmt.from(), stmt.where());
+
+        // PostgreSQL builds the range table before it analyses the rest of the query, so a name
+        // that does not resolve is reported on its own even when the window clause is also wrong.
+        windowEvaluator.validateWindowUsage(stmt);
 
         List<RowContext.TableBinding> baseBindings;
         if (!contexts.isEmpty()) {
