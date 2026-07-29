@@ -14,6 +14,7 @@ class FromResolver {
     final AstExecutor executor;
     final FromFunctionResolver functionResolver;
     final FromJoinExecutor joinExecutor;
+    final CrossProductPairer pairer;
     // Track the last resolved table info for LEFT JOIN null-padding when right side is empty
     Table lastResolvedRightTable;
     String lastResolvedRightAlias;
@@ -43,6 +44,7 @@ class FromResolver {
         this.executor = executor;
         this.functionResolver = new FromFunctionResolver(executor);
         this.joinExecutor = new FromJoinExecutor(this);
+        this.pairer = new CrossProductPairer(executor);
         this.fullJoinCheck = new FullJoinAdmissibility(this);
     }
 
@@ -580,16 +582,8 @@ class FromResolver {
                         }
                     }
 
-                    List<RowContext> newAccumulated = new ArrayList<>();
-                    for (RowContext leftCtx : accumulated) {
-                        for (RowContext rightCtx : resolved) {
-                            RowContext merged = joinExecutor.mergeContexts(leftCtx, rightCtx);
-                            if (passesEarlyPredicates(merged, applicablePredicates)) {
-                                newAccumulated.add(merged);
-                            }
-                        }
-                    }
-                    accumulated = newAccumulated;
+                    accumulated = pairer.pair(accumulated, resolved, applicablePredicates,
+                            (l, r) -> joinExecutor.mergeContexts(l, r));
                 }
             }
         }
@@ -1091,16 +1085,8 @@ class FromResolver {
                     }
                 }
 
-                List<RowContext> newAccumulated = new ArrayList<>();
-                for (RowContext leftCtx : accumulated) {
-                    for (RowContext rightCtx : resolved) {
-                        RowContext merged = leftCtx.merge(rightCtx);
-                        if (passesEarlyPredicates(merged, applicablePredicates)) {
-                            newAccumulated.add(merged);
-                        }
-                    }
-                }
-                accumulated = newAccumulated;
+                accumulated = pairer.pair(accumulated, resolved, applicablePredicates,
+                        (l, r) -> l.merge(r));
             }
         }
         return accumulated != null ? accumulated : Cols.listOf();
@@ -1124,7 +1110,15 @@ class FromResolver {
         }
     }
 
-    private boolean canEvaluatePredicate(Expression pred, RowContext ctx) {
+    /**
+     * Whether every column a conjunct names is one this row has, and so whether it can be
+     * decided here at all.
+     *
+     * <p>Answering yes wrongly does not lose rows: a conjunct that then fails to evaluate leaves
+     * its rows alone, and the query's own WHERE runs over the finished rows regardless. It only
+     * costs the chance to have filtered earlier.
+     */
+    static boolean canEvaluatePredicate(Expression pred, RowContext ctx) {
         try {
             collectColumnRefs(pred, ctx);
             return true;
@@ -1133,7 +1127,7 @@ class FromResolver {
         }
     }
 
-    private void collectColumnRefs(Expression expr, RowContext ctx) {
+    private static void collectColumnRefs(Expression expr, RowContext ctx) {
         if (expr instanceof ColumnRef) {
             ColumnRef cr = (ColumnRef) expr;
             if (ctx.resolveColumnDef(cr.table(), cr.column()) == null) {
@@ -1181,19 +1175,6 @@ class FromResolver {
             if (caseExpr.elseExpr() != null) collectColumnRefs(caseExpr.elseExpr(), ctx);
         }
         // Subqueries, ExistsExpr, Literals, and other types: skip or always resolve
-    }
-
-    private boolean passesEarlyPredicates(RowContext ctx, List<Expression> predicates) {
-        if (predicates.isEmpty()) return true;
-        for (Expression pred : predicates) {
-            try {
-                Object result = executor.evalExpr(pred, ctx);
-                if (!executor.isTruthy(result)) return false;
-            } catch (Exception e) {
-                // If evaluation fails, don't filter the row (conservative)
-            }
-        }
-        return true;
     }
 
     // ---- MVCC Visibility ----
