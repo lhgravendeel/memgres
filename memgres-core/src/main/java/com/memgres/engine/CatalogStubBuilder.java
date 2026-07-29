@@ -57,7 +57,8 @@ class CatalogStubBuilder {
                 col("tablespace", DataType.TEXT),
                 col("hasindexes", DataType.BOOLEAN),
                 col("hasrules", DataType.BOOLEAN),
-                col("hastriggers", DataType.BOOLEAN)
+                col("hastriggers", DataType.BOOLEAN),
+                col("rowsecurity", DataType.BOOLEAN)
         );
         Table table = new Table("pg_tables", cols);
         // M22: tables on either side of a FK carry internal RI triggers in PG.
@@ -85,7 +86,8 @@ class CatalogStubBuilder {
                 boolean hasTrig = database.getAllTriggers().containsKey(tableName)
                         || hasFk || fkReferencedTables.contains(tableName.toLowerCase());
                 table.insertRow(new Object[]{
-                        schemaEntry.getKey(), tableName, "memgres", null, hasIdx, false, hasTrig
+                        schemaEntry.getKey(), tableName, "memgres", null, hasIdx, false, hasTrig,
+                        t.isRlsEnabled()
                 });
             }
         }
@@ -335,6 +337,7 @@ class CatalogStubBuilder {
                 col("n_tup_upd", DataType.BIGINT),
                 col("n_tup_del", DataType.BIGINT),
                 col("n_tup_hot_upd", DataType.BIGINT),
+                col("n_tup_newpage_upd", DataType.BIGINT),
                 col("n_live_tup", DataType.BIGINT),
                 col("n_dead_tup", DataType.BIGINT),
                 col("n_mod_since_analyze", DataType.BIGINT),
@@ -346,7 +349,11 @@ class CatalogStubBuilder {
                 col("vacuum_count", DataType.BIGINT),
                 col("autovacuum_count", DataType.BIGINT),
                 col("analyze_count", DataType.BIGINT),
-                col("autoanalyze_count", DataType.BIGINT)
+                col("autoanalyze_count", DataType.BIGINT),
+                col("total_vacuum_time", DataType.DOUBLE_PRECISION),
+                col("total_autovacuum_time", DataType.DOUBLE_PRECISION),
+                col("total_analyze_time", DataType.DOUBLE_PRECISION),
+                col("total_autoanalyze_time", DataType.DOUBLE_PRECISION)
         );
         Table table = new Table("pg_stat_user_tables", cols);
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
@@ -358,11 +365,12 @@ class CatalogStubBuilder {
                         oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName()),
                         schemaEntry.getKey(), t.getName(),
                         0L, null, 0L, 0L, null, 0L,   // scans
-                        0L, t.getTupUpdated(), t.getTupDeleted(), 0L, // ins (always 0, stats not tracked), upd, del, hot_upd
+                        0L, t.getTupUpdated(), t.getTupDeleted(), 0L, 0L, // ins, upd, del, hot_upd, newpage_upd
                         (long) t.getRows().size(), 0L, // live, dead
                         0L, 0L,                        // mod_since_analyze, ins_since_vacuum
                         lastVac, null, lastAna, null,   // last vacuum/analyze
-                        0L, 0L, 0L, 0L                 // counts
+                        0L, 0L, 0L, 0L,                // counts
+                        0.0, 0.0, 0.0, 0.0             // total vacuum/analyze times
                 });
             }
         }
@@ -374,14 +382,76 @@ class CatalogStubBuilder {
                     oids.oid("rel:" + vSchema + "." + vd.name()),
                     vSchema, vd.name(),
                     0L, null, 0L, 0L, null, 0L,
-                    0L, 0L, 0L, 0L,
+                    0L, 0L, 0L, 0L, 0L,
                     0L, 0L,
                     0L, 0L,
                     null, null, null, null,
-                    0L, 0L, 0L, 0L
+                    0L, 0L, 0L, 0L,
+                    0.0, 0.0, 0.0, 0.0
             });
         }
         return table;
+    }
+
+    /**
+     * The transaction-local table counters. PostgreSQL keeps these in their own view with a
+     * shorter column list than pg_stat_all_tables, so they need their own shape rather than
+     * borrowing one that reports lifetime vacuum times a transaction cannot have.
+     */
+    Table buildPgStatXactTables(String name) {
+        List<Column> cols = Cols.listOf(
+                col("relid", DataType.INTEGER),
+                col("schemaname", DataType.TEXT),
+                col("relname", DataType.TEXT),
+                col("seq_scan", DataType.BIGINT),
+                col("seq_tup_read", DataType.BIGINT),
+                col("idx_scan", DataType.BIGINT),
+                col("idx_tup_fetch", DataType.BIGINT),
+                col("n_tup_ins", DataType.BIGINT),
+                col("n_tup_upd", DataType.BIGINT),
+                col("n_tup_del", DataType.BIGINT),
+                col("n_tup_hot_upd", DataType.BIGINT),
+                col("n_tup_newpage_upd", DataType.BIGINT)
+        );
+        Table table = new Table(name, cols);
+        if (name.contains("_sys_")) return table;
+        for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            for (Table t : schemaEntry.getValue().getTables().values()) {
+                table.insertRow(new Object[]{
+                        oids.oid("rel:" + schemaEntry.getKey() + "." + t.getName()),
+                        schemaEntry.getKey(), t.getName(),
+                        0L, 0L, 0L, 0L,
+                        0L, t.getTupUpdated(), t.getTupDeleted(), 0L, 0L
+                });
+            }
+        }
+        return table;
+    }
+
+    /** Block-level index counters; a different view from pg_stat_*_indexes, with its own columns. */
+    Table buildPgStatioIndexes(String name) {
+        List<Column> cols = Cols.listOf(
+                col("relid", DataType.INTEGER),
+                col("indexrelid", DataType.INTEGER),
+                col("schemaname", DataType.TEXT),
+                col("relname", DataType.TEXT),
+                col("indexrelname", DataType.TEXT),
+                col("idx_blks_read", DataType.BIGINT),
+                col("idx_blks_hit", DataType.BIGINT)
+        );
+        return new Table(name, cols); // empty, in-memory with no I/O stats
+    }
+
+    /** Block-level sequence counters. */
+    Table buildPgStatioSequences(String name) {
+        List<Column> cols = Cols.listOf(
+                col("relid", DataType.INTEGER),
+                col("schemaname", DataType.TEXT),
+                col("relname", DataType.TEXT),
+                col("blks_read", DataType.BIGINT),
+                col("blks_hit", DataType.BIGINT)
+        );
+        return new Table(name, cols); // empty, in-memory with no I/O stats
     }
 
     Table buildPgStatUserIndexes() {
@@ -479,8 +549,9 @@ class CatalogStubBuilder {
                 col("sessions_abandoned", DataType.BIGINT),
                 col("sessions_fatal", DataType.BIGINT),
                 col("sessions_killed", DataType.BIGINT),
-                col("stats_reset", DataType.TIMESTAMPTZ),
-                col("parallel_workers_launched", DataType.BIGINT)
+                col("parallel_workers_to_launch", DataType.BIGINT),
+                col("parallel_workers_launched", DataType.BIGINT),
+                col("stats_reset", DataType.TIMESTAMPTZ)
         );
         Table table = new Table("pg_stat_database", cols);
         int numBackends = database.getActiveSessions().size();
@@ -491,21 +562,28 @@ class CatalogStubBuilder {
                 0.0, 0.0,   // blk_read_time, blk_write_time
                 0.0, 0.0, 0.0, // session_time, active_time, idle_in_transaction_time
                 (long) numBackends, 0L, 0L, 0L, // sessions, abandoned, fatal, killed
-                null,
-                0L           // parallel_workers_launched
+                0L, 0L,      // parallel_workers_to_launch, parallel_workers_launched
+                null         // stats_reset
         });
         return table;
     }
 
     Table buildPgStatistic() {
-        List<Column> cols = Cols.listOf(
+        // PostgreSQL keeps five numbered slots per column; a query that reads a histogram or a
+        // most-common-value list names them, so a pg_statistic without them describes nothing.
+        List<Column> cols = new java.util.ArrayList<>(Cols.listOf(
                 col("starelid", DataType.INTEGER),
                 col("staattnum", DataType.SMALLINT),
                 col("stainherit", DataType.BOOLEAN),
                 col("stanullfrac", DataType.REAL),
                 col("stawidth", DataType.INTEGER),
                 col("stadistinct", DataType.REAL)
-        );
+        ));
+        for (int i = 1; i <= 5; i++) cols.add(col("stakind" + i, DataType.SMALLINT));
+        for (int i = 1; i <= 5; i++) cols.add(col("staop" + i, DataType.OID));
+        for (int i = 1; i <= 5; i++) cols.add(col("stacoll" + i, DataType.OID));
+        for (int i = 1; i <= 5; i++) cols.add(col("stanumbers" + i, DataType.FLOAT4_ARRAY));
+        for (int i = 1; i <= 5; i++) cols.add(col("stavalues" + i, DataType.ANYARRAY));
         Table table = new Table("pg_statistic", cols);
         // Populate with rows for tables that have been ANALYZEd
         for (String schemaTable : database.getAnalyzedTables()) {
@@ -549,33 +627,32 @@ class CatalogStubBuilder {
         List<Column> cols = Cols.listOf(
                 col("num_timed", DataType.BIGINT),
                 col("num_requested", DataType.BIGINT),
+                col("num_done", DataType.BIGINT),
                 col("restartpoints_timed", DataType.BIGINT),
                 col("restartpoints_req", DataType.BIGINT),
                 col("restartpoints_done", DataType.BIGINT),
                 col("write_time", DataType.DOUBLE_PRECISION),
                 col("sync_time", DataType.DOUBLE_PRECISION),
                 col("buffers_written", DataType.BIGINT),
+                col("slru_written", DataType.BIGINT),
                 col("stats_reset", DataType.TIMESTAMPTZ)
         );
         Table table = new Table("pg_stat_checkpointer", cols);
-        table.insertRow(new Object[]{0L, 0L, 0L, 0L, 0L, 0.0, 0.0, 0L, null});
+        table.insertRow(new Object[]{0L, 0L, 0L, 0L, 0L, 0L, 0.0, 0.0, 0L, 0L, null});
         return table;
     }
 
     Table buildPgStatWal() {
+        // PG 18 dropped the write/sync counters from this view; they moved to pg_stat_io.
         List<Column> cols = Cols.listOf(
                 col("wal_records", DataType.BIGINT),
                 col("wal_fpi", DataType.BIGINT),
                 col("wal_bytes", DataType.NUMERIC),
                 col("wal_buffers_full", DataType.BIGINT),
-                col("wal_write", DataType.BIGINT),
-                col("wal_sync", DataType.BIGINT),
-                col("wal_write_time", DataType.DOUBLE_PRECISION),
-                col("wal_sync_time", DataType.DOUBLE_PRECISION),
                 col("stats_reset", DataType.TIMESTAMPTZ)
         );
         Table table = new Table("pg_stat_wal", cols);
-        table.insertRow(new Object[]{0L, 0L, java.math.BigDecimal.ZERO, 0L, 0L, 0L, 0.0, 0.0, null});
+        table.insertRow(new Object[]{0L, 0L, java.math.BigDecimal.ZERO, 0L, null});
         return table;
     }
 
@@ -609,18 +686,21 @@ class CatalogStubBuilder {
         List<Column> cols = Cols.listOf(
                 col("subid", DataType.INTEGER),
                 col("subname", DataType.TEXT),
+                col("worker_type", DataType.TEXT),
                 col("pid", DataType.INTEGER),
+                col("leader_pid", DataType.INTEGER),
                 col("relid", DataType.INTEGER),
-                col("received_lsn", DataType.TEXT),
+                col("received_lsn", DataType.PG_LSN),
                 col("last_msg_send_time", DataType.TIMESTAMPTZ),
                 col("last_msg_receipt_time", DataType.TIMESTAMPTZ),
-                col("latest_end_lsn", DataType.TEXT),
+                col("latest_end_lsn", DataType.PG_LSN),
                 col("latest_end_time", DataType.TIMESTAMPTZ)
         );
         return new Table("pg_stat_subscription", cols); // empty, no subscriptions
     }
 
     Table buildPgStatProgressVacuum() {
+        // PG 17 replaced the dead-tuple counts with byte-based ones and added index progress.
         List<Column> cols = Cols.listOf(
                 col("pid", DataType.INTEGER),
                 col("datid", DataType.INTEGER),
@@ -631,10 +711,89 @@ class CatalogStubBuilder {
                 col("heap_blks_scanned", DataType.BIGINT),
                 col("heap_blks_vacuumed", DataType.BIGINT),
                 col("index_vacuum_count", DataType.BIGINT),
-                col("max_dead_tuples", DataType.BIGINT),
-                col("num_dead_tuples", DataType.BIGINT)
+                col("max_dead_tuple_bytes", DataType.BIGINT),
+                col("dead_tuple_bytes", DataType.BIGINT),
+                col("num_dead_item_ids", DataType.BIGINT),
+                col("indexes_total", DataType.BIGINT),
+                col("indexes_processed", DataType.BIGINT),
+                col("delay_time", DataType.DOUBLE_PRECISION)
         );
         return new Table("pg_stat_progress_vacuum", cols); // empty, no vacuum in progress
+    }
+
+    /** The remaining pg_stat_progress_* views: no operation is ever in progress, but a
+     *  monitoring query names their columns and has to resolve. */
+    Table buildPgStatProgressAnalyze() {
+        return new Table("pg_stat_progress_analyze", Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("datid", DataType.INTEGER),
+                col("datname", DataType.TEXT),
+                col("relid", DataType.INTEGER),
+                col("phase", DataType.TEXT),
+                col("sample_blks_total", DataType.BIGINT),
+                col("sample_blks_scanned", DataType.BIGINT),
+                col("ext_stats_total", DataType.BIGINT),
+                col("ext_stats_computed", DataType.BIGINT),
+                col("child_tables_total", DataType.BIGINT),
+                col("child_tables_done", DataType.BIGINT),
+                col("current_child_table_relid", DataType.OID),
+                col("delay_time", DataType.DOUBLE_PRECISION)));
+    }
+
+    Table buildPgStatProgressCluster() {
+        return new Table("pg_stat_progress_cluster", Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("datid", DataType.INTEGER),
+                col("datname", DataType.TEXT),
+                col("relid", DataType.INTEGER),
+                col("command", DataType.TEXT),
+                col("phase", DataType.TEXT),
+                col("cluster_index_relid", DataType.OID),
+                col("heap_tuples_scanned", DataType.BIGINT),
+                col("heap_tuples_written", DataType.BIGINT),
+                col("heap_blks_total", DataType.BIGINT),
+                col("heap_blks_scanned", DataType.BIGINT),
+                col("index_rebuild_count", DataType.BIGINT)));
+    }
+
+    Table buildPgStatProgressBasebackup() {
+        return new Table("pg_stat_progress_basebackup", Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("phase", DataType.TEXT),
+                col("backup_total", DataType.BIGINT),
+                col("backup_streamed", DataType.BIGINT),
+                col("tablespaces_total", DataType.BIGINT),
+                col("tablespaces_streamed", DataType.BIGINT)));
+    }
+
+    Table buildPgStatProgressCopy() {
+        return new Table("pg_stat_progress_copy", Cols.listOf(
+                col("pid", DataType.INTEGER),
+                col("datid", DataType.INTEGER),
+                col("datname", DataType.TEXT),
+                col("relid", DataType.INTEGER),
+                col("command", DataType.TEXT),
+                col("type", DataType.TEXT),
+                col("bytes_processed", DataType.BIGINT),
+                col("bytes_total", DataType.BIGINT),
+                col("tuples_processed", DataType.BIGINT),
+                col("tuples_excluded", DataType.BIGINT),
+                col("tuples_skipped", DataType.BIGINT)));
+    }
+
+    /** The memory-context view PG exposes for a backend; memgres allocates on the JVM heap. */
+    Table buildPgBackendMemoryContexts() {
+        return new Table("pg_backend_memory_contexts", Cols.listOf(
+                col("name", DataType.TEXT),
+                col("ident", DataType.TEXT),
+                col("type", DataType.TEXT),
+                col("level", DataType.INTEGER),
+                col("path", DataType.INT4_ARRAY),
+                col("total_bytes", DataType.BIGINT),
+                col("total_nblocks", DataType.BIGINT),
+                col("free_bytes", DataType.BIGINT),
+                col("free_chunks", DataType.BIGINT),
+                col("used_bytes", DataType.BIGINT)));
     }
 
     Table buildPgStatProgressCreateIndex() {
@@ -663,13 +822,14 @@ class CatalogStubBuilder {
         List<Column> cols = Cols.listOf(
                 col("pid", DataType.INTEGER),
                 col("status", DataType.TEXT),
-                col("receive_start_lsn", DataType.TEXT),
+                col("receive_start_lsn", DataType.PG_LSN),
                 col("receive_start_tli", DataType.INTEGER),
-                col("received_lsn", DataType.TEXT),
+                col("written_lsn", DataType.PG_LSN),
+                col("flushed_lsn", DataType.PG_LSN),
                 col("received_tli", DataType.INTEGER),
                 col("last_msg_send_time", DataType.TIMESTAMPTZ),
                 col("last_msg_receipt_time", DataType.TIMESTAMPTZ),
-                col("latest_end_lsn", DataType.TEXT),
+                col("latest_end_lsn", DataType.PG_LSN),
                 col("latest_end_time", DataType.TIMESTAMPTZ),
                 col("slot_name", DataType.TEXT),
                 col("sender_host", DataType.TEXT),
@@ -686,7 +846,6 @@ class CatalogStubBuilder {
                 col("version", DataType.TEXT),
                 col("cipher", DataType.TEXT),
                 col("bits", DataType.INTEGER),
-                col("compression", DataType.BOOLEAN),
                 col("client_dn", DataType.TEXT),
                 col("client_serial", DataType.NUMERIC),
                 col("issuer_dn", DataType.TEXT)
@@ -1000,10 +1159,10 @@ class CatalogStubBuilder {
 
     Table buildPgAm() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("amname", DataType.TEXT),
-                colNN("amtype", DataType.CHAR),
-                col("amhandler", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("amname", DataType.NAME),
+                colNN("amtype", DataType.INTERNAL_CHAR),
+                col("amhandler", DataType.REGPROC),
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_am", cols);
@@ -1082,13 +1241,20 @@ class CatalogStubBuilder {
     }
 
     Table buildPgSeclabel(String name) {
-        List<Column> cols = Cols.listOf(
-                colNN("objoid", DataType.INTEGER),
-                colNN("classoid", DataType.INTEGER),
-                colNN("objsubid", DataType.INTEGER),
-                col("provider", DataType.TEXT),
-                col("label", DataType.TEXT)
-        );
+        // A shared label is on a whole object, so pg_shseclabel carries no objsubid.
+        boolean shared = name.startsWith("pg_sh");
+        List<Column> cols = shared
+                ? Cols.listOf(
+                        colNN("objoid", DataType.OID),
+                        colNN("classoid", DataType.OID),
+                        col("provider", DataType.TEXT),
+                        col("label", DataType.TEXT))
+                : Cols.listOf(
+                        colNN("objoid", DataType.OID),
+                        colNN("classoid", DataType.OID),
+                        colNN("objsubid", DataType.INTEGER),
+                        col("provider", DataType.TEXT),
+                        col("label", DataType.TEXT));
         return new Table(name, cols);
     }
 
@@ -1111,8 +1277,9 @@ class CatalogStubBuilder {
                 colNN("stxnamespace", DataType.INTEGER),
                 col("stxowner", DataType.INTEGER),
                 col("stxkeys", DataType.TEXT),
-                col("stxkind", DataType.TEXT),
-                col("stxstattarget", DataType.INTEGER)
+                col("stxkind", DataType.INTERNAL_CHAR_ARRAY),
+                col("stxstattarget", DataType.SMALLINT),
+                col("stxexprs", DataType.PG_NODE_TREE)
         );
         Table table = new Table("pg_statistic_ext", cols);
         int pgCatalogNs = oids.oid("ns:public");
@@ -1158,7 +1325,8 @@ class CatalogStubBuilder {
                     10, // stxowner (superuser)
                     keys.toString(),
                     kindStr.toString(),
-                    es.getStattarget()
+                    (short) es.getStattarget(),
+                    null // stxexprs: no expression statistics
             });
         }
         return table;
@@ -1166,18 +1334,19 @@ class CatalogStubBuilder {
 
     Table buildPgStatisticExtData() {
         List<Column> cols = Cols.listOf(
-                colNN("stxoid", DataType.INTEGER),
-                col("stxdndistinct", DataType.TEXT),
-                col("stxddependencies", DataType.TEXT),
-                col("stxdmcv", DataType.BYTEA),
-                col("stxdexpr", DataType.TEXT)
+                colNN("stxoid", DataType.OID),
+                colNN("stxdinherit", DataType.BOOLEAN),
+                col("stxdndistinct", DataType.PG_NDISTINCT),
+                col("stxddependencies", DataType.PG_DEPENDENCIES),
+                col("stxdmcv", DataType.PG_MCV_LIST),
+                col("stxdexpr", DataType.ANYARRAY)
         );
         Table table = new Table("pg_statistic_ext_data", cols);
         for (ExtendedStatistic es : database.getAllExtendedStatistics().values()) {
             if (es.isAnalyzed()) {
                 int statOid = oids.oid("stat:" + es.getName());
                 table.insertRow(new Object[]{
-                        statOid, null, null, null, null
+                        statOid, false, null, null, null, null
                 });
             }
         }
@@ -1193,13 +1362,16 @@ class CatalogStubBuilder {
                 col("null_frac", DataType.REAL),
                 col("avg_width", DataType.INTEGER),
                 col("n_distinct", DataType.REAL),
-                col("most_common_vals", DataType.TEXT),
-                col("most_common_freqs", DataType.TEXT),
-                col("histogram_bounds", DataType.TEXT),
+                col("most_common_vals", DataType.ANYARRAY),
+                col("most_common_freqs", DataType.FLOAT4_ARRAY),
+                col("histogram_bounds", DataType.ANYARRAY),
                 col("correlation", DataType.REAL),
-                col("most_common_elems", DataType.TEXT),
-                col("most_common_elem_freqs", DataType.TEXT),
-                col("elem_count_histogram", DataType.TEXT)
+                col("most_common_elems", DataType.ANYARRAY),
+                col("most_common_elem_freqs", DataType.FLOAT4_ARRAY),
+                col("elem_count_histogram", DataType.FLOAT4_ARRAY),
+                col("range_length_histogram", DataType.ANYARRAY),
+                col("range_empty_frac", DataType.REAL),
+                col("range_bounds_histogram", DataType.ANYARRAY)
         );
         Table table = new Table("pg_stats", cols);
         // Populate stats for all analyzed tables
@@ -1234,7 +1406,8 @@ class CatalogStubBuilder {
                 table.insertRow(new Object[]{
                         schemaName, tableName, col.getName(), false,
                         nullFrac, avgWidth, nDistinct,
-                        null, null, null, 0.0f, null, null, null
+                        null, null, null, 0.0f, null, null, null,
+                        null, null, null
                 });
             }
         }
@@ -1243,12 +1416,21 @@ class CatalogStubBuilder {
 
     Table buildPgStatsExt() {
         List<Column> cols = Cols.listOf(
-                col("schemaname", DataType.TEXT),
-                col("tablename", DataType.TEXT),
-                col("statistics_name", DataType.TEXT),
-                col("attnames", DataType.TEXT),
-                col("kinds", DataType.TEXT),
-                col("exprs", DataType.TEXT)
+                col("schemaname", DataType.NAME),
+                col("tablename", DataType.NAME),
+                col("statistics_schemaname", DataType.NAME),
+                col("statistics_name", DataType.NAME),
+                col("statistics_owner", DataType.NAME),
+                col("attnames", DataType.NAME_ARRAY),
+                col("exprs", DataType.TEXT_ARRAY),
+                col("kinds", DataType.INTERNAL_CHAR_ARRAY),
+                col("inherited", DataType.BOOLEAN),
+                col("n_distinct", DataType.PG_NDISTINCT),
+                col("dependencies", DataType.PG_DEPENDENCIES),
+                col("most_common_vals", DataType.TEXT_ARRAY),
+                col("most_common_val_nulls", DataType.BOOL_ARRAY),
+                col("most_common_freqs", DataType.FLOAT8_ARRAY),
+                col("most_common_base_freqs", DataType.FLOAT8_ARRAY)
         );
         Table table = new Table("pg_stats_ext", cols);
         for (ExtendedStatistic es : database.getAllExtendedStatistics().values()) {
@@ -1277,10 +1459,15 @@ class CatalogStubBuilder {
             table.insertRow(new Object[]{
                     schemaName,
                     es.getTableName(),
+                    "public",              // statistics_schemaname
                     es.getName(),
+                    "memgres",             // statistics_owner
                     attnames.toString(),
+                    null,                  // exprs
                     kinds.toString(),
-                    null // exprs
+                    false,                 // inherited
+                    null, null,            // n_distinct, dependencies
+                    null, null, null, null // most_common_*
             });
         }
         return table;
@@ -1706,11 +1893,10 @@ class CatalogStubBuilder {
                 col("name", DataType.TEXT),
                 col("default_version", DataType.TEXT),
                 col("installed_version", DataType.TEXT),
-                col("trusted", DataType.BOOLEAN),
                 col("comment", DataType.TEXT)
         );
         Table table = new Table("pg_available_extensions", cols);
-        table.insertRow(new Object[]{"plpgsql", "1.0", "1.0", true, "PL/pgSQL procedural language"});
+        table.insertRow(new Object[]{"plpgsql", "1.0", "1.0", "PL/pgSQL procedural language"});
         return table;
     }
 
@@ -1849,17 +2035,32 @@ class CatalogStubBuilder {
     }
 
     Table buildPgPublicationTables() {
+        // The view PostgreSQL publishes: which columns are replicated and under what filter,
+        // keyed by publication name. There is no pubid column to join on.
         List<Column> cols = Cols.listOf(
-                col("pubid", DataType.INTEGER),
-                col("pubname", DataType.TEXT),
-                col("schemaname", DataType.TEXT),
-                col("tablename", DataType.TEXT)
+                col("pubname", DataType.NAME),
+                col("schemaname", DataType.NAME),
+                col("tablename", DataType.NAME),
+                col("attnames", DataType.NAME_ARRAY),
+                col("rowfilter", DataType.TEXT)
         );
         Table table = new Table("pg_publication_tables", cols);
         for (Database.PubDef pub : database.getPublications().values()) {
-            int pubOid = oids.oid("pub:" + pub.name);
             for (String tblName : pub.tables) {
-                table.insertRow(new Object[]{ pubOid, pub.name, "public", tblName });
+                StringBuilder attnames = new StringBuilder("{");
+                Table src = null;
+                for (Schema sch : database.getSchemas().values()) {
+                    src = sch.getTable(tblName);
+                    if (src != null) break;
+                }
+                if (src != null) {
+                    for (int i = 0; i < src.getColumns().size(); i++) {
+                        if (i > 0) attnames.append(",");
+                        attnames.append(src.getColumns().get(i).getName());
+                    }
+                }
+                attnames.append("}");
+                table.insertRow(new Object[]{ pub.name, "public", tblName, attnames.toString(), null });
             }
         }
         return table;
@@ -1875,14 +2076,19 @@ class CatalogStubBuilder {
                 col("temporary", DataType.BOOLEAN),
                 col("active", DataType.BOOLEAN),
                 col("active_pid", DataType.INTEGER),
-                col("xmin", DataType.INTEGER),
-                col("catalog_xmin", DataType.INTEGER),
-                col("restart_lsn", DataType.TEXT),
-                col("confirmed_flush_lsn", DataType.TEXT),
+                col("xmin", DataType.XID),
+                col("catalog_xmin", DataType.XID),
+                col("restart_lsn", DataType.PG_LSN),
+                col("confirmed_flush_lsn", DataType.PG_LSN),
                 col("wal_status", DataType.TEXT),
                 col("safe_wal_size", DataType.BIGINT),
                 col("two_phase", DataType.BOOLEAN),
-                col("conflicting", DataType.BOOLEAN)
+                col("two_phase_at", DataType.PG_LSN),
+                col("inactive_since", DataType.TIMESTAMPTZ),
+                col("conflicting", DataType.BOOLEAN),
+                col("invalidation_reason", DataType.TEXT),
+                col("failover", DataType.BOOLEAN),
+                col("synced", DataType.BOOLEAN)
         );
         Table table = new Table("pg_replication_slots", cols);
         for (Database.ReplicationSlot slot : database.getReplicationSlots().values()) {
@@ -1890,7 +2096,8 @@ class CatalogStubBuilder {
                     slot.slotName, slot.plugin, slot.slotType,
                     oids.oid("db:memgres"), "memgres",
                     false, false, null, null, null,
-                    "0/0", "0/0", "reserved", null, false, false
+                    "0/0", "0/0", "reserved", null, false,
+                    null, null, false, null, false, false
             });
         }
         return table;
@@ -1920,6 +2127,14 @@ class CatalogStubBuilder {
                 col("subname", DataType.TEXT),
                 col("apply_error_count", DataType.BIGINT),
                 col("sync_error_count", DataType.BIGINT),
+                // PG 18 counts each kind of apply conflict separately.
+                col("confl_insert_exists", DataType.BIGINT),
+                col("confl_update_origin_differs", DataType.BIGINT),
+                col("confl_update_exists", DataType.BIGINT),
+                col("confl_update_missing", DataType.BIGINT),
+                col("confl_delete_origin_differs", DataType.BIGINT),
+                col("confl_delete_missing", DataType.BIGINT),
+                col("confl_multiple_unique_conflicts", DataType.BIGINT),
                 col("stats_reset", DataType.TIMESTAMPTZ)
         );
         return new Table("pg_stat_subscription_stats", cols);
@@ -2046,12 +2261,15 @@ class CatalogStubBuilder {
                 col("object", DataType.TEXT),
                 col("context", DataType.TEXT),
                 col("reads", DataType.BIGINT),
+                col("read_bytes", DataType.NUMERIC),
                 col("read_time", DataType.DOUBLE_PRECISION),
                 col("writes", DataType.BIGINT),
+                col("write_bytes", DataType.NUMERIC),
                 col("write_time", DataType.DOUBLE_PRECISION),
                 col("writebacks", DataType.BIGINT),
                 col("writeback_time", DataType.DOUBLE_PRECISION),
                 col("extends", DataType.BIGINT),
+                col("extend_bytes", DataType.NUMERIC),
                 col("extend_time", DataType.DOUBLE_PRECISION),
                 col("hits", DataType.BIGINT),
                 col("evictions", DataType.BIGINT),
@@ -2155,7 +2373,8 @@ class CatalogStubBuilder {
                 col("line_number", DataType.INTEGER),
                 col("map_name", DataType.TEXT),
                 col("sys_name", DataType.TEXT),
-                col("pg_username", DataType.TEXT)
+                col("pg_username", DataType.TEXT),
+                col("error", DataType.TEXT)
         );
         return new Table("pg_ident_file_mappings", cols); // empty, no ident mappings
     }

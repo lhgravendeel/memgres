@@ -238,13 +238,21 @@ class Round16CatalogCompletenessTest {
     // J10. pg_operator.oprcode / oprleft / oprresult wired
     // =========================================================================
 
+    /**
+     * oprcode is a regproc: it compares as an OID and prints as the function's name, which is
+     * what PostgreSQL answers for {@code oprcode::text} and what a reader asking "what does this
+     * operator do" is after. This once read the column as a number, which only held while the
+     * name was missing.
+     */
     @Test
     void pg_operator_int4_eq_has_nonzero_oprcode() throws SQLException {
-        long code = Long.parseLong(str(
+        assertEquals("0", str(
+                "SELECT count(*)::text FROM pg_operator " +
+                "WHERE oprname='=' AND oprleft=23 AND oprright=23 AND oprcode=0"),
+                "pg_operator for int4=int4 must have a non-zero oprcode");
+        assertEquals("int4eq", str(
                 "SELECT oprcode::text FROM pg_operator " +
                 "WHERE oprname='=' AND oprleft=23 AND oprright=23 LIMIT 1"));
-        assertTrue(code != 0L,
-                "pg_operator for int4=int4 must have non-zero oprcode; got " + code);
     }
 
     // =========================================================================

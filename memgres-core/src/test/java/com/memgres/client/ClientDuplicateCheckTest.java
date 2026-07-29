@@ -212,7 +212,8 @@ class ClientDuplicateCheckTest {
                 String key = entry.getKey();
                 // These kinds legitimately have same-name entries
                 if (key.contains("[kind=c]") || key.contains("[kind=F]") ||
-                        key.contains("[kind=O]") || key.contains("[kind=R]")) {
+                        key.contains("[kind=O]") || key.contains("[kind=R]") ||
+                        key.contains("[kind=a]")) {
                     continue;
                 }
                 realNameDuplicates.add("  " + key + " -> " + entry.getValue());

@@ -2192,6 +2192,8 @@ class ExprEvaluator {
     }
 
     private Object evalExists(ExistsExpr ex, RowContext outerCtx) {
+        Boolean fromKeys = existsFromKeyIndex(ex, outerCtx);
+        if (fromKeys != null) return fromKeys;
         if (outerCtx != null) executor.outerContextStack.push(outerCtx);
         try {
             QueryResult result = executor.executeStatement(ex.subquery());
@@ -2199,6 +2201,26 @@ class ExprEvaluator {
         } finally {
             if (outerCtx != null) executor.outerContextStack.pop();
         }
+    }
+
+    /**
+     * A correlated EXISTS that tests one column of one relation against a value from the outer
+     * row is answered from that column's values, collected once for the statement. See
+     * {@link ExistsKeyIndex}. Null means the subquery has to be run as written.
+     */
+    private Boolean existsFromKeyIndex(ExistsExpr ex, RowContext outerCtx) {
+        if (outerCtx == null) return null;
+        ExistsKeyIndex idx = executor.existsKeyIndex(ex);
+        if (idx == ExistsKeyIndex.NOT_INDEXABLE) return null;
+        Object outerValue;
+        try {
+            outerValue = evalExpr(idx.outerSide(), outerCtx);
+        } catch (RuntimeException e) {
+            return null;   // the value does not resolve here; let the subquery say so
+        }
+        // NULL is equal to nothing, so the subquery finds no row whatever the relation holds.
+        if (outerValue == null) return Boolean.FALSE;
+        return idx.contains(executor, outerValue);
     }
 
     private Object evalAnyAll(AnyAllExpr aa, RowContext ctx) {

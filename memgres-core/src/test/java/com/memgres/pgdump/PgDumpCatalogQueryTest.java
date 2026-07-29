@@ -539,7 +539,8 @@ class PgDumpCatalogQueryTest {
                      "       c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, " +
                      "       c.relfrozenxid, c.relminmxid, c.relacl, c.relpersistence, " +
                      "       c.relreplident, c.relpages, c.reltuples, c.relallvisible, " +
-                     "       c.relhasoids, c.relispartition, c.relallfrozen " +
+                     // relhasoids was dropped from pg_class in PostgreSQL 12
+                     "       c.relispartition, c.relallfrozen " +
                      "FROM pg_catalog.pg_class c " +
                      "WHERE c.relname = 'customers'")) {
             assertTrue(rs.next(), "Should find customers in pg_class");

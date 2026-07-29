@@ -805,5 +805,132 @@ final class BuiltinFunctionSignatures {
             {"websearch_to_tsquery", "3615", "3734 25", "fi"},
             {"width", "701", "603", "fi"},
             {"xml", "142", "25", "fs"},
+
+            // hstore (type OID 90001 is memgres's own; PostgreSQL assigns the extension one)
+            {"akeys", "1009", "90001", "fi"},
+            {"avals", "1009", "90001", "fi"},
+            {"defined", "16", "90001 25", "fi"},
+            {"delete", "90001", "90001 25", "fi"},
+            {"delete", "90001", "90001 1009", "fi"},
+            {"delete", "90001", "90001 90001", "fi"},
+            {"delete_key", "90001", "90001 25", "fi"},
+            {"each", "2249", "90001", "ti"},
+            {"exist", "16", "90001 25", "fi"},
+            {"isdefined", "16", "90001 25", "fi"},
+            {"isexists", "16", "90001 25", "fi"},
+            {"hstore", "90001", "1009", "fi"},
+            {"hstore", "90001", "2249", "fi"},
+            {"hstore", "90001", "25 25", "fi"},
+            {"hstore", "90001", "1009 1009", "fi"},
+            {"hstore_to_array", "1009", "90001", "fi"},
+            {"hstore_to_json", "114", "90001", "fi"},
+            {"hstore_to_json_loose", "114", "90001", "fi"},
+            {"hstore_to_jsonb", "3802", "90001", "fi"},
+            {"hstore_to_jsonb_loose", "3802", "90001", "fi"},
+            {"hstore_to_matrix", "1009", "90001", "fi"},
+            {"populate_record", "2283", "2283 90001", "fi"},
+            {"skeys", "25", "90001", "ti"},
+            {"svals", "25", "90001", "ti"},
+            {"slice", "90001", "90001 1009", "fi"},
+
+            // JSON population and stripping
+            {"json_populate_record", "2283", "2283 114 16", "fs"},
+            {"json_populate_recordset", "2283", "2283 114 16", "ts"},
+            {"jsonb_populate_record", "2283", "2283 3802", "fs"},
+            {"jsonb_populate_recordset", "2283", "2283 3802", "ts"},
+            {"json_strip_nulls", "114", "114 16", "fs"},
+            {"jsonb_strip_nulls", "3802", "3802 16", "fs"},
+            {"jsonb_object", "3802", "1009", "fi"},
+            {"jsonb_object", "3802", "1009 1009", "fi"},
+            {"jsonb_path_match", "16", "3802 4072 3802 16", "fi"},
+            {"jsonb_path_match_tz", "16", "3802 4072 3802 16", "fs"},
+            {"row_to_json", "114", "2249", "fs"},
+            {"row_to_json", "114", "2249 16", "fs"},
+            {"to_json", "114", "2283", "fs"},
+            {"to_jsonb", "3802", "2283", "fs"},
+
+            // Text search / fuzzy matching, and the privilege probe
+            {"levenshtein", "23", "25 25", "fi"},
+            {"soundex", "25", "25", "fi"},
+            {"unaccent", "25", "25", "fs"},
+            {"unaccent", "25", "3769 25", "fs"},
+            {"similarity", "700", "25 25", "fi"},
+            {"show_trgm", "1009", "25", "fi"},
+            {"has_any_column_privilege", "16", "25 25", "fs"},
+            {"has_any_column_privilege", "16", "26 25", "fs"},
+            {"has_any_column_privilege", "16", "19 26 25", "fs"},
+            {"has_any_column_privilege", "16", "26 25 25", "fs"},
+            {"has_any_column_privilege", "16", "26 26 25", "fs"},
+            {"has_any_column_privilege", "16", "19 25 25", "fs"},
+
+            // UUID and digest generators memgres evaluates without an extension being installed
+            {"gen_random_uuid", "2950", "", "fv"},
+            {"uuidv4", "2950", "", "fv"},
+            {"uuid_generate_v1", "2950", "", "fv"},
+            {"uuid_generate_v3", "2950", "2950 25", "fi"},
+            {"uuid_generate_v4", "2950", "", "fv"},
+            {"uuid_generate_v5", "2950", "2950 25", "fi"},
+            {"uuid_nil", "2950", "", "fi"},
+            {"uuid_ns_dns", "2950", "", "fi"},
+            {"uuid_ns_url", "2950", "", "fi"},
+            {"digest", "17", "25 25", "fi"},
+            {"hmac", "17", "25 25 25", "fi"},
+            {"gen_salt", "25", "25", "fv"},
+            {"gen_random_bytes", "17", "23", "fv"},
+            {"sha1", "17", "17", "fi"},
+
+            // Geometric predicates
+            {"closest_point", "600", "601 601", "fi"},
+            {"intersects", "16", "601 601", "fi"},
+            {"is_horizontal", "16", "601", "fi"},
+            {"is_vertical", "16", "601", "fi"},
+            {"is_parallel", "16", "601 601", "fi"},
+            {"is_perpendicular", "16", "601 601", "fi"},
+
+            // Unicode, MERGE and the information_schema helper
+            {"unicode_version", "25", "", "fi"},
+            {"unicode_assigned", "16", "25", "fi"},
+            {"merge_action", "25", "", "fv"},
+            {"_pg_expandarray", "2249", "2277", "ti"},
+
+            // Replication and WAL control
+            {"pg_backup_start", "3220", "25 16", "fv"},
+            {"pg_backup_stop", "2249", "16", "fv"},
+            {"pg_create_physical_replication_slot", "2249", "19 16 16", "fv"},
+            {"pg_create_logical_replication_slot", "2249", "19 19 16 16 16", "fv"},
+            {"pg_create_restore_point", "3220", "25", "fv"},
+            {"pg_logical_slot_get_changes", "2249", "19 3220 23 1009", "tv"},
+            {"pg_logical_slot_peek_changes", "2249", "19 3220 23 1009", "tv"},
+            {"pg_replication_slot_advance", "2249", "19 3220", "fv"},
+            {"pg_switch_wal", "3220", "", "fv"},
+            {"pg_wal_replay_pause", "2278", "", "fv"},
+            {"pg_wal_replay_resume", "2278", "", "fv"},
+            {"pg_walfile_name", "25", "3220", "fi"},
+            {"pg_advisory_xact_unlock", "2278", "20", "fv"},
+            {"pg_stat_statements_reset", "1184", "26 26 20 16", "fv"},
+    };
+
+    /**
+     * The window functions. PostgreSQL marks these prokind='w': they are not callable as ordinary
+     * functions and a tool that lists them as such will generate a call the server rejects.
+     *
+     * <p>Columns: proname, prorettype, proargtypes.
+     */
+    static final String[][] WINDOW_FUNCTIONS = {
+            {"row_number", "20", ""},
+            {"rank", "20", ""},
+            {"dense_rank", "20", ""},
+            {"percent_rank", "701", ""},
+            {"cume_dist", "701", ""},
+            {"ntile", "23", "23"},
+            {"lag", "2283", "2283"},
+            {"lag", "2283", "2283 23"},
+            {"lag", "2283", "2283 23 2283"},
+            {"lead", "2283", "2283"},
+            {"lead", "2283", "2283 23"},
+            {"lead", "2283", "2283 23 2283"},
+            {"first_value", "2283", "2283"},
+            {"last_value", "2283", "2283"},
+            {"nth_value", "2283", "2283 23"},
     };
 }

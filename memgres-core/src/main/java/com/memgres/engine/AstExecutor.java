@@ -191,12 +191,23 @@ public class AstExecutor {
             Statement priorOutermost = fromResolver.outermostQuery;
             boolean outermost = executeDepth == 0;
             if (outermost) fromResolver.outermostQuery = stmt instanceof SelectStmt ? stmt : null;
+            // A catalog relation is the same relation everywhere in one statement, so it is
+            // built once and reused; without this a correlated subquery over pg_proc rebuilds
+            // the whole of it for every outer row.
+            if (outermost) {
+                systemCatalog.beginStatement();
+                existsIndexes.clear();
+            }
             executeDepth++;
             try {
                 return executeStatement(stmt);
             } finally {
                 executeDepth--;
-                if (outermost) fromResolver.outermostQuery = priorOutermost;
+                if (outermost) {
+                    fromResolver.outermostQuery = priorOutermost;
+                    systemCatalog.endStatement();
+                    existsIndexes.clear();
+                }
             }
         } finally {
             this.boundParameters = previousParams;
@@ -285,6 +296,40 @@ public class AstExecutor {
     }
 
     public QueryResult executeStatement(Statement stmt) {
+        // A statement that is not a plain query can change what the catalogs report — a
+        // data-modifying CTE, a function body running DDL — so what has been built for this
+        // statement so far is dropped on either side of it rather than read again.
+        boolean mayChangeCatalog = !(stmt instanceof SelectStmt) && !(stmt instanceof SetOpStmt);
+        if (!mayChangeCatalog) return executeReadOrWrite(stmt);
+        dropStatementCaches();
+        try {
+            return executeReadOrWrite(stmt);
+        } finally {
+            dropStatementCaches();
+        }
+    }
+
+    /** The key sets built for correlated EXISTS subqueries of the statement now running. */
+    private final java.util.IdentityHashMap<ExistsExpr, ExistsKeyIndex> existsIndexes =
+            new java.util.IdentityHashMap<>();
+
+    /** The plan for answering this EXISTS from a key set, computed once per statement. */
+    ExistsKeyIndex existsKeyIndex(ExistsExpr ex) {
+        ExistsKeyIndex idx = existsIndexes.get(ex);
+        if (idx == null) {
+            idx = ExistsKeyIndex.plan(ex);
+            existsIndexes.put(ex, idx);
+        }
+        return idx;
+    }
+
+    /** Forget everything derived from the database for the statement now running. */
+    private void dropStatementCaches() {
+        systemCatalog.invalidateStatementCache();
+        existsIndexes.clear();
+    }
+
+    private QueryResult executeReadOrWrite(Statement stmt) {
         checkReadOnlyTransaction(stmt);
         if (stmt instanceof SelectStmt) return selectExecutor.executeSelect(((SelectStmt) stmt));
         if (stmt instanceof SetOpStmt) return selectExecutor.executeSetOp(((SetOpStmt) stmt));

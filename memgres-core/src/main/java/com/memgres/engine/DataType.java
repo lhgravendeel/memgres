@@ -118,6 +118,20 @@ public enum DataType {
     INET_ARRAY(1041, "_inet"),
     ACLITEM_ARRAY(1034, "_aclitem"),
     RECORD_ARRAY(2287, "_record"),
+    OID_ARRAY(1028, "_oid"),
+    INTERNAL_CHAR_ARRAY(1002, "_char"),
+
+    // Types the system catalogs declare columns of. A catalog column typed text where PG types
+    // it pg_node_tree tells a client the value can be read as text, which it cannot; and a
+    // statistics column has to be an array type for a query over it to resolve at all.
+    PG_NODE_TREE(194, "pg_node_tree"),
+    /** PostgreSQL's single-byte {@code "char"}, which the catalogs use for flag columns. */
+    INTERNAL_CHAR(18, "char"),
+    ANYARRAY(2277, "anyarray"),
+    PG_LSN(3220, "pg_lsn"),
+    PG_NDISTINCT(3361, "pg_ndistinct"),
+    PG_DEPENDENCIES(3402, "pg_dependencies"),
+    PG_MCV_LIST(5017, "pg_mcv_list"),
 
     // OID type
     OID(26, "oid"),
@@ -383,6 +397,9 @@ public enum DataType {
             case JSONB_ARRAY: return JSONB;
             case INET_ARRAY: return INET;
             case RECORD_ARRAY: return RECORD;
+            case OID_ARRAY: return OID;
+            case INTERNAL_CHAR_ARRAY: return INTERNAL_CHAR;
+            case ACLITEM_ARRAY: return null; // aclitem has no DataType of its own
             default: return null;
         }
     }
