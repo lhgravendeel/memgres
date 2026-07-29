@@ -833,6 +833,11 @@ class SessionExecutor {
             }
         }
 
+        if (name.equals("create_stub") || name.equals("drop_stub") || name.equals("alter_stub")
+                || name.equals("alter_rule") || name.equals("alter_trigger")) {
+            return executeStubObject(name, stmt.value());
+        }
+
         if (name.equals("alter_extension_set_schema")) {
             String val = stmt.value();
             int colonIdx = val.indexOf(':');
@@ -2566,5 +2571,93 @@ class SessionExecutor {
             return "memgres".equals(lower) || "test".equals(lower) || "postgres".equals(lower);
         }
         return false;
+    }
+
+    /** Separator inside a stub statement's encoded payload; SQL text cannot contain it. */
+    private static final String STUB_SEP = "\u0001";
+
+    /** Collations PostgreSQL ships with, which exist without ever being created. */
+    private static final Set<String> BUILTIN_COLLATIONS = Cols.setOf(
+            "default", "c", "posix", "c.utf-8", "c.utf8", "en_us", "en_us.utf-8", "en_us.utf8",
+            "und-x-icu", "en-us-x-icu", "en-x-icu", "ucs_basic");
+
+    /**
+     * Conversions, tablespaces and procedural languages are accepted here without being
+     * implemented, but PostgreSQL still refuses an ALTER on one that was never created — and
+     * reporting success for a rename that did not happen is what makes the next statement fail
+     * somewhere unrelated. The names are remembered so the existence check can be honest.
+     */
+    private QueryResult executeStubObject(String kind, String payload) {
+        String[] parts = (payload == null ? "" : payload).split(STUB_SEP, -1);
+        String first = parts.length > 0 ? parts[0] : "";
+        String second = parts.length > 1 ? parts[1] : "";
+        String third = parts.length > 2 ? parts[2] : "";
+        if (kind.equals("create_stub")) {
+            executor.database.addStubObject(first, second);
+            return QueryResult.message(QueryResult.Type.SET, "CREATE");
+        }
+        if (kind.equals("drop_stub")) {
+            executor.database.removeStubObject(first, second);
+            return QueryResult.message(QueryResult.Type.SET, "DROP");
+        }
+        if (kind.equals("alter_rule")) {
+            if (!executor.database.hasRule(first, second)) {
+                throw new MemgresException("rule \"" + first + "\" for relation \""
+                        + second + "\" does not exist", "42704");
+            }
+            if (!third.isEmpty()) {
+                if (executor.database.hasRule(third, second)) {
+                    throw new MemgresException("rule \"" + third + "\" for relation \""
+                            + second + "\" already exists", "42710");
+                }
+                executor.database.renameRule(first, second, third);
+            }
+            return QueryResult.message(QueryResult.Type.SET, "ALTER RULE");
+        }
+        if (kind.equals("alter_trigger")) {
+            PgTrigger found = null;
+            for (PgTrigger t : executor.database.getTriggersForTable(second)) {
+                if (t.getName().equalsIgnoreCase(first)) { found = t; break; }
+            }
+            if (found == null) {
+                throw new MemgresException("trigger \"" + first + "\" for table \""
+                        + second + "\" does not exist", "42704");
+            }
+            if (!third.isEmpty()) {
+                for (PgTrigger t : executor.database.getTriggersForTable(second)) {
+                    if (t.getName().equalsIgnoreCase(third)) {
+                        throw new MemgresException("trigger \"" + third + "\" for relation \""
+                                + second + "\" already exists", "42710");
+                    }
+                }
+                found.setName(third);
+            }
+            return QueryResult.message(QueryResult.Type.SET, "ALTER TRIGGER");
+        }
+        // alter_stub: kind, name, new name (empty when the action was not a rename)
+        boolean isCollation = first.equals("collation");
+        boolean exists = isCollation
+                ? executor.database.getCollation(second) != null
+                        || executor.database.hasStubObject("collation", second)
+                        || BUILTIN_COLLATIONS.contains(second.toLowerCase())
+                : executor.database.hasStubObject(first, second);
+        if (!exists) {
+            throw new MemgresException(isCollation
+                    ? "collation \"" + second + "\" for encoding \"UTF8\" does not exist"
+                    : first + " \"" + second + "\" does not exist", "42704");
+        }
+        if (!third.isEmpty()) {
+            if (isCollation) {
+                Database.CollationDef coll = executor.database.getCollation(second);
+                if (coll != null) {
+                    executor.database.getUserCollations().remove(second.toLowerCase());
+                    executor.database.addCollation(new Database.CollationDef(third, coll.provider,
+                            coll.locale, coll.lcCollate, coll.lcCtype, coll.deterministic,
+                            coll.fromCollation));
+                }
+            }
+            executor.database.renameStubObject(first, second, third);
+        }
+        return QueryResult.message(QueryResult.Type.SET, "ALTER");
     }
 }

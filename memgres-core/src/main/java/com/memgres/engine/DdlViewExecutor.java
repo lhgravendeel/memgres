@@ -30,6 +30,17 @@ class DdlViewExecutor {
         if (!stmt.orReplace() && executor.database.hasView(stmt.name())) {
             throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
         }
+        // A table, sequence or index of this name owns it just as firmly as another view would;
+        // CREATE OR REPLACE can only replace a view, never take a name from another kind. What
+        // it is refused with differs: a plain CREATE reports the name as taken, while a REPLACE
+        // reports that what is there is not the kind it knows how to replace.
+        String targetSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        if (stmt.orReplace() && !stmt.materialized()) {
+            RelationNamespace.requireKind(executor.database, targetSchema, stmt.name(),
+                    RelationNamespace.VIEW);
+        }
+        RelationNamespace.requireFree(executor.database, targetSchema, stmt.name(),
+                stmt.materialized() ? RelationNamespace.MATVIEW : RelationNamespace.VIEW);
         Database.ViewDef oldView = executor.database.getView(stmt.name());
 
         if (stmt.orReplace() && oldView != null && !stmt.materialized()) {
@@ -60,7 +71,8 @@ class DdlViewExecutor {
             }
         }
 
-        String viewSchema = executor.defaultSchema();
+        // A qualified name puts the view in the schema it names.
+        String viewSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
 
         // PG expands SELECT * when the view is defined, freezing the column list.
         // (A view over a temp table becomes temporary itself — see below.)
@@ -458,6 +470,10 @@ class DdlViewExecutor {
             if (executor.database.hasView(stmt.newName())) {
                 throw new MemgresException("relation \"" + stmt.newName() + "\" already exists", "42P07");
             }
+            // A table, sequence or index already answers to the new name just as firmly.
+            RelationNamespace.requireFree(executor.database,
+                    existing.schemaName() != null ? existing.schemaName() : executor.defaultSchema(),
+                    stmt.newName(), null);
             executor.database.removeView(stmt.name());
             executor.database.addView(new Database.ViewDef(stmt.newName(), existing.schemaName(), existing.query(),
                     existing.orReplace(), existing.materialized(),
@@ -523,17 +539,30 @@ class DdlViewExecutor {
     QueryResult executeRefreshMaterializedView(RefreshMaterializedViewStmt stmt) {
         Database.ViewDef view = executor.database.getView(stmt.name());
         if (view == null) {
+            // A table of that name is the wrong kind of relation, not a missing one. PostgreSQL
+            // lets a table through its permission check and then refuses it as not a
+            // materialized view; a sequence or an index never gets that far.
+            if (ddl.resolveTableOrNull(stmt.name()) != null) {
+                throw PgErrors.notImplemented("\"" + stmt.name() + "\" is not a materialized view");
+            }
+            if (RelationNamespace.kindOf(executor.database, executor.defaultSchema(),
+                    stmt.name()) != null) {
+                throw PgErrors.wrongObjectType("\"" + RelationNamespace.bareName(stmt.name())
+                        + "\" is not a table or materialized view");
+            }
             throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
         }
         if (!view.materialized()) {
-            throw new MemgresException("\"" + stmt.name() + "\" is not a materialized view");
+            throw PgErrors.wrongObjectType("\"" + RelationNamespace.bareName(stmt.name())
+                    + "\" is not a table or materialized view");
         }
         if (stmt.concurrently()) {
             // CONCURRENTLY replaces rows one by one instead of swapping the whole relation, so
             // it needs a unique index to tell which stored row each new row corresponds to.
             if (!stmt.withData()) {
-                throw new MemgresException(
-                        "CONCURRENTLY and WITH NO DATA options cannot be used together", "0A000");
+                // Two options that contradict each other is a fault in the statement itself.
+                throw PgErrors.syntax(
+                        "CONCURRENTLY and WITH NO DATA options cannot be used together");
             }
             if (!hasUniqueIndexForConcurrentRefresh(view)) {
                 String qualified = (view.schemaName() != null ? view.schemaName() : "public")

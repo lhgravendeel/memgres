@@ -1577,32 +1577,45 @@ class DmlExecutor {
      */
     private void enforceRlsWithCheck(Table table, Object[] row, String command) {
         String effectiveRole = executor.currentRole();
-        boolean anyPolicyMatched = false;
+        List<RlsPolicy> permissive = new ArrayList<>();
+        List<RlsPolicy> restrictive = new ArrayList<>();
         for (RlsPolicy policy : table.getRlsPolicies()) {
-            if (policy.appliesTo(command) && policy.appliesToRole(effectiveRole)) {
-                // For WITH CHECK: use withCheckExpr if present, else fall back to usingExpr (PG semantics)
-                Expression checkExpr = policy.getWithCheckExpr();
-                if (checkExpr == null) checkExpr = policy.getUsingExpr();
-                if (checkExpr == null) continue;
-                anyPolicyMatched = true;
-                RowContext rlsCtx = new RowContext(table, null, row);
-                try {
-                    Object result = executor.evalExpr(checkExpr, rlsCtx);
-                    if (!Boolean.TRUE.equals(result)) {
-                        throw new MemgresException(
-                            "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
-                    }
-                } catch (MemgresException e) {
-                    throw e;
-                } catch (Exception e) {
-                    throw new MemgresException(
-                        "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
-                }
-            }
+            if (!policy.appliesTo(command) || !policy.appliesToRole(effectiveRole)) continue;
+            // WITH CHECK falls back to USING when the policy did not write one.
+            if (policy.getWithCheckExpr() == null && policy.getUsingExpr() == null) continue;
+            if (policy.isRestrictive()) restrictive.add(policy); else permissive.add(policy);
         }
-        if (!anyPolicyMatched) {
+        RowContext rlsCtx = new RowContext(table, null, row);
+        // A PERMISSIVE policy grants: writing a second one widens what may be written, so the
+        // set is OR-ed. AND-ing them would make each new policy narrow the rule set instead,
+        // and would refuse rows the first policy plainly allows.
+        boolean granted = false;
+        for (RlsPolicy policy : permissive) {
+            if (rlsCheckPasses(policy, rlsCtx)) { granted = true; break; }
+        }
+        if (!granted) {
             throw new MemgresException(
                 "new row violates row-level security policy for table \"" + table.getName() + "\"", "42501");
+        }
+        // A RESTRICTIVE policy takes away: every one of them must also pass, and the one that
+        // refused is named.
+        for (RlsPolicy policy : restrictive) {
+            if (!rlsCheckPasses(policy, rlsCtx)) {
+                throw new MemgresException("new row violates row-level security policy \""
+                        + policy.getName() + "\" for table \"" + table.getName() + "\"", "42501");
+            }
+        }
+    }
+
+    /** Evaluate one policy's WITH CHECK expression (falling back to USING) against a new row. */
+    private boolean rlsCheckPasses(RlsPolicy policy, RowContext ctx) {
+        Expression checkExpr = policy.getWithCheckExpr();
+        if (checkExpr == null) checkExpr = policy.getUsingExpr();
+        if (checkExpr == null) return true;
+        try {
+            return Boolean.TRUE.equals(executor.evalExpr(checkExpr, ctx));
+        } catch (Exception e) {
+            return false;
         }
     }
 

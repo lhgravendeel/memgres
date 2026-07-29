@@ -42,23 +42,25 @@ class DmlTriggerHelper {
                 }
                 // Evaluate WHEN clause if present
                 if (trigger.getWhenClause() != null && !trigger.getWhenClause().isEmpty()) {
+                    com.memgres.engine.parser.ast.Expression whenExpr;
                     try {
-                        com.memgres.engine.parser.ast.Expression whenExpr =
-                                com.memgres.engine.parser.Parser.parseExpression(trigger.getWhenClause());
-                        // Build a row context with NEW/OLD references
-                        RowContext ctx = newRow != null ? new RowContext(table, "new", newRow) : null;
-                        if (oldRow != null && ctx != null) {
-                            ctx = ctx.merge(new RowContext(table, "old", oldRow));
-                        } else if (oldRow != null) {
-                            ctx = new RowContext(table, "old", oldRow);
-                        }
-                        if (ctx == null) ctx = new RowContext(table, table.getName(), new Object[table.getColumns().size()]);
-                        Object result = executor.evalExpr(whenExpr, ctx);
-                        if (!executor.isTruthy(result)) continue;
-                    } catch (Exception e) {
-                        // If WHEN evaluation fails, skip this trigger
-                        continue;
+                        whenExpr = com.memgres.engine.parser.Parser.parseExpression(trigger.getWhenClause());
+                    } catch (RuntimeException unparsable) {
+                        continue; // nothing to evaluate; the definition is reported elsewhere
                     }
+                    // Build a row context with NEW/OLD references
+                    RowContext ctx = newRow != null ? new RowContext(table, "new", newRow) : null;
+                    if (oldRow != null && ctx != null) {
+                        ctx = ctx.merge(new RowContext(table, "old", oldRow));
+                    } else if (oldRow != null) {
+                        ctx = new RowContext(table, "old", oldRow);
+                    }
+                    if (ctx == null) ctx = new RowContext(table, table.getName(), new Object[table.getColumns().size()]);
+                    // An error raised while deciding whether the trigger fires belongs to the
+                    // statement that raised it. Swallowing it silently skips the trigger and
+                    // lets a row through that a division by zero should have stopped.
+                    Object result = executor.evalExpr(whenExpr, ctx);
+                    if (!executor.isTruthy(result)) continue;
                 }
                 // Deferred constraint triggers: defer to commit
                 if (trigger.isInitiallyDeferred() && timing == PgTrigger.Timing.AFTER

@@ -39,7 +39,9 @@ class DdlTableExecutor {
         }
         Schema schema = executor.database.getOrCreateSchema(schemaName);
 
-        if (schema.getTable(stmt.name()) != null) {
+        // A schema holds one relation of a given name whatever its kind, so a view, sequence or
+        // index of this name blocks the table just as another table would.
+        if (RelationNamespace.kindOf(executor.database, schemaName, stmt.name()) != null) {
             if (stmt.ifNotExists()) {
                 if (executor.session != null) {
                     executor.session.addNotice("NOTICE", "42P07",
@@ -59,13 +61,37 @@ class DdlTableExecutor {
         List<Column> inheritedColumns = new ArrayList<>();
         List<Table> parentTables = new ArrayList<>();
         if (stmt.inherits() != null) {
+            Set<String> childDeclared = new HashSet<>();
+            for (ColumnDef def : stmt.columns()) childDeclared.add(def.name().toLowerCase());
+            Set<String> seenParents = new HashSet<>();
             for (String parentName : stmt.inherits()) {
                 Table parent = executor.resolveTable(schemaName, parentName);
+                if (!seenParents.add(parent.getName().toLowerCase())) {
+                    throw new MemgresException("relation \"" + parentName
+                            + "\" would be inherited from more than once", "42P07");
+                }
                 parentTables.add(parent);
                 for (Column col : parent.getColumns()) {
-                    boolean exists = inheritedColumns.stream()
-                            .anyMatch(c -> c.getName().equalsIgnoreCase(col.getName()));
-                    if (!exists) inheritedColumns.add(col);
+                    Column existing = null;
+                    for (Column c : inheritedColumns) {
+                        if (c.getName().equalsIgnoreCase(col.getName())) { existing = c; break; }
+                    }
+                    if (existing == null) { inheritedColumns.add(col); continue; }
+                    // Two parents contributing one column have to agree about what it holds:
+                    // the child gets one column, so a second parent's wider type has nowhere
+                    // to go and its rows would silently change shape on the way in.
+                    if (existing.getType() != col.getType()) {
+                        throw new MemgresException("inherited column \"" + col.getName()
+                                + "\" has a type conflict", "42804");
+                    }
+                    // A default the child does not override would have to be picked from two
+                    // parents, and there is no rule for choosing.
+                    if (!childDeclared.contains(col.getName().toLowerCase())
+                            && existing.getDefaultValue() != null && col.getDefaultValue() != null
+                            && !existing.getDefaultValue().equals(col.getDefaultValue())) {
+                        throw new MemgresException("column \"" + col.getName()
+                                + "\" inherits conflicting default values", "42611");
+                    }
                 }
             }
         }
@@ -94,8 +120,24 @@ class DdlTableExecutor {
                             .anyMatch(c -> c.getName().equalsIgnoreCase(col.getName()));
                     if (!exists) inheritedColumns.add(col);
                 }
+                // LIKE copies the columns and their NOT NULL, and nothing else unless asked.
+                // The keys travel with INCLUDING INDEXES, because it is the index they need;
+                // INCLUDING CONSTRAINTS brings the CHECK constraints only. Copying them all
+                // unasked gave the new table a primary key PostgreSQL never put there — under
+                // the source table's constraint name, so a duplicate was reported against a
+                // constraint on another relation.
+                boolean wantKeys = likeOptions.contains("INDEXES") || likeOptions.contains("ALL");
+                boolean wantChecks = likeOptions.contains("CONSTRAINTS") || likeOptions.contains("ALL");
                 for (StoredConstraint sc : likeTable.getConstraints()) {
-                    likeConstraints.add(sc);
+                    boolean isKey = sc.getType() == StoredConstraint.Type.PRIMARY_KEY
+                            || sc.getType() == StoredConstraint.Type.UNIQUE
+                            || sc.getType() == StoredConstraint.Type.EXCLUDE;
+                    if (isKey ? !wantKeys : (!wantChecks
+                            || sc.getType() != StoredConstraint.Type.CHECK)) {
+                        continue;
+                    }
+                    // The copy belongs to the new table and is named after it.
+                    likeConstraints.add(sc.copyForPartition(stmt.name()));
                 }
                 // Collect indexes to clone if INCLUDING INDEXES or INCLUDING ALL
                 if (likeOptions.contains("INDEXES") || likeOptions.contains("ALL")) {
@@ -105,6 +147,12 @@ class DdlTableExecutor {
                         if (idxTable != null && (idxTable.equalsIgnoreCase(schemaName + "." + likeTableName)
                                 || idxTable.equalsIgnoreCase(likeTableName))) {
                             likeIndexesToClone.add(new String[]{srcIdx, stmt.name()});
+                            // A standalone CREATE UNIQUE INDEX also registers a UNIQUE constraint
+                            // here, which PostgreSQL does not do — pg_constraint has no row for
+                            // one. Cloning both would give the new table two indexes over the same
+                            // columns where PostgreSQL gives it one, so the index stands and the
+                            // constraint it implies does not travel with it.
+                            dropKeyCoveredByIndex(likeConstraints, idxEntry.getValue());
                         }
                     }
                 }
@@ -251,6 +299,15 @@ class DdlTableExecutor {
                 col.setParsedDefaultExpr(def.defaultExpr());
             }
             if (existingIdx >= 0) {
+                // Redeclaring an inherited column only restates it: the child cannot give the
+                // column a type the parent's rows are not already stored in.
+                Column inheritedCol = columns.get(existingIdx);
+                boolean fromParent = inheritedColumns.stream()
+                        .anyMatch(c -> c.getName().equalsIgnoreCase(def.name()));
+                if (fromParent && stmt.inherits() != null && inheritedCol.getType() != col.getType()) {
+                    throw new MemgresException("column \"" + def.name() + "\" has a type conflict",
+                            "42804");
+                }
                 columns.set(existingIdx, col);
             } else {
                 columns.add(col);
@@ -278,10 +335,15 @@ class DdlTableExecutor {
             table.setPartitionStrategy(stmt.partitionBy());
             String partCol = stmt.partitionColumn();
             if (partCol != null) {
-                for (String col : partCol.split(",")) {
+                for (String col : splitTopLevel(partCol)) {
                     String trimmed = col.trim();
-                    // Skip validation for expression-based partition keys (e.g., "(lower(s))")
-                    if (trimmed.startsWith("(") || trimmed.contains("(")) continue;
+                    // An expression key decides which partition a row lives in, so it has to
+                    // give the same answer every time it is asked. A volatile or stable one
+                    // may route a row to one partition on INSERT and look for it in another.
+                    if (trimmed.contains("(")) {
+                        checkPartitionKeyExpression(trimmed, columns, table);
+                        continue;
+                    }
                     if (table.getColumnIndex(trimmed) < 0) {
                         throw new MemgresException("column \"" + trimmed + "\" named in partition key does not exist", "42703");
                     }
@@ -376,6 +438,10 @@ class DdlTableExecutor {
             }
         }
 
+        // A table has at most one primary key, so a second declaration is a fault in the
+        // definition rather than a second constraint to store.
+        DdlDefinitionChecks.rejectSecondPrimaryKey(table, stmt.name());
+
         // Validate that PK/UNIQUE constraints on partitioned tables include the partition column
         for (StoredConstraint sc : table.getConstraints()) {
             validatePartitionKeyCoverage(table, sc);
@@ -418,6 +484,29 @@ class DdlTableExecutor {
      * nothing for a unique index to hold; PostgreSQL refuses to key on one. Checked before the
      * table exists, so a rejected definition leaves nothing behind.
      */
+    /**
+     * Drops the UNIQUE constraint a cloned index already stands for, matching on the columns
+     * because that is what the two have in common. A PRIMARY KEY is left alone: PostgreSQL does
+     * record one in pg_constraint and does clone it, and its index is named for the key rather
+     * than copied under its own name.
+     */
+    private static void dropKeyCoveredByIndex(List<StoredConstraint> constraints,
+                                              List<String> indexColumns) {
+        if (indexColumns == null || indexColumns.isEmpty()) return;
+        java.util.Iterator<StoredConstraint> it = constraints.iterator();
+        while (it.hasNext()) {
+            StoredConstraint sc = it.next();
+            if (sc.getType() != StoredConstraint.Type.UNIQUE) continue;
+            List<String> cols = sc.getColumns();
+            if (cols == null || cols.size() != indexColumns.size()) continue;
+            boolean same = true;
+            for (int i = 0; i < cols.size(); i++) {
+                if (!cols.get(i).equalsIgnoreCase(indexColumns.get(i))) { same = false; break; }
+            }
+            if (same) it.remove();
+        }
+    }
+
     private void rejectKeysOnVirtualColumns(CreateTableStmt stmt, List<Column> columns) {
         Set<String> virtual = new HashSet<>();
         for (Column c : columns) {
@@ -488,6 +577,12 @@ class DdlTableExecutor {
 
     private QueryResult createPartitionOfTable(CreateTableStmt stmt, Schema schema, String schemaName) {
         Table parent = executor.resolveTable(schemaName, stmt.partitionOfParent());
+        // A table with no partition key has no slots to attach to, so a bound over it describes
+        // nothing; accepting it produces a table that holds rows nothing ever routes to.
+        if (parent.getPartitionStrategy() == null) {
+            throw new MemgresException("\"" + stmt.partitionOfParent() + "\" is not partitioned",
+                    "42P17");
+        }
         Table partition = new Table(stmt.name(), new ArrayList<>(parent.getColumns()));
         partition.setPartitionParent(parent);
 
@@ -730,25 +825,57 @@ class DdlTableExecutor {
             if (remainder < 0 || remainder >= modulus) {
                 throw new MemgresException("remainder for hash partition must be less than modulus", "42P16");
             }
+            // A hash partition takes the rows whose hash leaves this remainder modulo this
+            // modulus. Two moduli divide the same space consistently only when one is a multiple
+            // of the other, and two such slots collide when their remainders agree modulo the
+            // greatest common divisor — which is how MODULUS 4 REMAINDER 1 and MODULUS 2
+            // REMAINDER 0 can live side by side while MODULUS 2 REMAINDER 1 cannot.
             for (Table existingPart : parent.getPartitions()) {
                 if (existingPart == partition) continue;
-                if (existingPart.getPartitionModulus() != null
-                        && existingPart.getPartitionModulus() != modulus) {
-                    throw new MemgresException("every hash partition modulus must be a factor of the largest modulus", "42P16");
+                Integer otherModulus = existingPart.getPartitionModulus();
+                if (otherModulus == null || otherModulus <= 0) continue;
+                if (modulus % otherModulus != 0 && otherModulus % modulus != 0) {
+                    throw new MemgresException(
+                            "every hash partition modulus must be a factor of the next larger modulus",
+                            "42P17");
                 }
             }
             for (Table existingPart : parent.getPartitions()) {
                 if (existingPart == partition) continue;
-                if (existingPart.getPartitionModulus() != null
-                        && existingPart.getPartitionModulus() == modulus
-                        && existingPart.getPartitionRemainder() != null
-                        && existingPart.getPartitionRemainder() == remainder) {
+                Integer otherModulus = existingPart.getPartitionModulus();
+                Integer otherRemainder = existingPart.getPartitionRemainder();
+                if (otherModulus == null || otherRemainder == null || otherModulus <= 0) continue;
+                int common = gcd(modulus, otherModulus);
+                if (remainder % common == otherRemainder % common) {
                     throw new MemgresException("partition \"" + partitionName
-                            + "\" would overlap partition \"" + existingPart.getName() + "\"", "42P16");
+                            + "\" would overlap partition \"" + existingPart.getName() + "\"", "42P17");
                 }
             }
             partition.setPartitionHash(modulus, remainder);
         }
+    }
+
+    /**
+     * How a relation is named in a message about it: bare when the schema it lives in is reached
+     * through the search path, schema-qualified when it is not and the bare name would name
+     * something else — or nothing.
+     */
+    private String visibleName(String schemaName, String name) {
+        String schema = schemaName == null ? "public" : schemaName;
+        if (schema.equalsIgnoreCase("public") || schema.equalsIgnoreCase(executor.defaultSchema())) {
+            return name;
+        }
+        return schema + "." + name;
+    }
+
+    /** Greatest common divisor, for deciding whether two hash partition slots overlap. */
+    private static int gcd(int a, int b) {
+        while (b != 0) {
+            int t = b;
+            b = a % b;
+            a = t;
+        }
+        return a;
     }
 
     /**
@@ -836,6 +963,95 @@ class DdlTableExecutor {
         table.addConstraint(fk);
     }
 
+    /** The message PostgreSQL uses for a partition key expression that may change its answer. */
+    private static final String PARTITION_KEY_NOT_IMMUTABLE =
+            "functions in partition key expression must be marked IMMUTABLE";
+
+    /**
+     * Refuse a partition key expression that cannot be relied on to give the same answer twice.
+     * A volatile function is the obvious case; a cast off a {@code timestamptz} is the quiet one,
+     * since it reads the session's time zone and so answers differently in another session.
+     */
+    private void checkPartitionKeyExpression(String keyText, List<Column> columns, Table table) {
+        Expression keyExpr;
+        try {
+            keyExpr = com.memgres.engine.parser.Parser.parseExpression(keyText);
+        } catch (RuntimeException notAnExpression) {
+            return; // whatever reads it next reports it
+        }
+        rejectUnknownPartitionKeyColumn(keyExpr, table);
+        DdlExecutor.checkExpressionImmutability(keyExpr, executor.database,
+                PARTITION_KEY_NOT_IMMUTABLE);
+        rejectTimeZoneDependentCast(keyExpr, columns);
+    }
+
+    /** A key expression reads the row it routes, so every name in it has to be a column. */
+    private void rejectUnknownPartitionKeyColumn(Object node, Table table) {
+        AstWalk.forEach(node, n -> {
+            if (!(n instanceof ColumnRef)) return;
+            ColumnRef ref = (ColumnRef) n;
+            if (ref.table() != null) return;
+            if (table.getColumnIndex(ref.column()) < 0) {
+                throw new MemgresException("column \"" + ref.column() + "\" does not exist", "42703");
+            }
+        });
+    }
+
+    /**
+     * Split a partition key list on the commas that separate its keys, leaving the ones inside
+     * a key's own parentheses or string literals alone: {@code (date_trunc('month', ts))} is one
+     * key, not two, and splitting it blindly reported the column {@code ts))} as missing.
+     */
+    static List<String> splitTopLevel(String text) {
+        List<String> parts = new java.util.ArrayList<>();
+        int depth = 0;
+        boolean inString = false;
+        boolean inQuotedName = false;
+        StringBuilder current = new StringBuilder();
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (inString) {
+                if (ch == '\'') inString = false;
+            } else if (inQuotedName) {
+                if (ch == '"') inQuotedName = false;
+            } else if (ch == '\'') {
+                inString = true;
+            } else if (ch == '"') {
+                inQuotedName = true;
+            } else if (ch == '(') {
+                depth++;
+            } else if (ch == ')') {
+                depth--;
+            } else if (ch == ',' && depth == 0) {
+                parts.add(current.toString());
+                current.setLength(0);
+                continue;
+            }
+            current.append(ch);
+        }
+        parts.add(current.toString());
+        return parts;
+    }
+
+    /** Walk for a cast whose result depends on the session time zone. */
+    private void rejectTimeZoneDependentCast(Object node, List<Column> columns) {
+        AstWalk.forEach(node, n -> {
+            if (!(n instanceof CastExpr)) return;
+            CastExpr cast = (CastExpr) n;
+            String target = cast.typeName() == null ? "" : cast.typeName().toLowerCase();
+            boolean toLocalTime = target.startsWith("date") || target.startsWith("time")
+                    || target.startsWith("timestamp");
+            if (!toLocalTime || !(cast.expr() instanceof ColumnRef)) return;
+            String colName = ((ColumnRef) cast.expr()).column();
+            for (Column c : columns) {
+                if (!c.getName().equalsIgnoreCase(colName)) continue;
+                if (c.getType() == DataType.TIMESTAMPTZ || c.getType() == DataType.TIMETZ) {
+                    throw new MemgresException(PARTITION_KEY_NOT_IMMUTABLE, "42P17");
+                }
+            }
+        });
+    }
+
     private void validateGeneratedColumns(List<ColumnDef> columnDefs, List<Column> columns) {
         Set<String> generatedColNames = new HashSet<>();
         Set<String> allColNames = new HashSet<>();
@@ -884,13 +1100,11 @@ class DdlTableExecutor {
         if (schema != null) {
             Table droppedTable = schema.getTable(name);
             if (droppedTable == null) {
+                // A view, sequence or index of this name is the wrong kind of relation, and
+                // IF EXISTS does not make DROP TABLE the right command for it.
+                RelationNamespace.requireKind(executor.database, schemaName, name,
+                        RelationNamespace.TABLE);
                 if (!ifExists) {
-                    if (executor.database.hasView(name)) {
-                        throw new MemgresException("\"" + name + "\" is not a table", "42809");
-                    }
-                    if (executor.database.hasSequence(name)) {
-                        throw new MemgresException("\"" + name + "\" is not a table", "42809");
-                    }
                     throw new MemgresException("table \"" + name + "\" does not exist", "42P01");
                 }
                 if (executor.session != null) {
@@ -917,11 +1131,9 @@ class DdlTableExecutor {
                             }
                         }
                     }
-                    for (Database.ViewDef view : executor.database.getViews().values()) {
-                        String viewSql = view.query() != null ? view.query().toString().toLowerCase() : "";
-                        if (viewSql.contains(name.toLowerCase())) {
-                            throw new MemgresException("cannot drop table " + name + " because other objects depend on it", "2BP01");
-                        }
+                    if (!ViewDependencies.directDependents(executor.database, schemaName, name).isEmpty()) {
+                        throw new MemgresException("cannot drop table " + visibleName(schemaName, name)
+                                + " because other objects depend on it", "2BP01");
                     }
                     // Check function dependencies (%ROWTYPE, %TYPE, RETURNS table_type, SETOF table_type)
                     for (PgFunction fn : executor.database.getFunctions().values()) {
@@ -971,14 +1183,11 @@ class DdlTableExecutor {
                             for (String fkName : fksToRemove) otherTable.removeConstraint(fkName);
                         }
                     }
-                    List<String> viewsToDrop = new ArrayList<>();
-                    for (Map.Entry<String, Database.ViewDef> entry : executor.database.getViews().entrySet()) {
-                        String viewSql = entry.getValue().query() != null ? entry.getValue().query().toString().toLowerCase() : "";
-                        if (viewSql.contains(name.toLowerCase())) {
-                            viewsToDrop.add(entry.getKey());
-                        }
+                    // A view over a dependent view has to go too, or it is left reading a view
+                    // that no longer exists.
+                    for (String v : ViewDependencies.cascadeDependents(executor.database, schemaName, name)) {
+                        executor.database.removeView(v);
                     }
-                    for (String v : viewsToDrop) executor.database.removeView(v);
                     // CASCADE: also drop dependent functions (e.g., BEGIN ATOMIC bodies referencing this table)
                     List<String> funcsToDrop = new ArrayList<>();
                     for (PgFunction fn : executor.database.getFunctions().values()) {

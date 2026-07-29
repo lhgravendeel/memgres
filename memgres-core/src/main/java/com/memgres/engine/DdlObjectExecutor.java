@@ -98,9 +98,10 @@ class DdlObjectExecutor {
                 || stmt.action() == AlterTypeStmt.Action.RENAME_ATTRIBUTE) {
             return executeAlterCompositeType(stmt);
         }
-        // RENAME TO applies to any type; only an enum is looked up below, so a composite has to
-        // be handled here or it would be reported as a type that does not exist.
-        if (stmt.action() == AlterTypeStmt.Action.RENAME_TO
+        // RENAME TO and SET SCHEMA apply to any type; only an enum is looked up below, so a
+        // composite has to be handled here or it would be reported as a type that does not exist.
+        if ((stmt.action() == AlterTypeStmt.Action.RENAME_TO
+                || stmt.action() == AlterTypeStmt.Action.SET_SCHEMA)
                 && executor.database.isCompositeType(stmt.typeName())) {
             return executeAlterCompositeType(stmt);
         }
@@ -137,11 +138,14 @@ class DdlObjectExecutor {
                 break;
             }
             case RENAME_TO: {
+                requireTypeNameFree(stmt.value());
                 executor.database.removeCustomEnum(stmt.typeName());
                 executor.database.addCustomEnum(new CustomEnum(stmt.value(), existing.getLabels()));
                 break;
             }
             case SET_SCHEMA: {
+                requireSchemaExists(stmt.value());
+                executor.database.registerSchemaObject(stmt.value(), "enum", stmt.typeName());
                 break;
             }
             case OWNER_TO: {
@@ -169,6 +173,14 @@ class DdlObjectExecutor {
             }
             case DROP_ATTRIBUTE: {
                 if (!hasAttribute(fields, stmt.value())) {
+                    if (stmt.ifExists()) {
+                        if (executor.session != null) {
+                            executor.session.addNotice("NOTICE", "00000", "column \"" + stmt.value()
+                                    + "\" of relation \"" + stmt.typeName()
+                                    + "\" does not exist, skipping", null);
+                        }
+                        break;
+                    }
                     throw new MemgresException("column \"" + stmt.value() + "\" of relation \""
                             + stmt.typeName() + "\" does not exist", "42703");
                 }
@@ -217,20 +229,47 @@ class DdlObjectExecutor {
                 break;
             }
             case RENAME_TO: {
-                if (executor.database.isCompositeType(stmt.value())) {
-                    throw new MemgresException(
-                            "type \"" + stmt.value() + "\" already exists", "42710");
-                }
+                requireTypeNameFree(stmt.value());
                 executor.database.removeCompositeType(stmt.typeName());
                 executor.database.addCompositeType(stmt.value(), fields);
                 executor.database.registerSchemaObject(
                         executor.defaultSchema(), "composite", stmt.value());
                 break;
             }
+            case SET_SCHEMA: {
+                requireSchemaExists(stmt.value());
+                executor.database.registerSchemaObject(stmt.value(), "composite", stmt.typeName());
+                break;
+            }
             default:
                 break;
         }
         return QueryResult.command(QueryResult.Type.ALTER_TYPE, 0);
+    }
+
+    /**
+     * A type name is one name across enums, composites and domains, so a rename onto any of them
+     * would leave two types answering to it and every stored value ambiguous.
+     */
+    private void requireTypeNameFree(String name) {
+        if (name == null) return;
+        Schema schema = executor.database.getSchema(executor.defaultSchema());
+        // A table carries a composite type of its own name, so it takes the name for types too.
+        boolean tableTakesIt = schema != null && schema.getTable(name) != null;
+        if (executor.database.isCompositeType(name)
+                || executor.database.getCustomEnum(name) != null
+                || executor.database.isDomain(name)
+                || tableTakesIt) {
+            throw new MemgresException("type \"" + name + "\" already exists", "42710");
+        }
+    }
+
+    /** A destination schema that does not exist has nowhere to put the object. */
+    private void requireSchemaExists(String schemaName) {
+        if (schemaName == null) return;
+        if (executor.database.getSchema(schemaName) == null) {
+            throw new MemgresException("schema \"" + schemaName + "\" does not exist", "3F000");
+        }
     }
 
     private static boolean hasAttribute(List<CreateTypeStmt.CompositeField> fields, String name) {
@@ -1666,6 +1705,11 @@ class DdlObjectExecutor {
             if (stmt.whenClause() != null) {
                 throw PgErrors.notImplemented("INSTEAD OF triggers cannot have WHEN conditions");
             }
+            // An INSTEAD OF trigger replaces the whole statement on the view, so there is no
+            // "was this column written" to narrow it down to.
+            if (stmt.updateOfColumns() != null && !stmt.updateOfColumns().isEmpty()) {
+                throw PgErrors.notImplemented("INSTEAD OF triggers cannot have column lists");
+            }
         }
         if (!stmt.forEachStatement() && events.contains(PgTrigger.Event.TRUNCATE)) {
             throw PgErrors.notImplemented("TRUNCATE FOR EACH ROW triggers are not supported");
@@ -2012,6 +2056,10 @@ class DdlObjectExecutor {
             throw new MemgresException("\"" + stmt.name() + "\" is not a "
                     + (wantMaterialized ? "materialized view" : "view"), "42809");
         }
+        // A sequence or an index of this name is the wrong kind of relation too, and IF EXISTS
+        // does not turn the wrong kind into "nothing to do".
+        RelationNamespace.requireKind(executor.database, executor.defaultSchema(), stmt.name(),
+                wantMaterialized ? RelationNamespace.MATVIEW : RelationNamespace.VIEW);
         if (!stmt.ifExists()) {
             if (existing == null) {
                 if (ddl.resolveTableOrNull(stmt.name()) != null) {
@@ -2028,6 +2076,21 @@ class DdlObjectExecutor {
         }
         String dropViewSchema = (oldView != null && oldView.schemaName() != null)
                 ? oldView.schemaName() : executor.defaultSchema();
+        // A view is a relation like any other: what reads it depends on it, so dropping it
+        // blocks on those readers and CASCADE takes them with it.
+        String bareViewName = RelationNamespace.bareName(stmt.name());
+        if (oldView != null && !stmt.cascade()
+                && !ViewDependencies.directDependents(executor.database, dropViewSchema, bareViewName)
+                    .isEmpty()) {
+            throw new MemgresException("cannot drop " + (wantMaterialized ? "materialized view " : "view ")
+                    + bareViewName + " because other objects depend on it", "2BP01");
+        }
+        if (oldView != null && stmt.cascade()) {
+            for (String dependent : ViewDependencies.cascadeDependents(
+                    executor.database, dropViewSchema, bareViewName)) {
+                executor.database.removeView(dependent);
+            }
+        }
         executor.database.removeObjectOwner("view:" + dropViewSchema + "." + stmt.name());
         executor.database.removeView(stmt.name());
     }
@@ -2036,6 +2099,8 @@ class DdlObjectExecutor {
         String seqName = stmt.name();
         // Strip schema prefix for lookup
         String bareSeqName = seqName.contains(".") ? seqName.substring(seqName.lastIndexOf('.') + 1) : seqName;
+        RelationNamespace.requireKind(executor.database, executor.defaultSchema(), bareSeqName,
+                RelationNamespace.SEQUENCE);
         if (!stmt.ifExists()) {
             if (!executor.database.hasSequence(bareSeqName)) {
                 if (ddl.resolveTableOrNull(bareSeqName) != null || executor.database.hasView(bareSeqName)) {
@@ -2095,22 +2160,49 @@ class DdlObjectExecutor {
     }
 
     private void dropIndex(DropStmt stmt) {
-        if (!stmt.ifExists() && !executor.database.hasIndex(stmt.name())) {
-            throw new MemgresException("index \"" + stmt.name() + "\" does not exist", "42704");
-        }
-        if (executor.database.hasIndex(stmt.name())) {
-            String storedTable = executor.database.getIndexTable(stmt.name());
-            if (storedTable != null) {
-                try {
-                    int dotIdx = storedTable.indexOf('.');
-                    String schema = dotIdx >= 0 ? storedTable.substring(0, dotIdx) : "public";
-                    String tableName = dotIdx >= 0 ? storedTable.substring(dotIdx + 1) : storedTable;
-                    Table t = executor.resolveTable(schema, tableName);
-                    t.getConstraints().removeIf(sc -> sc.getName().equalsIgnoreCase(stmt.name()));
-                } catch (MemgresException ignored) {}
+        String bareIndexName = RelationNamespace.bareName(stmt.name());
+        String indexSchema = stmt.schema() != null ? stmt.schema()
+                : stmt.name().contains(".")
+                    ? stmt.name().substring(0, stmt.name().lastIndexOf('.'))
+                    : executor.defaultSchema();
+        RelationNamespace.requireKind(executor.database, indexSchema,
+                bareIndexName, RelationNamespace.INDEX);
+        // The index behind a PRIMARY KEY or UNIQUE constraint belongs to the constraint, which
+        // needs it: it goes when the constraint does, and not before. Only the index the
+        // constraint made for itself is protected — an index somebody wrote a CREATE INDEX for
+        // is theirs to drop, even when a constraint of the same name was recorded beside it.
+        Schema indexHome = executor.database.getSchema(indexSchema);
+        if (indexHome != null && !executor.database.hasIndex(bareIndexName)) {
+            for (Table owner : indexHome.getTables().values()) {
+                for (StoredConstraint sc : owner.getConstraints()) {
+                    if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY
+                            && sc.getType() != StoredConstraint.Type.UNIQUE) continue;
+                    if (sc.getName() == null || !sc.getName().equalsIgnoreCase(bareIndexName)) continue;
+                    throw new MemgresException("cannot drop index " + bareIndexName
+                            + " because constraint " + sc.getName() + " on table "
+                            + owner.getName() + " requires it", "2BP01");
+                }
             }
-            executor.database.removeIndex(stmt.name());
         }
+        // An unqualified name is looked for through the search path, so an index in a schema
+        // that is not on it is not found — dropping it needs the schema written out.
+        boolean visible = executor.database.hasIndex(bareIndexName)
+                && RelationNamespace.kindOf(executor.database, indexSchema, bareIndexName) != null;
+        if (!stmt.ifExists() && !visible) {
+            throw new MemgresException("index \"" + bareIndexName + "\" does not exist", "42704");
+        }
+        if (!visible) return;
+        String storedTable = executor.database.getIndexTable(bareIndexName);
+        if (storedTable != null) {
+            try {
+                int dotIdx = storedTable.indexOf('.');
+                String schema = dotIdx >= 0 ? storedTable.substring(0, dotIdx) : "public";
+                String tableName = dotIdx >= 0 ? storedTable.substring(dotIdx + 1) : storedTable;
+                Table t = executor.resolveTable(schema, tableName);
+                t.getConstraints().removeIf(sc -> sc.getName().equalsIgnoreCase(bareIndexName));
+            } catch (MemgresException ignored) {}
+        }
+        executor.database.removeIndex(bareIndexName);
     }
 
     private void dropFunction(DropStmt stmt) {
@@ -2326,9 +2418,15 @@ class DdlObjectExecutor {
         if (stmt.temporary() && executor.session != null) {
             seqName = executor.session.getTempSchemaName() + "." + seqName;
         }
-        if (executor.database.hasSequence(seqName)) {
+        // A qualified name puts the sequence in the schema it names, and it is that schema's
+        // relations the name has to be free of.
+        String seqSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        boolean nameOwned = executor.database.hasSequence(seqName)
+                || RelationNamespace.kindOf(executor.database, seqSchema, seqName) != null;
+        if (nameOwned) {
             if (stmt.ifNotExists()) return QueryResult.message(QueryResult.Type.SET, "CREATE SEQUENCE");
-            throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
+            throw new MemgresException("relation \"" + RelationNamespace.bareName(stmt.name())
+                    + "\" already exists", "42P07");
         }
         DdlSequenceValidator.Params p = DdlSequenceValidator.forCreate(stmt.getAsType(),
                 stmt.incrementBy(), stmt.minValue(), stmt.maxValue(), stmt.startWith(), stmt.getCache());
@@ -2352,10 +2450,17 @@ class DdlObjectExecutor {
             if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
             throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
         }
+        if (stmt.setSchema() != null) {
+            requireSchemaExists(stmt.setSchema());
+            executor.database.registerSchemaObject(stmt.setSchema(), "sequence", stmt.name());
+            return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
+        }
         if (stmt.renameTo() != null) {
             if (executor.database.hasSequence(stmt.renameTo())) {
                 throw new MemgresException("relation \"" + stmt.renameTo() + "\" already exists", "42P07");
             }
+            RelationNamespace.requireFree(executor.database, executor.defaultSchema(),
+                    stmt.renameTo(), null);
             executor.database.removeSequence(stmt.name());
             seq.setName(stmt.renameTo());
             executor.database.addSequence(seq);
@@ -2507,12 +2612,31 @@ class DdlObjectExecutor {
         if (domain == null) {
             throw new MemgresException("type \"" + stmt.domainName() + "\" does not exist", "42704");
         }
+        // The domain is shared state that every column declared with it reads, so what it looked
+        // like before this statement has to be recoverable if the transaction rolls back.
+        executor.recordUndo(new Session.AlterDomainUndo(domain));
         switch (stmt.action()) {
             case "SET_DEFAULT":
                 domain.setDefaultValue(stmt.defaultValue());
                 break;
             case "DROP_DEFAULT":
                 domain.setDefaultValue(null);
+                break;
+            case "SET_NOT_NULL": {
+                // The columns of this domain already hold what they hold; declaring the domain
+                // NOT NULL while one of them holds a null leaves a catalog that disagrees with
+                // the stored rows, and nothing would ever put it right.
+                forEachDomainValue(stmt.domainName(), (tableName, columnName, value) -> {
+                    if (value == null) {
+                        throw new MemgresException("column \"" + columnName + "\" of table \""
+                                + tableName + "\" contains null values", "23502");
+                    }
+                });
+                domain.setNotNull(true);
+                break;
+            }
+            case "DROP_NOT_NULL":
+                domain.setNotNull(false);
                 break;
             case "ADD_CONSTRAINT": {
                 String constraintName = stmt.constraintName() != null
@@ -2528,29 +2652,7 @@ class DdlObjectExecutor {
                     }
                 }
                 if (!stmt.notValid()) {
-                    for (Schema schema : executor.database.getSchemas().values()) {
-                        for (Table table : schema.getTables().values()) {
-                            for (int ci = 0; ci < table.getColumns().size(); ci++) {
-                                Column col = table.getColumns().get(ci);
-                                if (stmt.domainName().equals(col.getDomainTypeName())) {
-                                    Table valTable = new Table("_domain_check",
-                                            Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
-                                    for (Object[] row : table.getRows()) {
-                                        Object val = row[ci];
-                                        if (val != null && stmt.checkExpr() != null) {
-                                            RowContext valCtx = new RowContext(valTable, null, new Object[]{val});
-                                            Object result = executor.evalExpr(stmt.checkExpr(), valCtx);
-                                            if (!executor.isTruthy(result)) {
-                                                throw new MemgresException(
-                                                        "value for domain " + stmt.domainName() + " violates check constraint \"" + constraintName + "\"",
-                                                        "23514");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    checkDomainConstraintAgainstStoredRows(stmt.domainName(), domain, stmt.checkExpr());
                 }
                 domain.addConstraint(constraintName, stmt.rawCheckExpr(), stmt.checkExpr(), !stmt.notValid());
                 break;
@@ -2569,6 +2671,11 @@ class DdlObjectExecutor {
                 boolean found = false;
                 for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
                     if (nc.name().equalsIgnoreCase(stmt.constraintName())) {
+                        // Marking a NOT VALID constraint valid is a claim about the rows that
+                        // were let through while it was not being enforced, so those rows are
+                        // what has to be looked at.
+                        checkDomainConstraintAgainstStoredRows(stmt.domainName(), domain,
+                                nc.parsedCheck());
                         nc.setValidated(true);
                         found = true;
                         break;
@@ -2595,11 +2702,83 @@ class DdlObjectExecutor {
                 }
                 break;
             }
+            case "RENAME_TO": {
+                String newName = stmt.newConstraintName();
+                requireTypeNameFree(newName);
+                DomainType renamed = new DomainType(newName, domain.getBaseType(),
+                        domain.getBaseTypeName(), domain.isNotNull(), domain.getCheckExpression(),
+                        domain.getParsedCheck(), domain.getDefaultValue());
+                for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
+                    renamed.addConstraint(nc.name(), nc.rawCheckExpr(), nc.parsedCheck(),
+                            nc.isValidated());
+                }
+                executor.database.removeDomain(stmt.domainName());
+                executor.database.addDomain(renamed);
+                executor.database.registerSchemaObject(executor.defaultSchema(), "domain", newName);
+                // Every column declared with the domain names it, and the name just changed.
+                for (Schema s : executor.database.getSchemas().values()) {
+                    for (Table t : s.getTables().values()) {
+                        for (Column c : t.getColumns()) {
+                            if (stmt.domainName().equalsIgnoreCase(c.getDomainTypeName())) {
+                                c.setDomainTypeName(newName);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case "SET_SCHEMA": {
+                requireSchemaExists(stmt.newConstraintName());
+                executor.database.registerSchemaObject(stmt.newConstraintName(), "domain",
+                        stmt.domainName());
+                break;
+            }
             case "NO_OP": {
                 break;
             }
         }
         return QueryResult.message(QueryResult.Type.SET, "ALTER DOMAIN");
+    }
+
+    /** What to do with one stored value of a domain: the table and column it sits in, and it. */
+    private interface DomainValueVisitor {
+        void accept(String tableName, String columnName, Object value);
+    }
+
+    /** Visit every stored value in every column declared with this domain. */
+    private void forEachDomainValue(String domainName, DomainValueVisitor visitor) {
+        for (Schema schema : executor.database.getSchemas().values()) {
+            for (Table table : schema.getTables().values()) {
+                for (int ci = 0; ci < table.getColumns().size(); ci++) {
+                    Column col = table.getColumns().get(ci);
+                    if (!domainName.equalsIgnoreCase(col.getDomainTypeName())) continue;
+                    for (Object[] row : table.getRows()) {
+                        visitor.accept(table.getName(), col.getName(), row[ci]);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Refuse a domain constraint the rows already stored under that domain do not satisfy.
+     * PostgreSQL names the column and table that hold the offending value, because that is where
+     * the work of fixing it has to happen.
+     */
+    private void checkDomainConstraintAgainstStoredRows(String domainName, DomainType domain,
+                                                        Expression checkExpr) {
+        if (checkExpr == null) return;
+        final Table valTable = new Table("_domain_check",
+                Cols.listOf(new Column("value", domain.getBaseType(), true, false, null)));
+        forEachDomainValue(domainName, (tableName, columnName, value) -> {
+            if (value == null) return;
+            RowContext valCtx = new RowContext(valTable, null, new Object[]{value});
+            Object result = executor.evalExpr(checkExpr, valCtx);
+            if (!executor.isTruthy(result)) {
+                throw new MemgresException("column \"" + columnName + "\" of table \"" + tableName
+                        + "\" contains values that violate the new constraint", "23514");
+            }
+        });
     }
 
     // ---- CREATE INDEX ----
@@ -2705,7 +2884,10 @@ class DdlObjectExecutor {
     }
 
     QueryResult executeCreateIndex(CreateIndexStmt s) {
-        boolean nameTaken = s.name() != null && executor.database.hasIndex(s.name());
+        String indexSchema = s.schema() != null ? s.schema() : executor.defaultSchema();
+        boolean nameTaken = s.name() != null
+                && (executor.database.hasIndex(s.name())
+                    || RelationNamespace.kindOf(executor.database, indexSchema, s.name()) != null);
         if (nameTaken && s.ifNotExists()) return QueryResult.message(QueryResult.Type.SET, "CREATE INDEX");
         // PostgreSQL analyses the statement before it opens anything, so an aggregate or a
         // subquery is reported even when the access method or the index name is also wrong.

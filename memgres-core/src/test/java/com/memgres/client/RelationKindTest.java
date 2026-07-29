@@ -107,8 +107,9 @@ class RelationKindTest {
         exec("CREATE UNIQUE INDEX rkt_mv_ix ON rkt_mv (i)");
         exec("REFRESH MATERIALIZED VIEW CONCURRENTLY rkt_mv");
         assertEquals("2", scalar("SELECT count(*)::text FROM rkt_mv"));
-        // and it cannot be combined with WITH NO DATA
-        assertState("0A000", "REFRESH MATERIALIZED VIEW CONCURRENTLY rkt_mv WITH NO DATA");
+        // and it cannot be combined with WITH NO DATA: two options that contradict each other
+        // are a fault in the statement, which PostgreSQL reports as 42601
+        assertState("42601", "REFRESH MATERIALIZED VIEW CONCURRENTLY rkt_mv WITH NO DATA");
         exec("REFRESH MATERIALIZED VIEW rkt_mv");
         assertEquals("2", scalar("SELECT count(*)::text FROM rkt_mv"));
     }

@@ -2817,6 +2817,46 @@ public class Session {
         }
     }
 
+    /**
+     * Undo an ALTER DOMAIN. The domain object is shared by every session and by every column
+     * declared with it, so an ALTER inside a transaction that rolls back has to put back what
+     * was there — otherwise the rolled-back rule keeps refusing rows nobody ever forbade.
+     */
+    public static final class AlterDomainUndo implements UndoEntry {
+        public final String domainName;
+        private final boolean notNull;
+        private final String defaultValue;
+        private final List<DomainType.NamedConstraint> constraints;
+
+        public AlterDomainUndo(DomainType domain) {
+            this.domainName = domain.getName();
+            this.notNull = domain.isNotNull();
+            this.defaultValue = domain.getDefaultValue();
+            this.constraints = new ArrayList<>();
+            // The constraint objects are mutable — RENAME CONSTRAINT and VALIDATE change them
+            // in place — so the snapshot has to hold copies rather than the same objects.
+            for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
+                this.constraints.add(new DomainType.NamedConstraint(nc.name(), nc.rawCheckExpr(),
+                        nc.parsedCheck(), nc.isValidated()));
+            }
+        }
+
+        @Override
+        public void undo(Database db) {
+            DomainType domain = db.getDomain(domainName);
+            if (domain == null) return;
+            domain.setNotNull(notNull);
+            domain.setDefaultValue(defaultValue);
+            domain.getNamedConstraints().clear();
+            domain.getNamedConstraints().addAll(constraints);
+        }
+
+        @Override
+        public String toString() {
+            return "AlterDomainUndo[domainName=" + domainName + "]";
+        }
+    }
+
     /** Undo a CREATE FUNCTION by removing it. */
         public static final class CreateFunctionUndo implements UndoEntry {
         public final String funcName;

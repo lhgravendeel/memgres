@@ -280,4 +280,20 @@ public final class DdlDefinitionChecks {
         if (typeName == null) return "";
         return typeName.replaceAll("\\(.*\\)", "").replace("[]", "").trim();
     }
+
+    /**
+     * A relation has at most one primary key. A second one written in the same CREATE TABLE, or
+     * added to a table that already has one, is refused as a fault in the definition rather than
+     * stored as a second constraint nothing would ever consult.
+     */
+    static void rejectSecondPrimaryKey(Table table, String tableName) {
+        int keys = 0;
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) keys++;
+        }
+        if (keys > 1) {
+            throw new MemgresException("multiple primary keys for table \"" + tableName
+                    + "\" are not allowed", "42P16");
+        }
+    }
 }

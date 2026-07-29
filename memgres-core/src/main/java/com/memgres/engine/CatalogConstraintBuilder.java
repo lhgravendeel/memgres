@@ -197,7 +197,12 @@ class CatalogConstraintBuilder {
                             owner = parent;
                             parent = parent.getPartitionParent();
                         }
-                        String conname = owner.getName() + "_" + c.getName() + "_not_null";
+                        // The writer may have named the constraint; only fall back to the
+                        // default spelling when nobody did.
+                        String conname = owner.notNullConstraintName(c.getName());
+                        if (conname == null) {
+                            conname = owner.getName() + "_" + c.getName() + "_not_null";
+                        }
                         table.insertRow(new Object[]{
                                 oids.oid("con:" + t.getName() + "." + conname),
                                 conname,
@@ -781,11 +786,15 @@ class CatalogConstraintBuilder {
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_trigger", cols);
-        // Group triggers by name to combine multiple events into one pg_trigger row
+        // Group triggers by relation and name to combine multiple events into one pg_trigger
+        // row. A trigger name is only unique within its relation, so grouping by name alone
+        // merged same-named triggers on different tables and lost all but one of them.
         Map<String, List<PgTrigger>> byName = new java.util.LinkedHashMap<>();
         for (Map.Entry<String, List<PgTrigger>> entry : database.getAllTriggers().entrySet()) {
             for (PgTrigger trigger : entry.getValue()) {
-                byName.computeIfAbsent(trigger.getName(), k -> new java.util.ArrayList<>()).add(trigger);
+                String key = (trigger.getTableName() == null ? "" : trigger.getTableName().toLowerCase())
+                        + "." + trigger.getName().toLowerCase();
+                byName.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(trigger);
             }
         }
         for (Map.Entry<String, List<PgTrigger>> entry : byName.entrySet()) {
@@ -832,7 +841,8 @@ class CatalogConstraintBuilder {
 
             String tgenabled = first.isDisabled() ? "D" : "O";
             table.insertRow(new Object[]{
-                    oids.oid("trig:" + first.getName()), relOid, first.getName(),
+                    oids.oid("trig:" + trigSchema + "." + first.getTableName() + "." + first.getName()),
+                    relOid, first.getName(),
                     tgfoid, (short) tgtype, tgenabled, false, 0, false, false,
                     "", null, 0, null, null, 0, 1
             });

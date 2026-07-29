@@ -240,12 +240,16 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void collation_alter_owner() {
-        assertNoError("ALTER COLLATION renamed_coll OWNER TO test");
+        // Self-contained: ALTER now refuses a collation that was never created, so this test
+        // creates its own rather than relying on another test's rename having run first.
+        assertNoError("CREATE COLLATION owner_coll (LOCALE = 'fr_FR.utf8')");
+        assertNoError("ALTER COLLATION owner_coll OWNER TO test");
     }
 
     @Test
     void collation_alter_set_schema() {
-        assertNoError("ALTER COLLATION renamed_coll SET SCHEMA public");
+        assertNoError("CREATE COLLATION schema_coll (LOCALE = 'fr_FR.utf8')");
+        assertNoError("ALTER COLLATION schema_coll SET SCHEMA public");
     }
 
     // ========================================================================
@@ -336,7 +340,9 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void conversion_alter_owner() {
-        assertNoError("ALTER CONVERSION conv_renamed OWNER TO test");
+        // Self-contained for the same reason as collation_alter_owner.
+        assertNoError("CREATE CONVERSION conv_owner FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1");
+        assertNoError("ALTER CONVERSION conv_owner OWNER TO test");
     }
 
     @Test

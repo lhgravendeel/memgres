@@ -20,6 +20,13 @@ public class Table {
     private volatile List<Object[]> rows = new ArrayList<>();
     private final AtomicLong serialCounter = new AtomicLong(1);
     private final List<StoredConstraint> constraints = new CopyOnWriteArrayList<>();
+    /**
+     * The name a column's NOT NULL constraint answers to, keyed by column. Every NOT NULL column
+     * has such a constraint in PostgreSQL; it is named {@code <table>_<column>_not_null} unless
+     * the writer named it, and that name is what DROP CONSTRAINT, RENAME CONSTRAINT and ALTER
+     * CONSTRAINT ask for. Only names that differ from the default are stored here.
+     */
+    private final Map<String, String> notNullConstraintNames = new java.util.concurrent.ConcurrentHashMap<>();
     private final ReentrantLock writeLock = new ReentrantLock();
 
     // Hash indexes keyed by constraint name (for PK, UNIQUE constraints)
@@ -725,6 +732,58 @@ public class Table {
     public void removeConstraint(String name) {
         constraints.removeIf(c -> c.getName() != null && c.getName().equalsIgnoreCase(name));
         indexes.remove(name);
+    }
+
+    /** Give this column's NOT NULL constraint a name other than the default one. */
+    public void setNotNullConstraintName(String column, String name) {
+        if (column == null) return;
+        if (name == null) notNullConstraintNames.remove(column.toLowerCase());
+        else notNullConstraintNames.put(column.toLowerCase(), name);
+    }
+
+    /**
+     * The name this column's NOT NULL constraint answers to. Returns the default
+     * {@code <table>_<column>_not_null} when the writer never named it, and null when the column
+     * has no NOT NULL constraint at all.
+     */
+    public String notNullConstraintName(String column) {
+        if (column == null) return null;
+        int idx = getColumnIndex(column);
+        if (idx < 0 || columns.get(idx).isNullable()) return null;
+        String explicit = notNullConstraintNames.get(column.toLowerCase());
+        return explicit != null ? explicit : defaultNotNullConstraintName(column);
+    }
+
+    /** The name PostgreSQL gives a NOT NULL constraint nobody named. */
+    public String defaultNotNullConstraintName(String column) {
+        return name + "_" + column + "_not_null";
+    }
+
+    /** The column a NOT NULL constraint of this name covers, or null when there is none. */
+    public String notNullConstraintColumn(String constraintName) {
+        if (constraintName == null) return null;
+        for (Column c : columns) {
+            if (c.isNullable()) continue;
+            String own = notNullConstraintName(c.getName());
+            if (own != null && own.equalsIgnoreCase(constraintName)) return c.getName();
+        }
+        return null;
+    }
+
+    /**
+     * A column rename leaves the constraint's name alone in PostgreSQL, so a default name has to
+     * be written down before the column it was derived from changes underneath it.
+     */
+    public void pinNotNullConstraintName(String column) {
+        String current = notNullConstraintName(column);
+        if (current != null) notNullConstraintNames.put(column.toLowerCase(), current);
+    }
+
+    /** Carry a column's NOT NULL constraint name across a rename of that column. */
+    public void moveNotNullConstraintName(String oldColumn, String newColumn) {
+        if (oldColumn == null || newColumn == null) return;
+        String pinned = notNullConstraintNames.remove(oldColumn.toLowerCase());
+        if (pinned != null) notNullConstraintNames.put(newColumn.toLowerCase(), pinned);
     }
     public StoredConstraint getConstraint(String name) {
         for (StoredConstraint c : constraints) {

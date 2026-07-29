@@ -1062,7 +1062,8 @@ class CatalogMetadataFunctions {
             owner = parent;
             parent = parent.getPartitionParent();
         }
-        return owner.getName() + "_" + col.getName() + "_not_null";
+        String named = owner.notNullConstraintName(col.getName());
+        return named != null ? named : owner.getName() + "_" + col.getName() + "_not_null";
     }
 
     /** Strip a single pair of balanced outer parentheses, if present. */

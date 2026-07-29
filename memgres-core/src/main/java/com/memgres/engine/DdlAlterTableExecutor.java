@@ -41,6 +41,8 @@ class DdlAlterTableExecutor {
     QueryResult executeAlterTable(AlterTableStmt stmt) {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         rejectActionsOnOtherRelationKinds(stmt);
+        QueryResult indexResult = alterIndexRelation(stmt, schemaName);
+        if (indexResult != null) return indexResult;
         QueryResult viewResult = alterViewRelation(stmt);
         if (viewResult != null) return viewResult;
         Table table;
@@ -57,7 +59,9 @@ class DdlAlterTableExecutor {
                     "AccessExclusiveLock", executor.session, false);
         }
 
-        for (AlterTableStmt.AlterAction action : stmt.actions()) {
+        List<AlterTableStmt.AlterAction> ordered = orderedActions(stmt.actions());
+        rejectBeforeApplying(ordered, table, stmt);
+        for (AlterTableStmt.AlterAction action : ordered) {
             table = executeAction(action, table, stmt, schemaName);
         }
 
@@ -67,6 +71,105 @@ class DdlAlterTableExecutor {
         }
 
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /**
+     * A multi-action ALTER TABLE is one statement about the table's final shape, not a script.
+     * PostgreSQL settles that shape in passes — everything dropped first, then column types,
+     * then new columns, then the constraints over them — which is why
+     * {@code ADD CONSTRAINT ck CHECK (b > 0), ADD COLUMN b int} is accepted although the
+     * constraint is written before the column it reads. Running the list in written order
+     * refuses that, and quietly accepts {@code ADD COLUMN c, DROP COLUMN c}, which PostgreSQL
+     * refuses because its drop pass looks for a column that is not there yet.
+     *
+     * <p>The sort is stable, so two actions in the same pass keep the order they were written in.
+     */
+    private static List<AlterTableStmt.AlterAction> orderedActions(
+            List<AlterTableStmt.AlterAction> actions) {
+        if (actions == null || actions.size() < 2) return actions;
+        List<AlterTableStmt.AlterAction> sorted = new ArrayList<>(actions);
+        sorted.sort(java.util.Comparator.comparingInt(DdlAlterTableExecutor::actionPass));
+        return sorted;
+    }
+
+    /**
+     * ALTER TABLE is one statement, so an action that cannot succeed takes the whole statement
+     * with it and leaves the table as it was. memgres applies the actions one at a time, so the
+     * refusals a later action would raise are looked for first, over the shape the statement is
+     * going to produce — otherwise the earlier actions stay applied and the table is left in a
+     * state nobody wrote.
+     */
+    private void rejectBeforeApplying(List<AlterTableStmt.AlterAction> actions, Table table,
+                                      AlterTableStmt stmt) {
+        if (actions == null || actions.size() < 2) return;
+        Set<String> dropped = new HashSet<>();
+        for (AlterTableStmt.AlterAction action : actions) {
+            if (action instanceof AlterTableStmt.DropColumn) {
+                dropped.add(((AlterTableStmt.DropColumn) action).column().toLowerCase());
+            }
+        }
+        for (AlterTableStmt.AlterAction action : actions) {
+            if (action instanceof AlterTableStmt.AddConstraint) {
+                TableConstraint tc = ((AlterTableStmt.AddConstraint) action).constraint();
+                for (String col : constraintColumnNames(tc)) {
+                    if (dropped.contains(col.toLowerCase())) {
+                        throw new MemgresException("column \"" + col + "\" does not exist", "42703");
+                    }
+                }
+            }
+            if (!(action instanceof AlterTableStmt.AlterColumn)) continue;
+            AlterTableStmt.AlterColumn alterCol = (AlterTableStmt.AlterColumn) action;
+            if (!(alterCol.action() instanceof AlterTableStmt.SetNotNull)) continue;
+            int idx = table.getColumnIndex(alterCol.column());
+            if (idx < 0) continue;
+            for (Object[] row : table.getRows()) {
+                if (row[idx] == null) {
+                    throw new MemgresException("column \"" + alterCol.column() + "\" of relation \""
+                            + stmt.table() + "\" contains null values", "23502");
+                }
+            }
+        }
+    }
+
+    /** Every column a constraint names, whether in its key list or inside its CHECK expression. */
+    private static List<String> constraintColumnNames(TableConstraint tc) {
+        List<String> names = new ArrayList<>();
+        if (tc.columns() != null) {
+            for (String c : tc.columns()) {
+                if (c != null && !c.startsWith("__")) names.add(c);
+            }
+        }
+        AstWalk.forEach(tc.checkExpr(), node -> {
+            if (node instanceof ColumnRef && ((ColumnRef) node).table() == null) {
+                names.add(((ColumnRef) node).column());
+            }
+        });
+        return names;
+    }
+
+    /** Which pass an action belongs to; lower runs first. Mirrors PostgreSQL's AT_PASS_* order. */
+    private static int actionPass(AlterTableStmt.AlterAction action) {
+        if (action instanceof AlterTableStmt.DropColumn
+                || action instanceof AlterTableStmt.DropConstraint) {
+            return 0;
+        }
+        if (action instanceof AlterTableStmt.AlterColumn) {
+            AlterTableStmt.AlterColumnAction inner = ((AlterTableStmt.AlterColumn) action).action();
+            // Every DROP is one pass, the first: PostgreSQL puts DROP DEFAULT and DROP NOT NULL
+            // in AT_PASS_DROP with the rest, so SET DEFAULT 11, DROP DEFAULT ends with 11.
+            if (inner instanceof AlterTableStmt.DropIdentity
+                    || inner instanceof AlterTableStmt.DropExpression
+                    || inner instanceof AlterTableStmt.DropDefault
+                    || inner instanceof AlterTableStmt.DropNotNull) {
+                return 0;
+            }
+            if (inner instanceof AlterTableStmt.SetType) return 1;
+            if (inner instanceof AlterTableStmt.SetNotNull) return 4;
+            return 5;
+        }
+        if (action instanceof AlterTableStmt.AddColumn) return 2;
+        if (action instanceof AlterTableStmt.AddConstraint) return 3;
+        return 6;
     }
 
     /**
@@ -93,11 +196,10 @@ class DdlAlterTableExecutor {
         for (AlterTableStmt.AlterAction action : stmt.actions()) {
             if (action instanceof AlterTableStmt.RenameTable) {
                 String newName = ((AlterTableStmt.RenameTable) action).newName();
-                if (executor.database.getView(newName) != null
-                        || executor.database.getSchema(view.schemaName() != null
-                            ? view.schemaName() : executor.defaultSchema()) != null
-                        && executor.database.getSchema(view.schemaName() != null
-                            ? view.schemaName() : executor.defaultSchema()).getTable(newName) != null) {
+                RelationNamespace.requireFree(executor.database,
+                        view.schemaName() != null ? view.schemaName() : executor.defaultSchema(),
+                        newName, null);
+                if (executor.database.getView(newName) != null) {
                     throw new MemgresException("relation \"" + newName + "\" already exists", "42P07");
                 }
                 executor.database.removeView(bare);
@@ -155,6 +257,28 @@ class DdlAlterTableExecutor {
         return out;
     }
 
+    /**
+     * ALTER TABLE names any relation, and on an index the only actions that mean anything are
+     * the ones about its name and its owner — which PostgreSQL runs rather than refusing, so
+     * {@code ALTER TABLE i RENAME TO j} really renames the index.
+     */
+    private QueryResult alterIndexRelation(AlterTableStmt stmt, String schemaName) {
+        String bare = RelationNamespace.bareName(stmt.table());
+        Schema schema = executor.database.getSchema(schemaName);
+        if (schema != null && schema.getTable(bare) != null) return null;
+        if (executor.database.getView(bare) != null) return null;
+        if (!executor.database.hasIndex(bare)) return null;
+        for (AlterTableStmt.AlterAction action : stmt.actions()) {
+            if (action instanceof AlterTableStmt.RenameTable) {
+                String newName = ((AlterTableStmt.RenameTable) action).newName();
+                RelationNamespace.requireFree(executor.database, schemaName, newName, null);
+                executor.database.renameIndex(bare, newName);
+            }
+            // OWNER TO is accepted; memgres records no per-index owner to change.
+        }
+        return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
     private Database.ViewDef withViewName(Database.ViewDef view, String name, List<Column> cols) {
         return new Database.ViewDef(name, view.schemaName(), view.query(), view.orReplace(),
                 view.materialized(), cols, view.cachedRows(), view.sourceSQL(),
@@ -171,8 +295,17 @@ class DdlAlterTableExecutor {
                 ? stmt.table().substring(stmt.table().lastIndexOf('.') + 1) : stmt.table();
         Database.ViewDef view = executor.database.getView(bare);
         boolean isSequence = view == null && executor.database.hasSequence(bare);
-        if (view == null && !isSequence) return;
+        Schema ownSchema = executor.database.getSchema(
+                stmt.schema() != null ? stmt.schema() : executor.defaultSchema());
+        boolean isIndex = view == null && !isSequence
+                && (ownSchema == null || ownSchema.getTable(bare) == null)
+                && executor.database.hasIndex(bare);
+        if (view == null && !isSequence && !isIndex) return;
         for (AlterTableStmt.AlterAction action : stmt.actions()) {
+            // An index has no schema of its own to change: it always lives where its table does.
+            if (isIndex && action instanceof AlterTableStmt.SetSchema) {
+                throw PgErrors.wrongObjectType("cannot change schema of index \"" + bare + "\"");
+            }
             if (action instanceof AlterTableStmt.RenameTable
                     || action instanceof AlterTableStmt.SetSchema
                     || action instanceof AlterTableStmt.OwnerTo) {
@@ -265,8 +398,30 @@ class DdlAlterTableExecutor {
             executeValidateConstraint(vc, table, stmt);
         } else if (action instanceof AlterTableStmt.DropConstraint) {
             AlterTableStmt.DropConstraint dropConstraint = (AlterTableStmt.DropConstraint) action;
-            if (!dropConstraint.ifExists() && table.getConstraint(dropConstraint.name()) == null) {
+            StoredConstraint dropped = table.getConstraint(dropConstraint.name());
+            String notNullColumn = dropped == null
+                    ? table.notNullConstraintColumn(dropConstraint.name()) : null;
+            if (notNullColumn != null) {
+                int nnIdx = table.getColumnIndex(notNullColumn);
+                if (nnIdx >= 0 && table.getColumns().get(nnIdx).isPrimaryKey()) {
+                    throw new MemgresException("column \"" + notNullColumn
+                            + "\" is in a primary key", "42P16");
+                }
+                // Dropping the constraint is what makes the column nullable again.
+                table.alterColumnNullable(notNullColumn, true);
+                table.setNotNullConstraintName(notNullColumn, null);
+                return table;
+            }
+            if (!dropConstraint.ifExists() && dropped == null) {
                 throw new MemgresException("constraint \"" + dropConstraint.name() + "\" of relation \"" + stmt.table() + "\" does not exist", "42704");
+            }
+            // The columns carry their own "in the primary key" flag, so dropping the constraint
+            // has to clear it or the column keeps refusing DROP NOT NULL for a key that is gone.
+            if (dropped != null && dropped.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+                for (String pkCol : dropped.getColumns()) {
+                    int idx = table.getColumnIndex(pkCol);
+                    if (idx >= 0) table.getColumns().get(idx).setPrimaryKey(false);
+                }
             }
             table.removeConstraint(dropConstraint.name());
         } else if (action instanceof AlterTableStmt.EnableRls) {
@@ -296,6 +451,12 @@ class DdlAlterTableExecutor {
             AlterTableStmt.RenameConstraint renameConstraint = (AlterTableStmt.RenameConstraint) action;
             StoredConstraint oldConstraint = table.getConstraint(renameConstraint.oldName());
             if (oldConstraint == null) {
+                // A NOT NULL constraint is renamed the same way, though it lives on the column.
+                String nnCol = table.notNullConstraintColumn(renameConstraint.oldName());
+                if (nnCol != null) {
+                    table.setNotNullConstraintName(nnCol, renameConstraint.newName());
+                    return table;
+                }
                 throw new MemgresException("constraint \"" + renameConstraint.oldName() + "\" does not exist");
             }
             table.removeConstraint(renameConstraint.oldName());
@@ -431,7 +592,10 @@ class DdlAlterTableExecutor {
             } catch (Exception ignored) {}
         }
 
-        if (def.notNull() && defaultVal == null && genExpr == null && !table.getRows().isEmpty()) {
+        // DEFAULT NULL fills the existing rows with nothing, so it leaves the column exactly as
+        // empty as no default at all and the new rule cannot hold over the rows already stored.
+        boolean fillsExistingRows = defaultVal != null && !"null".equalsIgnoreCase(defaultVal.trim());
+        if (def.notNull() && !fillsExistingRows && genExpr == null && !table.getRows().isEmpty()) {
             throw new MemgresException("column \"" + def.name()
                     + "\" of relation \"" + stmt.table() + "\" contains null values", "23502");
         }
@@ -641,7 +805,11 @@ class DdlAlterTableExecutor {
             throw new MemgresException("inherited column \"" + rename.oldName()
                     + "\" must be renamed in child tables too", "42P16");
         }
+        // The NOT NULL constraint keeps the name it had, which was derived from the old column
+        // name, so that name has to be written down before the column changes underneath it.
+        table.pinNotNullConstraintName(rename.oldName());
         table.renameColumn(rename.oldName(), rename.newName());
+        table.moveNotNullConstraintName(rename.oldName(), rename.newName());
         propagateRenameColumn(table, rename.oldName(), rename.newName());
         rewriteIncomingForeignKeys(stmt.table(), schemaName, rename.oldName(), rename.newName());
         rewriteIndexMetadata(stmt.table(), schemaName, rename.oldName(), rename.newName());
@@ -809,6 +977,8 @@ class DdlAlterTableExecutor {
                                       AlterTableStmt stmt, String schemaName) {
         if (rename.newName() == null) return table;
         Schema schema = executor.database.getSchema(schemaName);
+        // The new name has to be free of every kind of relation, not only of another table.
+        RelationNamespace.requireFree(executor.database, schemaName, rename.newName(), null);
         if (schema.getTable(rename.newName()) != null) {
             throw new MemgresException("relation \"" + rename.newName() + "\" already exists", "42P07");
         }
@@ -879,8 +1049,10 @@ class DdlAlterTableExecutor {
             executeSetType(alterCol, setType, table, stmt, schemaName);
         } else if (alterCol.action() instanceof AlterTableStmt.SetDefault) {
             AlterTableStmt.SetDefault setDefault = (AlterTableStmt.SetDefault) alterCol.action();
+            rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table());
             executeSetDefault(alterCol, setDefault, table, stmt);
         } else if (alterCol.action() instanceof AlterTableStmt.DropDefault) {
+            rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table());
             table.alterColumnDefault(alterCol.column(), null);
         } else if (alterCol.action() instanceof AlterTableStmt.SetNotNull) {
             int colIdx = table.getColumnIndex(alterCol.column());
@@ -902,6 +1074,9 @@ class DdlAlterTableExecutor {
                         + "\" is in a primary key", "42P16");
             }
             table.alterColumnNullable(alterCol.column(), true);
+            // The constraint is gone, and a later SET NOT NULL makes a new one under the
+            // default name rather than resurrecting the name this one carried.
+            table.setNotNullConstraintName(alterCol.column(), null);
         } else if (alterCol.action() instanceof AlterTableStmt.DropIdentity) {
             executeDropIdentity((AlterTableStmt.DropIdentity) alterCol.action(),
                     alterCol.column(), table, stmt);
@@ -923,6 +1098,19 @@ class DdlAlterTableExecutor {
             col.setAttCompression(DdlDefinitionChecks.compressionCode(sc.method(), col));
         } else if (alterCol.action() instanceof AlterTableStmt.ColumnNoOp) {
             // no-op
+        }
+    }
+
+    /**
+     * A generated column's value comes from its expression on every row, so a default has
+     * nothing to fill in and setting or dropping one is refused rather than stored and ignored.
+     */
+    private static void rejectDefaultOnGeneratedColumn(Table table, String column, String tableName) {
+        int idx = table.getColumnIndex(column);
+        if (idx < 0) return; // the missing column is reported by the action itself
+        if (table.getColumns().get(idx).isGenerated()) {
+            throw PgErrors.syntax("column \"" + column + "\" of relation \"" + tableName
+                    + "\" is a generated column");
         }
     }
 
@@ -1109,6 +1297,13 @@ class DdlAlterTableExecutor {
                 RowContext ctx = new RowContext(table, null, row);
                 convertedValues[ri] = executor.evalExpr(setType.usingExpr(), ctx);
             }
+            // The rewritten column has to satisfy what was already declared over it. The
+            // indexes are rebuilt from the new values, so a conversion that maps two rows onto
+            // one value breaks a unique index, and one that yields a null breaks NOT NULL.
+            // Both are checked before anything is written, because PostgreSQL rolls the whole
+            // statement back and the old values have to still be there afterwards.
+            rejectRewriteThatBreaksColumn(table, alterCol.column(), convertedValues,
+                    stmt.table(), schemaName);
             table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
             Column newCol = table.getColumns().get(convIdx);
             for (int ri = 0; ri < table.getRows().size(); ri++) {
@@ -1128,6 +1323,60 @@ class DdlAlterTableExecutor {
         }
     }
 
+    /**
+     * What the column will hold after a retype has to satisfy the rules already declared over it:
+     * a NOT NULL column may not end up holding a null, and a unique index over the column may not
+     * end up with two rows on one value.
+     */
+    private void rejectRewriteThatBreaksColumn(Table table, String column, Object[] newValues,
+                                               String tableName, String schemaName) {
+        int idx = table.getColumnIndex(column);
+        if (idx < 0) return;
+        if (!table.getColumns().get(idx).isNullable()) {
+            for (Object v : newValues) {
+                if (v == null) {
+                    throw new MemgresException("column \"" + column + "\" of relation \""
+                            + tableName + "\" contains null values", "23502");
+                }
+            }
+        }
+        String uniqueIndex = uniqueIndexOverColumnAlone(table, column, schemaName, tableName);
+        if (uniqueIndex == null) return;
+        Set<String> seen = new HashSet<>();
+        for (Object v : newValues) {
+            if (v == null) continue; // nulls are distinct from each other in a unique index
+            if (!seen.add(String.valueOf(v))) {
+                throw new MemgresException("could not create unique index \"" + uniqueIndex
+                        + "\"\n  Detail: Key (" + column + ")=(" + v + ") is duplicated.", "23505");
+            }
+        }
+    }
+
+    /** The name of a unique index or constraint whose only key is this column, or null. */
+    private String uniqueIndexOverColumnAlone(Table table, String column, String schemaName,
+                                              String tableName) {
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.UNIQUE
+                    && sc.getType() != StoredConstraint.Type.PRIMARY_KEY) continue;
+            if (sc.getColumns() != null && sc.getColumns().size() == 1
+                    && sc.getColumns().get(0).equalsIgnoreCase(column)) {
+                return sc.getName();
+            }
+        }
+        String qualified = schemaName + "." + tableName;
+        for (Map.Entry<String, List<String>> e : executor.database.getIndexColumns().entrySet()) {
+            if (!executor.database.isUniqueIndex(e.getKey())) continue;
+            String owner = executor.database.getIndexTable(e.getKey());
+            if (owner == null) continue;
+            if (!owner.equalsIgnoreCase(qualified) && !owner.equalsIgnoreCase(tableName)) continue;
+            List<String> cols = e.getValue();
+            if (cols != null && cols.size() == 1 && cols.get(0).equalsIgnoreCase(column)) {
+                return e.getKey();
+            }
+        }
+        return null;
+    }
+
     private void executeSetDefault(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetDefault setDefault,
                                     Table table, AlterTableStmt stmt) {
         String defaultVal = DdlExecutor.exprToDefaultString(setDefault.expr());
@@ -1135,7 +1384,7 @@ class DdlAlterTableExecutor {
         if (defaultVal.contains("__set_increment__")) {
             handleSetIncrement(alterCol.column(), defaultVal, table);
         } else if (defaultVal.contains("__restart__")) {
-            handleRestart(alterCol.column(), defaultVal, table);
+            handleRestart(alterCol.column(), defaultVal, table, stmt);
         } else if (defaultVal.contains("__identity__")) {
             handleIdentity(alterCol.column(), defaultVal, table, stmt);
         } else {
@@ -1183,8 +1432,16 @@ class DdlAlterTableExecutor {
         }
     }
 
-    private void handleRestart(String column, String defaultVal, Table table) {
+    private void handleRestart(String column, String defaultVal, Table table, AlterTableStmt stmt) {
         String marker = DdlExecutor.extractMarker(defaultVal);
+        // RESTART is an identity action. On any other column, including a serial one — whose
+        // sequence is a default, not an identity — PostgreSQL refuses rather than restarting
+        // something the writer did not name.
+        Column named = requireColumn(table, column, stmt.table());
+        if (!isIdentityColumn(named)) {
+            throw new MemgresException("column \"" + column + "\" of relation \""
+                    + stmt.table() + "\" is not an identity column", "55000");
+        }
         int colIdx = table.getColumnIndex(column);
         Column col = colIdx >= 0 ? table.getColumns().get(colIdx) : null;
         boolean restarted = false;
@@ -1334,7 +1591,25 @@ class DdlAlterTableExecutor {
                                        AlterTableStmt stmt, String schemaName) {
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.NOT_NULL) {
             for (String colName : addConstraint.constraint().columns()) {
+                // The rows already stored decide whether the rule can hold at all.
+                int colIdx = table.getColumnIndex(colName);
+                if (colIdx >= 0) {
+                    for (Object[] row : table.getRows()) {
+                        if (row[colIdx] == null) {
+                            throw new MemgresException("column \"" + colName + "\" of relation \""
+                                    + stmt.table() + "\" contains null values", "23502");
+                        }
+                    }
+                }
+                // A column that is already NOT NULL keeps the constraint it has: PostgreSQL
+                // merges the new declaration into it and never creates the written name, so
+                // DROP CONSTRAINT on that name is 42704 there and must be here too.
+                boolean alreadyNotNull = colIdx >= 0
+                        && !table.getColumns().get(colIdx).isNullable();
                 table.alterColumnNullable(colName, false);
+                if (!alreadyNotNull && addConstraint.constraint().name() != null) {
+                    table.setNotNullConstraintName(colName, addConstraint.constraint().name());
+                }
             }
             return;
         }
@@ -1367,6 +1642,32 @@ class DdlAlterTableExecutor {
             // PG checks the key's definition before it looks for a name collision.
             if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY) {
                 ddl.validateForeignKeyDefinition(sc, table, schemaName);
+            }
+            // UNIQUE and PRIMARY KEY are enforced by an index that is built at once, so there is
+            // nothing for NOT VALID to defer and PostgreSQL refuses the combination outright —
+            // before it looks at whether the key itself could stand.
+            if (addConstraint.notValid()
+                    && (sc.getType() == StoredConstraint.Type.UNIQUE
+                        || sc.getType() == StoredConstraint.Type.PRIMARY_KEY)) {
+                throw PgErrors.notImplemented(
+                        (sc.getType() == StoredConstraint.Type.UNIQUE ? "UNIQUE" : "PRIMARY KEY")
+                        + " constraints cannot be marked NOT VALID");
+            }
+            // The index a key is built on takes a relation name, so a name another relation
+            // already owns is reported as that before the key is judged.
+            if (addConstraint.constraint().name() != null
+                    && (sc.getType() == StoredConstraint.Type.UNIQUE
+                        || sc.getType() == StoredConstraint.Type.PRIMARY_KEY)) {
+                RelationNamespace.requireFree(executor.database, schemaName, sc.getName(), null);
+            }
+            // A second primary key is refused for what it is, whatever it was going to be called.
+            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+                for (StoredConstraint existing : table.getConstraints()) {
+                    if (existing.getType() == StoredConstraint.Type.PRIMARY_KEY) {
+                        throw new MemgresException("multiple primary keys for table \""
+                                + stmt.table() + "\" are not allowed", "42P16");
+                    }
+                }
             }
             if (sc.getName() != null && table.getConstraint(sc.getName()) != null) {
                 throw new MemgresException("constraint \"" + sc.getName() + "\" for relation \"" + stmt.table() + "\" already exists", "42710");
@@ -1507,6 +1808,12 @@ class DdlAlterTableExecutor {
                                         AlterTableStmt stmt) {
         StoredConstraint sc = table.getConstraint(ac.constraintName());
         if (sc == null) {
+            // A named NOT NULL constraint is the one kind INHERIT / NO INHERIT is for.
+            if (table.notNullConstraintColumn(ac.constraintName()) != null) {
+                if (ac.alterInheritability()) return;
+                throw PgErrors.wrongObjectType("constraint \"" + ac.constraintName()
+                        + "\" of relation \"" + stmt.table() + "\" is not a foreign key constraint");
+            }
             throw new MemgresException("constraint \"" + ac.constraintName() + "\" of relation \""
                     + stmt.table() + "\" does not exist", "42704");
         }
@@ -1515,7 +1822,7 @@ class DdlAlterTableExecutor {
             throw PgErrors.wrongObjectType("constraint \"" + ac.constraintName() + "\" of relation \""
                     + stmt.table() + "\" is not a foreign key constraint");
         }
-        // memgres has no stored NOT NULL constraint object, so inheritability never applies.
+        // Only a NOT NULL constraint has inheritability to alter.
         if (ac.alterInheritability()) {
             throw PgErrors.wrongObjectType("constraint \"" + ac.constraintName() + "\" of relation \""
                     + stmt.table() + "\" is not a not-null constraint");

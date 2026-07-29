@@ -22,6 +22,11 @@ public final class AlterSequenceStmt implements Statement {
 
     public boolean ifExists() { return ifExists; }
     public void setIfExists(boolean ifExists) { this.ifExists = ifExists; }
+
+    /** ALTER SEQUENCE ... SET SCHEMA: the schema the sequence is being moved into. */
+    private String setSchema;
+    public String setSchema() { return setSchema; }
+    public void setSetSchema(String schemaName) { this.setSchema = schemaName; }
     public Integer getCache() { return cache; }
     public void setCache(Integer cache) { this.cache = cache; }
     public String getAsType() { return asType; }

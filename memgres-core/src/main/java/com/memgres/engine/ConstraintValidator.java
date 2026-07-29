@@ -173,8 +173,11 @@ class ConstraintValidator {
         for (int i = 0; i < table.getColumns().size(); i++) {
             Column col = table.getColumns().get(i);
             if (!col.isNullable() && row[i] == null) {
+                // PostgreSQL names the relation as well as the column: the same column name
+                // appears on a parent and its children, and only the relation tells them apart.
                 MemgresException ex = new MemgresException(
-                        "null value in column \"" + col.getName() + "\" violates not-null constraint",
+                        "null value in column \"" + col.getName() + "\" of relation \""
+                        + table.getName() + "\" violates not-null constraint",
                         "23502");
                 ex.setColumn(col.getName());
                 ex.setTable(table.getName());
@@ -321,7 +324,8 @@ class ConstraintValidator {
             for (int i = 0; i < newVals.length; i++) {
                 if (newVals[i] == null) {
                     throw new MemgresException(
-                            "null value in column \"" + columns.get(i) + "\" violates not-null constraint",
+                            "null value in column \"" + columns.get(i) + "\" of relation \""
+                            + table.getName() + "\" violates not-null constraint",
                             "23502");
                 }
             }
