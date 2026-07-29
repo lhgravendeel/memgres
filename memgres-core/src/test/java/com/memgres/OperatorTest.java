@@ -264,8 +264,11 @@ class OperatorTest {
             stmt.execute("CREATE OPERATOR ## (RIGHTARG = integer, FUNCTION = unary_fn)");
             stmt.execute("DROP OPERATOR ## (NONE, integer)");
 
+            // PostgreSQL carries six built-in ## operators of its own, so the count has to name
+            // the one that was dropped: a prefix operator over integer.
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '##'")) {
+                    "SELECT COUNT(*) FROM pg_operator WHERE oprname = '##'"
+                    + " AND oprkind = 'l' AND oprright = 'integer'::regtype::oid")) {
                 assertTrue(rs.next());
                 assertEquals(0, rs.getInt(1));
             }
@@ -905,7 +908,10 @@ class OperatorTest {
     void pgOperatorBuiltinPlusOperator() throws SQLException {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             try (ResultSet rs = stmt.executeQuery(
-                    "SELECT oprname, oprkind FROM pg_operator WHERE oprname = '+' LIMIT 1")) {
+                    // PostgreSQL declares a prefix + as well as the binary one, so the binary
+                    // form has to be asked for rather than taken from whichever row comes first.
+                    "SELECT oprname, oprkind FROM pg_operator"
+                    + " WHERE oprname = '+' AND oprkind = 'b' LIMIT 1")) {
                 assertTrue(rs.next());
                 assertEquals("+", rs.getString("oprname"));
                 assertEquals("b", rs.getString("oprkind"));
@@ -1674,8 +1680,10 @@ class OperatorTest {
         try (Connection conn = connect(); Statement stmt = conn.createStatement()) {
             // All built-in arithmetic operators should be binary
             try (ResultSet rs = stmt.executeQuery(
+                    // PostgreSQL also declares prefix + and -, so the comparison operators and
+                    // the two arithmetic ones that have no prefix form are what must be binary.
                     "SELECT oprname, oprkind FROM pg_operator "
-                    + "WHERE oprname IN ('+', '-', '*', '/', '=', '<>', '<', '>', '<=', '>=') "
+                    + "WHERE oprname IN ('*', '/', '=', '<>', '<', '>', '<=', '>=') "
                     + "ORDER BY oprname")) {
                 int count = 0;
                 while (rs.next()) {

@@ -98,6 +98,38 @@ public class SystemCatalog implements OidSupplier {
     }
 
     /**
+     * The catalog relations already built for the statement now running, or null when nothing is
+     * running. A catalog relation is derived from the database on every reference, and a
+     * correlated subquery over one references it once per outer row: the NOT EXISTS integrity
+     * checks a tool runs against pg_operator or pg_proc rebuilt thousands of rows thousands of
+     * times and took seconds where PostgreSQL takes milliseconds.
+     */
+    private Map<String, Table> statementCache;
+
+    /**
+     * Begin a statement: catalog relations built from here on are reused until it ends.
+     * A statement sees one state of the database, so building the same relation twice within
+     * one can only produce the same rows again.
+     */
+    public void beginStatement() {
+        statementCache = new HashMap<>();
+    }
+
+    /** End a statement, so the next one builds the catalog from the database afresh. */
+    public void endStatement() {
+        statementCache = null;
+    }
+
+    /**
+     * Drop what has been built for the statement now running. Called when a statement changes
+     * the database mid-flight — a data-modifying CTE, a function body that runs DDL — so a
+     * later reference in the same statement does not read a relation built before the change.
+     */
+    public void invalidateStatementCache() {
+        if (statementCache != null) statementCache.clear();
+    }
+
+    /**
      * Resolve a system catalog table, returning a virtual Table with rows.
      * Returns null if this is not a recognized catalog table.
      */
@@ -113,17 +145,22 @@ public class SystemCatalog implements OidSupplier {
         String tbl = tableName.toLowerCase();
         String sch = schema != null ? schema.toLowerCase() : null;
 
-        // pg_catalog tables
-        if (sch == null && tbl.startsWith("pg_") || "pg_catalog".equals(sch)) {
-            return pgCatalogBuilder.build(tbl, session);
-        }
+        boolean isPgCatalog = (sch == null && tbl.startsWith("pg_")) || "pg_catalog".equals(sch);
+        boolean isInfoSchema = "information_schema".equals(sch);
+        if (!isPgCatalog && !isInfoSchema) return null;
 
-        // information_schema tables
-        if ("information_schema".equals(sch)) {
-            return infoSchemaBuilder.build(tbl, session);
+        Map<String, Table> cache = statementCache;
+        // A session-scoped view answers for the session that asked, so the two forms are
+        // cached apart rather than one standing in for the other.
+        String key = (session != null ? "s:" : "-:") + (isPgCatalog ? "pg_catalog." : "information_schema.") + tbl;
+        if (cache != null) {
+            Table hit = cache.get(key);
+            if (hit != null) return hit;
         }
-
-        return null;
+        Table built = isPgCatalog ? pgCatalogBuilder.build(tbl, session)
+                : infoSchemaBuilder.build(tbl, session);
+        if (cache != null && built != null) cache.put(key, built);
+        return built;
     }
 
     @Override
@@ -134,6 +171,28 @@ public class SystemCatalog implements OidSupplier {
     /** Public accessor for looking up OIDs by key (used by ::regclass cast). */
     public int getOid(String key) {
         return oid(key);
+    }
+
+    /** Reverse of the OID map, rebuilt whenever the map has grown. */
+    private Map<Integer, String> keysByOid;
+    private int keysByOidBuiltAt = -1;
+
+    /**
+     * The object key an OID was handed out for, or null. This is what lets ::regproc and
+     * ::regtype print a name for an OID read out of a catalog column instead of the number
+     * back again — a scan of the map per value would be quadratic over a catalog query, so the
+     * reverse is kept and rebuilt only when a new OID has been allocated.
+     */
+    public synchronized String keyForOid(int oid) {
+        if (keysByOid == null || keysByOidBuiltAt != oidMap.size()) {
+            Map<Integer, String> reverse = new HashMap<>();
+            for (Map.Entry<String, Integer> e : oidMap.entrySet()) {
+                if (!reverse.containsKey(e.getValue())) reverse.put(e.getValue(), e.getKey());
+            }
+            keysByOid = reverse;
+            keysByOidBuiltAt = oidMap.size();
+        }
+        return keysByOid.get(oid);
     }
 
     /** Allocate and return the next available OID. */

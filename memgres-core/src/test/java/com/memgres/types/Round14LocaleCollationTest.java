@@ -74,9 +74,12 @@ class Round14LocaleCollationTest {
     }
 
     @Test
-    void pg_collation_has_colliculocale() throws SQLException {
-        // PG 15+: colliculocale is present on ICU entries
+    void pg_collation_has_colllocale() throws SQLException {
+        // colliculocale was the PG 15-17 name; PostgreSQL 18 carries colllocale beside collcollate.
         assertEquals(1, scalarInt(
+                "SELECT count(*)::int FROM information_schema.columns "
+                        + "WHERE table_name = 'pg_collation' AND column_name = 'colllocale'"));
+        assertEquals(0, scalarInt(
                 "SELECT count(*)::int FROM information_schema.columns "
                         + "WHERE table_name = 'pg_collation' AND column_name = 'colliculocale'"));
     }

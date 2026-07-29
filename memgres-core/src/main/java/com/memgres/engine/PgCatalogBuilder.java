@@ -1,5 +1,10 @@
 package com.memgres.engine;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 import static com.memgres.engine.CatalogHelper.*;
 
 /**
@@ -14,12 +19,58 @@ public class PgCatalogBuilder {
     private final CatalogTypeSystemBuilder typeSystem;
     private final CatalogStubBuilder stubs;
 
+    /**
+     * The columns each pg_catalog relation has, keyed by relation name. Built once by asking
+     * every builder for its table and keeping only the shape, so pg_attribute describes what the
+     * server actually answers rather than a second list that can drift from it.
+     */
+    private static volatile Map<String, List<Column>> shapes;
+
+    /** True while {@link #catalogShapes()} is running, so pg_attribute does not recurse into itself. */
+    private static final ThreadLocal<Boolean> COMPUTING_SHAPES = new ThreadLocal<Boolean>();
+
     public PgCatalogBuilder(Database database, OidSupplier oids) {
         this.core = new CatalogCoreBuilder(database, oids);
         this.constraints = new CatalogConstraintBuilder(database, oids);
         this.security = new CatalogSecurityBuilder(database, oids);
         this.typeSystem = new CatalogTypeSystemBuilder(database, oids);
         this.stubs = new CatalogStubBuilder(database, oids);
+    }
+
+    /** True when the catalog shapes are being collected; see {@link #COMPUTING_SHAPES}. */
+    static boolean collectingShapes() {
+        return Boolean.TRUE.equals(COMPUTING_SHAPES.get());
+    }
+
+    /**
+     * The column list of every pg_catalog relation memgres publishes. A relation with no builder
+     * behind it is absent from the map, which is how pg_class learns not to advertise it.
+     */
+    Map<String, List<Column>> catalogShapes() {
+        Map<String, List<Column>> cached = shapes;
+        if (cached != null) return cached;
+        // Re-entered from a builder that is only being asked for its columns: it has no need of
+        // the shapes to answer that, and handing it a half-built map would recurse forever.
+        if (collectingShapes()) return Collections.emptyMap();
+        Map<String, List<Column>> built = new LinkedHashMap<String, List<Column>>();
+        COMPUTING_SHAPES.set(Boolean.TRUE);
+        try {
+            for (String name : PgCatalogRelations.ALL) {
+                try {
+                    Table t = build(name, null);
+                    if (t != null && !t.getColumns().isEmpty()) {
+                        built.put(name, t.getColumns());
+                    }
+                } catch (RuntimeException ignored) {
+                    // A relation that cannot be built is one pg_class must not advertise.
+                }
+            }
+        } finally {
+            COMPUTING_SHAPES.remove();
+        }
+        cached = Collections.unmodifiableMap(built);
+        shapes = cached;
+        return cached;
     }
 
     /**
@@ -34,6 +85,86 @@ public class PgCatalogBuilder {
      * Build the requested pg_catalog table by name, with session context for session-scoped views.
      */
     public Table build(String tableName, Session session) {
+        return inPgColumnOrder(tableName, withoutRowHeaderColumns(buildRelation(tableName, session)));
+    }
+
+    /**
+     * The relation with its columns in the order PostgreSQL numbers them, where the two differ.
+     * See {@link PgCatalogRelations#attnumOrder}. A column memgres has that PostgreSQL does not
+     * keeps its place at the end rather than being dropped.
+     */
+    private static Table inPgColumnOrder(String tableName, Table t) {
+        String[] order = PgCatalogRelations.attnumOrder(tableName);
+        if (t == null || order == null) return t;
+        List<Column> have = t.getColumns();
+        List<Integer> at = new java.util.ArrayList<Integer>();
+        boolean[] taken = new boolean[have.size()];
+        for (String name : order) {
+            for (int i = 0; i < have.size(); i++) {
+                if (!taken[i] && have.get(i).getName().equalsIgnoreCase(name)) {
+                    at.add(i);
+                    taken[i] = true;
+                    break;
+                }
+            }
+        }
+        for (int i = 0; i < have.size(); i++) {
+            if (!taken[i]) at.add(i);
+        }
+        boolean unchanged = true;
+        for (int i = 0; i < at.size(); i++) {
+            if (at.get(i) != i) { unchanged = false; break; }
+        }
+        if (unchanged) return t;
+        List<Column> reordered = new java.util.ArrayList<Column>();
+        for (Integer i : at) reordered.add(have.get(i));
+        Table out = new Table(t.getName(), reordered);
+        for (Object[] row : t.getRows()) {
+            Object[] moved = new Object[at.size()];
+            for (int i = 0; i < at.size(); i++) {
+                int from = at.get(i);
+                moved[i] = from < row.length ? row[from] : null;
+            }
+            out.insertRow(moved);
+        }
+        return out;
+    }
+
+    /**
+     * The relation without the row-header columns memgres carries alongside it.
+     *
+     * <p>PostgreSQL answers {@code SELECT xmin FROM pg_class} but does not include xmin in
+     * {@code SELECT *}, and keeps it out of pg_attribute — it is a system column, not one of the
+     * relation's own. Carrying it in the column list made the relation return one more column
+     * than the catalog says it has, so what pg_class and pg_attribute describe and what selecting
+     * from the relation returns disagreed about twenty-seven relations. The value is still
+     * reachable by name: RowContext resolves the row-header columns before it looks at the
+     * relation's own.
+     */
+    private static Table withoutRowHeaderColumns(Table t) {
+        if (t == null) return null;
+        List<Column> kept = new java.util.ArrayList<Column>();
+        List<Integer> keptAt = new java.util.ArrayList<Integer>();
+        List<Column> all = t.getColumns();
+        for (int i = 0; i < all.size(); i++) {
+            if (CatalogCoreBuilder.isSystemColumn(all.get(i))) continue;
+            kept.add(all.get(i));
+            keptAt.add(i);
+        }
+        if (kept.size() == all.size()) return t;
+        Table stripped = new Table(t.getName(), kept);
+        for (Object[] row : t.getRows()) {
+            Object[] out = new Object[kept.size()];
+            for (int i = 0; i < keptAt.size(); i++) {
+                int at = keptAt.get(i);
+                out[i] = at < row.length ? row[at] : null;
+            }
+            stripped.insertRow(out);
+        }
+        return stripped;
+    }
+
+    private Table buildRelation(String tableName, Session session) {
         switch (tableName) {
             case "pg_class":
                 return core.buildPgClass();
@@ -63,13 +194,14 @@ public class PgCatalogBuilder {
                 return constraints.buildPgTrigger();
             case "pg_roles":
                 return security.buildPgRoles();
-            case "pg_authid": {
-                Table t = security.buildPgRoles();
-                // Return with correct name for info_schema column lookup
-                return new Table("pg_authid", t.getColumns());
-            }
+            case "pg_authid":
+                return security.buildPgAuthid();
             case "pg_user":
                 return security.buildPgUser();
+            case "pg_shadow":
+                return security.buildLoginRoleView("pg_shadow", "usename", "usesysid");
+            case "pg_group":
+                return security.buildPgGroup();
             case "pg_auth_members":
                 return security.buildPgAuthMembers();
             case "pg_default_acl":
@@ -144,14 +276,44 @@ public class PgCatalogBuilder {
                 return stubs.buildPgTimezoneAbbrevs();
             case "pg_stat_user_tables":
             case "pg_stat_all_tables":
+                return stubs.buildPgStatUserTables();
+            case "pg_stat_sys_tables": {
+                Table t = stubs.buildPgStatUserTables();
+                return new Table(tableName, t.getColumns());
+            }
             case "pg_stat_xact_user_tables":
             case "pg_stat_xact_all_tables":
-                return stubs.buildPgStatUserTables();
+            case "pg_stat_xact_sys_tables":
+                return stubs.buildPgStatXactTables(tableName);
             case "pg_stat_user_indexes":
             case "pg_stat_all_indexes":
+                return stubs.buildPgStatUserIndexes();
+            case "pg_stat_sys_indexes": {
+                Table t = stubs.buildPgStatUserIndexes();
+                return new Table(tableName, t.getColumns());
+            }
             case "pg_statio_all_indexes":
             case "pg_statio_user_indexes":
-                return stubs.buildPgStatUserIndexes();
+            case "pg_statio_sys_indexes":
+                return stubs.buildPgStatioIndexes(tableName);
+            case "pg_statio_all_sequences":
+            case "pg_statio_user_sequences":
+            case "pg_statio_sys_sequences":
+                return stubs.buildPgStatioSequences(tableName);
+            case "pg_statio_sys_tables": {
+                Table t = stubs.buildPgStatioUserTables();
+                return new Table(tableName, t.getColumns());
+            }
+            case "pg_stat_progress_analyze":
+                return stubs.buildPgStatProgressAnalyze();
+            case "pg_stat_progress_cluster":
+                return stubs.buildPgStatProgressCluster();
+            case "pg_stat_progress_basebackup":
+                return stubs.buildPgStatProgressBasebackup();
+            case "pg_stat_progress_copy":
+                return stubs.buildPgStatProgressCopy();
+            case "pg_backend_memory_contexts":
+                return stubs.buildPgBackendMemoryContexts();
             case "pg_stat_database":
                 return stubs.buildPgStatDatabase();
             case "pg_stat_bgwriter":

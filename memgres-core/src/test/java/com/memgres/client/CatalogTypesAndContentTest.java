@@ -212,8 +212,10 @@ class CatalogTypesAndContentTest {
 
     @Test
     void castFunctionIsNamedWhenThereIsOne() throws SQLException {
-        assertEquals("1740", one("SELECT castfunc::text FROM pg_cast"
-                + " WHERE castsource = 23 AND casttarget = 1700"));
+        // The OID itself is assigned by the server, so what is checked is that it resolves:
+        // a castfunc pointing at nothing drops out of every join that reads the cast catalogue.
+        assertEquals("numeric", one("SELECT p.proname FROM pg_cast c JOIN pg_proc p ON p.oid = c.castfunc"
+                + " WHERE c.castsource = 23 AND c.casttarget = 1700"));
         assertEquals("0", one("SELECT castfunc::text FROM pg_cast"
                 + " WHERE castsource = 23 AND casttarget = 26"));
     }
