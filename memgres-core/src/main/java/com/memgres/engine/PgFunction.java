@@ -96,6 +96,16 @@ public class PgFunction {
         return "record".equalsIgnoreCase(bare);
     }
 
+    /** True when the declaration answers a set of rows rather than a single value. */
+    public boolean isSetReturning() {
+        if (returnType != null) {
+            String bare = returnType.trim();
+            if (bare.length() > 6 && bare.substring(0, 6).equalsIgnoreCase("SETOF ")) return true;
+            if (bare.equalsIgnoreCase("TABLE")) return true;
+        }
+        return false;
+    }
+
     /** True when the signature already names the result columns, as OUT or TABLE parameters. */
     public boolean hasOutParams() {
         for (Param p : params) {

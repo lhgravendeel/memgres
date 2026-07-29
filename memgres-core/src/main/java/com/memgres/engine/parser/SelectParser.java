@@ -1,13 +1,16 @@
 package com.memgres.engine.parser;
 
 import com.memgres.engine.MemgresException;
+import com.memgres.engine.RecursiveCteCheck;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * SELECT statement parsing, extracted from Parser to reduce class size.
@@ -25,6 +28,8 @@ class SelectParser {
         // Grammar: set_expr = intersect_expr ((UNION|EXCEPT) [ALL] intersect_expr)*
         //          intersect_expr = select_term (INTERSECT [ALL] select_term)*
 
+        rejectSetOpOnModifyingStatement(left);
+        rejectSortedLeftArm(left);
         // First absorb any higher-precedence INTERSECT
         left = parseIntersectChain(left);
 
@@ -39,10 +44,11 @@ class SelectParser {
                     Expression offset = sop.offset();
                     boolean changed = false;
                     if (parser.matchKeywords("ORDER", "BY")) { orderBy = parser.parseOrderByList(); changed = true; }
-                    if (parser.matchKeyword("LIMIT")) { if (!parser.matchKeyword("ALL")) limit = parser.parsePrimary(); changed = true; }
+                    if (parser.matchKeyword("LIMIT")) { limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parsePrimary(); changed = true; }
                     if (parser.matchKeyword("OFFSET")) { offset = parser.parsePrimary(); changed = true; }
                     if (changed) {
-                        left = new SetOpStmt(sop.left(), sop.op(), sop.all(), sop.right(), orderBy, limit, offset);
+                        left = new SetOpStmt(sop.left(), sop.op(), sop.all(), sop.right(), orderBy, limit, offset,
+                        sop.withTies());
                     }
                 }
             }
@@ -63,24 +69,8 @@ class SelectParser {
                 throw new ParseException("syntax error at or near \"CORRESPONDING\"", parser.peek());
             }
 
-            Statement right;
-            int setOpExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
-            if (parser.check(TokenType.LEFT_PAREN) && setOpExtraParens > 0) {
-                parser.consumeLeadingParens(setOpExtraParens);
-                right = parser.parseSelect(); right = tryParseSetOp(right);
-                parser.consumeTrailingParens(setOpExtraParens);
-                lastRightWasParenthesized = true;
-            } else if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
-                lastRightWasParenthesized = true;
-            } else if (parser.checkKeyword("VALUES")) {
-                // A bare VALUES list is a query in its own right, so it may be a set-op arm
-                right = parseValuesBody();
-                lastRightWasParenthesized = false;
-            } else {
-                right = parser.parseSelect();
-                lastRightWasParenthesized = false;
-            }
+            lastRightWasParenthesized = parser.check(TokenType.LEFT_PAREN);
+            Statement right = parseSetOpOperand();
 
             // Right side may have higher-precedence INTERSECT
             right = parseIntersectChain(right);
@@ -103,19 +93,145 @@ class SelectParser {
             boolean changed = false;
 
             if (parser.matchKeywords("ORDER", "BY")) { orderBy = parser.parseOrderByList(); changed = true; }
-            if (parser.matchKeyword("LIMIT")) { if (!parser.matchKeyword("ALL")) limit = parser.parsePrimary(); changed = true; }
+            if (parser.matchKeyword("LIMIT")) { limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parsePrimary(); changed = true; }
             if (parser.matchKeyword("OFFSET")) { offset = parser.parsePrimary(); changed = true; }
 
             if (changed) {
-                left = new SetOpStmt(sop.left(), sop.op(), sop.all(), sop.right(), orderBy, limit, offset);
+                left = new SetOpStmt(sop.left(), sop.op(), sop.all(), sop.right(), orderBy, limit, offset,
+                        sop.withTies());
             }
+            rejectLockOnSetOp();
         }
 
         return left;
     }
 
+    /**
+     * A set operation combines queries, and INSERT, UPDATE, DELETE and MERGE are not queries --
+     * PostgreSQL's grammar has no production joining one to a SELECT, so a set-operation keyword
+     * after one is a syntax error there. Wrapping the statement as the left arm instead ran it and
+     * only then complained that the arms had different widths, which left the rows the INSERT had
+     * already written behind: {@code INSERT INTO t(id) (SELECT 1) UNION (SELECT 2)} reported an
+     * error and inserted one row. Refusing at the parser leaves nothing behind, because nothing
+     * has run.
+     */
+    private void rejectSetOpOnModifyingStatement(Statement left) {
+        if (!(left instanceof InsertStmt) && !(left instanceof UpdateStmt)
+                && !(left instanceof DeleteStmt) && !(left instanceof MergeStmt)) {
+            return;
+        }
+        if (!parser.checkKeyword("UNION") && !parser.checkKeyword("INTERSECT")
+                && !parser.checkKeyword("EXCEPT")) {
+            return;
+        }
+        throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                parser.peek());
+    }
+
+    /**
+     * A row lock names the base-table row behind an output row, and a set operation has combined
+     * rows from different relations by the time it has one to name. PostgreSQL refuses the lock
+     * written after the whole set operation just as it refuses one written on an arm.
+     */
+    private void rejectLockOnSetOp() {
+        if (!parser.checkKeyword("FOR")) return;
+        String mode = null;
+        if (parser.checkKeywordAt(1, "UPDATE")) mode = "UPDATE";
+        else if (parser.checkKeywordAt(1, "SHARE")) mode = "SHARE";
+        else if (parser.checkKeywordAt(1, "NO") && parser.checkKeywordAt(2, "KEY")) mode = "NO KEY UPDATE";
+        else if (parser.checkKeywordAt(1, "KEY") && parser.checkKeywordAt(2, "SHARE")) mode = "KEY SHARE";
+        if (mode == null) return;
+        throw new MemgresException("FOR " + mode
+                + " is not allowed with UNION/INTERSECT/EXCEPT", "0A000");
+    }
+
+    /**
+     * ORDER BY, LIMIT, OFFSET and FOR UPDATE belong to the set operation as a whole, so
+     * PostgreSQL's grammar has no production for one written on an unparenthesised arm:
+     * {@code SELECT a FROM t ORDER BY 1 UNION SELECT 5} is a syntax error at UNION, and so is the
+     * same with LIMIT, OFFSET or FOR UPDATE. The arms were parsed as ordinary SELECTs, which take
+     * those clauses, and the trailing-clause bubbling then moved them to the set operation -- so
+     * the ORDER BY silently applied to the union and the LIMIT silently applied to the first arm
+     * alone.
+     *
+     * <p>Parenthesised, all three are legal and mean the arm, which is a difference the AST does
+     * not record. The token before the set-operation keyword does record it: a parenthesised arm
+     * ends in the closing paren. Reading it there keeps the check to the one shape that can only
+     * have come from an unparenthesised arm.
+     */
+    private void rejectSortedLeftArm(Statement left) {
+        if (!(left instanceof SelectStmt)) return;
+        SelectStmt sel = (SelectStmt) left;
+        if (sel.orderBy() == null && sel.limit() == null && sel.offset() == null
+                && sel.lockClause() == null) {
+            return;
+        }
+        if (!parser.checkKeyword("UNION") && !parser.checkKeyword("INTERSECT")
+                && !parser.checkKeyword("EXCEPT")) {
+            return;
+        }
+        if (parser.previousTokenIs(TokenType.RIGHT_PAREN)) return;
+        throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                parser.peek());
+    }
+
+    /**
+     * Parse one operand of a set operation: a query, or a parenthesised one.
+     *
+     * <p>What stands inside the parentheses is a whole query expression and may be a set operation
+     * of its own, whose own arms may be parenthesised in turn -- so the parentheses have to be
+     * taken off one at a time, each one closed only after everything it opened has been read.
+     * Counting the run of opening parentheses first and then expecting that many closing ones at
+     * the end assumed every one of them belonged to the same operand: in
+     * {@code (SELECT 1) UNION ((SELECT 2) UNION (SELECT 3))} the two leading parentheses of the
+     * right operand close in different places, so the second closing parenthesis was looked for
+     * where the inner UNION stands and an ordinary set operation was a syntax error.
+     */
+    private Statement parseSetOpOperand() {
+        // Only an arm written bare may not begin with WITH; inside parentheses it is a query
+        // expression of its own and a WITH clause belongs to it. The check therefore stands here
+        // and not in the recursion, which is what descends through the parentheses.
+        if (!parser.check(TokenType.LEFT_PAREN)) rejectWithClauseArm();
+        return parseParenthesisedOperand();
+    }
+
+    private Statement parseParenthesisedOperand() {
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance();
+            Statement inner = parseParenthesisedOperand();
+            inner = tryParseSetOp(inner);
+            parser.expect(TokenType.RIGHT_PAREN);
+            return inner;
+        }
+        if (parser.checkKeyword("VALUES")) {
+            // A bare VALUES list is a query in its own right, so it may be a set-op arm
+            return parseValuesBody();
+        }
+        return parser.parseSelect();
+    }
+
+    /** Parse a set-op operand from outside this class (an INSERT's source query). */
+    Statement parseSetOpOperandPublic() {
+        return parseSetOpOperand();
+    }
+
+    /**
+     * A WITH clause is not one of the productions a set-operation arm may be.
+     *
+     * <p>PostgreSQL's grammar hangs WITH off a whole query, not off an arm, so {@code SELECT 1
+     * UNION ALL WITH x AS (...) SELECT ...} is a syntax error at the WITH — while the same
+     * written inside parentheses is a query in its own right and runs. The arms here were parsed
+     * by the full SELECT parser, which reads a WITH clause wherever it stands.
+     */
+    private void rejectWithClauseArm() {
+        if (parser.checkKeyword("WITH")) {
+            throw new ParseException("syntax error at or near \"WITH\"", parser.peek());
+        }
+    }
+
     /** Parse a chain of INTERSECT operations (higher precedence, left-associative). */
     Statement parseIntersectChain(Statement left) {
+        rejectSortedLeftArm(left);
         while (parser.checkKeyword("INTERSECT")) {
             parser.advance();
             boolean all = parser.matchKeyword("ALL");
@@ -126,19 +242,7 @@ class SelectParser {
                 throw new ParseException("syntax error at or near \"CORRESPONDING\"", parser.peek());
             }
 
-            Statement right;
-            int intersectExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
-            if (parser.check(TokenType.LEFT_PAREN) && intersectExtraParens > 0) {
-                parser.consumeLeadingParens(intersectExtraParens);
-                right = parser.parseSelect(); right = tryParseSetOp(right);
-                parser.consumeTrailingParens(intersectExtraParens);
-            } else if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
-            } else if (parser.checkKeyword("VALUES")) {
-                right = parseValuesBody();
-            } else {
-                right = parser.parseSelect();
-            }
+            Statement right = parseSetOpOperand();
 
             left = new SetOpStmt(left, SetOpStmt.SetOpType.INTERSECT, all, right, null, null, null);
         }
@@ -158,6 +262,7 @@ class SelectParser {
         List<SelectStmt.OrderByItem> orderBy = null;
         Expression limit = null;
         Expression offset = null;
+        boolean withTies = false;
         Statement cleanRight = processedRight;
 
         if (processedRight instanceof SelectStmt) {
@@ -166,8 +271,16 @@ class SelectParser {
                 orderBy = rsel.orderBy();
                 limit = rsel.limit();
                 offset = rsel.offset();
-                cleanRight = new SelectStmt(rsel.distinct(), rsel.targets(), rsel.from(), rsel.where(),
-                        rsel.groupBy(), rsel.having(), null, null, null, rsel.withClauses());
+                // Only ORDER BY, LIMIT and OFFSET move up — and WITH TIES with them, since it
+                // qualifies the limit it travels with. Everything else stays on the arm:
+                // rebuilding it through a short constructor dropped whatever that one has no
+                // parameter for, the row lock among them, so FOR UPDATE written after a set
+                // operation stopped being refused because the arm no longer carried it.
+                withTies = rsel.withTies();
+                cleanRight = new SelectStmt(rsel.distinct(), rsel.distinctOn(), rsel.targets(),
+                        rsel.from(), rsel.where(), rsel.groupBy(), rsel.having(), rsel.windowDefs(),
+                        null, null, null, rsel.withClauses(), rsel.groupingSets(),
+                        rsel.lockClause(), false);
             }
         } else if (processedRight instanceof SetOpStmt) {
             SetOpStmt rightSop = (SetOpStmt) processedRight;
@@ -175,12 +288,14 @@ class SelectParser {
                 orderBy = rightSop.orderBy();
                 limit = rightSop.limit();
                 offset = rightSop.offset();
+                withTies = rightSop.withTies();
                 cleanRight = new SetOpStmt(rightSop.left(), rightSop.op(), rightSop.all(), rightSop.right(), null, null, null);
             }
         }
 
         if (orderBy != null || limit != null || offset != null) {
-            return new SetOpStmt(sop.left(), sop.op(), sop.all(), cleanRight, orderBy, limit, offset);
+            return new SetOpStmt(sop.left(), sop.op(), sop.all(), cleanRight, orderBy, limit, offset,
+                    withTies);
         }
 
         if (processedRight != sop.right()) {
@@ -194,9 +309,10 @@ class SelectParser {
         // WITH clause (CTEs)
         List<SelectStmt.CommonTableExpr> withClauses = null;
         if (parser.checkKeyword("WITH")) {
+            // parseWithClause reads each item's own SEARCH and CYCLE clauses; reading them again
+            // here would consume a second set and rebuild the last item from whichever of the two
+            // this pass found, discarding the other.
             withClauses = parseWithClause();
-            // Consume optional SEARCH/CYCLE clauses (can appear in subquery context)
-            consumeSearchCycleClauses(withClauses);
         }
 
         Statement body = parseSelectBody();
@@ -420,11 +536,9 @@ class SelectParser {
         // LIMIT
         Expression limit = null;
         if (parser.matchKeyword("LIMIT")) {
-            if (parser.matchKeyword("ALL")) {
-                limit = null; // LIMIT ALL = no limit
-            } else {
-                limit = parseLimitOffsetExpr();
-            }
+            // LIMIT ALL is LIMIT NULL: no limit, but a LIMIT clause was written, and the rules
+            // that turn on whether a query has one have to be able to see it.
+            limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parseLimitOffsetExpr();
             sawLimit = true;
             if (parser.checkKeyword("LIMIT")) throw new ParseException("Multiple LIMIT clauses", parser.peek());
         }
@@ -538,7 +652,7 @@ class SelectParser {
 
         // PG allows LIMIT/OFFSET after FOR clauses
         if (limit == null && parser.matchKeyword("LIMIT")) {
-            if (!parser.matchKeyword("ALL")) limit = parseLimitOffsetExpr();
+            limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parseLimitOffsetExpr();
         }
         if (offset == null && parser.matchKeyword("OFFSET")) {
             offset = parseLimitOffsetExpr();
@@ -557,7 +671,31 @@ class SelectParser {
      */
     Statement parseValues() {
         // A bare VALUES list is a query, so it may be the left arm of a set operation too
-        return tryParseSetOp(parseValuesBody());
+        Statement stmt = tryParseSetOp(parseValuesBody());
+        // ... and a query of its own takes ORDER BY, LIMIT and OFFSET. A list of two rows or more
+        // is rewritten as a set operation, whose parsing reads them; a list of one row is one
+        // SELECT and nothing read them at all, so VALUES (7) ORDER BY 1 was a syntax error at
+        // ORDER while VALUES (7), (8) ORDER BY 1 sorted.
+        if (stmt instanceof SelectStmt) {
+            SelectStmt sel = (SelectStmt) stmt;
+            List<SelectStmt.OrderByItem> orderBy = sel.orderBy();
+            Expression limit = sel.limit();
+            Expression offset = sel.offset();
+            boolean changed = false;
+            if (parser.matchKeywords("ORDER", "BY")) { orderBy = parser.parseOrderByList(); changed = true; }
+            if (parser.matchKeyword("LIMIT")) {
+                limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parsePrimary();
+                changed = true;
+            }
+            if (parser.matchKeyword("OFFSET")) { offset = parser.parsePrimary(); changed = true; }
+            if (changed) {
+                return new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
+                        sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), orderBy, limit,
+                        offset, sel.withClauses(), sel.groupingSets(), sel.lockClause(),
+                        sel.withTies()).asValuesList();
+            }
+        }
+        return stmt;
     }
 
     /**
@@ -606,7 +744,12 @@ class SelectParser {
      * Parses the WITH clause first, then dispatches to the correct DML parser.
      */
     /**
-     * Consume optional SEARCH and CYCLE clauses after a WITH clause and attach to last CTE.
+     * Read the SEARCH and CYCLE clauses that follow one WITH item and attach them to it.
+     *
+     * <p>PostgreSQL's grammar allows at most one of each, in that order, so anything left over —
+     * a second SEARCH, a second CYCLE, or a SEARCH written after the CYCLE — is a syntax error at
+     * the word that starts it, not another clause to read. Saying so here is what stops a second
+     * pass over the same words from rebuilding the item with one of the two clauses dropped.
      */
     private void consumeSearchCycleClauses(List<SelectStmt.CommonTableExpr> ctes) {
         String searchCol = null;
@@ -628,37 +771,130 @@ class SelectParser {
         String cycleCol = null;
         String cyclePathCol = null;
         List<String> cycleByColumns = null;
+        Expression cycleMarkValue = null;
+        Expression cycleMarkDefault = null;
         if (parser.checkKeyword("CYCLE")) {
             parser.advance(); // CYCLE
             cycleByColumns = parser.parseIdentifierList();
             parser.expectKeyword("SET");
             cycleCol = parser.readIdentifier();
             if (parser.matchKeyword("TO")) {
-                parser.parseExpression();
-                parser.expectKeyword("DEFAULT");
-                parser.parseExpression();
+                cycleMarkValue = parseCycleMarkConstant();
+                requireKeywordHere("DEFAULT", true);
+                cycleMarkDefault = parseCycleMarkConstant();
+                requireKeywordHere("USING", false);
             }
             parser.expectKeyword("USING");
             cyclePathCol = parser.readIdentifier();
         }
+        if (parser.checkKeyword("SEARCH") || parser.checkKeyword("CYCLE")) {
+            throw new ParseException("syntax error at or near \""
+                    + parser.peek().value() + "\"", parser.peek());
+        }
         if ((searchCol != null || cycleCol != null) && !ctes.isEmpty()) {
             int last = ctes.size() - 1;
             SelectStmt.CommonTableExpr origCte = ctes.get(last);
-            if (!origCte.recursive()) {
+            // Declaring RECURSIVE does not make an item recursive; naming itself does. SEARCH and
+            // CYCLE order and cut a recursion, so an item that never recurses cannot carry them —
+            // and the item need not be the one the query goes on to read for PG to say so.
+            if (!origCte.recursive() || !RecursiveCteCheck.selfReferencing(origCte)) {
                 throw new com.memgres.engine.MemgresException(
-                    "WITH query \"" + origCte.name() + "\" is not recursive", "42601");
+                    "WITH query is not recursive", "42601");
+            }
+            // Every column SEARCH and CYCLE add stands beside the others in the item's column
+            // list, so two of them under one name leave the query no way to say which it meant.
+            if (searchCol != null && cycleCol != null && searchCol.equals(cycleCol)) {
+                throw new com.memgres.engine.MemgresException(
+                    "search sequence column name and cycle mark column name are the same", "42601");
+            }
+            if (searchCol != null && cyclePathCol != null && searchCol.equals(cyclePathCol)) {
+                throw new com.memgres.engine.MemgresException(
+                    "search sequence column name and cycle path column name are the same", "42601");
+            }
+            if (cycleCol != null && cyclePathCol != null && cycleCol.equals(cyclePathCol)) {
+                throw new com.memgres.engine.MemgresException(
+                    "cycle mark column name and cycle path column name are the same", "42601");
             }
             ctes.set(last, new SelectStmt.CommonTableExpr(origCte.name(), origCte.columnNames(),
-                    origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns, cycleCol, cyclePathCol, cycleByColumns));
+                    origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns,
+                    cycleCol, cyclePathCol, cycleByColumns, cycleMarkValue, cycleMarkDefault));
         }
+    }
+
+    /**
+     * The value a CYCLE clause may mark a row with: a constant, and nothing else.
+     *
+     * <p>PostgreSQL's grammar puts an {@code AexprConst} after TO and after DEFAULT, so a sign, an
+     * operator, a cast or a function call is a syntax error at the token that broke the constant —
+     * {@code TO -1} at the minus, {@code TO 1+1} at the plus, {@code TO 'x'::text} at the cast,
+     * {@code TO random()} at the paren that closes an empty argument list. Reading a whole
+     * expression here accepted all four and then evaluated them once, per query rather than per
+     * row, which is not a meaning PostgreSQL gives them.
+     */
+    private Expression parseCycleMarkConstant() {
+        Token t = parser.peek();
+        switch (t.type()) {
+            case INTEGER_LITERAL:
+            case FLOAT_LITERAL:
+            case STRING_LITERAL:
+            case DOLLAR_STRING_LITERAL:
+            case BIT_STRING_LITERAL:
+                return parser.parsePrimary();
+            case KEYWORD:
+                if (t.value().equals("TRUE") || t.value().equals("FALSE")
+                        || t.value().equals("NULL")) {
+                    return parser.parsePrimary();
+                }
+                // A type name followed by a string is a constant too: DATE '2020-01-01'.
+                if (tokenAt(1) != null
+                        && tokenAt(1).type() == TokenType.STRING_LITERAL) {
+                    return parser.parsePrimary();
+                }
+                break;
+            case IDENTIFIER:
+                if (tokenAt(1) != null
+                        && tokenAt(1).type() == TokenType.STRING_LITERAL) {
+                    return parser.parsePrimary();
+                }
+                // funcname '(' args ')' 'string' is the one other constant form, and the
+                // argument list may not be empty; report where PostgreSQL stops reading it.
+                if (tokenAt(1) != null
+                        && tokenAt(1).type() == TokenType.LEFT_PAREN) {
+                    Token stop = tokenAt(2);
+                    if (stop != null && stop.type() == TokenType.RIGHT_PAREN) {
+                        throw new ParseException("syntax error at or near \")\"", stop);
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+        throw new ParseException("syntax error at or near \"" + t.value() + "\"", t);
+    }
+
+    /** The token {@code offset} places ahead of the cursor, or null past the end. */
+    private Token tokenAt(int offset) {
+        int index = parser.pos + offset;
+        return index < parser.tokens.size() ? parser.tokens.get(index) : null;
+    }
+
+    /** The keyword the CYCLE clause has to have next, said the way PostgreSQL says it is missing. */
+    private void requireKeywordHere(String keyword, boolean consume) {
+        if (!parser.checkKeyword(keyword)) {
+            throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                    parser.peek());
+        }
+        if (consume) parser.advance();
     }
 
     Statement parseWithStatement() {
         List<SelectStmt.CommonTableExpr> ctes = parseWithClause();
-        consumeSearchCycleClauses(ctes);
         Token next = parser.peek();
         if (next.type() == TokenType.KEYWORD) {
             switch (next.value()) {
+                // TABLE t is a query wherever a query may stand, so it may be the body a WITH
+                // clause hangs off just as SELECT may.
+                case "TABLE":
                 case "SELECT": {
                     // Re-wrap into SELECT with CTEs
                     Statement body = parseSelectBody();
@@ -748,7 +984,19 @@ class SelectParser {
             parser.expect(TokenType.RIGHT_PAREN);
 
             ctes.add(new SelectStmt.CommonTableExpr(name, columnNames, cteBody, recursive));
+            // SEARCH and CYCLE belong to the item just closed, not to the WITH clause, so they
+            // are read here — before the comma that starts the next item, which is why
+            // "SEARCH ... SET ord, s AS (...)" parses at all.
+            consumeSearchCycleClauses(ctes);
         } while (parser.match(TokenType.COMMA));
+
+        Set<String> seenNames = new HashSet<>();
+        for (SelectStmt.CommonTableExpr cte : ctes) {
+            if (!seenNames.add(cte.name().toLowerCase())) {
+                throw new com.memgres.engine.MemgresException(
+                        "WITH query name \"" + cte.name() + "\" specified more than once", "42712");
+            }
+        }
 
         return ctes;
     }
@@ -1175,114 +1423,84 @@ class SelectParser {
         return false;
     }
 
-    SelectStmt.FromItem parseFromPrimary() {
-        // ROWS FROM(fn1(...), fn2(...)) [WITH ORDINALITY] AS alias(cols)
-        if (parser.checkKeyword("ROWS") && parser.checkKeywordAt(1, "FROM")) {
-            parser.advance(); // ROWS
-            parser.advance(); // FROM
+    /**
+     * {@code ROWS FROM (f(...) [AS (name type, ...)], g(...)) [WITH ORDINALITY] [AS] alias(cols)}.
+     *
+     * <p>Each function may carry its own column definition list, which is what distinguishes
+     * ROWS FROM from an ordinary function item: the item's alias list renames the columns of all
+     * the functions at once and so cannot describe any one of them. Carried through as a
+     * {@code __rows_from__} function item whose arguments are {@link RowsFromItem}s.
+     */
+    private SelectStmt.FromItem parseRowsFrom() {
+        parser.advance(); // ROWS
+        parser.advance(); // FROM
+        parser.expect(TokenType.LEFT_PAREN);
+        List<Expression> items = new ArrayList<>();
+        do {
+            String name = parser.readIdentifier();
             parser.expect(TokenType.LEFT_PAREN);
-            List<String> funcNames = new ArrayList<>();
-            List<List<Expression>> funcArgsList = new ArrayList<>();
-            do {
-                String fn = parser.readIdentifier();
-                funcNames.add(fn);
-                parser.expect(TokenType.LEFT_PAREN);
-                List<Expression> fnArgs = new ArrayList<>();
-                if (!parser.check(TokenType.RIGHT_PAREN)) {
-                    fnArgs = parser.parseExpressionList();
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
-                funcArgsList.add(fnArgs);
-            } while (parser.match(TokenType.COMMA));
-            parser.expect(TokenType.RIGHT_PAREN);
-            boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
-            String alias = null;
-            if (parser.matchKeyword("AS")) {
-                alias = parser.readIdentifier();
-            } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                    || isKeywordValidAsBareAlias()) {
-                alias = parser.readIdentifier();
+            List<Expression> args = new ArrayList<>();
+            if (!parser.check(TokenType.RIGHT_PAREN)) {
+                args = parser.parseExpressionList();
             }
-            List<String> colAliases = null;
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance();
-                colAliases = new ArrayList<>();
+            parser.expect(TokenType.RIGHT_PAREN);
+            List<String> columnDefs = null;
+            int beforeAs = parser.position();
+            if (parser.matchKeyword("AS") && parser.check(TokenType.LEFT_PAREN)) {
+                parser.advance(); // (
+                columnDefs = new ArrayList<>();
                 while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    colAliases.add(parser.readIdentifier());
+                    String col = parser.readIdentifier();
                     if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
-                        parser.parseTypeName(); // optional type
+                        col = col + " " + parser.parseTypeName();
                     }
+                    columnDefs.add(col);
                     parser.match(TokenType.COMMA);
                 }
                 parser.expect(TokenType.RIGHT_PAREN);
+            } else {
+                parser.resetPosition(beforeAs);
             }
-            // Encode as FunctionFrom with special name "__rows_from__"
-            // args = list of function calls encoded as nested ArrayExpr/FunctionCallExpr
-            List<Expression> rowsFromArgs = new ArrayList<>();
-            for (int i = 0; i < funcNames.size(); i++) {
-                rowsFromArgs.add(new com.memgres.engine.parser.ast.FunctionCallExpr(funcNames.get(i), funcArgsList.get(i), false, false));
+            items.add(new RowsFromItem(new FunctionCallExpr(name, args, false, false), columnDefs));
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
+        String alias = null;
+        if (parser.matchKeyword("AS")) {
+            alias = parser.readIdentifier();
+        } else if (parser.peek().type() == TokenType.IDENTIFIER
+                || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
+                || isKeywordValidAsBareAlias()) {
+            alias = parser.readIdentifier();
+        }
+        List<String> colAliases = null;
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance();
+            colAliases = new ArrayList<>();
+            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                colAliases.add(parser.readIdentifier());
+                if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
+                    parser.parseTypeName(); // optional type
+                }
+                parser.match(TokenType.COMMA);
             }
-            List<String> finalColAliases = colAliases;
-            if (withOrdinality && finalColAliases == null) {
-                finalColAliases = new ArrayList<>();
-                finalColAliases.add("ordinality");
-            }
-            return new SelectStmt.FunctionFrom("__rows_from__", rowsFromArgs, alias, finalColAliases);
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
+        return new SelectStmt.FunctionFrom("__rows_from__", items, alias, colAliases, withOrdinality);
+    }
+
+    SelectStmt.FromItem parseFromPrimary() {
+        // ROWS FROM(fn1(...) [AS (coldef)], ...) [WITH ORDINALITY] [AS] alias(cols)
+        if (parser.checkKeyword("ROWS") && parser.checkKeywordAt(1, "FROM")) {
+            return parseRowsFrom();
         }
 
         // LATERAL subquery
         boolean lateral = parser.matchKeyword("LATERAL");
 
-        // [LATERAL] ROWS FROM(fn1(...), fn2(...)) [WITH ORDINALITY] AS alias(cols)
+        // [LATERAL] ROWS FROM(...) — same item, reached after the LATERAL keyword
         if (parser.checkKeyword("ROWS") && parser.checkKeywordAt(1, "FROM")) {
-            parser.advance(); // ROWS
-            parser.advance(); // FROM
-            parser.expect(TokenType.LEFT_PAREN);
-            List<String> funcNames = new ArrayList<>();
-            List<List<Expression>> funcArgsList = new ArrayList<>();
-            do {
-                String fn = parser.readIdentifier();
-                funcNames.add(fn);
-                parser.expect(TokenType.LEFT_PAREN);
-                List<Expression> fnArgs = new ArrayList<>();
-                if (!parser.check(TokenType.RIGHT_PAREN)) {
-                    fnArgs = parser.parseExpressionList();
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
-                funcArgsList.add(fnArgs);
-            } while (parser.match(TokenType.COMMA));
-            parser.expect(TokenType.RIGHT_PAREN);
-            boolean withOrdinality = parser.matchKeywords("WITH", "ORDINALITY");
-            String alias = null;
-            if (parser.matchKeyword("AS")) {
-                alias = parser.readIdentifier();
-            } else if (parser.peek().type() == TokenType.IDENTIFIER || parser.peek().type() == TokenType.QUOTED_IDENTIFIER
-                    || isKeywordValidAsBareAlias()) {
-                alias = parser.readIdentifier();
-            }
-            List<String> colAliases = null;
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance();
-                colAliases = new ArrayList<>();
-                while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    colAliases.add(parser.readIdentifier());
-                    if (!parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
-                        parser.parseTypeName(); // optional type
-                    }
-                    parser.match(TokenType.COMMA);
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
-            }
-            List<Expression> rowsFromArgs = new ArrayList<>();
-            for (int i = 0; i < funcNames.size(); i++) {
-                rowsFromArgs.add(new com.memgres.engine.parser.ast.FunctionCallExpr(funcNames.get(i), funcArgsList.get(i), false, false));
-            }
-            List<String> finalColAliases = colAliases;
-            if (withOrdinality && finalColAliases == null) {
-                finalColAliases = new ArrayList<>();
-                finalColAliases.add("ordinality");
-            }
-            return new SelectStmt.FunctionFrom("__rows_from__", rowsFromArgs, alias, finalColAliases);
+            return parseRowsFrom();
         }
 
         // Subquery: [LATERAL] (SELECT|VALUES ...) [AS] alias [(col1, col2, ...)]
@@ -1520,15 +1738,19 @@ class SelectParser {
         // PostgreSQL allows this syntax (e.g., CROSS JOIN global_flags gf AS f(flag_key, enabled))
         if (alias != null && parser.matchKeyword("AS")) {
             alias = parser.readIdentifier();
-            // Consume optional column alias list
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance();
-                while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
-                    parser.readIdentifier();
-                    parser.match(TokenType.COMMA);
-                }
-                parser.expect(TokenType.RIGHT_PAREN);
+        }
+        // An alias may rename the relation's columns as well as the relation: t AS z(m) calls
+        // the first column m. The list renames as far as it reaches, so a shorter one leaves
+        // the columns past it under the names the relation gave them.
+        List<String> columnAliases = null;
+        if (alias != null && parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance();
+            columnAliases = new ArrayList<>();
+            while (!parser.check(TokenType.RIGHT_PAREN) && !parser.isAtEnd()) {
+                columnAliases.add(parser.readIdentifier());
+                parser.match(TokenType.COMMA);
             }
+            parser.expect(TokenType.RIGHT_PAREN);
         }
 
         // TABLESAMPLE method (percentage) [REPEATABLE (seed)]
@@ -1578,7 +1800,7 @@ class SelectParser {
                 tsArgs, finalAlias2, null);
         }
 
-        return new SelectStmt.TableRef(schema, tableName, alias, only);
+        return new SelectStmt.TableRef(schema, tableName, alias, only, columnAliases);
     }
 
     SelectStmt.JoinType tryParseJoinType() {

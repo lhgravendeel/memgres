@@ -389,6 +389,9 @@ class SelectAggregateEvaluator {
             }
             // Resolve GROUP BY ordinals and aliases
             List<Expression> resolvedGroupBy = resolveGroupByRefs(stmt.groupBy(), stmt, baseBindings);
+            // A set-returning key expands the rows before they are grouped, so the grouping
+            // itself only ever compares single values.
+            contexts = select.expandContextsForSrfs(resolvedGroupBy, contexts);
             // A plain GROUP BY has one grouping set, the one it names, and GROUPING() answers
             // for it as readily as for a set of GROUPING SETS: every listed expression is
             // grouped, so the answer is 0 and anything else is an error.
@@ -620,6 +623,11 @@ class SelectAggregateEvaluator {
                     }
                 }
                 return executor.functionEvaluator.evalFunction(new FunctionCallExpr(fn.name(), resolvedArgs, fn.distinct(), fn.star()), representative);
+            }
+            // A set-returning key was expanded into one row per element before the grouping ran,
+            // so this call already has its element; computing it again would answer the whole set.
+            if (representative != null && representative.hasBoundValue(fn)) {
+                return representative.getBoundValue(fn);
             }
             return executor.functionEvaluator.evalFunction(fn, representative);
         } else if (expr instanceof BinaryExpr) {

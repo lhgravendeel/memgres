@@ -24,12 +24,104 @@ class SelectCteExecutor {
      */
     SelectStmt.CommonTableExpr lookupCte(String name) {
         String lcName = name.toLowerCase();
-        if (executor.executingCtes.contains(lcName)) return null;
         for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
-            SelectStmt.CommonTableExpr cte = scope.get(lcName);
-            if (cte != null) return cte;
+            // A scope may hold a name mapped to null: that is a WITH item deliberately hidden
+            // from the body being run (see maskFor), and it must stop the search rather than let
+            // an enclosing scope answer, so that the name falls through to a stored relation.
+            if (!scope.containsKey(lcName)) continue;
+            SelectStmt.CommonTableExpr found = scope.get(lcName);
+            // The lexer has already folded an unquoted name to lower case and left a quoted one
+            // as written, so what is left to decide is whether the two spellings are the same
+            // name: WITH "X" declares X, and a later plain x is a different name entirely.
+            if (found != null && !found.name().equals(name)) return null;
+            // An item still being computed cannot answer for itself; inside a recursive term the
+            // rows of the previous round stand in its place, and elsewhere the name is not there.
+            if (found != null && executor.executingCteNodes.contains(found)) return null;
+            return found;
         }
         return null;
+    }
+
+    /**
+     * True when the name belongs to a WITH item somewhere in scope, whether or not that item can
+     * be read from here — enough to say that the name is not a stored relation.
+     */
+    boolean namesWithItem(String name) {
+        if (name == null) return false;
+        String lcName = name.toLowerCase();
+        for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
+            if (scope.get(lcName) != null) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Says why a name that is a WITH item did not resolve to one, when that is the reason.
+     *
+     * <p>A plain WITH item cannot see itself or anything written after it, so the name it wrote is
+     * a relation name here and the failure is "relation does not exist". PostgreSQL adds the two
+     * lines that turn that into an answerable complaint: which WITH item it was, and that
+     * RECURSIVE or a re-ordering is the way out.
+     */
+    void noteHiddenWithItem(MemgresException ex, String name) {
+        if (name == null) return;
+        String lcName = name.toLowerCase();
+        for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
+            if (!scope.containsKey(lcName)) continue;
+            if (scope.get(lcName) != null) return; // visible here, so this is not the reason
+            ex.setDetail("There is a WITH item named \"" + name
+                    + "\", but it cannot be referenced from this part of the query.");
+            ex.setHint("Use WITH RECURSIVE, or re-order the WITH items to remove forward "
+                    + "references.");
+            return;
+        }
+    }
+
+    /**
+     * The names a plain (non-RECURSIVE) WITH item may not see, mapped to null so they mask the
+     * scope the query itself pushed.
+     *
+     * <p>{@code WITH x AS (SELECT n FROM y), y AS (...)} is not a forward reference in PostgreSQL
+     * — it is an error, because a WITH item without RECURSIVE sees only the items written before
+     * it, and its own name is not among them either. If a stored relation happens to carry the
+     * name, that relation is what the body reads. Both follow from hiding the item and every
+     * later sibling for the duration of its body.
+     */
+    private Map<String, SelectStmt.CommonTableExpr> maskFor(SelectStmt.CommonTableExpr cte) {
+        if (cte.recursive()) return null;
+        for (Map<String, SelectStmt.CommonTableExpr> scope : executor.cteStack) {
+            int position = -1;
+            int i = 0;
+            for (SelectStmt.CommonTableExpr sibling : scope.values()) {
+                if (sibling == cte) { position = i; break; }
+                i++;
+            }
+            if (position < 0) continue;
+            Map<String, SelectStmt.CommonTableExpr> mask = new LinkedHashMap<>();
+            int j = 0;
+            for (String siblingName : scope.keySet()) {
+                if (j++ >= position) mask.put(siblingName, null);
+            }
+            return mask.isEmpty() ? null : mask;
+        }
+        return null;
+    }
+
+    /**
+     * The shape every recursive WITH item has to have, checked whether or not it is read.
+     *
+     * <p>PostgreSQL checks a WITH RECURSIVE item when it analyses the statement, so an item that
+     * does not have the form non-recursive-term UNION recursive-term is refused even where the
+     * query goes on to select a constant and never names it. Running the checks only from the
+     * item's own execution let an unread item say nothing at all.
+     */
+    void validateRecursiveItems(List<SelectStmt.CommonTableExpr> ctes) {
+        if (ctes == null) return;
+        for (SelectStmt.CommonTableExpr cte : ctes) {
+            if (cte.recursive() && RecursiveCteCheck.selfReferencing(cte)) {
+                RecursiveCteCheck.validate(select, cte);
+            }
+        }
     }
 
     /**
@@ -40,34 +132,53 @@ class SelectCteExecutor {
         QueryResult cached = executor.cteResultCache.get(cacheKey);
         if (cached != null) return cached;
 
-        if (cte.recursive()) {
+        if (cte.recursive()) detectMutualRecursionCycle(cte, cacheKey);
+
+        // Declaring RECURSIVE does not make a WITH item recursive; naming itself does. One that
+        // never names itself is an ordinary query, and running it through the fixed-point loop
+        // would repeat its rows, so it takes the plain path — and SEARCH or CYCLE, which order
+        // and cut a recursion that is not there, is refused the way PG refuses it.
+        if (cte.recursive() && RecursiveCteCheck.selfReferencing(cte)) {
             QueryResult result = executeRecursiveCte(cte);
             executor.cteResultCache.put(cacheKey, result);
             return result;
         }
+        if (cte.searchColumn() != null || cte.cycleColumn() != null) {
+            throw new MemgresException("WITH query is not recursive", "42601");
+        }
 
-        if (executor.executingCtes.contains(cacheKey)) {
+        // Re-entering this same item, not merely one of its name: a nested WITH clause may
+        // declare the name again, and that inner item is a different query.
+        if (executor.executingCteNodes.contains(cte)) {
             throw new MemgresException(
                     "recursive reference to query \"" + cte.name() + "\" must not appear within a non-recursive term", "42P19");
         }
         executor.executingCtes.add(cacheKey);
+        executor.executingCteNodes.add(cte);
 
         QueryResult result;
+        Map<String, SelectStmt.CommonTableExpr> mask = maskFor(cte);
+        if (mask != null) executor.cteStack.push(mask);
         try {
             result = executor.executeStatement(cte.query());
         } finally {
+            if (mask != null) executor.cteStack.pop();
             executor.executingCtes.remove(cacheKey);
+            executor.executingCteNodes.remove(cte);
         }
 
+        // A WITH item's alias list renames as far as it reaches. Naming more columns than the
+        // query has is an error; naming fewer is not — the columns past the list keep the names
+        // the query gave them, the same way a subquery alias list does.
         if (cte.columnNames() != null && !cte.columnNames().isEmpty()) {
-            if (cte.columnNames().size() != result.getColumns().size()) {
-                throw new MemgresException("table \"" + cte.name() + "\" has " + result.getColumns().size()
+            if (cte.columnNames().size() > result.getColumns().size()) {
+                throw new MemgresException("WITH query \"" + cte.name() + "\" has " + result.getColumns().size()
                         + " columns available but " + cte.columnNames().size() + " columns specified", "42P10");
             }
             List<Column> renamedCols = new ArrayList<>();
             for (int i = 0; i < result.getColumns().size(); i++) {
-                String newName = cte.columnNames().get(i);
                 Column orig = result.getColumns().get(i);
+                String newName = i < cte.columnNames().size() ? cte.columnNames().get(i) : orig.getName();
                 renamedCols.add(new Column(newName, orig.getType(), orig.isNullable(), orig.isPrimaryKey(), orig.getDefaultValue()));
             }
             result = QueryResult.select(renamedCols, result.getRows());
@@ -81,15 +192,17 @@ class SelectCteExecutor {
      * Execute a recursive CTE using iterative fixed-point evaluation.
      */
     private QueryResult executeRecursiveCte(SelectStmt.CommonTableExpr cte) {
-        if (!(cte.query() instanceof SetOpStmt)) {
-            return executeCte(new SelectStmt.CommonTableExpr(cte.name(), cte.columnNames(), cte.query(), false));
-        }
+        RecursiveCteCheck.validate(select, cte);
         SetOpStmt setOp = (SetOpStmt) cte.query();
 
         QueryResult baseResult = executor.executeStatement(setOp.left());
         List<Column> columns = baseResult.getColumns();
 
         if (cte.columnNames() != null && !cte.columnNames().isEmpty()) {
+            if (cte.columnNames().size() > columns.size()) {
+                throw new MemgresException("WITH query \"" + cte.name() + "\" has " + columns.size()
+                        + " columns available but " + cte.columnNames().size() + " columns specified", "42P10");
+            }
             List<Column> renamedCols = new ArrayList<>();
             for (int i = 0; i < columns.size(); i++) {
                 String newName = i < cte.columnNames().size() ? cte.columnNames().get(i) :
@@ -99,18 +212,33 @@ class SelectCteExecutor {
             }
             columns = renamedCols;
         }
+        checkSearchAndCycleColumns(cte, columns);
 
         List<Object[]> allRows = new ArrayList<>(baseResult.getRows());
         List<Object[]> workingSet = new ArrayList<>(baseResult.getRows());
         boolean isUnionAll = setOp.all();
         Set<String> seenKeys = new HashSet<>();
-        if (!isUnionAll) {
-            for (Object[] row : allRows) seenKeys.add(Arrays.deepToString(row));
-        }
 
         boolean hasSearch = cte.searchColumn() != null;
         boolean depthFirstSearch = hasSearch && cte.searchDepthFirst();
         boolean hasCycle = cte.cycleColumn() != null;
+
+        // CYCLE ... SET c [TO v DEFAULT d]: the mark a row carries is v when its cycle columns
+        // already appear in its own path and d otherwise, and the recursion stops at any row
+        // marked v. Both default to the booleans, and writing the two the same way is what makes
+        // the seed itself count as cycled and the query answer with the seed alone.
+        Object markTrue = Boolean.TRUE;
+        Object markFalse = Boolean.FALSE;
+        DataType markType = DataType.BOOLEAN;
+        if (hasCycle && cte.cycleMarkValue() != null) {
+            markTrue = executor.exprEvaluator.evalExpr(cte.cycleMarkValue(), null);
+            markFalse = executor.exprEvaluator.evalExpr(cte.cycleMarkDefault(), null);
+            markType = resolveMarkType(cte.cycleMarkValue(), markTrue,
+                    cte.cycleMarkDefault(), markFalse);
+            markTrue = coerceMark(markTrue, markType);
+            markFalse = coerceMark(markFalse, markType);
+        }
+        boolean markedFromTheStart = hasCycle && java.util.Objects.equals(markTrue, markFalse);
 
         // Resolve SEARCH BY column indices
         int[] searchByIndices = null;
@@ -165,7 +293,13 @@ class SelectCteExecutor {
                 List<Object> path = new ArrayList<>();
                 path.add(extractSearchKey(row, cycleByIndices));
                 cyclePaths.add(path);
-                isCycleFlags.add(false);
+                isCycleFlags.add(markedFromTheStart);
+            }
+        }
+        if (!isUnionAll) {
+            for (int i = 0; i < allRows.size(); i++) {
+                seenKeys.add(dedupKey(allRows.get(i), hasCycle ? cyclePaths.get(i) : null,
+                        hasCycle && markedFromTheStart));
             }
         }
 
@@ -173,8 +307,8 @@ class SelectCteExecutor {
         List<List<Object>> workingSetCyclePaths = hasCycle ? new ArrayList<>(cyclePaths) : null;
 
         String cteLower = cte.name().toLowerCase();
-        detectMutualRecursionCycle(cte, cteLower);
         executor.executingCtes.add(cteLower);
+        executor.executingCteNodes.add(cte);
         // Stopping the loop early would return a shorter result than the query defines, with
         // nothing to say so; both caps report instead.
         int maxIterations = 10000000;
@@ -221,62 +355,55 @@ class SelectCteExecutor {
                         QueryResult iterResult = executor.executeStatement(setOp.right());
 
                         if (iter == 0 && pi == 0) {
-                            validateIterationResult(iterResult, columns, setOp.right());
+                            validateIterationResult(iterResult, columns, cte.name(), setOp);
                         }
 
                         List<Object> parentCyclePath = (hasCycle && workingSetCyclePaths != null)
                                 ? workingSetCyclePaths.get(pi) : null;
 
                         for (Object[] row : iterResult.getRows()) {
-                            if (isUnionAll || seenKeys.add(Arrays.deepToString(row))) {
-                                boolean childIsCycle = false;
-                                if (hasCycle && parentCyclePath != null) {
-                                    Object childKey = extractSearchKey(row, cycleByIndices);
-                                    for (Object ancestorKey : parentCyclePath) {
-                                        if (java.util.Objects.equals(ancestorKey, childKey)) {
-                                            childIsCycle = true;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // Always emit the row (PG emits cycle rows with is_cycle=true)
-                                allRows.add(row);
-
-                                if (hasCycle) {
-                                    isCycleFlags.add(childIsCycle);
-                                }
-
-                                // Add search path for all rows (needed for ordcol indexing)
-                                if (hasSearch) {
-                                    List<Object> parentSearchPath = workingSetSearchPaths.get(pi);
-                                    List<Object> childSearchPath = new ArrayList<>(parentSearchPath);
-                                    childSearchPath.add(extractSearchKey(row, searchByIndices));
-                                    ordcolPaths.add(childSearchPath);
-                                    if (!childIsCycle) {
-                                        newSearchPaths.add(childSearchPath);
-                                    }
-                                }
-
-                                // Add cycle path for all rows (needed for is_cycle/path indexing)
-                                if (hasCycle) {
-                                    List<Object> childCyclePath = new ArrayList<>(parentCyclePath);
-                                    Object childKey = extractSearchKey(row, cycleByIndices);
-                                    childCyclePath.add(childKey);
-                                    cyclePaths.add(childCyclePath);
-                                    if (!childIsCycle) {
-                                        newCyclePaths.add(childCyclePath);
-                                    }
-                                }
-
-                                if (childIsCycle) {
-                                    // Don't recurse from cycle rows — but the row IS emitted
-                                    continue;
-                                }
-
-                                // Non-cycle row: add to working set for further recursion
-                                newRows.add(row);
+                            List<Object> childCyclePath = hasCycle
+                                    ? extendCyclePath(parentCyclePath, row, cycleByIndices) : null;
+                            boolean childIsCycle = markedFromTheStart
+                                    || (hasCycle && closesCycle(parentCyclePath, row, cycleByIndices));
+                            if (!isUnionAll
+                                    && !seenKeys.add(dedupKey(row, childCyclePath, childIsCycle))) {
+                                continue;
                             }
+
+                            // Always emit the row (PG emits cycle rows with is_cycle=true)
+                            allRows.add(row);
+
+                            if (hasCycle) {
+                                isCycleFlags.add(childIsCycle);
+                            }
+
+                            // Add search path for all rows (needed for ordcol indexing)
+                            if (hasSearch) {
+                                List<Object> parentSearchPath = workingSetSearchPaths.get(pi);
+                                List<Object> childSearchPath = new ArrayList<>(parentSearchPath);
+                                childSearchPath.add(extractSearchKey(row, searchByIndices));
+                                ordcolPaths.add(childSearchPath);
+                                if (!childIsCycle) {
+                                    newSearchPaths.add(childSearchPath);
+                                }
+                            }
+
+                            // Add cycle path for all rows (needed for is_cycle/path indexing)
+                            if (hasCycle) {
+                                cyclePaths.add(childCyclePath);
+                                if (!childIsCycle) {
+                                    newCyclePaths.add(childCyclePath);
+                                }
+                            }
+
+                            if (childIsCycle) {
+                                // Don't recurse from cycle rows — but the row IS emitted
+                                continue;
+                            }
+
+                            // Non-cycle row: add to working set for further recursion
+                            newRows.add(row);
                         }
                     } finally {
                         targetSchema.removeTable(cteName);
@@ -293,6 +420,7 @@ class SelectCteExecutor {
                 if (hasCycle) {
                     nonCycleWorkingSet = new ArrayList<>();
                     List<List<Object>> nonCyclePaths = new ArrayList<>();
+                    List<List<Object>> nonCycleSearchPaths = hasSearch ? new ArrayList<>() : null;
                     int wsOffset = allRows.size() - workingSet.size();
                     for (int wi = 0; wi < workingSet.size(); wi++) {
                         int globalIdx = wsOffset + wi;
@@ -303,8 +431,12 @@ class SelectCteExecutor {
                         if (workingSetCyclePaths != null && wi < workingSetCyclePaths.size()) {
                             nonCyclePaths.add(workingSetCyclePaths.get(wi));
                         }
+                        if (hasSearch && workingSetSearchPaths != null && wi < workingSetSearchPaths.size()) {
+                            nonCycleSearchPaths.add(workingSetSearchPaths.get(wi));
+                        }
                     }
                     workingSetCyclePaths = nonCyclePaths;
+                    if (hasSearch) workingSetSearchPaths = nonCycleSearchPaths;
                 }
 
                 if (nonCycleWorkingSet.isEmpty()) {
@@ -316,11 +448,14 @@ class SelectCteExecutor {
                 // to properly track cycle paths per ancestry chain
                 List<Object[]> newRows = new ArrayList<>();
                 List<List<Object>> newCyclePaths = hasCycle ? new ArrayList<>() : null;
+                List<List<Object>> newSearchPaths = hasSearch ? new ArrayList<>() : null;
 
                 for (int pi = 0; pi < nonCycleWorkingSet.size(); pi++) {
                     Object[] parentRow = nonCycleWorkingSet.get(pi);
                     List<Object> parentCyclePath = (hasCycle && workingSetCyclePaths != null && pi < workingSetCyclePaths.size())
                             ? workingSetCyclePaths.get(pi) : null;
+                    List<Object> parentSearchPath = (hasSearch && workingSetSearchPaths != null && pi < workingSetSearchPaths.size())
+                            ? workingSetSearchPaths.get(pi) : null;
 
                     Table singleRowTable = new Table(cteName, columns);
                     singleRowTable.insertRow(parentRow);
@@ -330,55 +465,52 @@ class SelectCteExecutor {
                         QueryResult iterResult = executor.executeStatement(setOp.right());
 
                         if (iter == 0 && pi == 0) {
-                            validateIterationResult(iterResult, columns, setOp.right());
+                            validateIterationResult(iterResult, columns, cte.name(), setOp);
                         }
 
                         for (Object[] row : iterResult.getRows()) {
-                            if (isUnionAll || seenKeys.add(Arrays.deepToString(row))) {
-                                boolean childIsCycle = false;
-                                if (hasCycle && parentCyclePath != null) {
-                                    Object childKey = extractSearchKey(row, cycleByIndices);
-                                    for (Object ancestorKey : parentCyclePath) {
-                                        if (java.util.Objects.equals(ancestorKey, childKey)) {
-                                            childIsCycle = true;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                // Always emit the row (PG emits cycle rows with is_cycle=true)
-                                allRows.add(row);
-
-                                if (hasCycle) {
-                                    isCycleFlags.add(childIsCycle);
-                                }
-
-                                // Add search path for all rows (needed for ordcol indexing)
-                                if (hasSearch) {
-                                    List<Object> searchPath = new ArrayList<>();
-                                    searchPath.add(extractSearchKey(row, searchByIndices));
-                                    ordcolPaths.add(searchPath);
-                                }
-
-                                // Add cycle path for all rows
-                                if (hasCycle) {
-                                    List<Object> childCyclePath = parentCyclePath != null
-                                            ? new ArrayList<>(parentCyclePath) : new ArrayList<>();
-                                    Object childKey = extractSearchKey(row, cycleByIndices);
-                                    childCyclePath.add(childKey);
-                                    cyclePaths.add(childCyclePath);
-                                    if (!childIsCycle) {
-                                        newCyclePaths.add(childCyclePath);
-                                    }
-                                }
-
-                                if (childIsCycle) {
-                                    // Don't recurse from cycle rows
-                                    continue;
-                                }
-
-                                newRows.add(row);
+                            List<Object> childCyclePath = hasCycle
+                                    ? extendCyclePath(parentCyclePath, row, cycleByIndices) : null;
+                            boolean childIsCycle = markedFromTheStart
+                                    || (hasCycle && closesCycle(parentCyclePath, row, cycleByIndices));
+                            if (!isUnionAll
+                                    && !seenKeys.add(dedupKey(row, childCyclePath, childIsCycle))) {
+                                continue;
                             }
+
+                            // Always emit the row (PG emits cycle rows with is_cycle=true)
+                            allRows.add(row);
+
+                            if (hasCycle) {
+                                isCycleFlags.add(childIsCycle);
+                            }
+
+                            // The breadth-first ordering column leads with how deep the row
+                            // is, so the path from the root has to be carried forward here
+                            // too — starting a fresh one-element path would make every row
+                            // depth 0 and leave ORDER BY ord sorting by the search key alone.
+                            if (hasSearch) {
+                                List<Object> childSearchPath = parentSearchPath != null
+                                        ? new ArrayList<>(parentSearchPath) : new ArrayList<>();
+                                childSearchPath.add(extractSearchKey(row, searchByIndices));
+                                ordcolPaths.add(childSearchPath);
+                                if (!childIsCycle) newSearchPaths.add(childSearchPath);
+                            }
+
+                            // Add cycle path for all rows
+                            if (hasCycle) {
+                                cyclePaths.add(childCyclePath);
+                                if (!childIsCycle) {
+                                    newCyclePaths.add(childCyclePath);
+                                }
+                            }
+
+                            if (childIsCycle) {
+                                // Don't recurse from cycle rows
+                                continue;
+                            }
+
+                            newRows.add(row);
                         }
                     } finally {
                         targetSchema.removeTable(cteName);
@@ -404,6 +536,7 @@ class SelectCteExecutor {
 
                 workingSet = newRows;
                 workingSetCyclePaths = newCyclePaths;
+                workingSetSearchPaths = newSearchPaths;
             }
         }
 
@@ -411,16 +544,20 @@ class SelectCteExecutor {
             throw e;
         } finally {
             executor.executingCtes.remove(cteLower);
+            executor.executingCteNodes.remove(cte);
         }
 
-        // Add SEARCH ordering column if declared
-        // PG stores the ord column as type record:
-        //   BFS: (depth bigint, search_key1, search_key2, ...)
-        //   DFS: (search_key1, search_key2, ...)
+        // Add SEARCH ordering column if declared.
+        // PG's ordering column is
+        //   BFS: one record (depth bigint, search_key1, search_key2, ...)
+        //   DFS: an array of such records, one per step of the path from the root
         if (hasSearch) {
             String scol = cte.searchColumn();
             List<Column> extCols = new ArrayList<>(columns);
-            extCols.add(new Column(scol, DataType.RECORD, true, false, null));
+            extCols.add(depthFirstSearch
+                    ? new Column(scol, DataType.RECORD_ARRAY, true, false, null,
+                            null, null, null, null, null, null, DataType.RECORD)
+                    : new Column(scol, DataType.RECORD, true, false, null));
             if (depthFirstSearch && ordcolPaths != null) {
                 // For DFS: sort rows by their search path (element-wise) and assign ordcol
                 Integer[] indices = new Integer[allRows.size()];
@@ -433,8 +570,11 @@ class SelectCteExecutor {
                     int origIdx = indices[rank];
                     Object[] orig = allRows.get(origIdx);
                     Object[] ext = Arrays.copyOf(orig, orig.length + 1);
-                    // DFS record: (search_key_path_elements...)
-                    ext[orig.length] = new AstExecutor.PgRow(ordcolPaths.get(origIdx));
+                    // DFS: one record per step, the whole path as an array. Kept as the records
+                    // themselves rather than their text, so that the column is a record[] to
+                    // whatever reads it — a cast of it says so instead of failing to parse the
+                    // rendering — and the array rendering follows from the value.
+                    ext[orig.length] = recordPath(ordcolPaths.get(origIdx));
                     sortedExt[origIdx] = ext;
                 }
                 for (Object[] ext : sortedExt) extRows.add(ext);
@@ -454,11 +594,16 @@ class SelectCteExecutor {
                     long depth = pathElements.size() - 1;
                     List<Object> recordValues = new ArrayList<>();
                     recordValues.add(depth);
-                    // Add the last search key (current row's search value)
+                    // Add the row's own search values, one field each: SEARCH BREADTH FIRST BY p,c
+                    // orders by depth and then by p and then by c, so the record PostgreSQL
+                    // builds is (depth, p, c). Keeping the two keys together as one field made
+                    // the record (depth, [p, c]) and ordered by the pair's rendering.
                     if (!pathElements.isEmpty()) {
                         Object lastKey = pathElements.get(pathElements.size() - 1);
                         if (lastKey instanceof Object[]) {
                             for (Object k : (Object[]) lastKey) recordValues.add(k);
+                        } else if (lastKey instanceof List) {
+                            recordValues.addAll((List<?>) lastKey);
                         } else {
                             recordValues.add(lastKey);
                         }
@@ -476,8 +621,9 @@ class SelectCteExecutor {
             String ccol = cte.cycleColumn();
             String pathcol = cte.cyclePathColumn() != null ? cte.cyclePathColumn() : "path";
             List<Column> extCols = new ArrayList<>(columns);
-            extCols.add(new Column(ccol, DataType.BOOLEAN, true, false, null));
-            extCols.add(new Column(pathcol, DataType.TEXT, true, false, null));
+            extCols.add(new Column(ccol, markType, true, false, null));
+            extCols.add(new Column(pathcol, DataType.RECORD_ARRAY, true, false, null,
+                    null, null, null, null, null, null, DataType.RECORD));
 
             List<Object[]> extRows = new ArrayList<>();
             for (int i = 0; i < allRows.size(); i++) {
@@ -485,7 +631,7 @@ class SelectCteExecutor {
                 boolean isCycle = i < isCycleFlags.size() ? isCycleFlags.get(i) : false;
                 List<Object> path = i < cyclePaths.size() ? cyclePaths.get(i) : Collections.singletonList(null);
                 Object[] ext = Arrays.copyOf(orig, orig.length + 2);
-                ext[orig.length] = isCycle;
+                ext[orig.length] = isCycle ? markTrue : markFalse;
                 ext[orig.length + 1] = formatRecordArray(path);
                 extRows.add(ext);
             }
@@ -496,13 +642,60 @@ class SelectCteExecutor {
         return QueryResult.select(columns, allRows);
     }
 
+    /**
+     * SEARCH and CYCLE name columns of the WITH query, and add one of their own.
+     *
+     * <p>A name that is not in the query's column list has nothing to order or to compare, so
+     * PostgreSQL refuses it rather than pick a column; and a column the clause <em>adds</em> under
+     * a name the query already uses would leave two columns answering to that name, which is
+     * ambiguous the moment anything selects it.
+     */
+    private void checkSearchAndCycleColumns(SelectStmt.CommonTableExpr cte, List<Column> columns) {
+        if (cte.searchByColumns() != null) {
+            for (String by : cte.searchByColumns()) {
+                if (indexOfColumn(columns, by) < 0) {
+                    throw new MemgresException(
+                            "search column \"" + by + "\" not in WITH query column list", "42601");
+                }
+            }
+        }
+        if (cte.cycleByColumns() != null) {
+            for (String by : cte.cycleByColumns()) {
+                if (indexOfColumn(columns, by) < 0) {
+                    throw new MemgresException(
+                            "cycle column \"" + by + "\" not in WITH query column list", "42601");
+                }
+            }
+        }
+        String[] added = {cte.searchColumn(), cte.cycleColumn(), cte.cyclePathColumn()};
+        for (String name : added) {
+            if (name != null && indexOfColumn(columns, name) >= 0) {
+                throw new MemgresException(
+                        "column reference \"" + name + "\" is ambiguous", "42702");
+            }
+        }
+    }
+
+    private static int indexOfColumn(List<Column> columns, String name) {
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i).getName().equalsIgnoreCase(name)) return i;
+        }
+        return -1;
+    }
+
     /** Validate the first iteration result of a recursive CTE. */
-    private void validateIterationResult(QueryResult iterResult, List<Column> columns, Statement recursiveTerm) {
+    private void validateIterationResult(QueryResult iterResult, List<Column> columns,
+                                         String cteName, SetOpStmt setOp) {
+        Statement recursiveTerm = setOp.right();
         if (!iterResult.getColumns().isEmpty()
                 && iterResult.getColumns().size() != columns.size()) {
             throw new MemgresException(
                     "each UNION query must have the same number of columns", "42601");
         }
+        // The recursive term's column types are what the first iteration computed; that is the
+        // same thing the union would resolve its output type against.
+        RecursiveCteCheck.checkColumnTypes(cteName, columns, setOp.left(), setOp.right(),
+                iterResult.getColumns());
         if (!iterResult.getRows().isEmpty()) {
             Object[] firstRow = iterResult.getRows().get(0);
             for (int ci = 0; ci < Math.min(columns.size(), firstRow.length); ci++) {
@@ -553,14 +746,141 @@ class SelectCteExecutor {
         return Integer.compare(a.size(), b.size());
     }
 
+    /**
+     * A path rendered the way PostgreSQL renders a {@code record[]}: one composite per step, and
+     * a composite quoted inside the array braces when its own text carries a comma.
+     */
+    /** A search path as the array of records PostgreSQL makes of it, one record per step. */
+    static List<Object> recordPath(List<Object> path) {
+        List<Object> records = new ArrayList<Object>(path.size());
+        for (Object step : path) {
+            List<Object> fields = step instanceof List
+                    ? new ArrayList<Object>((List<?>) step) : Collections.singletonList(step);
+            records.add(new AstExecutor.PgRow(fields));
+        }
+        return records;
+    }
+
     static String formatRecordArray(List<Object> path) {
         StringBuilder sb = new StringBuilder("{");
         for (int i = 0; i < path.size(); i++) {
             if (i > 0) sb.append(",");
-            sb.append("(").append(path.get(i)).append(")");
+            Object step = path.get(i);
+            List<Object> fields = step instanceof List
+                    ? new ArrayList<Object>((List<?>) step) : Collections.singletonList(step);
+            String text = new AstExecutor.PgRow(fields).toPgText();
+            if (text.indexOf(',') >= 0 || text.indexOf('"') >= 0 || text.indexOf('\\') >= 0) {
+                sb.append('"').append(text.replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
+            } else {
+                sb.append(text);
+            }
         }
         sb.append("}");
         return sb.toString();
+    }
+
+    /** The declared type of a CYCLE mark column, read off the value the clause set it to. */
+    private static DataType markTypeOf(Object markValue) {
+        if (markValue instanceof Boolean) return DataType.BOOLEAN;
+        if (markValue instanceof Integer) return DataType.INTEGER;
+        if (markValue instanceof Long) return DataType.BIGINT;
+        if (markValue instanceof java.math.BigDecimal) return DataType.NUMERIC;
+        if (markValue instanceof Double || markValue instanceof Float) {
+            return DataType.DOUBLE_PRECISION;
+        }
+        if (markValue instanceof java.time.LocalDate) return DataType.DATE;
+        if (markValue instanceof java.time.LocalDateTime) return DataType.TIMESTAMP;
+        if (markValue instanceof java.time.OffsetDateTime) return DataType.TIMESTAMPTZ;
+        return DataType.TEXT;
+    }
+
+    /**
+     * The one type both of a CYCLE clause's mark values have to have.
+     *
+     * <p>{@code SET c TO v DEFAULT d} declares one column, so PostgreSQL resolves a single type
+     * from the two constants the way a UNION resolves one from its arms: two of the same kind
+     * widen to the wider, and a bare string literal has no type of its own and is read as the
+     * other one's — {@code TO 1 DEFAULT 'x'} is a bad integer rather than an unmatched pair, while
+     * {@code TO true DEFAULT 1} has no common type at all. Taking the type from the first value
+     * alone declared the column integer and then stored the text in it.
+     */
+    private DataType resolveMarkType(Expression trueExpr, Object trueValue,
+                                     Expression falseExpr, Object falseValue) {
+        boolean trueUntyped = isUntypedConstant(trueExpr);
+        boolean falseUntyped = isUntypedConstant(falseExpr);
+        if (trueUntyped && falseUntyped) return DataType.TEXT;
+        if (trueUntyped) return markTypeOf(falseValue);
+        if (falseUntyped) return markTypeOf(trueValue);
+        DataType trueType = markTypeOf(trueValue);
+        DataType falseType = markTypeOf(falseValue);
+        if (trueType == falseType) return trueType;
+        if (TypeCoercion.categoryOf(trueType) != TypeCoercion.categoryOf(falseType)) {
+            throw new MemgresException("CYCLE types " + trueType.toRegtypeDisplay() + " and "
+                    + falseType.toRegtypeDisplay() + " cannot be matched", "42804");
+        }
+        return numericRank(trueType) >= numericRank(falseType) ? trueType : falseType;
+    }
+
+    /** True when a mark value is a string literal, which carries no type until one is wanted. */
+    private static boolean isUntypedConstant(Expression expr) {
+        return expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING;
+    }
+
+    private static int numericRank(DataType type) {
+        switch (type) {
+            case SMALLINT: return 1;
+            case INTEGER: return 2;
+            case BIGINT: return 3;
+            case NUMERIC: return 4;
+            case REAL: return 5;
+            case DOUBLE_PRECISION: return 6;
+            default: return 0;
+        }
+    }
+
+    /** A mark value read as the column's resolved type, or the input error it turned out to be. */
+    private Object coerceMark(Object value, DataType type) {
+        if (value == null || type == DataType.TEXT) return value;
+        try {
+            return executor.castEvaluator.applyCast(value, type.getPgName());
+        } catch (Exception e) {
+            throw new MemgresException("invalid input syntax for type " + type.toRegtypeDisplay()
+                    + ": \"" + value + "\"", "22P02");
+        }
+    }
+
+    /**
+     * What a UNION (not UNION ALL) recursive query compares to decide a row is already there.
+     *
+     * <p>A CYCLE clause adds two columns to the WITH item, and PostgreSQL's UNION removes a
+     * duplicate only when the whole row including them matches. The row that closes a cycle
+     * carries a different mark and a longer path than the one that started it, so it survives the
+     * duplicate removal — dropping it left the query answering as if the cycle were never found.
+     */
+    private static String dedupKey(Object[] row, List<Object> cyclePath, boolean isCycle) {
+        String key = Arrays.deepToString(row);
+        return cyclePath == null ? key : key + "|" + isCycle + "|" + cyclePath;
+    }
+
+    /** The child's ancestry: the parent's cycle keys with the child's own appended. */
+    private static List<Object> extendCyclePath(List<Object> parentPath, Object[] row,
+                                                int[] cycleByIndices) {
+        List<Object> path = parentPath != null
+                ? new ArrayList<Object>(parentPath) : new ArrayList<Object>();
+        path.add(extractSearchKey(row, cycleByIndices));
+        return path;
+    }
+
+    /** True when the row's cycle key already stands somewhere on the path that reached it. */
+    private static boolean closesCycle(List<Object> parentPath, Object[] row,
+                                       int[] cycleByIndices) {
+        if (parentPath == null) return false;
+        Object childKey = extractSearchKey(row, cycleByIndices);
+        for (Object ancestorKey : parentPath) {
+            if (java.util.Objects.equals(ancestorKey, childKey)) return true;
+        }
+        return false;
     }
 
     static Object extractSearchKey(Object[] row, int[] searchByIndices) {
@@ -633,6 +953,7 @@ class SelectCteExecutor {
         for (Deque<Map<String, SelectStmt.CommonTableExpr>> stack = executor.cteStack;
              !stack.isEmpty(); ) {
             for (Map.Entry<String, SelectStmt.CommonTableExpr> entry : stack.peek().entrySet()) {
+                if (entry.getValue() == null) continue; // a masked name, not a WITH item in scope
                 if (!entry.getKey().equals(cteLower) && entry.getValue().recursive()) {
                     siblingMap.put(entry.getKey(), entry.getValue());
                 }

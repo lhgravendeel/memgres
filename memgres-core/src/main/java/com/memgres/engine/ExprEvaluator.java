@@ -67,6 +67,9 @@ class ExprEvaluator {
         if (expr instanceof ColumnRef) return evalColumnRef(((ColumnRef) expr), ctx);
         if (expr instanceof BinaryExpr) {
             rejectUnequalRowArity((BinaryExpr) expr);
+            if (isRowSubqueryComparison((BinaryExpr) expr)) {
+                return evalRowSubqueryComparison((BinaryExpr) expr, ctx);
+            }
             return executor.binaryOpEvaluator.evalBinary(((BinaryExpr) expr), ctx);
         }
         if (expr instanceof UnaryExpr) {
@@ -84,6 +87,7 @@ class ExprEvaluator {
         if (expr instanceof JsonExistsExpr) return evalJsonExists(((JsonExistsExpr) expr), ctx);
         if (expr instanceof JsonValueExpr) return evalJsonValue(((JsonValueExpr) expr), ctx);
         if (expr instanceof JsonQueryExpr) return evalJsonQuery(((JsonQueryExpr) expr), ctx);
+        if (expr instanceof RowElementExpr) return evalRowElement(((RowElementExpr) expr), ctx);
         if (expr instanceof InExpr) return evalIn(((InExpr) expr), ctx);
         if (expr instanceof BetweenExpr) return evalBetween(((BetweenExpr) expr), ctx);
         if (expr instanceof LikeExpr) return evalLike(((LikeExpr) expr), ctx);
@@ -397,6 +401,11 @@ class ExprEvaluator {
     }
 
     private Object evalColumnRef(ColumnRef ref, RowContext ctx) {
+        if (ref.catalog() != null) {
+            rejectOtherCatalog(ref.catalog(),
+                    ref.schema() + "." + ref.table() + "." + ref.column());
+            ref = new ColumnRef(ref.schema(), ref.table(), ref.column());
+        }
         // pg_catalog.current_user etc.; treat as the system function directly
         if ("pg_catalog".equalsIgnoreCase(ref.table()) || "information_schema".equalsIgnoreCase(ref.table())) {
             String col = ref.column().toLowerCase();
@@ -573,9 +582,42 @@ class ExprEvaluator {
             if (savedHint != null) colEx.setHint(savedHint);
             throw colEx;
         } else {
-            // Schema-qualified reference (schema.table.column); CTEs are not schema-qualified,
-            // so a schema prefix means we're looking for a real table, not a CTE binding.
+            // Schema-qualified reference (schema.table.column). PostgreSQL resolves one against
+            // the FROM entry of that name when the entry is the relation the schema names; a CTE,
+            // a subquery alias or a relation from another schema is a FROM entry the schema
+            // prefix does not reach, and is reported as such rather than as a missing one.
             if (ref.schema() != null) {
+                RowContext.TableBinding reached = schemaPrefixReaches(ctx, ref.schema(), ref.table());
+                if (reached == null) {
+                    for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
+                        reached = schemaPrefixReaches(it.next(), ref.schema(), ref.table());
+                        if (reached != null) break;
+                    }
+                }
+                if (reached != null) {
+                    // Two schemas may hold a relation of the same name and both may be in the
+                    // FROM clause, so a reference the schema pins to the second of them is
+                    // answered from that one rather than from whichever the bare name finds first.
+                    // What the bare name reaches, asked without judging it: the name may reach
+                    // two entries and still be perfectly reachable through the schema.
+                    List<RowContext.TableBinding> byName = ctx == null
+                            ? Cols.<RowContext.TableBinding>listOf() : ctx.bindingsNamed(ref.table());
+                    if (byName.size() != 1 || reached != byName.get(0)) {
+                        int idx = reached.table().getColumnIndex(ref.column());
+                        if (idx >= 0) return reached.row()[idx];
+                    }
+                    return evalColumnRef(new ColumnRef(null, ref.table(), ref.column()), ctx);
+                }
+                if (bindingNamed(ctx, ref.table())) {
+                    // The same account PostgreSQL gives for a qualified star that reaches nothing:
+                    // the entry is there, the schema written in front of it is not how it is
+                    // reached. The message said so and the Detail beside it did not follow.
+                    MemgresException ex = new MemgresException(
+                        "invalid reference to FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
+                    ex.setDetail("There is an entry for table \"" + ref.table()
+                            + "\", but it cannot be referenced from this part of the query.");
+                    throw ex;
+                }
                 throw new MemgresException(
                     "missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
             }
@@ -634,6 +676,86 @@ class ExprEvaluator {
             if (aliasHidingError != null) throw aliasHidingError;
             throw new MemgresException("missing FROM-clause entry for table \"" + ref.table() + "\"", "42P01");
         }
+    }
+
+    /** True when {@code ctx} binds anything under {@code name}, whatever kind of thing it is. */
+    private static boolean bindingNamed(RowContext ctx, String name) {
+        return ctx != null && ctx.getBinding(name) != null;
+    }
+
+    /**
+     * A name written with four parts names a catalog, and PostgreSQL reaches only the one it is
+     * connected to: {@code memgrestest.public.t.id} is {@code public.t.id}, and any other catalog
+     * is a cross-database reference it does not implement. The whole name is reported, which is
+     * how PostgreSQL reports it.
+     */
+    void rejectOtherCatalog(String catalog, String rest) {
+        if (catalog == null) return;
+        String current = executor.session != null ? executor.session.getDatabaseName() : null;
+        if (current != null && current.equalsIgnoreCase(catalog)) return;
+        throw new MemgresException("cross-database references are not implemented: "
+                + catalog + "." + rest, "0A000");
+    }
+
+    /**
+     * The one FROM entry among {@code bindings} that {@code schema.table} names, or null. Shared
+     * with the star expansion, which has the bindings in hand rather than a row context.
+     */
+    RowContext.TableBinding schemaPrefixReaches(List<RowContext.TableBinding> bindings,
+                                                String schema, String table) {
+        return schemaPrefixReaches(new RowContext(bindings), schema, table);
+    }
+
+    /**
+     * Whether {@code schema.table} names the FROM entry {@code ctx} binds as {@code table}.
+     *
+     * <p>Only a relation can be reached through a schema: a WITH query and a subquery alias live
+     * in the query, not in a schema, so {@code public.c.n} against {@code WITH c AS (...)} is an
+     * invalid reference in PostgreSQL and not a resolution. A relation qualifies when the schema
+     * really holds it — the same table object the binding was built from for a table, and the
+     * recorded schema for a view or a system catalog, neither of which keeps its own table
+     * object once its rows have been read.
+     */
+    private RowContext.TableBinding schemaPrefixReaches(RowContext ctx, String schema, String table) {
+        if (ctx == null) return null;
+        List<RowContext.TableBinding> named = new ArrayList<>();
+        for (RowContext.TableBinding b : ctx.getBindings()) {
+            String exposed = b.alias() != null ? b.alias() : b.table().getName();
+            if (exposed.equalsIgnoreCase(table)) named.add(b);
+        }
+        if (named.isEmpty()) return null;
+        // A WITH query shadows a relation of the same name and is not reachable through a schema.
+        if (executor.selectExecutor.lookupCte(table) != null) return null;
+        // A schema that does not exist reaches nothing, however the name reads.
+        if (executor.database.getSchema(schema) == null && !"pg_temp".equalsIgnoreCase(schema)
+                && !SystemCatalog.isSystemCatalog(schema, table)) {
+            return null;
+        }
+        Table inSchema = null;
+        try {
+            inSchema = executor.resolveTable(schema, table, true);
+        } catch (MemgresException ignored) {
+            // Not a table of that schema; a view or a catalog may still answer to the name.
+        }
+        if (inSchema != null) {
+            for (RowContext.TableBinding b : named) {
+                if (b.table() == inSchema) return b;
+            }
+        }
+        Database.ViewDef view = executor.database.getView(table);
+        if (view != null && view.schemaName() != null && view.schemaName().equalsIgnoreCase(schema)) {
+            return named.get(0);
+        }
+        if (SystemCatalog.isSystemCatalog(schema, table)) {
+            // pg_catalog reaches its own relations, not a user table that happens to be in scope.
+            try {
+                executor.resolveTable(executor.defaultSchema(), table);
+                return null;
+            } catch (MemgresException notAUserTable) {
+                return named.get(0);
+            }
+        }
+        return null;
     }
 
     /** Sentinel returned by {@link #tryAttributeNotationFallback} when the fallback does not apply. */
@@ -1515,10 +1637,11 @@ class ExprEvaluator {
                             other), ctx);
         }
         Object val = evalExpr(in.expr(), ctx);
-        if (val == null) return null; // NULL IN (...) is NULL
 
-        // Check for IN (subquery)
-        if (in.values().size() == 1 && in.values().get(0) instanceof SubqueryExpr) {
+        // Check for IN (subquery). The ANY spelling over a written-out array is a list of
+        // elements, each of them a value on its own -- so a subquery among them is not the
+        // subquery form of IN and is judged as any other scalar element would be.
+        if (!in.fromAny() && in.values().size() == 1 && in.values().get(0) instanceof SubqueryExpr) {
             SubqueryExpr sq = (SubqueryExpr) in.values().get(0);
             if (ctx != null) executor.outerContextStack.push(ctx);
             QueryResult subResult;
@@ -1527,13 +1650,13 @@ class ExprEvaluator {
             } finally {
                 if (ctx != null) executor.outerContextStack.pop();
             }
-            // Validate column count: (a, b) IN (SELECT c) is an error if c has fewer columns
-            if (val instanceof List<?> || val instanceof AstExecutor.PgRow) {
-                int expectedCols = val instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) val).values().size() : ((List<?>) val).size();
-                if (!subResult.getColumns().isEmpty() && subResult.getColumns().size() < expectedCols) {
-                    throw new MemgresException("subquery has too few columns", "42601");
-                }
-            }
+            // Both sides of IN have to be the same width. Only the narrow half was checked, so
+            // 1 IN (SELECT 1, 2) compared against the first column and answered true where
+            // PostgreSQL refuses the subquery outright. The width is a question about the two
+            // select lists and not about the rows, so it is asked ahead of the null answer a null
+            // left-hand side would otherwise short-circuit to.
+            rejectSubqueryWidth(comparandWidth(in.expr(), val), subResult);
+            if (val == null) return null; // NULL IN (...) is NULL
             boolean found = false;
             boolean hasNull = false;
             for (Object[] row : subResult.getRows()) {
@@ -1557,6 +1680,13 @@ class ExprEvaluator {
             if (hasNull) return null;
             return in.negated();
         }
+        // Each entry of a written list stands where one value stands, so a subquery among them
+        // may have only one column -- and PostgreSQL settles that from its select list, before
+        // any entry is compared. Comparing left to right and stopping at the first match never
+        // reached the entry that was at fault, so 1 IN (1, (SELECT 1, 2)) answered true.
+        rejectWideSubqueryElements(in.values());
+        rejectRowEntryMismatch(in);
+        if (val == null) return null; // NULL IN (...) is NULL
 
         // Regular IN (value list)
         boolean found = false;
@@ -1806,18 +1936,258 @@ class ExprEvaluator {
         if (outerCtx != null) executor.outerContextStack.push(outerCtx);
         try {
             QueryResult result = executor.executeStatement(sq.subquery());
+            // How wide a scalar subquery is, is a property of its select list and not of the rows
+            // it happens to return, so PostgreSQL refuses a second column before it looks at any
+            // row -- including when there are none. Reading the width off the first row instead
+            // let SELECT (SELECT 1, 2 WHERE false) answer NULL, and reported "more than one row"
+            // for a query whose real fault was its width.
+            rejectWideSubquery(sq.subquery(), result);
             if (result.getRows().isEmpty()) return null;
             if (result.getRows().size() > 1) {
                 throw new MemgresException("more than one row returned by a subquery used as an expression", "21000");
             }
             Object[] firstRow = result.getRows().get(0);
-            if (firstRow.length > 1) {
-                throw new MemgresException("subquery must return only one column", "42601");
-            }
             if (firstRow.length > 0) return firstRow[0];
             return null;
         } finally {
             if (outerCtx != null) executor.outerContextStack.pop();
+        }
+    }
+
+    /**
+     * A subquery standing where one value is expected may have only one column -- and must have
+     * one. {@code SELECT} with an empty select list is a query PostgreSQL parses and gives no
+     * columns at all, so {@code SELECT (SELECT)} is the same complaint as {@code SELECT (SELECT
+     * 1, 2)}; answering NULL for it was reading a column that was not there. The empty list is
+     * read off the statement rather than off the result, because a result the engine could not
+     * describe also has no columns and refusing on that would refuse working SQL.
+     */
+    /**
+     * Refuse a subquery of more than one column written where one value stands -- an entry of an
+     * IN list or of an array constructor. The width is read off the select list rather than from
+     * running the query, both because that is where PostgreSQL reads it and because an entry that
+     * a comparison never reaches is one this engine has no result for.
+     */
+    /**
+     * A row on the left of IN is compared against each entry of the list, so every entry has to be
+     * a row of the same width: an entry of a different width has no comparison to make and one
+     * that is not a row at all has no operator. Both were read entry by entry as far as they went,
+     * so {@code ROW(1,2) IN (ROW(1,2,3))} answered false and {@code (a, b) IN ((1))} answered
+     * nothing found.
+     */
+    private void rejectRowEntryMismatch(InExpr in) {
+        int want = writtenRowWidth(in.expr());
+        if (want <= 1) return;
+        for (int i = 0; i < in.values().size(); i++) {
+            Expression entry = in.values().get(i);
+            int got = writtenRowWidth(entry);
+            if (got > 0) {
+                if (got != want) {
+                    throw new MemgresException("unequal number of entries in row expressions", "42601");
+                }
+                continue;
+            }
+            if (isWrittenScalar(entry)) throw noRecordOperator(typeNameOf(entry), false);
+        }
+    }
+
+    static void rejectWideSubqueryElements(List<Expression> elements) {
+        if (elements == null) return;
+        for (int i = 0; i < elements.size(); i++) {
+            Expression e = elements.get(i);
+            if (!(e instanceof SubqueryExpr)) continue;
+            if (SelectStmt.writtenWidth(((SubqueryExpr) e).subquery()) > 1) {
+                throw new MemgresException("subquery must return only one column", "42601");
+            }
+        }
+    }
+
+    static void rejectWideSubquery(Statement subquery, QueryResult result) {
+        if (result.getColumns() != null && result.getColumns().size() > 1) {
+            throw new MemgresException("subquery must return only one column", "42601");
+        }
+        if (subquery instanceof SelectStmt) {
+            List<SelectStmt.SelectTarget> targets = ((SelectStmt) subquery).targets();
+            if (targets != null && targets.isEmpty()) {
+                throw new MemgresException("subquery must return only one column", "42601");
+            }
+        }
+    }
+
+    /**
+     * How many columns the side of a comparison written as {@code expr} occupies, or -1 when that
+     * cannot be told from the query text.
+     *
+     * <p>A row constructor occupies one column per element, and that is a property of how it is
+     * written. Everything else occupies one column -- unless the value turns out to be a row, and
+     * a value can be a row without a row constructor: {@code x} in {@code FROM t x} is the whole
+     * row of t, and {@code x IN (SELECT y FROM t y)} compares one whole row against another. Such
+     * a side is left unmeasured rather than counted as its element count, which would have made
+     * the whole-row comparison look like a width clash and refused a query PostgreSQL runs.
+     */
+    private static int comparandWidth(Expression expr, Object value) {
+        if (expr instanceof ArrayExpr && ((ArrayExpr) expr).isRow()) {
+            return ((ArrayExpr) expr).elements().size();
+        }
+        if (value instanceof AstExecutor.PgRow || value instanceof List<?>) return -1;
+        return 1;
+    }
+
+    /**
+     * Both sides of a comparison against a subquery have to be the same width, and PostgreSQL
+     * settles that from the select lists before it reads a row -- so a subquery of the wrong width
+     * is refused whether or not it returns anything. Neither an unmeasurable side nor a subquery
+     * with no column list at all (one the engine could not describe) is judged: refusing on the
+     * strength of either would refuse comparisons PostgreSQL makes.
+     */
+    private static void rejectSubqueryWidth(int want, QueryResult sub) {
+        if (want < 0 || sub.getColumns() == null || sub.getColumns().isEmpty()) return;
+        int got = sub.getColumns().size();
+        if (got < want) throw new MemgresException("subquery has too few columns", "42601");
+        if (got > want) throw new MemgresException("subquery has too many columns", "42601");
+    }
+
+    /**
+     * A row constructor compared against a subquery reads the whole subquery row, not just its
+     * first column: {@code (1, 2) = (SELECT 1, 2)} is a row comparison and true. Sending the
+     * subquery down the scalar path refused it as too wide, so a legitimate row comparison came
+     * back as an error while a genuinely wide scalar subquery was let through.
+     *
+     * <p>Only the six ordered comparisons take this reading. IS DISTINCT FROM does not -- measured
+     * against PostgreSQL 18, which refuses a wide subquery there -- and neither does a subquery
+     * written on the left.
+     */
+    private static boolean isRowSubqueryComparison(BinaryExpr bin) {
+        if (!(bin.right() instanceof SubqueryExpr)) return false;
+        if (!(bin.left() instanceof ArrayExpr) || !((ArrayExpr) bin.left()).isRow()) return false;
+        switch (bin.op()) {
+            case EQUAL: case NOT_EQUAL:
+            case LESS_THAN: case GREATER_THAN: case LESS_EQUAL: case GREATER_EQUAL:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private Object evalRowSubqueryComparison(BinaryExpr bin, RowContext ctx) {
+        ArrayExpr leftRow = (ArrayExpr) bin.left();
+        SubqueryExpr sq = (SubqueryExpr) bin.right();
+        if (ctx != null) executor.outerContextStack.push(ctx);
+        QueryResult result;
+        try {
+            result = executor.executeStatement(sq.subquery());
+        } finally {
+            if (ctx != null) executor.outerContextStack.pop();
+        }
+        int want = leftRow.elements().size();
+        int got = result.getColumns() == null ? 0 : result.getColumns().size();
+        // The widths have to agree for the comparison to exist at all, so PostgreSQL settles them
+        // before it looks at a row -- an empty subquery of the wrong width is still refused.
+        if (got < want) throw new MemgresException("subquery has too few columns", "42601");
+        if (got > want) throw new MemgresException("subquery has too many columns", "42601");
+        rejectRowSubqueryTypeMismatch(bin, leftRow, result);
+        if (result.getRows().isEmpty()) return null;
+        if (result.getRows().size() > 1) {
+            throw new MemgresException("more than one row returned by a subquery used as an expression", "21000");
+        }
+        Object leftVal = evalExpr(leftRow, ctx);
+        List<Object> rightValues = new ArrayList<>(Arrays.asList(result.getRows().get(0)));
+        return executor.binaryOpEvaluator.evalBinaryValues(bin.op(), leftVal,
+                new AstExecutor.PgRow(rightValues));
+    }
+
+    /**
+     * Entry by entry the comparison has to have an operator, and PostgreSQL resolves that from the
+     * declared types before any row is read. Only a literal that carries its own type is judged
+     * here: a bare string literal is untyped and takes whatever the other side is, and anything
+     * the engine merely inferred a type for would refuse a comparison PostgreSQL makes.
+     */
+    private void rejectRowSubqueryTypeMismatch(BinaryExpr bin, ArrayExpr leftRow, QueryResult result) {
+        for (int i = 0; i < leftRow.elements().size(); i++) {
+            Expression element = leftRow.elements().get(i);
+            if (!(element instanceof Literal)) continue;
+            rejectUntypedTextEntry(element, result.getColumns().get(i).getType());
+            Literal.LiteralType kind = ((Literal) element).literalType();
+            if (kind != Literal.LiteralType.INTEGER && kind != Literal.LiteralType.FLOAT
+                    && kind != Literal.LiteralType.BOOLEAN) {
+                continue;
+            }
+            DataType leftType = executor.inferExprType(element);
+            DataType rightType = result.getColumns().get(i).getType();
+            if (leftType == null || rightType == null || leftType == rightType) continue;
+            TypeCoercion.TypeCategory leftCat = TypeCoercion.categoryOf(leftType);
+            TypeCoercion.TypeCategory rightCat = TypeCoercion.categoryOf(rightType);
+            if (leftCat == null || rightCat == null || leftCat == rightCat) continue;
+            throw new MemgresException("operator does not exist: " + leftType.toRegtypeDisplay()
+                    + " " + BinaryOpEvaluator.opSymbol(bin.op()) + " " + rightType.toRegtypeDisplay(),
+                    "42883");
+        }
+    }
+
+    /**
+     * One column of the row a multi-column UPDATE assignment takes its values from. The columns
+     * of one assignment share the source node, so the row is read once per updated row: whichever
+     * column is evaluated first binds it in that row's context and the rest read the binding. A
+     * source that returns no row leaves every one of the columns null, which is what PostgreSQL
+     * assigns.
+     */
+    private Object evalRowElement(RowElementExpr re, RowContext ctx) {
+        Object row;
+        if (ctx != null && ctx.hasBoundValue(re.source())) {
+            row = ctx.getBoundValue(re.source());
+        } else {
+            row = evalRowElementSource(re, ctx);
+            if (ctx != null) ctx.setBoundValue(re.source(), row);
+        }
+        if (!(row instanceof AstExecutor.PgRow)) return null;
+        List<Object> values = ((AstExecutor.PgRow) row).values();
+        return re.index() < values.size() ? values.get(re.index()) : null;
+    }
+
+    private Object evalRowElementSource(RowElementExpr re, RowContext ctx) {
+        if (!(re.source() instanceof SubqueryExpr)) {
+            return evalExpr(re.source(), ctx);
+        }
+        SubqueryExpr sq = (SubqueryExpr) re.source();
+        if (ctx != null) executor.outerContextStack.push(ctx);
+        QueryResult result;
+        try {
+            result = executor.executeStatement(sq.subquery());
+        } finally {
+            if (ctx != null) executor.outerContextStack.pop();
+        }
+        int got = result.getColumns() == null ? 0 : result.getColumns().size();
+        if (got > 0 && got != re.width()) {
+            throw new MemgresException("number of columns does not match number of values", "42601");
+        }
+        if (result.getRows().isEmpty()) return null;
+        if (result.getRows().size() > 1) {
+            throw new MemgresException("more than one row returned by a subquery used as an expression", "21000");
+        }
+        return new AstExecutor.PgRow(new ArrayList<>(Arrays.asList(result.getRows().get(0))));
+    }
+
+    /**
+     * A string literal written in a row carries no type of its own, so PostgreSQL reads it as the
+     * type the entry opposite has -- and the reading is what fails when the text is not a value of
+     * that type. {@code (1, 'a') = (SELECT 1, 2)} is not a comparison that comes out false; it is
+     * an 'a' that is not an integer. Comparing the text with the number instead answered false,
+     * where the same row written with '1' answers true.
+     */
+    private void rejectUntypedTextEntry(Expression entry, DataType otherType) {
+        if (!(entry instanceof Literal)) return;
+        if (((Literal) entry).literalType() != Literal.LiteralType.STRING) return;
+        if (otherType == null || otherType == DataType.TEXT || otherType == DataType.VARCHAR
+                || otherType == DataType.CHAR) {
+            return;
+        }
+        String text = ((Literal) entry).value();
+        if (text == null) return;
+        try {
+            executor.castEvaluator.applyCast(text, otherType.getPgName());
+        } catch (RuntimeException e) {
+            throw new MemgresException("invalid input syntax for type "
+                    + otherType.toRegtypeDisplay() + ": \"" + text + "\"", "22P02");
         }
     }
 
@@ -1857,8 +2227,13 @@ class ExprEvaluator {
 
         // A row-constructor left side compares against the whole subquery row, not just
         // its first column: (1,2) = ANY (SELECT xi, yi FROM pts).
+        int written = comparandWidth(aa.left(), leftVal);
         int leftWidth = leftVal instanceof AstExecutor.PgRow
                 ? ((AstExecutor.PgRow) leftVal).values().size() : 1;
+        // ... and one that is not a row constructor compares against one column, so a wider
+        // subquery has no comparison to make. Reading only the first column of it answered
+        // 1 = ANY (SELECT id, name FROM t) with true.
+        rejectSubqueryWidth(written, subResult);
 
         if (aa.isAll()) {
             boolean hasNull = false;
@@ -2376,6 +2751,7 @@ class ExprEvaluator {
                 SelectStmt sel = (SelectStmt) sq.subquery();
                 SelectStmt.SelectTarget inner = sel.targets().get(0);
                 if (inner.alias() != null) return inner.alias();
+                if (inner.expr() instanceof WildcardExpr) return starSubqueryAlias(sel);
                 return exprToAlias(inner.expr());
             }
             return "?column?";
@@ -2410,6 +2786,69 @@ class ExprEvaluator {
         if (expr instanceof CompositeStarExpr) return "?column?";
         if (expr instanceof ArraySliceExpr) return exprToAlias(((ArraySliceExpr) expr).array());
         return "?column?";
+    }
+
+    /**
+     * The type of the single column a sub-query answers with, or null when it cannot be read.
+     *
+     * <p>Typing the target needs the names its own FROM supplies, which is what a shape is for.
+     * Deliberately quiet: a sub-query this cannot describe leaves the type unknown rather than
+     * guessing, and unknown is what the callers already handled.
+     */
+    private DataType subqueryColumnType(Statement subquery) {
+        // A set operation answers with the types its first arm writes, so that is where the one
+        // column's type is read from. Giving up on it reported the column as text, and ARRAY() over
+        // it as an array of text, for a query whose arms are all integers.
+        if (subquery instanceof SetOpStmt) return subqueryColumnType(((SetOpStmt) subquery).left());
+        if (!(subquery instanceof SelectStmt)) return null;
+        SelectStmt sel = (SelectStmt) subquery;
+        if (sel.targets() == null || sel.targets().size() != 1) return null;
+        Expression target = sel.targets().get(0).expr();
+        try {
+            List<RowContext.TableBinding> inner = new ArrayList<>();
+            if (sel.from() != null) {
+                for (SelectStmt.FromItem item : sel.from()) {
+                    inner.addAll(executor.fromResolver.resolveItemShape(item));
+                }
+            }
+            // A star stands for the columns the FROM item exposes, and a sub-query used as a
+            // value has exactly one, so its type is that column's own.
+            if (target instanceof WildcardExpr) {
+                Column only = null;
+                for (RowContext.TableBinding b : inner) {
+                    for (Column c : b.table().getColumns()) {
+                        if (only != null) return null;
+                        only = c;
+                    }
+                }
+                return only == null ? null : only.getType();
+            }
+            return inferTypeFromContext(target, inner);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The label a scalar sub-query written {@code (SELECT * FROM one_column_thing)} carries.
+     *
+     * <p>A star stands for the columns the FROM item exposes, and a sub-query used as a value has
+     * exactly one, so the label is that column's own name — {@code (SELECT id FROM c)} and
+     * {@code (SELECT * FROM c)} answer under the same name in PostgreSQL. Deliberately narrow: one
+     * FROM item exposing exactly one column, and any difficulty describing it leaves the label as
+     * the unnamed one it was.
+     */
+    private String starSubqueryAlias(SelectStmt sel) {
+        if (sel.from() == null || sel.from().size() != 1) return "?column?";
+        try {
+            List<Column> columns = new ArrayList<>();
+            for (RowContext.TableBinding b : executor.fromResolver.resolveItemShape(sel.from().get(0))) {
+                columns.addAll(b.table().getColumns());
+            }
+            return columns.size() == 1 ? columns.get(0).getName() : "?column?";
+        } catch (RuntimeException e) {
+            return "?column?";
+        }
     }
 
     /** Map a cast type name to the PG column name (e.g. "int" -> "int4", "boolean" -> "bool"). */
@@ -2765,7 +3204,9 @@ class ExprEvaluator {
                 case INTEGER:
                     return DataType.INTEGER;
                 case FLOAT:
-                    return lit.value().contains("e") || lit.value().contains("E") ? DataType.DOUBLE_PRECISION : DataType.NUMERIC;
+                    // A written constant is numeric whether or not it carries an exponent —
+                    // 1.0e0 is the same numeric one as 1.0, and only a cast makes it float8.
+                    return DataType.NUMERIC;
                 case STRING:
                     return DataType.TEXT;
                 case BOOLEAN:
@@ -2870,6 +3311,15 @@ class ExprEvaluator {
                     || name.equals("grouping")
                     || name.equals("array_position")) return DataType.INTEGER;
             if (name.equals("array_positions")) return DataType.INT4_ARRAY;
+            // The set-returning calls, whose row type is the type of the column the query gets.
+            // Described as text they decoded as strings, though pg_typeof already answered right.
+            if (name.equals("regexp_matches")) return DataType.TEXT_ARRAY;
+            if (name.equals("json_array_elements")) return DataType.JSON;
+            if (name.equals("jsonb_array_elements")) return DataType.JSONB;
+            if (name.equals("json_each") || name.equals("jsonb_each")
+                    || name.equals("json_each_text") || name.equals("jsonb_each_text")) {
+                return DataType.RECORD;
+            }
             if (name.equals("sum") || name.equals("avg")) {
                 DataType dt = fn.args().isEmpty() ? null : inferTypeFromContext(fn.args().get(0), bindings);
                 if (dt == DataType.DOUBLE_PRECISION) return DataType.DOUBLE_PRECISION;
@@ -3084,6 +3534,12 @@ class ExprEvaluator {
                 PgFunction userFunc = resolveUserFunctionForTyping(name, fn, bindings);
                 if (userFunc != null && userFunc.getReturnType() != null) {
                     String declaredReturn = userFunc.getReturnType().replaceAll("\\(.*\\)", "").trim();
+                    // SETOF t is a set of t, and a call that expands into rows carries one t per
+                    // row -- so the column is t. Reading "SETOF int" as a type name found none
+                    // and the expanded rows were described as text.
+                    if (declaredReturn.regionMatches(true, 0, "SETOF ", 0, 6)) {
+                        declaredReturn = declaredReturn.substring(6).trim();
+                    }
                     if (PolymorphicTypes.isPolymorphic(declaredReturn)) {
                         // The result type of a polymorphic routine is whatever this call's
                         // arguments bind its slots to.
@@ -3136,6 +3592,17 @@ class ExprEvaluator {
         if (expr instanceof BetweenExpr) return DataType.BOOLEAN;
         if (expr instanceof LikeExpr) return DataType.BOOLEAN;
         if (expr instanceof ExistsExpr) return DataType.BOOLEAN;
+        // A sub-query used as a value has the type of the one column it answers with, and
+        // ARRAY(...) has the array of that type. Reporting either as text made the driver decode
+        // integers as strings, even though pg_typeof already answered correctly.
+        if (expr instanceof SubqueryExpr) {
+            return subqueryColumnType(((SubqueryExpr) expr).subquery());
+        }
+        if (expr instanceof ArraySubqueryExpr) {
+            DataType element = subqueryColumnType(((ArraySubqueryExpr) expr).subquery());
+            DataType array = element == null ? null : DataType.arrayOf(element);
+            return array != null ? array : DataType.TEXT_ARRAY;
+        }
         if (expr instanceof AnyAllExpr) return DataType.BOOLEAN;
         if (expr instanceof AnyAllArrayExpr) return DataType.BOOLEAN;
         if (expr instanceof IsBooleanExpr) return DataType.BOOLEAN;
@@ -3374,14 +3841,66 @@ class ExprEvaluator {
      * instead let {@code ROW(1,2) < ROW(1,2,3)} come out true on the strength of the entries the
      * two rows happen to share.
      */
-    private static void rejectUnequalRowArity(BinaryExpr bin) {
-        if (!(bin.left() instanceof ArrayExpr) || !(bin.right() instanceof ArrayExpr)) return;
+    private void rejectUnequalRowArity(BinaryExpr bin) {
         if (!isRowComparison(bin.op())) return;
-        ArrayExpr left = (ArrayExpr) bin.left();
-        ArrayExpr right = (ArrayExpr) bin.right();
-        if (!left.isRow() || !right.isRow()) return;
-        if (left.elements().size() == right.elements().size()) return;
-        throw new MemgresException("unequal number of entries in row expressions", "42601");
+        int left = writtenRowWidth(bin.left());
+        int right = writtenRowWidth(bin.right());
+        if (left > 0 && right > 0) {
+            if (left != right) {
+                throw new MemgresException("unequal number of entries in row expressions", "42601");
+            }
+            List<Expression> leftEntries = ((ArrayExpr) bin.left()).elements();
+            List<Expression> rightEntries = ((ArrayExpr) bin.right()).elements();
+            for (int i = 0; i < left; i++) {
+                rejectUntypedTextEntry(leftEntries.get(i), inferExprType(rightEntries.get(i)));
+                rejectUntypedTextEntry(rightEntries.get(i), inferExprType(leftEntries.get(i)));
+            }
+            return;
+        }
+        // A row on one side and a single value on the other is not a comparison PostgreSQL has an
+        // operator for, and it says so rather than reading the row's first entry. Only the two
+        // distinctness operators are judged here: the six ordered comparisons settle a subquery of
+        // the wrong width by its width, which is a different complaint and already made.
+        if (bin.op() != BinaryExpr.BinOp.IS_DISTINCT_FROM
+                && bin.op() != BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM) {
+            return;
+        }
+        if (left > 1 && isWrittenScalar(bin.right())) {
+            throw noRecordOperator(typeNameOf(bin.right()), false);
+        }
+        if (right > 1 && isWrittenScalar(bin.left())) {
+            throw noRecordOperator(typeNameOf(bin.left()), true);
+        }
+    }
+
+    /** How many entries a row constructor is written with, or -1 when this is not one. */
+    private static int writtenRowWidth(Expression expr) {
+        if (expr instanceof ArrayExpr && ((ArrayExpr) expr).isRow()) {
+            return ((ArrayExpr) expr).elements().size();
+        }
+        return -1;
+    }
+
+    /** True when the text fixes this side at one value: a literal, or a one-column subquery. */
+    private static boolean isWrittenScalar(Expression expr) {
+        if (expr instanceof Literal) return true;
+        if (expr instanceof CastExpr) return isWrittenScalar(((CastExpr) expr).expr());
+        return expr instanceof SubqueryExpr
+                && SelectStmt.writtenWidth(((SubqueryExpr) expr).subquery()) == 1;
+    }
+
+    private String typeNameOf(Expression expr) {
+        DataType type = inferExprType(expr);
+        return type == null ? "unknown" : type.toRegtypeDisplay();
+    }
+
+    /** PostgreSQL's complaint that a row and a single value have no comparison between them. */
+    static MemgresException noRecordOperator(String otherType, boolean otherOnLeft) {
+        MemgresException e = new MemgresException("operator does not exist: "
+                + (otherOnLeft ? otherType + " = record" : "record = " + otherType), "42883");
+        e.setHint("No operator matches the given name and argument types. "
+                + "You might need to add explicit type casts.");
+        return e;
     }
 
     /** The operators that compare two rows entry by entry. */

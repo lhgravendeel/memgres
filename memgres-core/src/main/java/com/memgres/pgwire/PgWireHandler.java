@@ -1344,8 +1344,18 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
      */
     private static void enrichErrorPosition(MemgresException e, String sql) {
         if (e.getPosition() > 0 || sql == null) return;
+        // Errors PostgreSQL raises with no parse location of their own get no Position at all,
+        // even though their message quotes a name that could be found in the text.
+        if (e.isPositionSuppressed()) return;
         String msg = e.getMessage();
         if (msg == null) return;
+        // A throw site that knows which word it is complaining about names it, because the word is
+        // not always the one the message quotes -- "not allowed in LIMIT" points at the call.
+        if (e.getPositionToken() != null) {
+            int at = findToken(sql, e.getPositionToken());
+            if (at >= 0) e.setPosition(at + 1);
+            return;
+        }
         // Extract quoted name from error message patterns like: relation "foo" does not exist
         // or column "bar" does not exist, or at or near "token"
         String name = null;
@@ -1378,6 +1388,29 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         if ("42P01".equals(sqlState) || "42703".equals(sqlState)) {
             if (e.getPosition() == 0) e.setPosition(1);
         }
+    }
+
+    /**
+     * The offset of {@code token} in {@code sql} as a whole word, or -1. Whole-word so that a
+     * function named in the message is not found inside a longer identifier that contains it.
+     */
+    private static int findToken(String sql, String token) {
+        String lowerSql = sql.toLowerCase();
+        String lowerToken = token.toLowerCase();
+        int from = 0;
+        while (true) {
+            int idx = lowerSql.indexOf(lowerToken, from);
+            if (idx < 0) return -1;
+            boolean startOk = idx == 0 || !isIdentChar(lowerSql.charAt(idx - 1));
+            int end = idx + lowerToken.length();
+            boolean endOk = end >= lowerSql.length() || !isIdentChar(lowerSql.charAt(end));
+            if (startOk && endOk) return idx;
+            from = idx + 1;
+        }
+    }
+
+    private static boolean isIdentChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '$';
     }
 
     /** After a SET command, emit ParameterStatus messages for tracked GUC parameters. */

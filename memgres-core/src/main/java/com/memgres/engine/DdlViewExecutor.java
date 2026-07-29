@@ -13,7 +13,7 @@ import java.util.*;
 class DdlViewExecutor {
     /** Errors about the query itself rather than about the rows it happens to read. */
     private static final Set<String> ANALYSIS_ERRORS =
-            Cols.setOf("42803", "42P10", "42P20", "42601", "42809");
+            Cols.setOf("42803", "42P10", "42P20", "42601", "42809", "42712", "42P09");
 
     private final DdlExecutor ddl;
     private final AstExecutor executor;
@@ -85,6 +85,7 @@ class DdlViewExecutor {
         int rowCount = 0;
         if (stmt.materialized()) {
             if (stmt.withData()) {
+                // A materialized view is filled when it is created, so its query is planned then.
                 QueryResult result = executor.executeStatement(query);
                 List<Column> cols = new ArrayList<>(result.getColumns());
                 List<Object[]> rows = new ArrayList<>(result.getRows());

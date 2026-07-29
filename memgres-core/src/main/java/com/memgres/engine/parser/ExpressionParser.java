@@ -56,6 +56,11 @@ public class ExpressionParser {
         return pos;
     }
 
+    /** True when the token just consumed is of {@code type}. False at the start of the input. */
+    protected boolean previousTokenIs(TokenType type) {
+        return pos > 0 && tokens.get(pos - 1).type() == type;
+    }
+
     protected void resetPosition(int saved) {
         pos = saved;
     }
@@ -352,6 +357,7 @@ public class ExpressionParser {
                 if (opTok.type() == TokenType.GREATER_THAN) {
                     desc = true;
                 }
+                rejectNonOrderingOperator(opTok);
                 // else default ASC for <, and other operators
             }
 
@@ -363,6 +369,32 @@ public class ExpressionParser {
             items.add(new SelectStmt.OrderByItem(expr, desc, nullsFirst));
         } while (match(TokenType.COMMA));
         return items;
+    }
+
+    /**
+     * ORDER BY ... USING takes an ordering operator, which PostgreSQL defines as a "&lt;" or "&gt;"
+     * member of a btree operator family. Anything else was consumed and the sort ran ascending, so
+     * ORDER BY a USING = quietly answered in whatever order the rows arrived.
+     *
+     * <p>Only the operators that are provably never ordering operators are refused here, which is
+     * the four comparisons every btree type has and none of which orders: {@code =}, {@code <>},
+     * {@code <=} and {@code >=}. An operator the type may not have at all -- {@code ~~} against an
+     * integer -- is a different complaint (the operator does not exist) and telling the two apart
+     * needs the sort column's type, which this parser does not have.
+     */
+    private void rejectNonOrderingOperator(Token opTok) {
+        String name;
+        switch (opTok.type()) {
+            case EQUALS: name = "="; break;
+            case NOT_EQUALS: name = opTok.value(); break;
+            case LESS_EQUALS: name = "<="; break;
+            case GREATER_EQUALS: name = ">="; break;
+            default: return;
+        }
+        MemgresException e = new MemgresException(
+                "operator " + name + " is not a valid ordering operator", "42809");
+        e.setHint("Ordering operators must be \"<\" or \">\" members of btree operator families.");
+        throw e;
     }
 
     protected List<SelectStmt.OrderByItem> parseOrderByClause() {
@@ -716,8 +748,12 @@ public class ExpressionParser {
                 Expression arrayExpr = parseExpression();
                 expect(TokenType.RIGHT_PAREN);
                 if (!isAll && arrayExpr instanceof ArrayExpr) {
+                    // Marked as the ANY spelling even though the elements are written out, so that
+                    // it is not mistaken for a written IN afterwards: the two are the same
+                    // comparison but not the same construct, and a one-element IN forbids things
+                    // a one-element ANY allows.
                     ArrayExpr arr = (ArrayExpr) arrayExpr;
-                    return new InExpr(left, arr.elements(), false);
+                    return new InExpr(left, arr.elements(), false, true);
                 }
                 // ANY/ALL with array expression: evaluate element by element
                 if (!isAll) {
@@ -1451,10 +1487,27 @@ public class ExpressionParser {
 
                 String name2 = readIdentifier();
 
-                // Check for schema.table.column
+                // Check for schema.table.column (or schema.table.*)
                 if (check(TokenType.DOT)) {
                     advance();
+                    if (check(TokenType.STAR)) {
+                        advance();
+                        return new WildcardExpr(name, name2);
+                    }
                     String name3 = readIdentifier();
+                    // ... and for catalog.schema.table.column, which SQL allows and PostgreSQL
+                    // accepts as long as the catalog is the database being queried. A fourth part
+                    // was a syntax error at the dot, so a name written the way a tool writes it
+                    // would not parse at all.
+                    if (check(TokenType.DOT)) {
+                        advance();
+                        if (check(TokenType.STAR)) {
+                            advance();
+                            return new WildcardExpr(name, name2, name3);
+                        }
+                        String name4 = readIdentifier();
+                        return new ColumnRef(name, name2, name3, name4);
+                    }
                     return new ColumnRef(name, name2, name3);
                 }
 

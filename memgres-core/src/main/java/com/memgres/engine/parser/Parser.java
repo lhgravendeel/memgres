@@ -329,6 +329,11 @@ public class Parser extends ExpressionParser {
         return selectParser.tryParseSetOp(left);
     }
 
+    /** Parse one operand of a set operation, taking off any parentheses around it. */
+    Statement parseSetOpOperandPublic() {
+        return selectParser.parseSetOpOperandPublic();
+    }
+
     List<SelectStmt.FromItem> parseFromList() {
         return selectParser.parseFromList();
     }

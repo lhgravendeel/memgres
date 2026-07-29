@@ -185,8 +185,10 @@ class Round36cFixesTest {
                                     "  SELECT e.dst FROM t JOIN r36c_dfs2 e ON t.n = e.src" +
                                     ") SEARCH DEPTH FIRST BY n SET ord " +
                                     "SELECT n, ord::int FROM t ORDER BY ord"));
-            assertTrue(ex.getMessage().contains("cannot cast type record to"),
-                    "Expected record-to-int cast rejection, got: " + ex.getMessage());
+            // A DEPTH FIRST ordering column is an array of records, one per step of the path,
+            // and PostgreSQL names it as such — a BREADTH FIRST one is the single record.
+            assertTrue(ex.getMessage().contains("cannot cast type record[] to integer"),
+                    "Expected record[]-to-integer cast rejection, got: " + ex.getMessage());
             s.execute("DROP TABLE r36c_dfs2");
         }
     }

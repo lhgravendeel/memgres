@@ -17,11 +17,38 @@ class FromResolver {
     // Track the last resolved table info for LEFT JOIN null-padding when right side is empty
     Table lastResolvedRightTable;
     String lastResolvedRightAlias;
+    /**
+     * The WHERE of the query whose FROM is being resolved. A full join reads it: a WHERE that
+     * discards the null-padded rows makes the join an inner one, which lifts the restriction on
+     * what its condition may be. See {@link FullJoinAdmissibility}.
+     */
+    Expression enclosingWhere;
+    /** The HAVING of that query; the clauses of it with no aggregate are WHERE clauses too. */
+    Expression enclosingHaving;
+    /** The ON conditions of the joins above the one being resolved that filter its rows. */
+    final List<Expression> joinQualsAbove = new ArrayList<>();
+    /** The query whose FROM clause is being resolved, or null when it is not a plain SELECT. */
+    Statement currentQuery;
+    /**
+     * The statement the client sent, when that statement is a SELECT. Everything else — a
+     * subquery, a WITH query, a view body, an arm of a set operation, the source of a writing
+     * statement, a function body — is a query PostgreSQL may still rescue a full join in from
+     * above, so it is never the one whose joins are judged. See {@link FullJoinAdmissibility}.
+     */
+    Statement outermostQuery;
+
+    final FullJoinAdmissibility fullJoinCheck;
 
     FromResolver(AstExecutor executor) {
         this.executor = executor;
         this.functionResolver = new FromFunctionResolver(executor);
         this.joinExecutor = new FromJoinExecutor(this);
+        this.fullJoinCheck = new FullJoinAdmissibility(this);
+    }
+
+    /** Whether the FROM clause being resolved is the one the client's own statement wrote. */
+    boolean judgingOutermostQuery() {
+        return outermostQuery != null && currentQuery == outermostQuery;
     }
 
     // ---- Table Bindings (column structure without data) ----
@@ -34,13 +61,117 @@ class FromResolver {
         return bindings;
     }
 
+    /**
+     * The names and columns a FROM item exposes, with every value null.
+     *
+     * <p>An outer join has to name-pad the side that contributed nothing: the whole point of
+     * {@code t1 RIGHT JOIN t2} is to answer with NULLs where {@code t1} has no match, and those
+     * rows must still answer to {@code t1}'s name. Taking the shape from the first row of the
+     * side only works while the side has a row; when it is empty — because the relation is empty,
+     * because a subquery filtered everything away, or because the condition is never true — the
+     * shape has to come from the FROM item itself.
+     */
+    List<RowContext.TableBinding> resolveItemShape(SelectStmt.FromItem item) {
+        List<RowContext.TableBinding> bindings = new ArrayList<>();
+        try {
+            resolveTableBindingsFromItem(item, bindings);
+        } catch (RuntimeException e) {
+            // The shape is a convenience, not the answer: a FROM item that cannot be described
+            // (an unreadable lateral, say) leaves the padding as it was before.
+            return Cols.listOf();
+        }
+        return bindings;
+    }
+
+    /**
+     * The columns a FROM item exposes, in order, when it produced no rows to read them from.
+     *
+     * <p>Every column of every relation, except where a USING or NATURAL join merged two of them
+     * into one — which also decides where in the list they sit. A join whose clause cannot be
+     * satisfied is described as though it had none: a query that answers with no rows still has
+     * to say what its columns are, and it is the executed join, not this, that refuses it.
+     *
+     * @param bindings the same item's bindings, which the returned columns index into
+     */
+    List<RowContext.OutCol> resolveItemOutput(SelectStmt.FromItem item,
+                                              List<RowContext.TableBinding> bindings) {
+        try {
+            Described described = describe(item);
+            return described.bindings.size() == bindings.size() ? described.output
+                    : RowContext.defaultOutput(bindings);
+        } catch (RuntimeException e) {
+            return RowContext.defaultOutput(bindings);
+        }
+    }
+
+    /** The columns a whole FROM clause exposes, its items placed side by side. */
+    List<RowContext.OutCol> resolveClauseOutput(List<SelectStmt.FromItem> fromItems,
+                                                List<RowContext.TableBinding> bindings) {
+        if (fromItems == null || fromItems.isEmpty()) return RowContext.defaultOutput(bindings);
+        List<RowContext.OutCol> out = new ArrayList<>();
+        int offset = 0;
+        try {
+            for (SelectStmt.FromItem item : fromItems) {
+                Described described = describe(item);
+                for (RowContext.OutCol oc : described.output) out.add(oc.shift(offset));
+                offset += described.bindings.size();
+            }
+        } catch (RuntimeException e) {
+            return RowContext.defaultOutput(bindings);
+        }
+        return offset == bindings.size() ? out : RowContext.defaultOutput(bindings);
+    }
+
+    /** A FROM item's relations and the columns it exposes over them, described together. */
+    private static final class Described {
+        final List<RowContext.TableBinding> bindings;
+        final List<RowContext.OutCol> output;
+
+        Described(List<RowContext.TableBinding> bindings, List<RowContext.OutCol> output) {
+            this.bindings = bindings;
+            this.output = output;
+        }
+    }
+
+    private Described describe(SelectStmt.FromItem item) {
+        if (!(item instanceof SelectStmt.JoinFrom)) {
+            List<RowContext.TableBinding> bindings = new ArrayList<>();
+            resolveTableBindingsFromItem(item, bindings);
+            return new Described(bindings, RowContext.defaultOutput(bindings));
+        }
+        SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
+        Described left = describe(jf.left());
+        Described right;
+        // A LATERAL item reads the names to its left, so describing it needs those names in
+        // scope even when they carry no row, exactly as resolveTableBindingsFromItem has it.
+        if (jf.right() instanceof SelectStmt.SubqueryFrom
+                && ((SelectStmt.SubqueryFrom) jf.right()).lateral()) {
+            executor.outerContextStack.push(new RowContext(new ArrayList<>(left.bindings)));
+            try {
+                right = describe(jf.right());
+            } finally {
+                executor.outerContextStack.pop();
+            }
+        } else {
+            right = describe(jf.right());
+        }
+        List<RowContext.TableBinding> bindings = new ArrayList<>(left.bindings);
+        bindings.addAll(right.bindings);
+        List<String> using = jf.using();
+        if (FromJoinExecutor.isNatural(jf.joinType())) {
+            using = FromJoinExecutor.naturalNames(left.output, right.output);
+        }
+        return new Described(bindings, FromJoinExecutor.shapeOfJoin(
+                left.output, left.bindings.size(), right.output, using).output);
+    }
+
     private void resolveTableBindingsFromItem(SelectStmt.FromItem item, List<RowContext.TableBinding> bindings) {
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef tableRef = (SelectStmt.TableRef) item;
             String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
             String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
             // Check CTEs first
-            SelectStmt.CommonTableExpr cte = executor.selectExecutor.lookupCte(tableRef.table());
+            SelectStmt.CommonTableExpr cte = lookupCteFor(tableRef);
             if (cte != null) {
                 QueryResult cteResult = executor.selectExecutor.executeCte(cte);
                 Table virtualTable = new Table(alias, cteResult.getColumns());
@@ -85,38 +216,24 @@ class FromResolver {
         } else if (item instanceof SelectStmt.JoinFrom) {
             SelectStmt.JoinFrom joinFrom = (SelectStmt.JoinFrom) item;
             resolveTableBindingsFromItem(joinFrom.left(), bindings);
-            int beforeRight = bindings.size();
-            resolveTableBindingsFromItem(joinFrom.right(), bindings);
-            // Apply USING column dedup for SELECT * / RowDescription
-            if (joinFrom.using() != null && !joinFrom.using().isEmpty()) {
-                Set<String> usingLower = new HashSet<>();
-                for (String col : joinFrom.using()) usingLower.add(col.toLowerCase());
-                for (int bi = beforeRight; bi < bindings.size(); bi++) {
-                    RowContext.TableBinding b = bindings.get(bi);
-                    List<Column> origCols = b.table().getColumns();
-                    List<Integer> indicesToRemove = new ArrayList<>();
-                    for (int ci = 0; ci < origCols.size(); ci++) {
-                        if (usingLower.contains(origCols.get(ci).getName().toLowerCase())) {
-                            indicesToRemove.add(ci);
-                        }
-                    }
-                    if (!indicesToRemove.isEmpty()) {
-                        Set<Integer> removeSet = new HashSet<>(indicesToRemove);
-                        List<Column> newCols = new ArrayList<>();
-                        for (int ci = 0; ci < origCols.size(); ci++) {
-                            if (!removeSet.contains(ci)) newCols.add(origCols.get(ci));
-                        }
-                        if (!newCols.isEmpty()) {
-                            bindings.set(bi, new RowContext.TableBinding(
-                                    new Table(b.table().getName(), newCols), b.alias(),
-                                    new Object[newCols.size()]));
-                        } else {
-                            bindings.remove(bi);
-                            bi--;
-                        }
-                    }
+            // A LATERAL item reads the names to its left, so describing it needs those names in
+            // scope even when they carry no row — otherwise the describe fails and the lateral
+            // alias goes missing from a query that answers with no rows at all.
+            boolean lateralRight = joinFrom.right() instanceof SelectStmt.SubqueryFrom
+                    && ((SelectStmt.SubqueryFrom) joinFrom.right()).lateral();
+            if (lateralRight) {
+                executor.outerContextStack.push(new RowContext(new ArrayList<>(bindings)));
+                try {
+                    resolveTableBindingsFromItem(joinFrom.right(), bindings);
+                } finally {
+                    executor.outerContextStack.pop();
                 }
+            } else {
+                resolveTableBindingsFromItem(joinFrom.right(), bindings);
             }
+            // A USING or NATURAL join still names both relations and both keep all their columns;
+            // what changes is which of them the join exposes, and that is the output shape's
+            // business (see resolveItemOutput), not the bindings'.
         } else if (item instanceof SelectStmt.SubqueryFrom) {
             SelectStmt.SubqueryFrom subqFrom = (SelectStmt.SubqueryFrom) item;
             if (subqFrom.alias() != null) {
@@ -157,19 +274,32 @@ class FromResolver {
                 Table virtualTable = new Table(alias, cols);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             } else {
+                // The shape describes an item that produced no row, so the type has to come from
+                // the call rather than from a value; text is only the fallback.
+                DataType known = functionResolver.singleColumnType(funcFrom);
+                DataType colType = known != null ? known : DataType.TEXT;
                 List<String> ca = funcFrom.columnAliases();
+                List<Column> cols = new ArrayList<>();
                 if (ca != null && !ca.isEmpty()) {
-                    List<Column> cols = new ArrayList<>();
                     for (String colName : ca) {
-                        cols.add(new Column(FromFunctionResolver.stripColType(colName), DataType.TEXT, true, false, null));
+                        cols.add(new Column(FromFunctionResolver.stripColType(colName), colType, true, false, null));
                     }
-                    Table virtualTable = new Table(alias, cols);
-                    bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
                 } else {
-                    List<Column> cols = Cols.listOf(new Column(alias, DataType.TEXT, true, false, null));
-                    Table virtualTable = new Table(alias, cols);
-                    bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[1]));
+                    cols.add(new Column(alias, colType, true, false, null));
                 }
+                // WITH ORDINALITY's column is a bigint whether or not the item produced a row to
+                // read the type off, and it is the last one however the aliases named them.
+                if (funcFrom.withOrdinality()) {
+                    if (ca == null || ca.size() < 2) {
+                        cols.add(new Column("ordinality", DataType.BIGINT, true, false, null));
+                    } else {
+                        Column last = cols.get(cols.size() - 1);
+                        cols.set(cols.size() - 1,
+                                new Column(last.getName(), DataType.BIGINT, true, false, null));
+                    }
+                }
+                Table virtualTable = new Table(alias, cols);
+                bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             }
         }
     }
@@ -187,14 +317,139 @@ class FromResolver {
 
     // ---- FROM Clause Resolution ----
 
-    List<RowContext> resolveFromClause(List<SelectStmt.FromItem> fromItems) {
-        return resolveFromClause(fromItems, null);
+    /**
+     * Resolve a SELECT's FROM clause, with its WHERE pushed down for early filtering during the
+     * cross-product, and recording which query the clause belongs to. A full join is judged only
+     * in the query the client sent, and a join below the ones this resolves belongs to whatever
+     * subquery, WITH query or view it was written in.
+     */
+    List<RowContext> resolveFromClause(List<SelectStmt.FromItem> fromItems, Expression where,
+                                       Expression having, Statement owner) {
+        Expression priorWhere = enclosingWhere;
+        Expression priorHaving = enclosingHaving;
+        Statement priorQuery = currentQuery;
+        List<Expression> priorJoinQuals = new ArrayList<>(joinQualsAbove);
+        enclosingWhere = where;
+        enclosingHaving = having;
+        currentQuery = owner;
+        joinQualsAbove.clear();
+        try {
+            List<RowContext> resolved = resolveFromClauseInner(fromItems, where);
+            stampCoveredNames(fromItems, resolved);
+            return resolved;
+        } finally {
+            enclosingWhere = priorWhere;
+            enclosingHaving = priorHaving;
+            currentQuery = priorQuery;
+            joinQualsAbove.clear();
+            joinQualsAbove.addAll(priorJoinQuals);
+        }
     }
 
     /**
-     * Resolve FROM clause with optional WHERE pushdown for early filtering during cross-product.
+     * Tells each row which relations the FROM clause holds but does not answer to, so that a
+     * qualifier naming one of them is reported as out of reach rather than as missing.
+     *
+     * <p>{@code (a JOIN b) AS j} exposes {@code j} and nothing else — {@code a} is written in the
+     * query and cannot be referenced, which is a different mistake from writing a relation that is
+     * not there at all, and PostgreSQL words the two differently.
      */
-    List<RowContext> resolveFromClause(List<SelectStmt.FromItem> fromItems, Expression where) {
+    private static void stampCoveredNames(List<SelectStmt.FromItem> fromItems,
+                                          List<RowContext> resolved) {
+        if (fromItems == null || resolved == null || resolved.isEmpty()) return;
+        Set<String> covered = new LinkedHashSet<>();
+        for (SelectStmt.FromItem item : fromItems) collectCoveredNames(item, covered);
+        if (covered.isEmpty()) return;
+        for (RowContext ctx : resolved) {
+            for (RowContext.TableBinding b : ctx.getBindings()) {
+                covered.remove(b.alias() != null ? b.alias().toLowerCase()
+                        : b.table().getName().toLowerCase());
+            }
+            break;
+        }
+        if (covered.isEmpty()) return;
+        for (RowContext ctx : resolved) ctx.setCoveredNames(covered);
+    }
+
+    /** Every relation name written anywhere in a FROM tree, however it was later renamed. */
+    static void collectCoveredNames(SelectStmt.FromItem item, Set<String> out) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            collectCoveredNames(((SelectStmt.JoinFrom) item).left(), out);
+            collectCoveredNames(((SelectStmt.JoinFrom) item).right(), out);
+            return;
+        }
+        if (item instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+            out.add(ref.alias() != null ? ref.alias().toLowerCase() : ref.table().toLowerCase());
+            return;
+        }
+        // A parenthesized join given an alias is carried as a sub-query over the join itself; the
+        // relations under it are written in the query and covered by that alias.
+        if (item instanceof SelectStmt.SubqueryFrom
+                && ((SelectStmt.SubqueryFrom) item).subquery() instanceof SelectStmt) {
+            SelectStmt inner = (SelectStmt) ((SelectStmt.SubqueryFrom) item).subquery();
+            if (inner.from() != null) {
+                for (SelectStmt.FromItem f : inner.from()) collectCoveredNames(f, out);
+            }
+        }
+    }
+
+    /**
+     * A FROM item that is not LATERAL cannot read the item beside it.
+     *
+     * <p>The relations of one FROM clause are computed side by side, so a sub-select written as one
+     * of them has no row of its neighbour to read — LATERAL is the word that says to compute it
+     * once per such row instead. PostgreSQL says the entry is there but out of reach and names the
+     * word that would bring it into reach; reporting the entry as missing sent the reader looking
+     * for a relation they had written.
+     *
+     * <p>Only a name a sibling actually exposes is reported. A name nothing in the query has is
+     * missing, and PostgreSQL says so.
+     */
+    private void rejectSiblingReferenceWithoutLateral(List<SelectStmt.FromItem> fromItems) {
+        if (fromItems == null || fromItems.size() < 2) return;
+        for (int i = 0; i < fromItems.size(); i++) {
+            SelectStmt.FromItem item = fromItems.get(i);
+            if (!(item instanceof SelectStmt.SubqueryFrom)) continue;
+            SelectStmt.SubqueryFrom sub = (SelectStmt.SubqueryFrom) item;
+            if (sub.lateral()) continue;
+            Set<String> siblings = new LinkedHashSet<>();
+            for (int j = 0; j < fromItems.size(); j++) {
+                if (j != i) collectExposedNames(fromItems.get(j), siblings);
+            }
+            if (siblings.isEmpty()) continue;
+            String referenced = SelectExecutor.firstReferenceTo(sub.subquery(), siblings);
+            if (referenced == null) continue;
+            MemgresException e = new MemgresException(
+                    "invalid reference to FROM-clause entry for table \"" + referenced + "\"", "42P01");
+            e.setDetail("There is an entry for table \"" + referenced
+                    + "\", but it cannot be referenced from this part of the query.");
+            e.setHint("To reference that table, you must mark this subquery with LATERAL.");
+            throw e;
+        }
+    }
+
+    /** Every name a FROM item answers to, at any depth of a join below it. */
+    static void collectExposedNames(SelectStmt.FromItem item, Set<String> out) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            collectExposedNames(((SelectStmt.JoinFrom) item).left(), out);
+            collectExposedNames(((SelectStmt.JoinFrom) item).right(), out);
+            return;
+        }
+        String name = SelectExecutor.exposedNameOf(item);
+        if (name != null) out.add(name);
+    }
+
+    /**
+     * Resolve the FROM of an UPDATE or the USING of a DELETE. The statement's WHERE is not pushed
+     * into the scan: it also names the table being written, which is not one of these relations.
+     */
+    List<RowContext> resolveWrittenFromClause(List<SelectStmt.FromItem> fromItems) {
+        return resolveFromClauseInner(fromItems, null);
+    }
+
+    private List<RowContext> resolveFromClauseInner(List<SelectStmt.FromItem> fromItems, Expression where) {
+        rejectSiblingReferenceWithoutLateral(fromItems);
         if (fromItems.size() == 1) {
             // For single-table queries, try index scan optimization
             if (where != null && fromItems.get(0) instanceof SelectStmt.TableRef) {
@@ -294,22 +549,12 @@ class FromResolver {
                 for (RowContext leftCtx : accumulated) {
                     executor.outerContextStack.push(leftCtx);
                     try {
-                        List<RowContext> funcRows = functionResolver.resolveFunctionFrom(funcFrom);
-                        if (funcRows.isEmpty()) {
-                            String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
-                            List<Column> emptyCols = funcFrom.columnAliases() != null
-                                    ? funcFrom.columnAliases().stream()
-                                        .map(c -> new Column(FromFunctionResolver.stripColType(c), DataType.TEXT, true, false, null))
-                                        .collect(java.util.stream.Collectors.toList())
-                                    : Cols.listOf();
-                            Table virtualTable = new Table(alias, emptyCols);
-                            Object[] nullRow = new Object[emptyCols.size()];
-                            RowContext rightCtx = new RowContext(virtualTable, alias, nullRow);
+                        // A comma between two FROM items is an inner join, so a function that
+                        // produces no rows for this left row removes it -- the same as the
+                        // lateral-subquery branch above, which skips it. Padding it with NULLs
+                        // instead answered LEFT JOIN LATERAL to a query that did not write one.
+                        for (RowContext rightCtx : functionResolver.resolveFunctionFrom(funcFrom)) {
                             newAccumulated.add(joinExecutor.mergeContexts(leftCtx, rightCtx));
-                        } else {
-                            for (RowContext rightCtx : funcRows) {
-                                newAccumulated.add(joinExecutor.mergeContexts(leftCtx, rightCtx));
-                            }
                         }
                     } finally {
                         executor.outerContextStack.pop();
@@ -362,13 +607,51 @@ class FromResolver {
         throw new IllegalArgumentException("Unknown FromItem type: " + fromItem.getClass().getSimpleName());
     }
 
+    /**
+     * The WITH item a FROM reference names, or null.
+     *
+     * <p>A WITH item lives in no schema, so a schema-qualified name can never reach one: it is
+     * always the stored relation of that name, and "does not exist" when there is none.
+     */
+    private SelectStmt.CommonTableExpr lookupCteFor(SelectStmt.TableRef tableRef) {
+        if (tableRef.schema() != null) return null;
+        return executor.selectExecutor.lookupCte(tableRef.table());
+    }
+
+    /**
+     * The columns a FROM item's alias list renames, as far as the list reaches.
+     *
+     * <p>{@code t AS z(m)} calls the relation's first column m and leaves the rest alone; naming
+     * more columns than the relation has is an error PostgreSQL raises before reading a row.
+     */
+    private static List<Column> renameColumns(String alias, List<Column> columns,
+                                              List<String> aliases) {
+        if (aliases == null || aliases.isEmpty()) return columns;
+        if (aliases.size() > columns.size()) {
+            throw new MemgresException("table \"" + alias + "\" has " + columns.size()
+                    + " columns available but " + aliases.size() + " columns specified", "42P10");
+        }
+        List<Column> renamed = new ArrayList<>();
+        for (int i = 0; i < columns.size(); i++) {
+            Column c = columns.get(i);
+            renamed.add(i < aliases.size()
+                    ? new Column(aliases.get(i), c.getType(), c.isNullable(), c.isPrimaryKey(),
+                            c.getDefaultValue(), c.getEnumTypeName(), c.getPrecision(), c.getScale(),
+                            null, c.getDomainTypeName(), c.getCompositeTypeName(),
+                            c.getArrayElementType())
+                    : c);
+        }
+        return renamed;
+    }
+
     private List<RowContext> resolveTableRef(SelectStmt.TableRef tableRef) {
         // Check CTEs first
-        SelectStmt.CommonTableExpr cte = executor.selectExecutor.lookupCte(tableRef.table());
+        SelectStmt.CommonTableExpr cte = lookupCteFor(tableRef);
         if (cte != null) {
-            QueryResult cteResult = executor.selectExecutor.executeCte(cte);
             String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
-            Table virtualTable = new Table(alias, cteResult.getColumns());
+            QueryResult cteResult = executor.selectExecutor.executeCte(cte);
+            Table virtualTable = new Table(alias,
+                    renameColumns(alias, cteResult.getColumns(), tableRef.columnAliases()));
             lastResolvedRightTable = virtualTable;
             lastResolvedRightAlias = alias;
             for (Object[] row : cteResult.getRows()) {
@@ -476,6 +759,14 @@ class FromResolver {
                     "AccessShareLock", executor.session, false);
         }
         String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+        // An alias list renames the columns the query will see. The rows are the stored table's
+        // own, so only the description in front of them is rebuilt.
+        if (tableRef.columnAliases() != null && !tableRef.columnAliases().isEmpty()) {
+            Table renamed = new Table(alias,
+                    renameColumns(alias, table.getColumns(), tableRef.columnAliases()));
+            for (Object[] row : table.getAllRows()) renamed.insertRow(row);
+            table = renamed;
+        }
         lastResolvedRightTable = table;
         lastResolvedRightAlias = alias;
 
@@ -734,6 +1025,7 @@ class FromResolver {
     }
 
     private List<RowContext> resolveSubquery(SelectStmt.SubqueryFrom subqFrom) {
+        String alias = subqFrom.alias() != null ? subqFrom.alias() : "subquery";
         QueryResult subResult;
         if (subqFrom.subquery() instanceof SelectStmt) {
             SelectStmt sel = (SelectStmt) subqFrom.subquery();
@@ -741,9 +1033,8 @@ class FromResolver {
         } else {
             subResult = executor.executeStatement(subqFrom.subquery());
         }
-        String alias = subqFrom.alias() != null ? subqFrom.alias() : "subquery";
         List<Column> columns = FromFunctionResolver.applyColumnAliases(
-                new ArrayList<>(subResult.getColumns()), subqFrom.columnAliases());
+                new ArrayList<>(subResult.getColumns()), subqFrom.columnAliases(), alias);
         Table virtualTable = new Table(alias, columns);
         for (Object[] row : subResult.getRows()) {
             virtualTable.insertRow(row);

@@ -1399,6 +1399,18 @@ class CatalogCoreBuilder {
             });
         }
 
+        // record[] is a real array type over the record pseudo-type, and a client asked to read
+        // one — a recursive query's SEARCH or CYCLE column — looks its row up here to learn the
+        // element type and delimiter before it will parse the value at all.
+        table.insertRow(new Object[]{
+                2287, "_record", pgCatalogOid, 10,
+                (short) -1, false, "b", "P", false, true, ",",
+                0, regproc("array_subscript_handler"), 2249, 0,
+                regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
+                regproc(null), regproc(null), regproc("array_typanalyze"), "d", "x",
+                false, 0, -1, 0, 0, null, null, null, 1
+        });
+
         // Add custom enum types
         for (CustomEnum ce : database.getCustomEnums().values()) {
             // Determine the schema this enum belongs to via the schema object registry

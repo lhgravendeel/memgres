@@ -1124,23 +1124,11 @@ class BinaryOpEvaluator {
                 List<?> lList = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
                 List<?> rList = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
                 if (lList != null && rList != null) {
+                    if (leftIsArray && rightIsArray) return arraysEqual(lList, rList);
                     if (lList.size() != rList.size()) {
-                        if (leftIsArray && rightIsArray) return false;
                         throw new MemgresException("cannot compare row values of different sizes", "42601");
                     }
-                    for (int ri = 0; ri < lList.size(); ri++) {
-                        Object lv = lList.get(ri), rv = rList.get(ri);
-                        if (lv == null || rv == null) {
-                            if (leftIsArray && rightIsArray) {
-                                // ARRAY: NULL=NULL is true, NULL!=non-NULL is false
-                                if (lv == null && rv == null) continue;
-                                return false;
-                            }
-                            return null; // ROW: NULL propagates
-                        }
-                        if (!TypeCoercion.areEqual(lv, rv)) return false;
-                    }
-                    return true;
+                    return rowEquality(lList, rList, true);
                 }
                 // text vs integer comparison: coerce to compare numerically if possible,
                 // otherwise treat as not-equal (catalog queries may compare text columns with OIDs)
@@ -1156,16 +1144,16 @@ class BinaryOpEvaluator {
             case NOT_EQUAL: {
                 if (left == null || right == null) return null; // NULL <> x is NULL
                 // Handle ROW comparison
+                boolean leftIsArrayNe = left instanceof List && !(left instanceof AstExecutor.PgRow);
+                boolean rightIsArrayNe = right instanceof List && !(right instanceof AstExecutor.PgRow);
                 List<?> lList2 = left instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) left).values() : left instanceof List ? (List<?>) left : null;
                 List<?> rList2 = right instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) right).values() : right instanceof List ? (List<?>) right : null;
                 if (lList2 != null && rList2 != null) {
+                    // An array is one value, and two arrays that hold NULL in the same place are
+                    // that same value -- so <> answers false where a row's <> answers unknown.
+                    if (leftIsArrayNe && rightIsArrayNe) return !arraysEqual(lList2, rList2);
                     if (lList2.size() != rList2.size()) throw new MemgresException("cannot compare row values of different sizes", "42601");
-                    for (int ri = 0; ri < lList2.size(); ri++) {
-                        Object lv = lList2.get(ri), rv = rList2.get(ri);
-                        if (lv == null || rv == null) return null;
-                        if (!TypeCoercion.areEqual(lv, rv)) return true;
-                    }
-                    return false;
+                    return rowEquality(lList2, rList2, false);
                 }
                 return !TypeCoercion.areEqual(left, right);
             }
@@ -2008,6 +1996,55 @@ class BinaryOpEvaluator {
     /**
      * Map a BinaryExpr.BinOp to its operator symbol string for user-defined operator lookup.
      */
+    /** The members of a value that is a row or an array, or null when it is neither. */
+    private static List<?> rowOrArrayValues(Object v) {
+        if (v instanceof AstExecutor.PgRow) return ((AstExecutor.PgRow) v).values();
+        if (v instanceof List) return (List<?>) v;
+        return null;
+    }
+
+    private static boolean isArrayValue(Object v) {
+        return v instanceof List && !(v instanceof AstExecutor.PgRow);
+    }
+
+    /**
+     * Two rows are equal when every pair of members is non-null and equal, unequal when some pair
+     * is non-null and unequal, and unknown otherwise. A NULL member does not settle the answer by
+     * itself and a pair that differs settles it even when another pair is NULL, so answering
+     * unknown at the first NULL was wrong in both directions: {@code (NULL, 1) = (2, 3)} is false
+     * to PostgreSQL, not unknown.
+     *
+     * @param equal true for {@code =}, false for {@code <>}
+     */
+    private static Object rowEquality(List<?> l, List<?> r, boolean equal) {
+        boolean unknown = false;
+        for (int i = 0; i < l.size(); i++) {
+            Object lv = l.get(i), rv = r.get(i);
+            if (lv == null || rv == null) { unknown = true; continue; }
+            if (!TypeCoercion.areEqual(lv, rv)) return equal ? Boolean.FALSE : Boolean.TRUE;
+        }
+        if (unknown) return null;
+        return equal ? Boolean.TRUE : Boolean.FALSE;
+    }
+
+    /** An array is one value: NULL in the same place on both sides is the same value. */
+    private static boolean arraysEqual(List<?> l, List<?> r) {
+        if (l.size() != r.size()) return false;
+        for (int i = 0; i < l.size(); i++) {
+            Object lv = l.get(i), rv = r.get(i);
+            if (lv == null || rv == null) {
+                if (lv == null && rv == null) continue;
+                return false;
+            }
+            if (!TypeCoercion.areEqual(lv, rv)) return false;
+        }
+        return true;
+    }
+
+    static String opSymbol(BinaryExpr.BinOp op) {
+        return binOpToSymbol(op);
+    }
+
     private static String binOpToSymbol(BinaryExpr.BinOp op) {
         switch (op) {
             case ADD: return "+";
@@ -2371,31 +2408,28 @@ class BinaryOpEvaluator {
             }
             case EQUAL: {
                 if (left == null || right == null) return null;
-                if (left instanceof List && right instanceof List) {
-                    List<?> lList = (List<?>) left;
-                    List<?> rList = (List<?>) right;
-                    if (lList.size() != rList.size()) return false;
-                    for (int ri = 0; ri < lList.size(); ri++) {
-                        Object lv = lList.get(ri), rv = rList.get(ri);
-                        if (lv == null || rv == null) return null;
-                        if (!TypeCoercion.areEqual(lv, rv)) return false;
-                    }
-                    return true;
+                // A ROW value is not a java List, so a row that reached here -- the one a row
+                // constructor compared against a subquery builds, among others -- missed the list
+                // branch entirely and was compared as its own printed text: (1,NULL) = (1,2) came
+                // back false because "(1,)" and "(1,2)" are different strings, and
+                // (1,NULL) = (1,NULL) came back true because they are the same one.
+                List<?> lEq = rowOrArrayValues(left);
+                List<?> rEq = rowOrArrayValues(right);
+                if (lEq != null && rEq != null) {
+                    if (isArrayValue(left) && isArrayValue(right)) return arraysEqual(lEq, rEq);
+                    if (lEq.size() != rEq.size()) return false;
+                    return rowEquality(lEq, rEq, true);
                 }
                 return TypeCoercion.areEqual(left, right);
             }
             case NOT_EQUAL: {
                 if (left == null || right == null) return null;
-                if (left instanceof List && right instanceof List) {
-                    List<?> lList = (List<?>) left;
-                    List<?> rList = (List<?>) right;
-                    if (lList.size() != rList.size()) return true;
-                    for (int ri = 0; ri < lList.size(); ri++) {
-                        Object lv = lList.get(ri), rv = rList.get(ri);
-                        if (lv == null || rv == null) return null;
-                        if (!TypeCoercion.areEqual(lv, rv)) return true;
-                    }
-                    return false;
+                List<?> lNe = rowOrArrayValues(left);
+                List<?> rNe = rowOrArrayValues(right);
+                if (lNe != null && rNe != null) {
+                    if (isArrayValue(left) && isArrayValue(right)) return !arraysEqual(lNe, rNe);
+                    if (lNe.size() != rNe.size()) return true;
+                    return rowEquality(lNe, rNe, false);
                 }
                 return !TypeCoercion.areEqual(left, right);
             }

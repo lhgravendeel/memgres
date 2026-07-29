@@ -41,6 +41,24 @@ public final class SelectStmt implements Statement {
 
     public boolean fromValues() { return fromValues; }
 
+    /**
+     * How many columns a query's select list writes, or -1 when the text does not settle it -- a
+     * star, or anything else that may stand for more than one column. This is what PostgreSQL
+     * measures a subquery's width by: it is a property of the text, settled before any row is
+     * read, so a query that returns nothing is still of the width it was written with.
+     */
+    public static int writtenWidth(Statement stmt) {
+        if (stmt instanceof SetOpStmt) return writtenWidth(((SetOpStmt) stmt).left());
+        if (!(stmt instanceof SelectStmt)) return -1;
+        List<SelectTarget> targets = ((SelectStmt) stmt).targets();
+        if (targets == null || targets.isEmpty()) return -1;
+        for (int i = 0; i < targets.size(); i++) {
+            Expression e = targets.get(i).expr();
+            if (e instanceof WildcardExpr || e instanceof CompositeStarExpr) return -1;
+        }
+        return targets.size();
+    }
+
     public SelectStmt(
             boolean distinct,
             List<Expression> distinctOn,
@@ -262,6 +280,8 @@ public final class SelectStmt implements Statement {
         public String table;
         public final String alias;
         public final boolean only;
+        /** The alias list of {@code t AS z(c1, c2)}: renames the relation's first columns. */
+        public final List<String> columnAliases;
 
         /** Retarget this reference at the same relation under its new schema and name. */
         public void retarget(String newSchema, String newTable) {
@@ -270,10 +290,16 @@ public final class SelectStmt implements Statement {
         }
 
         public TableRef(String schema, String table, String alias, boolean only) {
+            this(schema, table, alias, only, null);
+        }
+
+        public TableRef(String schema, String table, String alias, boolean only,
+                        List<String> columnAliases) {
             this.schema = schema;
             this.table = table;
             this.alias = alias;
             this.only = only;
+            this.columnAliases = columnAliases;
         }
 
         public TableRef(String table) {
@@ -292,6 +318,7 @@ public final class SelectStmt implements Statement {
         public String table() { return table; }
         public String alias() { return alias; }
         public boolean only() { return only; }
+        public List<String> columnAliases() { return columnAliases; }
 
         @Override
         public boolean equals(Object o) {
@@ -494,6 +521,9 @@ public final class SelectStmt implements Statement {
         public final String cycleColumn;
         public final String cyclePathColumn;
         public final List<String> cycleByColumns;
+        /** CYCLE ... SET c TO <value> DEFAULT <default>; both null for the boolean default. */
+        public final Expression cycleMarkValue;
+        public final Expression cycleMarkDefault;
 
         public CommonTableExpr(
                 String name,
@@ -507,6 +537,24 @@ public final class SelectStmt implements Statement {
                 String cyclePathColumn,
                 List<String> cycleByColumns
         ) {
+            this(name, columnNames, query, recursive, searchColumn, searchDepthFirst, searchByColumns,
+                    cycleColumn, cyclePathColumn, cycleByColumns, null, null);
+        }
+
+        public CommonTableExpr(
+                String name,
+                List<String> columnNames,
+                Statement query,
+                boolean recursive,
+                String searchColumn,
+                boolean searchDepthFirst,
+                List<String> searchByColumns,
+                String cycleColumn,
+                String cyclePathColumn,
+                List<String> cycleByColumns,
+                Expression cycleMarkValue,
+                Expression cycleMarkDefault
+        ) {
             this.name = name;
             this.columnNames = columnNames;
             this.query = query;
@@ -517,6 +565,8 @@ public final class SelectStmt implements Statement {
             this.cycleColumn = cycleColumn;
             this.cyclePathColumn = cyclePathColumn;
             this.cycleByColumns = cycleByColumns;
+            this.cycleMarkValue = cycleMarkValue;
+            this.cycleMarkDefault = cycleMarkDefault;
         }
 
         public CommonTableExpr(
@@ -548,6 +598,8 @@ public final class SelectStmt implements Statement {
         public String cycleColumn() { return cycleColumn; }
         public String cyclePathColumn() { return cyclePathColumn; }
         public List<String> cycleByColumns() { return cycleByColumns; }
+        public Expression cycleMarkValue() { return cycleMarkValue; }
+        public Expression cycleMarkDefault() { return cycleMarkDefault; }
 
         @Override
         public boolean equals(Object o) {
