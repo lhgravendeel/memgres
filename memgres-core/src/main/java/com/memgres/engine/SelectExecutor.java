@@ -141,6 +141,11 @@ class SelectExecutor {
         if (stmt.fromValues()) {
             for (SelectStmt.SelectTarget target : stmt.targets()) {
                 placementCheck.reject(target.expr(), "VALUES");
+                // A VALUES list is a constant table: its rows are written out, not produced, so
+                // there is nowhere for a set to expand into more of them. The one-row VALUES of
+                // an INSERT is a different construct, projected like a select list, and PostgreSQL
+                // does expand a set there -- that path is InsertStmt's own and is not this one.
+                rejectSrfIn(target.expr(), "VALUES");
             }
         }
         // SELECT without FROM
@@ -228,11 +233,8 @@ class SelectExecutor {
                             }
                             if (!wholeRow) {
                                 MemgresException colEx = new MemgresException("column \"" + cr.column() + "\" does not exist", "42703");
-                                // Try to generate a hint by finding the closest matching column
-                                for (RowContext.TableBinding b : baseBindings) {
-                                    String hint = RowContext.suggestClosestColumn(cr.column(), b.table());
-                                    if (hint != null) { colEx.setHint(hint); break; }
-                                }
+                                String hint = RowContext.suggestClosestColumn(cr.column(), baseBindings);
+                                if (hint != null) colEx.setHint(hint);
                                 throw colEx;
                             }
                         }
@@ -273,17 +275,22 @@ class SelectExecutor {
                                 ex.setHint("Perhaps you meant to reference the table alias \"" + hiddenByAlias + "\".");
                                 throw ex;
                             }
-                            throw new MemgresException("missing FROM-clause entry for table \"" + cr.table() + "\"", "42P01");
+                            throw outOfScopeOrMissing(cr.table(), stmt.from());
                         }
                         if (!colFound && !mayResolveViaAttributeNotation) {
                             // A qualified reference is named in full, the way RowContext names it
                             // when the same lookup fails at evaluation time.
                             MemgresException colEx = new MemgresException(
                                     "column " + cr.table() + "." + cr.column() + " does not exist", "42703");
+                            List<RowContext.TableBinding> named = new ArrayList<>();
                             for (RowContext.TableBinding b : baseBindings) {
-                                String hint = RowContext.suggestClosestColumn(cr.column(), b.table());
-                                if (hint != null) { colEx.setHint(hint); break; }
+                                if (cr.table().equalsIgnoreCase(b.alias())
+                                        || cr.table().equalsIgnoreCase(b.table().getName())) {
+                                    named.add(b);
+                                }
                             }
+                            String hint = RowContext.suggestClosestColumn(cr.column(), named);
+                            if (hint != null) colEx.setHint(hint);
                             throw colEx;
                         }
                     }
@@ -437,6 +444,7 @@ class SelectExecutor {
 
         // DISTINCT ON
         if (stmt.distinctOn() != null && !stmt.distinctOn().isEmpty()) {
+            contexts = expandContextsForDistinctOnSrfs(stmt, contexts);
             Set<String> seen = new LinkedHashSet<>();
             List<RowContext> deduped = new ArrayList<>();
             for (RowContext ctx : contexts) {
@@ -1178,7 +1186,7 @@ class SelectExecutor {
                     for (RowContext.OutCol oc : baseOutput) {
                         if (oc.bindings[0] >= baseBindings.size()) continue;
                         RowContext.TableBinding binding = baseBindings.get(oc.bindings[0]);
-                        resultColumns.add(copyColumnWithOid(binding.table(), oc.columns[0]));
+                        resultColumns.add(mergedColumnType(oc, copyColumnWithOid(binding.table(), oc.columns[0])));
                         final RowContext.OutCol col = oc;
                         projections.add(ctx -> col.valueIn(ctx.getBindings()));
                     }
@@ -1223,6 +1231,19 @@ class SelectExecutor {
                 String sourceTableName = null;
                 String sourceSchemaName = null;
                 int sourceColIdx = -1;
+                // A join merged this name into a column of its own, whose type is neither side's.
+                RowContext.OutCol mergedRef = mergedOutCol(expr, baseOutput);
+                if (mergedRef != null && mergedRef.bindings[0] < baseBindings.size()) {
+                    Column source = baseBindings.get(mergedRef.bindings[0]).table()
+                            .getColumns().get(mergedRef.columns[0]);
+                    resultColumns.add(new Column(alias, mergedRef.type, source.isNullable(),
+                            false, null));
+                    projections.add(ctx -> executor.evalExpr(expr, ctx));
+                    if (srfProjections != null && isSrfCall(target.expr())) {
+                        for (int pi = projectionStart; pi < projections.size(); pi++) srfProjections.add(pi);
+                    }
+                    continue;
+                }
                 if (expr instanceof ColumnRef && ((ColumnRef) expr).column() != null) {
                     ColumnRef cr = (ColumnRef) expr;
                     for (RowContext.TableBinding b : baseBindings) {
@@ -1280,6 +1301,34 @@ class SelectExecutor {
             return fields;
         }
         return value instanceof RecordValue ? ((RecordValue) value).valueAt(fieldIdx) : null;
+    }
+
+    /**
+     * The merged output column an unqualified reference names, when the FROM clause has one whose
+     * type is not the type of the relation column behind it. A qualified reference names one
+     * relation's own column and is not the merge.
+     */
+    private static RowContext.OutCol mergedOutCol(Expression expr, List<RowContext.OutCol> output) {
+        if (output == null) return null;
+        if (!(expr instanceof ColumnRef)) return null;
+        ColumnRef ref = (ColumnRef) expr;
+        if (ref.table() != null || ref.column() == null) return null;
+        RowContext.OutCol hit = null;
+        for (RowContext.OutCol oc : output) {
+            if (!oc.name.equalsIgnoreCase(ref.column())) continue;
+            if (hit != null) return null;
+            hit = oc;
+        }
+        return hit != null && hit.type != null ? hit : null;
+    }
+
+    /** The same column described with the type a join's merge resolved for it, where it has one. */
+    private static Column mergedColumnType(RowContext.OutCol oc, Column column) {
+        if (oc.type == null) return column;
+        Column merged = new Column(column.getName(), oc.type, column.isNullable(), false, null);
+        merged.setTableOid(column.getTableOid());
+        merged.setAttNum(column.getAttNum());
+        return merged;
     }
 
     /** Copy a column from a table, setting tableOid and attNum for RowDescription metadata. */
@@ -1540,8 +1589,8 @@ class SelectExecutor {
             }
             Object[] values = valuesList.toArray();
             if (!srfMap.isEmpty()) {
-                return QueryResult.select(columns,
-                        applyOffsetAndLimit(stmt, expandSrfRows(values, srfMap)));
+                return QueryResult.select(columns, applyOffsetAndLimit(stmt,
+                        applyDistinct(stmt, expandSrfRows(values, srfMap))));
             }
             List<Object[]> rows = new ArrayList<>();
             rows.add(values);
@@ -1621,8 +1670,12 @@ class SelectExecutor {
                     return 0;
                 });
             }
-            // Apply OFFSET + LIMIT
-            return QueryResult.select(columns, applyOffsetAndLimit(stmt, rows));
+            // DISTINCT reads the rows the query answers with, and a set-returning target is what
+            // produced them: PostgreSQL expands the set and then folds the duplicates, so
+            // SELECT DISTINCT unnest(ARRAY[1,1,2]) answers two rows. Skipping this pass left the
+            // duplicate the expansion had just created.
+            return QueryResult.select(columns,
+                    applyOffsetAndLimit(stmt, applyDistinct(stmt, rows)));
         }
 
         // A row list of one still has to honour LIMIT and OFFSET; skipping that made LIMIT 0
@@ -1665,7 +1718,7 @@ class SelectExecutor {
      * read once for the whole query. PG also refuses one buried in a conditional, since which
      * arm's rows it would produce is undecidable.
      */
-    private static void rejectMisplacedSrfs(SelectStmt stmt) {
+    private void rejectMisplacedSrfs(SelectStmt stmt) {
         rejectSrfIn(stmt.where(), "WHERE");
         rejectSrfIn(stmt.having(), "HAVING");
         rejectSrfIn(stmt.limit(), "LIMIT");
@@ -1682,7 +1735,7 @@ class SelectExecutor {
     }
 
     /** Refuses a set-returning call written in a clause that reads rows already produced. */
-    static void rejectSrfIn(Expression expr, String clause) {
+    void rejectSrfIn(Expression expr, String clause) {
         if (expr == null) return;
         List<FunctionCallExpr> found = collectSrfCalls(expr);
         if (!found.isEmpty()) throw misplacedSrf(clause, found.get(0));
@@ -1692,7 +1745,7 @@ class SelectExecutor {
      * FILTER selects which rows an aggregate accumulates, so only an aggregate may carry one.
      * PostgreSQL names the function rather than the clause, because what is wrong is the call.
      */
-    private static void rejectSrfInFilter(Expression expr) {
+    private void rejectSrfInFilter(Expression expr) {
         Object found = AstWalk.findFirst(expr, node -> node instanceof FunctionCallExpr
                 && ((FunctionCallExpr) node).filter() != null
                 && SRF_FUNCTIONS.contains(FunctionEvaluator.stripSchemaPrefix(
@@ -1712,7 +1765,7 @@ class SelectExecutor {
      * among them, which is an AND once written out). An SRF elsewhere in the same constructs --
      * a CASE operand or result -- is the placement rule again and reported so.
      */
-    private static void rejectSrfWhereOneBooleanIsWanted(Expression expr) {
+    private void rejectSrfWhereOneBooleanIsWanted(Expression expr) {
         Object found = AstWalk.findFirst(expr, node -> {
             if (node instanceof CaseExpr) {
                 for (CaseExpr.WhenClause when : ((CaseExpr) node).whenClauses()) {
@@ -1779,7 +1832,7 @@ class SelectExecutor {
         return null;
     }
 
-    private static void rejectSrfsInJoinConditions(List<SelectStmt.FromItem> fromItems) {
+    private void rejectSrfsInJoinConditions(List<SelectStmt.FromItem> fromItems) {
         if (fromItems == null) return;
         for (SelectStmt.FromItem item : fromItems) {
             if (!(item instanceof SelectStmt.JoinFrom)) continue;
@@ -1934,7 +1987,7 @@ class SelectExecutor {
     }
 
     private void addExposed(Map<String, SelectStmt.FromItem> exposed, SelectStmt.FromItem item) {
-        String name = exposedName(item);
+        String name = exposedNameOf(item);
         if (name == null) return;
         SelectStmt.FromItem prior = exposed.put(name.toLowerCase(), item);
         if (prior != null && !separateRelationsOfOneName(prior, item)) {
@@ -1962,7 +2015,32 @@ class SelectExecutor {
     }
 
     /** The name a FROM item answers to: its alias, or failing that the relation's own name. */
-    private static String exposedName(SelectStmt.FromItem item) {
+    /**
+     * What a qualifier the FROM clause does not answer to is.
+     *
+     * <p>A name nothing in the query has is missing. A name the FROM clause holds but has covered
+     * over — the relations under {@code (a JOIN b) AS j}, which answer to {@code j} and to nothing
+     * else — is there and out of reach, and PostgreSQL says which of the two it is. Reporting the
+     * second as missing sent the reader looking for a relation they had written down.
+     */
+    private static MemgresException outOfScopeOrMissing(String qualifier,
+                                                        List<SelectStmt.FromItem> from) {
+        Set<String> covered = new LinkedHashSet<>();
+        if (from != null) {
+            for (SelectStmt.FromItem item : from) FromResolver.collectCoveredNames(item, covered);
+        }
+        if (!covered.contains(qualifier.toLowerCase())) {
+            return new MemgresException(
+                    "missing FROM-clause entry for table \"" + qualifier + "\"", "42P01");
+        }
+        MemgresException e = new MemgresException(
+                "invalid reference to FROM-clause entry for table \"" + qualifier + "\"", "42P01");
+        e.setDetail("There is an entry for table \"" + qualifier
+                + "\", but it cannot be referenced from this part of the query.");
+        return e;
+    }
+
+    static String exposedNameOf(SelectStmt.FromItem item) {
         String name = null;
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef t = (SelectStmt.TableRef) item;
@@ -2023,7 +2101,7 @@ class SelectExecutor {
     }
 
     /** The first qualified reference under {@code node} naming one of {@code names}, or null. */
-    private static String firstReferenceTo(Object node, Set<String> names) {
+    static String firstReferenceTo(Object node, Set<String> names) {
         Set<String> outer = new HashSet<>(names);
         if (node instanceof SelectStmt) {
             // A name the item re-uses for its own FROM entry shadows the outer one
@@ -2031,7 +2109,7 @@ class SelectExecutor {
             List<SelectStmt.FromItem> from = ((SelectStmt) node).from();
             if (from != null) {
                 for (SelectStmt.FromItem f : from) {
-                    String n = exposedName(f);
+                    String n = exposedNameOf(f);
                     if (n != null) own.put(n.toLowerCase(), n);
                 }
             }
@@ -2087,7 +2165,7 @@ class SelectExecutor {
             FunctionCallExpr fc = (FunctionCallExpr) node;
             if (isAggregateFunction(fc.name())) {
                 for (Expression arg : fc.args()) {
-                    if (containsSrf(arg) || containsUserSrf(arg)) {
+                    if (containsSrf(arg)) {
                         MemgresException e = new MemgresException(
                                 "aggregate function calls cannot contain set-returning function calls", "0A000");
                         e.setHint("You might be able to move the set-returning function "
@@ -2182,7 +2260,7 @@ class SelectExecutor {
     }
 
     /** The conditional construct hiding an SRF in this expression, and the call, or null. */
-    private static MemgresException conditionalHidingSrf(Expression expr) {
+    private MemgresException conditionalHidingSrf(Expression expr) {
         Object found = AstWalk.findFirst(expr, node -> {
             if (node instanceof CaseExpr) return containsSrf(node);
             if (node instanceof FunctionCallExpr) {
@@ -2207,7 +2285,7 @@ class SelectExecutor {
      * One inside a nested query belongs to that query, so {@code WHERE x IN (SELECT
      * generate_series(1,2))} is not a set-returning call in WHERE.
      */
-    static boolean containsSrf(Object node) {
+    boolean containsSrf(Object node) {
         return !collectSrfCalls(node).isEmpty();
     }
 
@@ -2231,7 +2309,7 @@ class SelectExecutor {
      * Only used to decide whether the expanding evaluation path is needed at all;
      * {@link #collectSrfCalls} is what the expansion itself works from.
      */
-    static FunctionCallExpr findSrfCall(Expression expr) {
+    FunctionCallExpr findSrfCall(Expression expr) {
         List<FunctionCallExpr> found = collectSrfCalls(expr);
         return found.isEmpty() ? null : found.get(0);
     }
@@ -2246,21 +2324,40 @@ class SelectExecutor {
      * query, whose set-returning calls produce that query's rows and not this one's --
      * {@code WHERE x IN (SELECT generate_series(1,2))} is ordinary SQL.
      */
-    static List<FunctionCallExpr> collectSrfCalls(Object node) {
+    List<FunctionCallExpr> collectSrfCalls(Object node) {
         List<FunctionCallExpr> found = new ArrayList<>();
         collectSrfCalls(node, found);
         return found;
     }
 
-    private static void collectSrfCalls(Object node, List<FunctionCallExpr> out) {
+    private void collectSrfCalls(Object node, List<FunctionCallExpr> out) {
         if (node == null || node instanceof Statement) return;
-        if (node instanceof FunctionCallExpr
-                && SRF_FUNCTIONS.contains(FunctionEvaluator.stripSchemaPrefix(
-                        ((FunctionCallExpr) node).name().toLowerCase()))) {
+        if (node instanceof FunctionCallExpr && isSetReturningCall((FunctionCallExpr) node)) {
             out.add((FunctionCallExpr) node);
             return;
         }
         AstWalk.forEachChild(node, child -> collectSrfCalls(child, out));
+    }
+
+    /**
+     * True when a call answers a set: one of the built-in set-returning functions, or a function
+     * this database was told about that was declared {@code RETURNS SETOF} or {@code RETURNS
+     * TABLE}.
+     *
+     * <p>A declared one is the same kind of call as {@code generate_series} and PostgreSQL treats
+     * it the same way everywhere -- it expands in a select list, and it is refused in the clauses
+     * that read rows already produced. Recognising only the built-in names left
+     * {@code SELECT setof_fn()} answering one row holding the whole set rendered as an array.
+     *
+     * <p>One returning bare {@code record} is left out: its columns have no names until a caller
+     * supplies them, and a call written without them fails on the column before the set.
+     */
+    boolean isSetReturningCall(FunctionCallExpr call) {
+        String name = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase());
+        if (SRF_FUNCTIONS.contains(name)) return true;
+        if (executor.database == null) return false;
+        PgFunction declared = executor.database.getFunction(name);
+        return declared != null && declared.isSetReturning() && !declared.declaresRecordResult();
     }
 
     /**
@@ -2346,6 +2443,23 @@ class SelectExecutor {
      * expanded. A sort key that is also a select target is left alone: the projection expands
      * that one, and expanding it here as well would multiply the rows twice over.
      */
+    /**
+     * The rows DISTINCT ON groups, once a set-returning call written only in a DISTINCT ON key has
+     * been expanded. PostgreSQL expands the sets of a query below the DISTINCT, so the key it
+     * groups on is an ordinary value per row: {@code SELECT DISTINCT ON (generate_series(1,2)) a
+     * FROM two_rows} has four rows to choose from and answers two. A key that is also a select
+     * target is left alone, since the projection expands that one.
+     */
+    private List<RowContext> expandContextsForDistinctOnSrfs(SelectStmt stmt, List<RowContext> contexts) {
+        List<Expression> keys = new ArrayList<>();
+        for (Expression on : stmt.distinctOn()) {
+            if (!containsSrf(on)) continue;
+            if (resolveOrderByToColumnIndex(on, stmt.targets()) >= 0) continue;
+            keys.add(on);
+        }
+        return keys.isEmpty() ? contexts : expandContextsForSrfs(keys, contexts);
+    }
+
     private List<RowContext> expandContextsForOrderBySrfs(SelectStmt stmt, List<RowContext> contexts) {
         if (stmt.orderBy() == null || stmt.orderBy().isEmpty()) return contexts;
         List<Expression> keys = new ArrayList<>();

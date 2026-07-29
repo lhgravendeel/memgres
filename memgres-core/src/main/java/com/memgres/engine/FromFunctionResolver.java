@@ -46,10 +46,20 @@ class FromFunctionResolver {
         // A FROM item is what the query reads, so its arguments are settled before there is any
         // row to group or to number. PostgreSQL says so before it even looks the function up,
         // and a TABLESAMPLE percentage — carried here as a function item — is the same clause.
+        boolean spelledConstruct = funcFrom.functionName().startsWith("__");
         for (Expression arg : funcFrom.args()) {
             executor.selectExecutor.placementCheck.reject(arg, "functions in FROM");
+            // A FROM item's own call produces the rows; one nested in its arguments would have to
+            // produce them for it, and PostgreSQL says where a set-returning call may stand
+            // instead. The spelled-out constructs -- ROWS FROM, JSON_TABLE, XMLTABLE, TABLESAMPLE
+            // -- carry their items as arguments, and those items are at top level.
+            if (!spelledConstruct && executor.selectExecutor.containsSrf(arg)) {
+                throw new MemgresException(
+                        "set-returning functions must appear at top level of FROM", "0A000");
+            }
         }
-        List<RowContext> contexts = doResolveFunctionFrom(funcFrom);
+        rejectOrdinalityWithColumnDefinitionList(funcFrom);
+        List<RowContext> contexts = appendOrdinality(funcFrom, doResolveFunctionFrom(funcFrom));
         checkColumnAliasCount(funcFrom, contexts);
         // TABLESAMPLE binds the real stored table; never flag persistent tables.
         if (!funcFrom.functionName().toLowerCase().startsWith("__tablesample__:")) {
@@ -60,6 +70,64 @@ class FromFunctionResolver {
             }
         }
         return contexts;
+    }
+
+    /**
+     * The ordinality column, added once for every function rather than by each function for
+     * itself.
+     *
+     * <p>WITH ORDINALITY numbers the rows a FROM item produced, whatever produced them, so it is
+     * the same column in every case: one bigint counting from 1, named by the alias after the
+     * last of the function's own columns or {@code ordinality} when there is none. Each resolver
+     * used to add it on its own account, which meant the ones that had never been asked about it
+     * — {@code string_to_table}, {@code regexp_split_to_table}, {@code json_object_keys},
+     * {@code generate_subscripts}, {@code regexp_matches}, a function returning TABLE — silently
+     * dropped the column, and the alias list that named it then had one name too many for the
+     * columns that were left.
+     */
+    private List<RowContext> appendOrdinality(SelectStmt.FunctionFrom funcFrom,
+                                              List<RowContext> contexts) {
+        if (!funcFrom.withOrdinality() || contexts.isEmpty()) return contexts;
+        List<RowContext.TableBinding> first = contexts.get(0).getBindings();
+        if (first.isEmpty()) return contexts;
+        Table source = first.get(0).table();
+        String bindAlias = first.get(0).alias();
+        List<Column> base = source.getColumns();
+        List<Column> cols = new ArrayList<>(base);
+        List<String> aliases = funcFrom.columnAliases();
+        String ordName = aliases != null && aliases.size() > base.size()
+                ? stripColType(aliases.get(base.size())) : "ordinality";
+        cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
+        Table numbered = new Table(source.getName(), cols);
+        List<Object[]> rows = new ArrayList<>();
+        List<RowContext> out = new ArrayList<>();
+        long ord = 1;
+        for (RowContext ctx : contexts) {
+            List<RowContext.TableBinding> bindings = ctx.getBindings();
+            Object[] src = bindings.isEmpty() ? new Object[0] : bindings.get(0).row();
+            Object[] row = new Object[cols.size()];
+            for (int i = 0; i < base.size(); i++) row[i] = i < src.length ? src[i] : null;
+            row[base.size()] = ord++;
+            rows.add(row);
+            out.add(new RowContext(numbered, bindAlias, row));
+        }
+        numbered.replaceAllRows(rows);
+        return out;
+    }
+
+    /**
+     * WITH ORDINALITY and a column definition list describe the same alias list two ways — the
+     * definition list says what the columns are and the ordinality column is one more than that —
+     * so PostgreSQL refuses the pair and points at the spelling that can express both.
+     */
+    private static void rejectOrdinalityWithColumnDefinitionList(SelectStmt.FunctionFrom funcFrom) {
+        if (!funcFrom.withOrdinality()) return;
+        if (funcFrom.functionName().startsWith("__")) return;
+        if (!hasColumnDefinitionList(funcFrom.columnAliases())) return;
+        MemgresException e = PgErrors.syntax(
+                "WITH ORDINALITY cannot be used with a column definition list");
+        e.setHint("Put the column definition list inside ROWS FROM().");
+        throw e;
     }
 
     /**
@@ -93,20 +161,20 @@ class FromFunctionResolver {
         if (SINGLE_VALUE_SRFS.contains(fname) && hasColumnDefinitionList(rawColAliases)) {
             throw onlyForRecord();
         }
+        checkBuiltinColumnDefinitionList(fname, rawColAliases);
         List<Object> evalArgs = new ArrayList<>();
         for (Expression arg : funcFrom.args()) {
             evalArgs.add(executor.evalExpr(arg, null));
         }
-        if (fname.equals("generate_series")) return resolveGenerateSeries(alias, colAliases, evalArgs, funcFrom.withOrdinality());
+        if (fname.equals("generate_series")) return resolveGenerateSeries(alias, colAliases, evalArgs);
         if (fname.equals("generate_subscripts")) return resolveGenerateSubscripts(alias, colAliases, evalArgs);
         if (fname.equals("pg_indexam_has_property")) return resolvePgIndexamHasProperty(alias, evalArgs);
         if (fname.equals("pg_available_extension_versions")) return resolvePgAvailableExtensionVersions(alias);
         if (fname.equals("pg_show_all_settings")) return resolvePgShowAllSettings(alias);
-        if (fname.equals("unnest")) return resolveUnnest(alias, colAliases, evalArgs,
-                funcFrom.withOrdinality(), funcFrom.args());
+        if (fname.equals("unnest")) return resolveUnnest(alias, colAliases, evalArgs, funcFrom.args());
         if (fname.equals("_pg_expandarray")) return resolveExpandArray(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
-            return resolveJsonEach(fname, alias, colAliases, evalArgs, funcFrom.withOrdinality());
+            return resolveJsonEach(fname, alias, colAliases, evalArgs);
         if (fname.equals("jsonb_to_recordset") || fname.equals("json_to_recordset") || fname.equals("jsonb_to_record") || fname.equals("json_to_record"))
             return resolveJsonToRecordset(alias, rawColAliases, evalArgs);
         if (fname.equals("json_populate_recordset") || fname.equals("jsonb_populate_recordset")
@@ -151,7 +219,7 @@ class FromFunctionResolver {
         if (userFunc != null) {
             checkRecordColumnDefinitionList(userFunc, funcFrom);
             // Raw, not stripped: a column definition list gives the columns their types too.
-            return resolveUserFunction(userFunc, alias, rawColAliases, evalArgs, funcFrom.withOrdinality());
+            return resolveUserFunction(userFunc, alias, rawColAliases, evalArgs);
         }
 
         return resolveScalarFunctionInFrom(funcFrom, fname, alias, colAliases);
@@ -186,6 +254,39 @@ class FromFunctionResolver {
         }
         if (definitionList) throw onlyForRecord();
     }
+
+    /**
+     * The same question {@link #checkRecordColumnDefinitionList} asks of a declared function, asked
+     * of a built-in one.
+     *
+     * <p>Two named sets rather than a rule, because what a built-in's signature says is not
+     * something this engine records: {@code json_each} declares its {@code key} and {@code value}
+     * as OUT parameters and a list describing them again is redundant, while {@code json_to_record}
+     * returns bare {@code record} and cannot answer without one. Every name here was measured
+     * against PostgreSQL; a built-in on neither list keeps whatever it accepted before.
+     */
+    private static void checkBuiltinColumnDefinitionList(String fname, List<String> rawColAliases) {
+        boolean definitionList = hasColumnDefinitionList(rawColAliases);
+        if (RECORD_RESULT_SRFS.contains(fname)) {
+            if (!definitionList) {
+                throw PgErrors.syntax(
+                        "a column definition list is required for functions returning \"record\"");
+            }
+            return;
+        }
+        if (definitionList && OUT_PARAM_SRFS.contains(fname)) {
+            throw PgErrors.syntax(
+                    "a column definition list is redundant for a function with OUT parameters");
+        }
+    }
+
+    /** Built-ins that return bare {@code record} and so have to be told what their columns are. */
+    private static final Set<String> RECORD_RESULT_SRFS = new HashSet<>(Arrays.asList(
+            "json_to_record", "jsonb_to_record", "json_to_recordset", "jsonb_to_recordset"));
+
+    /** Built-ins whose own signature already names their columns. */
+    private static final Set<String> OUT_PARAM_SRFS = new HashSet<>(Arrays.asList(
+            "json_each", "json_each_text", "jsonb_each", "jsonb_each_text", "each"));
 
     private static MemgresException onlyForRecord() {
         return PgErrors.syntax(
@@ -264,15 +365,7 @@ class FromFunctionResolver {
         DataType type = value == null ? DataType.TEXT : TypeCoercion.inferType(value);
         List<Column> cols = new ArrayList<>();
         cols.add(new Column(firstColAlias(colAliases, alias), type, true, false, null));
-        Object[] row;
-        if (funcFrom.withOrdinality()) {
-            String ordName = colAliases != null && colAliases.size() > 1
-                    ? stripColType(colAliases.get(1)) : "ordinality";
-            cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
-            row = new Object[]{value, 1L};
-        } else {
-            row = new Object[]{value};
-        }
+        Object[] row = new Object[]{value};
         Table virtualTable = new Table(alias, cols);
         virtualTable.insertRow(row);
         List<RowContext> contexts = new ArrayList<>();
@@ -282,13 +375,7 @@ class FromFunctionResolver {
 
     // ---- generate_series ----
 
-    private List<RowContext> resolveGenerateSeries(String alias, List<String> colAliases, List<Object> evalArgs,
-                                                   boolean withOrdinality) {
-        // WITH ORDINALITY is what adds the second column. Inferring it from a second alias
-        // instead invented a column to hang the alias on, so an alias list too long for the
-        // function silently succeeded where PostgreSQL says how many columns are available.
-        boolean hasOrdinality = withOrdinality;
-        String ordColName = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "ordinality";
+    private List<RowContext> resolveGenerateSeries(String alias, List<String> colAliases, List<Object> evalArgs) {
         Object stepObj = evalArgs.size() > 2 ? evalArgs.get(2) : null;
         // A zero step can never reach the stop value, so PG rejects it rather than looping
         if (stepObj instanceof Number && ((Number) stepObj).doubleValue() == 0.0) {
@@ -307,18 +394,14 @@ class FromFunctionResolver {
             String colName = firstColAlias(colAliases, alias);
             List<Column> cols = new ArrayList<>();
             cols.add(new Column(colName, DataType.TIMESTAMPTZ, true, false, null));
-            if (hasOrdinality) {
-                cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
-            }
             Table virtualTable = new Table(alias, cols);
             List<Object[]> rows = new ArrayList<>();
             List<RowContext> contexts = new ArrayList<>();
             java.time.OffsetDateTime cur = tzStart;
-            long ord = 1;
             for (long guard = 0; guard < MAX_SERIES_ROWS; guard++) {
                 if ((guard & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (ascending ? cur.isAfter(tzStop) : cur.isBefore(tzStop)) break;
-                Object[] row = hasOrdinality ? new Object[]{cur, ord++} : new Object[]{cur};
+                Object[] row = new Object[]{cur};
                 rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
                 java.time.OffsetDateTime next = ivStep.addTo(cur);
@@ -341,19 +424,15 @@ class FromFunctionResolver {
             // DATE input → timestamptz (PG promotes), TIMESTAMP input → timestamp
             List<Column> cols = new ArrayList<>();
             cols.add(new Column(colName, dateInput ? DataType.TIMESTAMPTZ : DataType.TIMESTAMP, true, false, null));
-            if (hasOrdinality) {
-                cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
-            }
             Table virtualTable = new Table(alias, cols);
             List<Object[]> rows = new ArrayList<>();
             List<RowContext> contexts = new ArrayList<>();
             java.time.LocalDateTime cur = dtStart;
-            long ord = 1;
             for (long guard = 0; guard < MAX_SERIES_ROWS; guard++) {
                 if ((guard & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (ascending ? cur.isAfter(dtStop) : cur.isBefore(dtStop)) break;
                 Object val = dateInput ? cur.atZone(java.time.ZoneOffset.UTC).toOffsetDateTime() : cur;
-                Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
+                Object[] row = new Object[]{val};
                 rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
                 java.time.LocalDateTime next = ivStep.addTo(cur);
@@ -375,14 +454,10 @@ class FromFunctionResolver {
             String numColName = firstColAlias(colAliases, alias);
             List<Column> numCols = new ArrayList<>();
             numCols.add(new Column(numColName, DataType.NUMERIC, true, false, null));
-            if (hasOrdinality) {
-                numCols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
-            }
             Table numTable = new Table(alias, numCols);
             List<Object[]> numRows = new ArrayList<>();
             List<RowContext> numContexts = new ArrayList<>();
             boolean up = nStep.signum() > 0;
-            long numOrd = 1;
             long numProduced = 0;
             // Accumulate with add() so each value keeps PG's growing scale (1.0, 1.25, 1.50, ...)
             for (java.math.BigDecimal v = nStart;
@@ -390,7 +465,7 @@ class FromFunctionResolver {
                  v = v.add(nStep)) {
                 if ((numProduced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (numRows.size() >= MAX_SERIES_ROWS) throw seriesTooLarge();
-                Object[] row = hasOrdinality ? new Object[]{v, numOrd++} : new Object[]{v};
+                Object[] row = new Object[]{v};
                 numRows.add(row);
                 numContexts.add(new RowContext(numTable, alias, row));
             }
@@ -407,16 +482,21 @@ class FromFunctionResolver {
         long stop = executor.toLong(evalArgs.get(1));
         long step = evalArgs.size() > 2 ? executor.toLong(evalArgs.get(2)) : 1;
 
+        // PostgreSQL declares generate_series over int4 and over int8, and picks the int8 one as
+        // soon as an argument is already a bigint -- so the rows it answers are bigints too, and
+        // calling them int4 made the driver read a column PostgreSQL describes as int8.
+        DataType seriesType = DataType.INTEGER;
+        for (Object seriesArg : evalArgs) {
+            if (seriesArg instanceof Long || seriesArg instanceof java.math.BigInteger) {
+                seriesType = DataType.BIGINT;
+            }
+        }
         String colName = firstColAlias(colAliases, alias);
         List<Column> cols = new ArrayList<>();
-        cols.add(new Column(colName, DataType.INTEGER, true, false, null));
-        if (hasOrdinality) {
-            cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
-        }
+        cols.add(new Column(colName, seriesType, true, false, null));
         Table virtualTable = new Table(alias, cols);
         List<Object[]> rows = new ArrayList<>();
         List<RowContext> contexts = new ArrayList<>();
-        long ord = 1;
         long produced = 0;
         if (step != 0) {
             boolean ascending = step > 0;
@@ -424,8 +504,10 @@ class FromFunctionResolver {
             while (ascending ? v <= stop : v >= stop) {
                 if ((produced++ & CANCEL_POLL_MASK) == 0) StatementCancel.check();
                 if (rows.size() >= MAX_SERIES_ROWS) throw seriesTooLarge();
-                Object val = (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE) ? (int) v : v;
-                Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
+                Object val = seriesType == DataType.BIGINT ? (Object) Long.valueOf(v)
+                        : (v >= Integer.MIN_VALUE && v <= Integer.MAX_VALUE)
+                                ? (Object) Integer.valueOf((int) v) : (Object) Long.valueOf(v);
+                Object[] row = new Object[]{val};
                 rows.add(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
                 long next = v + step;
@@ -727,7 +809,7 @@ class FromFunctionResolver {
     // ---- unnest ----
 
     private List<RowContext> resolveUnnest(String alias, List<String> colAliases, List<Object> evalArgs,
-                                           boolean withOrdinality, List<Expression> argExprs) {
+                                           List<Expression> argExprs) {
         // unnest is declared three times over -- anyarray, anymultirange and tsvector -- so an
         // argument with no type of its own fits all three equally and PostgreSQL will not choose.
         if (argExprs != null && argExprs.size() == 1 && evalArgs.size() == 1
@@ -741,7 +823,7 @@ class FromFunctionResolver {
             throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
         }
         if (evalArgs.size() > 1) {
-            return resolveMultiUnnest(alias, colAliases, evalArgs, withOrdinality, argExprs);
+            return resolveMultiUnnest(alias, colAliases, evalArgs, argExprs);
         }
         // Single array/multirange unnest
         Object arr = evalArgs.get(0);
@@ -769,18 +851,10 @@ class FromFunctionResolver {
         DataType elementType = argExprs == null || argExprs.isEmpty() ? null
                 : DataType.elementOf(inferInOuterScope(argExprs.get(0)));
         cols.add(new Column(colName, elementType != null ? elementType : DataType.TEXT, true, false, null));
-        // The WITH ORDINALITY clause decides; a short alias list just leaves the extra
-        // column with its default name rather than dropping it
-        boolean hasOrdinality = withOrdinality;
-        String ordColName = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "ordinality";
-        if (hasOrdinality) {
-            cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
-        }
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
-        long ord = 1;
         for (Object elem : elements) {
-            Object[] row = hasOrdinality ? new Object[]{elem, ord++} : new Object[]{elem};
+            Object[] row = new Object[]{elem};
             virtualTable.insertRow(row);
             contexts.add(new RowContext(virtualTable, alias, row));
         }
@@ -788,7 +862,7 @@ class FromFunctionResolver {
     }
 
     private List<RowContext> resolveMultiUnnest(String alias, List<String> colAliases, List<Object> evalArgs,
-                                                boolean withOrdinality, List<Expression> argExprs) {
+                                                List<Expression> argExprs) {
         List<List<Object>> allElements = new ArrayList<>();
         int maxLen = 0;
         for (Object arr : evalArgs) {
@@ -807,11 +881,6 @@ class FromFunctionResolver {
                     ? DataType.elementOf(executor.exprEvaluator.inferExprType(argExprs.get(i))) : null;
             cols.add(new Column(cname, elementType != null ? elementType : DataType.TEXT, true, false, null));
         }
-        boolean hasOrdinality = withOrdinality;
-        String ordColName = (colAliases != null && colAliases.size() > evalArgs.size())
-                ? colAliases.get(evalArgs.size()) : "ordinality";
-        if (hasOrdinality) cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
-
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
         for (int row = 0; row < maxLen; row++) {
@@ -819,7 +888,6 @@ class FromFunctionResolver {
             for (int c = 0; c < allElements.size(); c++) {
                 rowData[c] = row < allElements.get(c).size() ? allElements.get(c).get(row) : null;
             }
-            if (hasOrdinality) rowData[allElements.size()] = (long)(row + 1);
             virtualTable.insertRow(rowData);
             contexts.add(new RowContext(virtualTable, alias, rowData));
         }
@@ -829,7 +897,7 @@ class FromFunctionResolver {
     // ---- jsonb_each / json_each ----
 
     private List<RowContext> resolveJsonEach(String fname, String alias, List<String> colAliases,
-                                             List<Object> evalArgs, boolean withOrdinality) {
+                                             List<Object> evalArgs) {
         Object jsonVal = evalArgs.get(0);
         boolean isText = fname.contains("_text");
         String keyCol = (colAliases != null && colAliases.size() >= 1) ? colAliases.get(0) : "key";
@@ -841,11 +909,6 @@ class FromFunctionResolver {
         List<Column> cols = new ArrayList<>();
         cols.add(new Column(keyCol, DataType.TEXT, true, false, null));
         cols.add(new Column(valCol, valType, true, false, null));
-        if (withOrdinality) {
-            String ordName = (colAliases != null && colAliases.size() >= 3)
-                    ? colAliases.get(2) : "ordinality";
-            cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
-        }
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
         if (jsonVal != null) {
@@ -853,16 +916,12 @@ class FromFunctionResolver {
             JsonFunctions.requireJsonEachObject(fname, json);
             try {
                 Map<String, String> pairs = JsonFunctions.eachMembers(fname, json);
-                long ordinal = 0;
                 for (Map.Entry<String, String> entry : pairs.entrySet()) {
                     String value = entry.getValue();
                     if (isText && value != null && value.startsWith("\"") && value.endsWith("\"")) {
                         value = value.substring(1, value.length() - 1);
                     }
-                    ordinal++;
-                    Object[] row = withOrdinality
-                            ? new Object[]{entry.getKey(), value, ordinal}
-                            : new Object[]{entry.getKey(), value};
+                    Object[] row = new Object[]{entry.getKey(), value};
                     virtualTable.insertRow(row);
                     contexts.add(new RowContext(virtualTable, alias, row));
                 }
@@ -1147,24 +1206,22 @@ class FromFunctionResolver {
         Object json = evalArgs.get(0);
         boolean textMode = fname.endsWith("_text");
         String colName = firstColAlias(colAliases, "value");
-        DataType dt = textMode ? DataType.TEXT : DataType.JSONB;
-        boolean hasOrdinality = colAliases != null && colAliases.size() >= 2;
+        // json_array_elements answers json and jsonb_array_elements answers jsonb; calling both
+        // jsonb described a json column as one the driver would have read differently.
+        DataType dt = textMode ? DataType.TEXT
+                : fname.startsWith("jsonb") ? DataType.JSONB : DataType.JSON;
         List<Column> cols = new ArrayList<>();
         cols.add(new Column(colName, dt, true, false, null));
-        if (hasOrdinality) {
-            cols.add(new Column(colAliases.get(1), DataType.BIGINT, true, false, null));
-        }
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
         if (json != null) {
             String s = json.toString().trim();
             JsonFunctions.requireJsonArray(fname, s);
             List<String> elements = JsonOperations.parseArrayElements(s);
-            long ord = 1;
             for (String elem : elements) {
                 String val = elem.trim();
                 if (textMode) val = JsonOperations.jsonValueToText(val);
-                Object[] row = hasOrdinality ? new Object[]{val, ord++} : new Object[]{val};
+                Object[] row = new Object[]{val};
                 virtualTable.insertRow(row);
                 contexts.add(new RowContext(virtualTable, alias, row));
             }
@@ -1365,7 +1422,6 @@ class FromFunctionResolver {
             maxLen = Math.max(maxLen, subRows.size());
         }
 
-        boolean hasOrdinality = funcFrom.withOrdinality();
         List<String> ca = funcFrom.columnAliases();
         if (ca != null) {
             for (int i = 0; i < ca.size() && i < cols.size(); i++) {
@@ -1373,12 +1429,6 @@ class FromFunctionResolver {
                 cols.set(i, new Column(stripColType(ca.get(i)), c.getType(), true, false, null));
             }
         }
-        if (hasOrdinality) {
-            String ordName = ca != null && ca.size() > cols.size()
-                    ? stripColType(ca.get(cols.size())) : "ordinality";
-            cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
-        }
-
         String tblAlias = alias != null ? alias : "rows_from";
         Table virtualTable = new Table(tblAlias, cols);
         List<RowContext> contexts = new ArrayList<>();
@@ -1393,7 +1443,6 @@ class FromFunctionResolver {
                 }
                 at += widths.get(f);
             }
-            if (hasOrdinality) rowData[at] = (long) (row + 1);
             virtualTable.insertRow(rowData);
             contexts.add(new RowContext(virtualTable, tblAlias, rowData));
         }
@@ -1402,7 +1451,7 @@ class FromFunctionResolver {
 
     // ---- User-defined functions ----
 
-    private List<RowContext> resolveUserFunction(PgFunction userFunc, String alias, List<String> colAliases, List<Object> evalArgs, boolean withOrdinality) {
+    private List<RowContext> resolveUserFunction(PgFunction userFunc, String alias, List<String> colAliases, List<Object> evalArgs) {
         // STRICT: return empty set if any argument is NULL (PG returns empty set for strict SRFs)
         if (userFunc.isStrict()) {
             for (Object arg : evalArgs) {
@@ -1522,15 +1571,9 @@ class FromFunctionResolver {
                 if (colAliases != null && !colAliases.isEmpty()) colName = stripColType(colAliases.get(0));
                 cols.add(new Column(colName,
                         scalarSetofType != null ? scalarSetofType : DataType.TEXT, true, false, null));
-                if (withOrdinality) {
-                    String ordName = colAliases != null && colAliases.size() > 1
-                            ? stripColType(colAliases.get(1)) : "ordinality";
-                    cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
-                }
                 virtualTable = new Table(alias, cols);
-                long ord = 1;
                 for (Object val : resultList) {
-                    Object[] row = withOrdinality ? new Object[]{val, ord++} : new Object[]{val};
+                    Object[] row = new Object[]{val};
                     virtualTable.insertRow(row);
                     contexts.add(new RowContext(virtualTable, alias, row));
                 }

@@ -437,18 +437,27 @@ class FromResolver {
                 DataType known = functionResolver.singleColumnType(funcFrom);
                 DataType colType = known != null ? known : DataType.TEXT;
                 List<String> ca = funcFrom.columnAliases();
+                List<Column> cols = new ArrayList<>();
                 if (ca != null && !ca.isEmpty()) {
-                    List<Column> cols = new ArrayList<>();
                     for (String colName : ca) {
                         cols.add(new Column(FromFunctionResolver.stripColType(colName), colType, true, false, null));
                     }
-                    Table virtualTable = new Table(alias, cols);
-                    bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
                 } else {
-                    List<Column> cols = Cols.listOf(new Column(alias, colType, true, false, null));
-                    Table virtualTable = new Table(alias, cols);
-                    bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[1]));
+                    cols.add(new Column(alias, colType, true, false, null));
                 }
+                // WITH ORDINALITY's column is a bigint whether or not the item produced a row to
+                // read the type off, and it is the last one however the aliases named them.
+                if (funcFrom.withOrdinality()) {
+                    if (ca == null || ca.size() < 2) {
+                        cols.add(new Column("ordinality", DataType.BIGINT, true, false, null));
+                    } else {
+                        Column last = cols.get(cols.size() - 1);
+                        cols.set(cols.size() - 1,
+                                new Column(last.getName(), DataType.BIGINT, true, false, null));
+                    }
+                }
+                Table virtualTable = new Table(alias, cols);
+                bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             }
         }
     }
@@ -484,11 +493,107 @@ class FromResolver {
         enclosingWhere = where;
         enclosingHaving = having;
         try {
-            return resolveFromClauseInner(fromItems, where);
+            List<RowContext> resolved = resolveFromClauseInner(fromItems, where);
+            stampCoveredNames(fromItems, resolved);
+            return resolved;
         } finally {
             enclosingWhere = priorWhere;
             enclosingHaving = priorHaving;
         }
+    }
+
+    /**
+     * Tells each row which relations the FROM clause holds but does not answer to, so that a
+     * qualifier naming one of them is reported as out of reach rather than as missing.
+     *
+     * <p>{@code (a JOIN b) AS j} exposes {@code j} and nothing else — {@code a} is written in the
+     * query and cannot be referenced, which is a different mistake from writing a relation that is
+     * not there at all, and PostgreSQL words the two differently.
+     */
+    private static void stampCoveredNames(List<SelectStmt.FromItem> fromItems,
+                                          List<RowContext> resolved) {
+        if (fromItems == null || resolved == null || resolved.isEmpty()) return;
+        Set<String> covered = new LinkedHashSet<>();
+        for (SelectStmt.FromItem item : fromItems) collectCoveredNames(item, covered);
+        if (covered.isEmpty()) return;
+        for (RowContext ctx : resolved) {
+            for (RowContext.TableBinding b : ctx.getBindings()) {
+                covered.remove(b.alias() != null ? b.alias().toLowerCase()
+                        : b.table().getName().toLowerCase());
+            }
+            break;
+        }
+        if (covered.isEmpty()) return;
+        for (RowContext ctx : resolved) ctx.setCoveredNames(covered);
+    }
+
+    /** Every relation name written anywhere in a FROM tree, however it was later renamed. */
+    static void collectCoveredNames(SelectStmt.FromItem item, Set<String> out) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            collectCoveredNames(((SelectStmt.JoinFrom) item).left(), out);
+            collectCoveredNames(((SelectStmt.JoinFrom) item).right(), out);
+            return;
+        }
+        if (item instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+            out.add(ref.alias() != null ? ref.alias().toLowerCase() : ref.table().toLowerCase());
+            return;
+        }
+        // A parenthesized join given an alias is carried as a sub-query over the join itself; the
+        // relations under it are written in the query and covered by that alias.
+        if (item instanceof SelectStmt.SubqueryFrom
+                && ((SelectStmt.SubqueryFrom) item).subquery() instanceof SelectStmt) {
+            SelectStmt inner = (SelectStmt) ((SelectStmt.SubqueryFrom) item).subquery();
+            if (inner.from() != null) {
+                for (SelectStmt.FromItem f : inner.from()) collectCoveredNames(f, out);
+            }
+        }
+    }
+
+    /**
+     * A FROM item that is not LATERAL cannot read the item beside it.
+     *
+     * <p>The relations of one FROM clause are computed side by side, so a sub-select written as one
+     * of them has no row of its neighbour to read — LATERAL is the word that says to compute it
+     * once per such row instead. PostgreSQL says the entry is there but out of reach and names the
+     * word that would bring it into reach; reporting the entry as missing sent the reader looking
+     * for a relation they had written.
+     *
+     * <p>Only a name a sibling actually exposes is reported. A name nothing in the query has is
+     * missing, and PostgreSQL says so.
+     */
+    private void rejectSiblingReferenceWithoutLateral(List<SelectStmt.FromItem> fromItems) {
+        if (fromItems == null || fromItems.size() < 2) return;
+        for (int i = 0; i < fromItems.size(); i++) {
+            SelectStmt.FromItem item = fromItems.get(i);
+            if (!(item instanceof SelectStmt.SubqueryFrom)) continue;
+            SelectStmt.SubqueryFrom sub = (SelectStmt.SubqueryFrom) item;
+            if (sub.lateral()) continue;
+            Set<String> siblings = new LinkedHashSet<>();
+            for (int j = 0; j < fromItems.size(); j++) {
+                if (j != i) collectExposedNames(fromItems.get(j), siblings);
+            }
+            if (siblings.isEmpty()) continue;
+            String referenced = SelectExecutor.firstReferenceTo(sub.subquery(), siblings);
+            if (referenced == null) continue;
+            MemgresException e = new MemgresException(
+                    "invalid reference to FROM-clause entry for table \"" + referenced + "\"", "42P01");
+            e.setDetail("There is an entry for table \"" + referenced
+                    + "\", but it cannot be referenced from this part of the query.");
+            e.setHint("To reference that table, you must mark this subquery with LATERAL.");
+            throw e;
+        }
+    }
+
+    /** Every name a FROM item answers to, at any depth of a join below it. */
+    static void collectExposedNames(SelectStmt.FromItem item, Set<String> out) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            collectExposedNames(((SelectStmt.JoinFrom) item).left(), out);
+            collectExposedNames(((SelectStmt.JoinFrom) item).right(), out);
+            return;
+        }
+        String name = SelectExecutor.exposedNameOf(item);
+        if (name != null) out.add(name);
     }
 
     /**
@@ -508,6 +613,7 @@ class FromResolver {
     }
 
     private List<RowContext> resolveFromClauseInner(List<SelectStmt.FromItem> fromItems, Expression where) {
+        rejectSiblingReferenceWithoutLateral(fromItems);
         if (fromItems.size() == 1) {
             // For single-table queries, try index scan optimization
             if (where != null && fromItems.get(0) instanceof SelectStmt.TableRef) {

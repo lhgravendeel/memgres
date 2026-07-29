@@ -35,6 +35,8 @@ class FromJoinExecutor {
         final String name;
         final RowContext.OutCol left;   // read against the left side's own bindings
         final RowContext.OutCol right;  // read against the right side's own bindings
+        /** The one type both sides are read as, or null when they already share one. */
+        DataType common;
 
         UsingKey(String name, RowContext.OutCol left, RowContext.OutCol right) {
             this.name = name;
@@ -205,6 +207,7 @@ class FromJoinExecutor {
         JoinShape shape = shapeOfJoin(leftOut, leftShape.size(), rightOut, using);
         List<UsingKey> keys = shape.keys;
         rejectUnequatableUsingTypes(keys, leftShape, rightShape);
+        resolveMergedTypes(shape, leftShape, rightShape);
 
         List<RowContext> rows;
         switch (join.joinType()) {
@@ -255,11 +258,79 @@ class FromJoinExecutor {
             DataType l = declaredType(key.left, leftShape);
             DataType r = declaredType(key.right, rightShape);
             if (l == null || r == null) continue;
-            if (isNumericType(l) && isStringType(r) || isStringType(l) && isNumericType(r)) {
-                throw new MemgresException("operator does not exist: " + l.toRegtypeDisplay()
-                        + " = " + r.toRegtypeDisplay(), "42883");
+            String lFamily = familyOf(l);
+            String rFamily = familyOf(r);
+            if (lFamily != null && rFamily != null && !lFamily.equals(rFamily)) {
+                throw noEqualityOperator(l, r);
             }
+            // A type with no equality operator of its own cannot be equated with itself either,
+            // so a USING or NATURAL clause naming such a column has no comparison to make.
+            // Measured one type at a time, because the family is small and guessing at it would
+            // refuse joins PostgreSQL runs.
+            if (l == r && NO_EQUALITY.contains(l)) throw noEqualityOperator(l, r);
         }
+    }
+
+    /**
+     * The types PostgreSQL declares no {@code =} operator for. Each was measured: {@code SELECT *
+     * FROM a NATURAL JOIN b} over a column of this type answers 42883 rather than a row.
+     */
+    private static final Set<DataType> NO_EQUALITY = Collections.unmodifiableSet(
+            new HashSet<>(Arrays.asList(DataType.JSON, DataType.XML, DataType.POINT)));
+
+    private static MemgresException noEqualityOperator(DataType l, DataType r) {
+        return new MemgresException("operator does not exist: " + l.toRegtypeDisplay()
+                + " = " + r.toRegtypeDisplay()
+                + "\n  Hint: No operator matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
+    }
+
+    /**
+     * The one type each merged column is read as, where the two sides did not already share one.
+     *
+     * <p>PostgreSQL resolves a USING or NATURAL join's merged column the way it resolves a UNION's:
+     * one type both inputs convert to, which for the numeric types is the wider of the two. The
+     * merged column is that type and the comparison is made in it — so {@code int JOIN bigint}
+     * exposes a bigint, and {@code int JOIN real} matches 1 against 1.0, which comparing the two
+     * values as they were written did not. The character types keep the left side's, which is what
+     * PostgreSQL answers and what reading the left one already did.
+     *
+     * <p>The merged output columns are the first entries of the shape, one per key, in key order.
+     */
+    private static void resolveMergedTypes(JoinShape shape, List<RowContext.TableBinding> leftShape,
+                                           List<RowContext.TableBinding> rightShape) {
+        if (shape.keys == null) return;
+        for (int i = 0; i < shape.keys.size() && i < shape.output.size(); i++) {
+            UsingKey key = shape.keys.get(i);
+            DataType common = commonNumericType(declaredType(key.left, leftShape),
+                    declaredType(key.right, rightShape));
+            if (common == null) continue;
+            key.common = common;
+            shape.output.set(i, shape.output.get(i).withType(common));
+        }
+    }
+
+    /**
+     * The wider of two numeric types, or null when either is not a numeric type or they are the
+     * same one. The order is PostgreSQL's implicit-conversion ladder through the numeric category,
+     * measured pair by pair rather than reasoned about: int2, int4, int8, numeric, float4, float8.
+     */
+    static DataType commonNumericType(DataType a, DataType b) {
+        if (a == null || b == null || a == b) return null;
+        int ra = numericRank(a);
+        int rb = numericRank(b);
+        if (ra < 0 || rb < 0) return null;
+        return ra >= rb ? a : b;
+    }
+
+    private static int numericRank(DataType t) {
+        if (t == DataType.SMALLINT || t == DataType.SMALLSERIAL) return 0;
+        if (t == DataType.INTEGER || t == DataType.SERIAL) return 1;
+        if (t == DataType.BIGINT || t == DataType.BIGSERIAL) return 2;
+        if (t == DataType.NUMERIC) return 3;
+        if (t == DataType.REAL) return 4;
+        if (t == DataType.DOUBLE_PRECISION) return 5;
+        return -1;
     }
 
     /** The type a side's key column is declared with, or null when it has none worth reading. */
@@ -269,6 +340,25 @@ class FromJoinExecutor {
         if (table.isFunctionResult()) return null;
         if (col.columns[0] >= table.getColumns().size()) return null;
         return table.getColumns().get(col.columns[0]).getType();
+    }
+
+    /**
+     * The category a key column's type belongs to, or null for a type this rule says nothing
+     * about. PostgreSQL declares no {@code =} across two of these categories, and every pair of
+     * the three named here was measured: eleven types joined against each other in both
+     * directions, and the cross-category pairs answered 42883 without exception.
+     *
+     * <p>Anything outside the three keeps whatever it was given. A type this file cannot place is
+     * a type it should not be refusing over.
+     */
+    private static String familyOf(DataType t) {
+        if (isNumericType(t)) return "number";
+        if (isStringType(t)) return "string";
+        if (t == DataType.DATE || t == DataType.TIMESTAMP || t == DataType.TIMESTAMPTZ
+                || t == DataType.TIME || t == DataType.TIMETZ) {
+            return "datetime";
+        }
+        return null;
     }
 
     private static boolean isNumericType(DataType t) {
@@ -803,6 +893,20 @@ class FromJoinExecutor {
             if (leftVal == null) return false;
             Object rightVal = key.right.valueIn(right.getBindings());
             if (rightVal == null) return false;
+            if (key.common != null) {
+                leftVal = TypeCoercion.coerce(leftVal, key.common);
+                rightVal = TypeCoercion.coerce(rightVal, key.common);
+                if (leftVal == null || rightVal == null) return false;
+                if (leftVal instanceof java.math.BigDecimal
+                        && rightVal instanceof java.math.BigDecimal) {
+                    // Two numerics are the same number whatever scale each was widened to.
+                    if (((java.math.BigDecimal) leftVal)
+                            .compareTo((java.math.BigDecimal) rightVal) != 0) {
+                        return false;
+                    }
+                    continue;
+                }
+            }
             if (!Objects.equals(leftVal, rightVal) && !leftVal.toString().equals(rightVal.toString())) {
                 return false;
             }
@@ -880,6 +984,15 @@ class FromJoinExecutor {
         for (UsingKey key : keys) {
             Object val = (leftSide ? key.left : key.right).valueIn(ctx.getBindings());
             if (val == null) return null;
+            // Both sides have to hash on the same reading of the value, or the wider side's rows
+            // land in a bucket the narrower side never looks in.
+            if (key.common != null) {
+                val = TypeCoercion.coerce(val, key.common);
+                if (val == null) return null;
+                if (val instanceof java.math.BigDecimal) {
+                    val = ((java.math.BigDecimal) val).stripTrailingZeros().toPlainString();
+                }
+            }
             if (sb.length() > 0) sb.append('\0');
             sb.append(val.toString());
         }

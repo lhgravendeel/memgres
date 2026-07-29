@@ -1741,6 +1741,9 @@ public final class GeometricOperations {
      * Geometric strings start with '(' for point/box/polygon/closed-path,
      * '[' for lseg/open-path, '<' for circle, '{' for line.
      */
+    /** One coefficient of a line, in any spelling PostgreSQL's float8 input accepts. */
+    private static final String NUMBER = "[-+]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][-+]?\\d+)?";
+
     public static boolean isGeometricString(String s) {
         if (s == null || s.isEmpty()) return false;
         s = s.trim();
@@ -1760,8 +1763,10 @@ public final class GeometricOperations {
             return s.contains("(") && s.endsWith(">");
         }
         if (c == '{') {
-            // line: {A,B,C}, must be numbers only, not JSON
-            return s.matches("\\{\\s*-?[\\d.].*") && !s.contains("\"") && !s.contains(":");
+            // A line is {A,B,C} — three coefficients, no more and no fewer. Accepting any
+            // brace-wrapped list of numbers claimed every integer array as a line, so a join on
+            // "a.ar @> b.ar" over two int[] columns tried to read {1,2} as one and refused it.
+            return s.matches("\\{\\s*" + NUMBER + "\\s*,\\s*" + NUMBER + "\\s*,\\s*" + NUMBER + "\\s*\\}");
         }
         return false;
     }
