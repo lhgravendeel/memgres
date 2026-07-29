@@ -307,6 +307,9 @@ class ArrayOperationHandler {
     }
 
     Object evalArray(ArrayExpr arr, RowContext ctx) {
+        // Each element stands where one value stands, so a subquery among them may have only one
+        // column -- settled from its select list, whether or not the element is reached.
+        ExprEvaluator.rejectWideSubqueryElements(arr.elements());
         List<Object> list = new ArrayList<>();
         for (Expression elem : arr.elements()) {
             list.add(executor.evalExpr(elem, ctx));

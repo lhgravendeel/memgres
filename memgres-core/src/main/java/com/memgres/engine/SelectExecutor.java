@@ -969,17 +969,40 @@ class SelectExecutor {
 
             if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
                 ColumnRef ref = (ColumnRef) expr;
-                for (SelectStmt.SelectTarget target : targets) {
-                    if (target.alias() != null && ref.column().equalsIgnoreCase(target.alias())) {
-                        expr = target.expr();
-                        break;
-                    }
-                }
+                Expression named = outputColumnNamed(targets, ref.column());
+                if (named != null) expr = named;
             }
 
             resolved.add(new SelectStmt.OrderByItem(expr, item.descending(), item.nullsFirst()));
         }
         return resolved;
+    }
+
+    /**
+     * The select item an ORDER BY name reaches, or null when it reaches none and the name is left
+     * for the FROM clause to answer.
+     *
+     * <p>A name that two select items answer to reaches neither -- unless they are the same
+     * expression written twice, which is one thing under two names and settles the sort either
+     * way. {@code SELECT a, a FROM t ORDER BY a} sorts; {@code SELECT a, a + 1 AS a FROM t ORDER
+     * BY a} and {@code SELECT n, s AS n FROM t ORDER BY n} have two different columns called the
+     * same thing, and PostgreSQL refuses the name rather than taking the first.
+     *
+     * <p>Only an alias written on the item was consulted, so the implicit name a bare column
+     * carries did not count as a match and the two-column clash went unseen.
+     */
+    private Expression outputColumnNamed(List<SelectStmt.SelectTarget> targets, String name) {
+        Expression found = null;
+        for (SelectStmt.SelectTarget target : targets) {
+            String outputName = target.alias() != null
+                    ? target.alias() : executor.exprToAlias(target.expr());
+            if (outputName == null || !outputName.equals(name)) continue;
+            if (found != null && !found.equals(target.expr())) {
+                throw new MemgresException("ORDER BY \"" + name + "\" is ambiguous", "42702");
+            }
+            if (found == null) found = target.expr();
+        }
+        return found;
     }
 
     int resolveOrderByToColumnIndex(Expression expr, List<SelectStmt.SelectTarget> targets) {
@@ -2075,7 +2098,13 @@ class SelectExecutor {
         if (node instanceof FunctionCallExpr) {
             PgFunction f = executor.database.getFunction(
                     FunctionEvaluator.stripSchemaPrefix(((FunctionCallExpr) node).name().toLowerCase()));
-            if (f != null && f.isSetReturning() && !f.declaresRecordResult()) return true;
+            // ... and one that declares OUT parameters names its columns after all, so a call
+            // written without a column list reaches the aggregate with every column it needs and
+            // the set is what is left to complain about.
+            if (f != null && f.isSetReturning()
+                    && (!f.declaresRecordResult() || f.hasOutParams())) {
+                return true;
+            }
         }
         boolean[] found = {false};
         AstWalk.forEachChild(node, child -> {

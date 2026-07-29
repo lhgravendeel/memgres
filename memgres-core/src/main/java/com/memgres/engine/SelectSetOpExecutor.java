@@ -116,6 +116,32 @@ class SelectSetOpExecutor {
                         Column orig = columns.get(ci);
                         columns.set(ci, new Column(orig.getName(), wider, orig.isNullable(), orig.isPrimaryKey(), orig.getDefaultValue()));
                     }
+                } else if (leftCat == rightCat
+                        && leftCat == TypeCoercion.TypeCategory.DATETIME) {
+                    // A set operation gives its column one type and reads every arm as that type,
+                    // so a date and a timestamp of the same instant are the same row. Leaving each
+                    // arm the type it came with described the column as date and left the two
+                    // values unequal, so UNION kept both of them.
+                    DataType wider = widenDatetimeSetOp(leftType, rightType);
+                    // A date and a time of day have no type that holds both. PostgreSQL settles a
+                    // set operation's column on the first arm's type and reads the rest as that,
+                    // so it reports the reading it could not do. Letting the two stand described
+                    // the column as one of them and answered rows of the other, which the client
+                    // then failed to decode.
+                    if (wider == null) {
+                        throw new MemgresException(stmt.op().name() + " could not convert type "
+                                + rightType.toRegtypeDisplay() + " to "
+                                + leftType.toRegtypeDisplay(), "42846");
+                    }
+                    if (leftType != wider) {
+                        coerceColumnValues(leftResult, ci, wider);
+                        Column orig = columns.get(ci);
+                        columns.set(ci, new Column(orig.getName(), wider, orig.isNullable(),
+                                orig.isPrimaryKey(), orig.getDefaultValue()));
+                    }
+                    if (rightType != wider) {
+                        coerceColumnValues(rightResult, ci, wider);
+                    }
                 } else if (leftCat == rightCat) {
                     // Same category, different types (e.g., varchar vs text) - allow
                 } else if (leftCat != rightCat) {
@@ -170,6 +196,13 @@ class SelectSetOpExecutor {
                     }
                 }
             }
+        }
+        // UNION, INTERSECT and EXCEPT tell one row from another, and INTERSECT and EXCEPT do so
+        // even with ALL, so every output column needs an equality to be compared by. A few types
+        // have none, and PostgreSQL refuses the whole operation rather than comparing them some
+        // other way; only UNION ALL, which never compares anything, takes them.
+        if (stmt.op() != SetOpStmt.SetOpType.UNION || !stmt.all()) {
+            rejectColumnWithoutEquality(columns);
         }
         List<Object[]> resultRows = new ArrayList<>();
 
@@ -395,10 +428,13 @@ class SelectSetOpExecutor {
                     throw new MemgresException("missing FROM-clause entry for table \""
                             + unresolved.table() + "\"", "42P01");
                 }
-                throw new MemgresException(
+                MemgresException missing = new MemgresException(
                         "column \"" + unresolved.column() + "\" does not exist", "42703");
+                nameAnArmThatHasIt(missing, stmt, unresolved.column());
+                throw missing;
             }
             if (expr instanceof ColumnRef) {
+                rejectAmbiguousOutputName(columns, ((ColumnRef) expr).column());
                 Column named = namedColumn(columns, ((ColumnRef) expr).column());
                 if (!collated) continue;
                 if (named != null && !isCollatable(named.getType())) {
@@ -440,15 +476,109 @@ class SelectSetOpExecutor {
         while (walk instanceof CastExpr) {
             String typeName = ((CastExpr) walk).typeName();
             if (typeName == null) return expr;
+            // A cast that carries a length or a precision is a coercion whatever the type is:
+            // numeric(10,2) rounds and varchar(4) truncates, so neither is the relabel that peels
+            // away. Reading the type name past the parenthesis made both look like no cast at all.
+            if (typeName.indexOf('(') >= 0) return expr;
             if (DataType.fromPgName(DataType.canonicalName(typeName)) != named.getType()) return expr;
             walk = ((CastExpr) walk).expr();
         }
         return inner;
     }
 
+    /**
+     * A name the set operation does not answer to may still be a column of one of its arms, and
+     * PostgreSQL says which arm rather than leaving the writer to guess. An arm has no name of its
+     * own, so it is called {@code *SELECT* n} by its place in the operation, counted left to right
+     * from one. A name that reads the same but for its case gets the same account as a suggestion
+     * instead, which is how a quoted alias written unquoted in the ORDER BY is explained.
+     */
+    private void nameAnArmThatHasIt(MemgresException e, SetOpStmt stmt, String name) {
+        List<SelectStmt> arms = new ArrayList<>();
+        collectArms(stmt, arms);
+        for (int i = 0; i < arms.size(); i++) {
+            for (String output : outputNames(arms.get(i))) {
+                if (!output.equals(name)) continue;
+                e.setDetail("There is a column named \"" + name + "\" in table \"*SELECT* "
+                        + (i + 1) + "\", but it cannot be referenced from this part of the query.");
+                return;
+            }
+        }
+        for (int i = 0; i < arms.size(); i++) {
+            for (String output : outputNames(arms.get(i))) {
+                if (!output.equalsIgnoreCase(name)) continue;
+                e.setHint("Perhaps you meant to reference the column \"*SELECT* "
+                        + (i + 1) + "." + output + "\".");
+                return;
+            }
+        }
+    }
+
+    /** The arms of a set operation, left to right, however they are nested. */
+    private static void collectArms(Statement stmt, List<SelectStmt> out) {
+        if (stmt instanceof SetOpStmt) {
+            collectArms(((SetOpStmt) stmt).left(), out);
+            collectArms(((SetOpStmt) stmt).right(), out);
+            return;
+        }
+        if (stmt instanceof SelectStmt) out.add((SelectStmt) stmt);
+    }
+
+    /** The names one arm writes for its columns, as written -- an alias, or the implicit name. */
+    private List<String> outputNames(SelectStmt arm) {
+        List<String> names = new ArrayList<>();
+        if (arm.targets() == null) return names;
+        for (SelectStmt.SelectTarget target : arm.targets()) {
+            String name = target.alias() != null
+                    ? target.alias() : executor.exprToAlias(target.expr());
+            if (name != null) names.add(name);
+        }
+        return names;
+    }
+
+    /**
+     * The types a set operation cannot compare rows by, because PostgreSQL defines no equality
+     * over them: json is compared by no operator at all (jsonb, which has one, is unaffected), xml
+     * likewise, and a point has ordering operators but no equality. Only these three are listed,
+     * because these are the three the reference server was measured refusing.
+     */
+    private static void rejectColumnWithoutEquality(List<Column> columns) {
+        for (Column column : columns) {
+            DataType type = column.getType();
+            if (type != DataType.JSON && type != DataType.XML && type != DataType.POINT) continue;
+            throw new MemgresException("could not identify an equality operator for type "
+                    + type.toRegtypeDisplay(), "42883");
+        }
+    }
+
+    /**
+     * A name that two output columns answer to names neither. The ORDER BY of a set operation
+     * reaches its output columns through the set operation, where each of them is a column of its
+     * own however it was written -- so two of them called the same thing leave the name with no
+     * one referent, and PostgreSQL refuses it. (Written on a plain SELECT the same name is not
+     * ambiguous when the two columns are the same expression, because there it reaches the select
+     * list itself; a set operation has no select list left to reach.) Taking the first match
+     * sorted by one of them.
+     */
+    private static void rejectAmbiguousOutputName(List<Column> columns, String name) {
+        int matches = 0;
+        for (Column column : columns) {
+            if (column.getName().equals(name)) matches++;
+        }
+        if (matches > 1) {
+            throw new MemgresException("ORDER BY \"" + name + "\" is ambiguous", "42702");
+        }
+    }
+
+    /**
+     * An output column of exactly this name. A quoted alias keeps the case it was written with and
+     * an unquoted name is folded down, so the two are the same name only when they read the same:
+     * matching without regard to case let {@code ORDER BY foo} reach a column called {@code "Foo"},
+     * which PostgreSQL says does not exist.
+     */
     private static Column namedColumn(List<Column> columns, String name) {
         for (Column column : columns) {
-            if (column.getName().equalsIgnoreCase(name)) return column;
+            if (column.getName().equals(name)) return column;
         }
         return null;
     }
@@ -485,6 +615,38 @@ class SelectSetOpExecutor {
     private static boolean isCollatable(DataType type) {
         return type == DataType.TEXT || type == DataType.VARCHAR || type == DataType.CHAR
                 || type == DataType.NAME;
+    }
+
+    /**
+     * The one date/time type two arms can both be read as, or null when there is none. A date is
+     * a timestamp of midnight and a timestamp is a timestamptz in the session's zone, so each of
+     * those pairs has a wider type both fit; a time and a date have none, and are left to the
+     * mismatch the caller reports.
+     */
+    private static DataType widenDatetimeSetOp(DataType a, DataType b) {
+        int ra = datetimeRank(a), rb = datetimeRank(b);
+        if (ra == 0 || rb == 0) return null;
+        boolean aIsDateLike = ra <= 3, bIsDateLike = rb <= 3;
+        if (aIsDateLike != bIsDateLike) return null;
+        return rb > ra ? b : a;
+    }
+
+    /** Date-like types rank 1..3 and time-like types 4..5; anything else is 0. */
+    private static int datetimeRank(DataType dt) {
+        if (dt == DataType.DATE) return 1;
+        if (dt == DataType.TIMESTAMP) return 2;
+        if (dt == DataType.TIMESTAMPTZ) return 3;
+        if (dt == DataType.TIME) return 4;
+        if (dt == DataType.TIMETZ) return 5;
+        return 0;
+    }
+
+    /** Read every value of one column of one arm as {@code target}. */
+    private void coerceColumnValues(QueryResult result, int ci, DataType target) {
+        for (Object[] row : result.getRows()) {
+            if (row[ci] == null) continue;
+            row[ci] = executor.castEvaluator.applyCast(row[ci], target.getPgName());
+        }
     }
 
     static DataType widenNumericSetOp(DataType a, DataType b) {

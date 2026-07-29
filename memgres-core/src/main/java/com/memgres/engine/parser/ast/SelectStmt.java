@@ -41,6 +41,24 @@ public final class SelectStmt implements Statement {
 
     public boolean fromValues() { return fromValues; }
 
+    /**
+     * How many columns a query's select list writes, or -1 when the text does not settle it -- a
+     * star, or anything else that may stand for more than one column. This is what PostgreSQL
+     * measures a subquery's width by: it is a property of the text, settled before any row is
+     * read, so a query that returns nothing is still of the width it was written with.
+     */
+    public static int writtenWidth(Statement stmt) {
+        if (stmt instanceof SetOpStmt) return writtenWidth(((SetOpStmt) stmt).left());
+        if (!(stmt instanceof SelectStmt)) return -1;
+        List<SelectTarget> targets = ((SelectStmt) stmt).targets();
+        if (targets == null || targets.isEmpty()) return -1;
+        for (int i = 0; i < targets.size(); i++) {
+            Expression e = targets.get(i).expr();
+            if (e instanceof WildcardExpr || e instanceof CompositeStarExpr) return -1;
+        }
+        return targets.size();
+    }
+
     public SelectStmt(
             boolean distinct,
             List<Expression> distinctOn,

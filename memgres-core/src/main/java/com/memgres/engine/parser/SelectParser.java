@@ -28,6 +28,7 @@ class SelectParser {
         // Grammar: set_expr = intersect_expr ((UNION|EXCEPT) [ALL] intersect_expr)*
         //          intersect_expr = select_term (INTERSECT [ALL] select_term)*
 
+        rejectSetOpOnModifyingStatement(left);
         rejectSortedLeftArm(left);
         // First absorb any higher-precedence INTERSECT
         left = parseIntersectChain(left);
@@ -68,25 +69,8 @@ class SelectParser {
                 throw new ParseException("syntax error at or near \"CORRESPONDING\"", parser.peek());
             }
 
-            Statement right;
-            int setOpExtraParens = Math.max(0, wrappingParensBeforeArm());
-            if (parser.check(TokenType.LEFT_PAREN) && setOpExtraParens > 0) {
-                parser.consumeLeadingParens(setOpExtraParens);
-                right = parseArmAfterWrappers();
-                parser.consumeTrailingParens(setOpExtraParens);
-                lastRightWasParenthesized = true;
-            } else if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
-                lastRightWasParenthesized = true;
-            } else if (parser.checkKeyword("VALUES")) {
-                // A bare VALUES list is a query in its own right, so it may be a set-op arm
-                right = parseValuesBody();
-                lastRightWasParenthesized = false;
-            } else {
-                rejectWithClauseArm();
-                right = parser.parseSelect();
-                lastRightWasParenthesized = false;
-            }
+            lastRightWasParenthesized = parser.check(TokenType.LEFT_PAREN);
+            Statement right = parseSetOpOperand();
 
             // Right side may have higher-precedence INTERSECT
             right = parseIntersectChain(right);
@@ -120,6 +104,28 @@ class SelectParser {
         }
 
         return left;
+    }
+
+    /**
+     * A set operation combines queries, and INSERT, UPDATE, DELETE and MERGE are not queries --
+     * PostgreSQL's grammar has no production joining one to a SELECT, so a set-operation keyword
+     * after one is a syntax error there. Wrapping the statement as the left arm instead ran it and
+     * only then complained that the arms had different widths, which left the rows the INSERT had
+     * already written behind: {@code INSERT INTO t(id) (SELECT 1) UNION (SELECT 2)} reported an
+     * error and inserted one row. Refusing at the parser leaves nothing behind, because nothing
+     * has run.
+     */
+    private void rejectSetOpOnModifyingStatement(Statement left) {
+        if (!(left instanceof InsertStmt) && !(left instanceof UpdateStmt)
+                && !(left instanceof DeleteStmt) && !(left instanceof MergeStmt)) {
+            return;
+        }
+        if (!parser.checkKeyword("UNION") && !parser.checkKeyword("INTERSECT")
+                && !parser.checkKeyword("EXCEPT")) {
+            return;
+        }
+        throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                parser.peek());
     }
 
     /**
@@ -170,48 +176,36 @@ class SelectParser {
     }
 
     /**
-     * How many of the parens that open a set-operation arm merely wrap it.
+     * Parse one operand of a set operation: a query, or a parenthesised one.
      *
-     * <p>Counting every paren before the SELECT keyword reads {@code ((SELECT 1) EXCEPT (SELECT
-     * 2))} as two wrappers around one SELECT, so the arm's own set operation was left in the
-     * stream and the EXCEPT that follows became a syntax error. A paren whose matching close is
-     * followed by a set-operation keyword is not a wrapper — it encloses that operation's left
-     * operand — so counting stops there and the arm is parsed as the set operation it is.
+     * <p>What stands inside the parentheses is a whole query expression and may be a set operation
+     * of its own, whose own arms may be parenthesised in turn -- so the parentheses have to be
+     * taken off one at a time, each one closed only after everything it opened has been read.
+     * Counting the run of opening parentheses first and then expecting that many closing ones at
+     * the end assumed every one of them belonged to the same operand: in
+     * {@code (SELECT 1) UNION ((SELECT 2) UNION (SELECT 3))} the two leading parentheses of the
+     * right operand close in different places, so the second closing parenthesis was looked for
+     * where the inner UNION stands and an ordinary set operation was a syntax error.
      */
-    private int wrappingParensBeforeArm() {
-        int count = parser.countLeadingParensBeforeQuery();
-        while (count > 1 && closedBeforeSetOp(parser.pos + count - 1)) count--;
-        return count;
-    }
-
-    /** True when the paren at {@code index} closes immediately before UNION, INTERSECT or EXCEPT. */
-    private boolean closedBeforeSetOp(int index) {
-        int depth = 1;
-        int look = index + 1;
-        while (look < parser.tokens.size() && depth > 0) {
-            if (parser.tokens.get(look).type() == TokenType.LEFT_PAREN) depth++;
-            else if (parser.tokens.get(look).type() == TokenType.RIGHT_PAREN) depth--;
-            look++;
-        }
-        if (look >= parser.tokens.size()) return false;
-        Token after = parser.tokens.get(look);
-        if (after.type() != TokenType.KEYWORD) return false;
-        String kw = after.value();
-        return kw.equals("UNION") || kw.equals("INTERSECT") || kw.equals("EXCEPT");
-    }
-
-    /** The arm left standing after its wrapping parens were consumed. */
-    private Statement parseArmAfterWrappers() {
-        Statement arm;
+    private Statement parseSetOpOperand() {
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.advance();
-            arm = parser.parseSelect();
-            arm = tryParseSetOp(arm);
+            Statement inner = parseSetOpOperand();
+            inner = tryParseSetOp(inner);
             parser.expect(TokenType.RIGHT_PAREN);
-        } else {
-            arm = parser.parseSelect();
+            return inner;
         }
-        return tryParseSetOp(arm);
+        if (parser.checkKeyword("VALUES")) {
+            // A bare VALUES list is a query in its own right, so it may be a set-op arm
+            return parseValuesBody();
+        }
+        rejectWithClauseArm();
+        return parser.parseSelect();
+    }
+
+    /** Parse a set-op operand from outside this class (an INSERT's source query). */
+    Statement parseSetOpOperandPublic() {
+        return parseSetOpOperand();
     }
 
     /**
@@ -241,20 +235,7 @@ class SelectParser {
                 throw new ParseException("syntax error at or near \"CORRESPONDING\"", parser.peek());
             }
 
-            Statement right;
-            int intersectExtraParens = Math.max(0, wrappingParensBeforeArm());
-            if (parser.check(TokenType.LEFT_PAREN) && intersectExtraParens > 0) {
-                parser.consumeLeadingParens(intersectExtraParens);
-                right = parseArmAfterWrappers();
-                parser.consumeTrailingParens(intersectExtraParens);
-            } else if (parser.check(TokenType.LEFT_PAREN)) {
-                parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
-            } else if (parser.checkKeyword("VALUES")) {
-                right = parseValuesBody();
-            } else {
-                rejectWithClauseArm();
-                right = parser.parseSelect();
-            }
+            Statement right = parseSetOpOperand();
 
             left = new SetOpStmt(left, SetOpStmt.SetOpType.INTERSECT, all, right, null, null, null);
         }
@@ -683,7 +664,31 @@ class SelectParser {
      */
     Statement parseValues() {
         // A bare VALUES list is a query, so it may be the left arm of a set operation too
-        return tryParseSetOp(parseValuesBody());
+        Statement stmt = tryParseSetOp(parseValuesBody());
+        // ... and a query of its own takes ORDER BY, LIMIT and OFFSET. A list of two rows or more
+        // is rewritten as a set operation, whose parsing reads them; a list of one row is one
+        // SELECT and nothing read them at all, so VALUES (7) ORDER BY 1 was a syntax error at
+        // ORDER while VALUES (7), (8) ORDER BY 1 sorted.
+        if (stmt instanceof SelectStmt) {
+            SelectStmt sel = (SelectStmt) stmt;
+            List<SelectStmt.OrderByItem> orderBy = sel.orderBy();
+            Expression limit = sel.limit();
+            Expression offset = sel.offset();
+            boolean changed = false;
+            if (parser.matchKeywords("ORDER", "BY")) { orderBy = parser.parseOrderByList(); changed = true; }
+            if (parser.matchKeyword("LIMIT")) {
+                limit = parser.matchKeyword("ALL") ? Literal.ofNull() : parser.parsePrimary();
+                changed = true;
+            }
+            if (parser.matchKeyword("OFFSET")) { offset = parser.parsePrimary(); changed = true; }
+            if (changed) {
+                return new SelectStmt(sel.distinct(), sel.distinctOn(), sel.targets(), sel.from(),
+                        sel.where(), sel.groupBy(), sel.having(), sel.windowDefs(), orderBy, limit,
+                        offset, sel.withClauses(), sel.groupingSets(), sel.lockClause(),
+                        sel.withTies()).asValuesList();
+            }
+        }
+        return stmt;
     }
 
     /**
