@@ -44,6 +44,8 @@ public class AstExecutor {
      */
     final java.util.Map<String, Long> sessionSequenceValues = new java.util.HashMap<>();
     final FromResolver fromResolver = new FromResolver(this);
+    /** How deep a statement run from inside another statement is. */
+    private int executeDepth;
     final ExprEvaluator exprEvaluator = new ExprEvaluator(this);
     final SelectExecutor selectExecutor = new SelectExecutor(this);
     // Stack of outer row contexts for correlated subqueries
@@ -183,7 +185,19 @@ public class AstExecutor {
             Statement stmt = Parser.parse(sql);
             if (stmt == null) return QueryResult.empty(); // empty input (only comments)
             rejectNestedDataModifyingCtes(stmt);
-            return executeStatement(stmt);
+            // The FULL JOIN restriction is asked of the statement the client sent and of nothing
+            // else; a statement run from inside one — a function body, a catalog lookup — is not
+            // the outermost query, so what it holds is left alone. See FullJoinAdmissibility.
+            Statement priorOutermost = fromResolver.outermostQuery;
+            boolean outermost = executeDepth == 0;
+            if (outermost) fromResolver.outermostQuery = stmt instanceof SelectStmt ? stmt : null;
+            executeDepth++;
+            try {
+                return executeStatement(stmt);
+            } finally {
+                executeDepth--;
+                if (outermost) fromResolver.outermostQuery = priorOutermost;
+            }
         } finally {
             this.boundParameters = previousParams;
             this.currentRawSql = previousRawSql;

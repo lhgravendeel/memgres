@@ -33,16 +33,26 @@ import static org.junit.jupiter.api.Assertions.*;
  * <p><b>A full join above which a strict qual sits is not a full join.</b>
  * {@code reduce_outer_joins} downgrades it to a left, right or inner join when a qual rejects the
  * rows one side was padded with, and the downgraded join is never asked the question. The qual may
- * be in WHERE, in a HAVING clause with no aggregate in it, in the ON condition of an inner join
- * above, or in an enclosing query once the subquery, WITH query or view holding the join has been
- * pulled up. Only a strict qual counts: {@code WHERE a.x IS NOT NULL} downgrades the join and
- * {@code WHERE a.x IS NULL} does not, which is the difference between answering and refusing.
+ * be in WHERE, in a HAVING clause with no aggregate in it, or in the ON condition of an inner join
+ * above. Only a strict qual counts: {@code WHERE a.x IS NOT NULL} downgrades the join and
+ * {@code WHERE a.x IS NULL} does not, which is the difference between answering and refusing. It
+ * counts relations and not columns, as {@code find_nonnullable_rels} does: an OR proves what every
+ * arm of it proves, so {@code a.x = 1 OR a.t = 'b'} proves that {@code a} is not null, and
+ * {@code a.x IS NOT NULL OR b.y IS NOT NULL} proves nothing.
+ *
+ * <p><b>Only the query the client sent is judged.</b> The qual that rescues a join may be written
+ * a long way from it: PostgreSQL pulls simple subqueries up, and pushes a qual down into the ones
+ * it cannot pull up, which it declines to do only for LIMIT and OFFSET. Deciding which applies is
+ * reimplementing the optimiser, and two attempts to do it refused thirty-seven queries PostgreSQL
+ * answers. So a full join inside a subquery, a WITH query, a view, an arm of a set operation, the
+ * source of a writing statement or a function body is accepted unread. What is bought for that is
+ * that no valid statement is refused; what is paid is that a handful PostgreSQL declines to plan
+ * are answered.
  *
  * <p><b>Analysis comes before planning.</b> A view's body is analysed when the view is defined, so
- * a view over a refused join is created and fails when it is read — and the complaints that belong
- * to analysis, a column name the view would answer to twice among them, have to be raised at
- * definition time rather than short-circuited by the planner's refusal. A name that does not
- * resolve is reported before anything is planned too.
+ * the complaints that belong to analysis — a column name the view would answer to twice among them
+ * — are raised then. A name no relation of the query answers to is reported before anything is
+ * planned too, so it comes ahead of the refusal.
  *
  * <p>The last section is ordinary SQL, which has to keep working: the cost of a rule that reaches
  * too far is a refused valid statement.
@@ -416,29 +426,51 @@ class FullJoinAdmissibilityTest {
         }
 
         @Test
-        void aQualThatDoesNotReachDownLeavesTheRestrictionInPlace() {
-            assertRejected("SELECT count(*) FROM (SELECT * FROM fja_a a FULL JOIN fja_b b"
-                    + " ON a.x < b.y) s", "0A000", UNMERGEABLE);
-            assertRejected("SELECT count(*) FROM (SELECT * FROM fja_a a FULL JOIN fja_b b"
-                    + " ON a.x < b.y) s WHERE s.x IS NULL", "0A000", UNMERGEABLE);
-            assertRejected("SELECT count(*) FROM (SELECT * FROM fja_a a FULL JOIN fja_b b"
-                    + " ON a.x < b.y LIMIT 10) s WHERE s.x IS NOT NULL", "0A000", UNMERGEABLE);
-            assertRejected("WITH s AS (SELECT * FROM fja_a a FULL JOIN fja_b b ON a.x < b.y)"
-                    + " SELECT count(*) FROM s", "0A000", UNMERGEABLE);
-            assertRejected("SELECT count(*) FROM fja_fv", "0A000", UNMERGEABLE);
-            assertRejected("SELECT (SELECT count(*) FROM fja_a a FULL JOIN fja_b b ON a.x < b.y)",
-                    "0A000", UNMERGEABLE);
+        void aQualNamingAnotherRelationProvesNothingAboutThisJoin() {
             assertRejected("SELECT count(*) FROM fja_a a FULL JOIN fja_b b ON a.x < b.y"
-                    + " UNION SELECT 1", "0A000", UNMERGEABLE);
+                    + " JOIN fja_c c ON c.z > 0", "0A000", UNMERGEABLE);
+            assertRejected("SELECT count(*) FROM fja_a a FULL JOIN fja_b b ON a.x < b.y,"
+                    + " fja_c c WHERE c.z > 0", "0A000", UNMERGEABLE);
         }
 
         @Test
-        void theWhereOfAWritingStatementIsAQualAboveItsFromClause() throws SQLException {
-            assertEquals("0", rows("SELECT count(*) FROM fja_c WHERE z = 99"));
+        void anOrProvesOnlyWhatEveryArmOfItProves() throws SQLException {
+            String q = "SELECT count(*) FROM fja_a a FULL JOIN fja_b b ON a.x < b.y WHERE ";
+            // Both arms reject a null row of a, whatever column of it each one reads.
+            assertEquals("3", rows(q + "a.x IS NOT NULL OR a.t IS NOT NULL"));
+            assertEquals("2", rows(q + "a.x = 1 OR a.t = 'b'"));
+            assertEquals("0", rows(q + "NOT (a.x > 0 AND a.t > '')"));
+            assertEquals("3", rows(q + "(a.x = 1 AND a.t = 'a') OR a.x > 1"));
+            // One arm rejects a null a and the other a null b, so neither is proved.
+            assertRejected(q + "a.x IS NOT NULL OR b.y IS NOT NULL", "0A000", UNMERGEABLE);
+            assertRejected(q + "a.x IS NOT NULL OR a.t IS NULL", "0A000", UNMERGEABLE);
+        }
+
+        @Test
+        void aQualInsideAnythingElseIsNotThisQuerysQual() throws SQLException {
+            // The join no longer stands in the query being planned, so nothing here judges it:
+            // PostgreSQL may still rescue it by pulling the subquery up or pushing a qual down.
+            assertEquals("4", rows("SELECT count(*) FROM (SELECT * FROM fja_a a FULL JOIN fja_b b"
+                    + " ON a.x < b.y) s"));
+            assertEquals("3", rows("SELECT count(*) FROM (SELECT * FROM fja_a a FULL JOIN fja_b b"
+                    + " ON a.x < b.y LIMIT 10) s WHERE s.x IS NOT NULL"));
+            assertEquals("4", rows("WITH s AS (SELECT * FROM fja_a a FULL JOIN fja_b b"
+                    + " ON a.x < b.y) SELECT count(*) FROM s"));
+            assertEquals("4", rows("SELECT count(*) FROM fja_fv"));
+            assertEquals("4", rows("SELECT (SELECT count(*) FROM fja_a a FULL JOIN fja_b b"
+                    + " ON a.x < b.y)"));
+            assertEquals("4,1", rows("SELECT count(*) FROM fja_a a FULL JOIN fja_b b ON a.x < b.y"
+                    + " UNION ALL SELECT 1"));
+        }
+
+        @Test
+        void theWhereOfAWritingStatementIsNotAQualAboveItsFromClause() throws SQLException {
             exec("UPDATE fja_c SET t3 = t3 FROM fja_a a FULL JOIN fja_b b ON a.x < b.y"
                     + " WHERE fja_c.z = a.x");
             exec("DELETE FROM fja_c USING fja_a a FULL JOIN fja_b b ON a.x < b.y"
                     + " WHERE fja_c.z = a.x AND fja_c.z = 99");
+            exec("UPDATE fja_c SET t3 = t3 FROM fja_a a FULL JOIN fja_b b ON a.x < b.y"
+                    + " WHERE fja_c.z = 99");
         }
 
         @Test
@@ -472,9 +504,9 @@ class FullJoinAdmissibilityTest {
         }
 
         @Test
-        void aViewOverARefusedJoinIsStoredAndFailsWhenItIsRead() throws SQLException {
+        void aViewOverARefusedJoinIsStoredAndReadsWithoutComplaint() throws SQLException {
             exec("CREATE VIEW fja_v1 AS SELECT a.x, b.y FROM fja_a a FULL JOIN fja_b b ON a.x > b.y");
-            assertRejected("SELECT count(*) FROM fja_v1", "0A000", UNMERGEABLE);
+            assertEquals("4", rows("SELECT count(*) FROM fja_v1"));
             exec("DROP VIEW fja_v1");
         }
 
@@ -487,18 +519,22 @@ class FullJoinAdmissibilityTest {
         }
 
         @Test
-        void aMaterializedViewIsFilledWhenItIsCreatedAndSoIsPlannedThen() throws SQLException {
-            assertRejected("CREATE MATERIALIZED VIEW fja_mv AS SELECT a.x, b.y FROM fja_a a"
-                    + " FULL JOIN fja_b b ON a.x > b.y", "0A000", UNMERGEABLE);
+        void aMaterializedViewsBodyIsNotTheQueryBeingPlanned() throws SQLException {
+            exec("CREATE MATERIALIZED VIEW fja_mv AS SELECT a.x, b.y FROM fja_a a"
+                    + " FULL JOIN fja_b b ON a.x > b.y");
+            assertEquals("4", rows("SELECT count(*) FROM fja_mv"));
+            exec("DROP MATERIALIZED VIEW fja_mv");
             exec("CREATE MATERIALIZED VIEW fja_mv AS SELECT a.x, b.y FROM fja_a a"
                     + " FULL JOIN fja_b b ON a.x > b.y WITH NO DATA");
             exec("DROP MATERIALIZED VIEW fja_mv");
         }
 
         @Test
-        void aStatementThatWritesIsPlannedLikeAnyOther() {
-            assertRejected("INSERT INTO fja_c SELECT a.x, b.t2 FROM fja_a a FULL JOIN fja_b b"
-                    + " ON a.x < b.y", "0A000", UNMERGEABLE);
+        void theSourceOfAWritingStatementIsNotEither() throws SQLException {
+            exec("CREATE TABLE fja_w (z int, t3 text)");
+            exec("INSERT INTO fja_w SELECT a.x, b.t2 FROM fja_a a FULL JOIN fja_b b ON a.x < b.y");
+            assertEquals("4", rows("SELECT count(*) FROM fja_w"));
+            exec("DROP TABLE fja_w");
         }
     }
 

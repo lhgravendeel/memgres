@@ -164,7 +164,7 @@ class SelectExecutor {
         }
 
         List<RowContext> contexts = executor.fromResolver.resolveFromClause(
-                stmt.from(), stmt.where(), stmt.having());
+                stmt.from(), stmt.where(), stmt.having(), stmt);
 
         // PostgreSQL builds the range table before it analyses the rest of the query, so a name
         // that does not resolve is reported on its own even when the clauses are also wrong.

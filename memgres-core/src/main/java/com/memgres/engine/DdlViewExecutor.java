@@ -26,21 +26,6 @@ class DdlViewExecutor {
     // ---- CREATE VIEW ----
 
     QueryResult executeCreateView(CreateViewStmt stmt) {
-        // Defining a view analyses its query; only reading the view plans it. A FULL JOIN whose
-        // condition PostgreSQL could not merge or hash is therefore stored without complaint, and
-        // the complaints that belong to analysis — a column name the view would answer to twice —
-        // are the ones that have to be raised here. Running the query to learn its columns must
-        // not let the planner's refusal stand in front of them.
-        boolean priorSuppress = executor.fromResolver.suppressFullJoinCheck;
-        executor.fromResolver.suppressFullJoinCheck = true;
-        try {
-            return createView(stmt);
-        } finally {
-            executor.fromResolver.suppressFullJoinCheck = priorSuppress;
-        }
-    }
-
-    private QueryResult createView(CreateViewStmt stmt) {
         ddl.checkPgCatalogWriteProtection();
         if (!stmt.orReplace() && executor.database.hasView(stmt.name())) {
             throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
@@ -101,7 +86,7 @@ class DdlViewExecutor {
         if (stmt.materialized()) {
             if (stmt.withData()) {
                 // A materialized view is filled when it is created, so its query is planned then.
-                QueryResult result = withFullJoinCheck(query);
+                QueryResult result = executor.executeStatement(query);
                 List<Column> cols = new ArrayList<>(result.getColumns());
                 List<Object[]> rows = new ArrayList<>(result.getRows());
                 rowCount = rows.size();
@@ -161,17 +146,6 @@ class DdlViewExecutor {
             return QueryResult.command(QueryResult.Type.SELECT_INTO, rowCount);
         }
         return QueryResult.message(QueryResult.Type.SET, "CREATE VIEW");
-    }
-
-    /** Run a query with the full-join restriction back in force, as a plan of it would be. */
-    private QueryResult withFullJoinCheck(Statement query) {
-        boolean prior = executor.fromResolver.suppressFullJoinCheck;
-        executor.fromResolver.suppressFullJoinCheck = false;
-        try {
-            return executor.executeStatement(query);
-        } finally {
-            executor.fromResolver.suppressFullJoinCheck = prior;
-        }
     }
 
     /**

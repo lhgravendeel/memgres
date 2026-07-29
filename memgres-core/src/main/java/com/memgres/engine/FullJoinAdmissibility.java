@@ -4,8 +4,11 @@ import com.memgres.engine.parser.ast.*;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -18,7 +21,21 @@ import java.util.Set;
  * conditions}. An application that runs against both engines has to see the same refusal, which is
  * why memgres reproduces a limitation it does not itself have.
  *
- * <p>The trap is that PostgreSQL does not read the condition as written. Two passes run first:
+ * <p><b>Only the outermost query is judged.</b> PostgreSQL asks the question of a plan, not of a
+ * query, and by the time it plans, the join may have been rescued by something written a long way
+ * from it. {@code reduce_outer_joins} downgrades a full join to a left, right or inner one as soon
+ * as a qual above it rejects the rows one side was padded with, and the qual reaches down through
+ * a pulled-up subquery ({@code pull_up_subqueries}) or, where it cannot be pulled up, through a
+ * pushed-down qual ({@code subquery_is_pushdown_safe}, which blocks on LIMIT and OFFSET and on
+ * almost nothing else). Deciding which of those apply is reimplementing the optimiser, and two
+ * attempts to do it refused thirty-seven queries PostgreSQL answers. So the question is asked in
+ * one place only: the query the client sent, when the join stands in its own FROM clause. A join
+ * inside a subquery, a WITH query, a view, an arm of a set operation, the source of a writing
+ * statement or a function body is accepted without being read, because something above it may
+ * rescue it and nothing here can tell.
+ *
+ * <p>What is left is decided the way PostgreSQL decides it. Two passes run before the condition is
+ * judged:
  *
  * <ul>
  *   <li><b>Normalisation.</b> {@code eval_const_expressions} folds constants, eliminates NOT by
@@ -28,21 +45,18 @@ import java.util.Set;
  *       a clause, so {@code (A AND B) OR (A AND C)} becomes {@code A AND (B OR C)}. Only what is
  *       left of the condition after all of that is asked to be mergejoinable. A single-element
  *       {@code IN} never reaches the planner as one at all: the parser writes it as an equality.
- *   <li><b>Outer-join reduction.</b> {@code reduce_outer_joins} downgrades a full join to a left,
- *       right or inner one when a qual above it rejects the rows one side was padded with, and a
- *       downgraded join is never asked the question. The qual may come from WHERE, from a HAVING
- *       clause with no aggregate in it, from the ON condition of an inner join above, or from an
- *       enclosing query once the subquery, WITH query or view holding the join has been pulled up.
- *       Only a <em>strict</em> qual counts: {@code WHERE a.x IS NOT NULL} downgrades the join,
- *       {@code WHERE a.x IS NULL} and {@code WHERE coalesce(a.x,0) &gt;= 0} do not.
+ *   <li><b>Outer-join reduction.</b> The quals of that one query — its WHERE, the clauses of its
+ *       HAVING with no aggregate in them, and the ON conditions of the joins above this one in the
+ *       same FROM clause — are read for the relations they prove are not null, PostgreSQL's
+ *       {@code find_nonnullable_rels}: the AND of two quals proves what either proves, an OR only
+ *       what every arm proves, and a test for null proves nothing. A qual naming a relation
+ *       proves nothing about a different one, which is why
+ *       {@code a FULL JOIN b ON a.x &lt; b.y JOIN c ON c.z &gt; 0} is still refused.
  * </ul>
  *
- * <p><b>The check errs towards accepting.</b> Refusing a query PostgreSQL answers is worse than
- * answering one PostgreSQL refuses — the rule exists only so the two engines cannot be told apart,
- * and memgres can compute any full join it is asked for. So a clause whose shape this cannot read,
- * a qual naming something it cannot place, and every position it cannot follow a qual through are
- * all reasons to accept, and the refusal is raised only when every remaining clause is one of the
- * shapes measured against PostgreSQL as not mergejoinable.
+ * <p><b>Within that one query the check still errs towards accepting.</b> A clause whose shape this
+ * cannot read is a reason to accept, and the refusal is raised only when every remaining clause is
+ * one of the shapes measured against PostgreSQL as not mergejoinable.
  */
 final class FullJoinAdmissibility {
 
@@ -89,12 +103,15 @@ final class FullJoinAdmissibility {
         // described is not one this check can judge.
         if (on == null) return;
         if (leftShape == null || leftShape.isEmpty() || rightShape == null || rightShape.isEmpty()) return;
-        // A view's body is analysed, not planned, when the view is defined: PostgreSQL stores the
-        // definition and refuses only the reads of it.
-        if (from.suppressFullJoinCheck) return;
+        // Anything but the query the client sent may be rescued from above by a qual this cannot
+        // see, so only that query's own joins are judged.
+        if (!from.judgingOutermostQuery()) return;
         // A name that reads from both sides is reported as ambiguous when the condition is
         // resolved, which PostgreSQL does before it plans anything.
         if (hasAmbiguousBareName(on, leftShape, rightShape)) return;
+        // A qual naming something the query has no relation for is reported when the range table
+        // is built, which PostgreSQL does before it plans anything.
+        if (hasUnresolvableQualName(leftShape, rightShape)) return;
         if (downgradedFromAbove(leftShape, rightShape)) return;
 
         Expression normalised = normalize(on, 0);
@@ -524,15 +541,110 @@ final class FullJoinAdmissibility {
         return side;
     }
 
+    // ---- Names reported before the plan is made ----
+
+    /**
+     * Whether a qual of this query names something no relation of it answers to. PostgreSQL builds
+     * the range table and resolves every name against it before a plan is made, so such a query
+     * fails with {@code 42P01} or {@code 42703} however its joins would have been planned; raising
+     * the planner's refusal instead would report the wrong thing about a query that is wrong for
+     * another reason. Only a name that can be shown to resolve nowhere counts: the relations a
+     * FROM clause writes are read from the clause itself, without running any of it.
+     */
+    private boolean hasUnresolvableQualName(List<RowContext.TableBinding> leftShape,
+                                            List<RowContext.TableBinding> rightShape) {
+        List<Expression> quals = new ArrayList<Expression>();
+        if (from.enclosingWhere != null) quals.add(from.enclosingWhere);
+        if (from.enclosingHaving != null) quals.add(from.enclosingHaving);
+        quals.addAll(from.joinQualsAbove);
+        if (quals.isEmpty()) return false;
+        List<ColumnRef> refs = new ArrayList<ColumnRef>();
+        for (Expression q : quals) collectVisibleRefs(q, refs);
+        if (refs.isEmpty()) return false;
+
+        Map<String, Table> rangeTable = rangeTable(leftShape, rightShape);
+        if (rangeTable == null) return false;
+        for (ColumnRef ref : refs) {
+            if (ref.column() == null || SelectExecutor.isSystemColumn(ref.column())) continue;
+            if (ref.table() != null) {
+                if (!rangeTable.containsKey(ref.table().toLowerCase())) return true;
+                Table named = rangeTable.get(ref.table().toLowerCase());
+                if (named != null && named.getColumnIndex(ref.column()) < 0) return true;
+                continue;
+            }
+            boolean owned = false;
+            for (Table t : rangeTable.values()) {
+                // A relation this could not describe might answer to the name, so it is taken to.
+                if (t == null || t.getColumnIndex(ref.column()) >= 0) {
+                    owned = true;
+                    break;
+                }
+            }
+            if (!owned) return true;
+        }
+        return false;
+    }
+
+    /**
+     * The relations this query's FROM clause writes, by the name they answer to, with a null value
+     * for one whose columns could not be learned without running it. Null when the clause itself
+     * could not be read. The join's own two sides are already described; the rest is read from the
+     * clause and looked up by name, so that describing it runs nothing.
+     */
+    private Map<String, Table> rangeTable(List<RowContext.TableBinding> leftShape,
+                                          List<RowContext.TableBinding> rightShape) {
+        if (!(from.currentQuery instanceof SelectStmt)) return null;
+        List<SelectStmt.FromItem> items = ((SelectStmt) from.currentQuery).from();
+        if (items == null || items.isEmpty()) return null;
+        Map<String, Table> out = new HashMap<String, Table>();
+        for (RowContext.TableBinding b : leftShape) out.put(nameOf(b), b.table());
+        for (RowContext.TableBinding b : rightShape) out.put(nameOf(b), b.table());
+        for (SelectStmt.FromItem item : items) addToRangeTable(item, out);
+        return out;
+    }
+
+    private static String nameOf(RowContext.TableBinding b) {
+        return (b.alias() != null ? b.alias() : b.table().getName()).toLowerCase();
+    }
+
+    private void addToRangeTable(SelectStmt.FromItem item, Map<String, Table> out) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            addToRangeTable(((SelectStmt.JoinFrom) item).left(), out);
+            addToRangeTable(((SelectStmt.JoinFrom) item).right(), out);
+            return;
+        }
+        String name;
+        Table table = null;
+        if (item instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) item;
+            name = ref.alias() != null ? ref.alias() : ref.table();
+            try {
+                table = executor.resolveTable(
+                        ref.schema() != null ? ref.schema() : executor.defaultSchema(), ref.table());
+            } catch (RuntimeException e) {
+                table = null;
+            }
+        } else if (item instanceof SelectStmt.SubqueryFrom) {
+            name = ((SelectStmt.SubqueryFrom) item).alias();
+        } else if (item instanceof SelectStmt.FunctionFrom) {
+            SelectStmt.FunctionFrom fn = (SelectStmt.FunctionFrom) item;
+            name = fn.alias() != null ? fn.alias() : fn.functionName();
+        } else {
+            return;
+        }
+        if (name == null) return;
+        if (!out.containsKey(name.toLowerCase())) out.put(name.toLowerCase(), table);
+    }
+
     // ---- Quals above the join ----
 
     /**
-     * Whether a qual above the join rejects the rows one side was padded with, which makes
-     * PostgreSQL plan a left, right or inner join instead and ask nothing of the condition.
+     * Whether a qual of the query being executed rejects the rows one side of the join was padded
+     * with, which makes PostgreSQL plan a left, right or inner join instead and ask nothing of the
+     * condition.
      */
     private boolean downgradedFromAbove(List<RowContext.TableBinding> leftShape,
                                         List<RowContext.TableBinding> rightShape) {
-        if (from.inheritedQualsUnreadable) return true;
         List<Expression> quals = new ArrayList<Expression>();
         if (from.enclosingWhere != null) {
             List<Expression> parts = new ArrayList<Expression>();
@@ -556,123 +668,148 @@ final class FullJoinAdmissibility {
             quals.add(normalize(q, 0));
         }
 
-        // A name this cannot place belongs to something outside the join — a sibling relation, an
-        // enclosing query, or nothing at all, which PostgreSQL reports before it plans.
+        Relations rels = new Relations(leftShape, rightShape);
         for (Expression q : quals) {
-            List<ColumnRef> refs = new ArrayList<ColumnRef>();
-            collectVisibleRefs(q, refs);
-            for (ColumnRef ref : refs) {
-                if (placeRef(ref, leftShape, rightShape) == SIDE_NONE) return true;
-            }
-        }
-
-        Set<ColumnRef> nonNullable = new HashSet<ColumnRef>();
-        for (Expression q : quals) {
-            nonNullableVars(q, nonNullable);
-        }
-        for (ColumnRef ref : nonNullable) {
-            int side = placeRef(ref, leftShape, rightShape);
-            if (side == SIDE_LEFT || side == SIDE_RIGHT) return true;
-        }
-        for (String name : from.inheritedNonNullNames) {
-            if (hasColumn(leftShape, name) || hasColumn(rightShape, name)) return true;
+            // Overlapping either side is enough: PostgreSQL then plans a left, right or inner
+            // join, none of which is asked to be mergejoinable.
+            if (!nonNullableRels(q, rels).isEmpty()) return true;
         }
         return false;
     }
 
     /**
-     * The columns a qual proves are not null, PostgreSQL's {@code find_nonnullable_vars}: the AND
-     * of two quals proves what either proves, the OR only what both do, and a test for null
-     * proves nothing.
+     * The two sides of the join, with each relation in them numbered so that a set of them can be
+     * intersected the way PostgreSQL intersects the relids of an OR's arms.
      */
-    void nonNullableVars(Expression e, Set<ColumnRef> out) {
-        if (e == null) return;
-        e = strip(e);
-        if (e instanceof ColumnRef) {
-            out.add((ColumnRef) e);
-            return;
+    private static final class Relations {
+        private final List<RowContext.TableBinding> left;
+        private final List<RowContext.TableBinding> right;
+
+        Relations(List<RowContext.TableBinding> left, List<RowContext.TableBinding> right) {
+            this.left = left;
+            this.right = right;
         }
+
+        /**
+         * The relations of the join a name could be reading. A name belonging to none of them —
+         * a sibling relation, an enclosing query — reads none, and so proves nothing about this
+         * join; a bare name several of them answer to is counted for all of them, which can only
+         * prove more and so only accept more.
+         */
+        Set<Integer> of(ColumnRef ref) {
+            Set<Integer> out = new HashSet<Integer>();
+            for (int i = 0; i < left.size(); i++) {
+                if (matches(left.get(i), ref)) out.add(Integer.valueOf(i));
+            }
+            for (int i = 0; i < right.size(); i++) {
+                if (matches(right.get(i), ref)) out.add(Integer.valueOf(left.size() + i));
+            }
+            return out;
+        }
+
+        private static boolean matches(RowContext.TableBinding b, ColumnRef ref) {
+            if (ref.table() != null) {
+                return b.alias() != null ? b.alias().equalsIgnoreCase(ref.table())
+                        : b.table().getName().equalsIgnoreCase(ref.table());
+            }
+            return ref.column() != null && b.table().getColumnIndex(ref.column()) >= 0;
+        }
+    }
+
+    private static final Set<Integer> NO_RELATIONS = Collections.emptySet();
+
+    /**
+     * The relations of the join a qual proves are not null, PostgreSQL's
+     * {@code find_nonnullable_rels}: the AND of two quals proves what either proves, an OR only
+     * what every one of its arms proves, and a test for null proves nothing.
+     */
+    private Set<Integer> nonNullableRels(Expression e, Relations rels) {
+        if (e == null) return NO_RELATIONS;
+        e = strip(e);
+        if (e instanceof ColumnRef) return rels.of((ColumnRef) e);
         if (e instanceof BinaryExpr) {
             BinaryExpr b = (BinaryExpr) e;
             if (b.op() == BinaryExpr.BinOp.AND) {
-                nonNullableVars(b.left(), out);
-                nonNullableVars(b.right(), out);
-                return;
+                Set<Integer> out = new HashSet<Integer>(nonNullableRels(b.left(), rels));
+                out.addAll(nonNullableRels(b.right(), rels));
+                return out;
             }
             if (b.op() == BinaryExpr.BinOp.OR) {
                 List<Expression> arms = new ArrayList<Expression>();
                 flattenOr(b, arms);
-                Set<ColumnRef> shared = null;
+                Set<Integer> shared = null;
                 for (Expression arm : arms) {
-                    Set<ColumnRef> armVars = new HashSet<ColumnRef>();
-                    nonNullableVars(arm, armVars);
-                    if (shared == null) shared = armVars;
-                    else shared.retainAll(armVars);
+                    Set<Integer> armRels = nonNullableRels(arm, rels);
+                    if (shared == null) shared = new HashSet<Integer>(armRels);
+                    else shared.retainAll(armRels);
+                    if (shared.isEmpty()) return NO_RELATIONS;
                 }
-                if (shared != null) out.addAll(shared);
-                return;
+                return shared == null ? NO_RELATIONS : shared;
             }
             if (b.op() == BinaryExpr.BinOp.IS_DISTINCT_FROM
                     || b.op() == BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM) {
-                return;
+                return NO_RELATIONS;
             }
-            strictVars(b.left(), out);
-            strictVars(b.right(), out);
-            return;
+            Set<Integer> out = new HashSet<Integer>();
+            strictRels(b.left(), rels, out);
+            strictRels(b.right(), rels, out);
+            return out;
         }
+        Set<Integer> out = new HashSet<Integer>();
         if (e instanceof IsNullExpr) {
-            if (((IsNullExpr) e).negated()) strictVars(((IsNullExpr) e).expr(), out);
-            return;
+            if (((IsNullExpr) e).negated()) strictRels(((IsNullExpr) e).expr(), rels, out);
+            return out;
         }
         if (e instanceof IsBooleanExpr) {
             IsBooleanExpr t = (IsBooleanExpr) e;
             if (t.test() == IsBooleanExpr.BooleanTest.IS_TRUE
                     || t.test() == IsBooleanExpr.BooleanTest.IS_FALSE
                     || t.test() == IsBooleanExpr.BooleanTest.IS_NOT_UNKNOWN) {
-                strictVars(t.expr(), out);
+                strictRels(t.expr(), rels, out);
             }
-            return;
+            return out;
         }
         if (e instanceof BetweenExpr) {
             BetweenExpr b = (BetweenExpr) e;
-            strictVars(b.expr(), out);
-            strictVars(b.low(), out);
-            strictVars(b.high(), out);
-            return;
+            strictRels(b.expr(), rels, out);
+            strictRels(b.low(), rels, out);
+            strictRels(b.high(), rels, out);
+            return out;
         }
         if (e instanceof LikeExpr) {
             LikeExpr l = (LikeExpr) e;
-            strictVars(l.left(), out);
-            strictVars(l.pattern(), out);
-            return;
+            strictRels(l.left(), rels, out);
+            strictRels(l.pattern(), rels, out);
+            return out;
         }
         if (e instanceof InExpr) {
-            strictVars(((InExpr) e).expr(), out);
-            return;
+            strictRels(((InExpr) e).expr(), rels, out);
+            return out;
         }
         if (e instanceof AnyAllArrayExpr) {
-            strictVars(((AnyAllArrayExpr) e).left(), out);
-            return;
+            strictRels(((AnyAllArrayExpr) e).left(), rels, out);
+            return out;
         }
         if (e instanceof CastExpr) {
-            strictVars(e, out);
+            strictRels(e, rels, out);
         }
+        return out;
     }
 
     /**
-     * The columns an expression reads in a position where a null in makes a null out. Reading into
-     * a function this does not know is deliberate: taking a function for strict can only make the
-     * check accept a join, never refuse one.
+     * The relations an expression reads in a position where a null in makes a null out. Reading
+     * into a function this does not know is deliberate: taking a function for strict can only make
+     * the check accept a join, never refuse one.
      */
-    private void strictVars(Expression e, Set<ColumnRef> out) {
+    private void strictRels(Expression e, Relations rels, Set<Integer> out) {
         if (e == null) return;
         e = strip(e);
         if (e instanceof ColumnRef) {
-            out.add((ColumnRef) e);
+            out.addAll(rels.of((ColumnRef) e));
             return;
         }
         if (e instanceof CastExpr) {
-            strictVars(((CastExpr) e).expr(), out);
+            strictRels(((CastExpr) e).expr(), rels, out);
             return;
         }
         if (e instanceof BinaryExpr) {
@@ -682,19 +819,19 @@ final class FullJoinAdmissibility {
                     || b.op() == BinaryExpr.BinOp.IS_NOT_DISTINCT_FROM) {
                 return;
             }
-            strictVars(b.left(), out);
-            strictVars(b.right(), out);
+            strictRels(b.left(), rels, out);
+            strictRels(b.right(), rels, out);
             return;
         }
         if (e instanceof UnaryExpr) {
             UnaryExpr u = (UnaryExpr) e;
             if (u.op() == UnaryExpr.UnaryOp.NOT) return;
-            strictVars(u.operand(), out);
+            strictRels(u.operand(), rels, out);
             return;
         }
         if (e instanceof LikeExpr) {
-            strictVars(((LikeExpr) e).left(), out);
-            strictVars(((LikeExpr) e).pattern(), out);
+            strictRels(((LikeExpr) e).left(), rels, out);
+            strictRels(((LikeExpr) e).pattern(), rels, out);
             return;
         }
         if (e instanceof FunctionCallExpr) {
@@ -704,7 +841,7 @@ final class FullJoinAdmissibility {
             if (dot >= 0) name = name.substring(dot + 1);
             if (NON_STRICT.contains(name)) return;
             if (f.args() != null) {
-                for (Expression a : f.args()) strictVars(a, out);
+                for (Expression a : f.args()) strictRels(a, rels, out);
             }
         }
     }
