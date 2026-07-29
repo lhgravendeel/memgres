@@ -1652,6 +1652,7 @@ class SessionExecutor {
      * which performs type analysis before storing the prepared statement.
      */
     private void validatePreparedBody(Statement body, List<String> paramTypes) {
+        validatePreparedQueryShape(body);
         if (body instanceof SelectStmt) {
             SelectStmt select = (SelectStmt) body;
             // Validate CASE expressions in the select list for type compatibility
@@ -1679,6 +1680,34 @@ class SessionExecutor {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * The analysis a prepared body gets for its shape rather than its types: PostgreSQL analyses a
+     * PREPARE body in full, so a FROM clause that names one relation twice and an ORDER BY over a
+     * set operation that names no output column are both refused when the statement is prepared
+     * and not when it is executed. Neither check reads a row, so both can be made here.
+     *
+     * <p>Only a parameter is judged in the ORDER BY. Which expressions are output columns is a
+     * question about the arms' select lists, which the set-operation executor answers with the
+     * columns in hand; a parameter is the one item that can never be an output column name however
+     * the arms are written.
+     */
+    private void validatePreparedQueryShape(Statement body) {
+        if (body instanceof SelectStmt) {
+            executor.selectExecutor.validateFromClause(((SelectStmt) body).from());
+            return;
+        }
+        if (!(body instanceof SetOpStmt)) return;
+        SetOpStmt setOp = (SetOpStmt) body;
+        validatePreparedQueryShape(setOp.left());
+        validatePreparedQueryShape(setOp.right());
+        if (setOp.orderBy() == null) return;
+        for (SelectStmt.OrderByItem item : setOp.orderBy()) {
+            Expression expr = item.expr();
+            if (expr instanceof CollateExpr) expr = ((CollateExpr) expr).expr();
+            if (expr instanceof ParamRef) throw SelectSetOpExecutor.notAnOutputColumn();
         }
     }
 

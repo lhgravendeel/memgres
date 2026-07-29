@@ -27,6 +27,7 @@ class SelectParser {
         // Grammar: set_expr = intersect_expr ((UNION|EXCEPT) [ALL] intersect_expr)*
         //          intersect_expr = select_term (INTERSECT [ALL] select_term)*
 
+        rejectSortedLeftArm(left);
         // First absorb any higher-precedence INTERSECT
         left = parseIntersectChain(left);
 
@@ -111,13 +112,62 @@ class SelectParser {
             if (changed) {
                 left = new SetOpStmt(sop.left(), sop.op(), sop.all(), sop.right(), orderBy, limit, offset);
             }
+            rejectLockOnSetOp();
         }
 
         return left;
     }
 
+    /**
+     * A row lock names the base-table row behind an output row, and a set operation has combined
+     * rows from different relations by the time it has one to name. PostgreSQL refuses the lock
+     * written after the whole set operation just as it refuses one written on an arm.
+     */
+    private void rejectLockOnSetOp() {
+        if (!parser.checkKeyword("FOR")) return;
+        String mode = null;
+        if (parser.checkKeywordAt(1, "UPDATE")) mode = "UPDATE";
+        else if (parser.checkKeywordAt(1, "SHARE")) mode = "SHARE";
+        else if (parser.checkKeywordAt(1, "NO") && parser.checkKeywordAt(2, "KEY")) mode = "NO KEY UPDATE";
+        else if (parser.checkKeywordAt(1, "KEY") && parser.checkKeywordAt(2, "SHARE")) mode = "KEY SHARE";
+        if (mode == null) return;
+        throw new MemgresException("FOR " + mode
+                + " is not allowed with UNION/INTERSECT/EXCEPT", "0A000");
+    }
+
+    /**
+     * ORDER BY, LIMIT, OFFSET and FOR UPDATE belong to the set operation as a whole, so
+     * PostgreSQL's grammar has no production for one written on an unparenthesised arm:
+     * {@code SELECT a FROM t ORDER BY 1 UNION SELECT 5} is a syntax error at UNION, and so is the
+     * same with LIMIT, OFFSET or FOR UPDATE. The arms were parsed as ordinary SELECTs, which take
+     * those clauses, and the trailing-clause bubbling then moved them to the set operation -- so
+     * the ORDER BY silently applied to the union and the LIMIT silently applied to the first arm
+     * alone.
+     *
+     * <p>Parenthesised, all three are legal and mean the arm, which is a difference the AST does
+     * not record. The token before the set-operation keyword does record it: a parenthesised arm
+     * ends in the closing paren. Reading it there keeps the check to the one shape that can only
+     * have come from an unparenthesised arm.
+     */
+    private void rejectSortedLeftArm(Statement left) {
+        if (!(left instanceof SelectStmt)) return;
+        SelectStmt sel = (SelectStmt) left;
+        if (sel.orderBy() == null && sel.limit() == null && sel.offset() == null
+                && sel.lockClause() == null) {
+            return;
+        }
+        if (!parser.checkKeyword("UNION") && !parser.checkKeyword("INTERSECT")
+                && !parser.checkKeyword("EXCEPT")) {
+            return;
+        }
+        if (parser.previousTokenIs(TokenType.RIGHT_PAREN)) return;
+        throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                parser.peek());
+    }
+
     /** Parse a chain of INTERSECT operations (higher precedence, left-associative). */
     Statement parseIntersectChain(Statement left) {
+        rejectSortedLeftArm(left);
         while (parser.checkKeyword("INTERSECT")) {
             parser.advance();
             boolean all = parser.matchKeyword("ALL");
@@ -168,8 +218,14 @@ class SelectParser {
                 orderBy = rsel.orderBy();
                 limit = rsel.limit();
                 offset = rsel.offset();
-                cleanRight = new SelectStmt(rsel.distinct(), rsel.targets(), rsel.from(), rsel.where(),
-                        rsel.groupBy(), rsel.having(), null, null, null, rsel.withClauses());
+                // Only ORDER BY, LIMIT and OFFSET move up. Rebuilding the arm through a short
+                // constructor dropped everything the short one has no parameter for, and the row
+                // lock among them: FOR UPDATE written after a set operation is refused because
+                // the arm still carries it, and it stopped carrying it here.
+                cleanRight = new SelectStmt(rsel.distinct(), rsel.distinctOn(), rsel.targets(),
+                        rsel.from(), rsel.where(), rsel.groupBy(), rsel.having(), rsel.windowDefs(),
+                        null, null, null, rsel.withClauses(), rsel.groupingSets(),
+                        rsel.lockClause(), rsel.withTies());
             }
         } else if (processedRight instanceof SetOpStmt) {
             SetOpStmt rightSop = (SetOpStmt) processedRight;

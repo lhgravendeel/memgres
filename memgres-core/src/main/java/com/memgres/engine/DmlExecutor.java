@@ -1258,7 +1258,11 @@ class DmlExecutor {
             for (SelectStmt.FromItem fi : stmt.from()) {
                 String fromAlias = partitionHelper.extractFromItemAlias(fi);
                 if (fromAlias != null && fromAlias.equalsIgnoreCase(targetAlias)) {
-                    throw new MemgresException("table reference \"" + targetAlias + "\" is ambiguous", "42712");
+                    // The name is given twice, which is what PostgreSQL says: the target and
+                    // the FROM item answer to one name and neither can be reached. "ambiguous"
+                    // is a different complaint with a different message under the same SQLSTATE.
+                    throw new MemgresException(
+                            "table name \"" + targetAlias + "\" specified more than once", "42712");
                 }
             }
         }
@@ -1843,7 +1847,11 @@ class DmlExecutor {
             for (SelectStmt.FromItem fi : stmt.using()) {
                 String usingAlias = partitionHelper.extractFromItemAlias(fi);
                 if (usingAlias != null && usingAlias.equalsIgnoreCase(targetAlias)) {
-                    throw new MemgresException("table reference \"" + targetAlias + "\" is ambiguous", "42712");
+                    // The name is given twice, which is what PostgreSQL says: the target and
+                    // the FROM item answer to one name and neither can be reached. "ambiguous"
+                    // is a different complaint with a different message under the same SQLSTATE.
+                    throw new MemgresException(
+                            "table name \"" + targetAlias + "\" specified more than once", "42712");
                 }
             }
         }
