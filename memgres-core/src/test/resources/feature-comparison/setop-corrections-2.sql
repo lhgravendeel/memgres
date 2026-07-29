@@ -59,7 +59,12 @@ DROP FUNCTION IF EXISTS stn_arr();
 DROP FUNCTION IF EXISTS stn_out();
 DROP FUNCTION IF EXISTS stn_setofint();
 
+-- stn_t is updated and deleted from by section 4 and by the last section, and an earlier file
+-- in this suite leaves a publication FOR ALL TABLES behind, under which a table with no
+-- replica identity may not be updated or deleted from (55000). stn_t cannot take a primary
+-- key -- section 4 writes a null into a -- so it is given a replica identity of its own.
 CREATE TABLE stn_t (a int, b text);
+ALTER TABLE stn_t REPLICA IDENTITY FULL;
 INSERT INTO stn_t VALUES (1, 'a'), (2, 'b');
 
 CREATE TABLE stn_u (c int, d text);

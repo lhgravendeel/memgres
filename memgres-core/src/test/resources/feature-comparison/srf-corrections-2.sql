@@ -53,7 +53,12 @@
 -- ============================================================================
 
 DROP TABLE IF EXISTS srn_t CASCADE;
+-- srn_t is deleted from and updated below, and an earlier file in this suite leaves a
+-- publication FOR ALL TABLES behind, under which a table with no replica identity may not be
+-- updated or deleted from (55000). A replica identity of its own keeps those statements
+-- measuring what they are written to measure.
 CREATE TABLE srn_t (a int, b text);
+ALTER TABLE srn_t REPLICA IDENTITY FULL;
 INSERT INTO srn_t VALUES (1,'a'), (2,'b');
 
 DROP TABLE IF EXISTS srn_tgt CASCADE;
@@ -493,41 +498,49 @@ SELECT count(*) FROM (SELECT 1 AS a) s, (SELECT 2 AS b) t WHERE s.a < t.b;
 -- 10. A suggested column names the relation that has it
 -- ============================================================================
 
+-- note: the suggestion is a HINT beside the message, not part of the message itself
 -- begin-expected-error
 -- sqlstate: 42703
--- message-like: Perhaps you meant to reference the column "a.t"
+-- message-like: column "tt" does not exist
+-- hint-like: Perhaps you meant to reference the column "a.t".
 -- end-expected-error
 SELECT tt FROM srn_a a;
 
 -- begin-expected-error
 -- sqlstate: 42703
--- message-like: Perhaps you meant to reference the column "a.t"
+-- message-like: column a.tt does not exist
+-- hint-like: Perhaps you meant to reference the column "a.t".
 -- end-expected-error
 SELECT a.tt FROM srn_a a;
 
+-- note: with no alias the relation is named by its own name
 -- begin-expected-error
 -- sqlstate: 42703
--- message-like: Perhaps you meant to reference the column "srn_a.t"
+-- message-like: column "tt" does not exist
+-- hint-like: Perhaps you meant to reference the column "srn_a.t".
 -- end-expected-error
 SELECT tt FROM srn_a;
 
 -- begin-expected-error
 -- sqlstate: 42703
--- message-like: Perhaps you meant to reference the column "srn_a.t"
+-- message-like: column srn_a.tt does not exist
+-- hint-like: Perhaps you meant to reference the column "srn_a.t".
 -- end-expected-error
 SELECT srn_a.tt FROM srn_a;
 
 -- A qualified reference is answered for that relation only
 -- begin-expected-error
 -- sqlstate: 42703
--- message-like: Perhaps you meant to reference the column "b.y"
+-- message-like: column b.yy does not exist
+-- hint-like: Perhaps you meant to reference the column "b.y".
 -- end-expected-error
 SELECT b.yy FROM srn_a a JOIN srn_b b ON a.x = b.y;
 
 -- Every relation with a near miss is offered
 -- begin-expected-error
 -- sqlstate: 42703
--- message-like: Perhaps you meant to reference the column "a.t" or the column "b.t"
+-- message-like: column "tt" does not exist
+-- hint-like: Perhaps you meant to reference the column "a.t" or the column "b.t".
 -- end-expected-error
 SELECT tt FROM srn_a a JOIN srn_b b ON a.id = b.id;
 

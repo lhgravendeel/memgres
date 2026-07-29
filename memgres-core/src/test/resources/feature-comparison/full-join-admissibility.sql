@@ -499,8 +499,10 @@ CREATE VIEW fja_v2 AS SELECT * FROM fja_p a FULL JOIN fja_q b ON a.id = b.id;
 -- refuses it; memgres does not judge a body it is only storing
 -- expected-divergence: a join not in the outermost query is accepted rather than judged
 CREATE MATERIALIZED VIEW fja_mv AS SELECT a.x, b.y FROM fja_a a FULL JOIN fja_b b ON a.x > b.y;
-DROP MATERIALIZED VIEW fja_mv;
+-- the create above is the divergence, so only one of the two engines has anything to drop
+DROP MATERIALIZED VIEW IF EXISTS fja_mv;
 
+-- note: WITH NO DATA does not run the query, so PostgreSQL stores this one and both engines drop it
 CREATE MATERIALIZED VIEW fja_mv AS SELECT a.x, b.y FROM fja_a a FULL JOIN fja_b b ON a.x > b.y WITH NO DATA;
 DROP MATERIALIZED VIEW fja_mv;
 
