@@ -154,8 +154,11 @@ class SelectSetOpExecutor {
                                 // PG returns 22P02 (invalid_text_representation) when a
                                 // literal/unknown value cannot be coerced to the target type
                                 // in a set operation (e.g., SELECT 1 UNION ALL SELECT 'x').
+                                // The type is named the way PostgreSQL names it in a message --
+                                // "integer", not the catalog's "int4" -- as the mismatch error
+                                // just above already does.
                                 throw new MemgresException(
-                                        "invalid input syntax for type " + targetType.getPgName()
+                                        "invalid input syntax for type " + targetType.toRegtypeDisplay()
                                                 + ": \"" + val + "\"", "22P02");
                             }
                         }
@@ -236,10 +239,10 @@ class SelectSetOpExecutor {
 
         final List<Column> orderColumns = columns;
         // ORDER BY on set operation result
-        validateOrderBy(stmt, columns);
-        if (stmt.orderBy() != null && !stmt.orderBy().isEmpty()) {
+        final List<SelectStmt.OrderByItem> orderBy = validateOrderBy(stmt, columns);
+        if (orderBy != null && !orderBy.isEmpty()) {
             resultRows.sort((a, b) -> {
-                for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+                for (SelectStmt.OrderByItem item : orderBy) {
                     int colIdx = -1;
                     if (item.expr() instanceof Literal && ((Literal) item.expr()).literalType() == Literal.LiteralType.INTEGER) {
                         Literal lit = (Literal) item.expr();
@@ -342,13 +345,30 @@ class SelectSetOpExecutor {
      * take. Sorting by whatever happened to match and ignoring the rest let ORDER BY 5 pass; and
      * because the OFFSET beside it was read with neither a sign check nor a rounding, OFFSET -1
      * changed the row order instead of raising.
+     *
+     * <p>"Only an output column name" is the shape of what PostgreSQL accepts, not the test it
+     * applies. What it does is analyse the item and then look for the result among the output
+     * columns it already has, refusing only when the item added one. So an expression that
+     * analyses back to an output column is accepted, and the one such expression is a cast to the
+     * type the column already has: {@code ORDER BY a::int} over an integer {@code a} is a relabel
+     * PostgreSQL elides, and it sorts. {@code a::bigint} is a real coercion and is refused, and so
+     * are {@code b::varchar} over text, {@code +a}, {@code abs(a)} and {@code 1::int}. Refusing
+     * every cast alike refused SQL PostgreSQL runs.
      */
-    private void validateOrderBy(SetOpStmt stmt, List<Column> columns) {
-        if (stmt.orderBy() == null) return;
+    private List<SelectStmt.OrderByItem> validateOrderBy(SetOpStmt stmt, List<Column> columns) {
+        if (stmt.orderBy() == null) return null;
+        List<SelectStmt.OrderByItem> resolved = new ArrayList<>();
         for (SelectStmt.OrderByItem item : stmt.orderBy()) {
             Expression expr = item.expr();
             boolean collated = expr instanceof CollateExpr;
             if (collated) expr = ((CollateExpr) expr).expr();
+
+            // A cast that changes nothing is not there once the item is analysed, so peel it off
+            // and judge what it wrapped -- and sort by what it wrapped, since the peeled item is
+            // the one the sort below knows how to read. COLLATE is a node of its own and never
+            // peels away.
+            if (!collated) expr = stripNoOpCasts(expr, columns);
+            resolved.add(new SelectStmt.OrderByItem(expr, item.descending(), item.nullsFirst()));
 
             Integer pos = GroupByValidator.integerConstant(expr);
             if (pos != null) {
@@ -386,8 +406,44 @@ class SelectSetOpExecutor {
                             + named.getType().toRegtypeDisplay(), "42804");
                 }
             }
-            throw new MemgresException("invalid UNION/INTERSECT/EXCEPT ORDER BY clause", "0A000");
+            throw notAnOutputColumn();
         }
+        return resolved;
+    }
+
+    /**
+     * The error PostgreSQL raises for an ORDER BY item over a set operation that is not one of the
+     * output columns, carrying the Detail and the Hint it sends with it.
+     */
+    static MemgresException notAnOutputColumn() {
+        MemgresException e = new MemgresException(
+                "invalid UNION/INTERSECT/EXCEPT ORDER BY clause", "0A000");
+        e.setDetail("Only result column names can be used, not expressions or functions.");
+        e.setHint("Add the expression/function to every SELECT, "
+                + "or move the UNION into a FROM clause.");
+        return e;
+    }
+
+    /**
+     * {@code expr} with any casts peeled off that cast an output column to the type it already
+     * has, or {@code expr} unchanged. Only a chain of such casts over a named output column peels:
+     * a cast of anything else, or to any other type, is a coercion the analysed item keeps, and
+     * keeping it here is what makes the item fail the output-column test below.
+     */
+    private static Expression stripNoOpCasts(Expression expr, List<Column> columns) {
+        Expression inner = expr;
+        while (inner instanceof CastExpr) inner = ((CastExpr) inner).expr();
+        if (!(inner instanceof ColumnRef) || ((ColumnRef) inner).table() != null) return expr;
+        Column named = namedColumn(columns, ((ColumnRef) inner).column());
+        if (named == null || named.getType() == null) return expr;
+        Expression walk = expr;
+        while (walk instanceof CastExpr) {
+            String typeName = ((CastExpr) walk).typeName();
+            if (typeName == null) return expr;
+            if (DataType.fromPgName(DataType.canonicalName(typeName)) != named.getType()) return expr;
+            walk = ((CastExpr) walk).expr();
+        }
+        return inner;
     }
 
     private static Column namedColumn(List<Column> columns, String name) {

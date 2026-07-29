@@ -825,8 +825,10 @@ class SelectExecutor {
                 }
                 continue;
             }
+            RowContext.TableBinding only = w.table() == null ? null : starTarget(w, bindings);
             for (RowContext.TableBinding b : bindings) {
-                if (w.table() != null && !b.alias().equalsIgnoreCase(w.table())
+                if (only != null && b != only) continue;
+                if (only == null && w.table() != null && !b.alias().equalsIgnoreCase(w.table())
                         && !b.table().getName().equalsIgnoreCase(w.table())) {
                     continue;
                 }
@@ -867,6 +869,61 @@ class SelectExecutor {
                     bindings.get(oc.bindings[i]).table().getColumns().get(oc.columns[i]).getName()));
         }
         return new FunctionCallExpr("coalesce", sources);
+    }
+
+    /**
+     * The single FROM entry a qualified star stands for, or null when the qualifier is a bare
+     * name and the FROM entry of that name is whichever one answers to it.
+     *
+     * <p>A schema in the qualifier picks the entry out: {@code SELECT s2.t.* FROM s1.t, s2.t} is
+     * s2's t and nothing else, and {@code SELECT s1.t.* FROM s2.t} reaches nothing at all. The
+     * parser dropped the schema, so the star matched by name -- expanding both relations for the
+     * first and s2's for the second, where PostgreSQL answers with one relation and an error.
+     */
+    private RowContext.TableBinding starTarget(WildcardExpr star,
+                                               List<RowContext.TableBinding> bindings) {
+        if (star.catalog() != null) {
+            executor.exprEvaluator.rejectOtherCatalog(star.catalog(),
+                    star.schema() + "." + star.table() + ".*");
+        }
+        if (star.schema() == null) {
+            // A bare qualifier that names two FROM entries names neither of them in particular.
+            // Expanding both put the columns of two relations behind one star.
+            RowContext.TableBinding first = null;
+            for (RowContext.TableBinding b : bindings) {
+                String exposed = b.alias() != null ? b.alias() : b.table().getName();
+                if (!exposed.equalsIgnoreCase(star.table())) continue;
+                if (first != null && first != b) {
+                    throw new MemgresException(
+                            "table reference \"" + star.table() + "\" is ambiguous", "42P09");
+                }
+                first = b;
+            }
+            return null;
+        }
+        RowContext.TableBinding reached =
+                executor.exprEvaluator.schemaPrefixReaches(bindings, star.schema(), star.table());
+        if (reached != null) return reached;
+        for (RowContext.TableBinding b : bindings) {
+            String exposed = b.alias() != null ? b.alias() : b.table().getName();
+            if (exposed.equalsIgnoreCase(star.table())) {
+                MemgresException ex = new MemgresException("invalid reference to FROM-clause entry"
+                        + " for table \"" + star.table() + "\"", "42P01");
+                ex.setDetail("There is an entry for table \"" + star.table()
+                        + "\", but it cannot be referenced from this part of the query.");
+                throw ex;
+            }
+        }
+        for (RowContext.TableBinding b : bindings) {
+            if (b.alias() != null && b.table().getName().equalsIgnoreCase(star.table())) {
+                MemgresException ex = new MemgresException("invalid reference to FROM-clause entry"
+                        + " for table \"" + star.table() + "\"", "42P01");
+                ex.setHint("Perhaps you meant to reference the table alias \"" + b.alias() + "\".");
+                throw ex;
+            }
+        }
+        throw new MemgresException(
+                "missing FROM-clause entry for table \"" + star.table() + "\"", "42P01");
     }
 
     /** True when a DISTINCT ON key is a window function, which only the window pass can evaluate. */
@@ -1085,18 +1142,21 @@ class SelectExecutor {
             if (target.expr() instanceof WildcardExpr) {
                 WildcardExpr w = (WildcardExpr) target.expr();
                 if (w.table() != null) {
+                    RowContext.TableBinding only = starTarget(w, baseBindings);
                     boolean named = false;
                     for (int bIdx = 0; bIdx < baseBindings.size(); bIdx++) {
                         RowContext.TableBinding binding = baseBindings.get(bIdx);
-                        if (binding.alias().equalsIgnoreCase(w.table()) ||
-                                binding.table().getName().equalsIgnoreCase(w.table())) {
-                            named = true;
-                            final int bindingIdx = bIdx;
-                            for (int i = 0; i < binding.table().getColumns().size(); i++) {
-                                resultColumns.add(copyColumnWithOid(binding.table(), i));
-                                final int colIdx = i;
-                                projections.add(ctx -> ctx.getBindings().get(bindingIdx).row()[colIdx]);
-                            }
+                        if (only != null ? binding != only
+                                : !(binding.alias().equalsIgnoreCase(w.table())
+                                    || binding.table().getName().equalsIgnoreCase(w.table()))) {
+                            continue;
+                        }
+                        named = true;
+                        final int bindingIdx = bIdx;
+                        for (int i = 0; i < binding.table().getColumns().size(); i++) {
+                            resultColumns.add(copyColumnWithOid(binding.table(), i));
+                            final int colIdx = i;
+                            projections.add(ctx -> ctx.getBindings().get(bindingIdx).row()[colIdx]);
                         }
                     }
                     // A qualifier no FROM item answers to expands to nothing at all, which is a
@@ -1712,7 +1772,7 @@ class SelectExecutor {
      * the join is executed instead, which is early enough that it is reported rather than
      * evaluated.
      */
-    private void validateFromClause(List<SelectStmt.FromItem> from) {
+    void validateFromClause(List<SelectStmt.FromItem> from) {
         if (from == null) return;
         Map<String, SelectStmt.FromItem> exposed = new LinkedHashMap<>();
         for (SelectStmt.FromItem item : from) {

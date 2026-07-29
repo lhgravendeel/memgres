@@ -400,6 +400,11 @@ class ExprEvaluator {
     }
 
     private Object evalColumnRef(ColumnRef ref, RowContext ctx) {
+        if (ref.catalog() != null) {
+            rejectOtherCatalog(ref.catalog(),
+                    ref.schema() + "." + ref.table() + "." + ref.column());
+            ref = new ColumnRef(ref.schema(), ref.table(), ref.column());
+        }
         // pg_catalog.current_user etc.; treat as the system function directly
         if ("pg_catalog".equalsIgnoreCase(ref.table()) || "information_schema".equalsIgnoreCase(ref.table())) {
             String col = ref.column().toLowerCase();
@@ -592,8 +597,11 @@ class ExprEvaluator {
                     // Two schemas may hold a relation of the same name and both may be in the
                     // FROM clause, so a reference the schema pins to the second of them is
                     // answered from that one rather than from whichever the bare name finds first.
-                    RowContext.TableBinding byName = ctx == null ? null : ctx.getBinding(ref.table());
-                    if (reached != byName) {
+                    // What the bare name reaches, asked without judging it: the name may reach
+                    // two entries and still be perfectly reachable through the schema.
+                    List<RowContext.TableBinding> byName = ctx == null
+                            ? Cols.<RowContext.TableBinding>listOf() : ctx.bindingsNamed(ref.table());
+                    if (byName.size() != 1 || reached != byName.get(0)) {
                         int idx = reached.table().getColumnIndex(ref.column());
                         if (idx >= 0) return reached.row()[idx];
                     }
@@ -666,6 +674,29 @@ class ExprEvaluator {
     /** True when {@code ctx} binds anything under {@code name}, whatever kind of thing it is. */
     private static boolean bindingNamed(RowContext ctx, String name) {
         return ctx != null && ctx.getBinding(name) != null;
+    }
+
+    /**
+     * A name written with four parts names a catalog, and PostgreSQL reaches only the one it is
+     * connected to: {@code memgrestest.public.t.id} is {@code public.t.id}, and any other catalog
+     * is a cross-database reference it does not implement. The whole name is reported, which is
+     * how PostgreSQL reports it.
+     */
+    void rejectOtherCatalog(String catalog, String rest) {
+        if (catalog == null) return;
+        String current = executor.session != null ? executor.session.getDatabaseName() : null;
+        if (current != null && current.equalsIgnoreCase(catalog)) return;
+        throw new MemgresException("cross-database references are not implemented: "
+                + catalog + "." + rest, "0A000");
+    }
+
+    /**
+     * The one FROM entry among {@code bindings} that {@code schema.table} names, or null. Shared
+     * with the star expansion, which has the bindings in hand rather than a row context.
+     */
+    RowContext.TableBinding schemaPrefixReaches(List<RowContext.TableBinding> bindings,
+                                                String schema, String table) {
+        return schemaPrefixReaches(new RowContext(bindings), schema, table);
     }
 
     /**
@@ -1599,7 +1630,6 @@ class ExprEvaluator {
                             other), ctx);
         }
         Object val = evalExpr(in.expr(), ctx);
-        if (val == null) return null; // NULL IN (...) is NULL
 
         // Check for IN (subquery)
         if (in.values().size() == 1 && in.values().get(0) instanceof SubqueryExpr) {
@@ -1611,13 +1641,13 @@ class ExprEvaluator {
             } finally {
                 if (ctx != null) executor.outerContextStack.pop();
             }
-            // Validate column count: (a, b) IN (SELECT c) is an error if c has fewer columns
-            if (val instanceof List<?> || val instanceof AstExecutor.PgRow) {
-                int expectedCols = val instanceof AstExecutor.PgRow ? ((AstExecutor.PgRow) val).values().size() : ((List<?>) val).size();
-                if (!subResult.getColumns().isEmpty() && subResult.getColumns().size() < expectedCols) {
-                    throw new MemgresException("subquery has too few columns", "42601");
-                }
-            }
+            // Both sides of IN have to be the same width. Only the narrow half was checked, so
+            // 1 IN (SELECT 1, 2) compared against the first column and answered true where
+            // PostgreSQL refuses the subquery outright. The width is a question about the two
+            // select lists and not about the rows, so it is asked ahead of the null answer a null
+            // left-hand side would otherwise short-circuit to.
+            rejectSubqueryWidth(comparandWidth(in.expr(), val), subResult);
+            if (val == null) return null; // NULL IN (...) is NULL
             boolean found = false;
             boolean hasNull = false;
             for (Object[] row : subResult.getRows()) {
@@ -1641,6 +1671,7 @@ class ExprEvaluator {
             if (hasNull) return null;
             return in.negated();
         }
+        if (val == null) return null; // NULL IN (...) is NULL
 
         // Regular IN (value list)
         boolean found = false;
@@ -1895,7 +1926,7 @@ class ExprEvaluator {
             // row -- including when there are none. Reading the width off the first row instead
             // let SELECT (SELECT 1, 2 WHERE false) answer NULL, and reported "more than one row"
             // for a query whose real fault was its width.
-            rejectWideSubquery(result);
+            rejectWideSubquery(sq.subquery(), result);
             if (result.getRows().isEmpty()) return null;
             if (result.getRows().size() > 1) {
                 throw new MemgresException("more than one row returned by a subquery used as an expression", "21000");
@@ -1908,11 +1939,57 @@ class ExprEvaluator {
         }
     }
 
-    /** A subquery standing where one value is expected may have only one column. */
-    static void rejectWideSubquery(QueryResult result) {
+    /**
+     * A subquery standing where one value is expected may have only one column -- and must have
+     * one. {@code SELECT} with an empty select list is a query PostgreSQL parses and gives no
+     * columns at all, so {@code SELECT (SELECT)} is the same complaint as {@code SELECT (SELECT
+     * 1, 2)}; answering NULL for it was reading a column that was not there. The empty list is
+     * read off the statement rather than off the result, because a result the engine could not
+     * describe also has no columns and refusing on that would refuse working SQL.
+     */
+    static void rejectWideSubquery(Statement subquery, QueryResult result) {
         if (result.getColumns() != null && result.getColumns().size() > 1) {
             throw new MemgresException("subquery must return only one column", "42601");
         }
+        if (subquery instanceof SelectStmt) {
+            List<SelectStmt.SelectTarget> targets = ((SelectStmt) subquery).targets();
+            if (targets != null && targets.isEmpty()) {
+                throw new MemgresException("subquery must return only one column", "42601");
+            }
+        }
+    }
+
+    /**
+     * How many columns the side of a comparison written as {@code expr} occupies, or -1 when that
+     * cannot be told from the query text.
+     *
+     * <p>A row constructor occupies one column per element, and that is a property of how it is
+     * written. Everything else occupies one column -- unless the value turns out to be a row, and
+     * a value can be a row without a row constructor: {@code x} in {@code FROM t x} is the whole
+     * row of t, and {@code x IN (SELECT y FROM t y)} compares one whole row against another. Such
+     * a side is left unmeasured rather than counted as its element count, which would have made
+     * the whole-row comparison look like a width clash and refused a query PostgreSQL runs.
+     */
+    private static int comparandWidth(Expression expr, Object value) {
+        if (expr instanceof ArrayExpr && ((ArrayExpr) expr).isRow()) {
+            return ((ArrayExpr) expr).elements().size();
+        }
+        if (value instanceof AstExecutor.PgRow || value instanceof List<?>) return -1;
+        return 1;
+    }
+
+    /**
+     * Both sides of a comparison against a subquery have to be the same width, and PostgreSQL
+     * settles that from the select lists before it reads a row -- so a subquery of the wrong width
+     * is refused whether or not it returns anything. Neither an unmeasurable side nor a subquery
+     * with no column list at all (one the engine could not describe) is judged: refusing on the
+     * strength of either would refuse comparisons PostgreSQL makes.
+     */
+    private static void rejectSubqueryWidth(int want, QueryResult sub) {
+        if (want < 0 || sub.getColumns() == null || sub.getColumns().isEmpty()) return;
+        int got = sub.getColumns().size();
+        if (got < want) throw new MemgresException("subquery has too few columns", "42601");
+        if (got > want) throw new MemgresException("subquery has too many columns", "42601");
     }
 
     /**
@@ -2027,8 +2104,13 @@ class ExprEvaluator {
 
         // A row-constructor left side compares against the whole subquery row, not just
         // its first column: (1,2) = ANY (SELECT xi, yi FROM pts).
+        int written = comparandWidth(aa.left(), leftVal);
         int leftWidth = leftVal instanceof AstExecutor.PgRow
                 ? ((AstExecutor.PgRow) leftVal).values().size() : 1;
+        // ... and one that is not a row constructor compares against one column, so a wider
+        // subquery has no comparison to make. Reading only the first column of it answered
+        // 1 = ANY (SELECT id, name FROM t) with true.
+        rejectSubqueryWidth(written, subResult);
 
         if (aa.isAll()) {
             boolean hasNull = false;

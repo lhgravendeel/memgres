@@ -266,14 +266,39 @@ public class RowContext {
      * carry no alias (or whose alias is the table name itself).
      */
     public TableBinding getBinding(String qualifier) {
+        TableBinding found = null;
         for (TableBinding b : bindings) {
-            if (b.alias() != null) {
-                if (b.alias().equalsIgnoreCase(qualifier)) return b;
-            } else if (b.table().getName().equalsIgnoreCase(qualifier)) {
-                return b;
+            boolean matches = b.alias() != null
+                    ? b.alias().equalsIgnoreCase(qualifier)
+                    : b.table().getName().equalsIgnoreCase(qualifier);
+            if (!matches) continue;
+            // Two relations of one name from two schemas may both stand in a FROM clause --
+            // FROM s1.t, s2.t is legal, because either can still be reached by writing its
+            // schema. Written bare, the name reaches both, and PostgreSQL says so rather than
+            // answering from whichever it finds first, which is what taking the first match did.
+            if (found != null && found != b) {
+                throw new MemgresException(
+                        "table reference \"" + qualifier + "\" is ambiguous", "42P09");
             }
+            found = b;
         }
-        return null;
+        return found;
+    }
+
+    /**
+     * Every binding {@code qualifier} names, without judging whether naming several is a fault --
+     * for the callers that have already pinned one down by other means and only need to know
+     * which, or how many, the bare name would have reached.
+     */
+    public List<TableBinding> bindingsNamed(String qualifier) {
+        List<TableBinding> named = new ArrayList<>();
+        for (TableBinding b : bindings) {
+            boolean matches = b.alias() != null
+                    ? b.alias().equalsIgnoreCase(qualifier)
+                    : b.table().getName().equalsIgnoreCase(qualifier);
+            if (matches) named.add(b);
+        }
+        return named;
     }
 
     /**
