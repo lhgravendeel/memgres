@@ -598,8 +598,14 @@ class PlpgsqlFidelityTest {
         }
     }
 
+    /**
+     * The target of a FOR over rows is the variable the block declared, not a fresh one: PG 18
+     * writes each row into it and leaves the last one there after the loop. (Only the integer
+     * FOR defines a variable of its own, and only an inner block's own DECLARE shadows.) The
+     * live server returns 2:2 for this function, so 'outer' was never what it kept.
+     */
     @Test
-    void record_for_loop_variable_does_not_clobber_outer() throws SQLException {
+    void record_for_loop_variable_is_the_declared_one() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE TABLE lvr_t (id int)");
             s.execute("INSERT INTO lvr_t VALUES (1), (2)");
@@ -607,14 +613,29 @@ class PlpgsqlFidelityTest {
                 CREATE OR REPLACE FUNCTION lvr_fn() RETURNS text LANGUAGE plpgsql AS $$
                 DECLARE r text := 'outer'; n int := 0;
                 BEGIN
-                  FOR r IN SELECT id FROM lvr_t LOOP n := n + 1; END LOOP;
-                  RETURN r || ':' || n;  -- outer r must still be 'outer'
+                  FOR r IN SELECT id FROM lvr_t ORDER BY id LOOP n := n + 1; END LOOP;
+                  RETURN r || ':' || n;
                 END;
                 $$""");
 
-            assertEquals("outer:2", query1(s, "SELECT lvr_fn()"));
+            assertEquals("2:2", query1(s, "SELECT lvr_fn()"));
+
+            // An inner block that declares its own r is the one thing that does shadow
+            s.execute("""
+                CREATE OR REPLACE FUNCTION lvr_fn2() RETURNS text LANGUAGE plpgsql AS $$
+                DECLARE r text := 'outer';
+                BEGIN
+                  DECLARE r record;
+                  BEGIN
+                    FOR r IN SELECT id FROM lvr_t LOOP NULL; END LOOP;
+                  END;
+                  RETURN r;
+                END;
+                $$""");
+            assertEquals("outer", query1(s, "SELECT lvr_fn2()"));
 
             s.execute("DROP FUNCTION lvr_fn()");
+            s.execute("DROP FUNCTION lvr_fn2()");
             s.execute("DROP TABLE lvr_t");
         }
     }

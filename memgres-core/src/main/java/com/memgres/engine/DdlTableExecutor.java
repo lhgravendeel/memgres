@@ -874,6 +874,7 @@ class DdlTableExecutor {
     }
 
     void dropSingleTable(String schemaHint, String name, boolean ifExists, boolean cascade) {
+        if (checkDropSchemaExists(schemaHint, ifExists)) return;
         String schemaName = schemaHint != null ? schemaHint : executor.defaultSchema();
         String tempSchema = executor.session != null ? executor.session.getTempSchemaName() : "pg_temp";
         Schema pgTemp = executor.database.getSchema(tempSchema);
@@ -1048,6 +1049,29 @@ class DdlTableExecutor {
         }
     }
 
+    /**
+     * A DROP that names a schema of its own says where to look, and a schema that is not there
+     * is what is missing — PostgreSQL reports 3F000 for the schema rather than 42P01 for an
+     * object it never went looking for, and IF EXISTS skips on the schema by name. Returns true
+     * when the caller should stop because the schema is absent and IF EXISTS was given.
+     */
+    boolean checkDropSchemaExists(String schemaHint, boolean ifExists) {
+        if (schemaHint == null || executor.database.getSchema(schemaHint) != null) return false;
+        String tempSchema = executor.session != null ? executor.session.getTempSchemaName() : null;
+        if (schemaHint.equalsIgnoreCase("pg_temp")
+                || (tempSchema != null && schemaHint.equalsIgnoreCase(tempSchema))) {
+            return false;
+        }
+        if (!ifExists) {
+            throw new MemgresException("schema \"" + schemaHint + "\" does not exist", "3F000");
+        }
+        if (executor.session != null) {
+            executor.session.addNotice("NOTICE", "00000",
+                    "schema \"" + schemaHint + "\" does not exist, skipping", null);
+        }
+        return true;
+    }
+
     /** Find the schema name that holds this exact table instance, falling back to the given name. */
     private String findSchemaNameOf(Table table, String fallback) {
         for (Map.Entry<String, Schema> entry : executor.database.getSchemas().entrySet()) {
@@ -1180,6 +1204,9 @@ class DdlTableExecutor {
             }
             List<String> searchSchemas;
             if (explicitSchema != null) {
+                // A schema named here is where the table is looked for, so a schema that is not
+                // there is what is missing rather than the table
+                checkDropSchemaExists(explicitSchema, false);
                 searchSchemas = Cols.listOf(explicitSchema);
             } else {
                 // Use search_path from session, falling back to "public"

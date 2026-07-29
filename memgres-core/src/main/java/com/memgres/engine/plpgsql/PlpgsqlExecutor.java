@@ -71,6 +71,14 @@ public class PlpgsqlExecutor {
         final Map<String, String> notNullVars = new LinkedHashMap<>();
         /** Variables of a domain type, so every assignment re-checks the domain's constraints. */
         final Map<String, String> domainVars = new LinkedHashMap<>();
+        /**
+         * Variables whose declared type carries a length or precision, mapped to that type. The
+         * declaration is a constraint on the variable and not only on its first value, so it is
+         * re-applied on every write.
+         */
+        final Map<String, String> constrainedTypes = new LinkedHashMap<>();
+        /** Names declared ALIAS FOR something else, mapped to the name they stand for. */
+        final Map<String, String> aliases = new LinkedHashMap<>();
         final java.util.Set<String> outputOnlyVars = new java.util.HashSet<>();
         final Scope parent;
         int lastRowCount = 0;
@@ -89,15 +97,33 @@ public class PlpgsqlExecutor {
             return null;
         }
 
-        Object get(String name) {
+        /**
+         * The name a reference really reaches. An ALIAS FOR declares no storage of its own, so
+         * every read and write has to land on the variable it stands for.
+         */
+        String resolve(String name) {
             String key = name.toLowerCase();
+            for (int hops = 0; hops < 16; hops++) {
+                String target = null;
+                for (Scope s = this; s != null; s = s.parent) {
+                    if (s.aliases.containsKey(key)) { target = s.aliases.get(key); break; }
+                    if (s.variables.containsKey(key)) return key;
+                }
+                if (target == null) return key;
+                key = target;
+            }
+            return key;
+        }
+
+        Object get(String name) {
+            String key = resolve(name);
             if (variables.containsKey(key)) return variables.get(key);
             if (parent != null) return parent.get(key);
             return null;
         }
 
         void set(String name, Object value) {
-            String key = name.toLowerCase();
+            String key = resolve(name);
             Scope s = this;
             while (s != null) {
                 if (s.variables.containsKey(key)) {
@@ -122,11 +148,18 @@ public class PlpgsqlExecutor {
                         + declaredName + "\" declared NOT NULL", "22004");
             }
             String domain = domainVars.get(key);
-            return domain != null ? astExecutor.castValue(value, domain) : value;
+            Object coerced = domain != null ? astExecutor.castValue(value, domain) : value;
+            String constrained = constrainedTypes.get(key);
+            if (coerced != null && isTemporalTypmodType(constrained)) {
+                // A declared fractional-seconds precision is applied by reading the value as the
+                // declared type, which is where the rounding lives
+                return astExecutor.castValue(coerced, constrained);
+            }
+            return applyDeclaredTypmod(coerced, constrained);
         }
 
         boolean has(String name) {
-            String key = name.toLowerCase();
+            String key = resolve(name);
             if (variables.containsKey(key)) return true;
             return parent != null && parent.has(key);
         }
@@ -149,7 +182,7 @@ public class PlpgsqlExecutor {
         }
 
         String declaredType(String name) {
-            String key = name.toLowerCase();
+            String key = resolve(name);
             Scope sc = this;
             while (sc != null) {
                 if (sc.declaredTypes.containsKey(key)) return sc.declaredTypes.get(key);
@@ -347,10 +380,21 @@ public class PlpgsqlExecutor {
             }
             val = coerceParamValue(val, p.typeName());
             scope.declare(pName, val);
+            if (p.name() != null) {
+                // Every parameter answers to its position as well as its name, so
+                // ALIAS FOR $1 reaches the same storage that the name reaches
+                scope.aliases.put("$" + (i + 1), p.name().toLowerCase());
+            }
         }
         scope.declare("found", false);
 
         String returnType = function.getReturnType();
+        if (returnType != null) scope.declare("__return_type__", returnType);
+        // A PL/pgSQL function declared RETURNS void hands back the one value of type void, whose
+        // text is empty — not NULL. `f() IS NULL` is false for it, as PostgreSQL reports. (A
+        // LANGUAGE SQL function of the same signature really does yield NULL, so this is the
+        // PL/pgSQL path only.)
+        boolean voidReturning = "void".equalsIgnoreCase(returnType);
         boolean isSetof = returnType != null && returnType.toUpperCase().startsWith("SETOF");
         boolean isTable = returnType != null && returnType.equalsIgnoreCase("TABLE");
 
@@ -391,7 +435,7 @@ public class PlpgsqlExecutor {
             // Explicit RETURN; if we also have OUT params, prefer the OUT param values
             if (outParams.isEmpty()) {
                 checkReturnedRecord(rs.value, returnType);
-                return rs.value;
+                return voidReturning ? VOID_VALUE : rs.value;
             }
         }
 
@@ -415,13 +459,16 @@ public class PlpgsqlExecutor {
         // A function that forgets to RETURN would otherwise hand the caller a NULL that nothing
         // downstream can tell apart from a real one
         if (!returned && returnType != null && !returnType.isEmpty()
-                && !"void".equalsIgnoreCase(returnType)
+                && !voidReturning
                 && !"trigger".equalsIgnoreCase(returnType)
                 && !"event_trigger".equalsIgnoreCase(returnType)) {
             throw new MemgresException("control reached end of function without RETURN", "2F005");
         }
-        return null;
+        return voidReturning ? VOID_VALUE : null;
     }
+
+    /** The text of the single value of type {@code void}, which is empty and is not NULL. */
+    private static final String VOID_VALUE = "";
 
     /**
      * A record returned where a composite type is declared has to have that type's fields. A row
@@ -714,6 +761,10 @@ public class PlpgsqlExecutor {
 
     private void executeBlockBody(PlpgsqlStatement.Block block, Scope scope) {
         for (PlpgsqlStatement.VarDeclaration decl : block.declarations()) {
+            if (decl.aliasFor() != null) {
+                scope.aliases.put(decl.name().toLowerCase(), decl.aliasFor().toLowerCase());
+                continue;
+            }
             if (decl.isCursor() && decl.cursorQuery() != null && !decl.cursorQuery().isEmpty()) {
                 // A bound cursor keeps its query so OPEN can run it, with or without arguments
                 scope.declareTyped(decl.name(),
@@ -738,6 +789,10 @@ public class PlpgsqlExecutor {
             if (coerceType != null && database.isDomain(coerceType)) {
                 scope.domainVars.put(key, coerceType);
             }
+            if (declaredTypmod(coerceType) != null) {
+                scope.constrainedTypes.put(key, coerceType);
+                defaultVal = applyDeclaredTypmod(defaultVal, coerceType);
+            }
             scope.declareTyped(decl.name(), defaultVal, decl.typeName());
         }
 
@@ -752,13 +807,13 @@ public class PlpgsqlExecutor {
             boolean implicitTxnStarted = false;
             if (session != null) {
                 implicitTxnStarted = !session.isInTransaction();
-                session.savepoint(subtxnSavepoint);
+                session.internalSavepoint(subtxnSavepoint);
             }
             try {
                 executeStatements(block.body(), scope);
                 // Body succeeded — release the savepoint
                 if (session != null) {
-                    try { session.releaseSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
+                    try { session.internalReleaseSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
                     if (implicitTxnStarted && session.isInTransaction() && !session.isExplicitTransactionBlock()) {
                         session.commit();
                     }
@@ -766,7 +821,7 @@ public class PlpgsqlExecutor {
             } catch (ReturnSignal rs) {
                 // Release savepoint on normal RETURN
                 if (session != null) {
-                    try { session.releaseSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
+                    try { session.internalReleaseSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
                     if (implicitTxnStarted && session.isInTransaction() && !session.isExplicitTransactionBlock()) {
                         session.commit();
                     }
@@ -775,7 +830,7 @@ public class PlpgsqlExecutor {
             } catch (MemgresException e) {
                 // Rollback to savepoint to undo changes made in the try body (subtransaction rollback)
                 if (session != null) {
-                    try { session.rollbackToSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
+                    try { session.internalRollbackToSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
                 }
                 String sqlState = e.getSqlState() != null ? e.getSqlState() : "P0001";
                 for (PlpgsqlStatement.ExceptionHandler handler : block.exceptionHandlers()) {
@@ -798,7 +853,7 @@ public class PlpgsqlExecutor {
             } catch (RuntimeException e) {
                 // Rollback to savepoint to undo changes made in the try body (subtransaction rollback)
                 if (session != null) {
-                    try { session.rollbackToSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
+                    try { session.internalRollbackToSavepoint(subtxnSavepoint); } catch (Exception ignored) {}
                 }
                 // Handle Java exceptions (like ArithmeticException for / by zero)
                 String sqlState = mapJavaExceptionToSqlState(e);
@@ -833,9 +888,121 @@ public class PlpgsqlExecutor {
     private Object evalDeclarationDefault(PlpgsqlStatement.VarDeclaration decl, String coerceType,
                                           Scope scope) {
         if (coerceType != null) {
-            return evalExpr("CAST(" + decl.defaultExpr() + " AS " + coerceType + ")", scope);
+            // A cast to varchar(3) truncates, but storing into a varchar(3) variable does not:
+            // the length is applied separately so an over-long initialiser is refused, not cut
+            String castTo = declaredTypmod(coerceType) != null
+                    ? coerceType.substring(0, coerceType.indexOf('(')).trim() : coerceType;
+            return evalExpr("CAST(" + decl.defaultExpr() + " AS " + castTo + ")", scope);
         }
         return evalExpr(decl.defaultExpr(), scope);
+    }
+
+    /**
+     * The length or precision a declared type carries, or null when it carries none or when it is
+     * one memgres does not police here.
+     */
+    static String declaredTypmod(String typeSpec) {
+        if (typeSpec == null) return null;
+        // An array of a type with a length carries that length on every element, so a
+        // varchar(5)[] is policed exactly as a varchar(5) is
+        String spec = elementTypeOf(typeSpec);
+        int paren = spec.indexOf('(');
+        if (paren < 0 || !spec.endsWith(")")) return null;
+        String base = spec.substring(0, paren).trim().toLowerCase();
+        if (!TYPMOD_BASES.contains(base)) return null;
+        return spec.substring(paren + 1, spec.length() - 1).trim();
+    }
+
+    /** A declared type with its array brackets removed, which is the type an element carries. */
+    private static String elementTypeOf(String typeSpec) {
+        String spec = typeSpec.trim();
+        while (spec.endsWith("[]")) spec = spec.substring(0, spec.length() - 2).trim();
+        return spec;
+    }
+
+    private static final Set<String> TYPMOD_BASES = new java.util.HashSet<String>(Arrays.asList(
+            "varchar", "character varying", "char", "character", "bpchar", "numeric", "decimal",
+            "timestamp", "timestamptz", "time", "timetz", "interval",
+            "timestamp with time zone", "timestamp without time zone",
+            "time with time zone", "time without time zone"));
+
+    /**
+     * Types whose declared parameter is a fractional-seconds precision rather than a length: the
+     * value is held to it by being read as the declared type, which rounds, not by trimming.
+     */
+    static boolean isTemporalTypmodType(String typeSpec) {
+        if (typeSpec == null) return false;
+        String spec = typeSpec.trim().toLowerCase();
+        int paren = spec.indexOf('(');
+        if (paren < 0 || !spec.endsWith(")")) return false;
+        String base = spec.substring(0, paren).trim();
+        return base.equals("timestamp") || base.equals("timestamptz") || base.equals("time")
+                || base.equals("timetz") || base.equals("interval")
+                || base.startsWith("timestamp with") || base.startsWith("timestamp without")
+                || base.startsWith("time with") || base.startsWith("time without");
+    }
+
+    /**
+     * Hold a value to the length or precision its variable was declared with. A local is a typed
+     * store like a column is, so {@code v varchar(3)} refuses a wider string (22001) and
+     * {@code v numeric(4,2)} rounds to its scale and refuses a value past its precision (22003).
+     * Anything without a length or precision in its declaration is left exactly as it is.
+     */
+    static Object applyDeclaredTypmod(Object value, String typeSpec) {
+        if (value == null) return value;
+        String typmod = declaredTypmod(typeSpec);
+        if (typmod == null) return value;
+        if (typeSpec.trim().endsWith("[]")) {
+            // Every element of the array is held to the element type's own length or precision
+            if (!(value instanceof List)) return value;
+            String element = typeSpec.trim().substring(0, typeSpec.trim().length() - 2).trim();
+            List<Object> out = new ArrayList<Object>(((List<?>) value).size());
+            for (Object e : (List<?>) value) out.add(applyDeclaredTypmod(e, element));
+            return out;
+        }
+        String spec = typeSpec.trim();
+        int paren = spec.indexOf('(');
+        String base = spec.substring(0, paren).trim().toLowerCase();
+        String[] args = typmod.split(",");
+        int first;
+        try {
+            first = Integer.parseInt(args[0].trim());
+        } catch (NumberFormatException e) {
+            return value;
+        }
+        if (base.equals("varchar") || base.equals("character varying")) {
+            // A number assigned to a varchar(n) is a string by the time it is stored, and it is
+            // its written length the declaration bounds
+            String s = value instanceof String ? (String) value
+                    : (value instanceof Number ? value.toString() : null);
+            if (s != null && s.length() > first) {
+                throw new MemgresException(
+                        "value too long for type character varying(" + first + ")", "22001");
+            }
+            return value;
+        }
+        if (value instanceof String
+                && (base.equals("char") || base.equals("character") || base.equals("bpchar"))) {
+            String s = (String) value;
+            if (s.length() > first) {
+                throw new MemgresException(
+                        "value too long for type character(" + first + ")", "22001");
+            }
+            StringBuilder padded = new StringBuilder(s);
+            while (padded.length() < first) padded.append(' ');
+            return padded.toString();
+        }
+        if (base.equals("numeric") || base.equals("decimal")) {
+            java.math.BigDecimal bd = value instanceof java.math.BigDecimal
+                    ? (java.math.BigDecimal) value
+                    : (value instanceof Number ? new java.math.BigDecimal(value.toString()) : null);
+            if (bd == null) return value;
+            int scale = args.length > 1 ? Integer.parseInt(args[1].trim()) : 0;
+            java.math.BigDecimal rounded = bd.setScale(scale, java.math.RoundingMode.HALF_UP);
+            TypeCoercion.checkNumericTypmod(rounded, first, scale);
+            return rounded;
+        }
+        return value;
     }
 
     /**
@@ -867,7 +1034,7 @@ public class PlpgsqlExecutor {
      */
     private void releaseSubtxnSavepoint(String savepoint, boolean implicitTxnStarted) {
         if (session != null) {
-            try { session.releaseSavepoint(savepoint); } catch (Exception ignored) {}
+            try { session.internalReleaseSavepoint(savepoint); } catch (Exception ignored) {}
             if (implicitTxnStarted && session.isInTransaction() && !session.isExplicitTransactionBlock()) {
                 session.commit();
             }
@@ -1181,17 +1348,22 @@ public class PlpgsqlExecutor {
         QueryResult result = astExecutor.execute(sql);
 
         List<String> varNames = stmt.varNames();
-        boolean multiVar = varNames.size() > 1;
-        // PG semantics: a record target is implicitly declared in an inner block (it must not
-        // clobber a same-named outer variable and vanishes after the loop), while a
-        // comma-separated scalar list targets previously declared variables (values persist).
+        // A single target that the block declared as a scalar is a list of one scalar, not a
+        // record: PG gives it the column's value, and only a record or row variable takes a row
+        boolean multiVar = varNames.size() > 1
+                || (scope.has(varNames.get(0)) && !isRowVariable(scope, varNames.get(0)));
+        // PG semantics: the loop target names variables the block already declared and their
+        // values persist past the loop, whether the target is one record or a list of scalars.
+        // Only a target nobody declared gets storage of its own for the run of the loop.
         Scope loopScope = new Scope(scope);
         if (multiVar) {
             for (String vn : varNames) {
                 if (!scope.has(vn)) scope.declare(vn, null);
             }
         } else {
-            loopScope.declare(varNames.get(0), null);
+            // A loop variable the block declared keeps its own storage: shadowing it here
+            // would drop the row it holds the moment the loop ends
+            if (!scope.has(varNames.get(0))) loopScope.declare(varNames.get(0), null);
         }
         boolean anyIteration = false;
 
@@ -1204,11 +1376,7 @@ public class PlpgsqlExecutor {
                 }
             } else {
                 // Single variable — always create a record (Map) so that field access (r.col) works
-                Map<String, Object> record = new LinkedHashMap<>();
-                for (int i = 0; i < result.getColumns().size(); i++) {
-                    record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
-                }
-                loopScope.declare(varNames.get(0), record);
+                declareLoopRow(scope, loopScope, varNames.get(0), result, row);
             }
             try {
                 executeStatements(stmt.body(), loopScope);
@@ -1219,6 +1387,11 @@ public class PlpgsqlExecutor {
                 if (c.label == null || c.label.equalsIgnoreCase(stmt.label())) continue;
                 throw c;
             }
+        }
+        if (!anyIteration && !multiVar) {
+            // A loop that saw no row still leaves its variable with the query's shape and every
+            // field NULL, so a field read after it answers NULL rather than failing to resolve
+            declareLoopRow(scope, loopScope, varNames.get(0), result, new Object[0]);
         }
         scope.set("found", anyIteration);
     }
@@ -1236,17 +1409,22 @@ public class PlpgsqlExecutor {
         QueryResult result = astExecutor.execute(sql);
 
         List<String> varNames = stmt.varNames();
-        boolean multiVar = varNames.size() > 1;
-        // PG semantics: a record target is implicitly declared in an inner block (it must not
-        // clobber a same-named outer variable and vanishes after the loop), while a
-        // comma-separated scalar list targets previously declared variables (values persist).
+        // A single target that the block declared as a scalar is a list of one scalar, not a
+        // record: PG gives it the column's value, and only a record or row variable takes a row
+        boolean multiVar = varNames.size() > 1
+                || (scope.has(varNames.get(0)) && !isRowVariable(scope, varNames.get(0)));
+        // PG semantics: the loop target names variables the block already declared and their
+        // values persist past the loop, whether the target is one record or a list of scalars.
+        // Only a target nobody declared gets storage of its own for the run of the loop.
         Scope loopScope = new Scope(scope);
         if (multiVar) {
             for (String vn : varNames) {
                 if (!scope.has(vn)) scope.declare(vn, null);
             }
         } else {
-            loopScope.declare(varNames.get(0), null);
+            // A loop variable the block declared keeps its own storage: shadowing it here
+            // would drop the row it holds the moment the loop ends
+            if (!scope.has(varNames.get(0))) loopScope.declare(varNames.get(0), null);
         }
         boolean anyIteration = false;
 
@@ -1257,11 +1435,7 @@ public class PlpgsqlExecutor {
                     scope.set(varNames.get(i), i < row.length ? row[i] : null);
                 }
             } else {
-                Map<String, Object> record = new LinkedHashMap<>();
-                for (int i = 0; i < result.getColumns().size(); i++) {
-                    record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
-                }
-                loopScope.declare(varNames.get(0), record);
+                declareLoopRow(scope, loopScope, varNames.get(0), result, row);
             }
             try {
                 executeStatements(stmt.body(), loopScope);
@@ -1272,6 +1446,9 @@ public class PlpgsqlExecutor {
                 if (c.label == null || c.label.equalsIgnoreCase(stmt.label())) continue;
                 throw c;
             }
+        }
+        if (!anyIteration && !multiVar) {
+            declareLoopRow(scope, loopScope, varNames.get(0), result, new Object[0]);
         }
         scope.set("found", anyIteration);
     }
@@ -1416,7 +1593,47 @@ public class PlpgsqlExecutor {
         if (trimmed.equalsIgnoreCase("NEW")) throw new ReturnSignal(scope.get("new"));
         if (trimmed.equalsIgnoreCase("OLD")) throw new ReturnSignal(scope.get("old"));
         if (trimmed.equalsIgnoreCase("NULL")) throw new ReturnSignal(null);
-        throw new ReturnSignal(evalExpr(stmt.valueExpr(), scope));
+        Object value = evalExpr(stmt.valueExpr(), scope);
+        throw new ReturnSignal(unpadBpchar(stmt.valueExpr(), value,
+                (String) scope.get("__return_type__"), scope));
+    }
+
+    /**
+     * Drop the blanks a {@code character(n)} value was padded with when it is read as text.
+     * PostgreSQL pads the value in the variable — {@code RAISE '%'} still shows the padding —
+     * but its cast to text or varchar strips those blanks again, so a char(n) variable returned
+     * from a text function or assigned to a text variable arrives without them. A PL/pgSQL
+     * declaration is the only place memgres knows a value's declared width, so only a value
+     * read straight out of such a variable is trimmed.
+     */
+    private Object unpadBpchar(String valueExpr, Object value, String targetType, Scope scope) {
+        if (!(value instanceof String) || valueExpr == null || targetType == null) return value;
+        String target = targetType.indexOf('%') >= 0 ? coercionType(targetType) : targetType;
+        if (target == null || !isUnpaddedTextType(target)) return value;
+        String name = valueExpr.trim();
+        if (!isSimpleIdentifier(name) || !scope.has(name)) return value;
+        // %TYPE names the column rather than its type, so resolve it before reading the base
+        String declared = coercionType(scope.declaredType(name));
+        if (declared == null) return value;
+        String base = declared.trim().toLowerCase();
+        int paren = base.indexOf('(');
+        if (paren < 0) return value;
+        base = base.substring(0, paren).trim();
+        if (!base.equals("char") && !base.equals("character") && !base.equals("bpchar")) {
+            return value;
+        }
+        String s = (String) value;
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == ' ') end--;
+        return s.substring(0, end);
+    }
+
+    /** Types whose input keeps no trailing blanks of its own, so a bpchar loses its padding. */
+    private static boolean isUnpaddedTextType(String type) {
+        String t = type.trim().toLowerCase();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        return t.equals("text") || t.equals("varchar") || t.equals("character varying");
     }
 
     @SuppressWarnings("unchecked")
@@ -1555,10 +1772,21 @@ public class PlpgsqlExecutor {
     // ---- RAISE ----
 
     private void executeRaise(PlpgsqlStatement.RaiseStmt stmt, Scope scope) {
+        if (stmt.duplicateOption() != null) {
+            throw new MemgresException(
+                    "RAISE option already specified: " + stmt.duplicateOption(), "42601");
+        }
         // Bare RAISE: re-raise the current exception
         if (stmt.format() == null && stmt.messageExpr() == null && stmt.argExprs().isEmpty()
-                && stmt.errcode() == null && stmt.level().equals("EXCEPTION")) {
-            String sqlState = scope.has("sqlstate") ? String.valueOf(scope.get("sqlstate")) : "P0001";
+                && stmt.errcode() == null && stmt.condition() == null
+                && stmt.level().equals("EXCEPTION")) {
+            if (!scope.has("sqlstate")) {
+                // There is nothing to re-raise: no handler is running
+                throw new MemgresException(
+                        "RAISE without parameters cannot be used outside an exception handler",
+                        "0Z002");
+            }
+            String sqlState = String.valueOf(scope.get("sqlstate"));
             String msg = scope.has("sqlerrm") ? String.valueOf(scope.get("sqlerrm")) : "PL/pgSQL exception";
             MemgresException ex = new MemgresException(msg, sqlState);
             if (scope.has("__pg_detail")) ex.setDetail(String.valueOf(scope.get("__pg_detail")));
@@ -1584,6 +1812,15 @@ public class PlpgsqlExecutor {
         String datatype = asText(evalExpr(stmt.datatype(), scope));
         String table = asText(evalExpr(stmt.table(), scope));
         String schema = asText(evalExpr(stmt.schema(), scope));
+        if (stmt.condition() != null) {
+            // A named condition supplies both the SQLSTATE and, when nothing else does, the
+            // message — which PG reports as the condition's own name, underscores and all
+            if (errcode == null) errcode = stmt.condition();
+            if (message == null) message = stmt.condition().toLowerCase();
+        }
+        // RAISE SQLSTATE '22012' with nothing else to say reports the SQLSTATE as its message,
+        // the same way a condition name reports itself
+        if (message == null && errcode != null) message = errcode;
         switch (stmt.level()) {
             case "NOTICE":
             case "WARNING":
@@ -1625,7 +1862,7 @@ public class PlpgsqlExecutor {
                 // Named condition: RAISE division_by_zero, RAISE unique_violation, etc.
                 String condState = conditionToSqlState(stmt.level().toLowerCase());
                 if (!condState.equals("P0001") || stmt.level().contains("_")) {
-                    String msg = message != null ? message : stmt.level().replace("_", " ");
+                    String msg = message != null ? message : stmt.level().toLowerCase();
                     if (errcode != null) condState = conditionToSqlState(errcode);
                     MemgresException ex = new MemgresException(msg, condState);
                     if (detail != null) ex.setDetail(detail);
@@ -1666,8 +1903,7 @@ public class PlpgsqlExecutor {
                     sb.append('%');
                     i++; // skip second %
                 } else if (argIdx < argExprs.size()) {
-                    Object val = evalExpr(argExprs.get(argIdx), scope);
-                    sb.append(val != null ? val.toString() : "NULL");
+                    sb.append(raiseArgText(evalExpr(argExprs.get(argIdx), scope)));
                     argIdx++;
                 } else {
                     sb.append(c);
@@ -1677,6 +1913,32 @@ public class PlpgsqlExecutor {
             }
         }
         return sb.toString();
+    }
+
+    /**
+     * The text a {@code %} places into a RAISE message. PostgreSQL writes the value the way its
+     * type writes it — an array in braces, a boolean as t or f, a whole row in parentheses, a
+     * float the way {@code float8out} writes it — and a NULL argument as the word
+     * {@code <NULL>}, which is what tells a reader the value was absent rather than empty.
+     */
+    private String raiseArgText(Object val) {
+        if (val == null) return "<NULL>";
+        if (val instanceof Boolean) return ((Boolean) val) ? "t" : "f";
+        if (val instanceof java.time.temporal.Temporal) {
+            // A date or time writes itself the way its output function does, which is the same
+            // text its cast to text produces — never Java's ISO form with a T in it
+            Object text = astExecutor.castValue(val, "text");
+            if (text != null) return text.toString();
+        }
+        if (val instanceof List) return TypeCoercion.formatPgArray((List<?>) val);
+        if (val instanceof byte[]) return TypeCoercion.byteaToText((byte[]) val);
+        if (val instanceof Double) return PgFloatFormat.float8out((Double) val);
+        if (val instanceof Float) return PgFloatFormat.float4out((Float) val);
+        if (val instanceof AstExecutor.PgRow) return ((AstExecutor.PgRow) val).toPgText();
+        if (val instanceof Map) {
+            return AstExecutor.PgRow.fromFieldMap((Map<?, ?>) val).toPgText();
+        }
+        return val.toString();
     }
 
     // ---- PERFORM ----
@@ -1717,9 +1979,7 @@ public class PlpgsqlExecutor {
                     setFromRow(scope, stmt.intoVars(), result);
                 } else {
                     // Non-STRICT EXECUTE ... INTO with no rows sets all targets to NULL (PG semantics)
-                    for (String varName : stmt.intoVars()) {
-                        scope.set(varName, null);
-                    }
+                    setNoRow(scope, stmt.intoVars(), result);
                 }
             }
         } finally {
@@ -1855,9 +2115,7 @@ public class PlpgsqlExecutor {
                 scope.set("found", true);
             } else {
                 // Non-STRICT SELECT INTO with no rows sets all targets to NULL (PG semantics)
-                for (String varName : stmt.intoVars()) {
-                    scope.set(varName, null);
-                }
+                setNoRow(scope, stmt.intoVars(), result);
                 scope.set("found", false);
             }
         }
@@ -1928,25 +2186,160 @@ public class PlpgsqlExecutor {
         return args;
     }
 
+    /**
+     * What an INTO writes when the query produced no row. A scalar target simply becomes NULL,
+     * but a record or row target keeps the query's shape with every field NULL — that is what
+     * lets {@code r.col} answer NULL afterwards instead of failing to resolve, and what makes a
+     * field the query never had still a 42703.
+     */
+    private void setNoRow(Scope scope, List<String> varNames, QueryResult result) {
+        if (varNames.size() == 1 && isRowVariable(scope, varNames.get(0))) {
+            scope.set(varNames.get(0), rowRecord(scope, varNames.get(0), result, new Object[0]));
+            return;
+        }
+        for (String varName : varNames) {
+            scope.set(varName, null);
+        }
+    }
+
     private void setFromRow(Scope scope, List<String> varNames, QueryResult result) {
         Object[] row = result.getRows().get(0);
         if (varNames.size() > 1) {
             // Multiple INTO variables: assign each column to its corresponding variable
             for (int i = 0; i < varNames.size() && i < row.length; i++) {
-                scope.set(varNames.get(i), row[i]);
+                assignIntoTarget(scope, varNames.get(i), row[i]);
             }
         } else if (varNames.size() == 1) {
             String varName = varNames.get(0);
-            if (row.length == 1) {
-                scope.set(varName, row[0]);
+            if (row.length == 1 && !isRowVariable(scope, varName)) {
+                assignIntoTarget(scope, varName, row[0]);
             } else {
-                Map<String, Object> record = new LinkedHashMap<>();
-                for (int i = 0; i < result.getColumns().size(); i++) {
-                    record.put(result.getColumns().get(i).getName().toLowerCase(), row[i]);
-                }
-                scope.set(varName, record);
+                scope.set(varName, rowRecord(scope, varName, result, row));
             }
         }
+    }
+
+    /**
+     * Bind one row of a {@code FOR … IN query} loop to its variable. The loop variable is the
+     * one the enclosing block declared, so it keeps its declared type inside the loop: a
+     * %ROWTYPE or composite loop variable takes the query's columns in order under its own
+     * field names, exactly as a {@code SELECT … INTO} of the same variable does.
+     */
+    private void declareLoopRow(Scope outer, Scope loopScope, String varName,
+                                QueryResult result, Object[] row) {
+        String declared = outer.declaredType(varName);
+        Map<String, Object> record = rowRecordFor(declared, result, row);
+        if (outer.has(varName)) {
+            // The loop variable of a FOR … IN query is the one the block declared, so it is
+            // still readable after the loop and holds the last row it saw
+            outer.set(varName, record);
+        } else if (declared != null) {
+            loopScope.declareTyped(varName, record, declared);
+        } else {
+            loopScope.declare(varName, record);
+        }
+    }
+
+    /**
+     * Build the record a single row-shaped INTO target receives. A variable whose declaration
+     * names its fields — a composite type or a %ROWTYPE — keeps those names and takes the
+     * query's columns in order, which is what PostgreSQL does and what lets
+     * {@code select id, n*2 into r} reach {@code r.n}. Only a record, whose shape the query
+     * supplies, is keyed by the column names the query happened to produce.
+     */
+    private Map<String, Object> rowRecord(Scope scope, String varName, QueryResult result,
+                                          Object[] row) {
+        return rowRecordFor(scope.declaredType(varName), result, row);
+    }
+
+    private Map<String, Object> rowRecordFor(String declaredType, QueryResult result, Object[] row) {
+        Map<String, Object> record = new LinkedHashMap<>();
+        List<String> fields = rowTypeFields(declaredType);
+        if (fields != null) {
+            for (int i = 0; i < fields.size(); i++) {
+                record.put(fields.get(i), i < row.length ? row[i] : null);
+            }
+            return record;
+        }
+        for (int i = 0; i < result.getColumns().size(); i++) {
+            String name = result.getColumns().get(i).getName().toLowerCase();
+            // Two columns of one name are two fields of the row: the first is the one a field
+            // reference reaches, and the rest still belong to the row's own text
+            if (record.containsKey(name)) name = name + " " + i;
+            record.put(name, i < row.length ? row[i] : null);
+        }
+        return record;
+    }
+
+    /**
+     * Store one value into an INTO target, which may name a field of a composite variable rather
+     * than a variable of its own — {@code SELECT … INTO r.a} is as ordinary as {@code r.a := …}
+     * and is checked against the variable's fields the same way.
+     */
+    private void assignIntoTarget(Scope scope, String target, Object value) {
+        int dot = target.indexOf('.');
+        if (dot > 0) {
+            String qualifier = target.substring(0, dot);
+            String field = target.substring(dot + 1);
+            if (scope.has(qualifier)) {
+                Object qualObj = scope.get(qualifier);
+                checkFieldPath(scope, qualifier, field, qualObj);
+                if (qualObj == null) {
+                    Map<String, Object> map = new LinkedHashMap<String, Object>();
+                    scope.set(qualifier, map);
+                    qualObj = map;
+                }
+                if (qualObj instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> map = (Map<String, Object>) qualObj;
+                    assignNestedField(map, field, value);
+                    return;
+                }
+            }
+        }
+        scope.set(target, value);
+    }
+
+    /**
+     * Whether a single INTO target takes the whole row rather than its first column. A record or
+     * a %ROWTYPE variable does even when the query has one column, and that is what gives it the
+     * field names a later {@code r.f} reads.
+     */
+    private boolean isRowVariable(Scope scope, String varName) {
+        String declared = scope.declaredType(varName);
+        if (declared == null) return false;
+        String type = declared.trim().toLowerCase();
+        if (type.equals("record") || type.endsWith("%rowtype")) return true;
+        return rowTypeFields(type) != null;
+    }
+
+    /**
+     * The field names of a declared type that names a row — a composite type, or a table or view
+     * a {@code %ROWTYPE} refers to — or null when the type names no such thing.
+     */
+    private List<String> rowTypeFields(String declaredType) {
+        if (declaredType == null) return null;
+        String type = declaredType.trim();
+        if (type.isEmpty()) return null;
+        if (type.toUpperCase().endsWith("%ROWTYPE")) {
+            type = type.substring(0, type.length() - "%ROWTYPE".length()).trim();
+        }
+        int dot = type.lastIndexOf('.');
+        String bare = dot >= 0 ? type.substring(dot + 1) : type;
+        List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
+                database.getRowType(bare);
+        if (fields != null) {
+            List<String> names = new ArrayList<String>();
+            for (com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f : fields) {
+                names.add(f.name().toLowerCase());
+            }
+            return names;
+        }
+        Table table = resolveTableForScan(dot >= 0 ? type.substring(0, dot) : null, bare);
+        if (table == null) return null;
+        List<String> names = new ArrayList<String>();
+        for (Column c : table.getColumns()) names.add(c.getName().toLowerCase());
+        return names;
     }
 
     // ---- Assignment ----
@@ -1961,6 +2354,7 @@ public class PlpgsqlExecutor {
             String field = target.substring(dotIdx + 1);
             if (scope.has(qualifier)) {
                 Object qualObj = scope.get(qualifier);
+                checkFieldPath(scope, qualifier, field, qualObj);
                 if (qualObj == null) {
                     // Initialize composite variable as a map on first field assignment
                     Map<String, Object> map = new java.util.LinkedHashMap<>();
@@ -1987,8 +2381,62 @@ public class PlpgsqlExecutor {
             throw new MemgresException("\"" + target + "\" is not a known variable", "42601");
         }
         rejectCompositeIntoScalar(scope.declaredType(target), value);
+        value = unpadBpchar(stmt.valueExpr(), value, scope.declaredType(target), scope);
         // A row stored in a composite variable is kept by field name, so r.f reads it back
-        scope.set(target, coerceParamValue(value, scope.declaredType(target)));
+        scope.set(target, coerceRowValue(scope.declaredType(target), value));
+    }
+
+    /**
+     * Coerce a value on its way into a variable. A whole row — {@code r := ROW(…)} or
+     * {@code r := (SELECT t FROM t …)} — is spread over the target's own field names so that
+     * {@code r.f} reads it back; without this the row is stored as one opaque value and every
+     * field of it reads NULL. A target whose declaration names no fields is left to
+     * {@link #coerceParamValue}.
+     */
+    private Object coerceRowValue(String declaredType, Object value) {
+        Map<String, Object> record = rowValueAsRecord(declaredType, value);
+        return record != null ? record : coerceParamValue(value, declaredType);
+    }
+
+    /**
+     * Read a composite value as the field map a row variable holds, or null when the target does
+     * not name its fields or the value is not a row.
+     */
+    private Map<String, Object> rowValueAsRecord(String declaredType, Object value) {
+        if (value == null || value instanceof Map) return null;
+        List<String> fields = rowTypeFields(declaredType);
+        if (fields == null) return null;
+        List<Object> values;
+        if (value instanceof AstExecutor.PgRow) {
+            values = new ArrayList<Object>(((AstExecutor.PgRow) value).values());
+        } else if (value instanceof String && looksLikeCompositeText((String) value)) {
+            AstExecutor.PgRow parsed =
+                    astExecutor.parseCompositeToRow((String) value, rowTypeName(declaredType));
+            if (parsed == null) return null;
+            values = new ArrayList<Object>(parsed.values());
+        } else {
+            return null;
+        }
+        Map<String, Object> record = new LinkedHashMap<String, Object>();
+        String typeName = rowTypeName(declaredType);
+        for (int i = 0; i < fields.size(); i++) {
+            Object v = i < values.size() ? values.get(i) : null;
+            String ft = fieldType(typeName, fields.get(i));
+            if (v instanceof String && ft != null) {
+                try {
+                    v = astExecutor.castValue(v, ft);
+                } catch (RuntimeException ignored) {
+                    // A field the declared type cannot read back is kept as its text
+                }
+            }
+            record.put(fields.get(i), v);
+        }
+        return record;
+    }
+
+    private static boolean looksLikeCompositeText(String s) {
+        String t = s.trim();
+        return t.length() >= 2 && t.charAt(0) == '(' && t.charAt(t.length() - 1) == ')';
     }
 
     /**
@@ -2069,9 +2517,22 @@ public class PlpgsqlExecutor {
         if (rowType == null) return null;
         List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> fields =
                 database.getRowType(rowType);
-        if (fields == null) return null;
-        for (com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f : fields) {
-            if (f.name().equalsIgnoreCase(field)) return f.typeName();
+        if (fields != null) {
+            for (com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField f : fields) {
+                if (f.name().equalsIgnoreCase(field)) return f.typeName();
+            }
+            return null;
+        }
+        // A %ROWTYPE names a relation rather than a composite type, and its columns are the fields
+        int dot = rowType.lastIndexOf('.');
+        Table table = resolveTableForScan(dot >= 0 ? rowType.substring(0, dot) : null,
+                dot >= 0 ? rowType.substring(dot + 1) : rowType);
+        if (table == null) return null;
+        for (Column c : table.getColumns()) {
+            if (c.getName().equalsIgnoreCase(field)) {
+                return c.getCompositeTypeName() != null ? c.getCompositeTypeName()
+                        : c.getType().name().toLowerCase();
+            }
         }
         return null;
     }
@@ -2168,6 +2629,75 @@ public class PlpgsqlExecutor {
     }
 
     /**
+     * Refuse a write to a field the variable does not have. Without this the write is dropped into
+     * a field map nobody reads back, so a misspelt field name loses the value with no sign of it.
+     *
+     * <p>Only a variable whose fields are actually known is checked: a composite type or a
+     * %ROWTYPE names them in its declaration, a record takes them from the row last assigned to
+     * it, and anything else is left alone rather than guessed at.
+     */
+    private void checkFieldPath(Scope scope, String qualifier, String fieldPath, Object current) {
+        String declared = scope.declaredType(qualifier);
+        String type = declared == null ? null : declared.trim().toLowerCase();
+        List<String> fields = rowTypeFields(type);
+        boolean record = "record".equals(type);
+        String upper = qualifier.toUpperCase();
+        boolean triggerRow = ("NEW".equals(upper) || "OLD".equals(upper)) && current instanceof Map
+                && !((Map<?, ?>) current).isEmpty();
+        if (fields == null && !record && !triggerRow) return;
+        if (fields == null) {
+            if (!(current instanceof Map)) {
+                // A record takes its shape from the row assigned to it, and until one has been
+                // there is no field to write to
+                throw new MemgresException("record \"" + qualifier + "\" is not assigned yet", "55000");
+            }
+            fields = new ArrayList<String>();
+            for (Object k : ((Map<?, ?>) current).keySet()) fields.add(String.valueOf(k));
+        }
+
+        int dot = fieldPath.indexOf('.');
+        String head = (dot > 0 ? fieldPath.substring(0, dot) : fieldPath).trim().toLowerCase();
+        if (!containsIgnoreCase(fields, head)) {
+            // NEW and OLD are bound in upper case; PG names them the way the body wrote them
+            throw new MemgresException("record \"" + qualifier.toLowerCase()
+                    + "\" has no field \"" + head + "\"", "42703");
+        }
+        // Reaching deeper only makes sense when the field's own type names its fields too
+        String childType = type == null ? null : fieldType(rowTypeName(type), head);
+        while (dot > 0) {
+            String rest = fieldPath.substring(dot + 1);
+            dot = rest.indexOf('.');
+            String next = (dot > 0 ? rest.substring(0, dot) : rest).trim().toLowerCase();
+            List<String> childFields = rowTypeFields(childType);
+            if (childFields == null) return;
+            if (!containsIgnoreCase(childFields, next)) {
+                throw new MemgresException("cannot assign to field \"" + next + "\" of column \""
+                        + qualifier + "\" because there is no such column in data type "
+                        + childType, "42703");
+            }
+            childType = fieldType(rowTypeName(childType), next);
+            fieldPath = rest;
+        }
+    }
+
+    /** The name {@link #fieldType} looks a row type up by, with any %ROWTYPE suffix removed. */
+    private String rowTypeName(String declaredType) {
+        if (declaredType == null) return null;
+        String type = declaredType.trim();
+        if (type.toUpperCase().endsWith("%ROWTYPE")) {
+            type = type.substring(0, type.length() - "%ROWTYPE".length()).trim();
+        }
+        return type;
+    }
+
+    private static boolean containsIgnoreCase(List<String> names, String name) {
+        for (String n : names) {
+            if (n.equalsIgnoreCase(name)) return true;
+        }
+        return false;
+    }
+
+    /**
      * Assign through a dotted field path, creating intermediate composites as needed, so that
      * {@code v.y.a := 2} nests inside {@code v.y} rather than storing a field literally named
      * "y.a".
@@ -2195,6 +2725,12 @@ public class PlpgsqlExecutor {
     // ---- GET DIAGNOSTICS ----
 
     private void executeGetDiagnostics(PlpgsqlStatement.GetDiagnosticsStmt stmt, Scope scope) {
+        if (stmt.stacked() && !scope.has("sqlstate")) {
+            // Whether a handler is running is only known once the statement is reached, so this is
+            // the one GET STACKED DIAGNOSTICS complaint that does not belong to the compile
+            throw new MemgresException(
+                    "GET STACKED DIAGNOSTICS cannot be used outside an exception handler", "0Z002");
+        }
         for (PlpgsqlStatement.DiagItem item : stmt.items()) {
             Object value;
             String itemName = item.itemName().toUpperCase();
@@ -2367,26 +2903,34 @@ public class PlpgsqlExecutor {
         }
         Object[] row = cursor.move(stmt.direction(), count);
         if (row != null) {
-            if (stmt.intoVars() != null) {
-                if (stmt.intoVars().size() > 1) {
-                    // Multiple INTO variables: assign each column to its corresponding variable
-                    for (int i = 0; i < stmt.intoVars().size() && i < row.length; i++) {
-                        scope.set(stmt.intoVars().get(i), row[i]);
-                    }
-                } else if (row.length == 1) {
-                    scope.set(stmt.intoVars().get(0), row[0]);
-                } else {
-                    Map<String, Object> record = new LinkedHashMap<>();
-                    for (int i = 0; i < cursor.result.getColumns().size(); i++) {
-                        record.put(cursor.result.getColumns().get(i).getName().toLowerCase(), row[i]);
-                    }
-                    scope.set(stmt.intoVars().get(0), record);
-                }
-            }
+            if (stmt.intoVars() != null) storeFetchedRow(scope, stmt.intoVars(), cursor.result, row);
             scope.set("found", true);
         } else {
+            // A FETCH that lands on no row still writes its targets: PG sets them all to NULL, so
+            // the value the previous FETCH left behind cannot be read as if it were fetched again.
+            if (stmt.intoVars() != null) {
+                storeFetchedRow(scope, stmt.intoVars(), cursor.result,
+                        new Object[cursor.result.getColumns().size()]);
+            }
             scope.set("found", false);
         }
+    }
+
+    /** Spread one cursor row, real or the all-NULL stand-in for "no row", over the INTO targets. */
+    private void storeFetchedRow(Scope scope, List<String> intoVars, QueryResult result, Object[] row) {
+        if (intoVars.size() > 1) {
+            // Multiple INTO variables: assign each column to its corresponding variable
+            for (int i = 0; i < intoVars.size(); i++) {
+                assignIntoTarget(scope, intoVars.get(i), i < row.length ? row[i] : null);
+            }
+            return;
+        }
+        String varName = intoVars.get(0);
+        if (row.length == 1 && !isRowVariable(scope, varName)) {
+            assignIntoTarget(scope, varName, row[0]);
+            return;
+        }
+        scope.set(varName, rowRecord(scope, varName, result, row));
     }
 
     private void executeCloseCursor(PlpgsqlStatement.CloseCursorStmt stmt, Scope scope) {
@@ -2496,6 +3040,21 @@ public class PlpgsqlExecutor {
             int dot = trimmed.indexOf('.');
             String qualifier = trimmed.substring(0, dot).trim();
             String field = trimmed.substring(dot + 1).trim();
+            // PL/pgSQL substitutes names of one and two parts; a third part is left for the SQL
+            // parser, which reads v.f.g as schema.table.column and cannot find the table. A
+            // nested field is reached by writing (v.f).g instead, which PostgreSQL does resolve.
+            if (isSimpleIdentifier(qualifier) && scope.has(qualifier) && field.indexOf('.') > 0) {
+                String[] parts = field.split("\\.", -1);
+                boolean allSimple = true;
+                for (String part : parts) {
+                    if (!isSimpleIdentifier(part.trim())) allSimple = false;
+                }
+                if (allSimple) {
+                    throw new MemgresException(
+                            "missing FROM-clause entry for table \"" + parts[0].trim() + "\"",
+                            "42P01");
+                }
+            }
             if (isSimpleIdentifier(qualifier) && isSimpleIdentifier(field) && scope.has(qualifier)) {
                 Object qualObj = scope.get(qualifier);
                 if (qualObj instanceof Map) {
@@ -2504,10 +3063,13 @@ public class PlpgsqlExecutor {
                     String lowerField = field.toLowerCase();
                     if (!map.containsKey(lowerField)) {
                         String upperQ = qualifier.toUpperCase();
-                        if (upperQ.equals("NEW") || upperQ.equals("OLD")) {
-                            // In PG, OLD is NULL during INSERT and NEW is NULL during DELETE.
-                            // An empty map means the record is effectively NULL — return null.
-                            if (map.isEmpty()) return null;
+                        boolean triggerRow = upperQ.equals("NEW") || upperQ.equals("OLD");
+                        // In PG, OLD is NULL during INSERT and NEW is NULL during DELETE.
+                        // An empty map means the record is effectively NULL — return null.
+                        if (triggerRow && map.isEmpty()) return null;
+                        String declared = scope.declaredType(qualifier);
+                        if (triggerRow || "record".equalsIgnoreCase(declared)
+                                || rowTypeFields(declared) != null) {
                             throw new MemgresException(
                                     "record \"" + qualifier.toLowerCase() + "\" has no field \"" + lowerField + "\"",
                                     "42703");
@@ -2682,18 +3244,37 @@ public class PlpgsqlExecutor {
                         && i + 2 < tokens.size()
                         && tokens.get(i + 1).type() == TokenType.DOT) {
                     Object qualObj = scope.get(t.value().toLowerCase());
+                    // A variable whose declaration names its fields is read the same way whether
+                    // or not a row has been stored in it yet, and a field it has not got is an
+                    // error rather than a name for SQL to resolve some other way.
+                    List<String> known = rowTypeFields(scope.declaredType(t.value()));
+                    if (known != null && !(qualObj instanceof Map)
+                            && (tokens.get(i + 2).type() == TokenType.IDENTIFIER
+                                || tokens.get(i + 2).type() == TokenType.KEYWORD)) {
+                        String field = tokens.get(i + 2).value().toLowerCase();
+                        if (!containsIgnoreCase(known, field)) {
+                            throw new MemgresException("record \"" + t.value().toLowerCase()
+                                    + "\" has no field \"" + field + "\"", "42703");
+                        }
+                        appendValue(sb, null);
+                        i += 2;
+                        continue;
+                    }
                     if (qualObj instanceof Map) {
                         @SuppressWarnings("unchecked")
                         Map<String, Object> map = (Map<String, Object>) qualObj;
                         String field = tokens.get(i + 2).value().toLowerCase();
                         if (!map.containsKey(field)) {
                             String qualifier = t.value().toUpperCase();
-                            if (qualifier.equals("NEW") || qualifier.equals("OLD")) {
-                                if (map.isEmpty()) {
-                                    appendValue(sb, null);
-                                    i += 2;
-                                    continue;
-                                }
+                            boolean triggerRow = qualifier.equals("NEW") || qualifier.equals("OLD");
+                            if (triggerRow && map.isEmpty()) {
+                                appendValue(sb, null);
+                                i += 2;
+                                continue;
+                            }
+                            // A record's fields are the ones the row assigned to it carried
+                            if (triggerRow || known != null
+                                    || "record".equalsIgnoreCase(scope.declaredType(t.value()))) {
                                 throw new MemgresException(
                                         "record \"" + t.value().toLowerCase() + "\" has no field \"" + field + "\"",
                                         "42703");

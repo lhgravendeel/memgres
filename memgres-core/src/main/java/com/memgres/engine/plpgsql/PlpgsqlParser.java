@@ -249,6 +249,26 @@ public class PlpgsqlParser {
                 throw new MemgresException("syntax error at or near \"" + peek().value() + "\"", "42601");
             }
 
+            // ALIAS FOR gives an existing variable — usually a positional parameter — a second
+            // name, and declares nothing of its own
+            if (checkKw("ALIAS")) {
+                advance();
+                if (!matchKw("FOR")) {
+                    throw new MemgresException(
+                            "syntax error at or near \"" + peek().value() + "\"", "42601");
+                }
+                String target = check(TokenType.PARAM) ? advance().value() : readIdent();
+                PlpgsqlStatement.VarDeclaration alias = new PlpgsqlStatement.VarDeclaration(
+                        name, null, false, false, null, false, null);
+                alias.aliasFor = target;
+                decls.add(alias);
+                if (!match(TokenType.SEMICOLON) && !isAtEnd()) {
+                    throw new MemgresException(
+                            "syntax error at or near \"" + peek().value() + "\"", "42601");
+                }
+                continue;
+            }
+
             boolean constant = matchKw("CONSTANT");
             String typeName = readTypeName();
             boolean notNull = false;
@@ -672,23 +692,37 @@ public class PlpgsqlParser {
 
     // ---- RAISE ----
 
+    /**
+     * Whether the next token is a RAISE format string. Dollar quoting is just another way to
+     * write one — {@code raise notice $x$a % b$x$, 1} says exactly what the quoted form says —
+     * so a body that uses it must not be read as naming a condition instead.
+     */
+    private boolean isFormatLiteral() {
+        return check(TokenType.STRING_LITERAL) || check(TokenType.DOLLAR_STRING_LITERAL);
+    }
+
     private PlpgsqlStatement parseRaise() {
         matchKw("RAISE");
         String level = "EXCEPTION";
+        String condition = null;
         String errcode = null;
+        boolean levelGiven = false;
         if (checkKw("NOTICE") || checkKw("WARNING") || checkKw("EXCEPTION")
                 || checkKw("INFO") || checkKw("LOG") || checkKw("DEBUG")) {
             level = advance().value().toUpperCase();
-        } else if (checkKw("SQLSTATE")) {
+            levelGiven = true;
+        }
+        if (checkKw("SQLSTATE")) {
             // RAISE SQLSTATE 'XXXXX' ...
             advance(); // consume SQLSTATE
-            level = "EXCEPTION";
             if (check(TokenType.STRING_LITERAL)) {
                 errcode = "'" + advance().value().replace("'", "''") + "'";
             }
-        } else if (!check(TokenType.STRING_LITERAL) && !check(TokenType.SEMICOLON) && !checkKw("USING")) {
-            // Named condition: RAISE division_by_zero; or RAISE unique_violation USING MESSAGE = '...'
-            level = readIdent();
+        } else if (!isFormatLiteral() && !check(TokenType.SEMICOLON) && !checkKw("USING")) {
+            // Named condition, with or without a level of its own:
+            //   RAISE division_by_zero;  RAISE NOTICE unique_violation;
+            if (levelGiven) condition = readIdent();
+            else level = readIdent();
         }
 
         String format = null;
@@ -702,7 +736,7 @@ public class PlpgsqlParser {
         String table = null;
         String schema = null;
 
-        if (check(TokenType.STRING_LITERAL)) {
+        if (isFormatLiteral()) {
             format = advance().value();
             while (match(TokenType.COMMA)) {
                 if (checkKw("USING")) break;
@@ -710,17 +744,21 @@ public class PlpgsqlParser {
             }
         }
 
+        String duplicateOption = null;
         if (matchKw("USING")) {
             java.util.Set<String> seen = new java.util.HashSet<>();
+            // A format string is itself the message, so USING MESSAGE would be a second one
+            if (format != null) seen.add("MESSAGE");
             while (!check(TokenType.SEMICOLON) && !isAtEnd()) {
                 String key = readIdent();
                 if (match(TokenType.EQUALS) || match(TokenType.COLON_EQUALS)) {
                     // The value is an ordinary expression, so it is kept as text and evaluated
                     // when the RAISE runs rather than being read as a bare literal.
                     String val = collectUntilMulti(",", ";");
-                    if (!seen.add(key.toUpperCase())) {
-                        throw new MemgresException(
-                                "RAISE option already specified: " + key.toUpperCase(), "42601");
+                    // PG reads the whole statement before it complains that an option was given
+                    // twice, so the complaint belongs to the run rather than to the compile
+                    if (!seen.add(key.toUpperCase()) && duplicateOption == null) {
+                        duplicateOption = key.toUpperCase();
                     }
                     switch (key.toUpperCase()) {
                         case "ERRCODE": errcode = val; break;
@@ -732,7 +770,9 @@ public class PlpgsqlParser {
                         case "DATATYPE": datatype = val; break;
                         case "TABLE": table = val; break;
                         case "SCHEMA": schema = val; break;
-                        default: break;
+                        default:
+                            throw new MemgresException("unrecognized RAISE statement option at or"
+                                    + " near \"" + key.toLowerCase() + "\"", "42601");
                     }
                 }
                 match(TokenType.COMMA);
@@ -743,6 +783,8 @@ public class PlpgsqlParser {
         PlpgsqlStatement.RaiseStmt raise = new PlpgsqlStatement.RaiseStmt(level, format, args,
                 errcode, hint, detail, column, constraint, datatype, table, schema);
         raise.messageExpr = messageExpr;
+        raise.condition = condition;
+        raise.duplicateOption = duplicateOption;
         return raise;
     }
 
@@ -791,6 +833,15 @@ public class PlpgsqlParser {
 
     // ---- SQL statements ----
 
+    /**
+     * Close up the spaces the statement text was rebuilt with around a dot, so that an INTO
+     * target naming a field — {@code INTO r.a} — is read as one name rather than a name followed
+     * by something else.
+     */
+    private static String joinFieldPaths(String text) {
+        return text.replaceAll("\\s*\\.\\s*", ".");
+    }
+
     private PlpgsqlStatement parseSqlStmt() {
         String sql = collectUntilSemicolon();
         match(TokenType.SEMICOLON);
@@ -832,7 +883,7 @@ public class PlpgsqlParser {
                 java.util.regex.Matcher fromMatcher = java.util.regex.Pattern.compile("\\sFROM\\s", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(afterInto);
                 int fromIdx = fromMatcher.find() ? fromMatcher.start() : -1;
                 if (fromIdx >= 0) {
-                    String beforeFrom = afterInto.substring(0, fromIdx).trim();
+                    String beforeFrom = joinFieldPaths(afterInto.substring(0, fromIdx).trim());
                     // Parse comma-separated variable list
                     // Check if this looks like a variable list (identifiers separated by commas)
                     String[] parts = beforeFrom.split(",");
@@ -840,7 +891,8 @@ public class PlpgsqlParser {
                     List<String> varNames = new ArrayList<>();
                     for (String part : parts) {
                         String trimmed = part.trim();
-                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+                        // A target may be a field of a composite variable as well as a plain name
+                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*")) {
                             varNames.add(trimmed);
                         } else {
                             allIdents = false;
@@ -864,14 +916,15 @@ public class PlpgsqlParser {
                     }
                 } else {
                     // SELECT expr INTO var (no FROM)
-                    String trimmedAfter = afterInto.trim();
+                    String trimmedAfter = joinFieldPaths(afterInto.trim());
                     // Parse comma-separated variable list for no-FROM case too
                     String[] parts = trimmedAfter.split(",");
                     boolean allIdents = true;
                     List<String> varNames = new ArrayList<>();
                     for (String part : parts) {
                         String trimmed = part.trim();
-                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+                        // A target may be a field of a composite variable as well as a plain name
+                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*")) {
                             varNames.add(trimmed);
                         } else {
                             allIdents = false;
@@ -928,7 +981,8 @@ public class PlpgsqlParser {
                     List<String> varNames = new ArrayList<>();
                     for (String part : parts) {
                         String trimmed = part.trim();
-                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+                        // A target may be a field of a composite variable as well as a plain name
+                        if (trimmed.matches("[a-zA-Z_][a-zA-Z0-9_]*(\\.[a-zA-Z_][a-zA-Z0-9_]*)*")) {
                             varNames.add(trimmed);
                         }
                     }
@@ -949,6 +1003,8 @@ public class PlpgsqlParser {
     private PlpgsqlStatement parseGetDiagnostics() {
         matchKw("GET");
         boolean stacked = matchKw("STACKED");
+        // GET CURRENT DIAGNOSTICS spells out what plain GET DIAGNOSTICS already means
+        if (!stacked) matchKw("CURRENT");
         matchKw("DIAGNOSTICS");
         List<PlpgsqlStatement.DiagItem> items = new ArrayList<>();
         do {
@@ -1083,6 +1139,10 @@ public class PlpgsqlParser {
         String countExpr = null;
         if (isLabelToken(peek()) && FETCH_DIRECTIONS.contains(peek().value().toUpperCase())) {
             direction = advance().value().toUpperCase();
+        } else if (checkKw("ALL")) {
+            // A bare ALL is FORWARD ALL, the same count written the shorter way
+            direction = "FORWARD";
+            countExpr = advance().value().toUpperCase();
         }
         if ("ABSOLUTE".equals(direction) || "RELATIVE".equals(direction)
                 || "FORWARD".equals(direction) || "BACKWARD".equals(direction)) {
@@ -1284,6 +1344,11 @@ public class PlpgsqlParser {
         return sb.toString().trim();
     }
 
+    /**
+     * Collect one expression's worth of tokens. A terminator only ends it at the top level:
+     * a comma inside {@code ARRAY[1,2]} belongs to the array, exactly as one inside
+     * {@code coalesce(a,b)} belongs to the call, so brackets nest the same way parentheses do.
+     */
     private String collectUntilMulti(String... terminators) {
         StringBuilder sb = new StringBuilder();
         int depth = 0;
@@ -1296,8 +1361,8 @@ public class PlpgsqlParser {
                     if (t.type() == TokenType.KEYWORD && t.value().equalsIgnoreCase(term)) return sb.toString().trim();
                 }
             }
-            if (t.type() == TokenType.LEFT_PAREN) depth++;
-            if (t.type() == TokenType.RIGHT_PAREN) depth--;
+            if (t.type() == TokenType.LEFT_PAREN || t.type() == TokenType.LEFT_BRACKET) depth++;
+            if (t.type() == TokenType.RIGHT_PAREN || t.type() == TokenType.RIGHT_BRACKET) depth--;
             appendToken(sb, t);
             advance();
         }

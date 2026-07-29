@@ -363,8 +363,10 @@ class DdlParser {
                 name = parser.readIdentifier();
             }
         }
-        // Only routines carry the qualifier onward; the other object kinds still key by bare name.
-        String dropSchema = objectType == DropStmt.ObjectType.FUNCTION ? qualifier : null;
+        // Every kind carries the qualifier onward so the executor can tell a missing schema from
+        // a missing object; only routines are also looked up by it, the rest still key by bare
+        // name. An operator writes its own schema into its name above.
+        String dropSchema = objectType == DropStmt.ObjectType.OPERATOR ? null : qualifier;
 
         java.util.List<String> funcParamTypes = null;
         if ((objectType == DropStmt.ObjectType.FUNCTION || objectType == DropStmt.ObjectType.AGGREGATE)

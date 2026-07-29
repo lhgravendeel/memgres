@@ -896,7 +896,14 @@ public final class TypeCoercion {
             return datePart + " " + dt.format(DateTimeFormatter.ofPattern("HH:mm:ss")) + era;
         }
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).toString();
-        if (val instanceof LocalTime) return ((LocalTime) val).toString();
+        if (val instanceof LocalTime) {
+            LocalTime lt = (LocalTime) val;
+            if (lt.getNano() == 0) return lt.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+            // Java pads the fraction to a multiple of three digits; PostgreSQL writes only the
+            // digits the value has, so 01:02:03.99 stays two digits wide
+            String s = lt.format(DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS"));
+            return s.replaceAll("0+$", "").replaceAll("\\.$", "");
+        }
         if (val instanceof PgInterval) return ((PgInterval) val).toString();
         if (val instanceof java.util.List<?>) return formatPgArray((java.util.List<?>) val);
         if (val instanceof AstExecutor.PgEnum) return ((AstExecutor.PgEnum) val).label();
@@ -1364,8 +1371,32 @@ public final class TypeCoercion {
             throw new MemgresException(
                     "date/time field value out of range: \"" + val + "\"", "22008");
         }
+        // A year of five digits or more is written correctly, and date holds years up to 5874897;
+        // past that it is the range that fails rather than the spelling
+        java.util.regex.Matcher wide = WIDE_YEAR.matcher(s);
+        if (wide.matches()) {
+            long year = Long.parseLong(wide.group(1));
+            if (year > DATE_MAX_YEAR) {
+                throw new MemgresException("date out of range: \"" + val + "\"", "22008");
+            }
+            try {
+                return LocalDate.of((int) year, Integer.parseInt(wide.group(2)),
+                        Integer.parseInt(wide.group(3)));
+            } catch (RuntimeException e) {
+                throw new MemgresException(
+                        "date/time field value out of range: \"" + val + "\"", "22008");
+            }
+        }
         throw new MemgresException("invalid input syntax for type date: \"" + val + "\"", "22007");
     }
+
+    /** A date whose year runs to five digits or more, which the ISO parsers will not read. */
+    private static final java.util.regex.Pattern WIDE_YEAR =
+            java.util.regex.Pattern.compile("^(\\d{5,})-(\\d{1,2})-(\\d{1,2})$");
+
+    /** The last year date can hold, and the last one timestamp can. */
+    private static final long DATE_MAX_YEAR = 5874897L;
+    private static final long TIMESTAMP_MAX_YEAR = 294276L;
 
     public static LocalTime toLocalTime(Object val) {
         if (val instanceof LocalTime) return ((LocalTime) val);
@@ -1689,6 +1720,22 @@ public final class TypeCoercion {
             try {
                 return LocalDate.parse(dateOffset.group(1)).atStartOfDay();
             } catch (DateTimeParseException ignore) { /* fall through to the error below */ }
+        }
+        // A timestamp holds years up to 294276; past that it is the range that fails rather than
+        // the spelling, and PG says so with its own message
+        java.util.regex.Matcher wideTs = WIDE_YEAR.matcher(val.toString().trim());
+        if (wideTs.matches()) {
+            long year = Long.parseLong(wideTs.group(1));
+            if (year > TIMESTAMP_MAX_YEAR) {
+                throw new MemgresException("timestamp out of range: \"" + val + "\"", "22008");
+            }
+            try {
+                return LocalDate.of((int) year, Integer.parseInt(wideTs.group(2)),
+                        Integer.parseInt(wideTs.group(3))).atStartOfDay();
+            } catch (RuntimeException e) {
+                throw new MemgresException(
+                        "date/time field value out of range: \"" + val + "\"", "22008");
+            }
         }
         // Use 22008 for well-formatted but out-of-range timestamps
         String errCode = val.toString().trim().matches("\\d{4}-\\d{2}-\\d{2}.*") ? "22008" : "22007";
@@ -2395,5 +2442,52 @@ public final class TypeCoercion {
         if (aInc == bInc) return 0;
         if (isLower) return aInc ? -1 : 1;
         return aInc ? 1 : -1;
+    }
+
+    /**
+     * Hold a date/time value to a declared fractional-seconds precision. PostgreSQL rounds to
+     * that precision rather than dropping the digits past it, so {@code time(0)} turns
+     * 01:02:03.987 into 01:02:04 and not 01:02:03. A precision of 6 or more leaves microsecond
+     * values untouched, and anything that is not a time-of-day or timestamp is left alone.
+     */
+    public static Object roundTemporal(Object value, int precision) {
+        if (value == null || precision < 0 || precision >= 9) return value;
+        long unit = 1L;
+        for (int i = 0; i < 9 - precision; i++) unit *= 10L;
+        if (value instanceof LocalTime) {
+            return roundNanoOfDay((LocalTime) value, unit);
+        }
+        if (value instanceof OffsetTime) {
+            OffsetTime t = (OffsetTime) value;
+            return t.with(roundNanoOfDay(t.toLocalTime(), unit));
+        }
+        if (value instanceof LocalDateTime) {
+            LocalDateTime t = (LocalDateTime) value;
+            return roundDateTime(t, unit);
+        }
+        if (value instanceof OffsetDateTime) {
+            OffsetDateTime t = (OffsetDateTime) value;
+            return t.with(roundDateTime(t.toLocalDateTime(), unit));
+        }
+        if (value instanceof java.sql.Timestamp) {
+            java.sql.Timestamp ts = (java.sql.Timestamp) value;
+            return java.sql.Timestamp.valueOf(roundDateTime(ts.toLocalDateTime(), unit));
+        }
+        return value;
+    }
+
+    private static LocalTime roundNanoOfDay(LocalTime t, long unit) {
+        long nanos = t.toNanoOfDay();
+        long rounded = ((nanos + unit / 2) / unit) * unit;
+        // Rounding up out of the day wraps, which is what PostgreSQL's 24:00:00 boundary does
+        return LocalTime.ofNanoOfDay(rounded % 86400000000000L);
+    }
+
+    private static LocalDateTime roundDateTime(LocalDateTime t, long unit) {
+        long nanos = t.getNano();
+        long rounded = ((nanos + unit / 2) / unit) * unit;
+        LocalDateTime base = t.withNano(0);
+        if (rounded >= 1000000000L) return base.plusSeconds(1);
+        return base.withNano((int) rounded);
     }
 }

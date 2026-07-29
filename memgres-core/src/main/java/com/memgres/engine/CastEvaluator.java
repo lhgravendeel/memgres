@@ -354,6 +354,16 @@ class CastEvaluator {
             if (s.length() > n) return s.substring(0, n);
             return String.format("%-" + n + "s", s);
         }
+        // A date/time type's precision is a fractional-seconds precision, and it rounds rather
+        // than truncates: '01:02:03.987'::time(0) is 01:02:04. The value has to be read as its
+        // base type first, so the precision is applied to what comes back.
+        Integer timePrecision = temporalPrecision(lowerSpec);
+        if (timePrecision != null) {
+            String base = typeSpec.substring(0, typeSpec.indexOf('(')).trim()
+                    + typeSpec.substring(typeSpec.indexOf(')') + 1);
+            return TypeCoercion.roundTemporal(applyCast(val, base.trim(), fromUnknownLiteral),
+                    timePrecision);
+        }
         // An interval type carries its field qualifier and its fractional-seconds precision in
         // the type name, and both change the value: the qualifier decides what an unlabelled
         // number in the literal counts and which fields survive, the precision how many
@@ -505,6 +515,15 @@ class CastEvaluator {
                     String offsetStr = odt.getOffset().toString();
                     if (offsetStr.equals("Z")) offsetStr = "+00";
                     return odt.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd")) + " " + timePart + offsetStr;
+                }
+                // Java pads a time's fraction to a multiple of three digits; PG writes only the
+                // digits the value has, so 01:02:03.99 stays two digits wide
+                if (val instanceof java.time.LocalTime) {
+                    java.time.LocalTime lt = (java.time.LocalTime) val;
+                    return lt.getNano() == 0
+                            ? lt.format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"))
+                            : stripTrailingFracZeros(lt.format(
+                                    java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSSSSS")));
                 }
                 // H17: PgVector (int2vector/oidvector) to text: space-separated format
                 if (val instanceof PgVector) {
@@ -1473,6 +1492,32 @@ class CastEvaluator {
         }
         return sb.toString();
     }
+
+    /**
+     * The fractional-seconds precision a date/time type spells out, or null when the spec is not
+     * one of those types or carries no precision. {@code interval} is left alone: its qualifier
+     * is read elsewhere and means more than a precision.
+     */
+    private static Integer temporalPrecision(String lowerSpec) {
+        int paren = lowerSpec.indexOf('(');
+        if (paren < 0 || lowerSpec.endsWith("[]")) return null;
+        int close = lowerSpec.indexOf(')', paren);
+        if (close < 0) return null;
+        String base = (lowerSpec.substring(0, paren) + lowerSpec.substring(close + 1)).trim();
+        base = base.replaceAll("\\s+", " ");
+        if (!TEMPORAL_TYPMOD_TYPES.contains(base)) return null;
+        try {
+            return Integer.valueOf(lowerSpec.substring(paren + 1, close).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static final java.util.Set<String> TEMPORAL_TYPMOD_TYPES =
+            new java.util.HashSet<String>(java.util.Arrays.asList(
+                    "timestamp", "timestamptz", "time", "timetz",
+                    "timestamp with time zone", "timestamp without time zone",
+                    "time with time zone", "time without time zone"));
 
     /** True when the name belongs to an index PG materialises from a constraint. */
     private boolean isConstraintBackedIndex(String lowerName) {
