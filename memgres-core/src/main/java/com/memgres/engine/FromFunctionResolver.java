@@ -107,8 +107,17 @@ class FromFunctionResolver {
         if (fname.equals("_pg_expandarray")) return resolveExpandArray(alias, colAliases, evalArgs);
         if (fname.equals("jsonb_each") || fname.equals("jsonb_each_text") || fname.equals("json_each") || fname.equals("json_each_text"))
             return resolveJsonEach(fname, alias, colAliases, evalArgs, funcFrom.withOrdinality());
-        if (fname.equals("jsonb_to_recordset") || fname.equals("json_to_recordset") || fname.equals("jsonb_to_record") || fname.equals("json_to_record"))
+        if (fname.equals("jsonb_to_recordset") || fname.equals("json_to_recordset") || fname.equals("jsonb_to_record") || fname.equals("json_to_record")) {
+            // These four are declared to return bare record, so the caller has to say what the
+            // columns are. The requirement was placed on functions the database holds a
+            // declaration for and not on the built-ins that carry the same declaration, so
+            // SELECT * FROM json_to_record('{"a":1}') answered one nameless column.
+            if (!hasColumnDefinitionList(rawColAliases)) {
+                throw PgErrors.syntax(
+                        "a column definition list is required for functions returning \"record\"");
+            }
             return resolveJsonToRecordset(alias, rawColAliases, evalArgs);
+        }
         if (fname.equals("json_populate_recordset") || fname.equals("jsonb_populate_recordset")
                 || fname.equals("json_populate_record") || fname.equals("jsonb_populate_record"))
             return resolveJsonPopulateRecordset(funcFrom, alias, colAliases, evalArgs);
@@ -1413,6 +1422,19 @@ class FromFunctionResolver {
         }
         com.memgres.engine.plpgsql.PlpgsqlExecutor plExec = new com.memgres.engine.plpgsql.PlpgsqlExecutor(executor, executor.database, executor.session);
         Object result = plExec.executeFunction(userFunc, evalArgs);
+        // A function that does not return a set answers with one value however that value is
+        // shaped, and an array is one value. Reading every java list as the rows of a set turned
+        // a function returning int[] into a column of its elements: SELECT * FROM f() gave two
+        // rows of text where PostgreSQL gives one row holding the array.
+        if (result instanceof List<?> && !userFunc.isSetReturning()) {
+            String arrayColName = firstColAlias(colAliases, alias);
+            DataType arrayType = DataType.fromPgName(userFunc.getReturnType());
+            Table arrayTable = new Table(alias, Cols.listOf(new Column(arrayColName,
+                    arrayType != null ? arrayType : DataType.TEXT, true, false, null)));
+            Object[] arrayRow = new Object[]{result};
+            arrayTable.insertRow(arrayRow);
+            return Cols.listOf(new RowContext(arrayTable, alias, arrayRow));
+        }
         if (result instanceof List<?>) {
             List<?> resultList = (List<?>) result;
             List<PgFunction.Param> params = userFunc.getParams();

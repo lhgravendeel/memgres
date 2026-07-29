@@ -79,12 +79,13 @@ class DmlParser {
             // Parse SELECT which may include UNION/INTERSECT/EXCEPT
             selectStmt = parser.tryParseSetOp(parser.parseSelect());
         } else if (parser.check(TokenType.LEFT_PAREN)) {
-            // Parenthesized SELECT: INSERT INTO t (cols) (((SELECT ...)))
-            int extra = parser.countLeadingParensBeforeQuery();
-            if (extra > 0) {
-                parser.consumeLeadingParens(extra);
-                selectStmt = parser.tryParseSetOp(parser.parseSelect());
-                parser.consumeTrailingParens(extra);
+            // A parenthesised source query, which is one arm of whatever set operation follows:
+            // INSERT INTO t(id) (SELECT 1) UNION (SELECT 2) inserts both rows. Reading the
+            // parentheses off and stopping there left the UNION for the statement level, which
+            // made the INSERT itself an arm of a set operation -- so the INSERT ran and the width
+            // complaint came afterwards, with one row already written.
+            if (parser.countLeadingParensBeforeQuery() > 0) {
+                selectStmt = parser.tryParseSetOp(parser.parseSetOpOperandPublic());
             } else {
                 throw new ParseException("Expected VALUES, DEFAULT VALUES, or SELECT", parser.peek());
             }
@@ -226,7 +227,12 @@ class DmlParser {
 
     List<InsertStmt.SetClause> parseSetClauses() {
         List<InsertStmt.SetClause> clauses = new ArrayList<>();
+        List<String> plainlyAssigned = new ArrayList<>();
         do {
+            if (parser.check(TokenType.LEFT_PAREN)) {
+                parseMultiColumnSet(clauses, plainlyAssigned);
+                continue;
+            }
             String col = parser.readIdentifier();
             String subField = null;
             // Check for composite field update: col.field = value
@@ -299,10 +305,85 @@ class DmlParser {
                                 Literal.ofString(subscriptKeys.get(0))));
                 clauses.add(new InsertStmt.SetClause(col, setExpr, subField));
             } else {
+                rejectRepeatedAssignment(plainlyAssigned, col);
                 clauses.add(new InsertStmt.SetClause(col, val, subField));
             }
         } while (parser.match(TokenType.COMMA));
         return clauses;
+    }
+
+    /**
+     * One assignment may name several columns and take them from one row:
+     * {@code SET (a, b) = (SELECT x, y FROM ...)} and {@code SET (a, b) = (1, 'z')}. The engine
+     * stores an assignment per column, so the item is taken apart here -- a row constructor by its
+     * elements, a sub-SELECT by a shared node each column reads its own field of.
+     *
+     * <p>The source has to be one of those two. A parenthesised expression that is not a row --
+     * {@code (a) = (9)}, and {@code (a, b) = (9)} with it -- is written the same way but is not a
+     * row constructor, and PostgreSQL refuses it as such rather than reading the value into the
+     * first column.
+     */
+    private void parseMultiColumnSet(List<InsertStmt.SetClause> clauses, List<String> plainlyAssigned) {
+        Token open = parser.peek();
+        parser.expect(TokenType.LEFT_PAREN);
+        List<String> columns = new ArrayList<>();
+        do {
+            columns.add(parser.readIdentifier());
+        } while (parser.match(TokenType.COMMA));
+        parser.expect(TokenType.RIGHT_PAREN);
+        parser.expect(TokenType.EQUALS);
+        Expression source = parser.parseExpression();
+
+        if (source instanceof SubqueryExpr) {
+            int width = SelectStmt.writtenWidth(((SubqueryExpr) source).subquery());
+            if (width > 0 && width != columns.size()) {
+                throw mismatchedWidth(open);
+            }
+            for (int i = 0; i < columns.size(); i++) {
+                rejectRepeatedAssignment(plainlyAssigned, columns.get(i));
+                clauses.add(new InsertStmt.SetClause(columns.get(i),
+                        new RowElementExpr(source, i, columns.size()), null));
+            }
+            return;
+        }
+        if (source instanceof ArrayExpr && ((ArrayExpr) source).isRow()) {
+            List<Expression> elements = ((ArrayExpr) source).elements();
+            if (elements.size() != columns.size()) {
+                throw mismatchedWidth(open);
+            }
+            for (int i = 0; i < columns.size(); i++) {
+                rejectRepeatedAssignment(plainlyAssigned, columns.get(i));
+                clauses.add(new InsertStmt.SetClause(columns.get(i), elements.get(i), null));
+            }
+            return;
+        }
+        throw new com.memgres.engine.MemgresException(
+                "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression",
+                "0A000");
+    }
+
+    /**
+     * A column takes one value from one statement, so naming it twice among the assignments is a
+     * conflict PostgreSQL refuses rather than resolving. Only whole-column assignments count: a
+     * subscript and a composite field each write part of a column, and several of those to the
+     * same column are how a statement writes several parts of it.
+     */
+    private com.memgres.engine.MemgresException mismatchedWidth(Token open) {
+        com.memgres.engine.MemgresException e = new com.memgres.engine.MemgresException(
+                "number of columns does not match number of values", "42601");
+        if (open.position() >= 0) e.setPosition(open.position() + 1);
+        return e;
+    }
+
+    private void rejectRepeatedAssignment(List<String> plainlyAssigned, String column) {
+        for (int i = 0; i < plainlyAssigned.size(); i++) {
+            if (plainlyAssigned.get(i).equalsIgnoreCase(column)) {
+                com.memgres.engine.MemgresException e = new com.memgres.engine.MemgresException(
+                        "multiple assignments to same column \"" + column + "\"", "42601");
+                throw e;
+            }
+        }
+        plainlyAssigned.add(column);
     }
 
     DeleteStmt parseDelete() {
