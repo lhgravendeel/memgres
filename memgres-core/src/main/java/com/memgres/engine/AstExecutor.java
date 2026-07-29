@@ -54,6 +54,10 @@ public class AstExecutor {
     final Map<String, QueryResult> cteResultCache = new HashMap<>();
     // CTEs currently being executed (to prevent infinite recursion in recursive CTEs)
     final Set<String> executingCtes = new HashSet<>();
+    // The same items by identity: a nested WITH clause may declare the same name for a different
+    // item, and that inner item is readable while the outer one of that name is still running.
+    final Set<SelectStmt.CommonTableExpr> executingCteNodes =
+            Collections.newSetFromMap(new IdentityHashMap<SelectStmt.CommonTableExpr, Boolean>());
     // Bound parameter values for extended query protocol ($1, $2, ...)
     List<Object> boundParameters = new ArrayList<>();
     // Statement timestamp: frozen at statement start for now()/statement_timestamp()
@@ -969,7 +973,16 @@ public class AstExecutor {
         // Sequences are queryable as relations in PG (columns: last_value, log_cnt, is_called)
         Table seqTable = resolveSequenceAsRelation(schemaName, tableName);
         if (seqTable != null) return seqTable;
-        throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+        // PG names the relation the way the query did: a qualified reference that found nothing
+        // reports the qualified name, and only an unqualified one can have meant a WITH item.
+        if (userQualified && schemaName != null) {
+            throw new MemgresException(
+                    "relation \"" + schemaName + "." + tableName + "\" does not exist", "42P01");
+        }
+        MemgresException notThere =
+                new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
+        selectExecutor.noteHiddenWithItem(notThere, tableName);
+        throw notThere;
     }
 
     /**

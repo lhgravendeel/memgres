@@ -117,6 +117,7 @@ public enum DataType {
     JSONB_ARRAY(3807, "_jsonb"),
     INET_ARRAY(1041, "_inet"),
     ACLITEM_ARRAY(1034, "_aclitem"),
+    RECORD_ARRAY(2287, "_record"),
 
     // OID type
     OID(26, "oid"),
@@ -350,6 +351,7 @@ public enum DataType {
             case JSON: return JSON_ARRAY;
             case JSONB: return JSONB_ARRAY;
             case INET: return INET_ARRAY;
+            case RECORD: return RECORD_ARRAY;
             default: return null;
         }
     }
@@ -380,6 +382,7 @@ public enum DataType {
             case JSON_ARRAY: return JSON;
             case JSONB_ARRAY: return JSONB;
             case INET_ARRAY: return INET;
+            case RECORD_ARRAY: return RECORD;
             default: return null;
         }
     }

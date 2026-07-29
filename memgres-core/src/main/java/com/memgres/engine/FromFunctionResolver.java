@@ -1218,6 +1218,13 @@ class FromFunctionResolver {
             throw new MemgresException("tablesample percentage must be between 0 and 100", "2202H");
         }
 
+        // Sampling reads a fraction of a stored relation's pages, so there has to be one. A WITH
+        // item is computed, not stored, and PG says so rather than that the name is unknown.
+        if (executor.selectExecutor.namesWithItem(tableName)) {
+            throw new MemgresException(
+                    "TABLESAMPLE clause can only be applied to tables and materialized views",
+                    "0A000");
+        }
         Table table;
         try {
             table = executor.resolveTable(null, tableName);
