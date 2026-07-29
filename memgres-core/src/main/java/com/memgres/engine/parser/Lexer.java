@@ -820,11 +820,11 @@ public class Lexer {
         String upper = word.toUpperCase();
 
         if (KEYWORDS.contains(upper)) {
-            return new Token(TokenType.KEYWORD, upper, start);
+            return new Token(TokenType.KEYWORD, upper, start, word);
         }
         // PG truncates identifiers to NAMEDATALEN-1 = 63 bytes
         String id = word.toLowerCase();
         if (id.length() > 63) id = id.substring(0, 63);
-        return new Token(TokenType.IDENTIFIER, id, start);
+        return new Token(TokenType.IDENTIFIER, id, start, word);
     }
 }

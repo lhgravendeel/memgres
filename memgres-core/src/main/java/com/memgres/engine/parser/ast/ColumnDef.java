@@ -27,6 +27,28 @@ public final class ColumnDef {
     public final String refMatchType;           // FK MATCH type: null, "FULL", "SIMPLE", "PARTIAL"
     public final Expression checkConstraintExpr; // or null
 
+    // A column-level constraint may be introduced by CONSTRAINT name, and PG keeps that name:
+    // it is what pg_constraint lists and what SET CONSTRAINTS and ALTER TABLE DROP CONSTRAINT
+    // ask for. Only when none was written does the generated name apply.
+    private String primaryKeyName;
+    private String uniqueName;
+    private String foreignKeyName;
+
+    /** The name written for this column's PRIMARY KEY, or null to generate one. */
+    public String primaryKeyName() { return primaryKeyName; }
+
+    public void setPrimaryKeyName(String name) { this.primaryKeyName = name; }
+
+    /** The name written for this column's UNIQUE constraint, or null to generate one. */
+    public String uniqueName() { return uniqueName; }
+
+    public void setUniqueName(String name) { this.uniqueName = name; }
+
+    /** The name written for this column's REFERENCES constraint, or null to generate one. */
+    public String foreignKeyName() { return foreignKeyName; }
+
+    public void setForeignKeyName(String name) { this.foreignKeyName = name; }
+
     public ColumnDef(
             String name,
             String typeName,

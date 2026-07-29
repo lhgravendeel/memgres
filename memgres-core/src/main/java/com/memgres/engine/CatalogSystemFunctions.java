@@ -478,6 +478,23 @@ class CatalogSystemFunctions {
                     }
                     String settingValue = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
                     boolean isLocal = fn.args().size() >= 3 && executor.isTruthy(executor.evalExpr(fn.args().get(2), ctx));
+                    // set_config runs inside a query, so a transaction-scoped setting is subject
+                    // to the same rules the SET statement is: the isolation level can no longer
+                    // be chosen once this transaction has taken a snapshot, and a setting that
+                    // belongs to a transaction does not stick when there is no transaction open.
+                    if (executor.session != null && SessionExecutor.isTransactionScopedGuc(settingName)) {
+                        String lower = settingName.toLowerCase();
+                        if (lower.equals("transaction_isolation") || lower.equals("transaction_deferrable")) {
+                            throw new MemgresException("SET TRANSACTION "
+                                    + (lower.equals("transaction_isolation") ? "ISOLATION LEVEL" : "[NOT] DEFERRABLE")
+                                    + " must be called before any query", "25001");
+                        }
+                        if (!executor.session.isInTransaction()) {
+                            executor.session.addNotice("WARNING", "25P01",
+                                    "SET TRANSACTION can only be used in transaction blocks", null);
+                            return settingValue;
+                        }
+                    }
                     if (executor.session != null) {
                         if (isLocal) {
                             // M13: set_config(..., true) is LOCAL — no-op outside txn
@@ -917,6 +934,9 @@ class CatalogSystemFunctions {
             case POINT: case LINE: case LSEG: case BOX: case PATH: case POLYGON: case CIRCLE:
             case JSON: case JSONB: case TSVECTOR: case TSQUERY:
             case BIT: case VARBIT: case INET: case CIDR:
+            // void comes back as the empty string, which says nothing about the type that
+            // produced it; only the declaration can tell pg_typeof that it was void.
+            case VOID:
                 return true;
             default:
                 return false;

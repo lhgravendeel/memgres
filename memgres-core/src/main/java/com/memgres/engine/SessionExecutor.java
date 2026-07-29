@@ -191,6 +191,13 @@ class SessionExecutor {
                     if (!param.contains(".") && !guc.isKnown(param)) {
                         throw new MemgresException("unrecognized configuration parameter \"" + param + "\"", "42704");
                     }
+                    // A transaction-scoped setting has no session value to fall back to: it is
+                    // derived afresh from its default_ counterpart when a transaction starts, so
+                    // there is nothing for RESET to restore and PG says so.
+                    if (isTransactionScopedGuc(param)) {
+                        throw new MemgresException(
+                                "parameter \"" + param.toLowerCase() + "\" cannot be reset", "0A000");
+                    }
                     guc.reset(param);
                 }
             }
@@ -767,6 +774,15 @@ class SessionExecutor {
             return QueryResult.message(QueryResult.Type.SET, "ALTER DATABASE");
         }
 
+        if ("set_transaction".equals(name)) {
+            applySetTransaction(stmt.value());
+            return QueryResult.message(QueryResult.Type.SET, "SET");
+        }
+        if ("session_characteristics".equals(name)) {
+            applySessionCharacteristics(stmt.value());
+            return QueryResult.message(QueryResult.Type.SET, "SET");
+        }
+
         // SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }
         if ("constraints".equals(name) && stmt.value() != null && !stmt.value().isEmpty()) {
             String val = stmt.value();
@@ -778,19 +794,38 @@ class SessionExecutor {
                 if ("ALL".equals(namesStr)) {
                     if (executor.session != null) {
                         executor.session.setAllConstraintsDeferred(deferred);
+                        // Switching to IMMEDIATE is what makes the checks happen now: PG runs
+                        // everything still pending at that point, so a violation is reported by
+                        // the statement that asked for the check rather than surviving to COMMIT
+                        // — or disappearing entirely if the transaction rolls back.
+                        if (!deferred) executor.session.runPendingDeferredChecks(null);
                     }
                 } else {
                     // A name that matches no constraint would silently do nothing, leaving the
-                    // caller believing it had changed when a constraint fires.
+                    // caller believing it had changed when a constraint fires. A name that is
+                    // not deferrable cannot be deferred at all, and PG says so rather than
+                    // storing an override that never applies.
                     for (String cn : namesStr.split(",")) {
-                        String constraintName = cn.trim();
-                        if (!constraintExists(constraintName)) {
+                        String constraintName = bareConstraintName(cn.trim());
+                        StoredConstraint sc = findConstraint(constraintName);
+                        if (sc == null) {
                             throw PgErrors.undefinedObject("constraint", constraintName);
+                        }
+                        // IMMEDIATE is what a non-deferrable constraint already is, so only asking
+                        // for DEFERRED is a request it cannot honour.
+                        if (deferred && !sc.isDeferrable()) {
+                            throw new MemgresException(
+                                    "constraint \"" + constraintName + "\" is not deferrable", "42809");
                         }
                     }
                     if (executor.session != null) {
                         for (String cn : namesStr.split(",")) {
-                            executor.session.setConstraintDeferred(cn.trim(), deferred);
+                            executor.session.setConstraintDeferred(bareConstraintName(cn.trim()), deferred);
+                        }
+                        if (!deferred) {
+                            for (String cn : namesStr.split(",")) {
+                                executor.session.runPendingDeferredChecks(bareConstraintName(cn.trim()));
+                            }
                         }
                     }
                 }
@@ -868,6 +903,13 @@ class SessionExecutor {
                 } else {
                     guc.setLocal(name, value);
                 }
+            } else if (TRANSACTION_SCOPED_GUCS.contains(name)
+                    && executor.session != null && !executor.session.isInTransaction()) {
+                // These belong to a transaction and are reset when the next one starts, so
+                // setting one with no transaction open changes nothing that outlives the
+                // statement. Storing it would make it stick, which PG never does.
+                executor.session.addNotice("WARNING", "25P01",
+                        "SET TRANSACTION can only be used in transaction blocks", null);
             } else {
                 guc.set(name, value);
             }
@@ -875,12 +917,40 @@ class SessionExecutor {
         return QueryResult.message(QueryResult.Type.SET, "SET");
     }
 
+    /** GUCs whose value belongs to one transaction and is re-derived when the next one starts. */
+    private static final Set<String> TRANSACTION_SCOPED_GUCS = Cols.setOf(
+            "transaction_isolation", "transaction_read_only", "transaction_deferrable");
+
+    /** True for a setting that belongs to the current transaction rather than to the session. */
+    static boolean isTransactionScopedGuc(String name) {
+        return name != null && TRANSACTION_SCOPED_GUCS.contains(name.toLowerCase());
+    }
+
     // ---- DO block ----
+
+    /** The isolation levels PostgreSQL accepts, in the order its hint lists them. */
+    private static final List<String> ISOLATION_LEVELS = java.util.Arrays.asList(
+            "serializable", "repeatable read", "read committed", "read uncommitted");
 
     /** Validate a GUC parameter value based on the known type of the parameter. */
     private void validateGucValue(String name, String value) {
         if (value == null || Strs.isBlank(value)) return;
         String lname = name.toLowerCase();
+        // An isolation level the engine does not have would leave the session claiming an
+        // isolation it is not providing, so the name is checked where it is set.
+        if (lname.equals("default_transaction_isolation") || lname.equals("transaction_isolation")) {
+            String level = value.trim();
+            if (level.length() >= 2 && ((level.startsWith("'") && level.endsWith("'"))
+                    || (level.startsWith("\"") && level.endsWith("\"")))) {
+                level = level.substring(1, level.length() - 1);
+            }
+            level = level.toLowerCase();
+            if (!ISOLATION_LEVELS.contains(level)) {
+                throw new MemgresException("invalid value for parameter \"" + lname + "\": \"" + level + "\""
+                        + "\n  Hint: Available values: " + String.join(", ", ISOLATION_LEVELS) + ".", "22023");
+            }
+            return;
+        }
         // Boolean parameters — includes row_security, jit, synchronize_seqscans, etc.
         if (lname.equals("enable_seqscan") || lname.equals("enable_hashjoin") || lname.equals("enable_indexscan")
                 || lname.startsWith("enable_") || lname.equals("fsync") || lname.equals("log_checkpoints")
@@ -967,6 +1037,80 @@ class SessionExecutor {
                 throw new MemgresException("unrecognized time zone name: \"" + tz + "\"", "22023");
             }
         }
+    }
+
+    /** Read one mode out of the encoded "iso=...;ro=on;def=off" form, or null when absent. */
+    private static String encodedMode(String encoded, String key) {
+        if (encoded == null) return null;
+        for (String part : encoded.split(";")) {
+            if (part.startsWith(key + "=")) return part.substring(key.length() + 1);
+        }
+        return null;
+    }
+
+    /**
+     * Apply {@code SET TRANSACTION transaction_mode [, ...]}.
+     *
+     * <p>Isolation and deferrability describe the snapshot a transaction runs against, so they can
+     * only be chosen before it has taken one; PostgreSQL refuses them afterwards rather than
+     * pretending a statement already run happened at the new level. Outside a transaction block
+     * the statement has nothing to configure and PostgreSQL warns instead of changing the session
+     * — silently rewriting the session default would outlive the statement that asked for it.
+     */
+    private void applySetTransaction(String encoded) {
+        Session session = executor.session;
+        if (session == null) return;
+        String iso = encodedMode(encoded, "iso");
+        String ro = encodedMode(encoded, "ro");
+        String def = encodedMode(encoded, "def");
+        if (!session.isInTransaction()) {
+            if (iso != null) warnOutsideBlock(session, "SET TRANSACTION");
+            if (ro != null) warnOutsideBlock(session, "SET TRANSACTION");
+            if (def != null) warnOutsideBlock(session, "SET TRANSACTION");
+            return;
+        }
+        if (iso != null) {
+            if (session.hasSubtransaction()) {
+                throw new MemgresException(
+                        "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction", "25001");
+            }
+            if (session.hasRunQueryInTransaction()) {
+                throw new MemgresException(
+                        "SET TRANSACTION ISOLATION LEVEL must be called before any query", "25001");
+            }
+            session.getGucSettings().set("transaction_isolation", iso);
+        }
+        if (def != null) {
+            if (session.hasSubtransaction()) {
+                throw new MemgresException(
+                        "SET TRANSACTION [NOT] DEFERRABLE must not be called in a subtransaction", "25001");
+            }
+            if (session.hasRunQueryInTransaction()) {
+                throw new MemgresException(
+                        "SET TRANSACTION [NOT] DEFERRABLE must be called before any query", "25001");
+            }
+            session.getGucSettings().set("transaction_deferrable", def);
+        }
+        if (ro != null) {
+            session.getGucSettings().set("transaction_read_only", ro);
+        }
+    }
+
+    private static void warnOutsideBlock(Session session, String command) {
+        session.addNotice("WARNING", "25P01",
+                command + " can only be used in transaction blocks", null);
+    }
+
+    /** Apply {@code SET SESSION CHARACTERISTICS AS TRANSACTION transaction_mode [, ...]}. */
+    private void applySessionCharacteristics(String encoded) {
+        Session session = executor.session;
+        if (session == null) return;
+        String iso = encodedMode(encoded, "iso");
+        String ro = encodedMode(encoded, "ro");
+        String def = encodedMode(encoded, "def");
+        if (iso != null) session.getGucSettings().set("default_transaction_isolation", iso);
+        if (ro != null) session.getGucSettings().set("default_transaction_read_only", ro);
+        if (def != null) session.getGucSettings().set("default_transaction_deferrable", def);
     }
 
     /** Normalize a DateStyle value to PG canonical form (e.g. "ISO, DMY"). */
@@ -2188,7 +2332,9 @@ class SessionExecutor {
         List<Object[]> fetched = cursorFetch(cursor, stmt.direction(), stmt.count());
 
         if (stmt.isMove()) {
-            return QueryResult.command(QueryResult.Type.SET, fetched.size());
+            // MOVE's command tag carries the number of rows it passed over, and a client reads
+            // that back as the statement's row count. Tagging it "SET" reports 0 every time.
+            return QueryResult.message(QueryResult.Type.SET, "MOVE " + fetched.size());
         }
         return QueryResult.select(cursor.getColumns(), fetched);
     }
@@ -2326,12 +2472,35 @@ class SessionExecutor {
 
     /** True when some table in the database carries a constraint of this name. */
     private boolean constraintExists(String name) {
+        return findConstraint(name) != null;
+    }
+
+    /**
+     * The constraint name inside a possibly schema-qualified SET CONSTRAINTS entry.
+     *
+     * <p>PostgreSQL takes {@code schema.name} here, and reports the schema when it does not exist.
+     * Splitting on the dot and looking up the first half instead reports that the schema is a
+     * constraint that does not exist, which is a refusal of valid SQL.
+     */
+    private String bareConstraintName(String name) {
+        int dot = name.lastIndexOf('.');
+        if (dot < 0) return name;
+        String schema = name.substring(0, dot);
+        if (!executor.database.getSchemas().containsKey(schema.toLowerCase())) {
+            throw new MemgresException("schema \"" + schema + "\" does not exist", "3F000");
+        }
+        return name.substring(dot + 1);
+    }
+
+    /** The first constraint anywhere in the database with this name, or null. */
+    private StoredConstraint findConstraint(String name) {
         for (Schema schema : executor.database.getSchemas().values()) {
             for (Table table : schema.getTables().values()) {
-                if (table.getConstraint(name) != null) return true;
+                StoredConstraint sc = table.getConstraint(name);
+                if (sc != null) return sc;
             }
         }
-        return false;
+        return null;
     }
 
     // ---- CREATE / ALTER / DROP STATISTICS ----

@@ -22,6 +22,18 @@ class DdlAdminExecutor {
 
     // ---- TRANSACTION ----
 
+    /**
+     * Statements that only mean something inside a transaction block. PostgreSQL refuses them
+     * outside one rather than treating them as a no-op, because a script that reaches
+     * {@code SAVEPOINT} or {@code COMMIT AND CHAIN} with no transaction open is not doing what
+     * it was written to do.
+     */
+    private void requireTransactionBlock(String command) {
+        if (executor.session != null && !executor.session.isInTransaction()) {
+            throw new MemgresException(command + " can only be used in transaction blocks", "25P01");
+        }
+    }
+
     QueryResult executeTransaction(TransactionStmt stmt) {
         if (executor.session != null) {
             switch (stmt.action()) {
@@ -34,37 +46,51 @@ class DdlAdminExecutor {
                     if (stmt.readOnly() != null) {
                         executor.session.getGucSettings().set("transaction_read_only", stmt.readOnly() ? "on" : "off");
                     }
+                    if (stmt.deferrable() != null) {
+                        executor.session.getGucSettings().set("transaction_deferrable", stmt.deferrable() ? "on" : "off");
+                    }
                     break;
                 }
                 case COMMIT: {
-                    String savedIso = stmt.chain() ? executor.session.getGucSettings().get("transaction_isolation") : null;
-                    String savedRo = stmt.chain() ? executor.session.getGucSettings().get("transaction_read_only") : null;
+                    if (stmt.chain()) requireTransactionBlock("COMMIT AND CHAIN");
+                    String savedIso = chainedValue(stmt, "transaction_isolation");
+                    String savedRo = chainedValue(stmt, "transaction_read_only");
+                    String savedDef = chainedValue(stmt, "transaction_deferrable");
                     executor.session.commit();
                     if (stmt.chain()) {
                         executor.session.begin();
+                        executor.session.setExplicitTransactionBlock(true);
                         if (savedIso != null) executor.session.getGucSettings().set("transaction_isolation", savedIso);
                         if (savedRo != null) executor.session.getGucSettings().set("transaction_read_only", savedRo);
+                        if (savedDef != null) executor.session.getGucSettings().set("transaction_deferrable", savedDef);
                     }
                     break;
                 }
                 case ROLLBACK: {
-                    String savedIso = stmt.chain() ? executor.session.getGucSettings().get("transaction_isolation") : null;
-                    String savedRo = stmt.chain() ? executor.session.getGucSettings().get("transaction_read_only") : null;
+                    if (stmt.chain()) requireTransactionBlock("ROLLBACK AND CHAIN");
+                    String savedIso = chainedValue(stmt, "transaction_isolation");
+                    String savedRo = chainedValue(stmt, "transaction_read_only");
+                    String savedDef = chainedValue(stmt, "transaction_deferrable");
                     executor.session.rollback();
                     if (stmt.chain()) {
                         executor.session.begin();
+                        executor.session.setExplicitTransactionBlock(true);
                         if (savedIso != null) executor.session.getGucSettings().set("transaction_isolation", savedIso);
                         if (savedRo != null) executor.session.getGucSettings().set("transaction_read_only", savedRo);
+                        if (savedDef != null) executor.session.getGucSettings().set("transaction_deferrable", savedDef);
                     }
                     break;
                 }
                 case SAVEPOINT:
+                    requireTransactionBlock("SAVEPOINT");
                     executor.session.savepoint(stmt.savepointName());
                     break;
                 case RELEASE_SAVEPOINT:
+                    requireTransactionBlock("RELEASE SAVEPOINT");
                     executor.session.releaseSavepoint(stmt.savepointName());
                     break;
                 case ROLLBACK_TO_SAVEPOINT:
+                    requireTransactionBlock("ROLLBACK TO SAVEPOINT");
                     executor.session.rollbackToSavepoint(stmt.savepointName());
                     break;
                 case PREPARE_TRANSACTION: {
@@ -120,6 +146,17 @@ class DdlAdminExecutor {
             default:
                 throw new IllegalStateException("Unknown transaction action: " + stmt.action());
         }
+    }
+
+    /**
+     * The value AND CHAIN carries into the next transaction: only one this transaction actually
+     * set. Carrying a value that was merely inherited from the session default would pin it,
+     * so a later change to the default would stop reaching the chained transaction.
+     */
+    private String chainedValue(TransactionStmt stmt, String setting) {
+        if (!stmt.chain()) return null;
+        GucSettings gucs = executor.session.getGucSettings();
+        return gucs.hasSessionOverride(setting) ? gucs.get(setting) : null;
     }
 
     // ---- EXPLAIN ----

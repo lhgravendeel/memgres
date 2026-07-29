@@ -444,26 +444,29 @@ class MultiConnectionTransactionTest {
     // ========================================================================
 
     @Test
-    void testCreateTableInTransactionVisibleThenRolledBack() throws SQLException {
-        // Note: DDL (CREATE TABLE) is still immediately visible to other sessions (no DDL MVCC).
-        // But the INSERT inside the transaction is not visible until committed.
+    void testCreateTableInTransactionIsNotVisibleUntilCommitted() throws SQLException {
+        // DDL is transactional: until the transaction commits, the relation may still turn out
+        // never to have existed, so PostgreSQL does not let another session read it.
         try (Connection c1 = connect(); Connection c2 = connect();
              Statement s1 = c1.createStatement(); Statement s2 = c2.createStatement()) {
             s1.execute("BEGIN");
             s1.execute("CREATE TABLE ddl_txn_create (id int)");
             s1.execute("INSERT INTO ddl_txn_create VALUES (1)");
-            // c2 can see the table (DDL is immediately visible) but not the uncommitted row
-            assertEquals("0", query1(s2, "SELECT count(*) FROM ddl_txn_create"));
+            // its own session sees both the table and its own row
+            assertEquals("1", query1(s1, "SELECT count(*) FROM ddl_txn_create"));
+            try {
+                s2.executeQuery("SELECT count(*) FROM ddl_txn_create");
+                fail("Table should not be visible to another session before commit");
+            } catch (SQLException e) {
+                assertEquals("42P01", e.getSQLState());
+            }
             // Rollback removes the table
             s1.execute("ROLLBACK");
-            // Table should no longer exist
             try {
                 s2.executeQuery("SELECT count(*) FROM ddl_txn_create");
                 fail("Table should not exist after rollback");
             } catch (SQLException e) {
-                assertTrue(e.getMessage().toLowerCase().contains("ddl_txn_create")
-                        || e.getMessage().toLowerCase().contains("does not exist")
-                        || e.getMessage().toLowerCase().contains("not found"));
+                assertEquals("42P01", e.getSQLState());
             }
         }
     }

@@ -160,6 +160,9 @@ class DmlExecutor {
     private void validateAndInsertWaiting(Table checkTable, Object[] row,
                                           Table targetTable, Object[] storedRow) {
         while (true) {
+            // The wait below can end without the row having moved. Polling the cancel token here
+            // means a statement_timeout or a client cancel still ends this loop if it does.
+            StatementCancel.check();
             ConstraintValidator.PendingUniqueConflict pending;
             targetTable.getWriteLock().lock();
             try {
@@ -1441,12 +1444,12 @@ class DmlExecutor {
             com.memgres.engine.parser.ast.CurrentOfExpr cof = (com.memgres.engine.parser.ast.CurrentOfExpr) stmt.where();
             rows = filterByCurrentOf(cof, table, rows);
         } else if (stmt.where() != null) {
-            rows = rows.stream()
-                    .filter(row -> {
-                        Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
-                        return executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, updateAlias, evalRow)));
-                    })
-                    .collect(Collectors.toList());
+            final List<Object[]> scanned = rows;
+            final Table updateTable = table;
+            rows = matchAgainstCommittedRows(table, scanned, row -> {
+                Object[] evalRow = updateHasVirtual ? computeVirtualColumns(table, row) : row;
+                return executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, updateAlias, evalRow)));
+            }, () -> rescanTable(updateTable));
         }
 
         // RLS USING filter for UPDATE: restrict which rows can be updated
@@ -1655,6 +1658,114 @@ class DmlExecutor {
      * concurrent FOR UPDATE / FOR UPDATE NOWAIT blocks or reports 55P03 the way it does
      * against a real server. Waits (with deadlock detection) exactly like FOR UPDATE.
      */
+    /**
+     * Choose the rows an UPDATE or DELETE acts on, judging each against the values another
+     * session has actually committed.
+     *
+     * <p>An in-flight change from another transaction must not decide this statement's answer.
+     * Matching against the row as it stands lets an uncommitted UPDATE steer a row out of the
+     * WHERE clause — the statement quietly touches nothing, and if that transaction rolls back it
+     * touched nothing for a change that never happened. So the qual is evaluated against the last
+     * committed image, and a row that matches but is being written by someone else is waited for,
+     * then judged again on the outcome. Rows another transaction has inserted but not committed
+     * are not there to act on at all, and a row it has deleted without committing is still there:
+     * the statement waits for it rather than reporting that it deleted nothing.
+     *
+     * <p>A transaction that has already failed is not waited for. Its rows can never become
+     * permanent, so PostgreSQL treats them as dead the instant the statement errored; waiting is
+     * how two sessions that broke each other's statement wait for one another with no way out.
+     */
+    private List<Object[]> matchAgainstCommittedRows(Table table, List<Object[]> rows,
+                                                     java.util.function.Predicate<Object[]> matches) {
+        return matchAgainstCommittedRows(table, rows, matches, null);
+    }
+
+    /** Read a table's rows again, following its partitions, after a wait has ended. */
+    private List<Object[]> rescanTable(Table table) {
+        List<Object[]> fresh = new ArrayList<>();
+        if (table.getPartitionStrategy() != null && !table.getPartitions().isEmpty()) {
+            List<Table> allTables = new ArrayList<>();
+            DmlPartitionHelper.collectAllPartitionTables(table, allTables);
+            for (Table t : allTables) fresh.addAll(t.getRows());
+        } else {
+            fresh.addAll(table.getRows());
+        }
+        return fresh;
+    }
+
+    /**
+     * As above, with a {@code rescan} that re-reads the table after a wait ends. Without one the
+     * statement can only decide on the rows it read before waiting, which misses a row the other
+     * transaction had deleted and then put back.
+     */
+    private List<Object[]> matchAgainstCommittedRows(Table table, List<Object[]> rows,
+                                                     java.util.function.Predicate<Object[]> matches,
+                                                     java.util.function.Supplier<List<Object[]>> rescan) {
+        Session me = executor.session;
+        List<Object[]> plain = new ArrayList<>();
+        if (me == null) {
+            for (Object[] row : rows) {
+                if (matches.test(row)) plain.add(row);
+            }
+            return plain;
+        }
+        final String key = executor.constraintValidator.uncommittedKey(table);
+        List<Object[]> scan = rows;
+        while (true) {
+            // The wait below can end without the row having moved. Polling the cancel token here
+            // means a statement_timeout or a client cancel still ends this loop if it does.
+            StatementCancel.check();
+            Set<Object[]> notCommitted = Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+            Map<Object[], Object[]> otherOld = new IdentityHashMap<>();
+            Map<Object[], Session> owner = new IdentityHashMap<>();
+            List<Object[]> hiddenByOther = new ArrayList<>();
+            for (Session other : executor.database.getActiveSessions()) {
+                if (other == me || !other.isInTransaction()) continue;
+                boolean doomed = other.isDoomed();
+                for (Object[] r : other.getUncommittedInserts(key)) {
+                    notCommitted.add(r);
+                    if (!doomed) owner.put(r, other);
+                }
+                for (Map.Entry<Object[], Object[]> e : other.getUncommittedUpdates(key).entrySet()) {
+                    otherOld.put(e.getKey(), e.getValue());
+                    if (!doomed) owner.put(e.getKey(), other);
+                }
+                if (doomed) continue;
+                for (Object[] r : other.getUncommittedDeletes(key)) {
+                    owner.put(r, other);
+                    hiddenByOther.add(r);
+                }
+            }
+            List<Object[]> result = new ArrayList<>();
+            Session blocker = null;
+            Set<Object[]> seen = Collections.newSetFromMap(new IdentityHashMap<Object[], Boolean>());
+            for (Object[] row : scan) {
+                seen.add(row);
+                if (notCommitted.contains(row)) continue;
+                Object[] committed = otherOld.containsKey(row) ? otherOld.get(row) : row;
+                if (committed == null || !matches.test(committed)) continue;
+                Session own = owner.get(row);
+                if (own != null) { blocker = own; break; }
+                result.add(row);
+            }
+            // A row another transaction has deleted without committing is gone from the scan but
+            // is still committed-live: this statement has to wait for the outcome before it can
+            // say whether it deleted it.
+            if (blocker == null) {
+                for (Object[] row : hiddenByOther) {
+                    if (seen.contains(row)) continue;
+                    if (matches.test(row)) { blocker = owner.get(row); break; }
+                }
+            }
+            if (blocker == null) return result;
+            final Session waitFor = blocker;
+            executor.database.awaitConcurrentWrite(me, waitFor,
+                    () -> waitFor.isInTransaction() && !waitFor.isDoomed()
+                            && waitFor.hasUncommittedWork(key), table.getName());
+            if (rescan != null) scan = rescan.get();
+        }
+    }
+
     private void lockRowsForDml(Table table, List<Object[]> rows) {
         if (executor.session == null || table == null || rows == null || rows.isEmpty()) return;
         String tName = table.getName();
@@ -1999,12 +2110,25 @@ class DmlExecutor {
             List<Object[]> matched = filterByCurrentOf(cof, table, allRows);
             toDelete.addAll(matched);
         } else {
-            for (Object[] row : allRows) {
+            final List<Object[]> deleteScan = allRows;
+            final Map<Object[], Table> deleteOwner = rowOwner;
+            final List<Table> deleteTables = tablesToScan;
+            toDelete.addAll(matchAgainstCommittedRows(table, allRows, row -> {
                 Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
-                if (executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), evalRow)))) {
-                    toDelete.add(row);
+                return executor.isTruthy(executor.evalExpr(stmt.where(), viewAwareCtx(table, stmt.alias(), evalRow)));
+            }, () -> {
+                // A wait has ended, so the table may hold rows that were not there when it began.
+                // Both the scan and the row-to-partition map have to be rebuilt from it.
+                deleteScan.clear();
+                deleteOwner.clear();
+                for (Table t : deleteTables) {
+                    for (Object[] r : t.getRows()) {
+                        deleteScan.add(r);
+                        deleteOwner.put(r, t);
+                    }
                 }
-            }
+                return deleteScan;
+            }));
         }
 
         // RLS USING filter for DELETE: remove rows that don't pass DELETE policies

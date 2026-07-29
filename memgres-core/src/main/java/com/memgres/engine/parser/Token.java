@@ -7,12 +7,27 @@ public final class Token {
     public final TokenType type;
     public final String value;
     public final int position;
+    /** The word as it was written, before the lexer folded its case. Null when it is unchanged. */
+    private final String raw;
 
     public Token(TokenType type, String value, int position) {
+        this(type, value, position, null);
+    }
+
+    public Token(TokenType type, String value, int position, String raw) {
         this.type = type;
         this.value = value;
         this.position = position;
+        this.raw = raw;
     }
+
+    /**
+     * The token's text as the statement spelled it.
+     *
+     * <p>PostgreSQL quotes the user's own spelling back in a syntax error, so the message points
+     * at something findable in the statement rather than at the lexer's folded form.
+     */
+    public String raw() { return raw != null ? raw : value; }
 
     @Override
     public String toString() {

@@ -47,20 +47,56 @@ public class Sequence {
         if (incrementBy > 0) {
             if (next > maxValue) {
                 if (!cycle) {
-                    throw new MemgresException("nextval: reached maximum value of sequence \"" + name + "\" (" + maxValue + ")");
+                    throw new MemgresException("nextval: reached maximum value of sequence \"" + name + "\" (" + maxValue + ")", "2200H");
                 }
                 next = minValue;
             }
         } else {
             if (next < minValue) {
                 if (!cycle) {
-                    throw new MemgresException("nextval: reached minimum value of sequence \"" + name + "\" (" + minValue + ")");
+                    throw new MemgresException("nextval: reached minimum value of sequence \"" + name + "\" (" + minValue + ")", "2200H");
                 }
                 next = maxValue;
             }
         }
         currentValue.set(next);
         return next;
+    }
+
+    /**
+     * Bumped whenever the counter moves by something other than nextval.
+     *
+     * <p>A session that has reserved a block of CACHE values is holding values the sequence has
+     * already handed out. setval and ALTER SEQUENCE RESTART mean those are no longer the values
+     * the sequence would produce, so the block has to be given up — otherwise resetting a
+     * sequence, which is how a test fixture starts over, quietly keeps serving the old numbers.
+     */
+    private long resetGeneration;
+
+    /** The counter's reset generation; a block cached under an older one is stale. */
+    public synchronized long getResetGeneration() { return resetGeneration; }
+
+    /**
+     * Reserve a run of up to {@code count} consecutive values for one caller.
+     *
+     * <p>CACHE is an allocation hint, not a promise: PostgreSQL claims what is left of the
+     * sequence and no more, so a sequence whose cache is wider than its remaining range still
+     * hands out every value it has. Claiming the whole cache up front would exhaust such a
+     * sequence on its first call.
+     *
+     * @return {@code {firstValue, reservedCount}}; reservedCount is at least 1
+     * @throws MemgresException 2200H when not even one value is left
+     */
+    public synchronized long[] nextValBlock(int count) {
+        long first = nextVal();
+        long reserved = 1;
+        while (reserved < count) {
+            long candidate = currentValue.get() + incrementBy;
+            if (incrementBy > 0 ? candidate > maxValue : candidate < minValue) break;
+            currentValue.set(candidate);
+            reserved++;
+        }
+        return new long[]{first, reserved};
     }
 
     public synchronized long currVal() {
@@ -71,11 +107,10 @@ public class Sequence {
     }
 
     public synchronized long setVal(long value) {
-        if (value > maxValue) {
-            throw new MemgresException("setval: value " + value + " is out of bounds for sequence (max=" + maxValue + ")", "22003");
-        }
-        if (value < minValue) {
-            throw new MemgresException("setval: value " + value + " is out of bounds for sequence (min=" + minValue + ")", "22003");
+        resetGeneration++;
+        if (value > maxValue || value < minValue) {
+            throw new MemgresException("setval: value " + value + " is out of bounds for sequence \""
+                    + name + "\" (" + minValue + ".." + maxValue + ")", "22003");
         }
         currentValue.set(value);
         called = true;
@@ -83,11 +118,10 @@ public class Sequence {
     }
 
     public synchronized long setVal(long value, boolean isCalled) {
-        if (value > maxValue) {
-            throw new MemgresException("setval: value " + value + " is out of bounds for sequence (max=" + maxValue + ")", "22003");
-        }
-        if (value < minValue) {
-            throw new MemgresException("setval: value " + value + " is out of bounds for sequence (min=" + minValue + ")", "22003");
+        resetGeneration++;
+        if (value > maxValue || value < minValue) {
+            throw new MemgresException("setval: value " + value + " is out of bounds for sequence \""
+                    + name + "\" (" + minValue + ".." + maxValue + ")", "22003");
         }
         currentValue.set(value);
         if (isCalled) {
@@ -107,17 +141,20 @@ public class Sequence {
     public boolean isCycle() { return cycle; }
 
     public synchronized void restart() {
+        resetGeneration++;
         currentValue.set(startWith);
         called = false;
     }
 
     public synchronized void restart(long value) {
+        resetGeneration++;
         currentValue.set(value);
         called = false;
     }
 
     /** Set the counter and its called flag together, as ALTER SEQUENCE resolves them as a pair. */
     public synchronized void setCurrentValue(long value, boolean isCalled) {
+        resetGeneration++;
         currentValue.set(value);
         this.called = isCalled;
     }

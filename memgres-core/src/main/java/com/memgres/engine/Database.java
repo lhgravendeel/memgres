@@ -287,9 +287,21 @@ public class Database {
      * Otherwise blocks until the lock can be acquired.
      */
     public void acquireTableLock(String tableKey, String mode, Session session, boolean nowait) {
-        long timeoutMs = session == null ? 5_000L
-                : GucSettings.parseTimeoutMillis(session.getGucSettings().get("lock_timeout"));
-        acquireTableLock(tableKey, mode, session, nowait, timeoutMs > 0 ? timeoutMs : 5_000L);
+        acquireTableLock(tableKey, mode, session, nowait, lockWaitBudget(session));
+    }
+
+    /**
+     * How long a lock wait may last, in milliseconds, or {@link Long#MAX_VALUE} for no limit.
+     *
+     * <p>{@code lock_timeout} is the answer when it is set. When it is not, PostgreSQL waits:
+     * a wait that gives up on its own schedule turns a lock another session is about to release
+     * into an error the caller never asked for, and makes {@code lock_timeout} decorative. The
+     * wait stays interruptible, so {@code statement_timeout} and a client cancel still end it.
+     */
+    private static long lockWaitBudget(Session session) {
+        if (session == null) return Long.MAX_VALUE;
+        long configured = GucSettings.parseTimeoutMillis(session.getGucSettings().get("lock_timeout"));
+        return configured > 0 ? configured : Long.MAX_VALUE;
     }
 
     /**
@@ -298,37 +310,64 @@ public class Database {
      * entry rather than stacking one per statement.
      */
     public void acquireTableLock(String tableKey, String mode, Session session, boolean nowait, long timeoutMs) {
-        final long deadline = System.currentTimeMillis() + timeoutMs;
-        synchronized (tableLockMonitor) {
-            while (true) {
-                List<TableLockEntry> entries = tableLevelLocks.computeIfAbsent(tableKey, k -> new java.util.concurrent.CopyOnWriteArrayList<>());
-                boolean conflict = false;
-                boolean alreadyHeld = false;
-                for (TableLockEntry e : entries) {
-                    if (e.session == session) {
-                        if (mode.equals(e.mode)) alreadyHeld = true;
-                    } else if (!tableLockModesCompatible(e.mode, mode)) {
-                        conflict = true;
-                        break;
+        final long deadline = timeoutMs == Long.MAX_VALUE
+                ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMs;
+        final String relation = relationNameOf(tableKey);
+        boolean registered = false;
+        try {
+            synchronized (tableLockMonitor) {
+                while (true) {
+                    List<TableLockEntry> entries = tableLevelLocks.computeIfAbsent(tableKey, k -> new java.util.concurrent.CopyOnWriteArrayList<>());
+                    Session holder = null;
+                    boolean alreadyHeld = false;
+                    for (TableLockEntry e : entries) {
+                        if (e.session == session) {
+                            if (mode.equals(e.mode)) alreadyHeld = true;
+                        } else if (!tableLockModesCompatible(e.mode, mode)) {
+                            holder = e.session;
+                            break;
+                        }
+                    }
+                    if (holder == null) {
+                        if (!alreadyHeld) entries.add(new TableLockEntry(session, mode));
+                        return;
+                    }
+                    if (nowait) {
+                        throw new MemgresException(
+                                "could not obtain lock on relation \"" + relation + "\"", "55P03");
+                    }
+                    // Two sessions each holding what the other is waiting for will never make
+                    // progress, and waiting for lock_timeout (or forever, when it is unset) turns
+                    // that into a session no client can get an answer out of. PostgreSQL reports
+                    // it on the waiter that closes the cycle, which is what this does.
+                    if (session != null) {
+                        waitingFor.put(session, holder);
+                        registered = true;
+                        if (hasDeadlock(session, holder)) {
+                            throw new MemgresException("deadlock detected", "40P01");
+                        }
+                    }
+                    StatementCancel.check();
+                    long remaining = deadline == Long.MAX_VALUE ? 50L : deadline - System.currentTimeMillis();
+                    if (remaining <= 0) {
+                        throw new MemgresException("canceling statement due to lock timeout", "55P03");
+                    }
+                    try { tableLockMonitor.wait(Math.min(remaining, 50L)); } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw StatementCancel.canceled();
                     }
                 }
-                if (!conflict) {
-                    if (!alreadyHeld) entries.add(new TableLockEntry(session, mode));
-                    return;
-                }
-                if (nowait) {
-                    throw new MemgresException("could not obtain lock on relation", "55P03");
-                }
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    throw new MemgresException("canceling statement due to lock timeout", "55P03");
-                }
-                try { tableLockMonitor.wait(Math.min(remaining, 50L)); } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new MemgresException("lock wait interrupted", "57014");
-                }
             }
+        } finally {
+            if (registered) waitingFor.remove(session);
         }
+    }
+
+    /** The bare relation name inside a {@code schema.table} lock key, for an error message. */
+    private static String relationNameOf(String tableKey) {
+        if (tableKey == null) return "";
+        int dot = tableKey.lastIndexOf('.');
+        return dot >= 0 ? tableKey.substring(dot + 1) : tableKey;
     }
 
     /** Release all table-level locks for a session. */
@@ -1551,6 +1590,76 @@ public class Database {
     }
 
     // Sequences
+    // ---- Objects created by a transaction that has not committed yet ----
+
+    /**
+     * Relations, sequences and types a still-open transaction created, and who created them.
+     *
+     * <p>DDL is transactional: until the transaction commits, the object may never have existed.
+     * Another session that can read it has read something it may have to un-read, and if the
+     * creator rolls back it has read a relation that never existed at all.
+     */
+    private final Map<Object, Session> uncommittedObjects =
+            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<Object, Session>());
+
+    /** Record that {@code creator} made this object inside a transaction that is still open. */
+    public void markUncommittedObject(Object object, Session creator) {
+        if (object == null || creator == null || !creator.isInTransaction()) return;
+        uncommittedObjects.put(object, creator);
+    }
+
+    /** Everything this session created is now permanent (or gone); stop hiding it. */
+    public void clearUncommittedObjects(Session creator) {
+        if (creator == null) return;
+        synchronized (uncommittedObjects) {
+            uncommittedObjects.values().removeIf(s -> s == creator);
+        }
+    }
+
+    /** False only for an object another session created in a transaction that is still open. */
+    public boolean isObjectVisibleTo(Object object, Session viewer) {
+        if (object == null || uncommittedObjects.isEmpty()) return true;
+        Session creator = uncommittedObjects.get(object);
+        return creator == null || creator == viewer || !creator.isInTransaction();
+    }
+
+    /**
+     * The session whose statement is running on this thread, so a listing built deep inside the
+     * engine can tell whose uncommitted objects it is allowed to show.
+     *
+     * <p>Threading a session parameter through every catalog builder would touch a hundred call
+     * sites for a question that only ever has one answer per statement. It is set for the length
+     * of a statement and restored afterwards, so nesting (a function body, a trigger) is safe.
+     */
+    private static final ThreadLocal<Session> CURRENT_VIEWER = new ThreadLocal<Session>();
+
+    /** Bind the session running this thread's statement; returns the one it replaced. */
+    public static Session bindViewer(Session viewer) {
+        Session previous = CURRENT_VIEWER.get();
+        if (viewer == null) CURRENT_VIEWER.remove(); else CURRENT_VIEWER.set(viewer);
+        return previous;
+    }
+
+    /**
+     * {@code tables} without the relations a still-open transaction of another session created.
+     *
+     * <p>Returns the map itself when there is nothing to hide, which is the ordinary case, so
+     * neither a copy nor a wrapper is made for a statement no uncommitted DDL is running beside.
+     */
+    static Map<String, Table> visibleTables(Map<String, Table> tables) {
+        Session viewer = CURRENT_VIEWER.get();
+        if (viewer == null) return tables;
+        Database db = viewer.getDatabase();
+        if (db == null || db.uncommittedObjects.isEmpty()) return tables;
+        Map<String, Table> visible = null;
+        for (Map.Entry<String, Table> e : tables.entrySet()) {
+            if (db.isObjectVisibleTo(e.getValue(), viewer)) continue;
+            if (visible == null) visible = new java.util.LinkedHashMap<String, Table>(tables);
+            visible.remove(e.getKey());
+        }
+        return visible == null ? tables : visible;
+    }
+
     public void addSequence(Sequence sequence) {
         sequences.put(sequence.getName().toLowerCase(), sequence);
     }
@@ -1933,14 +2042,9 @@ public class Database {
      * @throws MemgresException 57014 when the wait is interrupted (statement cancel)
      */
     public void advisoryLock(AdvisoryLockId id, Session session, boolean shared, boolean xact) {
-        // Safety net: memgres processes each connection on a Netty event-loop thread, so an
-        // unbounded wait could starve other connections pinned to the same loop. Real PG
-        // waits forever when lock_timeout is disabled; we cap the wait instead.
-        final long safetyTimeoutMs = 30_000L;
-        long lockTimeoutMs = session != null
-                ? GucSettings.parseTimeoutMillis(session.getGucSettings().get("lock_timeout")) : 0L;
-        final long timeoutMs = lockTimeoutMs > 0 ? lockTimeoutMs : safetyTimeoutMs;
-        final long deadline = System.currentTimeMillis() + timeoutMs;
+        final long timeoutMs = lockWaitBudget(session);
+        final long deadline = timeoutMs == Long.MAX_VALUE
+                ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMs;
 
         synchronized (advisoryMonitor) {
             try {
@@ -1961,6 +2065,7 @@ public class Database {
                             throw new MemgresException("deadlock detected", "40P01");
                         }
                     }
+                    StatementCancel.check();
                     if (System.currentTimeMillis() >= deadline) {
                         throw new MemgresException("canceling statement due to lock timeout", "55P03");
                     }
@@ -1969,7 +2074,7 @@ public class Database {
                         advisoryMonitor.wait(50L);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
-                        throw new MemgresException("canceling statement due to user request", "57014");
+                        throw StatementCancel.canceled();
                     }
                 }
             } finally {
@@ -2137,17 +2242,24 @@ public class Database {
                                       java.util.function.BooleanSupplier stillBlocked,
                                       String relationName) {
         if (waiter == null || blocker == null) return;
-        long configured = GucSettings.parseTimeoutMillis(waiter.getGucSettings().get("lock_timeout"));
-        long timeoutMs = configured > 0 ? configured : 5_000L;
-        long deadline = System.currentTimeMillis() + timeoutMs;
+        long timeoutMs = lockWaitBudget(waiter);
+        long deadline = timeoutMs == Long.MAX_VALUE ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMs;
         waitingFor.put(waiter, blocker);
         try {
             while (stillBlocked.getAsBoolean()) {
+                // A transaction that can no longer commit anything cannot make its write
+                // permanent, so there is nothing left to learn from it. Waiting on one is how two
+                // sessions that broke each other's statement end up waiting for each other with
+                // no way out. The test has to be the same one the callers use to decide whether
+                // the row is still in the way: returning here for a blocker they still count
+                // turns their retry loop into a spin that no cancel can reach.
+                if (blocker.isDoomed() || !blocker.isInTransaction()) return;
                 if (hasDeadlock(waiter, blocker)) {
                     throw new MemgresException("deadlock detected", "40P01");
                 }
+                StatementCancel.check();
                 if (System.currentTimeMillis() >= deadline) {
-                    throw lockWaitExpired(configured > 0, relationName);
+                    throw new MemgresException("canceling statement due to lock timeout", "55P03");
                 }
                 try {
                     Thread.sleep(5L);
@@ -2161,23 +2273,12 @@ public class Database {
         }
     }
 
-    /**
-     * The error for a row lock that could not be taken in time. With lock_timeout set this is
-     * word for word PG's timeout error; the fallback wait exists only so a stuck session cannot
-     * block forever, and reports the lock it wanted rather than blaming a setting that is off.
-     */
-    private static MemgresException lockWaitExpired(boolean lockTimeoutConfigured, String relationName) {
-        if (lockTimeoutConfigured) {
-            return new MemgresException("canceling statement due to lock timeout", "55P03");
-        }
-        return new MemgresException("could not obtain lock on row in relation \""
-                + relationName + "\"", "55P03");
-    }
-
     private boolean hasDeadlock(Session requester, Session blocker) {
+        Set<Session> visited = new HashSet<>();
         Session current = blocker;
         while (current != null) {
             if (current == requester) return true;
+            if (!visited.add(current)) return false; // a cycle this session is not part of
             current = waitingFor.get(current);
         }
         return false;
@@ -2191,12 +2292,10 @@ public class Database {
      * @throws MemgresException with SQLSTATE 55P03 when the lock timeout expires
      */
     public void lockRowWaiting(String tableName, Object[] row, Session session, String mode) {
-        final long safetyTimeoutMs = 5_000L; // fallback when lock_timeout is 0 (disabled)
-        long lockTimeoutMs = GucSettings.parseTimeoutMillis(session.getGucSettings().get("lock_timeout"));
-        final boolean lockTimeoutConfigured = lockTimeoutMs > 0;
-        final long timeoutMs = lockTimeoutConfigured ? lockTimeoutMs : safetyTimeoutMs;
+        final long timeoutMs = lockWaitBudget(session);
         final long pollMs = 10L;
-        final long deadline = System.currentTimeMillis() + timeoutMs;
+        final long deadline = timeoutMs == Long.MAX_VALUE
+                ? Long.MAX_VALUE : System.currentTimeMillis() + timeoutMs;
 
         Map<Object[], List<LockEntry>> locks =
                 rowLocks.computeIfAbsent(tableName.toLowerCase(), k -> new IdentityHashMap<>());
@@ -2205,6 +2304,10 @@ public class Database {
             Session blocker;
             synchronized (locks) {
                 List<LockEntry> entries = locks.get(row);
+                // A row lock belonging to a transaction that has already failed is not a lock any
+                // more: PostgreSQL's abort makes the tuple version dead, so the next writer takes
+                // the row straight away instead of waiting for a ROLLBACK that may never be sent.
+                if (entries != null) entries.removeIf(e -> e.session != null && e.session.isDoomed());
                 blocker = getBlockingSession(entries, session, mode);
                 if (blocker == null) {
                     // Lock is available, acquire it
@@ -2226,10 +2329,16 @@ public class Database {
             // Register that this session is waiting for the blocker
             waitingFor.put(session, blocker);
 
-            // Check timeout
+            // Check cancellation and timeout
+            try {
+                StatementCancel.check();
+            } catch (RuntimeException e) {
+                waitingFor.remove(session);
+                throw e;
+            }
             if (System.currentTimeMillis() >= deadline) {
                 waitingFor.remove(session);
-                throw lockWaitExpired(lockTimeoutConfigured, tableName);
+                throw new MemgresException("canceling statement due to lock timeout", "55P03");
             }
 
             // Sleep briefly before retrying
@@ -2707,6 +2816,12 @@ public class Database {
         schemaObjectRegistry
                 .computeIfAbsent(schemaName.toLowerCase(), k -> ConcurrentHashMap.newKeySet())
                 .add(objectType + ":" + objectName.toLowerCase());
+    }
+
+    /** Forget one registered object, for a DDL statement that is being undone. */
+    public void unregisterSchemaObject(String schemaName, String objectType, String objectName) {
+        Set<String> entries = schemaObjectRegistry.get(schemaName.toLowerCase());
+        if (entries != null) entries.remove(objectType + ":" + objectName.toLowerCase());
     }
 
     /**
