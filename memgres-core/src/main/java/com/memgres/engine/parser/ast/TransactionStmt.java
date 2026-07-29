@@ -10,17 +10,24 @@ public final class TransactionStmt implements Statement {
     public final String isolationLevel;
     public final Boolean readOnly;
     public final boolean chain; // AND CHAIN (PG 11+)
+    public final Boolean deferrable; // [NOT] DEFERRABLE
 
     public TransactionStmt(TransactionAction action, String savepointName, String isolationLevel, Boolean readOnly) {
         this(action, savepointName, isolationLevel, readOnly, false);
     }
 
     public TransactionStmt(TransactionAction action, String savepointName, String isolationLevel, Boolean readOnly, boolean chain) {
+        this(action, savepointName, isolationLevel, readOnly, chain, null);
+    }
+
+    public TransactionStmt(TransactionAction action, String savepointName, String isolationLevel,
+                           Boolean readOnly, boolean chain, Boolean deferrable) {
         this.action = action;
         this.savepointName = savepointName;
         this.isolationLevel = isolationLevel;
         this.readOnly = readOnly;
         this.chain = chain;
+        this.deferrable = deferrable;
     }
 
     public enum TransactionAction {
@@ -38,6 +45,7 @@ public final class TransactionStmt implements Statement {
     public String isolationLevel() { return isolationLevel; }
     public Boolean readOnly() { return readOnly; }
     public boolean chain() { return chain; }
+    public Boolean deferrable() { return deferrable; }
 
     @Override
     public boolean equals(Object o) {

@@ -23,6 +23,12 @@ import com.memgres.engine.parser.ast.*;
 class AdvisoryLockFunctions {
     private static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
+    /**
+     * What a function declared {@code RETURNS void} hands back. PG renders it as an empty string,
+     * so returning SQL NULL instead changes what the client reads and how it tests the result.
+     */
+    private static final Object VOID_RESULT = "";
+
     private final AstExecutor executor;
 
     AdvisoryLockFunctions(AstExecutor executor) {
@@ -43,19 +49,19 @@ class AdvisoryLockFunctions {
         switch (name) {
             case "pg_advisory_lock": {
                 executor.database.advisoryLock(advisoryKey(fn, ctx), executor.session, false, false);
-                return null;
+                return VOID_RESULT;
             }
             case "pg_advisory_lock_shared": {
                 executor.database.advisoryLock(advisoryKey(fn, ctx), executor.session, true, false);
-                return null;
+                return VOID_RESULT;
             }
             case "pg_advisory_xact_lock": {
                 executor.database.advisoryLock(advisoryKey(fn, ctx), executor.session, false, true);
-                return null;
+                return VOID_RESULT;
             }
             case "pg_advisory_xact_lock_shared": {
                 executor.database.advisoryLock(advisoryKey(fn, ctx), executor.session, true, true);
-                return null;
+                return VOID_RESULT;
             }
             case "pg_try_advisory_lock": {
                 return executor.database.tryAdvisoryLock(advisoryKey(fn, ctx), executor.session, false, false);
@@ -77,7 +83,7 @@ class AdvisoryLockFunctions {
             }
             case "pg_advisory_unlock_all": {
                 executor.database.advisoryUnlockAll(executor.session);
-                return null;
+                return VOID_RESULT;
             }
             default:
                 return NOT_HANDLED;

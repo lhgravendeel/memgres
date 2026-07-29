@@ -261,13 +261,21 @@ class DdlTableParser {
         boolean colNotEnforced = false;
         String colRefMatchType = null;
         Expression columnCheckExpr = null;
+        // A CONSTRAINT clause names whatever constraint follows it. PG stores that name, and it
+        // is the one SET CONSTRAINTS, ALTER TABLE DROP CONSTRAINT and pg_constraint use.
+        String pendingName = null;
+        String pkName = null;
+        String uqName = null;
+        String fkName = null;
 
         while (true) {
-            if (parser.matchKeywords("NOT", "NULL")) { notNull = true; continue; }
+            if (parser.matchKeywords("NOT", "NULL")) { notNull = true; pendingName = null; continue; }
             if (parser.matchKeyword("NULL")) { notNull = false; continue; }
             if (parser.matchKeywords("PRIMARY", "KEY")) {
                 pk = true;
                 notNull = true;
+                pkName = pendingName;
+                pendingName = null;
                 // A column-level key may say when it is checked, just as a table-level one can.
                 if (parser.matchKeyword("DEFERRABLE")) {
                     deferrable = true;
@@ -282,13 +290,16 @@ class DdlTableParser {
             }
             if (parser.matchKeyword("UNIQUE")) {
                 unique = true;
+                uqName = pendingName;
+                pendingName = null;
                 if (parser.checkKeyword("NULLS")) {
                     parser.advance();
                     if (parser.matchKeywords("NOT", "DISTINCT")) {
-                        pendingColumnChecks.add(new TableConstraint(null,
+                        pendingColumnChecks.add(new TableConstraint(uqName,
                                 TableConstraint.ConstraintType.UNIQUE,
                                 Cols.listOf(colName), null, null, null, null, null, true));
                         unique = false;
+                        uqName = null;
                     } else {
                         parser.matchKeyword("DISTINCT");
                     }
@@ -306,6 +317,8 @@ class DdlTableParser {
             }
             if (parser.matchKeyword("DEFAULT")) { defaultExpr = parser.parseExpression(); continue; }
             if (parser.matchKeyword("REFERENCES")) {
+                fkName = pendingName;
+                pendingName = null;
                 refTable = parser.readIdentifier();
                 if (parser.match(TokenType.DOT)) {
                     refTable = refTable + "." + parser.readIdentifier();
@@ -347,27 +360,19 @@ class DdlTableParser {
                 boolean colChkNoInherit = parser.matchKeywords("NO", "INHERIT");
                 boolean checkNotEnforced = parseNotEnforced();
                 columnCheckExpr = checkExpr;
-                pendingColumnChecks.add(new TableConstraint(null, TableConstraint.ConstraintType.CHECK,
-                        Cols.listOf(colName), checkExpr, null, null, null, null, false, false, false, checkNotEnforced, colChkNoInherit, null, null));
+                // A check the statement named is stored on the table rather than on the column,
+                // which is how it was stored before this clause could carry a name.
+                List<String> checkCols = new ArrayList<String>();
+                if (pendingName == null) checkCols.add(colName);
+                pendingColumnChecks.add(new TableConstraint(pendingName, TableConstraint.ConstraintType.CHECK,
+                        checkCols, checkExpr, null, null, null, null,
+                        false, false, false, checkNotEnforced, colChkNoInherit, null, null));
+                pendingName = null;
                 continue;
             }
+            // CONSTRAINT only names what comes next; the clause itself is one of the ones above.
             if (parser.matchKeyword("CONSTRAINT")) {
-                String constraintName = parser.readIdentifier();
-                if (parser.matchKeyword("CHECK")) {
-                    parser.expect(TokenType.LEFT_PAREN);
-                    Expression checkExpr = parser.parseExpression();
-                    parser.expect(TokenType.RIGHT_PAREN);
-                    boolean checkNotEnforced2 = parseNotEnforced();
-                    columnCheckExpr = checkExpr;
-                    pendingColumnChecks.add(new TableConstraint(constraintName, TableConstraint.ConstraintType.CHECK,
-                            Cols.listOf(), checkExpr, null, null, null, null, false, false, false, checkNotEnforced2, null));
-                } else if (parser.matchKeywords("NOT", "NULL")) {
-                    notNull = true;
-                } else if (parser.matchKeywords("PRIMARY", "KEY")) {
-                    pk = true; notNull = true;
-                } else if (parser.matchKeyword("UNIQUE")) {
-                    unique = true;
-                }
+                pendingName = parser.readIdentifier();
                 continue;
             }
             if (parser.matchKeyword("GENERATED")) {
@@ -437,9 +442,13 @@ class DdlTableParser {
             }
         }
 
-        return new ColumnDef(colName, typeName, precision, scale, notNull, pk, unique,
+        ColumnDef def = new ColumnDef(colName, typeName, precision, scale, notNull, pk, unique,
                 defaultExpr, refTable, refColumn, generatedExpr, generatedVirtual, identity, refOnDelete, refOnUpdate,
                 identityStart, identityIncrement, deferrable, initiallyDeferred, colNotEnforced, colRefMatchType, columnCheckExpr);
+        def.setPrimaryKeyName(pkName);
+        def.setUniqueName(uqName);
+        def.setForeignKeyName(fkName);
+        return def;
     }
 
     long[] parseSequenceOptionsInParens() {

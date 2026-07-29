@@ -267,8 +267,10 @@ class LockingAndQueuePatternsTest {
         try {
             conn.setAutoCommit(false);
             try {
+                // OF names the relation as FROM exposes it, and an alias hides the table name:
+                // PostgreSQL rejects "FOR UPDATE OF wi_fuo" here with 42P01.
                 List<List<String>> rows = query(
-                    "SELECT w.*, r.id AS rid FROM wi_fuo w JOIN wi_fuo_ref r ON r.wi_id = w.id FOR UPDATE OF wi_fuo");
+                    "SELECT w.*, r.id AS rid FROM wi_fuo w JOIN wi_fuo_ref r ON r.wi_id = w.id FOR UPDATE OF w");
                 assertFalse(rows.isEmpty(), "FOR UPDATE OF table should return rows");
                 conn.commit();
             } catch (SQLException e) {

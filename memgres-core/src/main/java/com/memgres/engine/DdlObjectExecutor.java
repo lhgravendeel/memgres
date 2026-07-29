@@ -45,8 +45,13 @@ class DdlObjectExecutor {
                             + "\"pg_enum_typid_label_index\"", "23505");
                 }
             }
-            executor.database.addCustomEnum(new CustomEnum(name, stmt.enumLabels()));
+            CustomEnum created = new CustomEnum(name, stmt.enumLabels());
+            executor.database.addCustomEnum(created);
+            executor.database.markUncommittedObject(created, executor.session);
             executor.database.registerSchemaObject(executor.defaultSchema(), "enum", name);
+            // CREATE TYPE is undone by ROLLBACK like any other DDL; without this the type
+            // outlives the transaction that never committed it.
+            executor.recordUndo(new Session.CreateEnumTypeUndo(executor.defaultSchema(), name));
         } else if (stmt.rangeSubtype() != null) {
             ddl.resolveColumnType(stmt.rangeSubtype(), null);
             executor.database.addRangeType(name, stmt.rangeSubtype());
@@ -2332,6 +2337,7 @@ class DdlObjectExecutor {
         if (stmt.cycle() != null) seq.setCycle(stmt.cycle());
         if (stmt.ownedByTable() != null) applySequenceOwnedBy(seq, stmt.ownedByTable(), stmt.ownedByColumn());
         executor.database.addSequence(seq);
+        executor.database.markUncommittedObject(seq, executor.session);
         executor.database.registerSchemaObject(executor.defaultSchema(), "sequence", seqName);
         executor.recordUndo(new Session.CreateSequenceUndo(seqName));
         executor.database.setObjectOwner("sequence:" + seqName, executor.sessionUser());

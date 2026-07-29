@@ -1229,8 +1229,12 @@ class CastEvaluator {
                     }
                     return coerced;
                 }
-                // Check if it's an enum type
+                // Check if it's an enum type. A type another session created in a transaction
+                // that has not committed is not one this session can cast to yet.
                 CustomEnum customEnum = executor.database.getCustomEnum(typeName);
+                if (customEnum != null && !executor.database.isObjectVisibleTo(customEnum, executor.session)) {
+                    customEnum = null;
+                }
                 if (customEnum != null) {
                     String label = val instanceof AstExecutor.PgEnum ? ((AstExecutor.PgEnum) val).label() : val.toString();
                     if (!customEnum.isValidLabel(label)) {

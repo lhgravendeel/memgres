@@ -31,7 +31,15 @@ public class Schema {
         tables.remove(name);
     }
 
+    /**
+     * The tables in this schema, as the session running the current statement may see them.
+     *
+     * <p>A relation created by a transaction that has not committed does not exist yet for anyone
+     * else, so it is left out — which is what keeps it out of pg_class, information_schema and
+     * every other listing built by walking the schemas. The map itself is returned unchanged
+     * whenever there is nothing to hide, which is every ordinary statement.
+     */
     public Map<String, Table> getTables() {
-        return tables;
+        return Database.visibleTables(tables);
     }
 }

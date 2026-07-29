@@ -290,41 +290,7 @@ class UtilityParser {
             parser.advance(); // CHARACTERISTICS
             parser.matchKeyword("AS");
             parser.matchKeyword("TRANSACTION");
-            if (parser.checkKeyword("ISOLATION")) {
-                parser.advance(); // ISOLATION
-                parser.matchKeyword("LEVEL");
-                String isolLevel = null;
-                if (parser.matchKeyword("READ")) {
-                    if (parser.matchKeyword("COMMITTED")) isolLevel = "read committed";
-                    else if (parser.matchKeyword("UNCOMMITTED")) isolLevel = "read uncommitted";
-                } else if (parser.matchKeyword("REPEATABLE")) {
-                    parser.matchKeyword("READ");
-                    isolLevel = "repeatable read";
-                } else if (parser.matchKeyword("SERIALIZABLE")) {
-                    isolLevel = "serializable";
-                }
-                // consume remaining (READ ONLY/WRITE, DEFERRABLE, etc.)
-                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-                if (isolLevel != null) {
-                    return new SetStmt("default_transaction_isolation", isolLevel);
-                }
-                return new SetStmt("default_transaction_isolation", "");
-            }
-            if (parser.checkKeyword("READ")) {
-                parser.advance(); // READ
-                if (parser.matchKeyword("ONLY")) {
-                    // consume remaining
-                    while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-                    return new SetStmt("default_transaction_read_only", "on");
-                } else if (parser.matchKeyword("WRITE")) {
-                    // consume remaining
-                    while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-                    return new SetStmt("default_transaction_read_only", "off");
-                }
-            }
-            // consume remaining
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("default_transaction_isolation", "");
+            return new SetStmt("session_characteristics", encodeModes(requireTransactionModes()));
         }
         // SET LOCAL SESSION AUTHORIZATION name | DEFAULT
         if (isLocal && parser.checkKeyword("SESSION") && parser.pos + 1 < parser.tokens.size()
@@ -360,9 +326,9 @@ class UtilityParser {
             if (parser.matchKeyword("ALL")) {
                 constraintNames.add("ALL");
             } else {
-                constraintNames.add(parser.readIdentifier());
+                constraintNames.add(readQualifiedConstraintName());
                 while (parser.match(TokenType.COMMA)) {
-                    constraintNames.add(parser.readIdentifier());
+                    constraintNames.add(readQualifiedConstraintName());
                 }
             }
             String mode = "IMMEDIATE";
@@ -375,24 +341,9 @@ class UtilityParser {
             return new SetStmt("constraints", String.join(",", constraintNames) + ":" + mode);
         }
 
-        // SET TRANSACTION [ISOLATION LEVEL ...] [READ ONLY|WRITE] [NOT DEFERRABLE|DEFERRABLE]
+        // SET TRANSACTION transaction_mode [, ...] | SET TRANSACTION SNAPSHOT 'id'
         if (parser.checkKeyword("TRANSACTION")) {
             parser.advance();
-            String isolLevel = null;
-            Boolean readOnly = null;
-            if (parser.matchKeyword("ISOLATION")) {
-                parser.matchKeyword("LEVEL");
-                if (parser.matchKeyword("READ")) {
-                    if (parser.matchKeyword("COMMITTED")) isolLevel = "read committed";
-                    else if (parser.matchKeyword("UNCOMMITTED")) isolLevel = "read uncommitted";
-                } else if (parser.matchKeyword("REPEATABLE")) {
-                    parser.matchKeyword("READ");
-                    isolLevel = "repeatable read";
-                } else if (parser.matchKeyword("SERIALIZABLE")) {
-                    isolLevel = "serializable";
-                }
-            }
-            // Parse SNAPSHOT 'id'
             if (parser.matchKeyword("SNAPSHOT") || parser.matchIdentifier("SNAPSHOT")) {
                 String snapshotId;
                 if (parser.check(TokenType.STRING_LITERAL)) {
@@ -402,23 +353,7 @@ class UtilityParser {
                 }
                 return new SetStmt("transaction_snapshot", snapshotId);
             }
-            // Parse READ ONLY/WRITE
-            if (parser.matchKeyword("READ")) {
-                if (parser.matchKeyword("ONLY")) {
-                    readOnly = true;
-                } else if (parser.matchKeyword("WRITE")) {
-                    readOnly = false;
-                }
-            }
-            // consume remaining (DEFERRABLE, etc.)
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            if (readOnly != null) {
-                return new SetStmt("transaction_read_only", readOnly ? "on" : "off");
-            }
-            if (isolLevel != null) {
-                return new SetStmt("transaction_isolation", isolLevel);
-            }
-            return new SetStmt("transaction", "");
+            return new SetStmt("set_transaction", encodeModes(requireTransactionModes()));
         }
 
         String name = parser.readIdentifier();
@@ -480,35 +415,122 @@ class UtilityParser {
             parser.matchKeyword("TRANSACTION");
             parser.matchKeyword("WORK");
         }
-        String isolationLevel = null;
-        Boolean readOnly = null;
-        // Consume transaction options (ISOLATION LEVEL, READ ONLY/WRITE, [NOT] DEFERRABLE)
+        TransactionModes modes = parseTransactionModes();
+        return new TransactionStmt(TransactionStmt.TransactionAction.BEGIN, null,
+                modes.isolationLevel, modes.readOnly, false, modes.deferrable);
+    }
+
+    /** Render a mode list as "iso=...;ro=on;def=off", listing only the modes that were written. */
+    static String encodeModes(TransactionModes modes) {
+        StringBuilder sb = new StringBuilder();
+        if (modes.isolationLevel != null) sb.append("iso=").append(modes.isolationLevel).append(';');
+        if (modes.readOnly != null) sb.append("ro=").append(modes.readOnly ? "on" : "off").append(';');
+        if (modes.deferrable != null) sb.append("def=").append(modes.deferrable ? "on" : "off").append(';');
+        return sb.toString();
+    }
+
+    /** The transaction_mode list shared by BEGIN, START TRANSACTION and SET TRANSACTION. */
+    static final class TransactionModes {
+        String isolationLevel;
+        Boolean readOnly;
+        Boolean deferrable;
+        boolean any;
+    }
+
+    /**
+     * Parse {@code transaction_mode [, ...]}.
+     *
+     * <p>An isolation level PostgreSQL does not have is a syntax error, not a level to remember:
+     * accepting it would leave the session claiming an isolation it is not providing.
+     */
+    TransactionModes parseTransactionModes() {
+        TransactionModes modes = new TransactionModes();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON) && !parser.check(TokenType.EOF)) {
-            if (parser.matchKeyword("ISOLATION")) {
-                parser.matchKeyword("LEVEL");
-                // READ COMMITTED / UNCOMMITTED / REPEATABLE READ / SERIALIZABLE
-                if (parser.matchKeyword("READ")) {
-                    if (parser.matchKeyword("COMMITTED")) isolationLevel = "read committed";
-                    else if (parser.matchKeyword("UNCOMMITTED")) isolationLevel = "read uncommitted";
-                } else if (parser.matchKeyword("REPEATABLE")) {
-                    parser.matchKeyword("READ");
-                    isolationLevel = "repeatable read";
-                } else if (parser.matchKeyword("SERIALIZABLE")) {
-                    isolationLevel = "serializable";
+            if (matchWord("ISOLATION")) {
+                matchWord("LEVEL");
+                if (matchWord("READ")) {
+                    if (matchWord("COMMITTED")) modes.isolationLevel = "read committed";
+                    else if (matchWord("UNCOMMITTED")) modes.isolationLevel = "read uncommitted";
+                    else throw syntaxErrorHere();
+                } else if (matchWord("REPEATABLE")) {
+                    if (!matchWord("READ")) throw syntaxErrorHere();
+                    modes.isolationLevel = "repeatable read";
+                } else if (matchWord("SERIALIZABLE")) {
+                    modes.isolationLevel = "serializable";
+                } else {
+                    throw syntaxErrorHere();
                 }
-            } else if (parser.matchKeyword("READ")) {
-                if (parser.matchKeyword("ONLY")) readOnly = true;
-                else if (parser.matchKeyword("WRITE")) readOnly = false;
-            } else if (parser.matchKeyword("NOT")) {
-                parser.matchKeyword("DEFERRABLE");
-            } else if (parser.matchKeyword("DEFERRABLE")) {
-                // consumed
+                modes.any = true;
+            } else if (matchWord("READ")) {
+                if (matchWord("ONLY")) modes.readOnly = true;
+                else if (matchWord("WRITE")) modes.readOnly = false;
+                else throw syntaxErrorHere();
+                modes.any = true;
+            } else if (matchWord("NOT")) {
+                if (!matchWord("DEFERRABLE")) throw syntaxErrorHere();
+                modes.deferrable = false;
+                modes.any = true;
+            } else if (matchWord("DEFERRABLE")) {
+                modes.deferrable = true;
+                modes.any = true;
             } else {
                 break;
             }
             parser.match(TokenType.COMMA); // options can be comma-separated
         }
-        return new TransactionStmt(TransactionStmt.TransactionAction.BEGIN, null, isolationLevel, readOnly);
+        // Anything left over is not a transaction mode. Stopping quietly would let BEGIN
+        // garbage start a transaction, discarding a word the caller expected to be honoured.
+        if (!atStatementEnd()) throw syntaxErrorHere();
+        return modes;
+    }
+
+    /**
+     * A constraint name in SET CONSTRAINTS, which PostgreSQL allows to be schema-qualified.
+     * The qualification is kept so the lookup can honour it rather than searching for a schema.
+     */
+    private String readQualifiedConstraintName() {
+        String name = parser.readIdentifier();
+        if (parser.match(TokenType.DOT)) {
+            name = name + "." + parser.readIdentifier();
+        }
+        return name;
+    }
+
+    /**
+     * The mode list of a statement that is nothing but its modes.
+     *
+     * <p>{@code BEGIN} on its own is a statement; {@code SET TRANSACTION} on its own is not, and
+     * PostgreSQL's grammar requires at least one mode after it.
+     */
+    private TransactionModes requireTransactionModes() {
+        TransactionModes modes = parseTransactionModes();
+        if (!modes.any) throw syntaxErrorHere();
+        return modes;
+    }
+
+    /** True when nothing but the end of the statement is left. */
+    private boolean atStatementEnd() {
+        return parser.isAtEnd() || parser.check(TokenType.SEMICOLON) || parser.check(TokenType.EOF);
+    }
+
+    /** Reject anything the statement did not consume, the way PostgreSQL's grammar does. */
+    private void expectStatementEnd() {
+        if (!atStatementEnd()) throw syntaxErrorHere();
+    }
+
+    /** Match a bare word whether the lexer classified it as a keyword or an identifier. */
+    private boolean matchWord(String word) {
+        Token t = parser.peek();
+        if ((t.type() == TokenType.KEYWORD || t.type() == TokenType.IDENTIFIER)
+                && t.value().equalsIgnoreCase(word)) {
+            parser.advance();
+            return true;
+        }
+        return false;
+    }
+
+    private ParseException syntaxErrorHere() {
+        return ParseException.at(parser.peek());
     }
 
     TransactionStmt parseTransactionCommit() {
@@ -522,6 +544,7 @@ class UtilityParser {
             parser.matchKeyword("WORK");
         }
         boolean chain = parseAndChain();
+        expectStatementEnd();
         return new TransactionStmt(TransactionStmt.TransactionAction.COMMIT, null, null, null, chain);
     }
 
@@ -540,6 +563,7 @@ class UtilityParser {
         parser.matchKeyword("TRANSACTION");
         parser.matchKeyword("WORK");
         boolean chain = parseAndChain();
+        expectStatementEnd();
         return new TransactionStmt(TransactionStmt.TransactionAction.ROLLBACK, null, null, null, chain);
     }
 

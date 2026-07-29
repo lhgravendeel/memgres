@@ -291,6 +291,7 @@ class DdlTableExecutor {
         }
 
         schema.addTable(table);
+        executor.database.markUncommittedObject(table, executor.session);
         executor.recordUndo(new Session.CreateTableUndo(schemaName, stmt.name()));
 
         try {
@@ -314,7 +315,8 @@ class DdlTableExecutor {
         for (ColumnDef def : stmt.columns()) {
             if (def.primaryKey()) {
                 StoredConstraint pk = StoredConstraint.primaryKey(
-                        stmt.name() + "_pkey", Cols.listOf(def.name()));
+                        def.primaryKeyName() != null ? def.primaryKeyName() : stmt.name() + "_pkey",
+                        Cols.listOf(def.name()));
                 // A column-level key carries its own DEFERRABLE, exactly as a table-level one does.
                 pk.setDeferrable(def.deferrable());
                 pk.setInitiallyDeferred(def.initiallyDeferred());
@@ -322,7 +324,9 @@ class DdlTableExecutor {
             }
             if (def.unique()) {
                 StoredConstraint uq = StoredConstraint.unique(
-                        stmt.name() + "_" + def.name() + "_key", Cols.listOf(def.name()));
+                        def.uniqueName() != null ? def.uniqueName()
+                                : stmt.name() + "_" + def.name() + "_key",
+                        Cols.listOf(def.name()));
                 uq.setDeferrable(def.deferrable());
                 uq.setInitiallyDeferred(def.initiallyDeferred());
                 table.addConstraint(uq);
@@ -814,7 +818,8 @@ class DdlTableExecutor {
         List<String> refCols = def.referencesColumn() != null
                 ? Cols.listOf(def.referencesColumn()) : Cols.listOf();
         StoredConstraint fk = StoredConstraint.foreignKey(
-                tableName + "_" + def.name() + "_fkey",
+                def.foreignKeyName() != null ? def.foreignKeyName()
+                        : tableName + "_" + def.name() + "_fkey",
                 Cols.listOf(def.name()), refTableName, refCols,
                 StoredConstraint.parseFkAction(def.refOnDelete()),
                 StoredConstraint.parseFkAction(def.refOnUpdate()));
@@ -1338,6 +1343,7 @@ class DdlTableExecutor {
 
         Table table = new Table(stmt.name(), columns);
         schema.addTable(table);
+        executor.database.markUncommittedObject(table, executor.session);
         executor.recordUndo(new Session.CreateTableUndo(schemaName, stmt.name()));
 
         int rowCount = 0;

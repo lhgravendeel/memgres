@@ -2914,10 +2914,12 @@ class FunctionEvaluator {
         if (executor.session != null) {
             String tempName = executor.session.getTempSchemaName() + "." + seqName;
             Sequence seq = executor.database.getSequence(tempName);
-            if (seq != null) return seq;
+            if (seq != null && executor.database.isObjectVisibleTo(seq, executor.session)) return seq;
         }
         Sequence seq = executor.database.getSequence(seqName);
-        if (seq != null) return seq;
+        // A sequence another session created in a transaction that is still open may never
+        // have existed; it is not there to draw a value from yet.
+        if (seq != null && executor.database.isObjectVisibleTo(seq, executor.session)) return seq;
 
         // PG creates implicit sequences for SERIAL columns (tablename_colname_seq).
         // Memgres uses an internal counter instead, so auto-create the sequence

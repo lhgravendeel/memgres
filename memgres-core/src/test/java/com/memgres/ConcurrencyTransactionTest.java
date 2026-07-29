@@ -140,17 +140,31 @@ class ConcurrencyTransactionTest {
         }
     }
 
+    // SET TRANSACTION configures the transaction it is issued in. Outside a transaction block
+    // there is none, so PostgreSQL warns and the session default stands.
     @Test void testSetTransactionIsolationRepeatableRead() throws SQLException {
         try (Connection c = connect(); Statement st = c.createStatement()) {
+            st.execute("BEGIN");
             st.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
             assertEquals("repeatable read", query1(st, "SHOW transaction_isolation"));
+            st.execute("COMMIT");
+            assertEquals("read committed", query1(st, "SHOW transaction_isolation"));
         }
     }
 
     @Test void testSetTransactionIsolationSerializable() throws SQLException {
         try (Connection c = connect(); Statement st = c.createStatement()) {
+            st.execute("BEGIN");
             st.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
             assertEquals("serializable", query1(st, "SHOW transaction_isolation"));
+            st.execute("COMMIT");
+        }
+    }
+
+    @Test void testSetTransactionIsolationOutsideABlockLeavesTheSessionAlone() throws SQLException {
+        try (Connection c = connect(); Statement st = c.createStatement()) {
+            st.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+            assertEquals("read committed", query1(st, "SHOW transaction_isolation"));
         }
     }
 
@@ -652,7 +666,9 @@ class ConcurrencyTransactionTest {
 
     @Test void testSetTransactionAndBegin() throws SQLException {
         try (Connection c = connect(); Statement st = c.createStatement()) {
-            st.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+            // Only SET SESSION CHARACTERISTICS reaches past the current transaction, so that is
+            // what a following BEGIN inherits; a bare SET TRANSACTION outside a block does not.
+            st.execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ");
             assertEquals("repeatable read", query1(st, "SHOW transaction_isolation"));
             st.execute("BEGIN");
             assertEquals("repeatable read", query1(st, "SHOW transaction_isolation"));

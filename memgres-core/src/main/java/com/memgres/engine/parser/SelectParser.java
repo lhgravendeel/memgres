@@ -606,38 +606,10 @@ class SelectParser {
             // Optional: OF table_name [, ...]
             if (parser.matchKeyword("OF")) {
                 forUpdateTables = new ArrayList<>();
-                forUpdateTables.add(parser.readIdentifier());
-                while (parser.match(TokenType.COMMA)) forUpdateTables.add(parser.readIdentifier());
-                // Validate that the table names exist in the FROM clause
-                if (from != null) {
-                    java.util.Set<String> fromNames = new java.util.HashSet<>();
-                    for (SelectStmt.FromItem fi : from) {
-                        if (fi instanceof SelectStmt.TableRef) {
-                            SelectStmt.TableRef tr = (SelectStmt.TableRef) fi;
-                            fromNames.add(tr.table().toLowerCase());
-                            if (tr.alias() != null) fromNames.add(tr.alias().toLowerCase());
-                        } else if (fi instanceof SelectStmt.JoinFrom) {
-                            SelectStmt.JoinFrom ji = (SelectStmt.JoinFrom) fi;
-                            if (ji.left() instanceof SelectStmt.TableRef) {
-                                SelectStmt.TableRef lt = (SelectStmt.TableRef) ji.left();
-                                fromNames.add(lt.table().toLowerCase());
-                                if (lt.alias() != null) fromNames.add(lt.alias().toLowerCase());
-                            }
-                            if (ji.right() instanceof SelectStmt.TableRef) {
-                                SelectStmt.TableRef rt2 = (SelectStmt.TableRef) ji.right();
-                                fromNames.add(rt2.table().toLowerCase());
-                                if (rt2.alias() != null) fromNames.add(rt2.alias().toLowerCase());
-                            }
-                        }
-                    }
-                    for (String fut : forUpdateTables) {
-                        if (!fromNames.contains(fut.toLowerCase())) {
-                            // Not a syntax error: PG reports the missing relation by name
-                            throw new com.memgres.engine.MemgresException(
-                                    "relation \"" + fut + "\" in FOR UPDATE clause not found in FROM clause", "42P01");
-                        }
-                    }
-                }
+                forUpdateTables.add(readLockTargetName(lockMode));
+                while (parser.match(TokenType.COMMA)) forUpdateTables.add(readLockTargetName(lockMode));
+                // Whether these names are really in FROM is decided by the executor, which sees
+                // the whole FROM tree including aliases, subqueries and outer-join sides.
             }
             // Optional: NOWAIT | SKIP LOCKED
             if (parser.matchKeyword("NOWAIT")) {
@@ -1954,8 +1926,8 @@ class SelectParser {
             }
             if (parser.matchKeyword("OF")) {
                 ofTables = new ArrayList<>();
-                ofTables.add(parser.readIdentifier());
-                while (parser.match(TokenType.COMMA)) ofTables.add(parser.readIdentifier());
+                ofTables.add(readLockTargetName(lockMode));
+                while (parser.match(TokenType.COMMA)) ofTables.add(readLockTargetName(lockMode));
             }
             if (parser.matchKeyword("NOWAIT")) {
                 nowait = true;
@@ -1966,6 +1938,23 @@ class SelectParser {
         }
         return lockMode == null ? null
                 : new SelectStmt.LockClause(lockMode, nowait, skipLocked, ofTables);
+    }
+
+    /**
+     * One relation name in {@code FOR UPDATE OF}.
+     *
+     * <p>The grammar takes a bare name here: what {@code OF} refers to is a FROM entry, which an
+     * alias may have renamed, so a schema qualification could not identify one. PostgreSQL says
+     * so rather than reporting a syntax error at the dot.
+     */
+    private String readLockTargetName(String lockMode) {
+        String name = parser.readIdentifier();
+        if (parser.check(TokenType.DOT)) {
+            throw new com.memgres.engine.MemgresException(
+                    "FOR " + (lockMode == null ? "UPDATE" : lockMode)
+                            + " must specify unqualified relation names", "42601");
+        }
+        return name;
     }
 
     SelectStmt parseTableCommand() {

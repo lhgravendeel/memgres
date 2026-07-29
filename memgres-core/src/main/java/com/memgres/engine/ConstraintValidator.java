@@ -49,6 +49,10 @@ class ConstraintValidator {
         Map<Object[], Session> pending = new java.util.IdentityHashMap<>();
         for (Session other : executor.database.getActiveSessions()) {
             if (other == executor.session) continue;
+            // A transaction that has already failed will never make its row permanent, so there
+            // is nothing to wait for. Waiting anyway is how two sessions that broke each other's
+            // statement end up waiting for one another with no way out.
+            if (other.isDoomed()) continue;
             java.util.Set<Object[]> theirs = other.getUncommittedInserts(key);
             if (theirs == null) continue;
             for (Object[] r : theirs) {
@@ -98,6 +102,34 @@ class ConstraintValidator {
             }
         }
         return null;
+    }
+
+    /**
+     * Rows another session inserted inside a transaction that has already failed.
+     *
+     * <p>PostgreSQL marks such a row dead the instant the statement errors, so its key is free
+     * again: an INSERT that would collide with it succeeds rather than reporting 23505 for a row
+     * nobody will ever be able to read. Returning them here lets the uniqueness scan skip them.
+     * The set is empty in every ordinary case, and is only built when a failed transaction with
+     * uncommitted rows really is open, so the common path pays a session walk and nothing else.
+     */
+    java.util.Set<Object[]> deadUncommittedRows(Table table) {
+        if (executor.session == null || executor.database == null) {
+            return java.util.Collections.emptySet();
+        }
+        java.util.Set<Object[]> dead = null;
+        String key = null;
+        for (Session other : executor.database.getActiveSessions()) {
+            if (other == executor.session || !other.isDoomed()) continue;
+            if (key == null) key = uncommittedKey(table);
+            java.util.Set<Object[]> theirs = other.getUncommittedInserts(key);
+            if (theirs == null || theirs.isEmpty()) continue;
+            if (dead == null) {
+                dead = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Object[], Boolean>());
+            }
+            dead.addAll(theirs);
+        }
+        return dead == null ? java.util.Collections.<Object[]>emptySet() : dead;
     }
 
     /** True while the row is still an uncommitted insert belonging to that session. */
@@ -212,6 +244,8 @@ class ConstraintValidator {
         if (hasVirtual) {
             newRow = executor.dmlExecutor.computeVirtualColumns(table, newRow, false);
         }
+        // Rows a failed transaction wrote are dead: they hold no key any more.
+        final java.util.Set<Object[]> dead = deadUncommittedRows(table);
         // For partial unique indexes, check if the new row satisfies the WHERE predicate
         if (whereExpr != null) {
             RowContext newCtx = new RowContext(table, null, newRow);
@@ -238,6 +272,7 @@ class ConstraintValidator {
 
             for (Object[] existingRow : table.getRows()) {
                 if (excludeRow != null && existingRow == excludeRow) continue;
+                if (dead.contains(existingRow)) continue;
 
                 Object[] evalExisting = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, existingRow, false) : existingRow;
 
@@ -304,7 +339,9 @@ class ConstraintValidator {
         // Skip index fast path for NULLS NOT DISTINCT with NULL values because index treats NULLs as distinct
         boolean hasNull = false;
         for (Object val : newVals) { if (val == null) { hasNull = true; break; } }
-        if (whereExpr == null && constraintName != null && !(nullsNotDistinct && hasNull)) {
+        // The index cannot tell a dead row from a live one, so when one is present the scan below
+        // does the work instead. That only happens while a failed transaction is still open.
+        if (whereExpr == null && constraintName != null && !(nullsNotDistinct && hasNull) && dead.isEmpty()) {
             TableIndex idx = table.getIndex(constraintName);
             if (idx != null) {
                 Object[] conflict = idx.findConflict(newRow, excludeRow);
@@ -325,6 +362,7 @@ class ConstraintValidator {
 
         for (Object[] existingRow : table.getRows()) {
             if (excludeRow != null && existingRow == excludeRow) continue;
+            if (dead.contains(existingRow)) continue;
 
             Object[] evalExisting = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, existingRow, false) : existingRow;
 
@@ -443,9 +481,15 @@ class ConstraintValidator {
             if (hasNull && !isPK && !nullsNotDistinct) continue;
             TableIndex.IndexKey key = new TableIndex.IndexKey(vals);
             if (!seen.add(key)) {
-                throw new MemgresException(
+                MemgresException ex = new MemgresException(
                         "duplicate key value violates unique constraint \"" + sc.getName() + "\"",
                         "23505");
+                ex.setConstraint(sc.getName());
+                ex.setTable(table.getName());
+                String schema = findSchemaName(table);
+                if (schema != null) ex.setSchema(schema);
+                ex.setDetail(buildKeyDetail(columns, vals));
+                throw ex;
             }
         }
     }

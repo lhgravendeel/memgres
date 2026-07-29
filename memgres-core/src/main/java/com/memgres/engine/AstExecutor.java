@@ -911,6 +911,14 @@ public class AstExecutor {
     }
 
     /**
+     * Hide a relation another session created in a transaction that has not committed. It may
+     * still turn out never to have existed, so resolution behaves as if it does not yet.
+     */
+    private Table visibleTable(Table table) {
+        return database.isObjectVisibleTo(table, session) ? table : null;
+    }
+
+    /**
      * @param userQualified true when the user explicitly wrote schema.table in SQL
      *                      (prevents temp tables from shadowing the explicit schema)
      */
@@ -923,7 +931,7 @@ public class AstExecutor {
         if ("pg_temp".equalsIgnoreCase(schemaName)) {
             Schema pgTemp = database.getSchema(tempSchemaName);
             if (pgTemp != null) {
-                Table tempTable = pgTemp.getTable(tableName);
+                Table tempTable = visibleTable(pgTemp.getTable(tableName));
                 if (tempTable != null) return tempTable;
             }
             throw new MemgresException("relation \"" + schemaName + "." + tableName + "\" does not exist", "42P01");
@@ -933,7 +941,7 @@ public class AstExecutor {
         if (userQualified && schemaName != null) {
             Schema schema = database.getSchema(schemaName);
             if (schema != null) {
-                Table table = schema.getTable(tableName);
+                Table table = visibleTable(schema.getTable(tableName));
                 if (table != null) return table;
             }
             // Fall through to view/sequence resolution below
@@ -941,13 +949,13 @@ public class AstExecutor {
             // Check temp schema first (temp tables shadow search_path)
             Schema pgTemp = database.getSchema(tempSchemaName);
             if (pgTemp != null) {
-                Table tempTable = pgTemp.getTable(tableName);
+                Table tempTable = visibleTable(pgTemp.getTable(tableName));
                 if (tempTable != null) return tempTable;
             }
             // Then check explicit/default schema
             Schema schema = schemaName != null ? database.getSchema(schemaName) : null;
             if (schema != null) {
-                Table table = schema.getTable(tableName);
+                Table table = visibleTable(schema.getTable(tableName));
                 if (table != null) return table;
             }
             // Then walk search_path
@@ -959,7 +967,7 @@ public class AstExecutor {
                         if (s.isEmpty() || s.equals("$user")) continue;
                         Schema spSchema = database.getSchema(s);
                         if (spSchema != null) {
-                            Table table = spSchema.getTable(tableName);
+                            Table table = visibleTable(spSchema.getTable(tableName));
                             if (table != null) return table;
                         }
                     }
@@ -1173,7 +1181,7 @@ public class AstExecutor {
             String bare = tableName.substring(dot + 1);
             Schema s = database.getSchema(schema);
             if (s != null) {
-                Table t = s.getTable(bare);
+                Table t = visibleTable(s.getTable(bare));
                 if (t != null) return t;
             }
             throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");
@@ -1182,17 +1190,17 @@ public class AstExecutor {
         if (defSchema != null) {
             Schema ds = database.getSchema(defSchema);
             if (ds != null) {
-                Table t = ds.getTable(tableName);
+                Table t = visibleTable(ds.getTable(tableName));
                 if (t != null) return t;
             }
         }
         Schema pub = database.getSchema("public");
         if (pub != null) {
-            Table t = pub.getTable(tableName);
+            Table t = visibleTable(pub.getTable(tableName));
             if (t != null) return t;
         }
         for (Schema schema : database.getSchemas().values()) {
-            Table t = schema.getTable(tableName);
+            Table t = visibleTable(schema.getTable(tableName));
             if (t != null) return t;
         }
         throw new MemgresException("relation \"" + tableName + "\" does not exist", "42P01");

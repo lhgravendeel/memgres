@@ -3401,7 +3401,16 @@ class ExprEvaluator {
                     || name.equals("has_language_privilege")
                     || name.equals("pg_is_in_recovery") || name.equals("pg_is_wal_replay_paused")
                     || name.equals("pg_has_role")
+                    || name.startsWith("pg_try_advisory_")
+                    || name.equals("pg_advisory_unlock") || name.equals("pg_advisory_unlock_shared")
                     || name.equals("overlaps")) return DataType.BOOLEAN;
+            // The blocking advisory lock functions return void: a client reads back an empty
+            // string, not a NULL, and the difference is visible to anything that checks.
+            if (name.equals("pg_advisory_lock") || name.equals("pg_advisory_lock_shared")
+                    || name.equals("pg_advisory_xact_lock") || name.equals("pg_advisory_xact_lock_shared")
+                    || name.equals("pg_advisory_unlock_all")) {
+                return DataType.VOID;
+            }
             // abs and unary negation answer in the argument's own type; an untyped argument
             // resolves to float8, the preferred type of the numeric category.
             if (name.equals("abs")) {

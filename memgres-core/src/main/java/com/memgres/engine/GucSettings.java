@@ -32,6 +32,7 @@ public class GucSettings {
         DEFAULTS.put("default_transaction_isolation", "read committed");
         DEFAULTS.put("transaction_read_only", "off");
         DEFAULTS.put("default_transaction_read_only", "off");
+        DEFAULTS.put("transaction_deferrable", "off");
         DEFAULTS.put("default_transaction_deferrable", "off");
 
         // Date/Time
@@ -298,6 +299,17 @@ public class GucSettings {
         bootDefaults.put(name.toLowerCase(), value);
     }
 
+    /**
+     * The per-transaction settings and the session default each supplies when a transaction
+     * starts. Until the transaction says otherwise, reading one has to report the other.
+     */
+    private static final Map<String, String> TRANSACTION_DEFAULTS = new LinkedHashMap<>();
+    static {
+        TRANSACTION_DEFAULTS.put("transaction_isolation", "default_transaction_isolation");
+        TRANSACTION_DEFAULTS.put("transaction_read_only", "default_transaction_read_only");
+        TRANSACTION_DEFAULTS.put("transaction_deferrable", "default_transaction_deferrable");
+    }
+
     /** Get a parameter value (transaction override, then session override, then boot default, then static default). */
     public String get(String name) {
         String key = name.toLowerCase();
@@ -305,6 +317,11 @@ public class GucSettings {
         if (val != null) return val;
         val = sessionOverrides.get(key);
         if (val != null) return val;
+        String sessionDefault = TRANSACTION_DEFAULTS.get(key);
+        if (sessionDefault != null) {
+            String derived = get(sessionDefault);
+            if (derived != null && !derived.isEmpty()) return derived;
+        }
         val = bootDefaults.get(key);
         if (val != null) return val;
         return DEFAULTS.getOrDefault(key, null);

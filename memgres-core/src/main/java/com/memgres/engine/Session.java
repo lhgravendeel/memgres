@@ -22,7 +22,14 @@ public class Session {
     private DatabaseRegistry databaseRegistry;
     private volatile TransactionStatus status = TransactionStatus.IDLE;
     private final List<UndoEntry> undoLog = new ArrayList<>();
-    private final LinkedHashMap<String, Integer> savepoints = new LinkedHashMap<>();
+    /**
+     * Established savepoints, innermost last.
+     *
+     * <p>A savepoint name is not a key: {@code SAVEPOINT s} twice establishes two, the second
+     * shadowing the first, and releasing one name uncovers the one under it. Keying by name
+     * instead discards every savepoint that shares a name the moment one of them is released.
+     */
+    private final List<SavepointFrame> savepoints = new ArrayList<>();
     private final List<DeferredFkCheck> deferredFkChecks = new ArrayList<>();
     private final List<Runnable> deferredTriggers = new ArrayList<>();
     private boolean allConstraintsDeferred = false; // SET CONSTRAINTS ALL DEFERRED
@@ -73,7 +80,6 @@ public class Session {
         }
     }
     private final List<PgNotice> pendingNotices = new ArrayList<>();
-    private final LinkedHashMap<String, Integer> savepointNotifCounts = new LinkedHashMap<>(); // savepoint → deferred notification count
     private final int pid = System.identityHashCode(this);
     private final String tempSchemaName = "pg_temp_" + Math.abs(System.identityHashCode(this));
 
@@ -123,31 +129,46 @@ public class Session {
     // Transaction timestamp: frozen at BEGIN for now()/current_timestamp stability
     private java.time.OffsetDateTime transactionTimestamp = null;
 
-    // Per-session sequence cache: seq name -> [nextCachedValue, cacheEnd]
+    // Per-session sequence cache: seq name -> [nextCachedValue, valuesStillCached, resetGeneration]
     private final Map<String, long[]> sequenceCache = new LinkedHashMap<>();
 
-    /** Get next value from a sequence, using session-level cache if CACHE > 1. */
+    /**
+     * Get the next value of a sequence, drawing from this session's cached block if CACHE &gt; 1.
+     *
+     * <p>The block is whatever the sequence could actually spare, which may be less than CACHE:
+     * reserving the full cache against the bounds would make a sequence whose cache is wider than
+     * its range fail on its very first call, when PostgreSQL hands out every value it has and only
+     * fails once one really passes the bound.
+     */
     public long nextvalCached(Sequence seq) {
         if (seq.getCache() <= 1 || seq.isCycle()) {
             return seq.nextVal();
         }
         String key = seq.getName().toLowerCase();
+        long generation = seq.getResetGeneration();
         long[] cached = sequenceCache.get(key);
-        if (cached != null && cached[0] < cached[1]) {
-            // Return next value from cache block
+        // setval and ALTER SEQUENCE RESTART move the counter under the block this session
+        // reserved, so those values are no longer what the sequence would hand out. PG discards
+        // the cache there, and without that a reset sequence goes on serving the old numbers.
+        if (cached != null && cached[2] != generation) {
+            sequenceCache.remove(key);
+            cached = null;
+        }
+        if (cached != null && cached[1] > 0) {
             long val = cached[0];
             cached[0] += seq.getIncrementBy();
+            cached[1]--;
             return val;
         }
-        // Allocate new cache block: get base value from shared sequence
-        long base = seq.nextVal();
-        // Advance sequence by (cache-1) more to reserve the block
-        for (int i = 1; i < seq.getCache(); i++) {
-            seq.nextVal();
+        long[] block = seq.nextValBlock(seq.getCache());
+        long first = block[0];
+        long remaining = block[1] - 1;
+        if (remaining > 0) {
+            sequenceCache.put(key, new long[]{first + seq.getIncrementBy(), remaining, generation});
+        } else {
+            sequenceCache.remove(key);
         }
-        long end = base + seq.getIncrementBy() * seq.getCache();
-        sequenceCache.put(key, new long[]{base + seq.getIncrementBy(), end});
-        return base;
+        return first;
     }
 
     /** Clear session sequence cache (on disconnect). */
@@ -450,6 +471,32 @@ public class Session {
         table.deleteRows(rows);
     }
 
+    /** True once this transaction has run something that fixes its snapshot. */
+    private boolean queryRanInTransaction = false;
+
+    /**
+     * Statements that configure the session rather than read the database.
+     *
+     * <p>The list is PostgreSQL's: {@code PortalRunUtility} runs a utility statement without a
+     * snapshot only when {@code CommandIsReadOnly} says it needs none, which covers the settings
+     * commands, {@code LOCK}, and the asynchronous-notification commands. {@code DEALLOCATE} and
+     * {@code DISCARD} are not on it, and neither is anything that reads a table.
+     */
+    private static boolean isSnapshotFree(String upper) {
+        return upper.startsWith("SET ") || upper.equals("SET")
+                || upper.startsWith("SHOW ") || upper.startsWith("RESET ")
+                || upper.startsWith("LOCK ")
+                || upper.startsWith("LISTEN ") || upper.startsWith("UNLISTEN ")
+                || upper.startsWith("NOTIFY ") || upper.equals("CHECKPOINT")
+                || upper.startsWith("CHECKPOINT ");
+    }
+
+    /** True when this transaction has already run a statement that took its snapshot. */
+    public boolean hasRunQueryInTransaction() { return queryRanInTransaction; }
+
+    /** True when a savepoint is open, so the current work is inside a subtransaction. */
+    public boolean hasSubtransaction() { return !savepoints.isEmpty(); }
+
     public QueryResult execute(String sql) {
         return execute(sql, Cols.listOf());
     }
@@ -470,11 +517,21 @@ public class Session {
                 || upper.startsWith("ROLLBACK") || upper.startsWith("SAVEPOINT")
                 || upper.startsWith("RELEASE") || upper.startsWith("PREPARE TRANSACTION");
 
-        // In FAILED state, only ROLLBACK (and SAVEPOINT-related) commands are allowed
-        if (status == TransactionStatus.FAILED && !isTransactionCmd) {
+        // An aborted transaction can only be ended or wound back to a savepoint. Establishing or
+        // releasing a savepoint is ordinary work that PG refuses like any other statement — only
+        // COMMIT/ROLLBACK (which end it) and ROLLBACK TO SAVEPOINT (which recovers it) get through.
+        boolean allowedWhileAborted = upper.startsWith("COMMIT") || upper.startsWith("END")
+                || upper.startsWith("ABORT") || upper.startsWith("ROLLBACK");
+        if (status == TransactionStatus.FAILED && !allowedWhileAborted) {
             throw new MemgresException(
                     "current transaction is aborted, commands ignored until end of transaction block",
                     "25P02");
+        }
+        // Track whether this transaction has taken a snapshot yet: SET TRANSACTION ISOLATION LEVEL
+        // and [NOT] DEFERRABLE are only meaningful before one has been taken. Settings and
+        // transaction control do not take one.
+        if (status == TransactionStatus.IN_TRANSACTION && !isTransactionCmd && !isSnapshotFree(upper)) {
+            queryRanInTransaction = true;
         }
 
         // statement_timeout: arm a deadline for this statement. PG re-reads the setting at the
@@ -504,6 +561,9 @@ public class Session {
         }
 
         executingStatement = true;
+        // Everything this statement reads is read as this session, including the catalog listings
+        // built too deep in the engine to be handed one.
+        final Session outerViewer = Database.bindViewer(this);
         try {
             QueryResult result = executor.execute(sql, parameters);
             // A timeout that arrives after the statement has already produced its answer is too
@@ -524,6 +584,7 @@ public class Session {
             throw reported;
         } finally {
             executingStatement = false;
+            Database.bindViewer(outerViewer);
             if (timeoutTask != null && !timeoutTask.cancel(false)) {
                 // Too late to cancel: the task is already interrupting us. Let it finish, or the
                 // interrupt lands after the clear below and kills the next statement instead.
@@ -591,6 +652,8 @@ public class Session {
         commandId = 0;
         undoLog.clear();
         savepoints.clear();
+        queryRanInTransaction = false;
+        database.clearUncommittedObjects(this);
         // M13: snapshot session GUC overrides so plain SET can be rolled back
         gucSessionSnapshot = gucSettings.snapshotSessionOverrides();
     }
@@ -621,24 +684,7 @@ public class Session {
         }
         // Validate deferred constraints before committing
         try {
-            // First, validate deferred PK/UNIQUE constraints (whole-table scan, deduplicated)
-            Set<String> validatedUnique = new java.util.HashSet<>();
-            for (DeferredFkCheck check : deferredFkChecks) {
-                StoredConstraint sc = check.constraint();
-                if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
-                    String key = System.identityHashCode(check.table()) + ":" + sc.getName();
-                    if (validatedUnique.add(key)) {
-                        executor.constraintValidator.validateDeferredUniqueness(check.table(), sc);
-                    }
-                }
-            }
-            // Then validate other deferred constraints (CHECK, FK, EXCLUDE)
-            for (DeferredFkCheck check : deferredFkChecks) {
-                StoredConstraint sc = check.constraint();
-                if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) {
-                    executor.constraintValidator.validateDeferredConstraint(check.table(), check.row(), sc);
-                }
-            }
+            validateDeferredChecks(deferredFkChecks);
         } catch (MemgresException e) {
             // Deferred constraint failed, rollback
             rollback();
@@ -670,9 +716,12 @@ public class Session {
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
+        gucSettings.reset("transaction_deferrable");
         // Discard undo log; changes are permanent
         undoLog.clear();
         savepoints.clear();
+        queryRanInTransaction = false;
+        database.clearUncommittedObjects(this);
         deferredFkChecks.clear();
         allConstraintsDeferred = false;
         allConstraintsImmediate = false;
@@ -683,11 +732,6 @@ public class Session {
             database.getNotificationManager().notify(n.channel(), n.payload(), n.pid());
         }
         deferredNotifications.clear();
-        savepointNotifCounts.clear();
-        savepointMvccSnapshots.clear();
-        savepointLockMarks.clear();
-        savepointSessionGucs.clear();
-        savepointLocalGucs.clear();
         // Drop temp tables with ON COMMIT DROP
         for (String[] pair : onCommitDropTables) {
             Schema s = database.getSchema(pair[0]);
@@ -740,8 +784,11 @@ public class Session {
         // Reset per-transaction GUCs (transaction_read_only, transaction_isolation)
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
+        gucSettings.reset("transaction_deferrable");
         undoLog.clear();
         savepoints.clear();
+        queryRanInTransaction = false;
+        database.clearUncommittedObjects(this);
         deferredFkChecks.clear();
         deferredTriggers.clear();
         allConstraintsDeferred = false;
@@ -750,11 +797,6 @@ public class Session {
         immediateConstraintNames.clear();
         // Discard deferred notifications; transaction was rolled back
         deferredNotifications.clear();
-        savepointNotifCounts.clear();
-        savepointMvccSnapshots.clear();
-        savepointLockMarks.clear();
-        savepointSessionGucs.clear();
-        savepointLocalGucs.clear();
         onCommitDropTables.clear();
         // Release transaction-scoped advisory locks
         releaseXactAdvisoryLocks();
@@ -800,19 +842,17 @@ public class Session {
         gucSettings.clearTransactionOverrides();
         gucSettings.reset("transaction_read_only");
         gucSettings.reset("transaction_isolation");
+        gucSettings.reset("transaction_deferrable");
         undoLog.clear();
         savepoints.clear();
+        queryRanInTransaction = false;
+        database.clearUncommittedObjects(this);
         deferredFkChecks.clear();
         allConstraintsDeferred = false;
         allConstraintsImmediate = false;
         deferredConstraintNames.clear();
         immediateConstraintNames.clear();
         deferredNotifications.clear();
-        savepointNotifCounts.clear();
-        savepointMvccSnapshots.clear();
-        savepointLockMarks.clear();
-        savepointSessionGucs.clear();
-        savepointLocalGucs.clear();
         onCommitDropTables.clear();
         releaseXactAdvisoryLocks();
         database.unlockAllRows(this);
@@ -848,29 +888,59 @@ public class Session {
         pt.uncommittedDeletes.clear();
     }
 
-    // MVCC map snapshots per savepoint — used to restore MVCC state on ROLLBACK TO SAVEPOINT
-    private final Map<String, MvccSnapshot> savepointMvccSnapshots = new LinkedHashMap<>();
+    /** Everything one savepoint has to be able to put back. */
+    private static final class SavepointFrame {
+        final String name;
+        final int undoPosition;
+        final int notificationCount;
+        final long lockMark;
+        final Map<String, String> sessionGucs;
+        final Map<String, String> localGucs;
+        final MvccSnapshot mvcc;
+        /** The cursors that existed when the savepoint was taken; later ones die with it. */
+        final Set<String> cursorNames;
 
-    // Row-lock acquisition marks and GUC snapshots per savepoint: PG rolls both back with
-    // the subtransaction, so locks taken and SETs issued after the savepoint must be undone.
-    private final Map<String, Long> savepointLockMarks = new LinkedHashMap<>();
-    private final Map<String, Map<String, String>> savepointSessionGucs = new LinkedHashMap<>();
-    private final Map<String, Map<String, String>> savepointLocalGucs = new LinkedHashMap<>();
+        SavepointFrame(String name, int undoPosition, int notificationCount, long lockMark,
+                       Map<String, String> sessionGucs, Map<String, String> localGucs,
+                       MvccSnapshot mvcc, Set<String> cursorNames) {
+            this.name = name;
+            this.undoPosition = undoPosition;
+            this.notificationCount = notificationCount;
+            this.lockMark = lockMark;
+            this.sessionGucs = sessionGucs;
+            this.localGucs = localGucs;
+            this.mvcc = mvcc;
+            this.cursorNames = cursorNames;
+        }
+    }
+
+    /**
+     * Index of the innermost savepoint carrying this name, or -1.
+     *
+     * <p>The name arrives already folded the way it was written: {@code SAVEPOINT s} lowercases,
+     * {@code SAVEPOINT "S"} does not. Folding again here would make the two the same savepoint,
+     * so {@code ROLLBACK TO s} would wind back one that was never established under that name.
+     */
+    private int findSavepoint(String name) {
+        for (int i = savepoints.size() - 1; i >= 0; i--) {
+            if (savepoints.get(i).name.equals(name)) return i;
+        }
+        return -1;
+    }
 
     public void savepoint(String name) {
         if (status != TransactionStatus.IN_TRANSACTION) {
             // Implicit BEGIN
             begin();
         }
-        String key = name.toLowerCase();
-        savepoints.put(key, undoLog.size());
-        savepointNotifCounts.put(key, deferredNotifications.size());
-        savepointLockMarks.put(key, database.currentRowLockMark());
-        savepointSessionGucs.put(key, getGucSettings().snapshotSessionOverrides());
-        savepointLocalGucs.put(key, getGucSettings().snapshotTransactionOverrides());
-        // Snapshot current MVCC maps so we can restore on ROLLBACK TO SAVEPOINT.
-        // Deep-copy the outer maps; inner collections are identity-based.
-        savepointMvccSnapshots.put(key, MvccSnapshot.capture(uncommittedInserts, uncommittedUpdates, uncommittedDeletes));
+        savepoints.add(new SavepointFrame(name, undoLog.size(),
+                deferredNotifications.size(), database.currentRowLockMark(),
+                getGucSettings().snapshotSessionOverrides(),
+                getGucSettings().snapshotTransactionOverrides(),
+                // Snapshot current MVCC maps so we can restore on ROLLBACK TO SAVEPOINT.
+                // Deep-copy the outer maps; inner collections are identity-based.
+                MvccSnapshot.capture(uncommittedInserts, uncommittedUpdates, uncommittedDeletes),
+                new LinkedHashSet<>(cursors.keySet())));
     }
 
     /** Snapshot of MVCC tracking maps at savepoint creation time. */
@@ -919,77 +989,61 @@ public class Session {
         if (status == TransactionStatus.IDLE) {
             throw new MemgresException("RELEASE SAVEPOINT can only be used in transaction blocks", "25P01");
         }
-        String key = name.toLowerCase();
-        if (!savepoints.containsKey(key)) {
+        int index = findSavepoint(name);
+        if (index < 0) {
             throw new MemgresException("savepoint \"" + name + "\" does not exist", "3B001");
         }
-        savepoints.remove(key);
-        savepointLockMarks.remove(key);
-        savepointSessionGucs.remove(key);
-        savepointLocalGucs.remove(key);
+        // Releasing a savepoint also destroys every savepoint established after it.
+        savepoints.subList(index, savepoints.size()).clear();
     }
 
     public void rollbackToSavepoint(String name) {
         if (status == TransactionStatus.IDLE) {
             throw new MemgresException("ROLLBACK TO SAVEPOINT can only be used in transaction blocks", "25P01");
         }
-        String key = name.toLowerCase();
-        if (!savepoints.containsKey(key)) {
+        int index = findSavepoint(name);
+        if (index < 0) {
             throw new MemgresException("savepoint \"" + name + "\" does not exist", "3B001");
         }
-        int position = savepoints.get(key);
+        SavepointFrame frame = savepoints.get(index);
 
         // Restore MVCC maps to their state at savepoint creation time.
         // This must happen BEFORE applyUndo so that concurrent readers see consistent
         // MVCC visibility during the undo process. The volatile swap is atomic from
         // the perspective of cross-session reads.
-        MvccSnapshot snapshot = savepointMvccSnapshots.get(key);
-        if (snapshot != null) {
-            uncommittedInserts = snapshot.inserts;
-            uncommittedUpdates = snapshot.updates;
-            uncommittedDeletes = snapshot.deletes;
+        if (frame.mvcc != null) {
+            uncommittedInserts = frame.mvcc.inserts;
+            uncommittedUpdates = frame.mvcc.updates;
+            uncommittedDeletes = frame.mvcc.deletes;
         }
 
-        applyUndo(position);
+        applyUndo(frame.undoPosition);
 
         // Row locks and GUC values set after the savepoint go away with the subtransaction
-        Long lockMark = savepointLockMarks.get(key);
-        if (lockMark != null) {
-            database.releaseRowLocksAfter(this, lockMark);
+        database.releaseRowLocksAfter(this, frame.lockMark);
+        if (frame.sessionGucs != null) {
+            getGucSettings().restoreSessionOverrides(frame.sessionGucs);
         }
-        Map<String, String> sessionGucs = savepointSessionGucs.get(key);
-        if (sessionGucs != null) {
-            getGucSettings().restoreSessionOverrides(sessionGucs);
-        }
-        Map<String, String> localGucs = savepointLocalGucs.get(key);
-        if (localGucs != null) {
-            getGucSettings().restoreTransactionOverrides(localGucs);
+        if (frame.localGucs != null) {
+            getGucSettings().restoreTransactionOverrides(frame.localGucs);
         }
 
         // Truncate deferred notifications to the savepoint's count
-        Integer notifCount = savepointNotifCounts.get(key);
-        if (notifCount != null && notifCount < deferredNotifications.size()) {
-            deferredNotifications.subList(notifCount, deferredNotifications.size()).clear();
+        if (frame.notificationCount < deferredNotifications.size()) {
+            deferredNotifications.subList(frame.notificationCount, deferredNotifications.size()).clear();
         }
 
-        // Remove savepoints created after this one
-        List<String> toRemove = new ArrayList<>();
-        boolean found = false;
-        for (String sp : savepoints.keySet()) {
-            if (found) {
-                toRemove.add(sp);
-            }
-            if (sp.equals(key)) {
-                found = true;
-            }
+        // A cursor opened inside the subtransaction goes away with it. Closing one does not
+        // come back, and a cursor that was only moved keeps the position the FETCH left it at,
+        // so only cursors that did not exist at the savepoint are removed.
+        if (frame.cursorNames != null) {
+            cursors.keySet().retainAll(frame.cursorNames);
         }
-        for (String sp : toRemove) {
-            savepoints.remove(sp);
-            savepointNotifCounts.remove(sp);
-            savepointMvccSnapshots.remove(sp);
-            savepointLockMarks.remove(sp);
-            savepointSessionGucs.remove(sp);
-            savepointLocalGucs.remove(sp);
+
+        // Savepoints established after this one are destroyed; this one survives, so it can be
+        // rolled back to again.
+        if (index + 1 < savepoints.size()) {
+            savepoints.subList(index + 1, savepoints.size()).clear();
         }
 
         // Transaction is no longer in FAILED state after rolling back to savepoint
@@ -1001,6 +1055,26 @@ public class Session {
 
     public boolean isInTransaction() {
         return status == TransactionStatus.IN_TRANSACTION || status == TransactionStatus.FAILED;
+    }
+
+    /**
+     * True when this transaction has already failed. Its writes cannot become permanent, so
+     * another session waiting on one of them has nothing left to wait for.
+     */
+    public boolean isTransactionAborted() {
+        return status == TransactionStatus.FAILED;
+    }
+
+    /**
+     * True when nothing this transaction has written can ever become visible to anyone else.
+     *
+     * <p>PostgreSQL records the abort the moment the statement fails, so from that instant every
+     * row the transaction wrote is dead: another session neither waits for it nor sees its key.
+     * The one way back is a savepoint, which undoes only the failed subtransaction and leaves the
+     * work before it alive — so a transaction holding a savepoint is still worth waiting for.
+     */
+    public boolean isDoomed() {
+        return status == TransactionStatus.FAILED && savepoints.isEmpty();
     }
 
     // Notice support (RAISE NOTICE/WARNING, DDL skipped notices)
@@ -1420,6 +1494,52 @@ public class Session {
         deferredFkChecks.add(new DeferredFkCheck(table, row, constraint));
     }
 
+    /**
+     * Run a set of postponed constraint checks. Uniqueness is checked once per constraint over the
+     * whole table, so a run of inserts that collide is reported once; the row-scoped checks
+     * (CHECK, FK, EXCLUDE) are then run against the rows that were recorded.
+     */
+    private void validateDeferredChecks(List<DeferredFkCheck> checks) {
+        Set<String> validatedUnique = new java.util.HashSet<>();
+        for (DeferredFkCheck check : checks) {
+            StoredConstraint sc = check.constraint();
+            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
+                String key = System.identityHashCode(check.table()) + ":" + sc.getName();
+                if (validatedUnique.add(key)) {
+                    executor.constraintValidator.validateDeferredUniqueness(check.table(), sc);
+                }
+            }
+        }
+        for (DeferredFkCheck check : checks) {
+            StoredConstraint sc = check.constraint();
+            if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) {
+                executor.constraintValidator.validateDeferredConstraint(check.table(), check.row(), sc);
+            }
+        }
+    }
+
+    /**
+     * Run the checks postponed so far, as {@code SET CONSTRAINTS ... IMMEDIATE} asks. Checks that
+     * pass are done with and are not repeated at COMMIT; a failure leaves them pending, because
+     * the transaction is going to be rolled back anyway.
+     *
+     * @param constraintName restrict to one constraint, or null for every pending check
+     */
+    public void runPendingDeferredChecks(String constraintName) {
+        if (deferredFkChecks.isEmpty()) return;
+        List<DeferredFkCheck> selected = new ArrayList<>();
+        for (DeferredFkCheck check : deferredFkChecks) {
+            String scName = check.constraint().getName();
+            if (constraintName == null
+                    || (scName != null && scName.equalsIgnoreCase(constraintName))) {
+                selected.add(check);
+            }
+        }
+        if (selected.isEmpty()) return;
+        validateDeferredChecks(selected);
+        deferredFkChecks.removeAll(selected);
+    }
+
     public void addDeferredTrigger(Runnable trigger) {
         deferredTriggers.add(trigger);
     }
@@ -1585,6 +1705,13 @@ public class Session {
         synchronized (live) {
             return new ArrayList<>(live);
         }
+    }
+
+    /** True while this session still has uncommitted inserts, updates or deletes on a table. */
+    public boolean hasUncommittedWork(String schemaTable) {
+        return !getUncommittedInserts(schemaTable).isEmpty()
+                || !getUncommittedUpdates(schemaTable).isEmpty()
+                || !getUncommittedDeletes(schemaTable).isEmpty();
     }
 
     // Flag: true once the first RR/SERIALIZABLE snapshot has been taken in this transaction.
@@ -1767,12 +1894,19 @@ public class Session {
         return "read committed";
     }
 
-    /** Check if the current transaction is read-only. */
+    /**
+     * Check if the current transaction is read-only.
+     *
+     * <p>{@code default_transaction_read_only} only supplies the starting value:
+     * {@code BEGIN READ WRITE} (or {@code SET TRANSACTION READ WRITE}) says what this
+     * transaction is, and has to win. Letting the session default win instead refuses
+     * the writes of a transaction that explicitly asked to make them.
+     */
     public boolean isReadOnly() {
-        String val = gucSettings.get("default_transaction_read_only");
-        if ("on".equalsIgnoreCase(val)) return true;
-        val = gucSettings.get("transaction_read_only");
-        return "on".equalsIgnoreCase(val);
+        if (gucSettings.hasSessionOverride("transaction_read_only")) {
+            return "on".equalsIgnoreCase(gucSettings.get("transaction_read_only"));
+        }
+        return "on".equalsIgnoreCase(gucSettings.get("default_transaction_read_only"));
     }
 
     /** Check if the current transaction uses SERIALIZABLE isolation. */
@@ -1908,6 +2042,28 @@ public class Session {
 
     public interface UndoEntry {
         void undo(Database db);
+    }
+
+    /**
+     * Undo a CREATE TYPE ... AS ENUM.
+     *
+     * <p>DDL is transactional in PostgreSQL, so a type whose transaction rolled back never
+     * existed. Leaving it behind makes a type nobody created castable from every session.
+     */
+    public static final class CreateEnumTypeUndo implements UndoEntry {
+        public final String schema;
+        public final String typeName;
+
+        public CreateEnumTypeUndo(String schema, String typeName) {
+            this.schema = schema;
+            this.typeName = typeName;
+        }
+
+        @Override
+        public void undo(Database db) {
+            db.removeCustomEnum(typeName);
+            db.unregisterSchemaObject(schema, "enum", typeName);
+        }
     }
 
     /** Undo an INSERT by removing the row. */

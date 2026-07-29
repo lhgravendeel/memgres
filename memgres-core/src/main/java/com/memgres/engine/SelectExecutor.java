@@ -651,6 +651,117 @@ class SelectExecutor {
         SelectStmt.LockClause lock = stmt.lockClause();
         if (lock == null) return;
         checkLockable(stmt, lock, lock.ofTables() == null || lock.ofTables().isEmpty());
+        checkLockTargetsResolvable(stmt, lock);
+        rejectRowLockInReadOnlyTransaction(stmt, lock);
+    }
+
+    /**
+     * A row lock is a write: it marks the row so no one else may change it, and a read-only
+     * transaction may not do that. PostgreSQL names the lock mode that was asked for, and only
+     * refuses when the lock has a relation to apply to — {@code SELECT 1 FOR UPDATE} has none.
+     */
+    private void rejectRowLockInReadOnlyTransaction(SelectStmt stmt, SelectStmt.LockClause lock) {
+        if (executor.session == null || !executor.session.isReadOnly()) return;
+        if (stmt.from() == null || stmt.from().isEmpty()) return;
+        throw new MemgresException("cannot execute SELECT FOR "
+                + (lock.mode() == null ? "UPDATE" : lock.mode())
+                + " in a read-only transaction", "25006");
+    }
+
+    /**
+     * Check the relations a row lock applies to.
+     *
+     * <p>Two things can go wrong. A name in {@code OF} may not be in FROM at all — and an alias
+     * hides the table name it stands for, so {@code FROM t a ... FOR UPDATE OF t} names nothing.
+     * And the nullable side of an outer join produces all-NULL rows that stand for no base row,
+     * so there is nothing there to lock; PostgreSQL refuses rather than locking whatever the
+     * other side happened to join to.
+     */
+    private void checkLockTargetsResolvable(SelectStmt stmt, SelectStmt.LockClause lock) {
+        if (stmt.from() == null || stmt.from().isEmpty()) return;
+        String mode = "FOR " + (lock.mode() == null ? "UPDATE" : lock.mode());
+        Map<String, SelectStmt.FromItem> exposed = new LinkedHashMap<>();
+        Set<String> nullable = new LinkedHashSet<>();
+        for (SelectStmt.FromItem item : stmt.from()) {
+            collectExposedNames(item, false, exposed, nullable);
+        }
+        Set<String> cteNames = new LinkedHashSet<>();
+        if (stmt.withClauses() != null) {
+            for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) cteNames.add(cte.name().toLowerCase());
+        }
+        boolean named = lock.ofTables() != null && !lock.ofTables().isEmpty();
+        List<String> targets = new ArrayList<String>();
+        if (named) {
+            for (String of : lock.ofTables()) targets.add(of.toLowerCase());
+        } else {
+            targets.addAll(exposed.keySet());
+        }
+        for (String target : targets) {
+            SelectStmt.FromItem item = exposed.get(target);
+            if (item == null) {
+                if (!named) continue;
+                throw new MemgresException("relation \"" + target + "\" in " + mode
+                        + " clause not found in FROM clause", "42P01");
+            }
+            // A plain FOR UPDATE simply locks nothing in a FROM entry that has no base rows;
+            // only naming one in OF is an error, because then the lock was asked for by name.
+            if (named) {
+                if (item instanceof SelectStmt.FunctionFrom) {
+                    throw new MemgresException(mode + " cannot be applied to a function", "0A000");
+                }
+                if (item instanceof SelectStmt.TableRef && cteNames.contains(target)
+                        && ((SelectStmt.TableRef) item).alias() == null) {
+                    throw new MemgresException(mode + " cannot be applied to a WITH query", "0A000");
+                }
+            }
+            // A derived table on the nullable side is refused like a base table: the lock reaches
+            // through it to the relations it reads, and those have no row behind an all-NULL
+            // output row either. A set-returning function is not, because there is no row to
+            // lock in the first place, and PostgreSQL lets a plain FOR UPDATE ignore it.
+            boolean reachesBaseRows = item instanceof SelectStmt.TableRef
+                    || item instanceof SelectStmt.SubqueryFrom;
+            if (nullable.contains(target) && (named || reachesBaseRows)) {
+                throw new MemgresException(
+                        mode + " cannot be applied to the nullable side of an outer join", "0A000");
+            }
+        }
+    }
+
+    /**
+     * Map each FROM entry to the one name it is addressable by — its alias when it has one,
+     * otherwise the relation name — and record which of those sit on a nullable join side.
+     */
+    private static void collectExposedNames(SelectStmt.FromItem item, boolean nullableHere,
+                                            Map<String, SelectStmt.FromItem> exposed,
+                                            Set<String> nullable) {
+        if (item instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef tr = (SelectStmt.TableRef) item;
+            String name = (tr.alias() != null ? tr.alias() : tr.table()).toLowerCase();
+            exposed.put(name, item);
+            if (nullableHere) nullable.add(name);
+        } else if (item instanceof SelectStmt.SubqueryFrom) {
+            String alias = ((SelectStmt.SubqueryFrom) item).alias();
+            if (alias != null) {
+                exposed.put(alias.toLowerCase(), item);
+                if (nullableHere) nullable.add(alias.toLowerCase());
+            }
+        } else if (item instanceof SelectStmt.FunctionFrom) {
+            SelectStmt.FunctionFrom ff = (SelectStmt.FunctionFrom) item;
+            String name = (ff.alias() != null ? ff.alias() : ff.functionName()).toLowerCase();
+            exposed.put(name, item);
+            if (nullableHere) nullable.add(name);
+        } else if (item instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
+            SelectStmt.JoinType type = jf.joinType();
+            boolean leftNullable = nullableHere
+                    || type == SelectStmt.JoinType.RIGHT || type == SelectStmt.JoinType.NATURAL_RIGHT
+                    || type == SelectStmt.JoinType.FULL || type == SelectStmt.JoinType.NATURAL_FULL;
+            boolean rightNullable = nullableHere
+                    || type == SelectStmt.JoinType.LEFT || type == SelectStmt.JoinType.NATURAL_LEFT
+                    || type == SelectStmt.JoinType.FULL || type == SelectStmt.JoinType.NATURAL_FULL;
+            if (jf.left() != null) collectExposedNames(jf.left(), leftNullable, exposed, nullable);
+            if (jf.right() != null) collectExposedNames(jf.right(), rightNullable, exposed, nullable);
+        }
     }
 
     private void checkLockable(SelectStmt stmt, SelectStmt.LockClause lock, boolean descend) {
