@@ -403,16 +403,21 @@ class NoopDdlCoverageTest {
         exec("CREATE TABLESPACE myts OWNER test LOCATION '/data/ts'");
     }
 
+    // Each ALTER creates its own tablespace: ALTER now refuses a name that was never created,
+    // so these can no longer lean on whichever other test happened to run first.
     @Test void testAlterTablespace() throws SQLException {
-        exec("ALTER TABLESPACE myts RENAME TO newts");
+        exec("CREATE TABLESPACE renamets LOCATION '/data/ts'");
+        exec("ALTER TABLESPACE renamets RENAME TO newts");
     }
 
     @Test void testAlterTablespaceOwner() throws SQLException {
-        exec("ALTER TABLESPACE myts OWNER TO newowner");
+        exec("CREATE TABLESPACE ownerts LOCATION '/data/ts'");
+        exec("ALTER TABLESPACE ownerts OWNER TO newowner");
     }
 
     @Test void testAlterTablespaceSet() throws SQLException {
-        exec("ALTER TABLESPACE myts SET (seq_page_cost = 1.5)");
+        exec("CREATE TABLESPACE setts LOCATION '/data/ts'");
+        exec("ALTER TABLESPACE setts SET (seq_page_cost = 1.5)");
     }
 
     @Test void testDropTablespace() throws SQLException {

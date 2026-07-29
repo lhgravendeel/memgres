@@ -70,6 +70,11 @@ final class AstWalk {
         return null;
     }
 
+    /** Apply {@code action} to every node in the tree, once each. */
+    static void forEach(Object root, java.util.function.Consumer<Object> action) {
+        findFirst(root, node -> { action.accept(node); return false; });
+    }
+
     /** Apply {@code action} to each direct AST child of a node (one level, no recursion). */
     static void forEachChild(Object node, java.util.function.Consumer<Object> action) {
         if (node == null) return;

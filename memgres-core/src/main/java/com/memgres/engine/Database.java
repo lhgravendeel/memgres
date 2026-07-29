@@ -90,6 +90,55 @@ public class Database {
         }
     }
 
+    // ---- Stub catalog objects ----
+    /**
+     * Objects memgres accepts but does not implement — conversions, tablespaces, procedural
+     * languages. It stores no behaviour for them, but it has to remember that they exist:
+     * PostgreSQL refuses an ALTER on a name that was never created, and quietly succeeding
+     * there reports that a rename happened when nothing did.
+     */
+    private final Map<String, Set<String>> stubObjects = new ConcurrentHashMap<>();
+
+    /** Built-in members of each stub kind, which exist without ever being created. */
+    private static final Map<String, Set<String>> BUILTIN_STUBS = builtinStubs();
+
+    private static Map<String, Set<String>> builtinStubs() {
+        Map<String, Set<String>> m = new java.util.HashMap<>();
+        Set<String> langs = new java.util.HashSet<>();
+        langs.add("internal"); langs.add("c"); langs.add("sql"); langs.add("plpgsql");
+        m.put("language", langs);
+        Set<String> spaces = new java.util.HashSet<>();
+        spaces.add("pg_default"); spaces.add("pg_global");
+        m.put("tablespace", spaces);
+        return m;
+    }
+
+    public void addStubObject(String kind, String name) {
+        if (name == null) return;
+        stubObjects.computeIfAbsent(kind.toLowerCase(), k -> ConcurrentHashMap.newKeySet())
+                .add(name.toLowerCase());
+    }
+
+    public boolean hasStubObject(String kind, String name) {
+        if (name == null) return false;
+        String lower = name.toLowerCase();
+        Set<String> builtin = BUILTIN_STUBS.get(kind.toLowerCase());
+        if (builtin != null && builtin.contains(lower)) return true;
+        Set<String> created = stubObjects.get(kind.toLowerCase());
+        return created != null && created.contains(lower);
+    }
+
+    public void removeStubObject(String kind, String name) {
+        if (name == null) return;
+        Set<String> created = stubObjects.get(kind.toLowerCase());
+        if (created != null) created.remove(name.toLowerCase());
+    }
+
+    public void renameStubObject(String kind, String oldName, String newName) {
+        removeStubObject(kind, oldName);
+        addStubObject(kind, newName);
+    }
+
     public void addCollation(CollationDef coll) { userCollations.put(coll.name.toLowerCase(), coll); }
     public CollationDef getCollation(String name) { return userCollations.get(name.toLowerCase()); }
     public Map<String, CollationDef> getUserCollations() { return userCollations; }
@@ -1717,6 +1766,20 @@ public class Database {
         return rules.containsKey("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
     }
 
+    /**
+     * ALTER RULE ... RENAME TO: the rule keeps its event and its action, under a new name.
+     * Reporting success without re-keying leaves the rule answering only to a name that is
+     * no longer written anywhere, so DROP RULE on the new name cannot find it.
+     */
+    public void renameRule(String ruleName, String table, String newName) {
+        String oldKey = "name:" + ruleName.toLowerCase() + ":" + table.toLowerCase();
+        String event = rules.remove(oldKey);
+        if (event == null) return;
+        rules.put("name:" + newName.toLowerCase() + ":" + table.toLowerCase(), event);
+        String definition = rules.remove("def:" + ruleName.toLowerCase());
+        if (definition != null) rules.put("def:" + newName.toLowerCase(), definition);
+    }
+
     public void removeRule(String ruleName, String table) {
         String event = rules.remove("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
         rules.remove("def:" + ruleName.toLowerCase());
@@ -1782,49 +1845,67 @@ public class Database {
         return comments;
     }
 
+    /**
+     * The key an index of this name is stored under. PostgreSQL folds an unquoted identifier and
+     * keeps a quoted one, so {@code "MixedCase"} and {@code mixedcase} are two indexes and the
+     * name is stored exactly as it was written. Names that reach here from somewhere that folded
+     * them already still resolve, case-insensitively, to the one index that answers to them.
+     */
+    private String ixKey(String name) {
+        if (name == null) return null;
+        if (indexColumns.containsKey(name) || indexTableNames.containsKey(name)) return name;
+        for (String key : indexColumns.keySet()) {
+            if (key.equalsIgnoreCase(name)) return key;
+        }
+        for (String key : indexTableNames.keySet()) {
+            if (key.equalsIgnoreCase(name)) return key;
+        }
+        return name;
+    }
+
     // Index metadata (for USING INDEX lookups)
     public void addIndex(String name, List<String> columns) {
-        indexColumns.put(name.toLowerCase(), columns);
+        indexColumns.put(name, columns);
     }
 
     public void addIndexMeta(String name, String tableName, boolean isUnique) {
-        indexTableNames.put(name.toLowerCase(), tableName);
-        indexUniqueFlags.put(name.toLowerCase(), isUnique);
+        indexTableNames.put(name, tableName);
+        indexUniqueFlags.put(name, isUnique);
     }
 
     public void addIndexMeta(String name, String tableName, boolean isUnique, String method, String whereClause) {
-        indexTableNames.put(name.toLowerCase(), tableName);
-        indexUniqueFlags.put(name.toLowerCase(), isUnique);
-        if (method != null) indexMethods.put(name.toLowerCase(), method);
-        if (whereClause != null) indexWhereClauses.put(name.toLowerCase(), whereClause);
+        indexTableNames.put(name, tableName);
+        indexUniqueFlags.put(name, isUnique);
+        if (method != null) indexMethods.put(name, method);
+        if (whereClause != null) indexWhereClauses.put(name, whereClause);
     }
 
     public void setIndexColumnOptions(String name, List<String> options) {
-        if (options != null) indexColumnOptions.put(name.toLowerCase(), options);
+        if (options != null) indexColumnOptions.put(name, options);
     }
 
     public List<String> getIndexColumnOptions(String name) {
-        return indexColumnOptions.get(name.toLowerCase());
+        return indexColumnOptions.get(ixKey(name));
     }
 
     public void setIndexIncludeColumns(String name, List<String> cols) {
-        if (cols != null && !cols.isEmpty()) indexIncludeColumns.put(name.toLowerCase(), cols);
+        if (cols != null && !cols.isEmpty()) indexIncludeColumns.put(name, cols);
     }
 
     public List<String> getIndexIncludeColumns(String name) {
-        return indexIncludeColumns.get(name.toLowerCase());
+        return indexIncludeColumns.get(ixKey(name));
     }
 
     public void setIndexNullsNotDistinct(String name, boolean value) {
-        if (value) indexNullsNotDistinct.put(name.toLowerCase(), true);
+        if (value) indexNullsNotDistinct.put(name, true);
     }
 
     public boolean isIndexNullsNotDistinct(String name) {
-        return indexNullsNotDistinct.getOrDefault(name.toLowerCase(), false);
+        return indexNullsNotDistinct.getOrDefault(ixKey(name), false);
     }
 
     public void setIndexParent(String childIndex, String parentIndex) {
-        indexParentIndex.put(childIndex.toLowerCase(), parentIndex.toLowerCase());
+        indexParentIndex.put(ixKey(childIndex), ixKey(parentIndex));
     }
 
     public Map<String, String> getIndexParentMap() {
@@ -1832,15 +1913,15 @@ public class Database {
     }
 
     public String getIndexMethod(String name) {
-        return indexMethods.getOrDefault(name.toLowerCase(), "btree");
+        return indexMethods.getOrDefault(ixKey(name), "btree");
     }
 
     public String getIndexWhereClause(String name) {
-        return indexWhereClauses.get(name.toLowerCase());
+        return indexWhereClauses.get(ixKey(name));
     }
 
     public String getIndexTable(String name) {
-        return indexTableNames.get(name.toLowerCase());
+        return indexTableNames.get(ixKey(name));
     }
 
     /** Returns all index → table name mappings (used by CLUSTER to find clustered indexes for a table). */
@@ -1849,45 +1930,51 @@ public class Database {
     }
 
     public boolean isUniqueIndex(String name) {
-        return indexUniqueFlags.getOrDefault(name.toLowerCase(), false);
+        return indexUniqueFlags.getOrDefault(ixKey(name), false);
     }
 
     public List<String> getIndexColumns(String name) {
-        return indexColumns.get(name.toLowerCase());
+        return indexColumns.get(ixKey(name));
     }
 
     public Map<String, String> getIndexReloptions(String name) {
-        return indexReloptions.get(name.toLowerCase());
+        return indexReloptions.get(ixKey(name));
     }
 
     public void setIndexReloptions(String name, Map<String, String> opts) {
-        indexReloptions.put(name.toLowerCase(), opts);
+        indexReloptions.put(name, opts);
     }
 
     public void removeIndexReloptions(String name) {
-        indexReloptions.remove(name.toLowerCase());
+        indexReloptions.remove(ixKey(name));
     }
 
+    /**
+     * True when an index answers to exactly this name. The match is exact because the name is
+     * what decides whether another index may be created under it, and PostgreSQL has already
+     * folded an unquoted identifier by the time it gets here.
+     */
     public boolean hasIndex(String name) {
-        return indexColumns.containsKey(name.toLowerCase());
+        return name != null && indexColumns.containsKey(name);
     }
 
     public void removeIndex(String name) {
-        indexColumns.remove(name.toLowerCase());
-        indexTableNames.remove(name.toLowerCase());
-        indexUniqueFlags.remove(name.toLowerCase());
-        indexWhereClauses.remove(name.toLowerCase());
-        indexMethods.remove(name.toLowerCase());
-        indexReloptions.remove(name.toLowerCase());
-        indexColumnOptions.remove(name.toLowerCase());
-        indexIncludeColumns.remove(name.toLowerCase());
-        indexNullsNotDistinct.remove(name.toLowerCase());
+        String key = ixKey(name);
+        indexColumns.remove(key);
+        indexTableNames.remove(key);
+        indexUniqueFlags.remove(key);
+        indexWhereClauses.remove(key);
+        indexMethods.remove(key);
+        indexReloptions.remove(key);
+        indexColumnOptions.remove(key);
+        indexIncludeColumns.remove(key);
+        indexNullsNotDistinct.remove(key);
     }
 
     /** Rename an index: re-key across all index maps and update schema registry. */
     public void renameIndex(String oldName, String newName) {
-        String oldKey = oldName.toLowerCase();
-        String newKey = newName.toLowerCase();
+        String oldKey = ixKey(oldName);
+        String newKey = newName;
         List<String> cols = indexColumns.remove(oldKey);
         if (cols != null) indexColumns.put(newKey, cols);
         String tbl = indexTableNames.remove(oldKey);
@@ -1908,8 +1995,8 @@ public class Database {
         if (nnd != null) indexNullsNotDistinct.put(newKey, nnd);
         // Update schema registry
         for (Map.Entry<String, Set<String>> entry : schemaObjectRegistry.entrySet()) {
-            if (entry.getValue().remove("index:" + oldKey)) {
-                entry.getValue().add("index:" + newKey);
+            if (entry.getValue().remove("index:" + oldKey.toLowerCase())) {
+                entry.getValue().add("index:" + newKey.toLowerCase());
             }
         }
         // Update object ownership key

@@ -8,7 +8,7 @@ public class PgTrigger {
     public enum Timing { BEFORE, AFTER, INSTEAD_OF }
     public enum Event { INSERT, UPDATE, DELETE, TRUNCATE }
 
-    private final String name;
+    private String name;
     private final Timing timing;
     private final Event event;
     private final String tableName;
@@ -63,6 +63,11 @@ public class PgTrigger {
 
     public String getName() {
         return name;
+    }
+
+    /** ALTER TRIGGER ... RENAME TO: the trigger keeps its definition under a new name. */
+    public void setName(String name) {
+        this.name = name;
     }
 
     public Timing getTiming() {

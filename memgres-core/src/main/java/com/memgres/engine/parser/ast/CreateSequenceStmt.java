@@ -57,6 +57,11 @@ public final class CreateSequenceStmt implements Statement {
         this(name, ifNotExists, startWith, incrementBy, minValue, maxValue, cycle, false);
     }
 
+    /** The schema written before the name, when the name was written qualified. */
+    private String schema;
+    public String schema() { return schema; }
+    public void setSchema(String schema) { this.schema = schema; }
+
     public String name() { return name; }
     public boolean ifNotExists() { return ifNotExists; }
     public Long startWith() { return startWith; }

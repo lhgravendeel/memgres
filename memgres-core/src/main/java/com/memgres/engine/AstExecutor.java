@@ -1379,6 +1379,15 @@ public class AstExecutor {
             : database.getFunction(stmt.name());
     }
 
+    /**
+     * The signature PostgreSQL names when a routine is missing: the name with the argument list
+     * that was written, so two overloads of one name are told apart in the message.
+     */
+    private static String alterFunctionSignature(AlterFunctionStmt stmt) {
+        if (stmt.paramTypes() == null) return stmt.name();
+        return stmt.name() + "(" + DdlObjectExecutor.canonicalTypeList(stmt.paramTypes()) + ")";
+    }
+
     private QueryResult executeAlterFunction(AlterFunctionStmt stmt) {
         String tag = stmt.commandTag();
         String kind = stmt.isProcedure() ? "procedure" : "function";
@@ -1388,7 +1397,7 @@ public class AstExecutor {
                 PgFunction func = resolveAlterFunction(stmt);
                 if (func == null) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
-                    throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
+                    throw new MemgresException(kind + " " + alterFunctionSignature(stmt) + " does not exist", "42883");
                 }
                 // Check for name conflict: target name must not already exist with compatible signature
                 java.util.List<PgFunction> existingTarget = database.getFunctionOverloads(stmt.targetValue());
@@ -1425,7 +1434,7 @@ public class AstExecutor {
                 PgFunction func = resolveAlterFunction(stmt);
                 if (func == null) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
-                    throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
+                    throw new MemgresException(kind + " " + alterFunctionSignature(stmt) + " does not exist", "42883");
                 }
                 String oldSchema = func.getSchemaName() != null ? func.getSchemaName() : "public";
                 String newSchema = stmt.targetValue();
@@ -1443,7 +1452,7 @@ public class AstExecutor {
                 PgFunction func = resolveAlterFunction(stmt);
                 if (func == null) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
-                    throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
+                    throw new MemgresException(kind + " " + alterFunctionSignature(stmt) + " does not exist", "42883");
                 }
                 String newOwner = ddlExecutor.resolveOwnerName(stmt.targetValue());
                 if (!database.hasRole(newOwner)) {
@@ -1457,7 +1466,7 @@ public class AstExecutor {
                 PgFunction func = resolveAlterFunction(stmt);
                 if (func == null) {
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, tag);
-                    throw new MemgresException(kind + " " + stmt.name() + " does not exist", "42883");
+                    throw new MemgresException(kind + " " + alterFunctionSignature(stmt) + " does not exist", "42883");
                 }
                 // Record undo for transactional rollback
                 if (session != null && session.getStatus() == Session.TransactionStatus.IN_TRANSACTION) {
@@ -1560,6 +1569,10 @@ public class AstExecutor {
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }
                 if (database.hasIndex(stmt.name())) {
+                    // The new name has to be free of every kind of relation, not only of another
+                    // index: renaming an index onto a table left two relations answering to one
+                    // name and the index unreachable under either.
+                    RelationNamespace.requireFree(database, defaultSchema(), stmt.targetValue(), null);
                     if (database.hasIndex(stmt.targetValue())) {
                         throw new MemgresException("relation \"" + stmt.targetValue() + "\" already exists", "42P07");
                     }

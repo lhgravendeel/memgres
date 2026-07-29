@@ -504,6 +504,11 @@ class DdlAdminExecutor {
             throw new MemgresException("role \"" + roleName + "\" does not exist", "42704");
         }
         if (stmt.renameTo() != null) {
+            // Renaming onto a role that already exists would merge two roles into one and lose
+            // whichever set of privileges was written second.
+            if (executor.database.hasRole(stmt.renameTo())) {
+                throw new MemgresException("role \"" + stmt.renameTo() + "\" already exists", "42710");
+            }
             Map<String, String> attrs = executor.database.getRole(stmt.name());
             if (attrs != null) {
                 executor.database.removeRole(stmt.name());

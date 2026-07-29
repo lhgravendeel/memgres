@@ -104,8 +104,9 @@ class DdlParser {
                 throw new MemgresException(
                         "syntax error at or near \"NOT\"", "42601");
             }
+            String langName = parser.readIdentifierOrString();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("create_noop", "ok");
+            return new SetStmt("create_stub", "language" + STUB_SEP + langName);
         }
 
         // CREATE EVENT TRIGGER
@@ -143,10 +144,19 @@ class DdlParser {
         }
 
         // No-op CREATE targets (accepted but not functionally implemented)
-        if (parser.matchKeyword("CONVERSION")
-                || parser.matchKeywords("DEFAULT", "CONVERSION")
-                || parser.matchKeyword("TABLESPACE")
-                || parser.matchKeyword("TRANSFORM")
+        // A conversion and a tablespace have no behaviour here, but their names are remembered
+        // so a later ALTER on a name that was never created is refused rather than ignored.
+        if (parser.matchKeyword("CONVERSION") || parser.matchKeywords("DEFAULT", "CONVERSION")) {
+            String convName = parser.readIdentifierOrString();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("create_stub", "conversion" + STUB_SEP + convName);
+        }
+        if (parser.matchKeyword("TABLESPACE")) {
+            String tsName = parser.readIdentifierOrString();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("create_stub", "tablespace" + STUB_SEP + tsName);
+        }
+        if (parser.matchKeyword("TRANSFORM")
                 || parser.matchKeywords("ACCESS", "METHOD")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("create_noop", "ok");
@@ -296,12 +306,17 @@ class DdlParser {
             return new SetStmt(action, dbName);
         }
         else if (parser.matchKeyword("TABLESPACE")) {
+            parser.matchKeywords("IF", "EXISTS");
+            String tsName = parser.readIdentifierOrString();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return new SetStmt("drop_stub", "tablespace" + STUB_SEP + tsName);
         }
         else if (parser.matchKeyword("LANGUAGE")) {
+            parser.matchKeyword("PROCEDURAL");
+            parser.matchKeywords("IF", "EXISTS");
+            String langName = parser.readIdentifierOrString();
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_noop", "ok");
+            return new SetStmt("drop_stub", "language" + STUB_SEP + langName);
         }
         else if (parser.matchKeywords("EVENT", "TRIGGER")) {
             return parseDropEventTrigger();
@@ -364,8 +379,9 @@ class DdlParser {
             }
         }
         // Every kind carries the qualifier onward so the executor can tell a missing schema from
-        // a missing object; only routines are also looked up by it, the rest still key by bare
-        // name. An operator writes its own schema into its name above.
+        // a missing object; routines and indexes are also looked up by it, because an unqualified
+        // name of either only reaches what the search path makes visible, and the rest still key
+        // by bare name. An operator writes its own schema into its name above.
         String dropSchema = objectType == DropStmt.ObjectType.OPERATOR ? null : qualifier;
 
         java.util.List<String> funcParamTypes = null;
@@ -639,12 +655,17 @@ class DdlParser {
             return new SetStmt("alter_noop", "ok");
         }
         if (parser.matchKeyword("AGGREGATE")) return parseAlterAggregate();
-        // No-op ALTER targets
-        if (parser.matchKeyword("COLLATION")
-                || parser.matchKeyword("RULE") || parser.matchKeyword("CONVERSION")
-                || parser.matchKeyword("TABLESPACE")
-                || parser.matchKeyword("LANGUAGE")
-                || parser.matchKeywords("LARGE", "OBJECT")
+        // ALTER on a name that was never created is an error in PostgreSQL, so each of these
+        // carries the name it was written with and is checked before it is ignored.
+        if (parser.matchKeyword("COLLATION")) return parseAlterStub("collation");
+        if (parser.matchKeyword("CONVERSION")) return parseAlterStub("conversion");
+        if (parser.matchKeyword("TABLESPACE")) return parseAlterStub("tablespace");
+        if (parser.matchKeyword("LANGUAGE") || parser.matchKeywords("PROCEDURAL", "LANGUAGE")) {
+            return parseAlterStub("language");
+        }
+        if (parser.matchKeyword("RULE")) return parseAlterRuleStub();
+        if (parser.matchKeyword("TRIGGER")) return parseAlterTriggerStub();
+        if (parser.matchKeywords("LARGE", "OBJECT")
                 || parser.matchKeyword("TRANSFORM")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_noop", "ok");
@@ -849,7 +870,8 @@ class DdlParser {
     CreateViewStmt parseCreateView(boolean orReplace, boolean materialized) {
         if (parser.matchKeywords("IF", "NOT", "EXISTS")) orReplace = true;
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        String viewSchema = null;
+        if (parser.match(TokenType.DOT)) { viewSchema = name; name = parser.readIdentifier(); }
 
         List<String> columnNames = null;
         if (parser.check(TokenType.LEFT_PAREN) && !parser.checkKeyword("AS")) {
@@ -869,7 +891,7 @@ class DdlParser {
                 if (parser.matchKeyword("NO")) { parser.expectKeyword("DATA"); withData = false; }
                 else parser.expectKeyword("DATA");
             }
-            return new CreateViewStmt(name, query, orReplace, true, columnNames, withData);
+            return new CreateViewStmt(name, query, orReplace, true, columnNames, withData).withSchema(viewSchema);
         }
 
         // Parse WITH (options) before AS, e.g. WITH (security_invoker = true)
@@ -903,7 +925,8 @@ class DdlParser {
             if (checkOption == null) checkOption = "CASCADED";
         }
 
-        return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption, withOptions);
+        return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption, withOptions)
+                .withSchema(viewSchema);
     }
 
     /**
@@ -1350,7 +1373,8 @@ class DdlParser {
     CreateSequenceStmt parseCreateSequence(boolean temporary) {
         boolean ifNotExists = parser.matchKeywords("IF", "NOT", "EXISTS");
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        String seqSchema = null;
+        if (parser.match(TokenType.DOT)) { seqSchema = name; name = parser.readIdentifier(); }
         Long[] startWith = {null}, incrementBy = {null}, minValue = {null}, maxValue = {null};
         Boolean[] cycle = {null};
         Integer[] cache = {null};
@@ -1361,6 +1385,7 @@ class DdlParser {
         stmt.setCache(cache[0]);
         stmt.setAsType(asType[0]);
         stmt.setOwnedBy(ownedByTable[0], ownedByColumn[0]);
+        stmt.setSchema(seqSchema);
         return stmt;
     }
 
@@ -1372,6 +1397,13 @@ class DdlParser {
             AlterSequenceStmt renamed = AlterSequenceStmt.renameTo(name, parser.readIdentifier());
             renamed.setIfExists(ifExists);
             return renamed;
+        }
+        if (parser.matchKeywords("SET", "SCHEMA")) {
+            AlterSequenceStmt moved = new AlterSequenceStmt(name, false, null, null, null,
+                    null, null, null, null, null, null, null);
+            moved.setIfExists(ifExists);
+            moved.setSetSchema(parser.readIdentifier());
+            return moved;
         }
         boolean restart = false;
         Long restartWith = null;
@@ -1431,6 +1463,50 @@ class DdlParser {
 
     // ---- ALTER specific types ----
 
+    /**
+     * {@code ALTER <kind> name [RENAME TO new | anything else]} for the object kinds memgres
+     * accepts without implementing. The name travels with the statement so the executor can
+     * refuse one that was never created, and a RENAME takes effect on the remembered name.
+     */
+    private Statement parseAlterStub(String kind) {
+        String name = parser.readIdentifierOrString();
+        String newName = "";
+        if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_stub", kind + STUB_SEP + name + STUB_SEP + newName);
+    }
+
+    /** {@code ALTER RULE name ON relation ...}: the rule is looked up on its relation. */
+    private Statement parseAlterRuleStub() {
+        String name = parser.readIdentifierOrString();
+        String relation = "";
+        if (parser.matchKeyword("ON")) {
+            relation = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) relation = parser.readIdentifier();
+        }
+        String newName = "";
+        if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_rule", name + STUB_SEP + relation + STUB_SEP + newName);
+    }
+
+    /** {@code ALTER TRIGGER name ON relation RENAME TO new}. */
+    private Statement parseAlterTriggerStub() {
+        String name = parser.readIdentifierOrString();
+        String relation = "";
+        if (parser.matchKeyword("ON")) {
+            relation = parser.readIdentifier();
+            if (parser.match(TokenType.DOT)) relation = parser.readIdentifier();
+        }
+        String newName = "";
+        if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_trigger", name + STUB_SEP + relation + STUB_SEP + newName);
+    }
+
+    /** Separator inside the encoded payload of a stub statement; SQL text cannot contain it. */
+    private static final String STUB_SEP = "\u0001";
+
     AlterDomainStmt parseAlterDomain() {
         String domainName = parser.readIdentifier();
         if (parser.match(TokenType.DOT)) domainName = parser.readIdentifier();
@@ -1441,6 +1517,10 @@ class DdlParser {
         }
         if (parser.matchKeywords("DROP", "DEFAULT"))
             return new AlterDomainStmt(domainName, "DROP_DEFAULT", null, null, null, null);
+        if (parser.matchKeywords("SET", "NOT", "NULL"))
+            return new AlterDomainStmt(domainName, "SET_NOT_NULL", null, null, null, null);
+        if (parser.matchKeywords("DROP", "NOT", "NULL"))
+            return new AlterDomainStmt(domainName, "DROP_NOT_NULL", null, null, null, null);
         // The constraint name is optional: ALTER DOMAIN d ADD CHECK (...) is as valid as the
         // named form, and PostgreSQL then names the constraint itself.
         if (parser.matchKeyword("ADD")) {
@@ -1468,6 +1548,16 @@ class DdlParser {
             parser.expectKeyword("TO");
             String newName = parser.readIdentifier();
             return new AlterDomainStmt(domainName, "RENAME_CONSTRAINT", null, oldName, null, null, false, newName);
+        }
+        // RENAME TO and SET SCHEMA really move the domain; reading them as no-ops reported a
+        // rename that never happened and left the old name answering.
+        if (parser.matchKeywords("RENAME", "TO")) {
+            return new AlterDomainStmt(domainName, "RENAME_TO", null, null, null, null, false,
+                    parser.readIdentifier());
+        }
+        if (parser.matchKeywords("SET", "SCHEMA")) {
+            return new AlterDomainStmt(domainName, "SET_SCHEMA", null, null, null, null, false,
+                    parser.readIdentifier());
         }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         return new AlterDomainStmt(domainName, "NO_OP", null, null, null, null);
@@ -1499,6 +1589,11 @@ class DdlParser {
         if (parser.matchKeywords("RENAME", "TO"))
             return new AlterTypeStmt(typeName, AlterTypeStmt.Action.RENAME_TO, parser.readIdentifier(), null, false, null, null);
         if (parser.matchKeywords("ADD", "ATTRIBUTE")) {
+            // ADD ATTRIBUTE has no IF NOT EXISTS — only DROP ATTRIBUTE has IF EXISTS — so the
+            // words are a syntax error rather than an attribute called "not".
+            if (parser.matchKeyword("IF")) {
+                throw new ParseException("syntax error", parser.peek());
+            }
             String attrName = parser.readIdentifier();
             String attrType = parser.readIdentifier();
             // Handle multi-word types like "double precision"
@@ -1510,9 +1605,10 @@ class DdlParser {
             return new AlterTypeStmt(typeName, AlterTypeStmt.Action.ADD_ATTRIBUTE, attrName, attrType, false, null, null);
         }
         if (parser.matchKeywords("DROP", "ATTRIBUTE")) {
-            parser.matchKeywords("IF", "EXISTS");
+            boolean attrIfExists = parser.matchKeywords("IF", "EXISTS");
             String attrName = parser.readIdentifier();
-            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.DROP_ATTRIBUTE, attrName, null, false, null, null);
+            return new AlterTypeStmt(typeName, AlterTypeStmt.Action.DROP_ATTRIBUTE, attrName, null,
+                    false, null, null, attrIfExists);
         }
         if (parser.matchKeywords("ALTER", "ATTRIBUTE")) {
             String attrName = parser.readIdentifier();

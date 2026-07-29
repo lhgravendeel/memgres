@@ -47,6 +47,20 @@ public final class CreateViewStmt implements Statement {
         this(name, query, orReplace, materialized, null, true, null);
     }
 
+    /**
+     * The schema the name was written under, when it was written qualified. A view goes into the
+     * schema it names, not into the one the session happens to be in, so a table of the same name
+     * in that schema is the same relation and blocks it.
+     */
+    private String schema;
+
+    public CreateViewStmt withSchema(String schemaName) {
+        this.schema = schemaName;
+        return this;
+    }
+
+    public String schema() { return schema; }
+
     public String name() { return name; }
     public Statement query() { return query; }
     public boolean orReplace() { return orReplace; }

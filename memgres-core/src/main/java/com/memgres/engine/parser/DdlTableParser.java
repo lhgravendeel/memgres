@@ -141,7 +141,20 @@ class DdlTableParser {
                     likeTables.add(likeTableName);
                 }
             } else if (isTableConstraintStart()) {
-                constraints.add(parseTableConstraint());
+                TableConstraint tc = parseTableConstraint();
+                // A table constraint written in CREATE TABLE may carry NOT VALID. There is
+                // nothing already stored for it to skip over, so PostgreSQL takes the
+                // constraint as valid and only the word is spare.
+                if (parser.matchKeywords("NOT", "VALID")) {
+                    if (tc.type() == TableConstraint.ConstraintType.UNIQUE
+                            || tc.type() == TableConstraint.ConstraintType.PRIMARY_KEY) {
+                        throw new MemgresException(
+                                (tc.type() == TableConstraint.ConstraintType.UNIQUE
+                                        ? "UNIQUE" : "PRIMARY KEY")
+                                + " constraints cannot be marked NOT VALID", "0A000");
+                    }
+                }
+                constraints.add(tc);
             } else {
                 ColumnDef colDef = parseColumnDef();
                 columns.add(colDef);

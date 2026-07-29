@@ -10,7 +10,7 @@ public class Column {
     private final String name;
     private final DataType type;
     private final boolean nullable;
-    private final boolean primaryKey;
+    private boolean primaryKey;
     private String defaultValue;       // String representation (for display/catalog)
     private Expression parsedDefaultExpr;     // Parsed AST (for evaluation; avoids re-parsing)
     private final String enumTypeName;
@@ -18,7 +18,7 @@ public class Column {
     private final Integer scale;
     private final String generatedExpr;
     private final boolean virtual;          // PG 18: VIRTUAL generated column (computed on read)
-    private final String domainTypeName;
+    private String domainTypeName;
     private final String compositeTypeName;  // For composite type columns (e.g., "pair")
     private final DataType arrayElementType; // For array columns, the element type (e.g., INTEGER for integer[])
     private int tableOid;    // PgWire RowDescription: source table OID (0 if not from a real table)
@@ -155,6 +155,8 @@ public class Column {
     public DataType getType() { return type; }
     public boolean isNullable() { return nullable; }
     public boolean isPrimaryKey() { return primaryKey; }
+    /** Clear or set the flag when the table's PRIMARY KEY constraint is dropped or added. */
+    public void setPrimaryKey(boolean primaryKey) { this.primaryKey = primaryKey; }
     public String getDefaultValue() { return defaultValue; }
     public void setDefaultValue(String defaultValue) { this.defaultValue = defaultValue; }
     public Expression getParsedDefaultExpr() { return parsedDefaultExpr; }
@@ -166,6 +168,8 @@ public class Column {
     public boolean isGenerated() { return generatedExpr != null; }
     public boolean isVirtual() { return virtual; }
     public String getDomainTypeName() { return domainTypeName; }
+    /** ALTER DOMAIN ... RENAME TO: the column keeps its domain, which now answers to another name. */
+    public void setDomainTypeName(String domainTypeName) { this.domainTypeName = domainTypeName; }
     public String getCompositeTypeName() { return compositeTypeName; }
     public DataType getArrayElementType() { return arrayElementType; }
     public int getTableOid() { return tableOid; }

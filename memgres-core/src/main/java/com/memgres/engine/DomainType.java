@@ -14,7 +14,7 @@ public class DomainType {
     private final String name;
     private final DataType baseType;
     private final String baseTypeName; // original type name (e.g., "citext")
-    private final boolean notNull;
+    private boolean notNull;
     private String checkExpression; // raw SQL text for the CHECK constraint
     private Expression parsedCheck; // parsed CHECK expression (VALUE replaced with the actual value)
     private String defaultValue;
@@ -40,6 +40,8 @@ public class DomainType {
     public DataType getBaseType() { return baseType; }
     public String getBaseTypeName() { return baseTypeName; }
     public boolean isNotNull() { return notNull; }
+    /** ALTER DOMAIN ... SET/DROP NOT NULL. */
+    public void setNotNull(boolean notNull) { this.notNull = notNull; }
     public String getCheckExpression() { return checkExpression; }
     public Expression getParsedCheck() { return parsedCheck; }
     public String getDefaultValue() { return defaultValue; }

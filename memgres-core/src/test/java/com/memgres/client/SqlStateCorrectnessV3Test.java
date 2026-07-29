@@ -238,12 +238,13 @@ class SqlStateCorrectnessV3Test {
         }
     }
 
-    @Test void hash_partition_wrong_modulus_gives_42P16() throws SQLException {
+    @Test void hash_partition_wrong_modulus_gives_42P17() throws SQLException {
         exec("CREATE TABLE ssv3_hpart (id INT) PARTITION BY HASH (id)");
         exec("CREATE TABLE ssv3_hpart_0 PARTITION OF ssv3_hpart FOR VALUES WITH (MODULUS 4, REMAINDER 0)");
         try {
-            // Different modulus should give 42P16 (invalid_table_definition)
-            assertSqlState("42P16",
+            // A modulus that splits an existing partition's slice overlaps it, and PG reports
+            // the overlap (42P17) rather than an invalid definition.
+            assertSqlState("42P17",
                 "CREATE TABLE ssv3_hpart_bad PARTITION OF ssv3_hpart FOR VALUES WITH (MODULUS 8, REMAINDER 0)");
         } finally {
             exec("DROP TABLE IF EXISTS ssv3_hpart CASCADE");

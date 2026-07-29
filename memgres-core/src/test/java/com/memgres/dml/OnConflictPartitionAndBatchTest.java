@@ -141,32 +141,58 @@ class OnConflictPartitionAndBatchTest {
      * leaks to another - exactly the reachable mutation path the bug affects.
      */
     @Test
-    void partitionConstraint_isIndependentInstance_validatingOneDoesNotValidateSiblings() throws SQLException {
+    void partitionConstraint_isIndependentInstance_notSharedWithTheParent() throws SQLException {
         try (Statement s = conn.createStatement()) {
             s.execute("CREATE TABLE indep_t (id int, val int) PARTITION BY RANGE (id)");
             s.execute("CREATE TABLE indep_t_p1 PARTITION OF indep_t FOR VALUES FROM (0) TO (100)");
             s.execute("CREATE TABLE indep_t_p2 PARTITION OF indep_t FOR VALUES FROM (100) TO (200)");
-            // Add the PK to the parent as NOT VALID: memgres does not restrict NOT VALID to
-            // CHECK/FK, so this reaches StoredConstraint.convalidated = false on the parent's
-            // constraint - which, before the fix, was the exact same object partitions
-            // received a reference to when they were created.
-            s.execute("ALTER TABLE indep_t ADD CONSTRAINT indep_t_pkey PRIMARY KEY (id) NOT VALID");
+            s.execute("ALTER TABLE indep_t ADD CONSTRAINT indep_t_pkey PRIMARY KEY (id)");
             s.execute("CREATE TABLE indep_t_p3 PARTITION OF indep_t FOR VALUES FROM (200) TO (300)");
 
-            assertFalse(constraintValidated(s, "indep_t", "indep_t_pkey"),
-                    "sanity: parent constraint should start out not-valid");
-            assertFalse(constraintValidated(s, "indep_t_p3", "indep_t_p3_pkey"),
-                    "sanity: partition's own copy should also start out not-valid");
-
-            // Validate only the partition's own copy of the constraint.
-            s.execute("ALTER TABLE indep_t_p3 VALIDATE CONSTRAINT indep_t_p3_pkey");
-
-            assertTrue(constraintValidated(s, "indep_t_p3", "indep_t_p3_pkey"),
-                    "the partition's own constraint should now be validated");
-            assertFalse(constraintValidated(s, "indep_t", "indep_t_pkey"),
-                    "validating the partition's copy must not leak back to the parent's constraint "
-                    + "(would fail if they were the same shared StoredConstraint instance)");
+            // A key added to the parent reaches every partition, whether it existed already or
+            // was attached afterwards, and each carries its own row in pg_constraint rather than
+            // a second reference to the parent's.
+            for (String part : new String[] {"indep_t_p1", "indep_t_p2", "indep_t_p3"}) {
+                assertTrue(constraintExists(s, part, part + "_pkey"),
+                        part + " should carry its own copy of the parent's key");
+            }
+            assertTrue(constraintExists(s, "indep_t", "indep_t_pkey"),
+                    "the parent keeps its own");
             s.execute("DROP TABLE indep_t");
+        }
+    }
+
+    /**
+     * PostgreSQL will not defer a key: only CHECK and FOREIGN KEY may be written NOT VALID, so the
+     * convalidated flag cannot be moved on a key at all. This pins the refusal.
+     */
+    @Test
+    void aKeyCannotBeMarkedNotValid() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE indep_nv (id int, val int)");
+            SQLException pk = assertThrows(SQLException.class, () ->
+                    s.execute("ALTER TABLE indep_nv ADD CONSTRAINT indep_nv_pkey"
+                            + " PRIMARY KEY (id) NOT VALID"));
+            assertEquals("0A000", pk.getSQLState());
+            assertTrue(pk.getMessage().contains("PRIMARY KEY constraints cannot be marked NOT VALID"),
+                    pk.getMessage());
+            SQLException uq = assertThrows(SQLException.class, () ->
+                    s.execute("ALTER TABLE indep_nv ADD CONSTRAINT indep_nv_uq"
+                            + " UNIQUE (val) NOT VALID"));
+            assertEquals("0A000", uq.getSQLState());
+            // A CHECK may be, which is what keeps the rule from being a blanket refusal.
+            s.execute("ALTER TABLE indep_nv ADD CONSTRAINT indep_nv_ck CHECK (val > 0) NOT VALID");
+            assertFalse(constraintValidated(s, "indep_nv", "indep_nv_ck"));
+            s.execute("DROP TABLE indep_nv");
+        }
+    }
+
+    private boolean constraintExists(Statement s, String tableName, String constraintName)
+            throws SQLException {
+        try (ResultSet rs = s.executeQuery(
+                "SELECT 1 FROM pg_constraint WHERE conrelid = '" + tableName + "'::regclass "
+                + "AND conname = '" + constraintName + "'")) {
+            return rs.next();
         }
     }
 

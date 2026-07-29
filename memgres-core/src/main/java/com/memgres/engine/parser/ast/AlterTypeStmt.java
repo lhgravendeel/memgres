@@ -8,6 +8,8 @@ public final class AlterTypeStmt implements Statement {
     public final boolean ifNotExists;
     public final String position;
     public final String neighbor;
+    /** DROP ATTRIBUTE IF EXISTS: a missing attribute is a notice, not an error. */
+    public final boolean ifExists;
 
     public AlterTypeStmt(
             String typeName,
@@ -18,6 +20,19 @@ public final class AlterTypeStmt implements Statement {
             String position,
             String neighbor
     ) {
+        this(typeName, action, value, newValue, ifNotExists, position, neighbor, false);
+    }
+
+    public AlterTypeStmt(
+            String typeName,
+            Action action,
+            String value,
+            String newValue,
+            boolean ifNotExists,
+            String position,
+            String neighbor,
+            boolean ifExists
+    ) {
         this.typeName = typeName;
         this.action = action;
         this.value = value;
@@ -25,6 +40,7 @@ public final class AlterTypeStmt implements Statement {
         this.ifNotExists = ifNotExists;
         this.position = position;
         this.neighbor = neighbor;
+        this.ifExists = ifExists;
     }
 
     public enum Action { ADD_VALUE, RENAME_VALUE, RENAME_TO, SET_SCHEMA, OWNER_TO,
@@ -37,6 +53,7 @@ public final class AlterTypeStmt implements Statement {
     public boolean ifNotExists() { return ifNotExists; }
     public String position() { return position; }
     public String neighbor() { return neighbor; }
+    public boolean ifExists() { return ifExists; }
 
     @Override
     public boolean equals(Object o) {

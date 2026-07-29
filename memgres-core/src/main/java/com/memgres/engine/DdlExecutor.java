@@ -587,6 +587,57 @@ class DdlExecutor {
      *
      * @throws MemgresException with sqlState 42P17 if expression is not immutable
      */
+    /**
+     * A SQL-language function whose body is a single {@code SELECT expr} is inlined by the planner
+     * before the expression is ever judged, so what governs is the body, not the declared
+     * volatility: {@code CREATE FUNCTION f(int) RETURNS int LANGUAGE sql STABLE AS 'SELECT $1 + 1'}
+     * leaves an immutable expression behind and PostgreSQL accepts it in a partition key. A body
+     * that is not a single expression is not inlinable, and its declaration is believed.
+     *
+     * @return true when the call was judged here — by its body — and needs no volatility check
+     */
+    private static boolean checkInlinedSqlBody(PgFunction fn, Database db, String errorMsg) {
+        if (fn.getLanguage() == null || !"sql".equalsIgnoreCase(fn.getLanguage())) return false;
+        String body = fn.getBody();
+        if (body == null) return false;
+        String trimmed = body.trim();
+        while (trimmed.endsWith(";")) trimmed = trimmed.substring(0, trimmed.length() - 1).trim();
+        if (!trimmed.regionMatches(true, 0, "select", 0, 6)) return false;
+        String selectList = trimmed.substring(6).trim();
+        // Anything past the select list — FROM, WHERE, a second statement — is not a bare
+        // expression, so the body is not inlinable in the sense that matters here.
+        if (selectList.isEmpty() || containsBareSemicolon(selectList)) return false;
+        Expression inlined;
+        try {
+            inlined = com.memgres.engine.parser.Parser.parseExpression(selectList);
+        } catch (RuntimeException notAnExpression) {
+            return false;
+        }
+        checkExpressionImmutability(inlined, db, errorMsg);
+        return true;
+    }
+
+    /** True when the text holds a {@code ;} outside quotes and parentheses. */
+    private static boolean containsBareSemicolon(String text) {
+        int depth = 0;
+        boolean inString = false;
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            if (inString) {
+                if (ch == '\'') inString = false;
+            } else if (ch == '\'') {
+                inString = true;
+            } else if (ch == '(') {
+                depth++;
+            } else if (ch == ')') {
+                depth--;
+            } else if (ch == ';' && depth == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     static void checkExpressionImmutability(Expression expr, Database db, String errorMsg) {
         if (expr == null) return;
 
@@ -599,7 +650,7 @@ class DdlExecutor {
             }
             // Check user-defined function volatility
             PgFunction pgFunc = db.getFunction(fn.name());
-            if (pgFunc != null) {
+            if (pgFunc != null && !checkInlinedSqlBody(pgFunc, db, errorMsg)) {
                 String vol = pgFunc.getVolatility();
                 if (vol == null || "VOLATILE".equalsIgnoreCase(vol) || "STABLE".equalsIgnoreCase(vol)) {
                     throw new MemgresException(errorMsg, "42P17");

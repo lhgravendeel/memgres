@@ -16,7 +16,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * - tableoid::regclass shows which partition a row comes from
  * - Overlapping range partitions fail with 42P17 (invalid_object_definition)
  * - Duplicate list partition values fail with 42P17
- * - Hash partition with conflicting modulus/remainder fail with 42P16
+ * - Hash partition with conflicting modulus/remainder fail with 42P17
  */
 class PartitioningTableoidTest {
 
@@ -175,9 +175,9 @@ class PartitioningTableoidTest {
                 exec("CREATE TABLE ph2_dup PARTITION OF ph2 FOR VALUES WITH (modulus 2, remainder 0)");
                 fail("Duplicate hash partition should fail");
             } catch (SQLException e) {
-                // PG uses 42P16 for this
-                assertEquals("42P16", e.getSQLState(),
-                        "Conflicting hash partition should be 42P16, got " + e.getSQLState());
+                // PG reports the overlap with the existing partition
+                assertEquals("42P17", e.getSQLState(),
+                        "Conflicting hash partition should be 42P17, got " + e.getSQLState());
             }
         } finally {
             exec("DROP TABLE IF EXISTS ph2 CASCADE");
