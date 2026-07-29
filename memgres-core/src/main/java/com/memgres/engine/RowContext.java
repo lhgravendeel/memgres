@@ -3,6 +3,7 @@ package com.memgres.engine;
 import com.memgres.engine.util.Cols;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -75,11 +76,25 @@ public class RowContext {
         public final int[] bindings;
         /** The column index within each of those bindings. */
         public final int[] columns;
+        /**
+         * The type a merged column carries when its two sides did not already share one, or null.
+         *
+         * <p>A USING or NATURAL join's merged column is not either side's column: PostgreSQL
+         * resolves one type both sides can be read as and the merged column is that type, so
+         * {@code int JOIN bigint USING (k)} exposes a bigint. Taking the left side's type instead
+         * described the column as int4 and left the value whichever raw one came first.
+         */
+        public final DataType type;
 
         public OutCol(String name, int[] bindings, int[] columns) {
+            this(name, bindings, columns, null);
+        }
+
+        public OutCol(String name, int[] bindings, int[] columns, DataType type) {
             this.name = name;
             this.bindings = bindings;
             this.columns = columns;
+            this.type = type;
         }
 
         public OutCol(String name, int binding, int column) {
@@ -89,12 +104,17 @@ public class RowContext {
         /** True when a USING or NATURAL join folded several relations' columns into this one. */
         public boolean merged() { return bindings.length > 1; }
 
+        /** The same column, read as {@code t}. */
+        public OutCol withType(DataType t) {
+            return new OutCol(name, bindings, columns, t);
+        }
+
         /** The same column read from a binding list this one has been appended to. */
         public OutCol shift(int delta) {
             if (delta == 0) return this;
             int[] b = new int[bindings.length];
             for (int i = 0; i < b.length; i++) b[i] = bindings[i] + delta;
-            return new OutCol(name, b, columns);
+            return new OutCol(name, b, columns, type);
         }
 
         /** The value this column takes in a row: the first source that is not null. */
@@ -104,7 +124,7 @@ public class RowContext {
                 Object[] r = row.get(bindings[i]).row();
                 if (columns[i] >= r.length) continue;
                 Object v = r[columns[i]];
-                if (v != null) return v;
+                if (v != null) return type == null ? v : TypeCoercion.coerce(v, type);
             }
             return null;
         }
@@ -126,6 +146,11 @@ public class RowContext {
     private boolean outerJoinNullPadded;
     /** Column names from USING clauses. These exist in multiple bindings but should not raise ambiguity. */
     private Set<String> usingColumns;
+    /**
+     * Relations the FROM clause holds but does not answer to — the ones under an aliased
+     * parenthesized join. Naming one is a reference that cannot reach, not a missing entry.
+     */
+    private Set<String> coveredNames;
     /**
      * View-column aliasing: maps a view column name (lower-case) to the underlying base-table
      * column name. Set when a DML statement runs through an auto-updatable view that renames
@@ -301,6 +326,26 @@ public class RowContext {
         return named;
     }
 
+    /** Records the relations this row's FROM clause covers over. See {@code coveredNames}. */
+    public void setCoveredNames(Set<String> names) { this.coveredNames = names; }
+
+    /**
+     * What a qualifier no binding answers to is: a relation the query does not have, or one it has
+     * written down under a clause that renamed it. PostgreSQL words the two differently, and
+     * calling the second missing sent the reader looking for something they had already written.
+     */
+    private MemgresException noSuchFromEntry(String qualifier) {
+        if (coveredNames == null || !coveredNames.contains(qualifier.toLowerCase())) {
+            return new MemgresException(
+                    "missing FROM-clause entry for table \"" + qualifier + "\"", "42P01");
+        }
+        MemgresException e = new MemgresException(
+                "invalid reference to FROM-clause entry for table \"" + qualifier + "\"", "42P01");
+        e.setDetail("There is an entry for table \"" + qualifier
+                + "\", but it cannot be referenced from this part of the query.");
+        return e;
+    }
+
     /**
      * Resolve a column value. Handles both qualified (table.col) and unqualified (col) references.
      * For unqualified references, throws on ambiguity (column exists in multiple tables).
@@ -332,12 +377,12 @@ public class RowContext {
                         throw ex;
                     }
                 }
-                throw new MemgresException("missing FROM-clause entry for table \"" + tableQualifier + "\"", "42P01");
+                throw noSuchFromEntry(tableQualifier);
             }
             int idx = b.table().getColumnIndex(columnName);
             if (idx < 0) {
                 MemgresException ex = new MemgresException("column " + tableQualifier + "." + columnName + " does not exist", "42703");
-                String hint = suggestClosestColumn(columnName, b.table());
+                String hint = suggestClosestColumn(columnName, Collections.singletonList(b));
                 if (hint != null) ex.setHint(hint);
                 throw ex;
             }
@@ -383,11 +428,8 @@ public class RowContext {
         }
         if (!found) {
             MemgresException ex = new MemgresException("column \"" + columnName + "\" does not exist", "42703");
-            // Try to suggest a close match from any binding
-            for (TableBinding b : bindings) {
-                String hint = suggestClosestColumn(columnName, b.table());
-                if (hint != null) { ex.setHint(hint); break; }
-            }
+            String hint = suggestClosestColumn(columnName, bindings);
+            if (hint != null) ex.setHint(hint);
             throw ex;
         }
         return result;
@@ -510,7 +552,11 @@ public class RowContext {
         if (outputColumns != null) {
             for (OutCol oc : outputColumns) {
                 if (oc.name.equalsIgnoreCase(columnName) && oc.bindings[0] < bindings.size()) {
-                    return bindings.get(oc.bindings[0]).table().getColumns().get(oc.columns[0]);
+                    Column source = bindings.get(oc.bindings[0]).table().getColumns().get(oc.columns[0]);
+                    // A merged column is declared with the type the join resolved for it, not with
+                    // either side's -- which is what pg_typeof is being asked about.
+                    return oc.type == null ? source
+                            : new Column(source.getName(), oc.type, source.isNullable(), false, null);
                 }
             }
         }
@@ -565,6 +611,40 @@ public class RowContext {
      * Uses Levenshtein edit distance. Returns null if no close match found.
      */
     static String suggestClosestColumn(String typo, Table table) {
+        String name = closestColumn(typo, table);
+        return name == null ? null
+                : "Perhaps you meant to reference the column \"" + name + "\".";
+    }
+
+    /**
+     * The hint for a name no relation in scope answers to, naming every relation that has a near
+     * miss and qualifying each with the name that relation is known by.
+     *
+     * <p>PostgreSQL always writes the suggestion qualified — {@code "a.t"}, not {@code "t"} — since
+     * an unqualified suggestion for a query with two relations would be as ambiguous as the name
+     * that failed, and it offers one per relation. Suggesting the bare column name told the reader
+     * to write what they had just written.
+     */
+    static String suggestClosestColumn(String typo, List<TableBinding> bindings) {
+        List<String> suggestions = new ArrayList<>();
+        for (TableBinding b : bindings) {
+            String column = closestColumn(typo, b.table());
+            if (column == null) continue;
+            String relation = b.alias() != null ? b.alias() : b.table().getName();
+            String qualified = "\"" + relation + "." + column + "\"";
+            if (!suggestions.contains(qualified)) suggestions.add(qualified);
+        }
+        if (suggestions.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder("Perhaps you meant to reference the column ");
+        for (int i = 0; i < suggestions.size(); i++) {
+            if (i > 0) sb.append(i == suggestions.size() - 1 ? " or the column " : ", the column ");
+            sb.append(suggestions.get(i));
+        }
+        return sb.append('.').toString();
+    }
+
+    /** The column of {@code table} closest to a name it does not have, or null when none is near. */
+    private static String closestColumn(String typo, Table table) {
         if (table == null || typo == null) return null;
         String bestName = null;
         int bestDist = Integer.MAX_VALUE;
@@ -578,10 +658,7 @@ public class RowContext {
             }
         }
         // Only suggest if the edit distance is small relative to the name length
-        if (bestName != null && bestDist <= Math.max(1, typo.length() / 2)) {
-            return "Perhaps you meant to reference the column \"" + bestName + "\".";
-        }
-        return null;
+        return bestName != null && bestDist <= Math.max(1, typo.length() / 2) ? bestName : null;
     }
 
     /** Compute Levenshtein edit distance between two strings. */

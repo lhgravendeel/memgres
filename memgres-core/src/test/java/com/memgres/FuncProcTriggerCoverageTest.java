@@ -313,14 +313,15 @@ class FuncProcTriggerCoverageTest {
         exec("CREATE TABLE fn_setof_data (id INTEGER, name TEXT)");
         exec("INSERT INTO fn_setof_data VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')");
         exec("CREATE FUNCTION fn_get_names() RETURNS SETOF TEXT AS $$ DECLARE rec RECORD; BEGIN FOR rec IN SELECT name FROM fn_setof_data ORDER BY id LOOP RETURN NEXT rec; END LOOP; RETURN; END; $$ LANGUAGE plpgsql");
+        // A set-returning call in the select list expands into rows, one value per row --
+        // measured against PostgreSQL 18, which answers three rows here. This used to accept
+        // one row holding the whole set rendered as an array, which PostgreSQL never answers.
         ResultSet rs = query("SELECT fn_get_names()");
-        assertTrue(rs.next());
-        // Result may be returned as array or as individual rows
-        String val = rs.getString(1);
-        assertNotNull(val);
-        assertTrue(val.contains("alpha"));
-        assertTrue(val.contains("beta"));
-        assertTrue(val.contains("gamma"));
+        for (String expected : new String[]{"alpha", "beta", "gamma"}) {
+            assertTrue(rs.next());
+            assertTrue(rs.getString(1).contains(expected), rs.getString(1));
+        }
+        assertFalse(rs.next());
         exec("DROP FUNCTION fn_get_names");
         exec("DROP TABLE fn_setof_data");
     }

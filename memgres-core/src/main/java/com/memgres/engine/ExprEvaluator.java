@@ -3534,6 +3534,12 @@ class ExprEvaluator {
                 PgFunction userFunc = resolveUserFunctionForTyping(name, fn, bindings);
                 if (userFunc != null && userFunc.getReturnType() != null) {
                     String declaredReturn = userFunc.getReturnType().replaceAll("\\(.*\\)", "").trim();
+                    // SETOF t is a set of t, and a call that expands into rows carries one t per
+                    // row -- so the column is t. Reading "SETOF int" as a type name found none
+                    // and the expanded rows were described as text.
+                    if (declaredReturn.regionMatches(true, 0, "SETOF ", 0, 6)) {
+                        declaredReturn = declaredReturn.substring(6).trim();
+                    }
                     if (PolymorphicTypes.isPolymorphic(declaredReturn)) {
                         // The result type of a polymorphic routine is whatever this call's
                         // arguments bind its slots to.

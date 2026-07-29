@@ -221,6 +221,9 @@ class DmlExecutor {
             }
         }
         placement.reject(oc.doUpdateWhereClause(), "WHERE");
+        // The WHERE of a DO UPDATE decides whether to overwrite the one conflicting row, so it is
+        // an UPDATE's WHERE and takes no set either -- the SET list beside it already refuses one.
+        executor.selectExecutor.rejectSrfIn(oc.doUpdateWhereClause(), "WHERE");
         if (oc.constraint() != null) {
             StoredConstraint named = null;
             for (StoredConstraint sc : table.getConstraints()) {
@@ -339,14 +342,14 @@ class DmlExecutor {
                     // into rows. Two or more rows are a scan of a constant table, which has
                     // nowhere to expand a set, and PostgreSQL refuses it -- measured: the same
                     // call in a one-row VALUES is accepted and writes one row per element.
-                    if (stmt.values().size() > 1) SelectExecutor.rejectSrfIn(value, "VALUES");
+                    if (stmt.values().size() > 1) executor.selectExecutor.rejectSrfIn(value, "VALUES");
                 }
             }
         }
         // ON CONFLICT DO UPDATE assigns to one row, the same as an UPDATE, and is named so.
         if (stmt.onConflict() != null && stmt.onConflict().doUpdate() != null) {
             for (InsertStmt.SetClause set : stmt.onConflict().doUpdate()) {
-                SelectExecutor.rejectSrfIn(set.value(), "UPDATE");
+                executor.selectExecutor.rejectSrfIn(set.value(), "UPDATE");
             }
         }
         // Capture view column mapping/order before any further resolveTable calls clobber them.
@@ -1816,6 +1819,10 @@ class DmlExecutor {
         // group or a finished result to have a value.
         PlacementCheck placement = executor.selectExecutor.placementCheck;
         placement.reject(stmt.where(), "WHERE");
+        // A WHERE decides one row at a time whether to delete it, so a set written in one has
+        // nowhere to expand: PostgreSQL refuses it here for the same reason it refuses it in an
+        // UPDATE's WHERE, which this already did.
+        executor.selectExecutor.rejectSrfIn(stmt.where(), "WHERE");
         placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table,
                 stmt.alias() != null ? stmt.alias() : stmt.table());
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
@@ -3122,6 +3129,7 @@ class DmlExecutor {
     private void checkMergePlacement(MergeStmt stmt) {
         PlacementCheck placement = executor.selectExecutor.placementCheck;
         placement.reject(stmt.onCondition(), "JOIN conditions");
+        executor.selectExecutor.rejectSrfIn(stmt.onCondition(), "JOIN conditions");
         for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
             Expression when = null;
             List<InsertStmt.SetClause> sets = null;
@@ -3140,13 +3148,38 @@ class DmlExecutor {
                 values = wn.values();
             }
             placement.reject(when, "MERGE WHEN conditions");
+            executor.selectExecutor.rejectSrfIn(when, "MERGE WHEN conditions");
             if (sets != null) {
-                for (InsertStmt.SetClause set : sets) placement.reject(set.value(), "UPDATE");
+                for (InsertStmt.SetClause set : sets) {
+                    placement.reject(set.value(), "UPDATE");
+                    executor.selectExecutor.rejectSrfIn(set.value(), "UPDATE");
+                }
             }
             if (values != null) {
-                for (Expression value : values) placement.reject(value, "VALUES");
+                for (Expression value : values) {
+                    placement.reject(value, "VALUES");
+                    // A MERGE's INSERT is not a VALUES list of its own: it writes one row for the
+                    // source row that reached it, so a set has no rows to expand into and
+                    // PostgreSQL says what the value is rather than which clause holds it. The
+                    // one-row VALUES of a plain INSERT, which does expand, is a different path.
+                    rejectSetValuedCall(value);
+                }
             }
         }
+    }
+
+    /**
+     * The refusal PostgreSQL raises where an expression is evaluated for one row and answers a
+     * set. It names the kind of value rather than the clause, because every clause that says this
+     * is one that had a row already.
+     */
+    private void rejectSetValuedCall(Expression expr) {
+        List<FunctionCallExpr> found = executor.selectExecutor.collectSrfCalls(expr);
+        if (found.isEmpty()) return;
+        MemgresException e = new MemgresException(
+                "set-valued function called in context that cannot accept a set", "0A000");
+        e.setPositionToken(found.get(0).name());
+        throw e;
     }
 
     /**
@@ -3163,11 +3196,11 @@ class DmlExecutor {
             // An assignment writes one value into one row's column. A set has no single value to
             // write and no rows of its own to multiply an UPDATE by, so PostgreSQL refuses it
             // whether or not the WHERE finds a row to try it on.
-            SelectExecutor.rejectSrfIn(set.value(), "UPDATE");
+            executor.selectExecutor.rejectSrfIn(set.value(), "UPDATE");
             placement.rejectOuterLevelAggregate(set.value(), "UPDATE", table, targetName);
         }
         placement.reject(stmt.where(), "WHERE");
-        SelectExecutor.rejectSrfIn(stmt.where(), "WHERE");
+        executor.selectExecutor.rejectSrfIn(stmt.where(), "WHERE");
         placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table, targetName);
     }
 
@@ -3189,7 +3222,7 @@ class DmlExecutor {
         boolean anySrf = false;
         for (List<Expression> valueRow : valueRows) {
             for (Expression value : valueRow) {
-                if (!SelectExecutor.collectSrfCalls(value).isEmpty()) { anySrf = true; break; }
+                if (!executor.selectExecutor.collectSrfCalls(value).isEmpty()) { anySrf = true; break; }
             }
             if (anySrf) break;
         }
@@ -3215,7 +3248,7 @@ class DmlExecutor {
             // no room for a set to expand into either -- RETURNING answers one row per row
             // written, so a call producing two values has nowhere to put the second.
             executor.selectExecutor.placementCheck.reject(target.expr(), "RETURNING");
-            SelectExecutor.rejectSrfIn(target.expr(), "RETURNING");
+            executor.selectExecutor.rejectSrfIn(target.expr(), "RETURNING");
             if (target.expr() instanceof WildcardExpr) continue;
             if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();

@@ -106,7 +106,7 @@ class SelectWindowEvaluator {
                     }
                 } else if (windowResults.containsKey(ti)) {
                     rowValues.add(windowResults.get(ti)[ri]);
-                } else if (SelectExecutor.findSrfCall(target.expr()) != null) {
+                } else if (select.findSrfCall(target.expr()) != null) {
                     // PostgreSQL expands the sets of the select list above the window, so each
                     // output row of the window becomes one row per element and carries the same
                     // window value -- which is why count(*) OVER () beside generate_series(1,3)
@@ -284,7 +284,7 @@ class SelectWindowEvaluator {
     boolean orderByNeedsWindowEvaluation(SelectStmt stmt) {
         if (stmt.distinct() || stmt.orderBy() == null || stmt.orderBy().isEmpty()) return false;
         for (SelectStmt.SelectTarget target : stmt.targets()) {
-            if (SelectExecutor.containsSrf(target.expr())) return false;
+            if (select.containsSrf(target.expr())) return false;
         }
         for (SelectStmt.OrderByItem item : stmt.orderBy()) {
             if (select.containsWindowFunction(item.expr())) return true;
@@ -520,7 +520,7 @@ class SelectWindowEvaluator {
                 if (select.containsWindowFunction(arg)) {
                     throw new MemgresException("window function calls cannot be nested", "42P20");
                 }
-                if (SelectExecutor.containsSrf(arg)) {
+                if (select.containsSrf(arg)) {
                     MemgresException e = new MemgresException(
                             "window function calls cannot contain set-returning function calls",
                             "0A000");
@@ -758,6 +758,10 @@ class SelectWindowEvaluator {
 
     private void rejectMisplacedCallsInFilter(Expression filter) {
         select.placementCheck.reject(filter, "FILTER");
+        // FILTER decides per input row whether the aggregate accumulates that row, so it reads
+        // rows already produced: a set in it has nothing to expand into and PostgreSQL names the
+        // clause. One inside a sub-query in the FILTER belongs to that query and is untouched.
+        select.rejectSrfIn(filter, "FILTER");
     }
 
     /** Collect every window function in an expression, including ones nested inside another. */
