@@ -125,13 +125,18 @@ class FromJoinExecutor {
                 if (found == null) found = oc;
             }
         }
+        // PostgreSQL sends no Position for either of these, so neither does memgres: the guess the
+        // protocol layer makes from the quoted name would point at the USING clause where
+        // PostgreSQL points at nothing.
         if (matches == 0) {
             throw new MemgresException("column \"" + name
-                    + "\" specified in USING clause does not exist in " + which + " table", "42703");
+                    + "\" specified in USING clause does not exist in " + which + " table", "42703")
+                    .suppressPosition();
         }
         if (matches > 1) {
             throw new MemgresException("common column name \"" + name
-                    + "\" appears more than once in " + which + " table", "42702");
+                    + "\" appears more than once in " + which + " table", "42702")
+                    .suppressPosition();
         }
         return found;
     }
@@ -423,40 +428,17 @@ class FromJoinExecutor {
                     }
                 }
                 if (!matched && isLeft) {
-                    String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
-                    List<Column> cols;
-                    // For XMLTABLE, extract column definitions from encoded args
-                    if (funcFrom.functionName().equals("__xmltable__")) {
-                        cols = new ArrayList<>();
-                        for (int i = 2; i < funcFrom.args().size(); i++) {
-                            Expression arg = funcFrom.args().get(i);
-                            String def = arg instanceof Literal ? ((Literal) arg).value() : arg.toString();
-                            String[] parts = def.split(":", 3);
-                            DataType dt = parts.length > 1 ? DataType.fromPgName(parts[1]) : null;
-                            cols.add(new Column(parts[0], dt != null ? dt : DataType.TEXT, true, false, null));
-                        }
-                    }
-                    // For JSON_TABLE, extract column definitions from the JsonTableExpr
-                    else if (funcFrom.functionName().equals("__json_table__") && !funcFrom.args().isEmpty()
-                            && funcFrom.args().get(0) instanceof JsonTableExpr) {
-                        JsonTableExpr jt = (JsonTableExpr) funcFrom.args().get(0);
-                        cols = new ArrayList<>();
-                        collectJsonTableNullCols(jt.columns, cols);
-                    } else if (funcFrom.columnAliases() != null) {
-                        cols = funcFrom.columnAliases().stream()
-                                .map(cn -> new Column(cn, DataType.TEXT, true, false, null))
-                                .collect(java.util.stream.Collectors.toList());
-                    } else {
-                        cols = Cols.listOf();
-                    }
-                    Table virtualTable = new Table(alias, cols);
-                    // Preserve SRF provenance on the unmatched-row placeholder so the
-                    // attribute-notation fallback (ExprEvaluator.tryAttributeNotationFallback)
-                    // still applies, matching resolveFunctionFrom's matched-row bindings.
-                    virtualTable.setFunctionResult(true);
-                    Object[] nullRow = new Object[cols.size()];
-                    RowContext rightCtx = new RowContext(virtualTable, alias, nullRow);
-                    results.add(mergeContexts(leftCtx, rightCtx));
+                    // The shape a function FROM item exposes is the same whether or not it
+                    // produced a row, so the padding is the item's own shape with null values.
+                    // Building it here from the column aliases alone left an item written
+                    // without them with no columns at all, and the padded row then answered a
+                    // reference to it with an empty record instead of NULL.
+                    List<RowContext.TableBinding> padding = fromResolver.resolveItemShape(funcFrom);
+                    // Preserve SRF provenance on the placeholder so the attribute-notation
+                    // fallback (ExprEvaluator.tryAttributeNotationFallback) still applies, the
+                    // same as on resolveFunctionFrom's matched-row bindings.
+                    for (RowContext.TableBinding b : padding) b.table().setFunctionResult(true);
+                    results.add(mergeContexts(leftCtx, new RowContext(padding)));
                 }
             } finally {
                 executor.outerContextStack.pop();

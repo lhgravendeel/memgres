@@ -383,6 +383,13 @@ class SelectExecutor {
             return aggregateEvaluator.executeAggregateSelect(grouped, contexts, baseBindings);
         }
 
+        // An ORDER BY expression is an output column the query does not print, and a set in one is
+        // expanded like any other output column: PostgreSQL answers SELECT a FROM t ORDER BY
+        // generate_series(1,2) with each row of t twice. Only a sort key that is not already a
+        // select target is expanded here -- one that is a target is expanded by the projection,
+        // and expanding it twice would square the rows.
+        contexts = expandContextsForOrderBySrfs(stmt, contexts);
+
         // Check for window functions in targets, in a DISTINCT ON key, or ordered by without
         // being selected. A window function anywhere needs the whole partition, so the query
         // cannot be answered a row at a time.
@@ -1659,18 +1666,44 @@ class SelectExecutor {
      * arm's rows it would produce is undecidable.
      */
     private static void rejectMisplacedSrfs(SelectStmt stmt) {
-        if (stmt.where() != null && containsSrf(stmt.where())) throw misplacedSrf("WHERE");
-        if (stmt.having() != null && containsSrf(stmt.having())) throw misplacedSrf("HAVING");
-        if (stmt.limit() != null && containsSrf(stmt.limit())) throw misplacedSrf("LIMIT");
-        if (stmt.offset() != null && containsSrf(stmt.offset())) throw misplacedSrf("OFFSET");
+        rejectSrfIn(stmt.where(), "WHERE");
+        rejectSrfIn(stmt.having(), "HAVING");
+        rejectSrfIn(stmt.limit(), "LIMIT");
+        rejectSrfIn(stmt.offset(), "OFFSET");
         rejectSrfsInJoinConditions(stmt.from());
         if (stmt.targets() != null) {
             for (SelectStmt.SelectTarget t : stmt.targets()) {
                 rejectSrfWhereOneBooleanIsWanted(t.expr());
-                String construct = conditionalHidingSrf(t.expr());
-                if (construct != null) throw misplacedSrf(construct);
+                rejectSrfInFilter(t.expr());
+                MemgresException conditional = conditionalHidingSrf(t.expr());
+                if (conditional != null) throw conditional;
             }
         }
+    }
+
+    /** Refuses a set-returning call written in a clause that reads rows already produced. */
+    static void rejectSrfIn(Expression expr, String clause) {
+        if (expr == null) return;
+        List<FunctionCallExpr> found = collectSrfCalls(expr);
+        if (!found.isEmpty()) throw misplacedSrf(clause, found.get(0));
+    }
+
+    /**
+     * FILTER selects which rows an aggregate accumulates, so only an aggregate may carry one.
+     * PostgreSQL names the function rather than the clause, because what is wrong is the call.
+     */
+    private static void rejectSrfInFilter(Expression expr) {
+        Object found = AstWalk.findFirst(expr, node -> node instanceof FunctionCallExpr
+                && ((FunctionCallExpr) node).filter() != null
+                && SRF_FUNCTIONS.contains(FunctionEvaluator.stripSchemaPrefix(
+                        ((FunctionCallExpr) node).name().toLowerCase())));
+        if (found == null) return;
+        String name = FunctionEvaluator.stripSchemaPrefix(
+                ((FunctionCallExpr) found).name().toLowerCase());
+        MemgresException e = new MemgresException(
+                "FILTER specified, but " + name + " is not an aggregate function", "42809");
+        e.setPositionToken(name);
+        throw e;
     }
 
     /**
@@ -1687,6 +1720,10 @@ class SelectExecutor {
                 }
                 return false;
             }
+            // IN compares one value against a list of values. A set on either side is neither,
+            // and PostgreSQL says so in the same words it uses for AND and OR. A set inside a
+            // sub-query on the right is ordinary -- containsSrf stops at the nested query.
+            if (node instanceof InExpr) return containsSrf(node);
             if (node instanceof BetweenExpr) return containsSrf(node);
             if (node instanceof BinaryExpr) {
                 BinaryExpr bin = (BinaryExpr) node;
@@ -1701,10 +1738,26 @@ class SelectExecutor {
         });
         if (found == null) return;
         String construct = found instanceof CaseExpr ? "CASE/WHEN"
+                : found instanceof InExpr ? "IN"
                 : found instanceof BetweenExpr ? "AND"
                 : found instanceof UnaryExpr ? "NOT"
                 : ((BinaryExpr) found).op().name();
-        throw new MemgresException("argument of " + construct + " must not return a set", "42804");
+        MemgresException e = new MemgresException(
+                "argument of " + construct + " must not return a set", "42804");
+        // PostgreSQL points at where the construct starts, which is its leftmost operand.
+        if (found instanceof InExpr) e.setPositionToken(leadingToken(((InExpr) found).expr()));
+        throw e;
+    }
+
+    /** The word an expression starts with, as it is written -- what a position points at. */
+    private static String leadingToken(Expression expr) {
+        if (expr instanceof ColumnRef) {
+            ColumnRef ref = (ColumnRef) expr;
+            return ref.table() != null ? ref.table() : ref.column();
+        }
+        if (expr instanceof FunctionCallExpr) return ((FunctionCallExpr) expr).name();
+        if (expr instanceof Literal) return ((Literal) expr).value();
+        return null;
     }
 
     private static void rejectSrfsInJoinConditions(List<SelectStmt.FromItem> fromItems) {
@@ -1712,7 +1765,7 @@ class SelectExecutor {
         for (SelectStmt.FromItem item : fromItems) {
             if (!(item instanceof SelectStmt.JoinFrom)) continue;
             SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
-            if (jf.on() != null && containsSrf(jf.on())) throw misplacedSrf("JOIN conditions");
+            rejectSrfIn(jf.on(), "JOIN conditions");
             rejectSrfsInJoinConditions(Cols.listOf(jf.left(), jf.right()));
         }
     }
@@ -1850,7 +1903,8 @@ class SelectExecutor {
                 for (String col : join.using()) {
                     if (!seen.add(col.toLowerCase())) {
                         throw new MemgresException(
-                                "column name \"" + col + "\" appears more than once in USING clause", "42701");
+                                "column name \"" + col + "\" appears more than once in USING clause",
+                                "42701").suppressPosition();
                     }
                 }
             }
@@ -1865,7 +1919,8 @@ class SelectExecutor {
         if (name == null) return;
         SelectStmt.FromItem prior = exposed.put(name.toLowerCase(), item);
         if (prior != null && !separateRelationsOfOneName(prior, item)) {
-            throw new MemgresException("table name \"" + name + "\" specified more than once", "42712");
+            throw new MemgresException("table name \"" + name + "\" specified more than once",
+                    "42712").suppressPosition();
         }
     }
 
@@ -1899,9 +1954,25 @@ class SelectExecutor {
             SelectStmt.FunctionFrom f = (SelectStmt.FunctionFrom) item;
             name = f.alias() != null ? f.alias()
                     : FunctionEvaluator.stripSchemaPrefix(f.functionName());
+            // ROWS FROM is a FROM item the parser spells as a call to a made-up function, so
+            // its own name is not one the query wrote. Unaliased, PostgreSQL names it after the
+            // first function inside it, and it clashes with a second item of that name.
+            if (f.alias() == null && "__rows_from__".equals(f.functionName())) {
+                name = firstRowsFromFunctionName(f);
+            }
         }
         // Names the parser invents for constructs with no user-visible name of their own
         return name == null || name.startsWith("__") ? null : name;
+    }
+
+    /** The name of the first function written in a ROWS FROM item, or null when there is none. */
+    private static String firstRowsFromFunctionName(SelectStmt.FunctionFrom item) {
+        for (Expression arg : item.args()) {
+            FunctionCallExpr call = arg instanceof RowsFromItem ? ((RowsFromItem) arg).call()
+                    : arg instanceof FunctionCallExpr ? (FunctionCallExpr) arg : null;
+            if (call != null) return FunctionEvaluator.stripSchemaPrefix(call.name());
+        }
+        return null;
     }
 
     /**
@@ -2002,6 +2073,8 @@ class SelectExecutor {
                                 "aggregate function calls cannot contain set-returning function calls", "0A000");
                         e.setHint("You might be able to move the set-returning function "
                                 + "into a LATERAL FROM item.");
+                        FunctionCallExpr srf = findSrfCall(arg);
+                        if (srf != null) e.setPositionToken(srf.name());
                         throw e;
                     }
                 }
@@ -2061,12 +2134,36 @@ class SelectExecutor {
         return a.toString().equalsIgnoreCase(b.toString());
     }
 
-    private static MemgresException misplacedSrf(String construct) {
-        return new MemgresException("set-returning functions are not allowed in " + construct, "0A000");
+    /**
+     * The placement refusal, pointed at the call rather than at the clause.
+     *
+     * <p>PostgreSQL reports the character the set-returning call starts at, not the keyword that
+     * forbids it, and the engine's AST carries no offsets — so the call's name travels with the
+     * exception and the protocol layer finds it in the statement text.
+     *
+     * @param offender the set-returning call that may not stand here, or null when unknown
+     */
+    static MemgresException misplacedSrf(String construct, FunctionCallExpr offender) {
+        MemgresException e = new MemgresException(
+                "set-returning functions are not allowed in " + construct, "0A000");
+        if (offender != null) e.setPositionToken(offender.name());
+        return e;
     }
 
-    /** The name of the conditional construct hiding an SRF in this expression, or null. */
-    private static String conditionalHidingSrf(Expression expr) {
+    /**
+     * The same refusal with the hint PostgreSQL adds when the call could have been written as a
+     * FROM item instead. It offers that only where moving the call would actually answer the
+     * query — inside a conditional or an aggregate's arguments — and not for LIMIT, OFFSET,
+     * WHERE, HAVING or a join condition, where a LATERAL item would not help.
+     */
+    private static MemgresException misplacedSrfWithHint(String construct, FunctionCallExpr offender) {
+        MemgresException e = misplacedSrf(construct, offender);
+        e.setHint("You might be able to move the set-returning function into a LATERAL FROM item.");
+        return e;
+    }
+
+    /** The conditional construct hiding an SRF in this expression, and the call, or null. */
+    private static MemgresException conditionalHidingSrf(Expression expr) {
         Object found = AstWalk.findFirst(expr, node -> {
             if (node instanceof CaseExpr) return containsSrf(node);
             if (node instanceof FunctionCallExpr) {
@@ -2080,9 +2177,10 @@ class SelectExecutor {
             return false;
         });
         if (found == null) return null;
-        if (found instanceof CaseExpr) return "CASE";
-        return FunctionEvaluator.stripSchemaPrefix(
-                ((FunctionCallExpr) found).name().toLowerCase()).toUpperCase();
+        String construct = found instanceof CaseExpr ? "CASE"
+                : FunctionEvaluator.stripSchemaPrefix(
+                        ((FunctionCallExpr) found).name().toLowerCase()).toUpperCase();
+        return misplacedSrfWithHint(construct, findSrfCall((Expression) found));
     }
 
     /**
@@ -2094,9 +2192,20 @@ class SelectExecutor {
         return !collectSrfCalls(node).isEmpty();
     }
 
-    /** Conditional constructs PG evaluates lazily, and so refuses to expand a set inside. */
+    /**
+     * The conditional constructs PostgreSQL refuses to expand a set inside — measured, not
+     * reasoned about, because the family is smaller than it looks.
+     *
+     * <p>A construct is on this list when it may skip evaluating an argument: CASE runs only the
+     * arm its condition picks, and COALESCE stops at the first argument that is not null, so which
+     * rows the query would answer depends on a value the planner does not have. NULLIF, GREATEST
+     * and LEAST look like the same kind of thing and are not — each evaluates every argument, so
+     * PostgreSQL expands the set and applies the operator per row, and
+     * {@code SELECT nullif(generate_series(1,2), 0)} answers two rows. Listing them here refused
+     * SQL PostgreSQL runs.
+     */
     private static final Set<String> CONDITIONAL_CONSTRUCTS =
-            new HashSet<>(Arrays.asList("coalesce", "nullif", "greatest", "least"));
+            new HashSet<>(Arrays.asList("coalesce"));
 
     /**
      * The first set-returning call this expression evaluates as part of its own row, or null.
@@ -2144,7 +2253,7 @@ class SelectExecutor {
      * past their end, so {@code generate_series(1,2) + generate_series(10,12)} answers 11, 13
      * and NULL. Everything else in the expression is recomputed once per row rather than copied.
      */
-    private Object evalSrfExpandedTarget(Expression expr, RowContext ctx) {
+    Object evalSrfExpandedTarget(Expression expr, RowContext ctx) {
         List<FunctionCallExpr> srfs = collectSrfCalls(expr);
         if (srfs.isEmpty()) return executor.evalExpr(expr, ctx);
         List<List<Object>> sets = new ArrayList<>(srfs.size());
@@ -2213,6 +2322,22 @@ class SelectExecutor {
      * {@code SELECT count(*) FROM one_row GROUP BY generate_series(1,2)} answers two groups of
      * one. The contexts are returned unchanged when no such call is written.
      */
+    /**
+     * The rows a query sorts, once the set-returning calls written only in its ORDER BY have been
+     * expanded. A sort key that is also a select target is left alone: the projection expands
+     * that one, and expanding it here as well would multiply the rows twice over.
+     */
+    private List<RowContext> expandContextsForOrderBySrfs(SelectStmt stmt, List<RowContext> contexts) {
+        if (stmt.orderBy() == null || stmt.orderBy().isEmpty()) return contexts;
+        List<Expression> keys = new ArrayList<>();
+        for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+            if (!containsSrf(item.expr())) continue;
+            if (resolveOrderByToColumnIndex(item.expr(), stmt.targets()) >= 0) continue;
+            keys.add(item.expr());
+        }
+        return keys.isEmpty() ? contexts : expandContextsForSrfs(keys, contexts);
+    }
+
     List<RowContext> expandContextsForSrfs(List<Expression> exprs, List<RowContext> contexts) {
         if (exprs == null || exprs.isEmpty()) return contexts;
         List<FunctionCallExpr> srfs = new ArrayList<>();
