@@ -292,9 +292,13 @@ class DdlTableExecutor {
                 }
             }
 
+            Integer colPrecision = def.precision() != null ? def.precision() : resolved.domainPrecision();
+            Integer colScale = def.scale() != null ? def.scale() : resolved.domainScale();
             Column col = new Column(def.name(), dataType, !notNull, def.primaryKey(), defaultVal,
-                    enumTypeName, def.precision(), def.scale(), def.generatedExpr(), def.generatedVirtual(),
+                    enumTypeName, colPrecision, colScale, def.generatedExpr(), def.generatedVirtual(),
                     domainTypeName, compositeTypeName, arrayElementType);
+            String qualifier = DataType.intervalQualifier(def.typeName());
+            col.setIntervalQualifier(qualifier != null ? qualifier : resolved.domainIntervalQualifier());
             if (def.defaultExpr() != null) {
                 col.setParsedDefaultExpr(def.defaultExpr());
             }
@@ -415,7 +419,7 @@ class DdlTableExecutor {
                     executor.selectExecutor.placementCheck.reject(tc.checkExpr(), "check constraints");
                     DdlDefinitionChecks.requireBooleanPredicate(tc.checkExpr(), table, "CHECK");
                 }
-                StoredConstraint sc = ddl.convertTableConstraint(stmt.name(), tc);
+                StoredConstraint sc = ddl.convertTableConstraint(stmt.name(), tc, table);
                 if (sc != null) {
                     // For FK constraints without explicit schema, set the schema from the table's schema
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY

@@ -730,56 +730,29 @@ class FromFunctionResolver {
         Table virtualTable = new Table(alias, cols);
         List<RowContext> contexts = new ArrayList<>();
         GucSettings guc = executor.session != null ? executor.session.getGucSettings() : new GucSettings();
-        Map<String, String> all = guc.getAll();
-        Map<String, String[]> meta = buildSettingsMetadata();
-        for (Map.Entry<String, String> e : all.entrySet()) {
-            String canonName = guc.getCanonicalName(e.getKey());
+        for (Map.Entry<String, String> e : guc.getAll().entrySet()) {
+            String name = e.getKey();
+            GucSettings.Def def = GucSettings.definition(name);
+            String value = guc.get(name);
+            if (value == null) value = e.getValue();
             Object[] row = new Object[cols.size()];
-            row[0] = canonName;
-            row[1] = e.getValue();
-            String[] m = meta.get(e.getKey().toLowerCase());
-            row[3] = m != null ? m[0] : "Ungrouped";
-            row[4] = m != null ? m[1] : "";
-            row[6] = m != null ? m[2] : "user";
-            row[7] = m != null ? m[3] : "string";
-            row[8] = "default";
-            row[12] = e.getValue();
-            row[13] = e.getValue();
+            row[0] = guc.getCanonicalName(name);
+            row[1] = value;
+            row[2] = def != null ? def.unit : null;
+            row[3] = def != null ? def.category : "Customized Options";
+            row[4] = def != null ? def.shortDesc : null;
+            row[6] = def != null ? def.context : "user";
+            row[7] = def != null ? def.vartype : "string";
+            row[8] = guc.hasSessionOverride(name) ? "session" : "default";
+            row[9] = def != null ? def.minVal : null;
+            row[10] = def != null ? def.maxVal : null;
+            row[11] = def != null ? def.enumVals : null;
+            row[12] = def != null ? def.bootVal : value;
+            row[13] = def != null ? guc.getResetValue(name) : value;
             virtualTable.insertRow(row);
             contexts.add(new RowContext(virtualTable, alias, row));
         }
         return contexts;
-    }
-
-    private static Map<String, String[]> buildSettingsMetadata() {
-        Map<String, String[]> meta = new java.util.LinkedHashMap<>();
-        meta.put("server_version", new String[]{"Preset Options", "Shows the server version.", "internal", "string"});
-        meta.put("server_version_num", new String[]{"Preset Options", "Shows the server version as an integer.", "internal", "string"});
-        meta.put("server_encoding", new String[]{"Client Connection Defaults", "Shows the server character set encoding.", "internal", "string"});
-        meta.put("client_encoding", new String[]{"Client Connection Defaults", "Sets the client's character set encoding.", "user", "string"});
-        meta.put("client_min_messages", new String[]{"Client Connection Defaults", "Sets the message levels sent to the client.", "user", "enum"});
-        meta.put("search_path", new String[]{"Client Connection Defaults", "Sets the schema search order.", "user", "string"});
-        meta.put("timezone", new String[]{"Client Connection Defaults / Locale and Formatting", "Sets the time zone.", "user", "string"});
-        meta.put("datestyle", new String[]{"Client Connection Defaults / Locale and Formatting", "Sets the display format for date and time.", "user", "string"});
-        meta.put("intervalstyle", new String[]{"Client Connection Defaults / Locale and Formatting", "Sets the display format for interval values.", "user", "string"});
-        meta.put("standard_conforming_strings", new String[]{"Version and Platform Compatibility", "Causes strings to treat backslashes literally.", "user", "bool"});
-        meta.put("max_connections", new String[]{"Connections and Authentication", "Sets max concurrent connections.", "postmaster", "integer"});
-        meta.put("shared_buffers", new String[]{"Resource Usage / Memory", "Sets shared memory buffers.", "postmaster", "string"});
-        meta.put("work_mem", new String[]{"Resource Usage / Memory", "Sets max memory for query workspaces.", "user", "string"});
-        meta.put("default_transaction_isolation", new String[]{"Client Connection Defaults", "Sets default transaction isolation.", "user", "enum"});
-        meta.put("transaction_isolation", new String[]{"Client Connection Defaults", "Sets current transaction isolation.", "user", "enum"});
-        meta.put("bytea_output", new String[]{"Client Connection Defaults", "Sets the output format for bytea.", "user", "enum"});
-        meta.put("application_name", new String[]{"Reporting and Logging", "Sets the application name.", "user", "string"});
-        meta.put("extra_float_digits", new String[]{"Client Connection Defaults", "Sets extra float digits.", "user", "integer"});
-        meta.put("row_security", new String[]{"Client Connection Defaults", "Enable row security.", "user", "bool"});
-        meta.put("default_tablespace", new String[]{"Client Connection Defaults", "Sets the default tablespace.", "user", "string"});
-        meta.put("xmloption", new String[]{"Client Connection Defaults", "Sets whether XML data is parsed as document or content.", "user", "enum"});
-        meta.put("jit", new String[]{"Query Tuning", "Allow JIT compilation.", "user", "bool"});
-        meta.put("statement_timeout", new String[]{"Client Connection Defaults", "Sets statement timeout.", "user", "integer"});
-        meta.put("lock_timeout", new String[]{"Client Connection Defaults", "Sets lock timeout.", "user", "integer"});
-        meta.put("idle_in_transaction_session_timeout", new String[]{"Client Connection Defaults", "Sets idle-in-transaction timeout.", "user", "integer"});
-        meta.put("is_superuser", new String[]{"Preset Options", "Shows whether the current user is a superuser.", "internal", "bool"});
-        return meta;
     }
 
     /**

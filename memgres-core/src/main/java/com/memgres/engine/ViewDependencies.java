@@ -61,8 +61,8 @@ final class ViewDependencies {
             // A view that reads itself is not something else that depends on it. PostgreSQL
             // records no such dependency, and CREATE OR REPLACE can produce one -- the view is
             // then unreadable, but it still drops on its own.
-            if (RelationNamespace.bareName(e.getKey()).equalsIgnoreCase(relName)) continue;
-            if (reads(v.query(), v.schemaName(), schemaName, relName)) out.add(e.getKey());
+            if (v.name().equalsIgnoreCase(relName)) continue;
+            if (reads(v.query(), v.schemaName(), schemaName, relName)) out.add(v.name());
         }
         return out;
     }

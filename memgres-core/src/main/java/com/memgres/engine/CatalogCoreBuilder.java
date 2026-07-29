@@ -108,10 +108,191 @@ class CatalogCoreBuilder {
     /** Types with a dedicated typanalyze function. */
     private static final Map<String, String> TYPANALYZE;
 
+    /**
+     * The physical attributes PostgreSQL records for each built-in type, read off a PG 18
+     * catalog rather than inferred: {typname, typlen, typbyval, typtype, typcategory,
+     * typispreferred, typdelim, typalign, typstorage, typcollation}. These describe how a value
+     * is laid out and how it is read back, so a client that decodes a value by following them —
+     * or a server-side check that two types are physically compatible — needs the recorded
+     * answer, not a plausible one. A box array is delimited by semicolons, not commas; name
+     * sorts under the C collation; and a double-aligned type is not int-aligned because most
+     * types are.
+     */
+    private static final String[][] TYPE_ATTRIBUTES = {
+            {"_aclitem", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_bit", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_bool", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_box", "-1", "f", "b", "A", "f", ";", "d", "x", "0"},
+            {"_bpchar", "-1", "f", "b", "A", "f", ",", "i", "x", "100"},
+            {"_bytea", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_char", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_cidr", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_circle", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_date", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_datemultirange", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_daterange", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_float4", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_float8", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_inet", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_int2", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_int2vector", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_int4", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_int4multirange", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_int4range", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_int8", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_int8multirange", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_int8range", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_interval", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_json", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_jsonb", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_line", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_lseg", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_macaddr", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_macaddr8", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_money", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_name", "-1", "f", "b", "A", "f", ",", "i", "x", "950"},
+            {"_numeric", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_nummultirange", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_numrange", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_oid", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_oidvector", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_path", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_point", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_polygon", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_record", "-1", "f", "p", "P", "f", ",", "d", "x", "0"},
+            {"_regclass", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_regproc", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_regtype", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_text", "-1", "f", "b", "A", "f", ",", "i", "x", "100"},
+            {"_time", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_timestamp", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_timestamptz", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_timetz", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_tsmultirange", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_tsquery", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_tsrange", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_tstzmultirange", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_tstzrange", "-1", "f", "b", "A", "f", ",", "d", "x", "0"},
+            {"_tsvector", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_uuid", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_varbit", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_varchar", "-1", "f", "b", "A", "f", ",", "i", "x", "100"},
+            {"_xid", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"_xml", "-1", "f", "b", "A", "f", ",", "i", "x", "0"},
+            {"aclitem", "16", "f", "b", "U", "f", ",", "d", "p", "0"},
+            {"any", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"anyarray", "-1", "f", "p", "P", "f", ",", "d", "x", "0"},
+            {"anycompatible", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"anycompatiblearray", "-1", "f", "p", "P", "f", ",", "d", "x", "0"},
+            {"anycompatiblemultirange", "-1", "f", "p", "P", "f", ",", "d", "x", "0"},
+            {"anycompatiblenonarray", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"anycompatiblerange", "-1", "f", "p", "P", "f", ",", "d", "x", "0"},
+            {"anyelement", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"anyenum", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"anymultirange", "-1", "f", "p", "P", "f", ",", "d", "x", "0"},
+            {"anynonarray", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"anyrange", "-1", "f", "p", "P", "f", ",", "d", "x", "0"},
+            {"bit", "-1", "f", "b", "V", "f", ",", "i", "x", "0"},
+            {"bool", "1", "t", "b", "B", "t", ",", "c", "p", "0"},
+            {"box", "32", "f", "b", "G", "f", ";", "d", "p", "0"},
+            {"bpchar", "-1", "f", "b", "S", "f", ",", "i", "x", "100"},
+            {"bytea", "-1", "f", "b", "U", "f", ",", "i", "x", "0"},
+            {"cidr", "-1", "f", "b", "I", "f", ",", "i", "m", "0"},
+            {"circle", "24", "f", "b", "G", "f", ",", "d", "p", "0"},
+            {"char", "1", "t", "b", "Z", "f", ",", "c", "p", "0"},
+            {"cstring", "-2", "f", "p", "P", "f", ",", "c", "p", "0"},
+            {"date", "4", "t", "b", "D", "f", ",", "i", "p", "0"},
+            {"datemultirange", "-1", "f", "m", "R", "f", ",", "i", "x", "0"},
+            {"daterange", "-1", "f", "r", "R", "f", ",", "i", "x", "0"},
+            {"event_trigger", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"float4", "4", "t", "b", "N", "f", ",", "i", "p", "0"},
+            {"float8", "8", "t", "b", "N", "t", ",", "d", "p", "0"},
+            {"inet", "-1", "f", "b", "I", "t", ",", "i", "m", "0"},
+            {"int2", "2", "t", "b", "N", "f", ",", "s", "p", "0"},
+            {"int2vector", "-1", "f", "b", "A", "f", ",", "i", "p", "0"},
+            {"int4", "4", "t", "b", "N", "f", ",", "i", "p", "0"},
+            {"int4multirange", "-1", "f", "m", "R", "f", ",", "i", "x", "0"},
+            {"int4range", "-1", "f", "r", "R", "f", ",", "i", "x", "0"},
+            {"int8", "8", "t", "b", "N", "f", ",", "d", "p", "0"},
+            {"int8multirange", "-1", "f", "m", "R", "f", ",", "d", "x", "0"},
+            {"int8range", "-1", "f", "r", "R", "f", ",", "d", "x", "0"},
+            {"internal", "8", "t", "p", "P", "f", ",", "d", "p", "0"},
+            {"interval", "16", "f", "b", "T", "t", ",", "d", "p", "0"},
+            {"json", "-1", "f", "b", "U", "f", ",", "i", "x", "0"},
+            {"jsonb", "-1", "f", "b", "U", "f", ",", "i", "x", "0"},
+            {"line", "24", "f", "b", "G", "f", ",", "d", "p", "0"},
+            {"lseg", "32", "f", "b", "G", "f", ",", "d", "p", "0"},
+            {"macaddr", "6", "f", "b", "U", "f", ",", "i", "p", "0"},
+            {"macaddr8", "8", "f", "b", "U", "f", ",", "i", "p", "0"},
+            {"money", "8", "t", "b", "N", "f", ",", "d", "p", "0"},
+            {"name", "64", "f", "b", "S", "f", ",", "c", "p", "950"},
+            {"numeric", "-1", "f", "b", "N", "f", ",", "i", "m", "0"},
+            {"nummultirange", "-1", "f", "m", "R", "f", ",", "i", "x", "0"},
+            {"numrange", "-1", "f", "r", "R", "f", ",", "i", "x", "0"},
+            {"oid", "4", "t", "b", "N", "t", ",", "i", "p", "0"},
+            {"oidvector", "-1", "f", "b", "A", "f", ",", "i", "p", "0"},
+            {"path", "-1", "f", "b", "G", "f", ",", "d", "x", "0"},
+            {"point", "16", "f", "b", "G", "f", ",", "d", "p", "0"},
+            {"polygon", "-1", "f", "b", "G", "f", ",", "d", "x", "0"},
+            {"record", "-1", "f", "p", "P", "f", ",", "d", "x", "0"},
+            {"regclass", "4", "t", "b", "N", "f", ",", "i", "p", "0"},
+            {"regproc", "4", "t", "b", "N", "f", ",", "i", "p", "0"},
+            {"regtype", "4", "t", "b", "N", "f", ",", "i", "p", "0"},
+            {"text", "-1", "f", "b", "S", "t", ",", "i", "x", "100"},
+            {"time", "8", "t", "b", "D", "f", ",", "d", "p", "0"},
+            {"timestamp", "8", "t", "b", "D", "f", ",", "d", "p", "0"},
+            {"timestamptz", "8", "t", "b", "D", "t", ",", "d", "p", "0"},
+            {"timetz", "12", "f", "b", "D", "f", ",", "d", "p", "0"},
+            {"trigger", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"tsmultirange", "-1", "f", "m", "R", "f", ",", "d", "x", "0"},
+            {"tsquery", "-1", "f", "b", "U", "f", ",", "i", "p", "0"},
+            {"tsrange", "-1", "f", "r", "R", "f", ",", "d", "x", "0"},
+            {"tstzmultirange", "-1", "f", "m", "R", "f", ",", "d", "x", "0"},
+            {"tstzrange", "-1", "f", "r", "R", "f", ",", "d", "x", "0"},
+            {"tsvector", "-1", "f", "b", "U", "f", ",", "i", "x", "0"},
+            {"uuid", "16", "f", "b", "U", "f", ",", "c", "p", "0"},
+            {"varbit", "-1", "f", "b", "V", "t", ",", "i", "x", "0"},
+            {"varchar", "-1", "f", "b", "S", "f", ",", "i", "x", "100"},
+            {"void", "4", "t", "p", "P", "f", ",", "i", "p", "0"},
+            {"xid", "4", "t", "b", "U", "f", ",", "i", "p", "0"},
+            {"xml", "-1", "f", "b", "U", "f", ",", "i", "x", "0"},
+    };
+
+    /** typname -> its row in {@link #TYPE_ATTRIBUTES}. */
+    private static final Map<String, String[]> TYPE_ATTRS_BY_NAME;
+
+    /** One type's recorded physical attributes, or null when memgres carries no record of it. */
+    private static String[] typeAttrs(String typname) {
+        return TYPE_ATTRS_BY_NAME.get(typname);
+    }
+
+    /**
+     * The pg_type name a column of this type is stored under. A serial column is an integer
+     * column with a sequence behind it, so it is laid out exactly as the integer is.
+     */
+    /** Whether a value of this type is passed by value, as pg_type records it. */
+    static boolean byValue(DataType dt) {
+        String[] attrs = typeAttrs(storedTypeName(dt));
+        return attrs != null && "t".equals(attrs[2]);
+    }
+
+    static String storedTypeName(DataType dt) {
+        switch (dt) {
+            case SERIAL: return "int4";
+            case BIGSERIAL: return "int8";
+            case SMALLSERIAL: return "int2";
+            default: return dt.getPgName();
+        }
+    }
+
     static {
         Map<Integer, Integer> arrayOf = new HashMap<>();
         for (Object[] a : STD_ARRAYS) arrayOf.put((Integer) a[1], (Integer) a[0]);
         ARRAY_OF = Collections.unmodifiableMap(arrayOf);
+
+        Map<String, String[]> attrs = new HashMap<>();
+        for (String[] row : TYPE_ATTRIBUTES) attrs.put(row[0], row);
+        TYPE_ATTRS_BY_NAME = Collections.unmodifiableMap(attrs);
 
         Set<String> signed = new HashSet<>();
         for (String[] sig : BuiltinFunctionSignatures.SIGNATURES) signed.add(sig[0]);
@@ -224,7 +405,6 @@ class CatalogCoreBuilder {
                 col("relhassubclass", DataType.BOOLEAN),
                 col("relrowsecurity", DataType.BOOLEAN),
                 col("relforcerowsecurity", DataType.BOOLEAN),
-                col("relhasoids", DataType.BOOLEAN),
                 col("relispopulated", DataType.BOOLEAN),
                 col("relreplident", DataType.CHAR),
                 col("relispartition", DataType.BOOLEAN),
@@ -320,10 +500,27 @@ class CatalogCoreBuilder {
                     false, false, "p", sysRelkind, // relhasindex, relisshared, relpersistence, relkind
                     (short) 0, (short) 0,   // relnatts, relchecks
                     false, false, false, false, false, // relhasrules..relforcerowsecurity
-                    false,                  // relhasoids (removed in PG 12, always false)
                     true, "d", false,       // relispopulated, relreplident, relispartition
                     0, 0, 0,                // relrewrite, relfrozenxid, relminmxid
                     null, null, null, 1     // relacl, reloptions, relpartbound, xmin
+            });
+        }
+
+        // information_schema's views are relations too, and a tool that reads pg_class to find
+        // out what it may query has to find them there.
+        int infoSchemaNs = oids.oid("ns:information_schema");
+        for (String isView : InfoSchemaBuilder.INFORMATION_SCHEMA_VIEWS) {
+            int viewOid = oids.oid("rel:information_schema." + isView);
+            table.insertRow(new Object[]{
+                    viewOid, isView, infoSchemaNs,
+                    0, 0, 10, 0, 0, 0,
+                    0, 0.0, 0, 0, 0,
+                    false, false, "p", "v",
+                    (short) 0, (short) 0,
+                    false, false, false, false, false,
+                    true, "d", false,
+                    0, 0, 0,
+                    null, null, null, 1
             });
         }
 
@@ -374,7 +571,6 @@ class CatalogCoreBuilder {
                         hasIdx, false, relPersistence(schemaEntry.getKey(), t.isUnlogged()), relkind, // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
                         false, hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
-                        false,              // relhasoids
                         true, String.valueOf(t.getReplicaIdentity()), relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid
                         buildRelacl(AstExecutor.privilegeKey(schemaEntry.getKey(), t.getName())),
@@ -408,7 +604,6 @@ class CatalogCoreBuilder {
                     false, false, relPersistence(vSchema, false), vd.materialized() ? "m" : "v",
                     (short) (vd.cachedColumns() != null ? vd.cachedColumns().size() : 0), (short) 0,
                     true, false, false, false, false,
-                    false, // relhasoids
                     !vd.materialized() || vd.populated(), "n", false,
                     0, 0, 0,
                     null, viewRelOptions, null, 1
@@ -427,7 +622,6 @@ class CatalogCoreBuilder {
                     false, false, "p", "S",
                     (short) 3, (short) 0,   // sequences have 3 columns (last_value, log_cnt, is_called)
                     false, false, false, false, false,
-                    false, // relhasoids
                     true, "n", false, 0, 0, 0,
                     null, null, null, 1
             });
@@ -454,7 +648,6 @@ class CatalogCoreBuilder {
                                 false, false, "p", "S",
                                 (short) 3, (short) 0,
                                 false, false, false, false, false,
-                                false, // relhasoids
                                 true, "n", false, 0, 0, 0,
                                 null, null, null, 1
                         });
@@ -524,7 +717,6 @@ class CatalogCoreBuilder {
                     false, false, "p", idxRelkind,
                     idxNatts, (short) 0,
                     false, false, false, false, false,
-                    false, // relhasoids
                     true, "n", false, 0, 0, 0,
                     null, reloptionsVal, null, 1
             });
@@ -546,7 +738,6 @@ class CatalogCoreBuilder {
                                 false, false, "p", ciRelkind,
                                 ciNatts, (short) 0,
                                 false, false, false, false, false,
-                                false, // relhasoids
                                 true, "n", false, 0, 0, 0,
                                 null, null, null, 1
                         });
@@ -570,7 +761,6 @@ class CatalogCoreBuilder {
                     false, false, "p", "c",
                     ctNatts, (short) 0,
                     false, false, false, false, false,
-                    false, // relhasoids
                     true, "n", false, 0, 0, 0,
                     null, null, null, 1
             });
@@ -653,6 +843,9 @@ class CatalogCoreBuilder {
                 colNN("attnotnull", DataType.BOOLEAN),
                 col("atttypmod", DataType.INTEGER),
                 col("attlen", DataType.SMALLINT),
+                // Whether a value of the column's type is passed by value. A client decoding a
+                // tuple by following the catalog reads it, and PostgreSQL has always had it.
+                col("attbyval", DataType.BOOLEAN),
                 colNN("attisdropped", DataType.BOOLEAN),
                 colNN("atthasdef", DataType.BOOLEAN),
                 col("attidentity", DataType.CHAR),
@@ -693,6 +886,7 @@ class CatalogCoreBuilder {
             addUserRelationAttributes(table, vRelOid, vd.cachedColumns(), true);
         }
         addPgAttributeExtras(table);
+        addCatalogRelationAttributes(table);
         return table;
     }
 
@@ -727,60 +921,17 @@ class CatalogCoreBuilder {
                     boolean hasDefault = c.isGenerated()
                             || (!isIdentityCol && (c.getDefaultValue() != null
                                 || colType == DataType.SERIAL || colType == DataType.BIGSERIAL || colType == DataType.SMALLSERIAL));
-                    // Determine attlen from the type's typlen
-                    short attlen;
-                    switch (colType) {
-                        case BOOLEAN:
-                            attlen = (short) 1;
-                            break;
-                        case SMALLINT:
-                        case SMALLSERIAL:
-                            attlen = (short) 2;
-                            break;
-                        case INTEGER:
-                        case SERIAL:
-                        case REAL:
-                            attlen = (short) 4;
-                            break;
-                        case BIGINT:
-                        case BIGSERIAL:
-                        case DOUBLE_PRECISION:
-                            attlen = (short) 8;
-                            break;
-                        case NAME:
-                            attlen = (short) 64;
-                            break;
-                        default:
-                            attlen = (short) -1;
-                            break;
-                    }
-                    // Determine storage type based on data type
-                    // p = plain, x = extended, e = external, m = main
-                    String storage;
-                    switch (colType) {
-                        case TEXT:
-                        case VARCHAR:
-                        case BYTEA:
-                        case JSON:
-                        case JSONB:
-                        case XML:
-                            storage = "x";
-                            break;
-                        case NUMERIC:
-                            storage = "m";
-                            break;
-                        default:
-                            storage = "p";
-                            break;
-                    }
-                    // Compute atttypmod: varchar(n) → n+4, char(n) → n+4, numeric(p,s) → (p<<16|s)+4
-                    int typmod = -1;
-                    if ((colType == DataType.VARCHAR || colType == DataType.CHAR) && c.getPrecision() != null) {
-                        typmod = c.getPrecision() + 4;
-                    } else if (colType == DataType.NUMERIC && c.getPrecision() != null) {
-                        int scale = c.getScale() != null ? c.getScale() : 0;
-                        typmod = (c.getPrecision() << 16 | scale) + 4;
-                    }
+                    // A column's physical attributes are its type's, and pg_type already records
+                    // what PostgreSQL says those are — reading them from the same table is what
+                    // keeps pg_attribute and pg_type answering alike for one column.
+                    String[] physical = typeAttrs(storedTypeName(colType));
+                    short attlen = physical != null ? Short.parseShort(physical[1]) : (short) -1;
+                    boolean attbyval = physical != null && "t".equals(physical[2]);
+                    String storage = physical != null ? physical[8] : "p";
+                    String align = physical != null ? physical[7] : "i";
+                    // The declared width, precision or interval qualifier, packed the way
+                    // format_type and every client that sizes a column read it back.
+                    int typmod = CatalogHelper.attTypmod(c);
                     // Resolve atttypid: use custom type OID for enums/domains
                     int atttypid = c.getType().getOid();
                     if (colType == DataType.ENUM && c.getEnumTypeName() != null) {
@@ -798,6 +949,7 @@ class CatalogCoreBuilder {
                             !forceNullable && !c.isNullable(),
                             typmod,
                             attlen,
+                            attbyval,
                             false,
                             hasDefault,
                             identity,  // attidentity
@@ -810,7 +962,7 @@ class CatalogCoreBuilder {
                             c.getAttCompression(),        // attcompression
                             c.isAttHasMissing(), // atthasmissing
                             null,      // attmissingval
-                            "i"        // attalign
+                            align      // attalign
                     });
         }
     }
@@ -830,7 +982,7 @@ class CatalogCoreBuilder {
             for (int i = 0; i < names.length; i++) {
                 table.insertRow(new Object[]{
                         seqOid, names[i], types[i].getOid(), (short) (i + 1),
-                        true, -1, lens[i], false, false,
+                        true, -1, lens[i], true, false, false,
                         "", "", 0, 1, true, 0, null, 0, null,
                         null, (short) -1, "p", "", false, null, aligns[i]
                 });
@@ -891,7 +1043,7 @@ class CatalogCoreBuilder {
             }
             table.insertRow(new Object[]{
                     idxOid, attname, type.getOid(), (short) (i + 1),
-                    false, -1, (short) typeLength(type), false, false,
+                    false, -1, (short) typeLength(type), byValue(type), false, false,
                     "", "", 0, 1, true, 0, null, 0, null,
                     null, (short) -1, "p", "", false, null, "i"
             });
@@ -971,6 +1123,102 @@ class CatalogCoreBuilder {
     private static final java.util.Set<String> INDEX_INT_FUNCS = new java.util.HashSet<>(java.util.Arrays.asList(
             "length", "char_length", "character_length", "octet_length", "strpos", "ascii"));
 
+    /**
+     * Guards the pass that describes the catalogs against describing itself: building a catalog
+     * relation to read its columns goes through the same builders, pg_attribute among them.
+     */
+    private static final ThreadLocal<Boolean> DESCRIBING_CATALOGS = new ThreadLocal<Boolean>();
+
+    /**
+     * One pg_attribute row per column of each catalog relation and information_schema view.
+     *
+     * <p>A relation the catalog does not describe is a relation no client can describe either:
+     * JDBC's getColumns reads pg_attribute joined to pg_class, so without these rows a tool
+     * asking what pg_class holds is told it holds nothing. The columns come from the builders
+     * that answer for those relations, so the description cannot drift from the relation.
+     */
+    private void addCatalogRelationAttributes(Table table) {
+        if (Boolean.TRUE.equals(DESCRIBING_CATALOGS.get())) return;
+        DESCRIBING_CATALOGS.set(Boolean.TRUE);
+        try {
+            java.util.Set<Integer> described = new HashSet<>();
+            for (Object[] row : table.getRows()) {
+                described.add((Integer) row[0]);
+            }
+            for (String catalogRelation : DESCRIBED_CATALOGS) {
+                int relOid = oids.oid("rel:pg_catalog." + catalogRelation);
+                if (!described.add(relOid)) continue;
+                addRelationColumns(table, relOid, catalogColumns(catalogRelation));
+            }
+        } finally {
+            DESCRIBING_CATALOGS.remove();
+        }
+    }
+
+    /**
+     * The columns a catalog relation has, remembered after the first time it is asked.
+     *
+     * <p>A catalog relation declares the same columns whatever the database holds, so the shape
+     * is worked out once and the rows — which do change — are never kept. Building all of them
+     * afresh for every query that reads pg_attribute is what a client's metadata call would
+     * otherwise pay for.
+     */
+    private List<Column> catalogColumns(String relation) {
+        List<Column> cached = CATALOG_RELATION_COLUMNS.get(relation);
+        if (cached != null) return cached;
+        Table built;
+        try {
+            built = new PgCatalogBuilder(database, oids).build(relation);
+        } catch (RuntimeException e) {
+            return null;
+        }
+        if (built == null || built.getColumns().isEmpty()) return null;
+        if ("dummy".equals(built.getColumns().get(0).getName())) return null;
+        List<Column> columns = new ArrayList<>(built.getColumns());
+        CATALOG_RELATION_COLUMNS.put(relation, columns);
+        return columns;
+    }
+
+    /** Catalog relation name -> the columns it declares. */
+    private static final Map<String, List<Column>> CATALOG_RELATION_COLUMNS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * The catalog relations pg_attribute describes column by column: the ones a client reads to
+     * learn what a relation holds. Every row here is a row every query over pg_attribute carries,
+     * so the list is the catalogs tools actually introspect rather than all of them.
+     */
+    private static final String[] DESCRIBED_CATALOGS = {
+            "pg_class", "pg_attribute", "pg_type", "pg_namespace", "pg_constraint", "pg_trigger"};
+
+    /**
+     * Describe one relation's columns, leaving out the ones every relation carries without
+     * declaring them — PostgreSQL keeps no pg_attribute row for a system column either.
+     */
+    private void addRelationColumns(Table table, int relOid, List<Column> relation) {
+        if (relation == null) return;
+        int attnum = 0;
+        for (Column c : relation) {
+            String name = c.getName().toLowerCase();
+            if ("xmin".equals(name) || "xmax".equals(name) || "cmin".equals(name)
+                    || "cmax".equals(name) || "ctid".equals(name) || "tableoid".equals(name)) {
+                continue;
+            }
+            attnum++;
+            String[] physical = typeAttrs(storedTypeName(c.getType()));
+            table.insertRow(new Object[]{
+                    relOid, c.getName(), c.getType().getOid(), (short) attnum,
+                    !c.isNullable(), -1,
+                    physical != null ? Short.parseShort(physical[1]) : (short) -1,
+                    physical != null && "t".equals(physical[2]),
+                    false, false,
+                    "", "", 0, 1, true, 0, null, 0, null,
+                    null, (short) -1, physical != null ? physical[8] : "p", "", false, null,
+                    physical != null ? physical[7] : "i"
+            });
+        }
+    }
+
     /** pg_attribute rows for foreign tables, composite types, and system catalogs. */
     private void addPgAttributeExtras(Table table) {
         addSequenceAttributes(table);
@@ -986,7 +1234,7 @@ class CatalogCoreBuilder {
                     int typOid = resolveTypeOidByName(colTypeName);
                     table.insertRow(new Object[]{
                             ftRelOid, colName, typOid, (short) (i + 1),
-                            false, -1, (short) -1, false, false,
+                            false, -1, (short) -1, false, false, false,
                             "", "", 0, 1, true, 0, null, 0, null,
                             null, (short) -1, "p", "", false, null, "i"
                     });
@@ -1007,7 +1255,7 @@ class CatalogCoreBuilder {
                 int atttypid = resolveTypeOidByName(f.typeName());
                 table.insertRow(new Object[]{
                         ctRelOid, f.name(), atttypid, (short) (i + 1),
-                        false, -1, (short) -1, false, false,
+                        false, -1, (short) -1, false, false, false,
                         "", "", 0, 1, true, 0, null, 0, null,
                         null, (short) -1, "p", "", false, null, "i"
                 });
@@ -1076,7 +1324,7 @@ class CatalogCoreBuilder {
         for (int i = 0; i < colNames.length; i++) {
             attrTable.insertRow(new Object[]{
                     relOid, colNames[i], 0, (short) (i + 1),
-                    false, -1, (short) -1, false, false,
+                    false, -1, (short) -1, false, false, false,
                     "", "", 0, 1, true, 0, null, 0, null,
                     null, (short) -1, "p", "", false, null, "i"
             });
@@ -1089,7 +1337,7 @@ class CatalogCoreBuilder {
         for (int i = 0; i < colNames.length; i++) {
             attrTable.insertRow(new Object[]{
                     relOid, colNames[i], typeOids[i], (short) (i + 1),
-                    false, -1, (short) -1, false, false,
+                    false, -1, (short) -1, false, false, false,
                     "", "", 0, 1, true, 0, null, 0, null,
                     null, (short) -1, "p", "", false, null, "i"
             });
@@ -1143,168 +1391,24 @@ class CatalogCoreBuilder {
                     || dt == DataType.SMALLSERIAL
                     || dt.getPgName().startsWith("_")
                     || dt == DataType.RECORD || dt == DataType.VOID) continue;
-            String cat;
-            switch (dt) {
-                case SMALLINT:
-                case INTEGER:
-                case BIGINT:
-                case REAL:
-                case DOUBLE_PRECISION:
-                case NUMERIC:
-                case MONEY:
-                case REGPROC:
-                case REGCLASS:
-                case REGTYPE:
-                    cat = "N";
-                    break;
-                case INT2VECTOR:
-                case OIDVECTOR:
-                    cat = "A";
-                    break;
-                case BOOLEAN:
-                    cat = "B";
-                    break;
-                case VARCHAR:
-                case CHAR:
-                case TEXT:
-                case NAME:
-                    cat = "S";
-                    break;
-                case DATE:
-                case TIMESTAMP:
-                case TIMESTAMPTZ:
-                case TIME:
-                case INTERVAL:
-                    cat = "D";
-                    break;
-                default:
-                    cat = "U";
-                    break;
-            }
-            short typlen;
-            switch (dt) {
-                case BOOLEAN:
-                    typlen = (short) 1;
-                    break;
-                case SMALLINT:
-                    typlen = (short) 2;
-                    break;
-                case INTEGER:
-                    typlen = (short) 4;
-                    break;
-                case BIGINT:
-                    typlen = (short) 8;
-                    break;
-                case REAL:
-                    typlen = (short) 4;
-                    break;
-                case DOUBLE_PRECISION:
-                    typlen = (short) 8;
-                    break;
-                case NAME:
-                    typlen = (short) 64;
-                    break;
-                case REGPROC:
-                case REGCLASS:
-                case REGTYPE:
-                    typlen = (short) 4;
-                    break;
-                default:
-                    typlen = (short) -1;
-                    break;
-            }
-            boolean isPreferred;
-            switch (dt) {
-                case DOUBLE_PRECISION:
-                case TEXT:
-                case BOOLEAN:
-                case TIMESTAMPTZ:
-                    isPreferred = true;
-                    break;
-                default:
-                    isPreferred = false;
-                    break;
-            }
-            // Collation OID: only for string types
-            int collation = (cat.equals("S")) ? 100 : 0;
+            String pgName = dt.getPgName();
+            String[] attrs = typeAttrs(pgName);
+            // A range and a multirange are their own kinds of type, not base types, and tools
+            // that bucket types by typtype rely on the distinction.
+            String typtype = attrs != null ? attrs[3]
+                    : pgName.endsWith("multirange") ? "m" : pgName.endsWith("range") ? "r" : "b";
+            String cat = attrs != null ? attrs[4] : pgName.endsWith("range") ? "R" : "U";
+            short typlen = attrs != null ? Short.parseShort(attrs[1]) : (short) -1;
+            boolean typbyval = attrs != null && "t".equals(attrs[2]);
+            boolean isPreferred = attrs != null && "t".equals(attrs[5]);
+            String typdelim = attrs != null ? attrs[6] : ",";
+            String typalign = attrs != null ? attrs[7] : "i";
+            String typstorage = attrs != null ? attrs[8] : "p";
+            int collation = attrs != null ? Integer.parseInt(attrs[9]) : 0;
             // A driver that does not hardcode an array OID discovers array support by following
             // typarray from the element type (pgjdbc's TypeInfoCache does exactly this), so every
             // element whose array type is registered has to point back at it.
             int typarray = ARRAY_OF.containsKey(dt.getOid()) ? ARRAY_OF.get(dt.getOid()) : 0;
-            // typbyval: passed by value for small fixed-size types
-            boolean typbyval;
-            switch (dt) {
-                case BOOLEAN:
-                case SMALLINT:
-                case INTEGER:
-                case REAL:
-                case REGPROC:
-                case REGCLASS:
-                case REGTYPE:
-                    typbyval = true;
-                    break;
-                case BIGINT:
-                case DOUBLE_PRECISION:
-                    typbyval = true;
-                    break;
-                default:
-                    typbyval = false;
-                    break;
-            }
-            // typalign: 'c'=char, 's'=short, 'i'=int, 'd'=double
-            String typalign;
-            switch (dt) {
-                case BOOLEAN:
-                case CHAR:
-                    typalign = "c";
-                    break;
-                case SMALLINT:
-                    typalign = "s";
-                    break;
-                case INTEGER:
-                case REAL:
-                case DATE:
-                    typalign = "i";
-                    break;
-                default:
-                    typalign = "d";
-                    break;
-            }
-            // typstorage: 'p'=plain, 'x'=extended, 'e'=external, 'm'=main
-            String typstorage;
-            switch (dt) {
-                case BOOLEAN:
-                case SMALLINT:
-                case INTEGER:
-                case BIGINT:
-                case REAL:
-                case DOUBLE_PRECISION:
-                case DATE:
-                    typstorage = "p";
-                    break;
-                case TEXT:
-                case VARCHAR:
-                case BYTEA:
-                case JSON:
-                case JSONB:
-                case XML:
-                    typstorage = "x";
-                    break;
-                default:
-                    typstorage = "p";
-                    break;
-            }
-            String pgName = dt.getPgName();
-            // A range and a multirange are their own kinds of type, not base types, and tools
-            // that bucket types by typtype rely on the distinction.
-            String typtype = "b";
-            if (pgName.endsWith("multirange")) {
-                typtype = "m";
-                cat = "R";
-            } else if (pgName.endsWith("range")) {
-                typtype = "r";
-                cat = "R";
-            }
             // A vector holds elements, and PG records which: 0-based int2vector/oidvector carry
             // typelem the same way an array type does.
             int typelem = dt == DataType.INT2VECTOR ? DataType.SMALLINT.getOid()
@@ -1315,7 +1419,7 @@ class CatalogCoreBuilder {
             table.insertRow(new Object[]{
                     dt.getOid(), pgName, pgCatalogOid,
                     10,          // typowner
-                    typlen, typbyval, typtype, cat, isPreferred, true, ",",
+                    typlen, typbyval, typtype, cat, isPreferred, true, typdelim,
                     0,           // typrelid
                     subscript,
                     typelem,
@@ -1331,13 +1435,27 @@ class CatalogCoreBuilder {
             });
         }
 
-        // aclitem base type (OID 1033)
+        // The single-byte "char" type (OID 18). It is a type of its own, not the character(n)
+        // that shares its spelling, and _char's typelem points at it — a catalog that carries the
+        // array without the element describes an array of nothing.
+        String[] charAttrs = typeAttrs("char");
+        table.insertRow(new Object[]{
+                18, "char", pgCatalogOid, 10,
+                Short.parseShort(charAttrs[1]), true, "b", charAttrs[4], false, true, charAttrs[6],
+                0, regproc(null), 0, 1002,
+                regproc("charin"), regproc("charout"), regproc("charrecv"), regproc("charsend"),
+                regproc(null), regproc(null), regproc(null), charAttrs[7], charAttrs[8],
+                false, 0, -1, 0, 0, null, null, null, 1
+        });
+
+        // aclitem base type (OID 1033) — a 16-byte, double-aligned struct in PG 18.
+        String[] aclAttrs = typeAttrs("aclitem");
         table.insertRow(new Object[]{
                 1033, "aclitem", pgCatalogOid, 10,
-                (short) 12, false, "b", "U", false, true, ",",
+                Short.parseShort(aclAttrs[1]), false, "b", "U", false, true, aclAttrs[6],
                 0, regproc(null), 0, 1034,
                 regproc("aclitemin"), regproc("aclitemout"), regproc(null), regproc(null),
-                regproc(null), regproc(null), regproc(null), "i", "p",
+                regproc(null), regproc(null), regproc(null), aclAttrs[7], aclAttrs[8],
                 false, 0, -1, 0, 0, null, null, null, 1
         });
 
@@ -1350,11 +1468,17 @@ class CatalogCoreBuilder {
             int arrOid = (Integer) a[0];
             int elemOid = (Integer) a[1];
             String arrName = (String) a[2];
-            int arrCollation = (elemOid == 25 || elemOid == 1043 || elemOid == 1042 || elemOid == 19) ? 100 : 0;
-            String align = (String) a[3];
+            // An array inherits its element's alignment, delimiter and collation, and PG records
+            // all three per array type: _box is semicolon-delimited because a box is, and _name
+            // sorts under C. Reading them off the record is what keeps them right.
+            String[] attrs = typeAttrs(arrName);
+            String align = attrs != null ? attrs[7] : (String) a[3];
+            String delim = attrs != null ? attrs[6] : ",";
+            int arrCollation = attrs != null ? Integer.parseInt(attrs[9])
+                    : ((elemOid == 25 || elemOid == 1043 || elemOid == 1042 || elemOid == 19) ? 100 : 0);
             table.insertRow(new Object[]{
                     arrOid, arrName, pgCatalogOid, 10,
-                    (short) -1, false, "b", "A", false, true, ",",
+                    (short) -1, false, "b", "A", false, true, delim,
                     0, regproc("array_subscript_handler"), elemOid, 0,
                     regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
                     regproc(null), regproc(null), regproc("array_typanalyze"), align, "x",
@@ -1388,13 +1512,18 @@ class CatalogCoreBuilder {
         for (String[] pt : pseudoTypes) {
             String ptName = pt[0];
             int ptOid = Integer.parseInt(pt[1]);
-            short ptLen = Short.parseShort(pt[2]);
+            String[] attrs = typeAttrs(ptName);
+            short ptLen = Short.parseShort(attrs != null ? attrs[1] : pt[2]);
+            // A pseudo-type is never passed by value unless PG says so: cstring is a pointer of
+            // length -2, and record is varlena, so neither is the by-value type its length suggests.
+            boolean ptByVal = attrs != null ? "t".equals(attrs[2]) : ptLen > 0;
             table.insertRow(new Object[]{
                     ptOid, ptName, pgCatalogOid, 10,
-                    ptLen, ptLen > 0, "p", "P", false, true, ",",
+                    ptLen, ptByVal, "p", "P", false, true, ",",
                     0, regproc(null), 0, 0,
                     regproc(ptName + "_in"), regproc(ptName + "_out"), regproc(null), regproc(null),
-                    regproc(null), regproc(null), regproc(null), pt[3], pt[4],
+                    regproc(null), regproc(null), regproc(null),
+                    attrs != null ? attrs[7] : pt[3], attrs != null ? attrs[8] : pt[4],
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
@@ -1403,8 +1532,9 @@ class CatalogCoreBuilder {
         // one — a recursive query's SEARCH or CYCLE column — looks its row up here to learn the
         // element type and delimiter before it will parse the value at all.
         table.insertRow(new Object[]{
+                // An array over a pseudo-type is itself a pseudo-type: PG records typtype 'p'.
                 2287, "_record", pgCatalogOid, 10,
-                (short) -1, false, "b", "P", false, true, ",",
+                (short) -1, false, "p", "P", false, true, ",",
                 0, regproc("array_subscript_handler"), 2249, 0,
                 regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
                 regproc(null), regproc(null), regproc("array_typanalyze"), "d", "x",
@@ -1500,7 +1630,7 @@ class CatalogCoreBuilder {
 
         // Add domain types
         for (DomainType dom : database.getDomains().values()) {
-            int domNsOid = oids.oid("ns:public");
+            int domNsOid = oids.oid("ns:" + dom.getSchemaName());
             // Resolve base type OID
             int baseTypeOid = 0;
             String baseTypeCat = "U";
@@ -1540,6 +1670,12 @@ class CatalogCoreBuilder {
                     }
                     break;
                 }
+            }
+            // A domain over an array has the array type as its base, not the element: a tool
+            // following typbasetype to size an input must not be told it is a scalar.
+            if (dom.isArray() && dom.getBaseType() != null) {
+                baseTypeOid = dom.getBaseType().getOid();
+                baseTypeCat = "A";
             }
             table.insertRow(new Object[]{
                     oids.oid("type:" + dom.getName()), dom.getName(), domNsOid, 10,

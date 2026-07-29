@@ -51,6 +51,18 @@ class FromResolver {
         return outermostQuery != null && currentQuery == outermostQuery;
     }
 
+    /**
+     * The view a FROM item names. A qualified reference reaches the view in the schema it names
+     * and nothing else: another schema's view of the same name is a different relation, and a
+     * table in the named schema is what the reference means when that schema holds no such view.
+     */
+    Database.ViewDef viewFor(SelectStmt.TableRef tableRef) {
+        if (tableRef.schema() != null) {
+            return executor.database.getView(tableRef.schema(), tableRef.table());
+        }
+        return executor.database.getView(tableRef.table());
+    }
+
     // ---- Table Bindings (column structure without data) ----
 
     List<RowContext.TableBinding> resolveTableBindings(List<SelectStmt.FromItem> fromItems) {
@@ -179,7 +191,7 @@ class FromResolver {
                 return;
             }
             // Check views
-            Database.ViewDef view = executor.database.getView(tableRef.table());
+            Database.ViewDef view = viewFor(tableRef);
             if (view != null) {
                 // Materialized views know their columns without re-running the query
                 // (and an unpopulated matview must still be describable).
@@ -665,7 +677,7 @@ class FromResolver {
         }
 
         // Check views
-        Database.ViewDef view = executor.database.getView(tableRef.table());
+        Database.ViewDef view = viewFor(tableRef);
         if (view != null) {
             if (view.materialized() && !view.populated()) {
                 MemgresException ex = new MemgresException(
@@ -820,7 +832,7 @@ class FromResolver {
     private List<RowContext> tryIndexScan(SelectStmt.TableRef tableRef, Expression where) {
         // Only optimize regular user tables (skip CTEs, views, system catalogs)
         if (executor.selectExecutor.lookupCte(tableRef.table()) != null) return null;
-        if (executor.database.getView(tableRef.table()) != null) return null;
+        if (viewFor(tableRef) != null) return null;
         String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
         Table table;
         try {

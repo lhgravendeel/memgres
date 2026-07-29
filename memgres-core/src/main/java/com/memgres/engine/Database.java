@@ -957,7 +957,9 @@ public class Database {
         for (Map.Entry<String, ViewDef> e : new LinkedHashMap<>(views).entrySet()) {
             ViewDef v = e.getValue();
             if (oldName.equalsIgnoreCase(v.schemaName())) {
-                views.put(e.getKey(), new ViewDef(v.name(), newName, v.query(), v.orReplace(),
+                // The view is keyed by the schema it lives in, which just changed its name.
+                views.remove(e.getKey());
+                addView(new ViewDef(v.name(), newName, v.query(), v.orReplace(),
                         v.materialized(), v.cachedColumns(), v.cachedRows(), v.sourceSQL(),
                         v.checkOption(), v.reloptions(), v.populated()));
             }
@@ -2009,20 +2011,66 @@ public class Database {
     }
 
     // Views
+    //
+    // A view belongs to a schema, so two schemas may each hold one of the same name and a
+    // qualified reference has to reach the one it names. The map is keyed by both, and a bare
+    // name still finds the only view that answers to it.
     public void addView(ViewDef view) {
-        views.put(view.name().toLowerCase(), view);
+        views.put(viewKey(view.schemaName(), view.name()), view);
     }
 
+    /** The key a view is stored under: its schema and its name. */
+    private static String viewKey(String schemaName, String name) {
+        String schema = schemaName == null ? "public" : schemaName;
+        return schema.toLowerCase() + "." + name.toLowerCase();
+    }
+
+    /**
+     * The view a name refers to. A qualified name reaches the view in the schema it names; a
+     * bare one finds a view of that name in any schema, preferring public.
+     */
     public ViewDef getView(String name) {
-        return views.get(name.toLowerCase());
+        if (name == null) return null;
+        String lower = name.toLowerCase();
+        ViewDef exact = views.get(lower);
+        if (exact != null) return exact;
+        if (lower.indexOf('.') >= 0) {
+            // A qualified name names one schema's view and no other's.
+            return null;
+        }
+        ViewDef found = views.get("public." + lower);
+        if (found != null) return found;
+        for (Map.Entry<String, ViewDef> e : views.entrySet()) {
+            if (e.getValue().name().equalsIgnoreCase(lower)) return e.getValue();
+        }
+        return null;
+    }
+
+    /** The view of this name in this schema, or null. */
+    public ViewDef getView(String schemaName, String name) {
+        if (name == null) return null;
+        if (name.indexOf('.') >= 0) return getView(name);
+        return views.get(viewKey(schemaName, name));
     }
 
     public void removeView(String name) {
-        views.remove(name.toLowerCase());
+        ViewDef view = getView(name);
+        if (view != null) views.remove(viewKey(view.schemaName(), view.name()));
+    }
+
+    /** Drop the view of this name in this schema. */
+    public void removeView(String schemaName, String name) {
+        ViewDef view = getView(schemaName, name);
+        if (view != null) views.remove(viewKey(view.schemaName(), view.name()));
     }
 
     public boolean hasView(String name) {
-        return views.containsKey(name.toLowerCase());
+        return getView(name) != null;
+    }
+
+    /** Whether this schema holds a view of this name. */
+    public boolean hasView(String schemaName, String name) {
+        return getView(schemaName, name) != null;
     }
 
     public Map<String, ViewDef> getViews() {

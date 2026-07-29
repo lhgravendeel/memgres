@@ -321,8 +321,35 @@ public enum DataType {
                 if (normalized.startsWith("_")) {
                     return arrayOf(fromPgName(normalized.substring(1)));
                 }
+                // "interval year to month" and its relatives are the interval type with a field
+                // qualifier written after it; the qualifier restricts which fields are kept, and
+                // it is recorded on the column rather than being a type of its own.
+                if (normalized.startsWith("interval ") && intervalQualifier(normalized) != null) {
+                    return INTERVAL;
+                }
                 return null;
         }
+    }
+
+    /** The interval field qualifiers SQL defines, spelled the way information_schema reports them. */
+    private static final java.util.Set<String> INTERVAL_QUALIFIERS = new java.util.HashSet<>(
+            java.util.Arrays.asList("year", "month", "day", "hour", "minute", "second",
+                    "year to month", "day to hour", "day to minute", "day to second",
+                    "hour to minute", "hour to second", "minute to second"));
+
+    /**
+     * The field qualifier written after {@code interval} in a type name, normalised to lower
+     * case and without any trailing precision, or null when the name carries none or carries
+     * one SQL does not define.
+     */
+    public static String intervalQualifier(String typeName) {
+        if (typeName == null) return null;
+        String normalized = typeName.toLowerCase().trim();
+        if (!normalized.startsWith("interval ")) return null;
+        String rest = normalized.substring("interval ".length()).trim();
+        int paren = rest.indexOf('(');
+        if (paren >= 0) rest = rest.substring(0, paren).trim();
+        return INTERVAL_QUALIFIERS.contains(rest) ? rest : null;
     }
 
     /** The array type over an element type, or null when memgres carries no OID for it. */

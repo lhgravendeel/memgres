@@ -18,6 +18,15 @@ public class DomainType {
     private String checkExpression; // raw SQL text for the CHECK constraint
     private Expression parsedCheck; // parsed CHECK expression (VALUE replaced with the actual value)
     private String defaultValue;
+    /** The base type's declared modifier, e.g. 12 and null for varchar(12), 10 and 2 for numeric(10,2). */
+    private Integer precision;
+    private Integer scale;
+    /** The interval field qualifier of the base type, lower case: "day to second", "year to month". */
+    private String intervalQualifier;
+    /** The element type when the domain is over an array, e.g. INTEGER for {@code integer[]}. */
+    private DataType arrayElementType;
+    /** The schema the domain was created in. */
+    private String schemaName = "public";
 
     /** Named constraints added via ALTER DOMAIN ADD CONSTRAINT. */
     private final List<NamedConstraint> namedConstraints = new ArrayList<>();
@@ -45,6 +54,33 @@ public class DomainType {
     public String getCheckExpression() { return checkExpression; }
     public Expression getParsedCheck() { return parsedCheck; }
     public String getDefaultValue() { return defaultValue; }
+    public Integer getPrecision() { return precision; }
+    public Integer getScale() { return scale; }
+
+    public String getIntervalQualifier() { return intervalQualifier; }
+    public DataType getArrayElementType() { return arrayElementType; }
+    public boolean isArray() { return arrayElementType != null; }
+    public String getSchemaName() { return schemaName; }
+
+    /** Record the base type's declared modifier, so information_schema can describe the domain. */
+    public void setTypmod(Integer precision, Integer scale) {
+        this.precision = precision;
+        this.scale = scale;
+    }
+
+    /**
+     * Record the rest of the base type's declaration — its interval field qualifier, whether it
+     * is an array, and the schema the domain lives in. A column declared with the domain is a
+     * column of that base type, so everything the declaration said has to travel with it.
+     */
+    public void setBaseTypeFacts(String intervalQualifier, DataType arrayElementType) {
+        this.intervalQualifier = intervalQualifier;
+        this.arrayElementType = arrayElementType;
+    }
+
+    public void setSchemaName(String schemaName) {
+        this.schemaName = schemaName;
+    }
 
     public void setDefaultValue(String defaultValue) {
         this.defaultValue = defaultValue;

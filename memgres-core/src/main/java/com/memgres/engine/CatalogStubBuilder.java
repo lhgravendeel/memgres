@@ -162,7 +162,10 @@ class CatalogStubBuilder {
                         if (addedIndexes.contains(indexName.toLowerCase())) continue;
                         String indexDef = "CREATE UNIQUE INDEX " + indexName
                                 + " ON " + schemaName + "." + t.getName()
-                                + " USING btree (" + String.join(", ", sc.getColumns()) + ")";
+                                + " USING btree (" + String.join(", ", sc.getColumns()) + ")"
+                                // The index a UNIQUE NULLS NOT DISTINCT constraint creates is
+                                // itself a NULLS NOT DISTINCT index, and reads back as one.
+                                + (sc.isNullsNotDistinct() ? " NULLS NOT DISTINCT" : "");
                         table.insertRow(new Object[]{schemaName, t.getName(), indexName, null, indexDef});
                         addedIndexes.add(indexName.toLowerCase());
                     }

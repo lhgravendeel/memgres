@@ -20,6 +20,27 @@ class CatalogConstraintBuilder {
         this.oids = oids;
     }
 
+    /**
+     * The columns a CHECK constraint reads, as attnums in column order — what PostgreSQL keeps
+     * in {@code pg_constraint.conkey} for a CHECK. information_schema.constraint_column_usage is
+     * built from it, so a constraint with no conkey is a constraint no tool can attribute to a
+     * column.
+     */
+    private List<Object> checkedColumns(Table t, StoredConstraint sc) {
+        if (sc.getCheckExpr() == null) return null;
+        Set<String> named = new LinkedHashSet<>();
+        for (String name : DdlExecutor.referencedColumnNames(sc.getCheckExpr())) {
+            named.add(name.toLowerCase());
+        }
+        List<Object> attnums = new ArrayList<>();
+        for (int i = 0; i < t.getColumns().size(); i++) {
+            if (named.contains(t.getColumns().get(i).getName().toLowerCase())) {
+                attnums.add(Integer.valueOf(i + 1));
+            }
+        }
+        return attnums.isEmpty() ? null : attnums;
+    }
+
     Table buildPgConstraint() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.INTEGER),
@@ -89,6 +110,11 @@ class CatalogConstraintBuilder {
                     }
                     // Convert column names to attnum array string
                     List<Object> conkey = columnNamesToAttnums(t, sc.getColumns());
+                    if (sc.getType() == StoredConstraint.Type.CHECK) {
+                        // A CHECK names no columns of its own: the ones it constrains are the
+                        // ones its expression reads, and that is what conkey lists.
+                        conkey = checkedColumns(t, sc);
+                    }
                     List<Object> confkey = null;
                     if (sc.getType() == StoredConstraint.Type.FOREIGN_KEY && sc.getReferencesTable() != null) {
                         Table refTable = findTable(database, sc.getReferencesTable());
@@ -471,7 +497,10 @@ class CatalogConstraintBuilder {
                                     true, true, true, null, null, constraintClustered,
                                     false, // indisreplident
                                     new PgVector(optElems),
-                                    false, new PgVector(resolvedClsElems), new PgVector(colElems)
+                                    // The index a UNIQUE constraint is backed by keeps the
+                                    // constraint's own NULLS NOT DISTINCT.
+                                    sc.isNullsNotDistinct(),
+                                    new PgVector(resolvedClsElems), new PgVector(colElems)
                             });
                         }
                     }
@@ -777,9 +806,16 @@ class CatalogConstraintBuilder {
                 col("tgconstrrelid", DataType.INTEGER),
                 col("tgdeferrable", DataType.BOOLEAN),
                 col("tginitdeferred", DataType.BOOLEAN),
+                // How many arguments the trigger passes to its function, and the arguments
+                // themselves. A tool that reads tgargs has to know how many are in it.
+                col("tgnargs", DataType.SMALLINT),
                 col("tgargs", DataType.TEXT),
                 col("tgattr", DataType.TEXT),
                 col("tgconstraint", DataType.INTEGER),
+                // The index a constraint trigger enforces, and the WHEN condition the trigger
+                // was declared with. Both are what PostgreSQL keeps here, empty or not.
+                col("tgconstrindid", DataType.INTEGER),
+                col("tgqual", DataType.TEXT),
                 col("tgoldtable", DataType.TEXT),
                 col("tgnewtable", DataType.TEXT),
                 col("tgparentid", DataType.INTEGER),
@@ -840,11 +876,14 @@ class CatalogConstraintBuilder {
             int tgfoid = oids.oid("proc:" + first.getFunctionName());
 
             String tgenabled = first.isDisabled() ? "D" : "O";
+            String whenCondition = first.getWhenClause();
             table.insertRow(new Object[]{
                     oids.oid("trig:" + trigSchema + "." + first.getTableName() + "." + first.getName()),
                     relOid, first.getName(),
                     tgfoid, (short) tgtype, tgenabled, false, 0, false, false,
-                    "", null, 0, null, null, 0, 1
+                    (short) 0, "", null, 0,
+                    0, whenCondition,
+                    first.getOldTransitionTable(), first.getNewTransitionTable(), 0, 1
             });
         }
         return table;

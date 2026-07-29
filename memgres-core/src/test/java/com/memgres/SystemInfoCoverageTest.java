@@ -461,8 +461,9 @@ class SystemInfoCoverageTest {
 
     @Test
     void testFormatTypeNull() throws SQLException {
+        // Measured on PG 18: format_type(NULL, NULL) is NULL — there is no type to name.
         String result = query1("SELECT format_type(NULL, NULL)");
-        assertNotNull(result);
+        assertNull(result);
     }
 
     // --- pg_get_viewdef(view_oid) ---

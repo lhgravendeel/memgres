@@ -100,10 +100,13 @@ class SystemCatalogTest {
     @Test
     void testPgAttributeNotNull() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
-            // Direct query without JOIN to verify attnotnull values
+            // The column is named by its relation: every relation the catalog describes may hold
+            // a column called "name", and PG 18 answers 20 rows for the name alone, only one of
+            // them NOT NULL. The question is about the users table's column.
             ResultSet rs = stmt.executeQuery(
-                    "SELECT attname, attnotnull FROM pg_catalog.pg_attribute " +
-                    "WHERE attname = 'name'");
+                    "SELECT a.attname, a.attnotnull FROM pg_catalog.pg_attribute a " +
+                    "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid " +
+                    "WHERE c.relname = 'users' AND a.attname = 'name'");
             boolean found = false;
             while (rs.next()) {
                 if ("name".equals(rs.getString("attname"))) {

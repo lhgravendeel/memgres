@@ -704,11 +704,17 @@ class CatalogConstraintAccuracyTest {
     // ========================================================================
 
     /**
-     * information_schema.constraint_column_usage lists columns referenced by
-     * PRIMARY KEY and UNIQUE constraints. For cat_t:
-     *   - PK references 'id'
-     *   - UNIQUE references 'email'
-     * CHECK constraints (age > 0) and NOT NULL must NOT appear here.
+     * information_schema.constraint_column_usage lists every column a constraint is used by,
+     * not only the key ones. Measured on PG 18 for this table's shape:
+     * <pre>
+     * age   | CHECK       | cat_t_age_check
+     * email | UNIQUE      | cat_t_email_key
+     * id    | CHECK       | cat_t_id_not_null
+     * id    | PRIMARY KEY | cat_t_pkey
+     * name  | CHECK       | cat_t_name_not_null
+     * </pre>
+     * A CHECK is used by the columns its expression reads and a NOT NULL by the column that
+     * carries it; only a column no constraint mentions — score — stays out.
      */
     @Test
     void constraint_column_usage_pk_and_unique_only() throws SQLException {
@@ -729,11 +735,10 @@ class CatalogConstraintAccuracyTest {
         assertTrue(cols.contains("email"),
                 "constraint_column_usage must list 'email' for UNIQUE; got: " + cols);
 
-        // Only id and email should appear (PK + UNIQUE), not age, name, score
-        assertFalse(cols.contains("age"),
-                "constraint_column_usage must not list CHECK column 'age'; got: " + cols);
-        assertFalse(cols.contains("name"),
-                "constraint_column_usage must not list NOT NULL column 'name'; got: " + cols);
+        assertTrue(cols.contains("age"),
+                "constraint_column_usage must list the CHECK's column 'age'; got: " + cols);
+        assertTrue(cols.contains("name"),
+                "constraint_column_usage must list the NOT NULL column 'name'; got: " + cols);
         assertFalse(cols.contains("score"),
                 "constraint_column_usage must not list unconstrained column 'score'; got: " + cols);
     }

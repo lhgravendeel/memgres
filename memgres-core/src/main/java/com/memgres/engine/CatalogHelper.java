@@ -62,6 +62,8 @@ public final class CatalogHelper {
                 return "timestamp with time zone";
             case TIME:
                 return "time without time zone";
+            case TIMETZ:
+                return "time with time zone";
             case INTERVAL:
                 return "interval";
             case BYTEA:
@@ -130,14 +132,6 @@ public final class CatalogHelper {
                 return "tsmultirange";
             case TSTZMULTIRANGE:
                 return "tstzmultirange";
-            case TEXT_ARRAY:
-                return "text[]";
-            case INT4_ARRAY:
-                return "integer[]";
-            case ACLITEM_ARRAY:
-                return "aclitem[]";
-            case NAME_ARRAY:
-                return "name[]";
             case ENUM:
                 return "USER-DEFINED";
             case XID:
@@ -157,7 +151,153 @@ public final class CatalogHelper {
             case HSTORE:
                 return "hstore";
             default:
-                throw new IllegalStateException("Unknown data type: " + dt);
+                // Every remaining type spells its SQL name the same way pg_type does. An array
+                // is written as its element type followed by [], and a type with no case above
+                // is still a type: throwing here would take out whichever catalog view is being
+                // built, which is a far worse answer than the name itself.
+                String pgName = dt.getPgName();
+                if (pgName.startsWith("_")) {
+                    DataType element = byPgName(pgName.substring(1));
+                    return (element != null ? pgTypeName(element) : pgName.substring(1)) + "[]";
+                }
+                return pgName;
+        }
+    }
+
+    /** The type spelled exactly {@code pgName} in pg_type, or null. */
+    private static DataType byPgName(String pgName) {
+        for (DataType dt : DataType.values()) {
+            if (dt.getPgName().equals(pgName)) return dt;
+        }
+        return null;
+    }
+
+    // ---- Type modifiers ----
+
+    /**
+     * The interval field qualifiers, and the bit each one sets in an interval typmod. PostgreSQL
+     * packs the fields a qualifier keeps into the high half of the modifier and the
+     * fractional-seconds precision into the low half, so {@code interval day to second(3)} is one
+     * number a client can read back as both.
+     */
+    private static final String[] INTERVAL_RANGES = {
+            "year", "month", "day", "hour", "minute", "second",
+            "year to month", "day to hour", "day to minute", "day to second",
+            "hour to minute", "hour to second", "minute to second"};
+    private static final int[] INTERVAL_MASKS = {
+            1 << 2, 1 << 1, 1 << 3, 1 << 10, 1 << 11, 1 << 12,
+            (1 << 2) | (1 << 1),
+            (1 << 3) | (1 << 10),
+            (1 << 3) | (1 << 10) | (1 << 11),
+            (1 << 3) | (1 << 10) | (1 << 11) | (1 << 12),
+            (1 << 10) | (1 << 11),
+            (1 << 10) | (1 << 11) | (1 << 12),
+            (1 << 11) | (1 << 12)};
+    /** Every field: what an interval with no qualifier keeps. */
+    private static final int INTERVAL_FULL_RANGE = 0x7FFF;
+
+    /** The bits an interval qualifier sets, or the full range when there is none. */
+    private static int intervalMask(String qualifier) {
+        if (qualifier == null) return INTERVAL_FULL_RANGE;
+        for (int i = 0; i < INTERVAL_RANGES.length; i++) {
+            if (INTERVAL_RANGES[i].equals(qualifier.toLowerCase())) return INTERVAL_MASKS[i];
+        }
+        return INTERVAL_FULL_RANGE;
+    }
+
+    /** The qualifier a set of interval typmod bits stands for, or null for the full range. */
+    private static String intervalQualifierOf(int mask) {
+        for (int i = 0; i < INTERVAL_MASKS.length; i++) {
+            if (INTERVAL_MASKS[i] == mask) return INTERVAL_RANGES[i];
+        }
+        return null;
+    }
+
+    /**
+     * The type modifier PostgreSQL stores in {@code pg_attribute.atttypmod} for a column: the
+     * declaration's width, precision or field qualifier packed the way {@code format_type} and
+     * every client that decodes a column width expect to read it back. A column that declared
+     * nothing has none, which is -1.
+     */
+    public static int attTypmod(Column c) {
+        return attTypmod(c.getType(), c.getPrecision(), c.getScale(), c.getIntervalQualifier());
+    }
+
+    /** As above, from a declaration's parts. */
+    public static int attTypmod(DataType dt, Integer precision, Integer scale, String intervalQualifier) {
+        if (dt == null) return -1;
+        switch (dt) {
+            case VARCHAR:
+            case CHAR:
+                return precision == null ? -1 : precision.intValue() + 4;
+            case NUMERIC:
+                if (precision == null) return -1;
+                return ((precision.intValue() << 16) | (scale == null ? 0 : scale.intValue())) + 4;
+            case TIMESTAMP:
+            case TIMESTAMPTZ:
+            case TIME:
+            case TIMETZ:
+                return precision == null ? -1 : precision.intValue();
+            case INTERVAL: {
+                if (precision == null && intervalQualifier == null) return -1;
+                int mask = intervalMask(intervalQualifier);
+                int prec = precision == null ? 0xFFFF : precision.intValue();
+                return (mask << 16) | prec;
+            }
+            case BIT:
+            case VARBIT:
+                return precision == null ? -1 : precision.intValue();
+            default:
+                return -1;
+        }
+    }
+
+    /**
+     * A type named the way {@code format_type} names it, with the modifier applied.
+     *
+     * <p>The modifier is part of what the type is: a client sizing an input reads
+     * "character varying(10)[]" and knows both that it holds an array and how wide each element
+     * may be, where a bare type name tells it neither.
+     */
+    public static String formatType(DataType dt, DataType elementType, int typmod) {
+        if (elementType != null) return formatType(elementType, null, typmod) + "[]";
+        if (dt == null) return "-";
+        switch (dt) {
+            case VARCHAR:
+                return typmod >= 4 ? "character varying(" + (typmod - 4) + ")" : "character varying";
+            case CHAR:
+                return typmod >= 4 ? "character(" + (typmod - 4) + ")" : "bpchar";
+            case NUMERIC:
+                if (typmod >= 4) {
+                    int raw = typmod - 4;
+                    return "numeric(" + ((raw >> 16) & 0xFFFF) + "," + (raw & 0xFFFF) + ")";
+                }
+                return "numeric";
+            case TIMESTAMP:
+                return typmod >= 0 ? "timestamp(" + typmod + ") without time zone"
+                        : "timestamp without time zone";
+            case TIMESTAMPTZ:
+                return typmod >= 0 ? "timestamp(" + typmod + ") with time zone"
+                        : "timestamp with time zone";
+            case TIME:
+                return typmod >= 0 ? "time(" + typmod + ") without time zone" : "time without time zone";
+            case TIMETZ:
+                return typmod >= 0 ? "time(" + typmod + ") with time zone" : "time with time zone";
+            case INTERVAL: {
+                if (typmod < 0) return "interval";
+                String qualifier = intervalQualifierOf((typmod >> 16) & 0x7FFF);
+                int prec = typmod & 0xFFFF;
+                StringBuilder sb = new StringBuilder("interval");
+                if (qualifier != null) sb.append(' ').append(qualifier);
+                if (prec != 0xFFFF) sb.append('(').append(prec).append(')');
+                return sb.toString();
+            }
+            case BIT:
+                return typmod >= 0 ? "bit(" + typmod + ")" : "bit";
+            case VARBIT:
+                return typmod >= 0 ? "bit varying(" + typmod + ")" : "bit varying";
+            default:
+                return pgTypeName(dt);
         }
     }
 
@@ -213,6 +353,20 @@ public final class CatalogHelper {
             if (col.getDomainTypeName() != null) typeName = col.getDomainTypeName();
             else if (col.getEnumTypeName() != null) typeName = col.getEnumTypeName();
             return def + "::" + typeName;
+        }
+        return def;
+    }
+
+    /**
+     * Format a domain's default the way information_schema.domains reports it. PG stores the
+     * default already coerced to the domain's base type, so a string literal comes back with the
+     * cast that coercion left behind: {@code 'x'::character varying}.
+     */
+    public static String formatDomainDefault(DomainType domain) {
+        String def = domain.getDefaultValue();
+        if (def == null) return null;
+        if (def.startsWith("'") && def.endsWith("'") && domain.getBaseType() != null) {
+            return def + "::" + pgTypeName(domain.getBaseType());
         }
         return def;
     }

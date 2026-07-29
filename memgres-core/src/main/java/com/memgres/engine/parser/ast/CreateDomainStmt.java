@@ -11,9 +11,13 @@ public final class CreateDomainStmt implements Statement {
     public final Expression checkExpr;
     public final String constraintName; // explicit constraint name for CHECK, or null
     private String collation;           // COLLATE clause, or null
+    /** The schema the name was written in, or null when it was written bare. */
+    private String schemaName;
 
     public String collation() { return collation; }
     public void setCollation(String collation) { this.collation = collation; }
+    public String schemaName() { return schemaName; }
+    public void setSchemaName(String schemaName) { this.schemaName = schemaName; }
 
     public CreateDomainStmt(
             String name,

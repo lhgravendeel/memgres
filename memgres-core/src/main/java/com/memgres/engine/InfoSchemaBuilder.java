@@ -15,7 +15,7 @@ public class InfoSchemaBuilder {
      * alongside the user's own relations, and a tool enumerating the schema reads that list to
      * decide which standard views it can rely on.
      */
-    private static final List<String> INFORMATION_SCHEMA_VIEWS = Cols.listOf(
+    static final List<String> INFORMATION_SCHEMA_VIEWS = Cols.listOf(
         "administrable_role_authorizations", "applicable_roles", "attributes",
         "character_sets", "check_constraint_routine_usage", "check_constraints",
         "collation_character_set_applicability", "collations", "column_column_usage",
@@ -358,15 +358,24 @@ public class InfoSchemaBuilder {
                 new Column("user_defined_type_schema", DataType.TEXT, true, false, null),
                 new Column("user_defined_type_name", DataType.TEXT, true, false, null),
                 new Column("is_insertable_into", DataType.TEXT, true, false, null),
-                new Column("is_typed", DataType.TEXT, true, false, null)
+                new Column("is_typed", DataType.TEXT, true, false, null),
+                // What a temporary table does at COMMIT. PG only ever fills this in for a
+                // local temporary table, so the column is null everywhere else — but a tool
+                // that selects it has to find it there.
+                new Column("commit_action", DataType.TEXT, true, false, null)
         );
         Table table = new Table("tables", cols);
 
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
+            // A table in a pg_temp namespace is temporary, and the standard has a table type of
+            // its own for it — a tool that lists BASE TABLE only would otherwise take it for a
+            // permanent table it can go on reading in the next session.
+            boolean temp = schemaEntry.getKey().toLowerCase().startsWith("pg_temp");
             for (String tableName : schemaEntry.getValue().getTables().keySet()) {
                 table.insertRow(new Object[]{
-                        catalogName(), schemaEntry.getKey(), tableName, "BASE TABLE",
-                        null, null, null, null, null, "YES", "NO"
+                        catalogName(), schemaEntry.getKey(), tableName,
+                        temp ? "LOCAL TEMPORARY" : "BASE TABLE",
+                        null, null, null, null, null, "YES", "NO", null
                 });
             }
         }
@@ -375,9 +384,26 @@ public class InfoSchemaBuilder {
             // M21: PG's information_schema excludes materialized views
             if (vd.materialized()) continue;
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
+            // A simple view can be inserted into, and information_schema.views says so for the
+            // same view; the two views describe one object and have to agree about it.
+            String insertable = isSimpleUpdatableView(vd) ? "YES" : "NO";
             table.insertRow(new Object[]{
                     catalogName(), vSchema, vd.name(), "VIEW",
-                    null, null, null, null, null, "NO", "NO"
+                    null, null, null, null, null, insertable, "NO", null
+            });
+        }
+
+        // The catalog relations information_schema.columns describes are listed here too: a tool
+        // that reads the listing to decide what it may describe has to find them in both.
+        for (String pgTable : PG_CATALOG_TABLES_FOR_IS) {
+            boolean isView = pgTable.startsWith("pg_stat") || pgTable.startsWith("pg_statio")
+                    || "pg_settings".equals(pgTable) || "pg_roles".equals(pgTable)
+                    || "pg_policies".equals(pgTable) || "pg_indexes".equals(pgTable)
+                    || "pg_cursors".equals(pgTable) || "pg_prepared_statements".equals(pgTable)
+                    || "pg_replication_slots".equals(pgTable);
+            table.insertRow(new Object[]{
+                    catalogName(), "pg_catalog", pgTable, isView ? "VIEW" : "BASE TABLE",
+                    null, null, null, null, null, isView ? "NO" : "YES", "NO", null
             });
         }
 
@@ -386,7 +412,7 @@ public class InfoSchemaBuilder {
         for (String isView : INFORMATION_SCHEMA_VIEWS) {
             table.insertRow(new Object[]{
                     catalogName(), "information_schema", isView, "VIEW",
-                    null, null, null, null, null, "NO", "NO"
+                    null, null, null, null, null, "NO", "NO", null
             });
         }
         return table;
@@ -497,13 +523,100 @@ public class InfoSchemaBuilder {
     /** Guards the self-description pass in {@link #buildIsColumns} against re-entering itself. */
     private boolean buildingIsColumns;
 
+    /**
+     * The SQL-standard description of a data type, as information_schema reports it in every
+     * view that describes one — columns, domains, attributes, parameters. Which of the length,
+     * numeric and datetime fields apply is a property of the type, so working it out once here
+     * keeps all of those views saying the same thing about the same type.
+     */
+    static final class TypeFacts {
+        final Integer charMaxLen;
+        final Integer charOctetLen;
+        final Integer numPrec;
+        final Integer numPrecRadix;
+        final Integer numScale;
+        final Integer datetimePrec;
+        final Integer intervalPrec;
+
+        TypeFacts(DataType dt, Integer typmodPrecision, Integer typmodScale) {
+            boolean isCharType = dt == DataType.VARCHAR || dt == DataType.CHAR
+                    || dt == DataType.TEXT || dt == DataType.NAME;
+            // character_maximum_length is the declared width of varchar(N)/char(N); text and an
+            // undecorated varchar have none. The octet length is the UTF-8 worst case.
+            charMaxLen = (dt == DataType.VARCHAR || dt == DataType.CHAR) ? typmodPrecision : null;
+            if (charMaxLen != null) charOctetLen = charMaxLen * 4;
+            else charOctetLen = isCharType ? Integer.valueOf(1073741824) : null;
+
+            Integer precision = CatalogHelper.numericPrecision(dt);
+            if (dt == DataType.NUMERIC) precision = typmodPrecision;
+            numPrec = precision;
+            // numeric counts in decimal digits and reports radix 10 even undecorated; the binary
+            // types report 2, and a type that is not numeric at all reports nothing.
+            if (dt == DataType.NUMERIC) numPrecRadix = Integer.valueOf(10);
+            else numPrecRadix = precision != null ? Integer.valueOf(2) : null;
+            if (dt == DataType.NUMERIC) {
+                // Only report scale when precision is declared (plain numeric has no limit)
+                numScale = typmodPrecision != null
+                        ? (typmodScale != null ? typmodScale : Integer.valueOf(0))
+                        : null;
+            } else {
+                numScale = precision != null && dt != DataType.REAL
+                        && dt != DataType.DOUBLE_PRECISION ? Integer.valueOf(0) : null;
+            }
+
+            // A temporal type declares how many fractional-second digits it keeps, and PG
+            // reports that typmod here: timestamp(3) is precision 3, not the type's default 6.
+            datetimePrec = datetimePrecision(dt, typmodPrecision);
+            // interval_precision is the leading-field precision of "interval year to month" and
+            // friends; a plain interval(3) carries its typmod in datetime_precision only.
+            intervalPrec = null;
+        }
+    }
+
+    /**
+     * The datetime_precision information_schema reports for a temporal type: the declared
+     * fractional-seconds typmod when the column has one, the type's own default otherwise.
+     * A date keeps no fractional seconds at all, so it reports 0.
+     */
+    static Integer datetimePrecision(DataType dt, Integer typmod) {
+        if (dt == DataType.DATE) return Integer.valueOf(0);
+        boolean temporal = dt == DataType.TIMESTAMP || dt == DataType.TIMESTAMPTZ
+                || dt == DataType.TIME || dt == DataType.TIMETZ || dt == DataType.INTERVAL;
+        if (!temporal) return null;
+        if (typmod != null && typmod >= 0 && typmod <= 6) return typmod;
+        return Integer.valueOf(6);
+    }
+
+    /**
+     * The interval_type information_schema reports: the field qualifier as written, upper case,
+     * with the fractional-seconds precision it was declared with — "DAY TO SECOND(3)". A plain
+     * interval and every other type report nothing.
+     */
+    static String intervalTypeOf(String qualifier, Integer precision) {
+        if (qualifier == null) return null;
+        String text = qualifier.toUpperCase();
+        if (precision != null) text += "(" + precision + ")";
+        return text;
+    }
+
+    /**
+     * The columns every relation carries without declaring them. PostgreSQL answers for them but
+     * does not describe them here, so a tool that reads this view to learn a relation's shape sees
+     * the columns the relation was defined with and no others.
+     */
+    private static final java.util.Set<String> SYSTEM_COLUMN_NAMES =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "xmin", "xmax", "cmin", "cmax", "ctid", "tableoid"));
+
     /** Add column entries for a table to the information_schema.columns table. */
     private void addColumnsForTable(Table isTable, String schemaName, Table t, boolean isUserTable) {
+        int ordinal = 0;
         for (int i = 0; i < t.getColumns().size(); i++) {
             Column col = t.getColumns().get(i);
+            if (!isUserTable && SYSTEM_COLUMN_NAMES.contains(col.getName().toLowerCase())) continue;
+            ordinal++;
             DataType dt = col.getType();
-            boolean isArrayType = dt == DataType.TEXT_ARRAY || dt == DataType.INT4_ARRAY
-                    || dt == DataType.ACLITEM_ARRAY || dt == DataType.NAME_ARRAY;
+            boolean isArrayType = dt.getPgName().startsWith("_");
             // H14: data_type — arrays report "ARRAY", composite types report
             // "USER-DEFINED", but DOMAIN columns report their BASE type (PG puts
             // the domain name in domain_name and the base type in data_type).
@@ -515,35 +628,15 @@ public class InfoSchemaBuilder {
             } else {
                 dataType = CatalogHelper.pgTypeName(dt);
             }
-            boolean isCharType = dt == DataType.VARCHAR || dt == DataType.CHAR || dt == DataType.TEXT || dt == DataType.NAME;
-            boolean isNumericType = dt == DataType.SMALLINT || dt == DataType.INTEGER || dt == DataType.BIGINT
-                    || dt == DataType.SERIAL || dt == DataType.BIGSERIAL || dt == DataType.SMALLSERIAL
-                    || dt == DataType.REAL || dt == DataType.DOUBLE_PRECISION || dt == DataType.NUMERIC;
-            boolean isDateTimeType = dt == DataType.TIMESTAMP || dt == DataType.TIMESTAMPTZ
-                    || dt == DataType.TIME || dt == DataType.DATE || dt == DataType.INTERVAL;
-
-            // H14: character_maximum_length from column precision for varchar(N)/char(N)
-            Integer charMaxLen = (dt == DataType.VARCHAR || dt == DataType.CHAR) ? col.getPrecision() : null;
-            Integer charOctetLen = isCharType ? Integer.valueOf(1073741824) : null;
-            if (charMaxLen != null) charOctetLen = charMaxLen * 4; // UTF-8 worst case
-            Integer numPrec = CatalogHelper.numericPrecision(dt);
-            // For NUMERIC columns, use the column's declared precision/scale if available
-            if (dt == DataType.NUMERIC && col.getPrecision() != null) {
-                numPrec = col.getPrecision();
-            }
-            Integer numPrecRadix = numPrec != null ? Integer.valueOf(dt == DataType.NUMERIC ? 10 : 2) : null;
-            Integer numScale;
-            if (dt == DataType.NUMERIC) {
-                // Only report scale when precision is declared (plain numeric has no limit)
-                numScale = col.getPrecision() != null
-                        ? (col.getScale() != null ? col.getScale() : Integer.valueOf(0))
-                        : null;
-            } else {
-                numScale = numPrec != null && dt != DataType.REAL && dt != DataType.DOUBLE_PRECISION ? Integer.valueOf(0) : null;
-            }
-            Integer datetimePrec = isDateTimeType ? Integer.valueOf(6) : null;
-            if (dt == DataType.DATE) datetimePrec = Integer.valueOf(0);
-            Integer intervalPrec = dt == DataType.INTERVAL ? Integer.valueOf(6) : null;
+            TypeFacts facts = new TypeFacts(dt, col.getPrecision(), col.getScale());
+            String intervalType = intervalTypeOf(col.getIntervalQualifier(), col.getPrecision());
+            Integer charMaxLen = facts.charMaxLen;
+            Integer charOctetLen = facts.charOctetLen;
+            Integer numPrec = facts.numPrec;
+            Integer numPrecRadix = facts.numPrecRadix;
+            Integer numScale = facts.numScale;
+            Integer datetimePrec = facts.datetimePrec;
+            Integer intervalPrec = facts.intervalPrec;
 
             // H14: udt_name — serial/bigserial/smallserial report int4/int8/int2
             String udtSchema = "pg_catalog";
@@ -579,7 +672,9 @@ public class InfoSchemaBuilder {
             String domainCatalog = null, domainSchema = null, domainName = null;
             if (isUserTable && col.getDomainTypeName() != null) {
                 domainCatalog = catalogName();
-                domainSchema = schemaName;
+                // The domain lives where it was created, which need not be where the table is.
+                DomainType colDomain = database.getDomain(col.getDomainTypeName());
+                domainSchema = colDomain != null ? colDomain.getSchemaName() : schemaName;
                 domainName = col.getDomainTypeName();
             }
 
@@ -591,7 +686,7 @@ public class InfoSchemaBuilder {
                     schemaName,                             // table_schema
                     t.getName(),                            // table_name
                     col.getName(),                          // column_name
-                    i + 1,                                  // ordinal_position
+                    ordinal,                                // ordinal_position
                     isUserTable ? CatalogHelper.formatColumnDefault(col) : null, // column_default
                     isNullable,                             // is_nullable
                     dataType,                               // data_type
@@ -601,7 +696,7 @@ public class InfoSchemaBuilder {
                     numPrecRadix,                           // numeric_precision_radix
                     numScale,                               // numeric_scale
                     datetimePrec,                           // datetime_precision
-                    null,                                   // interval_type
+                    intervalType,                           // interval_type
                     intervalPrec,                           // interval_precision
                     null, null, null,                       // character_set_*
                     null, null, null,                       // collation_*
@@ -611,7 +706,7 @@ public class InfoSchemaBuilder {
                     udtName,                                // udt_name
                     null, null, null,                       // scope_*
                     null,                                   // maximum_cardinality
-                    String.valueOf(i + 1),                  // dtd_identifier
+                    String.valueOf(ordinal),                // dtd_identifier
                     "NO",                                   // is_self_referencing
                     isIdentity ? "YES" : "NO",              // is_identity
                     identityGeneration,                     // identity_generation
@@ -630,15 +725,17 @@ public class InfoSchemaBuilder {
                 new Column("schema_owner", DataType.TEXT, true, false, null),
                 new Column("default_character_set_catalog", DataType.TEXT, true, false, null),
                 new Column("default_character_set_schema", DataType.TEXT, true, false, null),
-                new Column("default_character_set_name", DataType.TEXT, true, false, null)
+                new Column("default_character_set_name", DataType.TEXT, true, false, null),
+                // The SQL path of the schema. PG has no per-schema path and always reports null.
+                new Column("sql_path", DataType.TEXT, true, false, null)
         );
         Table table = new Table("schemata", cols);
         for (String schemaName : database.getSchemas().keySet()) {
-            table.insertRow(new Object[]{catalogName(), schemaName, "memgres", null, null, null});
+            table.insertRow(new Object[]{catalogName(), schemaName, "memgres", null, null, null, null});
         }
-        table.insertRow(new Object[]{catalogName(), "pg_catalog", "memgres", null, null, null});
-        table.insertRow(new Object[]{catalogName(), "information_schema", "memgres", null, null, null});
-        table.insertRow(new Object[]{catalogName(), "pg_toast", "memgres", null, null, null});
+        table.insertRow(new Object[]{catalogName(), "pg_catalog", "memgres", null, null, null, null});
+        table.insertRow(new Object[]{catalogName(), "information_schema", "memgres", null, null, null, null});
+        table.insertRow(new Object[]{catalogName(), "pg_toast", "memgres", null, null, null, null});
         return table;
     }
 
@@ -653,7 +750,10 @@ public class InfoSchemaBuilder {
                 new Column("constraint_type", DataType.TEXT, true, false, null),
                 new Column("is_deferrable", DataType.TEXT, true, false, null),
                 new Column("initially_deferred", DataType.TEXT, true, false, null),
-                new Column("enforced", DataType.TEXT, true, false, null)
+                new Column("enforced", DataType.TEXT, true, false, null),
+                // Whether a UNIQUE constraint treats two nulls as different values. Only a
+                // uniqueness constraint has an answer; PG leaves the rest null.
+                new Column("nulls_distinct", DataType.TEXT, true, false, null)
         );
         Table table = new Table("table_constraints", cols);
 
@@ -686,10 +786,12 @@ public class InfoSchemaBuilder {
                         default:
                             throw new IllegalStateException("Unknown constraint type: " + sc.getType());
                     }
+                    String nullsDistinct = sc.getType() == StoredConstraint.Type.UNIQUE
+                            ? (sc.isNullsNotDistinct() ? "NO" : "YES") : null;
                     table.insertRow(new Object[]{
                             catalogName(), schemaEntry.getKey(), sc.getName(),
                             catalogName(), schemaEntry.getKey(), t.getName(),
-                            type, "NO", "NO", sc.isNotEnforced() ? "NO" : "YES"
+                            type, "NO", "NO", sc.isNotEnforced() ? "NO" : "YES", nullsDistinct
                     });
                 }
                 // PG 18: NOT NULL constraints appear in information_schema.table_constraints
@@ -708,7 +810,7 @@ public class InfoSchemaBuilder {
                         table.insertRow(new Object[]{
                                 catalogName(), schemaEntry.getKey(), conname,
                                 catalogName(), schemaEntry.getKey(), t.getName(),
-                                "CHECK", "NO", "NO", "YES"
+                                "CHECK", "NO", "NO", "YES", null
                         });
                     }
                 }
@@ -981,6 +1083,10 @@ public class InfoSchemaBuilder {
                 new Column("sequence_name", DataType.TEXT, true, false, null),
                 new Column("data_type", DataType.TEXT, true, false, null),
                 new Column("numeric_precision", DataType.INTEGER, true, false, null),
+                // A sequence counts in binary, and its scale is fixed at whole numbers; the
+                // standard still expects both alongside the precision.
+                new Column("numeric_precision_radix", DataType.INTEGER, true, false, null),
+                new Column("numeric_scale", DataType.INTEGER, true, false, null),
                 new Column("start_value", DataType.TEXT, true, false, null),
                 new Column("minimum_value", DataType.TEXT, true, false, null),
                 new Column("maximum_value", DataType.TEXT, true, false, null),
@@ -1008,7 +1114,7 @@ public class InfoSchemaBuilder {
                 int precision = "smallint".equals(dataType) ? 16 : "integer".equals(dataType) ? 32 : 64;
                 String cycleOption = seq.isCycle() ? "YES" : "NO";
                 table.insertRow(new Object[]{
-                        catalogName(), "public", seqName, dataType, precision,
+                        catalogName(), sequenceSchema(seqName), seqName, dataType, precision, 2, 0,
                         String.valueOf(seq.getStartWith()),
                         String.valueOf(seq.getMinValue()),
                         String.valueOf(seq.getMaxValue()),
@@ -1018,6 +1124,16 @@ public class InfoSchemaBuilder {
             }
         }
         return table;
+    }
+
+    /** The schema a sequence was created in, as the schema object registry recorded it. */
+    private String sequenceSchema(String seqName) {
+        for (String schemaName : database.getSchemas().keySet()) {
+            if (database.getSchemaObjects(schemaName).contains("sequence:" + seqName.toLowerCase())) {
+                return schemaName;
+            }
+        }
+        return "public";
     }
 
     private Table buildIsViews() {
@@ -1069,21 +1185,66 @@ public class InfoSchemaBuilder {
     }
 
     private Table buildIsDomains() {
+        // A domain is a data type, so the view describes it with the same fields that describe a
+        // column's type — the length, numeric and datetime facts, and the base type's identity
+        // in udt_*. A tool reading a domain to size an input needs all of them, not just a name.
         List<Column> cols = Cols.listOf(
                 new Column("domain_catalog", DataType.TEXT, true, false, null),
                 new Column("domain_schema", DataType.TEXT, true, false, null),
                 new Column("domain_name", DataType.TEXT, true, false, null),
                 new Column("data_type", DataType.TEXT, true, false, null),
                 new Column("character_maximum_length", DataType.INTEGER, true, false, null),
+                new Column("character_octet_length", DataType.INTEGER, true, false, null),
+                new Column("character_set_catalog", DataType.TEXT, true, false, null),
+                new Column("character_set_schema", DataType.TEXT, true, false, null),
+                new Column("character_set_name", DataType.TEXT, true, false, null),
+                new Column("collation_catalog", DataType.TEXT, true, false, null),
+                new Column("collation_schema", DataType.TEXT, true, false, null),
+                new Column("collation_name", DataType.TEXT, true, false, null),
                 new Column("numeric_precision", DataType.INTEGER, true, false, null),
-                new Column("domain_default", DataType.TEXT, true, false, null)
+                new Column("numeric_precision_radix", DataType.INTEGER, true, false, null),
+                new Column("numeric_scale", DataType.INTEGER, true, false, null),
+                new Column("datetime_precision", DataType.INTEGER, true, false, null),
+                new Column("interval_type", DataType.TEXT, true, false, null),
+                new Column("interval_precision", DataType.INTEGER, true, false, null),
+                new Column("domain_default", DataType.TEXT, true, false, null),
+                new Column("udt_catalog", DataType.TEXT, true, false, null),
+                new Column("udt_schema", DataType.TEXT, true, false, null),
+                new Column("udt_name", DataType.TEXT, true, false, null),
+                new Column("scope_catalog", DataType.TEXT, true, false, null),
+                new Column("scope_schema", DataType.TEXT, true, false, null),
+                new Column("scope_name", DataType.TEXT, true, false, null),
+                new Column("maximum_cardinality", DataType.INTEGER, true, false, null),
+                new Column("dtd_identifier", DataType.TEXT, true, false, null)
         );
         Table table = new Table("domains", cols);
         for (Map.Entry<String, DomainType> entry : database.getDomains().entrySet()) {
             DomainType d = entry.getValue();
+            DataType base = d.getBaseType();
+            // A domain over an array is described as the array: its element's width is not the
+            // domain's, so none of the length or numeric facts apply to it.
+            boolean isArray = d.isArray();
+            TypeFacts facts = isArray ? null : new TypeFacts(base, d.getPrecision(), d.getScale());
+            String dataType = isArray
+                    ? CatalogHelper.pgTypeName(d.getArrayElementType()) + "[]"
+                    : CatalogHelper.pgTypeName(base);
             table.insertRow(new Object[]{
-                    catalogName(), "public", entry.getKey(),
-                    CatalogHelper.pgTypeName(d.getBaseType()), null, null, null
+                    catalogName(), d.getSchemaName(), entry.getKey(),
+                    dataType,
+                    facts == null ? null : facts.charMaxLen, facts == null ? null : facts.charOctetLen,
+                    null, null, null,                       // character_set_*
+                    null, null, null,                       // collation_*
+                    facts == null ? null : facts.numPrec,
+                    facts == null ? null : facts.numPrecRadix,
+                    facts == null ? null : facts.numScale,
+                    facts == null ? null : facts.datetimePrec,
+                    intervalTypeOf(d.getIntervalQualifier(), d.getPrecision()),
+                    facts == null ? null : facts.intervalPrec,
+                    CatalogHelper.formatDomainDefault(d),
+                    catalogName(), "pg_catalog", base.getPgName(),
+                    null, null, null,                       // scope_*
+                    null,                                   // maximum_cardinality
+                    "1"                                     // dtd_identifier
             });
         }
         return table;
@@ -1204,6 +1365,14 @@ public class InfoSchemaBuilder {
                                 });
                             }
                         }
+                    } else if (sc.getType() == StoredConstraint.Type.CHECK) {
+                        // A CHECK is used by the columns its expression reads.
+                        for (String col : checkedColumnNames(tableEntry.getValue(), sc)) {
+                            table.insertRow(new Object[]{
+                                    catalogName(), schemaEntry.getKey(), tableEntry.getKey(), col,
+                                    catalogName(), schemaEntry.getKey(), sc.getName()
+                            });
+                        }
                     } else if (sc.getColumns() != null) {
                         for (String col : sc.getColumns()) {
                             table.insertRow(new Object[]{
@@ -1213,9 +1382,33 @@ public class InfoSchemaBuilder {
                         }
                     }
                 }
+                // A NOT NULL constraint is a check over the column that carries it, and PG
+                // lists it here under the name it gave it.
+                for (Column col : tableEntry.getValue().getColumns()) {
+                    if (col.isNullable()) continue;
+                    table.insertRow(new Object[]{
+                            catalogName(), schemaEntry.getKey(), tableEntry.getKey(), col.getName(),
+                            catalogName(), schemaEntry.getKey(),
+                            notNullConstraintName(tableEntry.getValue(), col)
+                    });
+                }
             }
         }
         return table;
+    }
+
+    /** The columns a CHECK expression reads, in the relation's own column order. */
+    private static List<String> checkedColumnNames(Table t, StoredConstraint sc) {
+        List<String> out = new ArrayList<>();
+        if (sc.getCheckExpr() == null) return out;
+        java.util.Set<String> named = new java.util.LinkedHashSet<>();
+        for (String name : DdlExecutor.referencedColumnNames(sc.getCheckExpr())) {
+            named.add(name.toLowerCase());
+        }
+        for (Column c : t.getColumns()) {
+            if (named.contains(c.getName().toLowerCase())) out.add(c.getName());
+        }
+        return out;
     }
 
     private Table buildIsConstraintTableUsage() {
@@ -1340,6 +1533,10 @@ public class InfoSchemaBuilder {
                 new Column("action_timing", DataType.TEXT, true, false, null),
                 new Column("action_reference_old_table", DataType.TEXT, true, false, null),
                 new Column("action_reference_new_table", DataType.TEXT, true, false, null),
+                // The standard lets a trigger name its row variables; PG's are always OLD and
+                // NEW, so it reports nothing here — but the columns are part of the view.
+                new Column("action_reference_old_row", DataType.TEXT, true, false, null),
+                new Column("action_reference_new_row", DataType.TEXT, true, false, null),
                 new Column("created", DataType.TIMESTAMPTZ, true, false, null)
         );
         Table table = new Table("triggers", cols);
@@ -1380,6 +1577,8 @@ public class InfoSchemaBuilder {
                         timing,                 // action_timing
                         null,                   // action_reference_old_table
                         null,                   // action_reference_new_table
+                        null,                   // action_reference_old_row
+                        null,                   // action_reference_new_row
                         null                    // created
                 });
             }

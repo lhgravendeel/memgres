@@ -995,7 +995,9 @@ public class AstExecutor {
             }
             throw new MemgresException("schema \"" + schemaName + "\" does not exist", "3F000");
         }
-        Database.ViewDef view = database.getView(tableName);
+        // A qualified name reaches the view in the schema it names, and no other schema's.
+        Database.ViewDef view = userQualified && schemaName != null
+                ? database.getView(schemaName, tableName) : database.getView(tableName);
         if (view != null) {
             Table underlying = resolveViewToBaseTable(view);
             if (underlying != null) return underlying;

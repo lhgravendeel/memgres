@@ -31,7 +31,7 @@ final class RelationNamespace {
         String schema = schemaName == null ? "public" : schemaName.toLowerCase();
         Schema s = db.getSchema(schema);
         if (s != null && s.getTable(bare) != null) return TABLE;
-        Database.ViewDef v = db.getView(bare);
+        Database.ViewDef v = db.getView(schema, bare);
         if (v != null && sameSchema(v.schemaName, schema)) return v.materialized ? MATVIEW : VIEW;
         if (db.hasSequence(bare) && attributedTo(db, schema, "sequence", bare)) return SEQUENCE;
         if (db.hasIndex(bare) && attributedTo(db, schema, "index", bare)) return INDEX;

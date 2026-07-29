@@ -72,8 +72,8 @@ class CatalogMetadataFunctions {
         switch (name) {
             case "format_type": {
                 Object typeOid = executor.evalExpr(fn.args().get(0), ctx);
-                if (typeOid == null) return "unknown";
-                int oid = executor.toInt(typeOid);
+                if (typeOid == null) return null;
+                int oid = typeOidOf(typeOid);
                 int typmod = -1;
                 if (fn.args().size() > 1) {
                     Object modVal = executor.evalExpr(fn.args().get(1), ctx);
@@ -469,6 +469,7 @@ class CatalogMetadataFunctions {
         }
         List<String> cols = executor.database.getIndexColumns(indexName);
         String constraintTableName = null;
+        boolean constraintNullsNotDistinct = false;
         if (cols == null) {
             for (Map.Entry<String, Schema> schemaEntry : executor.database.getSchemas().entrySet()) {
                 for (Map.Entry<String, Table> tblEntry : schemaEntry.getValue().getTables().entrySet()) {
@@ -477,6 +478,7 @@ class CatalogMetadataFunctions {
                                 (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE)) {
                             cols = sc.getColumns();
                             constraintTableName = schemaEntry.getKey() + "." + tblEntry.getKey();
+                            constraintNullsNotDistinct = sc.isNullsNotDistinct();
                         }
                     }
                 }
@@ -514,7 +516,8 @@ class CatalogMetadataFunctions {
         List<String> normalizedCols = CatalogHelper.deparseIndexColumns(executor.database, tableName, cols);
         List<String> columnOptions = executor.database.getIndexColumnOptions(indexName);
         List<String> includeColumns = executor.database.getIndexIncludeColumns(indexName);
-        boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexName);
+        boolean nullsNotDistinct = executor.database.isIndexNullsNotDistinct(indexName)
+                || constraintNullsNotDistinct;
         return CatalogStubBuilder.buildIndexDef(indexName, tableName, unique, idxMethod,
                 normalizedCols, columnOptions, includeColumns, nullsNotDistinct, whereClause);
     }
@@ -527,32 +530,61 @@ class CatalogMetadataFunctions {
         for (Map.Entry<String, List<PgTrigger>> trigEntry : executor.database.getAllTriggers().entrySet()) {
             Map<String, java.util.List<PgTrigger>> grouped = new java.util.LinkedHashMap<>();
             for (PgTrigger trig : trigEntry.getValue()) {
-                grouped.computeIfAbsent(trig.getName(), k -> new java.util.ArrayList<>()).add(trig);
+                String key = (trig.getTableName() == null ? "" : trig.getTableName().toLowerCase())
+                        + "." + trig.getName().toLowerCase();
+                grouped.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(trig);
             }
             for (Map.Entry<String, List<PgTrigger>> nameEntry : grouped.entrySet()) {
-                int tOid = executor.systemCatalog.getOid("trig:" + nameEntry.getKey());
+                PgTrigger first = nameEntry.getValue().get(0);
+                String trigSchema = first.getSchemaName() != null ? first.getSchemaName() : "public";
+                // The trigger's OID is the one pg_trigger gave it, which is keyed by the
+                // relation it belongs to — a trigger name is only unique within its table.
+                int tOid = executor.systemCatalog.getOid(
+                        "trig:" + trigSchema + "." + first.getTableName() + "." + first.getName());
                 if (tOid == trigOid) {
-                    PgTrigger first = nameEntry.getValue().get(0);
-                    StringBuilder sb = new StringBuilder("CREATE TRIGGER ");
-                    sb.append(first.getName()).append(' ');
-                    sb.append(first.getTiming().name()).append(' ');
-                    java.util.List<String> events = new java.util.ArrayList<>();
-                    for (PgTrigger t : nameEntry.getValue()) {
-                        String ev = t.getEvent().name();
-                        if (t.getEvent() == PgTrigger.Event.UPDATE && t.getUpdateColumns() != null && !t.getUpdateColumns().isEmpty()) {
-                            ev += " OF " + String.join(", ", t.getUpdateColumns());
-                        }
-                        if (!events.contains(ev)) events.add(ev);
-                    }
-                    sb.append(String.join(" OR ", events));
-                    sb.append(" ON ").append(first.getTableName());
-                    sb.append(" FOR EACH ").append(first.isForEachStatement() ? "STATEMENT" : "ROW");
-                    sb.append(" EXECUTE FUNCTION ").append(first.getFunctionName()).append("()");
-                    return sb.toString();
+                    return buildTriggerDef(nameEntry.getValue(), trigSchema);
                 }
             }
         }
         return "";
+    }
+
+    /** The events a trigger may fire on, in the order PostgreSQL prints them. */
+    private static final PgTrigger.Event[] TRIGGER_EVENT_ORDER = {
+            PgTrigger.Event.INSERT, PgTrigger.Event.DELETE,
+            PgTrigger.Event.UPDATE, PgTrigger.Event.TRUNCATE};
+
+    /**
+     * The statement that would create this trigger, spelled the way PostgreSQL's
+     * pg_get_triggerdef spells it: the relation qualified by its schema, the events in the
+     * catalog's own order, and the WHEN condition when one was written.
+     */
+    private String buildTriggerDef(List<PgTrigger> triggers, String schema) {
+        PgTrigger first = triggers.get(0);
+        StringBuilder sb = new StringBuilder("CREATE TRIGGER ");
+        sb.append(first.getName()).append(' ');
+        sb.append(first.getTiming() == PgTrigger.Timing.INSTEAD_OF ? "INSTEAD OF"
+                : first.getTiming().name()).append(' ');
+        java.util.List<String> events = new java.util.ArrayList<>();
+        for (PgTrigger.Event wanted : TRIGGER_EVENT_ORDER) {
+            for (PgTrigger t : triggers) {
+                if (t.getEvent() != wanted) continue;
+                String ev = wanted.name();
+                if (wanted == PgTrigger.Event.UPDATE && t.getUpdateColumns() != null
+                        && !t.getUpdateColumns().isEmpty()) {
+                    ev += " OF " + String.join(", ", t.getUpdateColumns());
+                }
+                if (!events.contains(ev)) events.add(ev);
+            }
+        }
+        sb.append(String.join(" OR ", events));
+        sb.append(" ON ").append(schema).append('.').append(first.getTableName());
+        sb.append(" FOR EACH ").append(first.isForEachStatement() ? "STATEMENT" : "ROW");
+        if (first.getWhenClause() != null && !first.getWhenClause().isEmpty()) {
+            sb.append(" WHEN (").append(first.getWhenClause()).append(')');
+        }
+        sb.append(" EXECUTE FUNCTION ").append(first.getFunctionName()).append("()");
+        return sb.toString();
     }
 
     private Object evalPgGetViewdef(FunctionCallExpr fn, RowContext ctx) {
@@ -1103,7 +1135,10 @@ class CatalogMetadataFunctions {
             case PRIMARY_KEY:
                 return "PRIMARY KEY (" + String.join(", ", sc.getColumns()) + ")";
             case UNIQUE:
-                return "UNIQUE (" + String.join(", ", sc.getColumns()) + ")";
+                // NULLS NOT DISTINCT is part of what the constraint says, so the definition it
+                // reports back has to say it too.
+                return "UNIQUE " + (sc.isNullsNotDistinct() ? "NULLS NOT DISTINCT " : "")
+                        + "(" + String.join(", ", sc.getColumns()) + ")";
             case CHECK:
                 return "CHECK (" + RuleDeparser.deparse(sc.getCheckExpr(), RuleDeparser.forTable(owner)) + ")";
             case FOREIGN_KEY: {
@@ -1169,9 +1204,55 @@ class CatalogMetadataFunctions {
         EXTRA_TYPE_NAMES = java.util.Collections.unmodifiableMap(m);
     }
 
+    /**
+     * The OID a format_type argument names. A regtype value carries a type name rather than a
+     * number — {@code 'varchar[]'::regtype} is the array type, not a number to be parsed — so the
+     * name is looked up where one was written.
+     */
+    private int typeOidOf(Object value) {
+        if (value instanceof Number) return ((Number) value).intValue();
+        String text = value.toString().trim();
+        try {
+            return Integer.parseInt(text);
+        } catch (NumberFormatException ignored) {
+            // a type name, resolved below
+        }
+        boolean array = text.endsWith("[]");
+        String bare = array ? text.substring(0, text.length() - 2).trim() : text;
+        DataType dt = DataType.fromPgName(bare);
+        if (dt != null) {
+            DataType resolved = array ? DataType.arrayOf(dt) : dt;
+            if (resolved != null) return resolved.getOid();
+        }
+        for (CustomEnum ce : executor.database.getCustomEnums().values()) {
+            if (ce.getName().equalsIgnoreCase(bare)) return executor.systemCatalog.getOid("type:" + ce.getName());
+        }
+        for (DomainType domain : executor.database.getDomains().values()) {
+            if (domain.getName().equalsIgnoreCase(bare)) return executor.systemCatalog.getOid("type:" + domain.getName());
+        }
+        return 0;
+    }
+
     private String formatTypeByOid(int oid, int typmod) {
+        // An array is named after its element with the modifier applied to that element, so the
+        // array's own row is answered by formatting the element and adding the brackets.
+        DataType arrayType = null;
+        for (DataType dt : DataType.values()) {
+            if (dt.getOid() == oid && dt.getPgName().startsWith("_")) { arrayType = dt; break; }
+        }
+        if (arrayType != null) {
+            DataType element = DataType.elementOf(arrayType);
+            if (element != null) return CatalogHelper.formatType(element, null, typmod) + "[]";
+        }
         for (DataType dt : DataType.values()) {
             if (dt.getOid() == oid) {
+                switch (dt) {
+                    case VARCHAR: case CHAR: case NUMERIC: case TIMESTAMP: case TIMESTAMPTZ:
+                    case TIME: case TIMETZ: case INTERVAL: case BIT: case VARBIT:
+                        return CatalogHelper.formatType(dt, null, typmod);
+                    default:
+                        break;
+                }
                 String base;
                 switch (dt) {
                     case INTEGER:

@@ -455,12 +455,14 @@ class CatalogSystemFunctions {
             }
             case "current_setting": {
                 String setting = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                // current_setting reports the display form, the same text SHOW gives: a
+                // parameter counted in a unit reads back as "4MB", not as its 4096 kB.
                 String value = null;
                 if (executor.session != null) {
-                    value = executor.session.getGucSettings().get(setting);
+                    value = executor.session.getGucSettings().getForDisplay(setting);
                 }
                 if (value == null) {
-                    value = new GucSettings().get(setting);
+                    value = new GucSettings().getForDisplay(setting);
                 }
                 if (value == null) {
                     if (fn.args().size() > 1 && executor.isTruthy(executor.evalExpr(fn.args().get(1), ctx))) {

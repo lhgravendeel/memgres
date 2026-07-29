@@ -27,7 +27,10 @@ class DdlViewExecutor {
 
     QueryResult executeCreateView(CreateViewStmt stmt) {
         ddl.checkPgCatalogWriteProtection();
-        if (!stmt.orReplace() && executor.database.hasView(stmt.name())) {
+        // A view name is taken in the schema the view goes into, not in the database at large:
+        // another schema may already hold a view of that name, and this one is still free.
+        String createSchema = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
+        if (!stmt.orReplace() && executor.database.hasView(createSchema, stmt.name())) {
             throw new MemgresException("relation \"" + stmt.name() + "\" already exists", "42P07");
         }
         // A table, sequence or index of this name owns it just as firmly as another view would;
@@ -41,7 +44,7 @@ class DdlViewExecutor {
         }
         RelationNamespace.requireFree(executor.database, targetSchema, stmt.name(),
                 stmt.materialized() ? RelationNamespace.MATVIEW : RelationNamespace.VIEW);
-        Database.ViewDef oldView = executor.database.getView(stmt.name());
+        Database.ViewDef oldView = executor.database.getView(targetSchema, stmt.name());
 
         if (stmt.orReplace() && oldView != null && !stmt.materialized()) {
             try {

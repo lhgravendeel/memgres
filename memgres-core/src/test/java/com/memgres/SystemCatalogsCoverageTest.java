@@ -943,8 +943,9 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testFormatTypeNull() throws SQLException {
+        // PG 18 answers NULL for a NULL type, not the word "unknown": there is no type to name.
         String result = query1("SELECT format_type(NULL, NULL)");
-        assertEquals("unknown", result);
+        assertNull(result);
     }
 
     // ---- pg_typeof ----
