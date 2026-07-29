@@ -1453,7 +1453,10 @@ public class PgWireHandler extends SimpleChannelInboundHandler<PgWireMessage> {
         List<Session.PgNotice> notices = session.drainPendingNotices();
         int minLevel = getClientMinMessagesLevel();
         for (Session.PgNotice notice : notices) {
-            if (noticeSeverityLevel(notice.severity()) >= minLevel) {
+            // INFO is the one level client_min_messages does not govern: PostgreSQL always
+            // sends it to the client, which is what makes RAISE INFO usable for output
+            boolean always = "INFO".equalsIgnoreCase(notice.severity());
+            if (always || noticeSeverityLevel(notice.severity()) >= minLevel) {
                 sendNoticeResponse(ctx, notice);
             }
         }

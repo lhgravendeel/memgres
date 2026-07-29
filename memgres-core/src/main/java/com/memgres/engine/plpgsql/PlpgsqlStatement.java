@@ -19,6 +19,11 @@ public interface PlpgsqlStatement {
         public final String cursorQuery;
         /** Names of a bound cursor's parameters, in declaration order; empty when it takes none. */
         public final List<String> cursorParams;
+        /**
+         * Variable this name is an ALIAS FOR — {@code $1} or another name in scope. An alias
+         * declares no storage of its own: reads and writes reach the variable it names.
+         */
+        public String aliasFor;
 
         public VarDeclaration(
                 String name,
@@ -61,6 +66,7 @@ public interface PlpgsqlStatement {
         public boolean isCursor() { return isCursor; }
         public String cursorQuery() { return cursorQuery; }
         public List<String> cursorParams() { return cursorParams; }
+        public String aliasFor() { return aliasFor; }
 
         @Override
         public boolean equals(Object o) {
@@ -755,6 +761,16 @@ public interface PlpgsqlStatement {
          * string, so it carries no {@code %} placeholders and is kept apart from {@link #format}.
          */
         public String messageExpr;
+        /**
+         * Condition name given after a level, as in {@code RAISE NOTICE division_by_zero}. It
+         * names the SQLSTATE to report and supplies the message when none is written out.
+         */
+        public String condition;
+        /**
+         * An option the USING list gave twice. PostgreSQL reads the whole statement first and
+         * complains when it runs, so the parse records it rather than refusing the body.
+         */
+        public String duplicateOption;
 
         public RaiseStmt(
                 String level,
@@ -799,6 +815,8 @@ public interface PlpgsqlStatement {
         public String table() { return table; }
         public String schema() { return schema; }
         public String messageExpr() { return messageExpr; }
+        public String condition() { return condition; }
+        public String duplicateOption() { return duplicateOption; }
 
         @Override
         public boolean equals(Object o) {

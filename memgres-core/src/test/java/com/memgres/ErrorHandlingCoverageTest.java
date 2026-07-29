@@ -121,8 +121,15 @@ class ErrorHandlingCoverageTest {
     @Test
     void testUndefinedSchema_3F000() throws Exception {
         try (Statement st = conn.createStatement()) {
-            SQLException e = assertThrows(SQLException.class, () -> st.executeQuery("SELECT * FROM bogus_schema.some_table"));
+            // A schema of its own is what CREATE names, and a missing one there is 3F000
+            SQLException e = assertThrows(SQLException.class,
+                    () -> st.execute("CREATE TABLE bogus_schema.some_table (a int)"));
             assertEquals("3F000", e.getSQLState());
+            // A query names a relation: PostgreSQL reads schema.table as one name and reports
+            // the whole of it missing, so a client testing for 42P01 is right either way
+            SQLException q = assertThrows(SQLException.class,
+                    () -> st.executeQuery("SELECT * FROM bogus_schema.some_table"));
+            assertEquals("42P01", q.getSQLState());
         }
     }
 
