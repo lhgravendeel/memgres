@@ -1720,10 +1720,17 @@ class SelectExecutor {
                 }
                 return false;
             }
-            // IN compares one value against a list of values. A set on either side is neither,
-            // and PostgreSQL says so in the same words it uses for AND and OR. A set inside a
-            // sub-query on the right is ordinary -- containsSrf stops at the nested query.
-            if (node instanceof InExpr) return containsSrf(node);
+            // IN is mostly not one of these. PostgreSQL rewrites it into comparisons and expands
+            // a set written on either side of them, so "gs IN (1,2)" answers a row per element
+            // and "1 IN (gs, 5)" does too. What it will not do is compare one set against one
+            // other set: a list of exactly one element with a set on both sides is refused, while
+            // the same two sets among a longer list are expanded like anything else.
+            if (node instanceof InExpr) {
+                InExpr in = (InExpr) node;
+                if (isSubqueryIn(in)) return containsSrf(in.expr());
+                return in.values() != null && in.values().size() == 1
+                        && containsSrf(in.expr()) && containsSrf(in.values().get(0));
+            }
             if (node instanceof BetweenExpr) return containsSrf(node);
             if (node instanceof BinaryExpr) {
                 BinaryExpr bin = (BinaryExpr) node;
@@ -1744,9 +1751,21 @@ class SelectExecutor {
                 : ((BinaryExpr) found).op().name();
         MemgresException e = new MemgresException(
                 "argument of " + construct + " must not return a set", "42804");
+        // IN over a sub-query compares a row against the rows it answers with, and PostgreSQL
+        // names the row comparison rather than the IN.
+        if (found instanceof InExpr && isSubqueryIn((InExpr) found)) {
+            throw new MemgresException(
+                    "row comparison operator must not return a set", "42804");
+        }
         // PostgreSQL points at where the construct starts, which is its leftmost operand.
         if (found instanceof InExpr) e.setPositionToken(leadingToken(((InExpr) found).expr()));
         throw e;
+    }
+
+    /** Whether an IN reads a sub-query rather than a written-out list of values. */
+    private static boolean isSubqueryIn(InExpr in) {
+        return in.values() != null && in.values().size() == 1
+                && in.values().get(0) instanceof SubqueryExpr;
     }
 
     /** The word an expression starts with, as it is written -- what a position points at. */

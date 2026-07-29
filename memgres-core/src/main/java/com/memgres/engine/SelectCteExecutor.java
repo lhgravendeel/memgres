@@ -560,8 +560,11 @@ class SelectCteExecutor {
                     int origIdx = indices[rank];
                     Object[] orig = allRows.get(origIdx);
                     Object[] ext = Arrays.copyOf(orig, orig.length + 1);
-                    // DFS: one record per step, the whole path as an array
-                    ext[orig.length] = formatRecordArray(ordcolPaths.get(origIdx));
+                    // DFS: one record per step, the whole path as an array. Kept as the records
+                    // themselves rather than their text, so that the column is a record[] to
+                    // whatever reads it — a cast of it says so instead of failing to parse the
+                    // rendering — and the array rendering follows from the value.
+                    ext[orig.length] = recordPath(ordcolPaths.get(origIdx));
                     sortedExt[origIdx] = ext;
                 }
                 for (Object[] ext : sortedExt) extRows.add(ext);
@@ -732,6 +735,17 @@ class SelectCteExecutor {
      * A path rendered the way PostgreSQL renders a {@code record[]}: one composite per step, and
      * a composite quoted inside the array braces when its own text carries a comma.
      */
+    /** A search path as the array of records PostgreSQL makes of it, one record per step. */
+    static List<Object> recordPath(List<Object> path) {
+        List<Object> records = new ArrayList<Object>(path.size());
+        for (Object step : path) {
+            List<Object> fields = step instanceof List
+                    ? new ArrayList<Object>((List<?>) step) : Collections.singletonList(step);
+            records.add(new AstExecutor.PgRow(fields));
+        }
+        return records;
+    }
+
     static String formatRecordArray(List<Object> path) {
         StringBuilder sb = new StringBuilder("{");
         for (int i = 0; i < path.size(); i++) {

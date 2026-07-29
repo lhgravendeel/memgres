@@ -531,7 +531,7 @@ SQL: SELECT b['x'] FROM exprs
 ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
 --- STMT 39 ---
 SQL: SELECT exprs.nope FROM exprs
-ERROR [42703]: ERROR: column "nope" does not exist
+ERROR [42703]: ERROR: column exprs.nope does not exist
 --- STMT 40 ---
 SQL: SELECT (ROW(1,'a')::pair).z
 ERROR [42703]: ERROR: column "z" not found in data type pair
@@ -543,7 +543,7 @@ SQL: SELECT ARRAY[1,2][1][2]
 ERROR [42601]: ERROR: syntax error at or near "["
 --- STMT 43 ---
 SQL: SELECT ROW(1) = ROW(1,2)
-ERROR [42601]: ERROR: cannot compare row values of different sizes
+ERROR [42601]: ERROR: unequal number of entries in row expressions
 --- STMT 44 ---
 SQL: SELECT (SELECT id FROM exprs WHERE id IN (1,2))
 ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
@@ -682,7 +682,7 @@ COLUMNS: pg_typeof
 ROW: numeric
 --- STMT 75 ---
 SQL: SELECT 1 UNION ALL SELECT 'x'
-ERROR [22P02]: ERROR: invalid input syntax for type int4: "x"
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
 --- STMT 76 ---
 SQL: SELECT CASE WHEN true THEN ROW(1,'a')::pair ELSE ROW(2,'b')::pair END
 ERROR [42704]: ERROR: type "pair" does not exist
@@ -1101,7 +1101,7 @@ SQL: SELECT 2147483648::int4
 ERROR [22003]: ERROR: integer out of range
 --- STMT 35 ---
 SQL: SELECT 1e400::float8
-ERROR [22003]: ERROR: "1E+400" is out of range for type double precision
+ERROR [22003]: ERROR: "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" is out of range for type double precision
 --- STMT 36 ---
 SQL: SELECT '2024-02-30'::date
 ERROR [22008]: ERROR: date/time field value out of range: "2024-02-30"
@@ -1252,7 +1252,7 @@ SQL: -- failure cases CREATE TABLE tbad(a int, a int)
 ERROR [42701]: ERROR: column "a" specified more than once
 --- STMT 33 ---
 SQL: CREATE TABLE tbad2(a int DEFAULT 'x')
-ERROR [22P02]: ERROR: invalid input syntax for type int4: "x"
+ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
 --- STMT 34 ---
 SQL: CREATE TABLE no_schema.t(a int)
 ERROR [3F000]: ERROR: schema "no_schema" does not exist
@@ -1752,10 +1752,10 @@ ROW: 2
 ROW: 3
 --- STMT 20 ---
 SQL: -- bad / edge grouping SELECT a, count(*) FROM s
-ERROR [42803]: ERROR: column "a" must appear in the GROUP BY clause or be used in an aggregate function
+ERROR [42803]: ERROR: column "s.a" must appear in the GROUP BY clause or be used in an aggregate function
 --- STMT 21 ---
 SQL: SELECT b, a FROM s GROUP BY b
-ERROR [42803]: ERROR: column "a" must appear in the GROUP BY clause or be used in an aggregate function
+ERROR [42803]: ERROR: column "s.a" must appear in the GROUP BY clause or be used in an aggregate function
 --- STMT 22 ---
 SQL: SELECT * FROM s ORDER BY 99
 ERROR [42P10]: ERROR: ORDER BY position 99 is not in select list
@@ -1788,7 +1788,7 @@ ROW: NULL | NULL
 ROW: NULL | 60
 --- STMT 29 ---
 SQL: SELECT grouping(a) FROM s
-ERROR [42803]: ERROR: GROUPING is not supported without GROUPING SETS, ROLLUP, or CUBE
+ERROR [42803]: ERROR: arguments to GROUPING must be grouping expressions of the associated query level
 --- STMT 30 ---
 SQL: SELECT DISTINCT ON () * FROM s
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -1833,7 +1833,7 @@ SQL: -- more bad cases SELECT DISTINCT ON (b) a, b FROM s ORDER BY a
 ERROR [42P01]: ERROR: relation "s" does not exist
 --- STMT 43 ---
 SQL: SELECT b, sum(c) FROM s GROUP BY ROLLUP ()
-ERROR [42601]: ERROR: syntax error at or near ""
+ERROR [42601]: ERROR: syntax error at or near ")"
 --- STMT 44 ---
 SQL: SELECT * FROM (VALUES (1), (2)) AS v(a) ORDER BY 2
 ERROR [42P10]: ERROR: ORDER BY position 2 is not in select list
@@ -1980,7 +1980,7 @@ SQL: WITH RECURSIVE r(n) AS (SELECT 'x' UNION ALL SELECT n + 1 FROM r) SELECT * 
 ERROR [42883]: ERROR: operator does not exist: text + integer
 --- STMT 31 ---
 SQL: WITH c(x,y) AS (SELECT 1) SELECT * FROM c
-ERROR [42P10]: ERROR: table "c" has 1 columns available but 2 columns specified
+ERROR [42P10]: ERROR: WITH query "c" has 1 columns available but 2 columns specified
 --- STMT 32 ---
 SQL: SELECT * FROM j1 WHERE EXISTS (SELECT)
 RESULT: 2 columns, 3 rows
@@ -2229,7 +2229,7 @@ COLUMNS: f_handle, f_handle
 ROW: 1 | -1
 --- STMT 21 ---
 SQL: SELECT f_raise('boom')
-ERROR [P1234]: ERROR: p_msg
+ERROR [P1234]: ERROR: boom
 --- STMT 22 ---
 SQL: -- bad routine definitions/calls SELECT f_sql_add(1)
 ERROR [42883]: ERROR: function f_sql_add(integer) does not exist
@@ -2372,7 +2372,7 @@ SQL: SELECT jsonb_path_query('{"a":[1,2,3]}'::jsonb, 'not a path')
 ERROR [42601]: ERROR: syntax error at or near "not" of jsonpath input
 --- STMT 26 ---
 SQL: SELECT ARRAY[1,2] || 'x'
-ERROR [22P02]: ERROR: invalid input syntax for type integer: "x"
+ERROR [22P02]: ERROR: malformed array literal: "x"
 --- STMT 27 ---
 SQL: SELECT array_length(ARRAY[1,2,3], 0)
 RESULT: 1 columns, 1 rows
@@ -2519,7 +2519,7 @@ COLUMNS: array_lower
 ROW: NULL
 --- STMT 59 ---
 SQL: SELECT '[2:1]={}'::int[]
-ERROR [2202E]: ERROR: wrong number of array subscripts
+ERROR [2202E]: ERROR: upper bound cannot be less than lower bound
 --- STMT 60 ---
 SQL: SELECT range_merge(int4range(1,5), numrange(1,5))
 ERROR [42883]: ERROR: function range_merge(int4range, numrange) does not exist
@@ -2826,7 +2826,7 @@ ROW: 2024-03-01 14:00:00
 SQL: SELECT EXTRACT(epoch FROM TIMESTAMP '1970-01-02 00:00:00')
 RESULT: 1 columns, 1 rows
 COLUMNS: extract
-ROW: 86400
+ROW: 86400.000000
 --- STMT 22 ---
 SQL: SELECT isfinite(DATE '2024-01-01'), isfinite(TIMESTAMP 'infinity')
 RESULT: 2 columns, 1 rows
@@ -3668,7 +3668,7 @@ SQL: SELECT jsonb_path_exists('{"a":[1,2,3]}'::jsonb, 'not a path')
 ERROR [42601]: ERROR: syntax error at or near "not" of jsonpath input
 --- STMT 44 ---
 SQL: SELECT jsonb_path_match('{"a":2}'::jsonb, '$.a')
-ERROR [22038]: ERROR: jsonpath item method .boolean() can only be applied to a boolean, numeric, or string JSON item
+ERROR [22038]: ERROR: single boolean result is expected
 --- STMT 45 ---
 SQL: SELECT '{"a":1}'::json - 'a'
 ERROR [42883]: ERROR: operator does not exist: json - json
@@ -3758,12 +3758,12 @@ ROW: Seq Scan on admin_t\n  Sort Key: (...)
 SQL: EXPLAIN ANALYZE SELECT * FROM admin_t WHERE id = 1
 RESULT: 1 columns, 6 rows
 COLUMNS: QUERY PLAN
-ROW: Seq Scan on admin_t  (cost=0.00..1.02 rows=2 width=0) (actual time=0,128..0,128 rows=1 loops=1)
+ROW: Seq Scan on admin_t  (cost=0.00..1.02 rows=2 width=0) (actual time=0,272..0,272 rows=1 loops=1)
 ROW:   Filter: (...)
 ROW:   Rows Removed by Filter: 0
 ROW:   Output: (...)
-ROW: Planning Time: 0,055 ms
-ROW: Execution Time: 0,551 ms
+ROW: Planning Time: 0,080 ms
+ROW: Execution Time: 0,801 ms
 --- STMT 24 ---
 SQL: ANALYZE admin_t
 OK: 0 rows affected
@@ -3893,7 +3893,7 @@ SQL: VACUUM (NOTANOPTION) admin_t
 ERROR [42601]: ERROR: syntax error at or near "notanoption"
 --- STMT 65 ---
 SQL: ALTER VIEW no_such_view RENAME COLUMN a TO b
-ERROR [42P01]: ERROR: view "no_such_view" does not exist
+ERROR [42P01]: ERROR: relation "no_such_view" does not exist
 --- STMT 66 ---
 SQL: ALTER SEQUENCE no_such_seq RESTART WITH 1
 ERROR [42P01]: ERROR: relation "no_such_seq" does not exist
@@ -4062,13 +4062,13 @@ SQL: SELECT t.id AS x, t.a FROM tgt t ORDER BY missing_alias
 ERROR [42703]: ERROR: column "missing_alias" does not exist
 --- STMT 36 ---
 SQL: WITH tgt AS (SELECT 1 AS id) SELECT compat.tgt.id FROM tgt
-ERROR [42P01]: ERROR: missing FROM-clause entry for table "tgt"
+ERROR [42P01]: ERROR: invalid reference to FROM-clause entry for table "tgt"
 --- STMT 37 ---
 SQL: UPDATE tgt AS x SET a = x.a + 1 FROM src AS x WHERE x.id = x.id
-ERROR [42712]: ERROR: table reference "x" is ambiguous
+ERROR [42712]: ERROR: table name "x" specified more than once
 --- STMT 38 ---
 SQL: DELETE FROM tgt AS t USING src AS t WHERE t.id = t.id
-ERROR [42712]: ERROR: table reference "t" is ambiguous
+ERROR [42712]: ERROR: table name "t" specified more than once
 --- STMT 39 ---
 SQL: DROP SCHEMA compat CASCADE
 OK: 0 rows affected
@@ -4124,13 +4124,13 @@ ROW: 5 | 3 | {1,3,4,5}
 SQL: -- SEARCH / CYCLE WITH RECURSIVE graph(src, dst) AS ( SELECT src, dst FROM edges ), search_graph(id, path) AS ( SELECT 1, ARRAY[1] UNION ALL SELECT e.dst, sg.path || e.dst FROM search_graph sg JOIN gr...
 RESULT: 5 columns, 7 rows
 COLUMNS: id, path, ordcol, is_cycle, cycle_path
-ROW: 1 | {1} | (1) | f | {(1)}
-ROW: 2 | {1,2} | (1,2) | f | {(1),(2)}
-ROW: 4 | {1,2,4} | (1,2,4) | f | {(1),(2),(4)}
-ROW: 5 | {1,2,4,5} | (1,2,4,5) | f | {(1),(2),(4),(5)}
-ROW: 3 | {1,3} | (1,3) | f | {(1),(3)}
-ROW: 4 | {1,3,4} | (1,3,4) | f | {(1),(3),(4)}
-ROW: 5 | {1,3,4,5} | (1,3,4,5) | f | {(1),(3),(4),(5)}
+ROW: 1 | {1} | {(1)} | f | {(1)}
+ROW: 2 | {1,2} | {(1),(2)} | f | {(1),(2)}
+ROW: 4 | {1,2,4} | {(1),(2),(4)} | f | {(1),(2),(4)}
+ROW: 5 | {1,2,4,5} | {(1),(2),(4),(5)} | f | {(1),(2),(4),(5)}
+ROW: 3 | {1,3} | {(1),(3)} | f | {(1),(3)}
+ROW: 4 | {1,3,4} | {(1),(3),(4)} | f | {(1),(3),(4)}
+ROW: 5 | {1,3,4,5} | {(1),(3),(4),(5)} | f | {(1),(3),(4),(5)}
 --- STMT 14 ---
 SQL: -- data-modifying CTEs CREATE TABLE cte_t(id int PRIMARY KEY, v text)
 OK: 0 rows affected
@@ -4207,7 +4207,7 @@ OK: 20 rows affected
 SQL: SELECT count(*) FROM sample_t TABLESAMPLE SYSTEM (50)
 RESULT: 1 columns, 1 rows
 COLUMNS: count
-ROW: 11
+ROW: 9
 --- STMT 28 ---
 SQL: SELECT count(*) FROM sample_t TABLESAMPLE BERNOULLI (50) REPEATABLE (123)
 RESULT: 1 columns, 1 rows
@@ -4892,7 +4892,7 @@ SQL: WITH w AS MATERIALIZED SELECT 1
 ERROR [42601]: ERROR: syntax error at or near "SELECT"
 --- STMT 44 ---
 SQL: WITH w AS (SELECT 1) SEARCH DEPTH FIRST BY a SET ord SELECT * FROM w
-ERROR [42601]: ERROR: WITH query "w" is not recursive
+ERROR [42601]: ERROR: WITH query is not recursive
 --- STMT 45 ---
 SQL: CREATE TABLE q (a int,)
 ERROR [42601]: ERROR: syntax error at or near ")"
@@ -4928,7 +4928,7 @@ SQL: CREATE TRIGGER tr AFTER ON p FOR EACH ROW EXECUTE FUNCTION now()
 ERROR [42601]: ERROR: syntax error at or near "p"
 --- STMT 56 ---
 SQL: CREATE RULE r AS ON TO p DO INSTEAD NOTHING
-ERROR [42601]: ERROR: syntax error at or near "p"
+ERROR [42601]: ERROR: syntax error at or near "TO"
 --- STMT 57 ---
 SQL: ALTER TABLE p ALTER a TYPE int
 OK: 0 rows affected
@@ -5313,7 +5313,7 @@ SQL: SELECT date_part('year', 123)
 ERROR [42883]: ERROR: function date_part(unknown, integer) does not exist
 --- STMT 31 ---
 SQL: SELECT array_length('not_array', 1)
-ERROR [42804]: ERROR: function array_length(text, integer) does not exist
+ERROR [42804]: ERROR: could not determine polymorphic type because input has type unknown
 --- STMT 32 ---
 SQL: SELECT range_merge('x', 'y')
 ERROR [42804]: ERROR: function range_merge(text, text) does not exist
@@ -6208,18 +6208,18 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a1'), ('B', 'b1') RETURNING id, code, note, updated_at
 RESULT: 4 columns, 2 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a1 | 2026-07-27 11:11:23.542966+00
-ROW: 2 | B | b1 | 2026-07-27 11:11:23.542966+00
+ROW: 1 | A | a1 | 2026-07-29 01:56:54.833242+00
+ROW: 2 | B | b1 | 2026-07-29 01:56:54.833242+00
 --- STMT 12 ---
 SQL: -- returning / generated-key shaped cases INSERT INTO upsert_t(code) VALUES ('C') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 3 | C | d | 2026-07-27 11:11:23.542966+00
+ROW: 3 | C | d | 2026-07-29 01:56:54.834247+00
 --- STMT 13 ---
 SQL: INSERT INTO upsert_t(id, code, note) OVERRIDING SYSTEM VALUE VALUES (100, 'SYS', 'sys') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 100 | SYS | sys | 2026-07-27 11:11:23.544472+00
+ROW: 100 | SYS | sys | 2026-07-29 01:56:54.835248+00
 --- STMT 14 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED BY DEFAULT
 OK: 0 rows affected
@@ -6227,7 +6227,7 @@ OK: 0 rows affected
 SQL: INSERT INTO upsert_t(id, code, note) VALUES (200, 'MAN', 'manual') RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 200 | MAN | manual | 2026-07-27 11:11:23.544472+00
+ROW: 200 | MAN | manual | 2026-07-29 01:56:54.835248+00
 --- STMT 16 ---
 SQL: ALTER TABLE upsert_t ALTER COLUMN id SET GENERATED ALWAYS
 OK: 0 rows affected
@@ -6239,12 +6239,12 @@ COLUMNS: id, code, note, updated_at
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'a3') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note, updated_at = CURRENT_TIMESTAMP RETURNING id, code, note, updated_at
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-07-27 11:11:23.547987+00
+ROW: 1 | A | a3 | 2026-07-29 01:56:54.83725+00
 --- STMT 19 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('B', 'b2') ON CONFLICT ON CONSTRAINT upsert_t_code_key DO UPDATE SET note = EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 2 | B | b2 | 2026-07-27 11:11:23.542966+00
+ROW: 2 | B | b2 | 2026-07-29 01:56:54.833242+00
 --- STMT 20 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd1'), ('E', 'e1') RETURNING id, code, note
 RESULT: 3 columns, 2 rows
@@ -6255,7 +6255,7 @@ ROW: 8 | E | e1
 SQL: INSERT INTO upsert_t(code, note) VALUES ('D', 'd2') ON CONFLICT (code) DO UPDATE SET note = EXCLUDED.note WHERE upsert_t.note <> EXCLUDED.note RETURNING *
 RESULT: 4 columns, 1 rows
 COLUMNS: id, code, note, updated_at
-ROW: 7 | D | d2 | 2026-07-27 11:11:23.549993+00
+ROW: 7 | D | d2 | 2026-07-29 01:56:54.838249+00
 --- STMT 22 ---
 SQL: UPDATE upsert_t SET note = note WHERE code = 'A' RETURNING id, code, note
 RESULT: 3 columns, 1 rows
@@ -6273,19 +6273,19 @@ COLUMNS: id, code, note, updated_at
 SQL: SELECT * FROM upsert_t ORDER BY id
 RESULT: 4 columns, 7 rows
 COLUMNS: id, code, note, updated_at
-ROW: 1 | A | a3 | 2026-07-27 11:11:23.547987+00
-ROW: 2 | B | b2 | 2026-07-27 11:11:23.542966+00
-ROW: 3 | C | d | 2026-07-27 11:11:23.542966+00
-ROW: 7 | D | d2 | 2026-07-27 11:11:23.549993+00
-ROW: 8 | E | e1 | 2026-07-27 11:11:23.549993+00
-ROW: 100 | SYS | sys | 2026-07-27 11:11:23.544472+00
-ROW: 200 | MAN | manual | 2026-07-27 11:11:23.544472+00
+ROW: 1 | A | a3 | 2026-07-29 01:56:54.83725+00
+ROW: 2 | B | b2 | 2026-07-29 01:56:54.833242+00
+ROW: 3 | C | d | 2026-07-29 01:56:54.834247+00
+ROW: 7 | D | d2 | 2026-07-29 01:56:54.838249+00
+ROW: 8 | E | e1 | 2026-07-29 01:56:54.838249+00
+ROW: 100 | SYS | sys | 2026-07-29 01:56:54.835248+00
+ROW: 200 | MAN | manual | 2026-07-29 01:56:54.835248+00
 --- STMT 26 ---
 SQL: -- bad upsert / returning cases INSERT INTO upsert_t(code, note) VALUES ('A', 'dup') ON CONFLICT (note) DO NOTHING
 ERROR [42P10]: ERROR: there is no unique or exclusion constraint matching the ON CONFLICT specification
 --- STMT 27 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'dup') ON CONFLICT (code) DO UPDATE SET missing_col = EXCLUDED.note
-ERROR [42703]: ERROR: Column not found: missing_col
+ERROR [42703]: ERROR: column "missing_col" of relation "upsert_t" does not exist
 --- STMT 28 ---
 SQL: INSERT INTO upsert_t(code, note) VALUES ('A', 'dup') ON CONFLICT (code) DO UPDATE SET note = (SELECT code FROM upsert_t)
 ERROR [21000]: ERROR: more than one row returned by a subquery used as an expression
@@ -6615,7 +6615,7 @@ OK: 3 rows affected
 SQL: -- common app-shaped datetime and filter expressions SELECT CURRENT_DATE, CURRENT_TIMESTAMP, LOCALTIMESTAMP
 RESULT: 3 columns, 1 rows
 COLUMNS: current_date, current_timestamp, localtimestamp
-ROW: 2026-07-27 | 2026-07-27 11:11:23.701315+00 | 2026-07-27 13:11:23.701315
+ROW: 2026-07-29 | 2026-07-29 01:56:55.846392+00 | 2026-07-29 01:56:55.846392
 --- STMT 13 ---
 SQL: SELECT date_trunc('day', created_at), date_trunc('hour', local_ts) FROM app_t ORDER BY id
 RESULT: 2 columns, 3 rows
@@ -6711,10 +6711,10 @@ SQL: SELECT regexp_replace('abc', '(', 'x')
 ERROR [2201B]: ERROR: invalid regular expression: Unclosed group
 --- STMT 29 ---
 SQL: SELECT date_trunc('nonesuch', created_at) FROM app_t
-ERROR [22023]: ERROR: unit "nonesuch" not recognized for type timestamp
+ERROR [22023]: ERROR: unit "nonesuch" not recognized for type timestamp with time zone
 --- STMT 30 ---
 SQL: SELECT extract(nonesuch FROM created_at) FROM app_t
-ERROR [22023]: ERROR: unit "nonesuch" not recognized for type timestamp without time zone
+ERROR [22023]: ERROR: unit "nonesuch" not recognized for type timestamp with time zone
 --- STMT 31 ---
 SQL: SELECT split_part('a,b,c', ',', 0)
 ERROR [22023]: ERROR: field position must not be zero
@@ -6948,10 +6948,10 @@ SQL: DO $$ BEGIN EXECUTE format('SELECT * FROM %I', NULL); END $$
 ERROR [22004]: ERROR: null values cannot be formatted as an SQL identifier
 --- STMT 21 ---
 SQL: DO $$ BEGIN EXECUTE 'INSERT INTO compat.no_such VALUES (1)'; END $$
-ERROR [42P01]: ERROR: relation "no_such" does not exist
+ERROR [42P01]: ERROR: relation "compat.no_such" does not exist
 --- STMT 22 ---
 SQL: DO $$ DECLARE x int BEGIN x := 1; END $$
-ERROR [42601]: ERROR: missing semicolon after variable declaration before BEGIN
+ERROR [42601]: ERROR: syntax error at or near "BEGIN"
 --- STMT 23 ---
 SQL: DO LANGUAGE plpgsql $$ BEGIN EXECUTE 'SELECT nope'; END $$
 ERROR [42703]: ERROR: column "nope" does not exist
@@ -7470,7 +7470,7 @@ RESULT: 4 columns, 3 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
 ROW: 2 | 20 | b | NULL
-ROW: 3 | 10 | c | 2026-07-27 11:11:24.145844+00
+ROW: 3 | 10 | c | 2026-07-29 01:56:59.761835+00
 --- STMT 17 ---
 SQL: ALTER TABLE tenant_data FORCE ROW LEVEL SECURITY
 OK: 0 rows affected
@@ -7479,7 +7479,7 @@ SQL: SELECT * FROM tenant_data ORDER BY id
 RESULT: 4 columns, 2 rows
 COLUMNS: id, tenant_id, note, deleted_at
 ROW: 1 | 10 | a | NULL
-ROW: 3 | 10 | c | 2026-07-27 11:11:24.145844+00
+ROW: 3 | 10 | c | 2026-07-29 01:56:59.761835+00
 --- STMT 19 ---
 SQL: ALTER POLICY tenant_select_pol ON tenant_data USING (tenant_id = current_setting('compat.tenant_id')::int AND deleted_at IS NULL)
 OK: 0 rows affected
@@ -7792,23 +7792,23 @@ OK: 4 rows affected
 SQL: -- common repository query shapes SELECT * FROM repo_account WHERE id = 1
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-27 11:11:24.271123+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-29 01:57:00.6236+00
 --- STMT 15 ---
 SQL: SELECT * FROM repo_account WHERE email = 'a@example.com'
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-27 11:11:24.271123+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-29 01:57:00.6236+00
 --- STMT 16 ---
 SQL: SELECT * FROM repo_account WHERE deleted_at IS NULL ORDER BY id
 RESULT: 6 columns, 2 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-27 11:11:24.271123+00
-ROW: 2 | b@example.com | f | NULL | 0 | 2026-07-27 11:11:24.271123+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-29 01:57:00.6236+00
+ROW: 2 | b@example.com | f | NULL | 0 | 2026-07-29 01:57:00.6236+00
 --- STMT 17 ---
 SQL: SELECT * FROM repo_account WHERE active IS TRUE ORDER BY id
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-27 11:11:24.271123+00
+ROW: 1 | a@example.com | t | NULL | 0 | 2026-07-29 01:57:00.6236+00
 --- STMT 18 ---
 SQL: SELECT EXISTS (SELECT 1 FROM repo_account WHERE email = 'missing@example.com')
 RESULT: 1 columns, 1 rows
@@ -7829,21 +7829,21 @@ ROW: 2 | 1 | 40.00
 SQL: SELECT o.* FROM repo_order o WHERE o.account_id = 1 ORDER BY o.created_at DESC, o.id DESC LIMIT 2 OFFSET 0
 RESULT: 5 columns, 2 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 3 | 1 | done | 30.00 | 2026-07-27 11:11:24.272174+00
-ROW: 2 | 1 | open | 20.00 | 2026-07-27 11:11:24.272174+00
+ROW: 3 | 1 | done | 30.00 | 2026-07-29 01:57:00.624606+00
+ROW: 2 | 1 | open | 20.00 | 2026-07-29 01:57:00.624606+00
 --- STMT 22 ---
 SQL: SELECT o.* FROM repo_order o WHERE (o.created_at, o.id) < (CURRENT_TIMESTAMP, 999999) ORDER BY o.created_at DESC, o.id DESC LIMIT 10
 RESULT: 5 columns, 4 rows
 COLUMNS: id, account_id, status, total, created_at
-ROW: 4 | 2 | open | 40.00 | 2026-07-27 11:11:24.272174+00
-ROW: 3 | 1 | done | 30.00 | 2026-07-27 11:11:24.272174+00
-ROW: 2 | 1 | open | 20.00 | 2026-07-27 11:11:24.272174+00
-ROW: 1 | 1 | open | 10.00 | 2026-07-27 11:11:24.272174+00
+ROW: 4 | 2 | open | 40.00 | 2026-07-29 01:57:00.624606+00
+ROW: 3 | 1 | done | 30.00 | 2026-07-29 01:57:00.624606+00
+ROW: 2 | 1 | open | 20.00 | 2026-07-29 01:57:00.624606+00
+ROW: 1 | 1 | open | 10.00 | 2026-07-29 01:57:00.624606+00
 --- STMT 23 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 1 | a@example.com | t | NULL | 1 | 2026-07-27 11:11:24.271123+00
+ROW: 1 | a@example.com | t | NULL | 1 | 2026-07-29 01:57:00.6236+00
 --- STMT 24 ---
 SQL: UPDATE repo_account SET version = version + 1 WHERE id = 1 AND version = 0 RETURNING *
 RESULT: 6 columns, 0 rows
@@ -7852,7 +7852,7 @@ COLUMNS: id, email, active, deleted_at, version, created_at
 SQL: INSERT INTO repo_account(email, active) VALUES ('d@example.com', true) ON CONFLICT (email) DO NOTHING RETURNING *
 RESULT: 6 columns, 1 rows
 COLUMNS: id, email, active, deleted_at, version, created_at
-ROW: 4 | d@example.com | t | NULL | 0 | 2026-07-27 11:11:24.389274+00
+ROW: 4 | d@example.com | t | NULL | 0 | 2026-07-29 01:57:02.041596+00
 --- STMT 26 ---
 SQL: SELECT ra.id, ra.email, ro.id AS order_id, ro.status, ro.total FROM repo_account ra LEFT JOIN repo_order ro ON ro.account_id = ra.id WHERE ra.deleted_at IS NULL ORDER BY ra.id, ro.id
 RESULT: 5 columns, 5 rows

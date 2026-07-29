@@ -13,6 +13,32 @@ import java.util.*;
  */
 class CastEvaluator {
 
+    /**
+     * What a value that is neither a scalar nor a string is called in a cast rejection: a row is a
+     * {@code record}, and a collection of rows a {@code record[]}, which is what the ordering
+     * column of a SEARCH DEPTH FIRST clause holds. Anything else collected is an {@code array}.
+     */
+    private static String compositeSourceName(Object val) {
+        if (val instanceof AstExecutor.PgRow) return "record";
+        Object first = null;
+        if (val instanceof java.util.List<?>) {
+            java.util.List<?> list = (java.util.List<?>) val;
+            if (!list.isEmpty()) first = list.get(0);
+        } else if (val instanceof Object[]) {
+            Object[] arr = (Object[]) val;
+            if (arr.length > 0) first = arr[0];
+        }
+        return first instanceof AstExecutor.PgRow ? "record[]" : "array";
+    }
+
+    /** The name PostgreSQL puts in a message for an integer type, whichever alias was written. */
+    private static String integerTypeDisplayName(String lowerSpec) {
+        if (lowerSpec.equals("int") || lowerSpec.equals("int4")) return "integer";
+        if (lowerSpec.equals("int8")) return "bigint";
+        if (lowerSpec.equals("int2")) return "smallint";
+        return lowerSpec;
+    }
+
     private final AstExecutor executor;
 
     /** Maps PG OIDs to their canonical type names (used by ::regtype casts). */
@@ -269,9 +295,10 @@ class CastEvaluator {
         if (lowerSpec.equals("integer") || lowerSpec.equals("int") || lowerSpec.equals("int4")
                 || lowerSpec.equals("bigint") || lowerSpec.equals("int8")
                 || lowerSpec.equals("smallint") || lowerSpec.equals("int2")) {
-            if (val instanceof java.util.List<?> || val instanceof AstExecutor.PgRow) {
-                String srcType = val instanceof AstExecutor.PgRow ? "record" : "array";
-                throw new MemgresException("cannot cast type " + srcType + " to " + lowerSpec, "42846");
+            if (val instanceof java.util.List<?> || val instanceof Object[]
+                    || val instanceof AstExecutor.PgRow) {
+                throw new MemgresException("cannot cast type " + compositeSourceName(val)
+                        + " to " + integerTypeDisplayName(lowerSpec), "42846");
             }
             // Geometric types cannot be cast to integer
             if (val instanceof String && GeometricOperations.isGeometricString(((String) val).trim())) {
