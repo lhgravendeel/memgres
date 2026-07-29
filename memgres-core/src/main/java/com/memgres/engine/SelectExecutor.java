@@ -100,6 +100,9 @@ class SelectExecutor {
             for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
                 cteMap.put(cte.name().toLowerCase(), cte);
             }
+            // Before the scope is pushed: a refusal here must not leave a WITH scope standing on
+            // the stack for whatever the connection runs next.
+            cteExecutor.validateRecursiveItems(stmt.withClauses());
             executor.cteStack.push(cteMap);
             for (String cteName : cteMap.keySet()) {
                 executor.cteResultCache.remove(cteName);

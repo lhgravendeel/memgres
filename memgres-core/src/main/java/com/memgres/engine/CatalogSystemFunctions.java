@@ -102,6 +102,17 @@ class CatalogSystemFunctions {
                     }
                 }
 
+                // Subscripting an array yields one element of it, so the answer is the array's
+                // element type — jsonb only where the thing subscripted really was a jsonb.
+                if (rawExpr instanceof BinaryExpr && ctx != null
+                        && ((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT
+                        && ((BinaryExpr) rawExpr).left() instanceof ColumnRef) {
+                    ColumnRef base = (ColumnRef) ((BinaryExpr) rawExpr).left();
+                    Column baseDef = ctx.resolveColumnDef(base.table(), base.column());
+                    if (baseDef != null && baseDef.getArrayElementType() != null) {
+                        return pgTypeDisplayName(baseDef.getArrayElementType());
+                    }
+                }
                 if (rawExpr instanceof BinaryExpr
                         && (((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_ARROW
                             || ((BinaryExpr) rawExpr).op() == BinaryExpr.BinOp.JSON_SUBSCRIPT)) {

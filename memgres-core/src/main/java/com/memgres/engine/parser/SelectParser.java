@@ -69,10 +69,10 @@ class SelectParser {
             }
 
             Statement right;
-            int setOpExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
+            int setOpExtraParens = Math.max(0, wrappingParensBeforeArm());
             if (parser.check(TokenType.LEFT_PAREN) && setOpExtraParens > 0) {
                 parser.consumeLeadingParens(setOpExtraParens);
-                right = parser.parseSelect(); right = tryParseSetOp(right);
+                right = parseArmAfterWrappers();
                 parser.consumeTrailingParens(setOpExtraParens);
                 lastRightWasParenthesized = true;
             } else if (parser.check(TokenType.LEFT_PAREN)) {
@@ -83,6 +83,7 @@ class SelectParser {
                 right = parseValuesBody();
                 lastRightWasParenthesized = false;
             } else {
+                rejectWithClauseArm();
                 right = parser.parseSelect();
                 lastRightWasParenthesized = false;
             }
@@ -168,6 +169,65 @@ class SelectParser {
                 parser.peek());
     }
 
+    /**
+     * How many of the parens that open a set-operation arm merely wrap it.
+     *
+     * <p>Counting every paren before the SELECT keyword reads {@code ((SELECT 1) EXCEPT (SELECT
+     * 2))} as two wrappers around one SELECT, so the arm's own set operation was left in the
+     * stream and the EXCEPT that follows became a syntax error. A paren whose matching close is
+     * followed by a set-operation keyword is not a wrapper — it encloses that operation's left
+     * operand — so counting stops there and the arm is parsed as the set operation it is.
+     */
+    private int wrappingParensBeforeArm() {
+        int count = parser.countLeadingParensBeforeQuery();
+        while (count > 1 && closedBeforeSetOp(parser.pos + count - 1)) count--;
+        return count;
+    }
+
+    /** True when the paren at {@code index} closes immediately before UNION, INTERSECT or EXCEPT. */
+    private boolean closedBeforeSetOp(int index) {
+        int depth = 1;
+        int look = index + 1;
+        while (look < parser.tokens.size() && depth > 0) {
+            if (parser.tokens.get(look).type() == TokenType.LEFT_PAREN) depth++;
+            else if (parser.tokens.get(look).type() == TokenType.RIGHT_PAREN) depth--;
+            look++;
+        }
+        if (look >= parser.tokens.size()) return false;
+        Token after = parser.tokens.get(look);
+        if (after.type() != TokenType.KEYWORD) return false;
+        String kw = after.value();
+        return kw.equals("UNION") || kw.equals("INTERSECT") || kw.equals("EXCEPT");
+    }
+
+    /** The arm left standing after its wrapping parens were consumed. */
+    private Statement parseArmAfterWrappers() {
+        Statement arm;
+        if (parser.check(TokenType.LEFT_PAREN)) {
+            parser.advance();
+            arm = parser.parseSelect();
+            arm = tryParseSetOp(arm);
+            parser.expect(TokenType.RIGHT_PAREN);
+        } else {
+            arm = parser.parseSelect();
+        }
+        return tryParseSetOp(arm);
+    }
+
+    /**
+     * A WITH clause is not one of the productions a set-operation arm may be.
+     *
+     * <p>PostgreSQL's grammar hangs WITH off a whole query, not off an arm, so {@code SELECT 1
+     * UNION ALL WITH x AS (...) SELECT ...} is a syntax error at the WITH — while the same
+     * written inside parentheses is a query in its own right and runs. The arms here were parsed
+     * by the full SELECT parser, which reads a WITH clause wherever it stands.
+     */
+    private void rejectWithClauseArm() {
+        if (parser.checkKeyword("WITH")) {
+            throw new ParseException("syntax error at or near \"WITH\"", parser.peek());
+        }
+    }
+
     /** Parse a chain of INTERSECT operations (higher precedence, left-associative). */
     Statement parseIntersectChain(Statement left) {
         rejectSortedLeftArm(left);
@@ -182,16 +242,17 @@ class SelectParser {
             }
 
             Statement right;
-            int intersectExtraParens = Math.max(0, parser.countLeadingParensBeforeQuery());
+            int intersectExtraParens = Math.max(0, wrappingParensBeforeArm());
             if (parser.check(TokenType.LEFT_PAREN) && intersectExtraParens > 0) {
                 parser.consumeLeadingParens(intersectExtraParens);
-                right = parser.parseSelect(); right = tryParseSetOp(right);
+                right = parseArmAfterWrappers();
                 parser.consumeTrailingParens(intersectExtraParens);
             } else if (parser.check(TokenType.LEFT_PAREN)) {
                 parser.advance(); right = parser.parseSelect(); right = tryParseSetOp(right); parser.expect(TokenType.RIGHT_PAREN);
             } else if (parser.checkKeyword("VALUES")) {
                 right = parseValuesBody();
             } else {
+                rejectWithClauseArm();
                 right = parser.parseSelect();
             }
 
@@ -706,9 +767,10 @@ class SelectParser {
             parser.expectKeyword("SET");
             cycleCol = parser.readIdentifier();
             if (parser.matchKeyword("TO")) {
-                cycleMarkValue = parser.parseExpression();
-                parser.expectKeyword("DEFAULT");
-                cycleMarkDefault = parser.parseExpression();
+                cycleMarkValue = parseCycleMarkConstant();
+                requireKeywordHere("DEFAULT", true);
+                cycleMarkDefault = parseCycleMarkConstant();
+                requireKeywordHere("USING", false);
             }
             parser.expectKeyword("USING");
             cyclePathCol = parser.readIdentifier();
@@ -727,6 +789,16 @@ class SelectParser {
                 throw new com.memgres.engine.MemgresException(
                     "WITH query is not recursive", "42601");
             }
+            // Every column SEARCH and CYCLE add stands beside the others in the item's column
+            // list, so two of them under one name leave the query no way to say which it meant.
+            if (searchCol != null && cycleCol != null && searchCol.equals(cycleCol)) {
+                throw new com.memgres.engine.MemgresException(
+                    "search sequence column name and cycle mark column name are the same", "42601");
+            }
+            if (searchCol != null && cyclePathCol != null && searchCol.equals(cyclePathCol)) {
+                throw new com.memgres.engine.MemgresException(
+                    "search sequence column name and cycle path column name are the same", "42601");
+            }
             if (cycleCol != null && cyclePathCol != null && cycleCol.equals(cyclePathCol)) {
                 throw new com.memgres.engine.MemgresException(
                     "cycle mark column name and cycle path column name are the same", "42601");
@@ -735,6 +807,72 @@ class SelectParser {
                     origCte.query(), origCte.recursive(), searchCol, searchDepthFirst, searchByColumns,
                     cycleCol, cyclePathCol, cycleByColumns, cycleMarkValue, cycleMarkDefault));
         }
+    }
+
+    /**
+     * The value a CYCLE clause may mark a row with: a constant, and nothing else.
+     *
+     * <p>PostgreSQL's grammar puts an {@code AexprConst} after TO and after DEFAULT, so a sign, an
+     * operator, a cast or a function call is a syntax error at the token that broke the constant —
+     * {@code TO -1} at the minus, {@code TO 1+1} at the plus, {@code TO 'x'::text} at the cast,
+     * {@code TO random()} at the paren that closes an empty argument list. Reading a whole
+     * expression here accepted all four and then evaluated them once, per query rather than per
+     * row, which is not a meaning PostgreSQL gives them.
+     */
+    private Expression parseCycleMarkConstant() {
+        Token t = parser.peek();
+        switch (t.type()) {
+            case INTEGER_LITERAL:
+            case FLOAT_LITERAL:
+            case STRING_LITERAL:
+            case DOLLAR_STRING_LITERAL:
+            case BIT_STRING_LITERAL:
+                return parser.parsePrimary();
+            case KEYWORD:
+                if (t.value().equals("TRUE") || t.value().equals("FALSE")
+                        || t.value().equals("NULL")) {
+                    return parser.parsePrimary();
+                }
+                // A type name followed by a string is a constant too: DATE '2020-01-01'.
+                if (tokenAt(1) != null
+                        && tokenAt(1).type() == TokenType.STRING_LITERAL) {
+                    return parser.parsePrimary();
+                }
+                break;
+            case IDENTIFIER:
+                if (tokenAt(1) != null
+                        && tokenAt(1).type() == TokenType.STRING_LITERAL) {
+                    return parser.parsePrimary();
+                }
+                // funcname '(' args ')' 'string' is the one other constant form, and the
+                // argument list may not be empty; report where PostgreSQL stops reading it.
+                if (tokenAt(1) != null
+                        && tokenAt(1).type() == TokenType.LEFT_PAREN) {
+                    Token stop = tokenAt(2);
+                    if (stop != null && stop.type() == TokenType.RIGHT_PAREN) {
+                        throw new ParseException("syntax error at or near \")\"", stop);
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+        throw new ParseException("syntax error at or near \"" + t.value() + "\"", t);
+    }
+
+    /** The token {@code offset} places ahead of the cursor, or null past the end. */
+    private Token tokenAt(int offset) {
+        int index = parser.pos + offset;
+        return index < parser.tokens.size() ? parser.tokens.get(index) : null;
+    }
+
+    /** The keyword the CYCLE clause has to have next, said the way PostgreSQL says it is missing. */
+    private void requireKeywordHere(String keyword, boolean consume) {
+        if (!parser.checkKeyword(keyword)) {
+            throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                    parser.peek());
+        }
+        if (consume) parser.advance();
     }
 
     Statement parseWithStatement() {
