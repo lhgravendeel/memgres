@@ -100,10 +100,13 @@ class SystemCatalogTest {
     @Test
     void testPgAttributeNotNull() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
-            // Direct query without JOIN to verify attnotnull values
+            // Scoped to the relation under test: pg_catalog has its own nullable 'name'
+            // columns (pg_available_extensions, pg_timezone_names), and PostgreSQL answers
+            // this query with a mixture of t and f when it is not narrowed to one relation.
             ResultSet rs = stmt.executeQuery(
-                    "SELECT attname, attnotnull FROM pg_catalog.pg_attribute " +
-                    "WHERE attname = 'name'");
+                    "SELECT a.attname, a.attnotnull FROM pg_catalog.pg_attribute a " +
+                    "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid " +
+                    "WHERE c.relname = 'users' AND a.attname = 'name'");
             boolean found = false;
             while (rs.next()) {
                 if ("name".equals(rs.getString("attname"))) {

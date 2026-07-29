@@ -974,9 +974,22 @@ class FromJoinExecutor {
             Object val = ctx.resolveColumn(ref.table(), ref.column());
             if (val == null) return null;
             if (sb.length() > 0) sb.append('\0');
-            sb.append(val.toString());
+            sb.append(joinKeyOf(val));
         }
         return sb.toString();
+    }
+
+    /**
+     * How a value reads as a hash-join key. Both sides have to read it the same way or the one
+     * side's rows land in a bucket the other never looks in: a regproc column prints as the
+     * function's name but compares as its OID, so hashing what it prints made every join from a
+     * catalog's regproc column to pg_proc.oid find nothing once the two sides were large enough
+     * for the hash path — while the same join over smaller relations, taken as a nested loop,
+     * matched.
+     */
+    private static String joinKeyOf(Object val) {
+        if (val instanceof RegprocValue) return String.valueOf(((RegprocValue) val).oid());
+        return val.toString();
     }
 
     private String buildUsingKey(RowContext ctx, List<UsingKey> keys, boolean leftSide) {

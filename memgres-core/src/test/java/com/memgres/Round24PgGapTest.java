@@ -162,9 +162,13 @@ class Round24PgGapTest {
     // ========================================================================
 
     @Test
-    void pg_collation_has_en_us_utf8_row() throws SQLException {
-        // memgres should ship 'en_US.utf8' so `COLLATE "en_US.utf8"` works
-        assertEquals("1", q("SELECT count(*)::text FROM pg_collation WHERE collname = 'en_US.utf8'"));
+    void pg_collation_lists_only_collations_collate_accepts() throws SQLException {
+        // A catalog row for a collation the engine will not honour is worse than no row: it tells
+        // a client the collation is available and then refuses it. PostgreSQL 18 on the reference
+        // server carries no en_US.utf8 either, and COLLATE "en_US.utf8" fails on both engines.
+        assertEquals("0", q("SELECT count(*)::text FROM pg_collation WHERE collname = 'en_US.utf8'"));
+        assertEquals("4", q("SELECT count(*)::text FROM pg_collation"
+                + " WHERE collname IN ('C', 'POSIX', 'ucs_basic', 'default')"));
     }
 
     @Test

@@ -489,8 +489,9 @@ class SystemCatalogsCoverageTest {
 
     @Test
     void testPgAttrdefContainsDefaults() throws SQLException {
-        // The 'active' column has DEFAULT true, SERIAL columns have nextval defaults
-        assertTrue(queryHasRows("SELECT oid, adrelid, adsrc FROM pg_attrdef"));
+        // The 'active' column has DEFAULT true, SERIAL columns have nextval defaults.
+        // PostgreSQL dropped pg_attrdef.adsrc in version 12; adbin is what is left.
+        assertTrue(queryHasRows("SELECT oid, adrelid, adbin FROM pg_attrdef"));
     }
 
     @Test

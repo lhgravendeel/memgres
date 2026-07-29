@@ -141,6 +141,7 @@ class CatalogSecurityBuilder {
                 col("datlocale", DataType.TEXT),
                 col("daticurules", DataType.TEXT),
                 col("datcollversion", DataType.TEXT),
+                col("dathasloginevt", DataType.BOOLEAN),
                 col("datacl", DataType.ACLITEM_ARRAY)
         );
         Table table = new Table("pg_database", cols);
@@ -152,14 +153,14 @@ class CatalogSecurityBuilder {
                 "c", true, false, -1,
                 722, 1, tsOid,
                 "en_US.UTF-8", "en_US.UTF-8",
-                null, null, null, null
+                null, null, null, false, null
         });
         table.insertRow(new Object[]{
                 oids.oid("db:template1"), "template1", 10, 6,
                 "c", true, true, -1,
                 722, 1, tsOid,
                 "en_US.UTF-8", "en_US.UTF-8",
-                null, null, null, null
+                null, null, null, false, null
         });
 
         // Dynamically list all databases from the registry
@@ -171,7 +172,7 @@ class CatalogSecurityBuilder {
                         "c", false, true, -1,
                         722, 1, tsOid,
                         "en_US.UTF-8", "en_US.UTF-8",
-                        null, null, null, null
+                        null, null, null, false, null
                 });
             }
         } else {
@@ -181,7 +182,7 @@ class CatalogSecurityBuilder {
                     "c", false, true, -1,
                     722, 1, tsOid,
                     "en_US.UTF-8", "en_US.UTF-8",
-                    null, null, null, null
+                    null, null, null, false, null
             });
         }
 
@@ -190,8 +191,8 @@ class CatalogSecurityBuilder {
 
     Table buildPgRoles() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("rolname", DataType.TEXT),
+                colNN("oid", DataType.OID),
+                colNN("rolname", DataType.NAME),
                 col("rolsuper", DataType.BOOLEAN),
                 col("rolinherit", DataType.BOOLEAN),
                 col("rolcreaterole", DataType.BOOLEAN),
@@ -212,16 +213,22 @@ class CatalogSecurityBuilder {
             if (climRaw != null) {
                 try { connLimit = Integer.parseInt(climRaw.trim()); } catch (NumberFormatException ignore) {}
             }
+            // A superuser bypasses row-level security whatever the catalog says, and PostgreSQL
+            // reports it: the bootstrap superuser's rolbypassrls is true. An RLS-auditing tool
+            // reads this column to decide whose reads the policies actually constrain, so
+            // reporting false for a superuser tells it the opposite of the truth.
+            boolean superuser = "true".equalsIgnoreCase(attrs.getOrDefault("SUPERUSER", "false"));
             table.insertRow(new Object[]{
                     oids.oid("role:" + entry.getKey()), entry.getKey(),
-                    "true".equalsIgnoreCase(attrs.getOrDefault("SUPERUSER", "false")),
+                    superuser,
                     "true".equalsIgnoreCase(attrs.getOrDefault("INHERIT", "true")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("CREATEROLE", "false")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("CREATEDB", "false")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("LOGIN", "false")),
                     "true".equalsIgnoreCase(attrs.getOrDefault("REPLICATION", "false")),
                     connLimit, parseValidUntil(attrs.get("VALID_UNTIL")),
-                    "true".equalsIgnoreCase(attrs.getOrDefault("BYPASSRLS", "false")),
+                    "true".equalsIgnoreCase(
+                            attrs.getOrDefault("BYPASSRLS", String.valueOf(superuser))),
                     buildRolconfig(attrs.get("ROLCONFIG")), "********" // rolconfig, rolpassword (always masked in pg_roles)
             });
         }
@@ -254,6 +261,40 @@ class CatalogSecurityBuilder {
                     false, // no login
                     false, // no replication
                     -1, null, false, null, null // rolpassword null for system roles
+            });
+        }
+        return table;
+    }
+
+    /**
+     * pg_authid is the stored table pg_roles is a view over. It holds the real password and, being
+     * a table rather than a view, has no rolconfig column — that one lives in pg_db_role_setting
+     * and is only assembled by the view.
+     */
+    Table buildPgAuthid() {
+        Table roles = buildPgRoles();
+        List<Column> cols = Cols.listOf(
+                colNN("oid", DataType.OID),
+                colNN("rolname", DataType.NAME),
+                col("rolsuper", DataType.BOOLEAN),
+                col("rolinherit", DataType.BOOLEAN),
+                col("rolcreaterole", DataType.BOOLEAN),
+                col("rolcreatedb", DataType.BOOLEAN),
+                col("rolcanlogin", DataType.BOOLEAN),
+                col("rolreplication", DataType.BOOLEAN),
+                col("rolbypassrls", DataType.BOOLEAN),
+                col("rolconnlimit", DataType.INTEGER),
+                col("rolpassword", DataType.TEXT),
+                col("rolvaliduntil", DataType.TIMESTAMPTZ)
+        );
+        Table table = new Table("pg_authid", cols);
+        for (Object[] r : roles.getRows()) {
+            table.insertRow(new Object[]{
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+                    r[10],  // rolbypassrls
+                    r[8],   // rolconnlimit
+                    r[12],  // rolpassword
+                    r[9]    // rolvaliduntil
             });
         }
         return table;
@@ -294,26 +335,73 @@ class CatalogSecurityBuilder {
     }
 
     Table buildPgUser() {
+        return buildLoginRoleView("pg_user", "usename", "usesysid");
+    }
+
+    /**
+     * pg_user and pg_shadow are the same query over the login roles, differing only in the two
+     * leading column names and in pg_shadow being restricted to superusers. A tool auditing
+     * row-level security reads usebypassrls off one of them, so both carry PG's full column list
+     * rather than the four that were enough to list a user's name.
+     */
+    Table buildLoginRoleView(String viewName, String nameCol, String sysidCol) {
         List<Column> cols = Cols.listOf(
-                colNN("usesysid", DataType.INTEGER),
-                colNN("usename", DataType.TEXT),
-                col("usesuper", DataType.BOOLEAN),
+                colNN(nameCol, DataType.NAME),
+                colNN(sysidCol, DataType.OID),
                 col("usecreatedb", DataType.BOOLEAN),
+                col("usesuper", DataType.BOOLEAN),
+                col("userepl", DataType.BOOLEAN),
+                col("usebypassrls", DataType.BOOLEAN),
                 col("passwd", DataType.TEXT),
-                col("valuntil", DataType.TIMESTAMPTZ)
+                col("valuntil", DataType.TIMESTAMPTZ),
+                col("useconfig", DataType.TEXT_ARRAY)
         );
-        Table table = new Table("pg_user", cols);
+        Table table = new Table(viewName, cols);
         for (Map.Entry<String, Map<String, String>> entry : database.getRoles().entrySet()) {
             Map<String, String> attrs = entry.getValue();
             boolean canLogin = "true".equalsIgnoreCase(attrs.getOrDefault("LOGIN", "false"));
             if (canLogin) {
+                // Same reading of BYPASSRLS as pg_roles: a superuser bypasses RLS.
+                boolean superuser = "true".equalsIgnoreCase(attrs.getOrDefault("SUPERUSER", "false"));
                 table.insertRow(new Object[]{
-                        oids.oid("role:" + entry.getKey()), entry.getKey(),
-                        "true".equalsIgnoreCase(attrs.getOrDefault("SUPERUSER", "false")),
+                        entry.getKey(), oids.oid("role:" + entry.getKey()),
                         "true".equalsIgnoreCase(attrs.getOrDefault("CREATEDB", "false")),
-                        null, null
+                        superuser,
+                        "true".equalsIgnoreCase(attrs.getOrDefault("REPLICATION", "false")),
+                        "true".equalsIgnoreCase(
+                                attrs.getOrDefault("BYPASSRLS", String.valueOf(superuser))),
+                        null, null, null
                 });
             }
+        }
+        return table;
+    }
+
+    /** The group roles, as PostgreSQL's pg_group view reports them. */
+    Table buildPgGroup() {
+        List<Column> cols = Cols.listOf(
+                colNN("groname", DataType.NAME),
+                colNN("grosysid", DataType.OID),
+                col("grolist", DataType.OID_ARRAY)
+        );
+        Table table = new Table("pg_group", cols);
+        for (Map.Entry<String, Map<String, String>> entry : database.getRoles().entrySet()) {
+            Map<String, String> attrs = entry.getValue();
+            if ("true".equalsIgnoreCase(attrs.getOrDefault("LOGIN", "false"))) continue;
+            StringBuilder members = new StringBuilder("{");
+            java.util.Set<String> memberSet = database.getRoleMemberships().get(entry.getKey());
+            if (memberSet != null) {
+                boolean first = true;
+                for (String m : memberSet) {
+                    if (!first) members.append(",");
+                    members.append(oids.oid("role:" + m));
+                    first = false;
+                }
+            }
+            members.append("}");
+            table.insertRow(new Object[]{
+                    entry.getKey(), oids.oid("role:" + entry.getKey()), members.toString()
+            });
         }
         return table;
     }
@@ -347,14 +435,15 @@ class CatalogSecurityBuilder {
 
     Table buildPgPolicy() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("polname", DataType.TEXT),
-                colNN("polrelid", DataType.INTEGER),
-                col("polcmd", DataType.CHAR),
+                colNN("oid", DataType.OID),
+                colNN("polname", DataType.NAME),
+                colNN("polrelid", DataType.OID),
+                col("polcmd", DataType.INTERNAL_CHAR),
                 col("polpermissive", DataType.BOOLEAN),
                 col("polroles", DataType.TEXT),
-                col("polqual", DataType.TEXT),
-                col("polwithcheck", DataType.TEXT),
+                // A policy's expressions are parse trees in PG, not text a client can read back
+                col("polqual", DataType.PG_NODE_TREE),
+                col("polwithcheck", DataType.PG_NODE_TREE),
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_policy", cols);

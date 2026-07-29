@@ -319,12 +319,16 @@ SELECT castcontext::text AS castcontext FROM pg_cast
 SELECT castmethod::text AS castmethod FROM pg_cast
  WHERE castsource = 114 AND casttarget = 3802;
 
--- A cast performed by a function names the function; a binary-coercible one has none.
+-- A cast performed by a function names the function; a binary-coercible one has none. The
+-- function is named rather than compared by OID: PostgreSQL's built-ins carry OIDs assigned at
+-- its own bootstrap, which memgres mints for itself and cannot reproduce.
 -- begin-expected
 -- columns: castfunc
--- row: 1740
+-- row: numeric
 -- end-expected
-SELECT castfunc::text AS castfunc FROM pg_cast WHERE castsource = 23 AND casttarget = 1700;
+SELECT p.proname AS castfunc FROM pg_cast c
+  JOIN pg_proc p ON p.oid = c.castfunc
+WHERE c.castsource = 23 AND c.casttarget = 1700;
 
 -- begin-expected
 -- columns: castfunc

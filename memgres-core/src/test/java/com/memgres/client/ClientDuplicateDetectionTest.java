@@ -136,10 +136,13 @@ class ClientDuplicateDetectionTest {
             }
             // Check for duplicate names with same kind (which a client might flag)
             // Note: pg_opclass ('c') and pg_opfamily ('F') have same-named entries for different AMs;
-            // pg_proc ('R','a') legitimately has overloaded function names
+            // pg_proc ('R','a') legitimately has overloaded function and aggregate names; and
+            // pg_operator ('O') is overloaded by operand types the same way — PostgreSQL declares
+            // !~ over text and over name, and = over sixty-odd type pairs.
             for (var entry : byName.entrySet()) {
                 if (entry.getValue().size() > 1 && !entry.getKey().endsWith(":c") && !entry.getKey().endsWith(":F")
-                        && !entry.getKey().endsWith(":R") && !entry.getKey().endsWith(":a")) {
+                        && !entry.getKey().endsWith(":R") && !entry.getKey().endsWith(":a")
+                        && !entry.getKey().endsWith(":O")) {
                     fail("Duplicate name+kind in " + schemaName + ": " + entry.getKey() + " -> OIDs " + entry.getValue());
                 }
             }

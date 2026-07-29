@@ -41,6 +41,53 @@ class CastEvaluator {
 
     private final AstExecutor executor;
 
+    /**
+     * The name PostgreSQL prints for a type OID, or null when nothing here carries that OID.
+     *
+     * <p>Derived from the same lists pg_type is built from rather than from a second table of
+     * names: a type that has a pg_type row but no name here renders as its OID, which is what
+     * made {@code castsource::regtype::text} answer "18" where PostgreSQL answers "char".
+     */
+    private String typeNameForOid(int oid) {
+        String known = OID_TO_TYPE.get(oid);
+        if (known != null) return known;
+        DataType dt = DataType.fromOid(oid);
+        if (dt != null) {
+            DataType elem = DataType.elementOf(dt);
+            return elem != null ? regtypeDisplay(elem) + "[]" : regtypeDisplay(dt);
+        }
+        int elemOid = CatalogCoreBuilder.arrayElementOid(oid);
+        if (elemOid != 0) {
+            String elemName = typeNameForOid(elemOid);
+            if (elemName != null) return elemName + "[]";
+        }
+        String builtin = PgInternalTypes.nameForOid(oid);
+        if (builtin != null) return builtin;
+        String other = CatalogCoreBuilder.otherTypeName(oid);
+        if (other != null) return other;
+        // A user type (enum, domain, composite) is named in the catalog's OID map.
+        String key = executor.systemCatalog.keyForOid(oid);
+        if (key != null && key.startsWith("type:")) return key.substring(5);
+        return null;
+    }
+
+    /** PostgreSQL spells its single-byte flag type with the quotes; everything else as itself. */
+    private static String regtypeDisplay(DataType dt) {
+        return dt == DataType.INTERNAL_CHAR ? "\"char\"" : dt.toRegtypeDisplay();
+    }
+
+    /**
+     * The function name an OID was handed out for, or null. Overloads are keyed with a suffix
+     * ({@code proc:max#agg3}); the name is what regproc prints, so the suffix is dropped.
+     */
+    private String procNameForOid(int oid) {
+        String key = executor.systemCatalog.keyForOid(oid);
+        if (key == null || !key.startsWith("proc:")) return null;
+        String name = key.substring(5);
+        int suffix = name.indexOf('#');
+        return suffix > 0 ? name.substring(0, suffix) : name;
+    }
+
     /** Maps PG OIDs to their canonical type names (used by ::regtype casts). */
     private static final Map<Integer, String> OID_TO_TYPE;
 
@@ -1003,8 +1050,17 @@ class CastEvaluator {
             }
             case "regproc":
             case "regprocedure": {
-                // ::regproc converts a function name to its OID (or just keeps it as a string for comparison)
-                if (val instanceof Number) return val;
+                // ::regproc converts a function name to its OID — and an OID back to the name.
+                // A catalog column holding a function reference is read as
+                // `oprcode::regproc::text`, and answering with the number is answering with
+                // what the reader already had.
+                if (val instanceof RegprocValue) return val;
+                if (val instanceof Number) {
+                    int procOidIn = ((Number) val).intValue();
+                    if (procOidIn == 0) return new RegprocValue(0, "-");
+                    String known = procNameForOid(procOidIn);
+                    return known != null ? new RegprocValue(procOidIn, known) : val;
+                }
                 String procName = val.toString();
                 // Strip schema prefix for comparison
                 if (procName.contains(".")) {
@@ -1054,17 +1110,7 @@ class CastEvaluator {
                 if (val instanceof RegtypeValue) return val;
                 if (val instanceof Number) {
                     int oid = ((Number) val).intValue();
-                    String name = OID_TO_TYPE.get(oid);
-                    if (name == null) {
-                        // M15: user types (enum/domain/composite) — resolve the type NAME
-                        // from the catalog OID map rather than printing the raw OID.
-                        for (Map.Entry<String, Integer> e : executor.systemCatalog.getOidMap().entrySet()) {
-                            if (e.getValue() == oid && e.getKey().startsWith("type:")) {
-                                name = e.getKey().substring(5);
-                                break;
-                            }
-                        }
-                    }
+                    String name = typeNameForOid(oid);
                     return new RegtypeValue(oid, name != null ? name : String.valueOf(oid));
                 }
                 String rtName = val.toString().trim().toLowerCase();
