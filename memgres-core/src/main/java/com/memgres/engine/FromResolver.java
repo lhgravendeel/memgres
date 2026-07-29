@@ -62,6 +62,88 @@ class FromResolver {
         return bindings;
     }
 
+    /**
+     * The columns a FROM item exposes, in order, when it produced no rows to read them from.
+     *
+     * <p>Every column of every relation, except where a USING or NATURAL join merged two of them
+     * into one — which also decides where in the list they sit. A join whose clause cannot be
+     * satisfied is described as though it had none: a query that answers with no rows still has
+     * to say what its columns are, and it is the executed join, not this, that refuses it.
+     *
+     * @param bindings the same item's bindings, which the returned columns index into
+     */
+    List<RowContext.OutCol> resolveItemOutput(SelectStmt.FromItem item,
+                                              List<RowContext.TableBinding> bindings) {
+        try {
+            Described described = describe(item);
+            return described.bindings.size() == bindings.size() ? described.output
+                    : RowContext.defaultOutput(bindings);
+        } catch (RuntimeException e) {
+            return RowContext.defaultOutput(bindings);
+        }
+    }
+
+    /** The columns a whole FROM clause exposes, its items placed side by side. */
+    List<RowContext.OutCol> resolveClauseOutput(List<SelectStmt.FromItem> fromItems,
+                                                List<RowContext.TableBinding> bindings) {
+        if (fromItems == null || fromItems.isEmpty()) return RowContext.defaultOutput(bindings);
+        List<RowContext.OutCol> out = new ArrayList<>();
+        int offset = 0;
+        try {
+            for (SelectStmt.FromItem item : fromItems) {
+                Described described = describe(item);
+                for (RowContext.OutCol oc : described.output) out.add(oc.shift(offset));
+                offset += described.bindings.size();
+            }
+        } catch (RuntimeException e) {
+            return RowContext.defaultOutput(bindings);
+        }
+        return offset == bindings.size() ? out : RowContext.defaultOutput(bindings);
+    }
+
+    /** A FROM item's relations and the columns it exposes over them, described together. */
+    private static final class Described {
+        final List<RowContext.TableBinding> bindings;
+        final List<RowContext.OutCol> output;
+
+        Described(List<RowContext.TableBinding> bindings, List<RowContext.OutCol> output) {
+            this.bindings = bindings;
+            this.output = output;
+        }
+    }
+
+    private Described describe(SelectStmt.FromItem item) {
+        if (!(item instanceof SelectStmt.JoinFrom)) {
+            List<RowContext.TableBinding> bindings = new ArrayList<>();
+            resolveTableBindingsFromItem(item, bindings);
+            return new Described(bindings, RowContext.defaultOutput(bindings));
+        }
+        SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
+        Described left = describe(jf.left());
+        Described right;
+        // A LATERAL item reads the names to its left, so describing it needs those names in
+        // scope even when they carry no row, exactly as resolveTableBindingsFromItem has it.
+        if (jf.right() instanceof SelectStmt.SubqueryFrom
+                && ((SelectStmt.SubqueryFrom) jf.right()).lateral()) {
+            executor.outerContextStack.push(new RowContext(new ArrayList<>(left.bindings)));
+            try {
+                right = describe(jf.right());
+            } finally {
+                executor.outerContextStack.pop();
+            }
+        } else {
+            right = describe(jf.right());
+        }
+        List<RowContext.TableBinding> bindings = new ArrayList<>(left.bindings);
+        bindings.addAll(right.bindings);
+        List<String> using = jf.using();
+        if (FromJoinExecutor.isNatural(jf.joinType())) {
+            using = FromJoinExecutor.naturalNames(left.output, right.output);
+        }
+        return new Described(bindings, FromJoinExecutor.shapeOfJoin(
+                left.output, left.bindings.size(), right.output, using).output);
+    }
+
     private void resolveTableBindingsFromItem(SelectStmt.FromItem item, List<RowContext.TableBinding> bindings) {
         if (item instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef tableRef = (SelectStmt.TableRef) item;
@@ -113,7 +195,6 @@ class FromResolver {
         } else if (item instanceof SelectStmt.JoinFrom) {
             SelectStmt.JoinFrom joinFrom = (SelectStmt.JoinFrom) item;
             resolveTableBindingsFromItem(joinFrom.left(), bindings);
-            int beforeRight = bindings.size();
             // A LATERAL item reads the names to its left, so describing it needs those names in
             // scope even when they carry no row — otherwise the describe fails and the lateral
             // alias goes missing from a query that answers with no rows at all.
@@ -129,36 +210,9 @@ class FromResolver {
             } else {
                 resolveTableBindingsFromItem(joinFrom.right(), bindings);
             }
-            // Apply USING column dedup for SELECT * / RowDescription
-            if (joinFrom.using() != null && !joinFrom.using().isEmpty()) {
-                Set<String> usingLower = new HashSet<>();
-                for (String col : joinFrom.using()) usingLower.add(col.toLowerCase());
-                for (int bi = beforeRight; bi < bindings.size(); bi++) {
-                    RowContext.TableBinding b = bindings.get(bi);
-                    List<Column> origCols = b.table().getColumns();
-                    List<Integer> indicesToRemove = new ArrayList<>();
-                    for (int ci = 0; ci < origCols.size(); ci++) {
-                        if (usingLower.contains(origCols.get(ci).getName().toLowerCase())) {
-                            indicesToRemove.add(ci);
-                        }
-                    }
-                    if (!indicesToRemove.isEmpty()) {
-                        Set<Integer> removeSet = new HashSet<>(indicesToRemove);
-                        List<Column> newCols = new ArrayList<>();
-                        for (int ci = 0; ci < origCols.size(); ci++) {
-                            if (!removeSet.contains(ci)) newCols.add(origCols.get(ci));
-                        }
-                        if (!newCols.isEmpty()) {
-                            bindings.set(bi, new RowContext.TableBinding(
-                                    new Table(b.table().getName(), newCols), b.alias(),
-                                    new Object[newCols.size()]));
-                        } else {
-                            bindings.remove(bi);
-                            bi--;
-                        }
-                    }
-                }
-            }
+            // A USING or NATURAL join still names both relations and both keep all their columns;
+            // what changes is which of them the join exposes, and that is the output shape's
+            // business (see resolveItemOutput), not the bindings'.
         } else if (item instanceof SelectStmt.SubqueryFrom) {
             SelectStmt.SubqueryFrom subqFrom = (SelectStmt.SubqueryFrom) item;
             if (subqFrom.alias() != null) {

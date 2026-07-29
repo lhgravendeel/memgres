@@ -59,7 +59,69 @@ public class RowContext {
         }
     }
 
+    /**
+     * One column of what a FROM item exposes: a name and the binding columns it is read from.
+     *
+     * <p>Nearly every output column is one binding's column. A join written with USING or NATURAL
+     * merges the column named on its left with the one on its right into a single output column
+     * whose value is whichever of them is not null, and that is the only reason an output column
+     * ever has more than one source. Chaining such joins keeps merging: the left of the second
+     * {@code USING (id)} is the first join's already-merged {@code id}, so the second merge holds
+     * three sources and the whole chain still exposes one {@code id}.
+     */
+    public static final class OutCol {
+        public final String name;
+        /** Binding indices to read, in the order the value falls back through them. */
+        public final int[] bindings;
+        /** The column index within each of those bindings. */
+        public final int[] columns;
+
+        public OutCol(String name, int[] bindings, int[] columns) {
+            this.name = name;
+            this.bindings = bindings;
+            this.columns = columns;
+        }
+
+        public OutCol(String name, int binding, int column) {
+            this(name, new int[]{binding}, new int[]{column});
+        }
+
+        /** True when a USING or NATURAL join folded several relations' columns into this one. */
+        public boolean merged() { return bindings.length > 1; }
+
+        /** The same column read from a binding list this one has been appended to. */
+        public OutCol shift(int delta) {
+            if (delta == 0) return this;
+            int[] b = new int[bindings.length];
+            for (int i = 0; i < b.length; i++) b[i] = bindings[i] + delta;
+            return new OutCol(name, b, columns);
+        }
+
+        /** The value this column takes in a row: the first source that is not null. */
+        public Object valueIn(List<TableBinding> row) {
+            for (int i = 0; i < bindings.length; i++) {
+                if (bindings[i] >= row.size()) continue;
+                Object[] r = row.get(bindings[i]).row();
+                if (columns[i] >= r.length) continue;
+                Object v = r[columns[i]];
+                if (v != null) return v;
+            }
+            return null;
+        }
+
+        @Override
+        public String toString() {
+            return "OutCol[" + name + " " + java.util.Arrays.toString(bindings)
+                    + java.util.Arrays.toString(columns) + "]";
+        }
+    }
+
     private final List<TableBinding> bindings;
+    /**
+     * The columns this row exposes, in order, when a join merged some of them; null when the
+     * answer is simply every binding's columns in order. See {@link OutCol}.
+     */
+    private List<OutCol> outputColumns;
     /** True when this row was produced by a LEFT/RIGHT/FULL JOIN with no match on the outer side. */
     private boolean outerJoinNullPadded;
     /** Column names from USING clauses. These exist in multiple bindings but should not raise ambiguity. */
@@ -141,6 +203,32 @@ public class RowContext {
         this.outerJoinNullPadded = outerJoinNullPadded;
     }
 
+    /** The columns this row exposes, in order, or null when that is simply all of them. */
+    public List<OutCol> getOutputColumns() {
+        return outputColumns;
+    }
+
+    public void setOutputColumns(List<OutCol> outputColumns) {
+        this.outputColumns = outputColumns;
+    }
+
+    /** The columns this row exposes, filled in when no join has changed them. */
+    public List<OutCol> outputColumnsOrDefault() {
+        return outputColumns != null ? outputColumns : defaultOutput(bindings);
+    }
+
+    /** What a list of bindings exposes when no join merged anything: every column, in order. */
+    public static List<OutCol> defaultOutput(List<TableBinding> bindings) {
+        List<OutCol> out = new ArrayList<>();
+        for (int bi = 0; bi < bindings.size(); bi++) {
+            List<Column> cols = bindings.get(bi).table().getColumns();
+            for (int ci = 0; ci < cols.size(); ci++) {
+                out.add(new OutCol(cols.get(ci).getName(), bi, ci));
+            }
+        }
+        return out;
+    }
+
     public Set<String> getUsingColumns() {
         return usingColumns;
     }
@@ -162,6 +250,7 @@ public class RowContext {
         RowContext copy = new RowContext(bindings);
         copy.outerJoinNullPadded = outerJoinNullPadded;
         copy.usingColumns = usingColumns;
+        copy.outputColumns = outputColumns;
         copy.columnAliases = columnAliases;
         if (boundValues != null) {
             copy.boundValues = new java.util.IdentityHashMap<>(boundValues);
@@ -228,6 +317,24 @@ public class RowContext {
                 throw ex;
             }
             return b.row()[idx];
+        }
+
+        // Unqualified. When a join merged columns, what the name may resolve to is the join's
+        // output rather than the relations behind it: one merged column however many relations
+        // fed it, and still ambiguous when two output columns answer to the name.
+        if (outputColumns != null) {
+            OutCol hit = null;
+            int matches = 0;
+            for (OutCol oc : outputColumns) {
+                if (oc.name.equalsIgnoreCase(columnName)) {
+                    matches++;
+                    if (hit == null) hit = oc;
+                }
+            }
+            if (matches > 1) {
+                throw new MemgresException("column reference \"" + columnName + "\" is ambiguous", "42702");
+            }
+            if (matches == 1) return hit.valueIn(bindings);
         }
 
         // Unqualified, search all bindings
@@ -375,6 +482,13 @@ public class RowContext {
             return idx >= 0 ? b.table().getColumns().get(idx) : null;
         }
 
+        if (outputColumns != null) {
+            for (OutCol oc : outputColumns) {
+                if (oc.name.equalsIgnoreCase(columnName) && oc.bindings[0] < bindings.size()) {
+                    return bindings.get(oc.bindings[0]).table().getColumns().get(oc.columns[0]);
+                }
+            }
+        }
         for (TableBinding b : bindings) {
             int idx = b.table().getColumnIndex(columnName);
             if (idx >= 0) {
@@ -405,7 +519,20 @@ public class RowContext {
         RowContext result = new RowContext(merged);
         // Preserve view-column aliasing from either side (only the view side carries it).
         result.columnAliases = this.columnAliases != null ? this.columnAliases : other.columnAliases;
+        result.outputColumns = concatOutput(this, other);
         return result;
+    }
+
+    /**
+     * The columns two sides put side by side expose together, kept only when one of them has
+     * something to say — a plain pairing of relations is described well enough by its bindings.
+     */
+    public static List<OutCol> concatOutput(RowContext left, RowContext right) {
+        if (left.outputColumns == null && right.outputColumns == null) return null;
+        List<OutCol> out = new ArrayList<>(left.outputColumnsOrDefault());
+        int offset = left.bindings.size();
+        for (OutCol oc : right.outputColumnsOrDefault()) out.add(oc.shift(offset));
+        return out;
     }
 
     /**
