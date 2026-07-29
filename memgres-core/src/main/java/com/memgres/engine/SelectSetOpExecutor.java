@@ -234,6 +234,7 @@ class SelectSetOpExecutor {
             }
         }
 
+        final List<Column> orderColumns = columns;
         // ORDER BY on set operation result
         validateOrderBy(stmt, columns);
         if (stmt.orderBy() != null && !stmt.orderBy().isEmpty()) {
@@ -283,11 +284,52 @@ class SelectSetOpExecutor {
         if (stmt.limit() != null) {
             long lim = select.limitOffsetValue(stmt.limit(), true);
             if (lim >= 0 && lim < resultRows.size()) {
-                resultRows = new ArrayList<>(resultRows.subList(0, (int) lim));
+                int end = (int) lim;
+                // WITH TIES keeps going past the count for as long as the rows are equal to the
+                // last one under the ORDER BY — cutting there would answer with an arbitrary one
+                // of a group the query said was indistinguishable.
+                if (stmt.withTies() && stmt.orderBy() != null && !stmt.orderBy().isEmpty()
+                        && end > 0) {
+                    int[] keys = new int[stmt.orderBy().size()];
+                    for (int i = 0; i < keys.length; i++) {
+                        keys[i] = orderByColumnIndex(stmt.orderBy().get(i), orderColumns);
+                    }
+                    Object[] last = resultRows.get(end - 1);
+                    while (end < resultRows.size()
+                            && tiedWith(last, resultRows.get(end), keys)) {
+                        end++;
+                    }
+                }
+                resultRows = new ArrayList<>(resultRows.subList(0, end));
             }
         }
 
         return QueryResult.select(columns, resultRows);
+    }
+
+    /** The output column an ORDER BY item names, by position or by name, or -1. */
+    private static int orderByColumnIndex(SelectStmt.OrderByItem item, List<Column> columns) {
+        Expression expr = item.expr();
+        if (expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.INTEGER) {
+            return Integer.parseInt(((Literal) expr).value()) - 1;
+        }
+        if (expr instanceof ColumnRef && ((ColumnRef) expr).table() == null) {
+            String want = ((ColumnRef) expr).column();
+            for (int i = 0; i < columns.size(); i++) {
+                if (columns.get(i).getName().equalsIgnoreCase(want)) return i;
+            }
+        }
+        return -1;
+    }
+
+    /** True when two rows carry the same values in every ORDER BY key. */
+    private static boolean tiedWith(Object[] a, Object[] b, int[] keys) {
+        for (int key : keys) {
+            if (key < 0 || key >= a.length || key >= b.length) continue;
+            if (!java.util.Objects.deepEquals(a[key], b[key])) return false;
+        }
+        return true;
     }
 
     /**

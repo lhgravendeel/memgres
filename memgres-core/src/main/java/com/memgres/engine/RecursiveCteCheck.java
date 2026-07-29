@@ -2,6 +2,10 @@ package com.memgres.engine;
 
 import com.memgres.engine.parser.ast.CastExpr;
 import com.memgres.engine.parser.ast.Expression;
+import com.memgres.engine.parser.ast.Literal;
+import com.memgres.engine.parser.ast.BinaryExpr;
+import com.memgres.engine.parser.ast.CaseExpr;
+import com.memgres.engine.parser.ast.FunctionCallExpr;
 import com.memgres.engine.parser.ast.SelectStmt;
 import com.memgres.engine.parser.ast.SetOpStmt;
 import com.memgres.engine.parser.ast.Statement;
@@ -34,12 +38,12 @@ import java.util.Set;
  * WHERE, GROUP BY, DISTINCT, a window function, or an aggregate in the <em>non</em>-recursive
  * term — is left alone.
  */
-final class RecursiveCteCheck {
+public final class RecursiveCteCheck {
 
     private RecursiveCteCheck() { }
 
     /** True when a WITH item's body names the item itself, so it really does recurse. */
-    static boolean selfReferencing(SelectStmt.CommonTableExpr cte) {
+    public static boolean selfReferencing(SelectStmt.CommonTableExpr cte) {
         return !selfReferences(cte.query(), cte.name()).isEmpty();
     }
 
@@ -67,17 +71,28 @@ final class RecursiveCteCheck {
 
         List<Boolean> refs = selfReferences(setOp.right(), name);
         if (refs.isEmpty()) return;
-        if (refs.size() > 1) {
+
+        // Where the reference sits is decided before how many there are: PostgreSQL names the
+        // context of the offending reference — INTERSECT, EXCEPT, a sub-select, an outer join —
+        // and only says "more than once" when every one of them was in a place that allows one.
+        String setOpContext = refUnderNonUnionSetOp(setOp.right(), name);
+        if (setOpContext != null) {
             throw new MemgresException("recursive reference to query \"" + name
-                    + "\" must not appear more than once", "42P19");
+                    + "\" must not appear within " + setOpContext, "42P19");
         }
-        if (refs.get(0)) {
-            throw new MemgresException("recursive reference to query \"" + name
-                    + "\" must not appear within a subquery", "42P19");
+        for (Boolean viaExpr : refs) {
+            if (viaExpr) {
+                throw new MemgresException("recursive reference to query \"" + name
+                        + "\" must not appear within a subquery", "42P19");
+            }
         }
         if (refUnderOuterJoin(setOp.right(), name)) {
             throw new MemgresException("recursive reference to query \"" + name
                     + "\" must not appear within an outer join", "42P19");
+        }
+        if (refs.size() > 1) {
+            throw new MemgresException("recursive reference to query \"" + name
+                    + "\" must not appear more than once", "42P19");
         }
 
         // Clauses PG has not implemented for a recursive query. These sit on the set operation
@@ -108,29 +123,194 @@ final class RecursiveCteCheck {
     }
 
     /**
-     * The column types the two terms agree on must be the non-recursive term's own types: PG
-     * resolves the union's output type from both arms and then insists the seed already had it.
-     * Only an explicit cast in the recursive term is read here, because that is the one spelling
-     * that states a different type outright.
+     * The union's output type has to be the type the non-recursive term already had.
+     *
+     * <p>PostgreSQL resolves one output type per column from both arms and then insists the seed
+     * carried it, because the seed's rows are the ones already in the result when the recursive
+     * term first runs — there is nothing left to re-type them. So a recursive term that widens a
+     * column (integer to bigint, integer to numeric, date to timestamp) is refused, while one
+     * that narrows into the seed's own type is fine, and two arms with no common type at all are
+     * refused earlier and differently.
+     *
+     * <p>The recursive term's types are read off the rows its first iteration actually produced;
+     * an expression's declared type is what the engine computed for it, which is the same thing
+     * the union would resolve against. A seed column written as a bare NULL has no type of its
+     * own, so the recursive term's type is the union's and the mismatch is reported against the
+     * text PostgreSQL falls back to.
      */
-    static void checkColumnTypes(String cteName, List<Column> baseColumns, Statement recursiveTerm) {
-        if (!(recursiveTerm instanceof SelectStmt)) return;
-        List<SelectStmt.SelectTarget> targets = ((SelectStmt) recursiveTerm).targets();
-        if (targets == null) return;
-        int n = Math.min(baseColumns.size(), targets.size());
+    static void checkColumnTypes(String cteName, List<Column> baseColumns, Statement baseTerm,
+                                 Statement recTerm, List<Column> recursiveColumns) {
+        int n = Math.min(baseColumns.size(), recursiveColumns.size());
         for (int i = 0; i < n; i++) {
-            DataType baseType = baseColumns.get(i).getType();
-            int baseRank = numericRank(baseType);
-            if (baseRank == 0) continue;
-            Expression expr = targets.get(i).expr();
-            if (!(expr instanceof CastExpr)) continue;
-            String castName = ((CastExpr) expr).typeName();
-            int castRank = numericRank(castName);
-            if (castRank > baseRank) {
-                throw new MemgresException("recursive query \"" + cteName + "\" column " + (i + 1)
-                        + " has type " + displayName(baseType) + " in non-recursive term but type "
-                        + displayName(castRank) + " overall", "42804");
+            DataType recType = recursiveColumns.get(i).getType();
+            boolean baseUntyped = isUntypedNull(baseTerm, i);
+            DataType baseType = baseUntyped ? DataType.TEXT : baseColumns.get(i).getType();
+            if (baseType == null || recType == null) continue;
+            int baseFamily = baseUntyped ? family(recType) : family(baseType);
+            int recFamily = family(recType);
+            if (baseFamily == FAMILY_NONE || recFamily == FAMILY_NONE) continue;
+
+            if (baseFamily == recFamily) {
+                // The character types are not a widening ladder: PostgreSQL runs a varchar seed
+                // with a text recursive term and answers in varchar, and the only complaints it
+                // makes here are about length modifiers this engine does not carry. Nothing to
+                // show, so nothing refused.
+                if (recFamily == FAMILY_TEXT) continue;
+                int baseRank = baseUntyped ? 0 : rank(baseType);
+                int recRank = Math.max(rank(recType), castRankInValuePosition(recTerm, i, recFamily));
+                if (recRank > baseRank) {
+                    throw widened(cteName, i, baseType, widestOf(recFamily, recRank));
+                }
+                continue;
             }
+            // Different families have no common type at all — but only say so where the text
+            // side was cast to text outright. An unadorned string literal is of no type yet:
+            // PostgreSQL reads it as the other arm's type, so 'x' against an integer column is
+            // bad input rather than an unmatched union, and '5' is simply the number five.
+            if (statedAsText(baseFamily == FAMILY_TEXT ? baseTerm : recTerm, i)) {
+                throw new MemgresException("UNION types " + displayName(baseType) + " and "
+                        + displayName(recType) + " cannot be matched", "42804");
+            }
+        }
+    }
+
+    private static MemgresException widened(String cteName, int col, DataType base, DataType rec) {
+        MemgresException ex = new MemgresException("recursive query \"" + cteName + "\" column "
+                + (col + 1) + " has type " + displayName(base) + " in non-recursive term but type "
+                + displayName(rec) + " overall", "42804");
+        ex.setHint("Cast the output of the non-recursive term to the correct type.");
+        return ex;
+    }
+
+    /**
+     * The widest rank an explicit cast reaches in a value position of the i'th target.
+     *
+     * <p>The engine computes COALESCE and CASE as the type of the branch it took, so a wider
+     * branch it did not take this iteration is invisible in the result — but PostgreSQL resolves
+     * those from every branch at once. Only positions whose type reaches the result are read: a
+     * CASE's WHEN condition and a comparison's operands decide nothing about the value's type,
+     * and reading them would refuse queries PostgreSQL runs.
+     */
+    private static int castRankInValuePosition(Statement recTerm, int i, int wantedFamily) {
+        return valueCastRank(targetOf(recTerm, i), wantedFamily);
+    }
+
+    private static int valueCastRank(Expression expr, int wantedFamily) {
+        if (expr == null) return 0;
+        if (expr instanceof CastExpr) {
+            DataType cast = DataType.fromPgName(((CastExpr) expr).typeName());
+            return family(cast) == wantedFamily ? rank(cast) : 0;
+        }
+        int widest = 0;
+        if (expr instanceof CaseExpr) {
+            CaseExpr c = (CaseExpr) expr;
+            if (c.whenClauses() != null) {
+                for (CaseExpr.WhenClause when : c.whenClauses()) {
+                    widest = Math.max(widest, valueCastRank(when.result(), wantedFamily));
+                }
+            }
+            widest = Math.max(widest, valueCastRank(c.elseExpr(), wantedFamily));
+            return widest;
+        }
+        if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr call = (FunctionCallExpr) expr;
+            String fn = call.name() == null ? "" : call.name().toLowerCase();
+            // Only the functions whose result is one of their arguments carry an argument's type.
+            if (!fn.equals("coalesce") && !fn.equals("nullif") && !fn.equals("greatest")
+                    && !fn.equals("least")) return 0;
+            if (call.args() != null) {
+                for (Expression arg : call.args()) {
+                    widest = Math.max(widest, valueCastRank(arg, wantedFamily));
+                }
+            }
+            return widest;
+        }
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            switch (bin.op()) {
+                case ADD: case SUBTRACT: case MULTIPLY: case DIVIDE: case MODULO:
+                    return Math.max(valueCastRank(bin.left(), wantedFamily),
+                            valueCastRank(bin.right(), wantedFamily));
+                default:
+                    return 0;
+            }
+        }
+        return 0;
+    }
+
+    /** The type at a given rank within a family, for the message. */
+    private static DataType widestOf(int family, int rank) {
+        if (family == FAMILY_NUMBER) {
+            switch (rank) {
+                case 1: return DataType.SMALLINT;
+                case 2: return DataType.INTEGER;
+                case 3: return DataType.BIGINT;
+                case 4: return DataType.NUMERIC;
+                case 5: return DataType.REAL;
+                default: return DataType.DOUBLE_PRECISION;
+            }
+        }
+        if (family == FAMILY_DATETIME) {
+            return rank <= 1 ? DataType.DATE : rank == 2 ? DataType.TIMESTAMP : DataType.TIMESTAMPTZ;
+        }
+        return rank <= 1 ? DataType.CHAR : rank == 2 ? DataType.VARCHAR : DataType.TEXT;
+    }
+
+    /** The i'th target of a plain SELECT term, or null when the term is not one. */
+    private static Expression targetOf(Statement term, int i) {
+        if (!(term instanceof SelectStmt)) return null;
+        List<SelectStmt.SelectTarget> targets = ((SelectStmt) term).targets();
+        if (targets == null || i >= targets.size()) return null;
+        return targets.get(i).expr();
+    }
+
+    /** True when the seed wrote a bare NULL, which carries no type of its own. */
+    private static boolean isUntypedNull(Statement term, int i) {
+        Expression expr = targetOf(term, i);
+        return expr instanceof Literal && ((Literal) expr).literalType() == Literal.LiteralType.NULL;
+    }
+
+    /** True when a term said "text" outright — an explicit cast, not a literal of no type yet. */
+    private static boolean statedAsText(Statement term, int i) {
+        Expression expr = targetOf(term, i);
+        return expr instanceof CastExpr
+                && family(DataType.fromPgName(((CastExpr) expr).typeName())) == FAMILY_TEXT;
+    }
+
+    private static final int FAMILY_NONE = 0;
+    private static final int FAMILY_NUMBER = 1;
+    private static final int FAMILY_TEXT = 2;
+    private static final int FAMILY_DATETIME = 3;
+
+    private static int family(DataType t) {
+        if (t == null) return FAMILY_NONE;
+        switch (t) {
+            case SMALLINT: case SMALLSERIAL: case INTEGER: case SERIAL:
+            case BIGINT: case BIGSERIAL: case NUMERIC: case REAL: case DOUBLE_PRECISION:
+                return FAMILY_NUMBER;
+            case TEXT: case VARCHAR: case CHAR: case NAME:
+                return FAMILY_TEXT;
+            case DATE: case TIMESTAMP: case TIMESTAMPTZ:
+                return FAMILY_DATETIME;
+            default:
+                return FAMILY_NONE;
+        }
+    }
+
+    /** How wide a type is within its family; a wider recursive term than seed is the error. */
+    private static int rank(DataType t) {
+        if (t == null) return 0;
+        switch (t) {
+            case SMALLINT: case SMALLSERIAL: return 1;
+            case INTEGER: case SERIAL: return 2;
+            case BIGINT: case BIGSERIAL: return 3;
+            case NUMERIC: return 4;
+            case REAL: return 5;
+            case DOUBLE_PRECISION: return 6;
+            case DATE: return 1;
+            case TIMESTAMP: return 2;
+            case TIMESTAMPTZ: return 3;
+            default: return 0;
         }
     }
 
@@ -164,6 +344,9 @@ final class RecursiveCteCheck {
             }
             if (cur instanceof String || cur instanceof Number || cur instanceof Boolean
                     || cur instanceof Character || cur instanceof Enum) continue;
+            // A query that declares a WITH item of this name means that item everywhere below,
+            // not the one being defined; nothing under it is a self-reference.
+            if (cur instanceof SelectStmt && declaresWithItem((SelectStmt) cur, lcName)) continue;
             // Once inside an expression, everything below it is inside a sub-select of that
             // expression — the FROM-clause subqueries PG allows are reached through FromItems.
             boolean childInExpr = inExpr || cur instanceof Expression;
@@ -188,6 +371,32 @@ final class RecursiveCteCheck {
             }
         }
         return found;
+    }
+
+    /**
+     * The name of the set operation the self-reference sits inside, or null.
+     *
+     * <p>The iteration can supply the rows the previous round produced and nothing else, so a set
+     * operation that has to subtract from or intersect with the whole result — every one but the
+     * UNION that defines the recursion — has no meaning over a self-reference.
+     */
+    private static String refUnderNonUnionSetOp(Object node, String name) {
+        for (Object stmt : collect(node, SetOpStmt.class)) {
+            SetOpStmt sop = (SetOpStmt) stmt;
+            if (sop.op() == SetOpStmt.SetOpType.UNION) continue;
+            if (selfReferences(sop, name).isEmpty()) continue;
+            return sop.op() == SetOpStmt.SetOpType.EXCEPT ? "EXCEPT" : "INTERSECT";
+        }
+        return null;
+    }
+
+    /** True when a query's own WITH clause claims the name, shadowing an enclosing one. */
+    private static boolean declaresWithItem(SelectStmt stmt, String lcName) {
+        if (stmt.withClauses() == null) return false;
+        for (SelectStmt.CommonTableExpr item : stmt.withClauses()) {
+            if (item.name() != null && item.name().toLowerCase().equals(lcName)) return true;
+        }
+        return false;
     }
 
     /** True when the self-reference sits on a side of a join that the join may null-extend. */
@@ -269,48 +478,25 @@ final class RecursiveCteCheck {
         return false;
     }
 
-    // ---- numeric widening ----
-
-    private static int numericRank(DataType type) {
-        if (type == null) return 0;
-        switch (type) {
-            case SMALLINT: case SMALLSERIAL: return 1;
-            case INTEGER: case SERIAL: return 2;
-            case BIGINT: case BIGSERIAL: return 3;
-            case NUMERIC: return 4;
-            case REAL: return 5;
-            case DOUBLE_PRECISION: return 6;
-            default: return 0;
-        }
-    }
-
-    private static int numericRank(String typeName) {
-        if (typeName == null) return 0;
-        String t = typeName.trim().toLowerCase();
-        int paren = t.indexOf('(');
-        if (paren >= 0) t = t.substring(0, paren).trim();
-        if (t.equals("smallint") || t.equals("int2")) return 1;
-        if (t.equals("integer") || t.equals("int") || t.equals("int4")) return 2;
-        if (t.equals("bigint") || t.equals("int8")) return 3;
-        if (t.equals("numeric") || t.equals("decimal")) return 4;
-        if (t.equals("real") || t.equals("float4")) return 5;
-        if (t.equals("double precision") || t.equals("float8")) return 6;
-        return 0;
-    }
-
+    /** The name PostgreSQL prints for a type in a UNION or recursive-query complaint. */
     private static String displayName(DataType type) {
-        return displayName(numericRank(type));
-    }
-
-    private static String displayName(int rank) {
-        switch (rank) {
-            case 1: return "smallint";
-            case 2: return "integer";
-            case 3: return "bigint";
-            case 4: return "numeric";
-            case 5: return "real";
-            case 6: return "double precision";
-            default: return "unknown";
+        if (type == null) return "unknown";
+        switch (type) {
+            case SMALLINT: case SMALLSERIAL: return "smallint";
+            case INTEGER: case SERIAL: return "integer";
+            case BIGINT: case BIGSERIAL: return "bigint";
+            case NUMERIC: return "numeric";
+            case REAL: return "real";
+            case DOUBLE_PRECISION: return "double precision";
+            case TEXT: return "text";
+            case VARCHAR: return "character varying";
+            case CHAR: return "character";
+            case NAME: return "name";
+            case DATE: return "date";
+            case TIMESTAMP: return "timestamp without time zone";
+            case TIMESTAMPTZ: return "timestamp with time zone";
+            case BOOLEAN: return "boolean";
+            default: return type.getPgName();
         }
     }
 }

@@ -2935,7 +2935,9 @@ class ExprEvaluator {
                 case INTEGER:
                     return DataType.INTEGER;
                 case FLOAT:
-                    return lit.value().contains("e") || lit.value().contains("E") ? DataType.DOUBLE_PRECISION : DataType.NUMERIC;
+                    // A written constant is numeric whether or not it carries an exponent —
+                    // 1.0e0 is the same numeric one as 1.0, and only a cast makes it float8.
+                    return DataType.NUMERIC;
                 case STRING:
                     return DataType.TEXT;
                 case BOOLEAN:

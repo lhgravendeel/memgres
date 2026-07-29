@@ -14,6 +14,8 @@ public final class SetOpStmt implements Statement {
     public final List<SelectStmt.OrderByItem> orderBy;
     public final Expression limit;
     public final Expression offset;
+    /** FETCH ... WITH TIES: the limit keeps every row tied with the last one by ORDER BY. */
+    public final boolean withTies;
 
     public SetOpStmt(
             Statement left,
@@ -24,6 +26,20 @@ public final class SetOpStmt implements Statement {
             Expression limit,
             Expression offset
     ) {
+        this(left, op, all, right, orderBy, limit, offset, false);
+    }
+
+    public SetOpStmt(
+            Statement left,
+            SetOpType op,
+            boolean all,
+            Statement right,
+            List<SelectStmt.OrderByItem> orderBy,
+            Expression limit,
+            Expression offset,
+            boolean withTies
+    ) {
+        this.withTies = withTies;
         this.left = left;
         this.op = op;
         this.all = all;
@@ -44,6 +60,7 @@ public final class SetOpStmt implements Statement {
     public List<SelectStmt.OrderByItem> orderBy() { return orderBy; }
     public Expression limit() { return limit; }
     public Expression offset() { return offset; }
+    public boolean withTies() { return withTies; }
 
     @Override
     public boolean equals(Object o) {

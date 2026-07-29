@@ -329,7 +329,7 @@ class FromResolver {
             String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
             String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
             // Check CTEs first
-            SelectStmt.CommonTableExpr cte = executor.selectExecutor.lookupCte(tableRef.table());
+            SelectStmt.CommonTableExpr cte = lookupCteFor(tableRef);
             if (cte != null) {
                 QueryResult cteResult = executor.selectExecutor.executeCte(cte);
                 Table virtualTable = new Table(alias, cteResult.getColumns());
@@ -671,12 +671,49 @@ class FromResolver {
         throw new IllegalArgumentException("Unknown FromItem type: " + fromItem.getClass().getSimpleName());
     }
 
+    /**
+     * The WITH item a FROM reference names, or null.
+     *
+     * <p>A WITH item lives in no schema, so a schema-qualified name can never reach one: it is
+     * always the stored relation of that name, and "does not exist" when there is none.
+     */
+    private SelectStmt.CommonTableExpr lookupCteFor(SelectStmt.TableRef tableRef) {
+        if (tableRef.schema() != null) return null;
+        return executor.selectExecutor.lookupCte(tableRef.table());
+    }
+
+    /**
+     * The columns a FROM item's alias list renames, as far as the list reaches.
+     *
+     * <p>{@code t AS z(m)} calls the relation's first column m and leaves the rest alone; naming
+     * more columns than the relation has is an error PostgreSQL raises before reading a row.
+     */
+    private static List<Column> renameColumns(String alias, List<Column> columns,
+                                              List<String> aliases) {
+        if (aliases == null || aliases.isEmpty()) return columns;
+        if (aliases.size() > columns.size()) {
+            throw new MemgresException("table \"" + alias + "\" has " + columns.size()
+                    + " columns available but " + aliases.size() + " columns specified", "42P10");
+        }
+        List<Column> renamed = new ArrayList<>();
+        for (int i = 0; i < columns.size(); i++) {
+            Column c = columns.get(i);
+            renamed.add(i < aliases.size()
+                    ? new Column(aliases.get(i), c.getType(), c.isNullable(), c.isPrimaryKey(),
+                            c.getDefaultValue(), c.getEnumTypeName(), c.getPrecision(), c.getScale(),
+                            null, c.getDomainTypeName(), c.getCompositeTypeName(),
+                            c.getArrayElementType())
+                    : c);
+        }
+        return renamed;
+    }
+
     private List<RowContext> resolveTableRef(SelectStmt.TableRef tableRef) {
         // Check CTEs first
-        SelectStmt.CommonTableExpr cte = executor.selectExecutor.lookupCte(tableRef.table());
+        SelectStmt.CommonTableExpr cte = lookupCteFor(tableRef);
         if (cte != null) {
-            String cteAlias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
-            QualScope cteScope = enterNestedQuery(cte.query(), cteAlias, cte.columnNames(),
+            String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+            QualScope cteScope = enterNestedQuery(cte.query(), alias, cte.columnNames(),
                     !cte.recursive() && isInlinableSubquery(cte.query()));
             QueryResult cteResult;
             try {
@@ -684,8 +721,8 @@ class FromResolver {
             } finally {
                 leaveNestedQuery(cteScope);
             }
-            String alias = cteAlias;
-            Table virtualTable = new Table(alias, cteResult.getColumns());
+            Table virtualTable = new Table(alias,
+                    renameColumns(alias, cteResult.getColumns(), tableRef.columnAliases()));
             lastResolvedRightTable = virtualTable;
             lastResolvedRightAlias = alias;
             for (Object[] row : cteResult.getRows()) {
@@ -796,6 +833,14 @@ class FromResolver {
                     "AccessShareLock", executor.session, false);
         }
         String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+        // An alias list renames the columns the query will see. The rows are the stored table's
+        // own, so only the description in front of them is rebuilt.
+        if (tableRef.columnAliases() != null && !tableRef.columnAliases().isEmpty()) {
+            Table renamed = new Table(alias,
+                    renameColumns(alias, table.getColumns(), tableRef.columnAliases()));
+            for (Object[] row : table.getAllRows()) renamed.insertRow(row);
+            table = renamed;
+        }
         lastResolvedRightTable = table;
         lastResolvedRightAlias = alias;
 

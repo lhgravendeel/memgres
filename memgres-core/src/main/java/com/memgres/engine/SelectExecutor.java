@@ -975,6 +975,18 @@ class SelectExecutor {
     long limitOffsetValue(Expression expr, boolean isLimit) {
         Object raw = executor.evalExpr(expr, null);
         if (raw == null) return -1; // NULL means "no limit", as in PG
+        // LIMIT and OFFSET are bigint. A literal past that range is out of range, not a negative
+        // count — the sign it appears to have is only what the wrap left behind.
+        if (raw instanceof java.math.BigInteger
+                || (raw instanceof java.math.BigDecimal
+                    && ((java.math.BigDecimal) raw).compareTo(BIGINT_MAX) > 0)) {
+            java.math.BigDecimal big = raw instanceof java.math.BigInteger
+                    ? new java.math.BigDecimal((java.math.BigInteger) raw)
+                    : (java.math.BigDecimal) raw;
+            if (big.compareTo(BIGINT_MAX) > 0 || big.compareTo(BIGINT_MIN) < 0) {
+                throw new MemgresException("bigint out of range", "22003");
+            }
+        }
         long value;
         try {
             value = raw instanceof java.math.BigDecimal
@@ -992,6 +1004,11 @@ class SelectExecutor {
         }
         return value;
     }
+
+    private static final java.math.BigDecimal BIGINT_MAX =
+            java.math.BigDecimal.valueOf(Long.MAX_VALUE);
+    private static final java.math.BigDecimal BIGINT_MIN =
+            java.math.BigDecimal.valueOf(Long.MIN_VALUE);
 
     /** numeric to bigint, rounding half away from zero as the cast does. */
     private static long roundToBigint(java.math.BigDecimal value) {
@@ -2197,6 +2214,14 @@ class SelectExecutor {
 
     SelectStmt.CommonTableExpr lookupCte(String name) {
         return cteExecutor.lookupCte(name);
+    }
+
+    void noteHiddenWithItem(MemgresException ex, String name) {
+        cteExecutor.noteHiddenWithItem(ex, name);
+    }
+
+    boolean namesWithItem(String name) {
+        return cteExecutor.namesWithItem(name);
     }
 
     QueryResult executeCte(SelectStmt.CommonTableExpr cte) {
