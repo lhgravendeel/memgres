@@ -136,24 +136,35 @@ ALTER TABLE d12_nnc DROP CONSTRAINT d12_nnc_a_not_null;
 ALTER TABLE d12_nnc DROP CONSTRAINT d12_nnc_a;
 INSERT INTO d12_nnc (id, b) VALUES (1, 1);
 
--- Naming a constraint over a column that is already NOT NULL creates nothing:
--- PostgreSQL merges the declaration into the constraint already there.
-CREATE TABLE d12_nnd (id int PRIMARY KEY, b int NOT NULL);
+-- A named NOT NULL over a nullable column is created under the name given; only a column
+-- declared NOT NULL in CREATE TABLE takes the generated name. What naming one over a column
+-- that is ALREADY NOT NULL does is not asserted here: PostgreSQL 18.0 merges it into the
+-- constraint already there and a later 18 refuses it with 55000, so the statement answers
+-- differently on two servers that are both PostgreSQL 18.
+CREATE TABLE d12_nnd (id int PRIMARY KEY, b int);
 ALTER TABLE d12_nnd ADD CONSTRAINT d12_nnd_b NOT NULL b;
 
+-- begin-expected
+-- columns: conname
+-- row: d12_nnd_b
+-- row: d12_nnd_id_not_null
+-- end-expected
+SELECT conname FROM pg_constraint WHERE conrelid = 'd12_nnd'::regclass
+  AND contype = 'n' ORDER BY conname;
+
 -- begin-expected-error
 -- sqlstate: 42704
--- message-like: constraint "d12_nnd_b" of relation "d12_nnd" does not exist
+-- message-like: constraint "d12_nnd_nosuch" of relation "d12_nnd" does not exist
 -- end-expected-error
+ALTER TABLE d12_nnd DROP CONSTRAINT d12_nnd_nosuch;
+
+-- begin-expected-error
+-- sqlstate: 42704
+-- message-like: constraint "d12_nnd_nosuch" of relation "d12_nnd" does not exist
+-- end-expected-error
+ALTER TABLE d12_nnd ALTER CONSTRAINT d12_nnd_nosuch NO INHERIT;
+
 ALTER TABLE d12_nnd DROP CONSTRAINT d12_nnd_b;
-
--- begin-expected-error
--- sqlstate: 42704
--- message-like: constraint "d12_nnd_b" of relation "d12_nnd" does not exist
--- end-expected-error
-ALTER TABLE d12_nnd ALTER CONSTRAINT d12_nnd_b NO INHERIT;
-
-ALTER TABLE d12_nnd DROP CONSTRAINT d12_nnd_b_not_null;
 
 -- The constraint can be renamed.
 CREATE TABLE d12_nne (id int PRIMARY KEY, a int NOT NULL);
