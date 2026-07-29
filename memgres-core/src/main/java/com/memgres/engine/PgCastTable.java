@@ -8,9 +8,11 @@ package com.memgres.engine;
  * comparison. Listing a cast PG does not have therefore claims a conversion that changes what the
  * server accepts, so this table holds exactly what PostgreSQL 18 holds for these types — no more.
  *
- * <p>Columns: castsource, casttarget, castfunc (0 when the conversion needs no function),
- * castcontext ('i' implicit / 'a' assignment / 'e' explicit) and castmethod ('f' via function /
- * 'b' binary-coercible / 'i' I/O conversion).
+ * <p>Columns: castsource, casttarget, castfunc (the function's name, empty when the conversion
+ * needs none), castcontext ('i' implicit / 'a' assignment / 'e' explicit) and castmethod
+ * ('f' via function / 'b' binary-coercible / 'i' I/O conversion). The function is named rather
+ * than numbered so pg_cast.castfunc resolves against the pg_proc row memgres actually assigns
+ * it, instead of pointing at an OID that exists on some other server.
  */
 final class PgCastTable {
 
@@ -18,225 +20,240 @@ final class PgCastTable {
     }
 
     static final Object[][] CASTS = {
-            {16, 23, 2558, "e", "f"}, // boolean -> integer
-            {16, 25, 2971, "a", "f"}, // boolean -> text
-            {16, 1042, 2971, "a", "f"}, // boolean -> character
-            {16, 1043, 2971, "a", "f"}, // boolean -> character varying
-            {17, 20, 6372, "e", "f"}, // bytea -> bigint
-            {17, 21, 6370, "e", "f"}, // bytea -> smallint
-            {17, 23, 6371, "e", "f"}, // bytea -> integer
-            {18, 23, 77, "e", "f"}, // "char" -> integer
-            {18, 25, 946, "i", "f"}, // "char" -> text
-            {18, 1042, 860, "a", "f"}, // "char" -> character
-            {18, 1043, 946, "a", "f"}, // "char" -> character varying
-            {19, 25, 406, "i", "f"}, // name -> text
-            {19, 1042, 408, "a", "f"}, // name -> character
-            {19, 1043, 1401, "a", "f"}, // name -> character varying
-            {20, 17, 6369, "e", "f"}, // bigint -> bytea
-            {20, 21, 714, "a", "f"}, // bigint -> smallint
-            {20, 23, 480, "a", "f"}, // bigint -> integer
-            {20, 24, 1287, "i", "f"}, // bigint -> regproc
-            {20, 26, 1287, "i", "f"}, // bigint -> oid
-            {20, 700, 652, "i", "f"}, // bigint -> real
-            {20, 701, 482, "i", "f"}, // bigint -> double precision
-            {20, 790, 3812, "a", "f"}, // bigint -> money
-            {20, 1560, 2075, "e", "f"}, // bigint -> bit
-            {20, 1700, 1781, "i", "f"}, // bigint -> numeric
-            {20, 2202, 1287, "i", "f"}, // bigint -> regprocedure
-            {20, 2203, 1287, "i", "f"}, // bigint -> regoper
-            {20, 2204, 1287, "i", "f"}, // bigint -> regoperator
-            {20, 2205, 1287, "i", "f"}, // bigint -> regclass
-            {20, 2206, 1287, "i", "f"}, // bigint -> regtype
-            {20, 3734, 1287, "i", "f"}, // bigint -> regconfig
-            {20, 3769, 1287, "i", "f"}, // bigint -> regdictionary
-            {20, 4089, 1287, "i", "f"}, // bigint -> regnamespace
-            {20, 4096, 1287, "i", "f"}, // bigint -> regrole
-            {21, 17, 6367, "e", "f"}, // smallint -> bytea
-            {21, 20, 754, "i", "f"}, // smallint -> bigint
-            {21, 23, 313, "i", "f"}, // smallint -> integer
-            {21, 24, 313, "i", "f"}, // smallint -> regproc
-            {21, 26, 313, "i", "f"}, // smallint -> oid
-            {21, 700, 236, "i", "f"}, // smallint -> real
-            {21, 701, 235, "i", "f"}, // smallint -> double precision
-            {21, 1700, 1782, "i", "f"}, // smallint -> numeric
-            {21, 2202, 313, "i", "f"}, // smallint -> regprocedure
-            {21, 2203, 313, "i", "f"}, // smallint -> regoper
-            {21, 2204, 313, "i", "f"}, // smallint -> regoperator
-            {21, 2205, 313, "i", "f"}, // smallint -> regclass
-            {21, 2206, 313, "i", "f"}, // smallint -> regtype
-            {21, 3734, 313, "i", "f"}, // smallint -> regconfig
-            {21, 3769, 313, "i", "f"}, // smallint -> regdictionary
-            {21, 4089, 313, "i", "f"}, // smallint -> regnamespace
-            {21, 4096, 313, "i", "f"}, // smallint -> regrole
-            {23, 16, 2557, "e", "f"}, // integer -> boolean
-            {23, 17, 6368, "e", "f"}, // integer -> bytea
-            {23, 18, 78, "e", "f"}, // integer -> "char"
-            {23, 20, 481, "i", "f"}, // integer -> bigint
-            {23, 21, 314, "a", "f"}, // integer -> smallint
-            {23, 24, 0, "i", "b"}, // integer -> regproc
-            {23, 26, 0, "i", "b"}, // integer -> oid
-            {23, 700, 318, "i", "f"}, // integer -> real
-            {23, 701, 316, "i", "f"}, // integer -> double precision
-            {23, 790, 3811, "a", "f"}, // integer -> money
-            {23, 1560, 1683, "e", "f"}, // integer -> bit
-            {23, 1700, 1740, "i", "f"}, // integer -> numeric
-            {23, 2202, 0, "i", "b"}, // integer -> regprocedure
-            {23, 2203, 0, "i", "b"}, // integer -> regoper
-            {23, 2204, 0, "i", "b"}, // integer -> regoperator
-            {23, 2205, 0, "i", "b"}, // integer -> regclass
-            {23, 2206, 0, "i", "b"}, // integer -> regtype
-            {23, 3734, 0, "i", "b"}, // integer -> regconfig
-            {23, 3769, 0, "i", "b"}, // integer -> regdictionary
-            {23, 4089, 0, "i", "b"}, // integer -> regnamespace
-            {23, 4096, 0, "i", "b"}, // integer -> regrole
-            {24, 20, 1288, "a", "f"}, // regproc -> bigint
-            {24, 23, 0, "a", "b"}, // regproc -> integer
-            {24, 26, 0, "i", "b"}, // regproc -> oid
-            {24, 2202, 0, "i", "b"}, // regproc -> regprocedure
-            {25, 18, 944, "a", "f"}, // text -> "char"
-            {25, 19, 407, "i", "f"}, // text -> name
-            {25, 142, 2896, "e", "f"}, // text -> xml
-            {25, 1042, 0, "i", "b"}, // text -> character
-            {25, 1043, 0, "i", "b"}, // text -> character varying
-            {25, 2205, 1079, "i", "f"}, // text -> regclass
-            {26, 20, 1288, "a", "f"}, // oid -> bigint
-            {26, 23, 0, "a", "b"}, // oid -> integer
-            {26, 24, 0, "i", "b"}, // oid -> regproc
-            {26, 2202, 0, "i", "b"}, // oid -> regprocedure
-            {26, 2203, 0, "i", "b"}, // oid -> regoper
-            {26, 2204, 0, "i", "b"}, // oid -> regoperator
-            {26, 2205, 0, "i", "b"}, // oid -> regclass
-            {26, 2206, 0, "i", "b"}, // oid -> regtype
-            {26, 3734, 0, "i", "b"}, // oid -> regconfig
-            {26, 3769, 0, "i", "b"}, // oid -> regdictionary
-            {26, 4089, 0, "i", "b"}, // oid -> regnamespace
-            {26, 4096, 0, "i", "b"}, // oid -> regrole
-            {114, 3802, 0, "a", "i"}, // json -> jsonb
-            {142, 25, 0, "a", "b"}, // xml -> text
-            {142, 1042, 0, "a", "b"}, // xml -> character
-            {142, 1043, 0, "a", "b"}, // xml -> character varying
-            {600, 603, 4091, "a", "f"}, // point -> box
-            {601, 600, 1532, "e", "f"}, // lseg -> point
-            {602, 604, 1449, "a", "f"}, // path -> polygon
-            {603, 600, 1534, "e", "f"}, // box -> point
-            {603, 601, 1541, "e", "f"}, // box -> lseg
-            {603, 604, 1448, "a", "f"}, // box -> polygon
-            {603, 718, 1479, "e", "f"}, // box -> circle
-            {604, 600, 1540, "e", "f"}, // polygon -> point
-            {604, 602, 1447, "a", "f"}, // polygon -> path
-            {604, 603, 1446, "e", "f"}, // polygon -> box
-            {604, 718, 1474, "e", "f"}, // polygon -> circle
-            {650, 25, 730, "a", "f"}, // cidr -> text
-            {650, 869, 0, "i", "b"}, // cidr -> inet
-            {650, 1042, 730, "a", "f"}, // cidr -> character
-            {650, 1043, 730, "a", "f"}, // cidr -> character varying
-            {700, 20, 653, "a", "f"}, // real -> bigint
-            {700, 21, 238, "a", "f"}, // real -> smallint
-            {700, 23, 319, "a", "f"}, // real -> integer
-            {700, 701, 311, "i", "f"}, // real -> double precision
-            {700, 1700, 1742, "a", "f"}, // real -> numeric
-            {701, 20, 483, "a", "f"}, // double precision -> bigint
-            {701, 21, 237, "a", "f"}, // double precision -> smallint
-            {701, 23, 317, "a", "f"}, // double precision -> integer
-            {701, 700, 312, "a", "f"}, // double precision -> real
-            {701, 1700, 1743, "a", "f"}, // double precision -> numeric
-            {718, 600, 1416, "e", "f"}, // circle -> point
-            {718, 603, 1480, "e", "f"}, // circle -> box
-            {718, 604, 1544, "e", "f"}, // circle -> polygon
-            {774, 829, 4124, "i", "f"}, // macaddr8 -> macaddr
-            {790, 1700, 3823, "a", "f"}, // money -> numeric
-            {829, 774, 4123, "i", "f"}, // macaddr -> macaddr8
-            {869, 25, 730, "a", "f"}, // inet -> text
-            {869, 650, 1715, "a", "f"}, // inet -> cidr
-            {869, 1042, 730, "a", "f"}, // inet -> character
-            {869, 1043, 730, "a", "f"}, // inet -> character varying
-            {1042, 18, 944, "a", "f"}, // character -> "char"
-            {1042, 19, 409, "i", "f"}, // character -> name
-            {1042, 25, 401, "i", "f"}, // character -> text
-            {1042, 142, 2896, "e", "f"}, // character -> xml
-            {1042, 1042, 668, "i", "f"}, // character -> character
-            {1042, 1043, 401, "i", "f"}, // character -> character varying
-            {1043, 18, 944, "a", "f"}, // character varying -> "char"
-            {1043, 19, 1400, "i", "f"}, // character varying -> name
-            {1043, 25, 0, "i", "b"}, // character varying -> text
-            {1043, 142, 2896, "e", "f"}, // character varying -> xml
-            {1043, 1042, 0, "i", "b"}, // character varying -> character
-            {1043, 1043, 669, "i", "f"}, // character varying -> character varying
-            {1043, 2205, 1079, "i", "f"}, // character varying -> regclass
-            {1082, 1114, 2024, "i", "f"}, // date -> timestamp without time zone
-            {1082, 1184, 1174, "i", "f"}, // date -> timestamp with time zone
-            {1083, 1083, 1968, "i", "f"}, // time without time zone -> time without time zone
-            {1083, 1186, 1370, "i", "f"}, // time without time zone -> interval
-            {1083, 1266, 2047, "i", "f"}, // time without time zone -> time with time zone
-            {1114, 1082, 2029, "a", "f"}, // timestamp without time zone -> date
-            {1114, 1083, 1316, "a", "f"}, // timestamp without time zone -> time without time zone
-            {1114, 1114, 1961, "i", "f"}, // timestamp without time zone -> timestamp without time zone
-            {1114, 1184, 2028, "i", "f"}, // timestamp without time zone -> timestamp with time zone
-            {1184, 1082, 1178, "a", "f"}, // timestamp with time zone -> date
-            {1184, 1083, 2019, "a", "f"}, // timestamp with time zone -> time without time zone
-            {1184, 1114, 2027, "a", "f"}, // timestamp with time zone -> timestamp without time zone
-            {1184, 1184, 1967, "i", "f"}, // timestamp with time zone -> timestamp with time zone
-            {1184, 1266, 1388, "a", "f"}, // timestamp with time zone -> time with time zone
-            {1186, 1083, 1419, "a", "f"}, // interval -> time without time zone
-            {1186, 1186, 1200, "i", "f"}, // interval -> interval
-            {1266, 1083, 2046, "a", "f"}, // time with time zone -> time without time zone
-            {1266, 1266, 1969, "i", "f"}, // time with time zone -> time with time zone
-            {1560, 20, 2076, "e", "f"}, // bit -> bigint
-            {1560, 23, 1684, "e", "f"}, // bit -> integer
-            {1560, 1560, 1685, "i", "f"}, // bit -> bit
-            {1560, 1562, 0, "i", "b"}, // bit -> bit varying
-            {1562, 1560, 0, "i", "b"}, // bit varying -> bit
-            {1562, 1562, 1687, "i", "f"}, // bit varying -> bit varying
-            {1700, 20, 1779, "a", "f"}, // numeric -> bigint
-            {1700, 21, 1783, "a", "f"}, // numeric -> smallint
-            {1700, 23, 1744, "a", "f"}, // numeric -> integer
-            {1700, 700, 1745, "i", "f"}, // numeric -> real
-            {1700, 701, 1746, "i", "f"}, // numeric -> double precision
-            {1700, 790, 3824, "a", "f"}, // numeric -> money
-            {1700, 1700, 1703, "i", "f"}, // numeric -> numeric
-            {2202, 20, 1288, "a", "f"}, // regprocedure -> bigint
-            {2202, 23, 0, "a", "b"}, // regprocedure -> integer
-            {2202, 24, 0, "i", "b"}, // regprocedure -> regproc
-            {2202, 26, 0, "i", "b"}, // regprocedure -> oid
-            {2203, 20, 1288, "a", "f"}, // regoper -> bigint
-            {2203, 23, 0, "a", "b"}, // regoper -> integer
-            {2203, 26, 0, "i", "b"}, // regoper -> oid
-            {2203, 2204, 0, "i", "b"}, // regoper -> regoperator
-            {2204, 20, 1288, "a", "f"}, // regoperator -> bigint
-            {2204, 23, 0, "a", "b"}, // regoperator -> integer
-            {2204, 26, 0, "i", "b"}, // regoperator -> oid
-            {2204, 2203, 0, "i", "b"}, // regoperator -> regoper
-            {2205, 20, 1288, "a", "f"}, // regclass -> bigint
-            {2205, 23, 0, "a", "b"}, // regclass -> integer
-            {2205, 26, 0, "i", "b"}, // regclass -> oid
-            {2206, 20, 1288, "a", "f"}, // regtype -> bigint
-            {2206, 23, 0, "a", "b"}, // regtype -> integer
-            {2206, 26, 0, "i", "b"}, // regtype -> oid
-            {3734, 20, 1288, "a", "f"}, // regconfig -> bigint
-            {3734, 23, 0, "a", "b"}, // regconfig -> integer
-            {3734, 26, 0, "i", "b"}, // regconfig -> oid
-            {3769, 20, 1288, "a", "f"}, // regdictionary -> bigint
-            {3769, 23, 0, "a", "b"}, // regdictionary -> integer
-            {3769, 26, 0, "i", "b"}, // regdictionary -> oid
-            {3802, 16, 3556, "e", "f"}, // jsonb -> boolean
-            {3802, 20, 3452, "e", "f"}, // jsonb -> bigint
-            {3802, 21, 3450, "e", "f"}, // jsonb -> smallint
-            {3802, 23, 3451, "e", "f"}, // jsonb -> integer
-            {3802, 114, 0, "a", "i"}, // jsonb -> json
-            {3802, 700, 3453, "e", "f"}, // jsonb -> real
-            {3802, 701, 2580, "e", "f"}, // jsonb -> double precision
-            {3802, 1700, 3449, "e", "f"}, // jsonb -> numeric
-            {3904, 4451, 4281, "e", "f"}, // int4range -> int4multirange
-            {3906, 4532, 4284, "e", "f"}, // numrange -> nummultirange
-            {3908, 4533, 4287, "e", "f"}, // tsrange -> tsmultirange
-            {3910, 4534, 4290, "e", "f"}, // tstzrange -> tstzmultirange
-            {3912, 4535, 4293, "e", "f"}, // daterange -> datemultirange
-            {3926, 4536, 4296, "e", "f"}, // int8range -> int8multirange
-            {4089, 20, 1288, "a", "f"}, // regnamespace -> bigint
-            {4089, 23, 0, "a", "b"}, // regnamespace -> integer
-            {4089, 26, 0, "i", "b"}, // regnamespace -> oid
-            {4096, 20, 1288, "a", "f"}, // regrole -> bigint
-            {4096, 23, 0, "a", "b"}, // regrole -> integer
-            {4096, 26, 0, "i", "b"}, // regrole -> oid
+            {16, 23, "int4", "e", "f"}, // bool -> int4
+            {16, 25, "text", "a", "f"}, // bool -> text
+            {16, 1042, "text", "a", "f"}, // bool -> bpchar
+            {16, 1043, "text", "a", "f"}, // bool -> varchar
+            {17, 20, "int8", "e", "f"}, // bytea -> int8
+            {17, 21, "int2", "e", "f"}, // bytea -> int2
+            {17, 23, "int4", "e", "f"}, // bytea -> int4
+            {18, 23, "int4", "e", "f"}, // char -> int4
+            {18, 25, "text", "i", "f"}, // char -> text
+            {18, 1042, "bpchar", "a", "f"}, // char -> bpchar
+            {18, 1043, "text", "a", "f"}, // char -> varchar
+            {19, 25, "text", "i", "f"}, // name -> text
+            {19, 1042, "bpchar", "a", "f"}, // name -> bpchar
+            {19, 1043, "varchar", "a", "f"}, // name -> varchar
+            {20, 17, "bytea", "e", "f"}, // int8 -> bytea
+            {20, 21, "int2", "a", "f"}, // int8 -> int2
+            {20, 23, "int4", "a", "f"}, // int8 -> int4
+            {20, 24, "oid", "i", "f"}, // int8 -> regproc
+            {20, 26, "oid", "i", "f"}, // int8 -> oid
+            {20, 700, "float4", "i", "f"}, // int8 -> float4
+            {20, 701, "float8", "i", "f"}, // int8 -> float8
+            {20, 790, "money", "a", "f"}, // int8 -> money
+            {20, 1560, "bit", "e", "f"}, // int8 -> bit
+            {20, 1700, "numeric", "i", "f"}, // int8 -> numeric
+            {20, 2202, "oid", "i", "f"}, // int8 -> regprocedure
+            {20, 2203, "oid", "i", "f"}, // int8 -> regoper
+            {20, 2204, "oid", "i", "f"}, // int8 -> regoperator
+            {20, 2205, "oid", "i", "f"}, // int8 -> regclass
+            {20, 2206, "oid", "i", "f"}, // int8 -> regtype
+            {20, 3734, "oid", "i", "f"}, // int8 -> regconfig
+            {20, 3769, "oid", "i", "f"}, // int8 -> regdictionary
+            {20, 4089, "oid", "i", "f"}, // int8 -> regnamespace
+            {20, 4096, "oid", "i", "f"}, // int8 -> regrole
+            {20, 4191, "oid", "i", "f"}, // int8 -> regcollation
+            {21, 17, "bytea", "e", "f"}, // int2 -> bytea
+            {21, 20, "int8", "i", "f"}, // int2 -> int8
+            {21, 23, "int4", "i", "f"}, // int2 -> int4
+            {21, 24, "int4", "i", "f"}, // int2 -> regproc
+            {21, 26, "int4", "i", "f"}, // int2 -> oid
+            {21, 700, "float4", "i", "f"}, // int2 -> float4
+            {21, 701, "float8", "i", "f"}, // int2 -> float8
+            {21, 1700, "numeric", "i", "f"}, // int2 -> numeric
+            {21, 2202, "int4", "i", "f"}, // int2 -> regprocedure
+            {21, 2203, "int4", "i", "f"}, // int2 -> regoper
+            {21, 2204, "int4", "i", "f"}, // int2 -> regoperator
+            {21, 2205, "int4", "i", "f"}, // int2 -> regclass
+            {21, 2206, "int4", "i", "f"}, // int2 -> regtype
+            {21, 3734, "int4", "i", "f"}, // int2 -> regconfig
+            {21, 3769, "int4", "i", "f"}, // int2 -> regdictionary
+            {21, 4089, "int4", "i", "f"}, // int2 -> regnamespace
+            {21, 4096, "int4", "i", "f"}, // int2 -> regrole
+            {21, 4191, "int4", "i", "f"}, // int2 -> regcollation
+            {23, 16, "bool", "e", "f"}, // int4 -> bool
+            {23, 17, "bytea", "e", "f"}, // int4 -> bytea
+            {23, 18, "char", "e", "f"}, // int4 -> char
+            {23, 20, "int8", "i", "f"}, // int4 -> int8
+            {23, 21, "int2", "a", "f"}, // int4 -> int2
+            {23, 24, "", "i", "b"}, // int4 -> regproc
+            {23, 26, "", "i", "b"}, // int4 -> oid
+            {23, 700, "float4", "i", "f"}, // int4 -> float4
+            {23, 701, "float8", "i", "f"}, // int4 -> float8
+            {23, 790, "money", "a", "f"}, // int4 -> money
+            {23, 1560, "bit", "e", "f"}, // int4 -> bit
+            {23, 1700, "numeric", "i", "f"}, // int4 -> numeric
+            {23, 2202, "", "i", "b"}, // int4 -> regprocedure
+            {23, 2203, "", "i", "b"}, // int4 -> regoper
+            {23, 2204, "", "i", "b"}, // int4 -> regoperator
+            {23, 2205, "", "i", "b"}, // int4 -> regclass
+            {23, 2206, "", "i", "b"}, // int4 -> regtype
+            {23, 3734, "", "i", "b"}, // int4 -> regconfig
+            {23, 3769, "", "i", "b"}, // int4 -> regdictionary
+            {23, 4089, "", "i", "b"}, // int4 -> regnamespace
+            {23, 4096, "", "i", "b"}, // int4 -> regrole
+            {23, 4191, "", "i", "b"}, // int4 -> regcollation
+            {24, 20, "int8", "a", "f"}, // regproc -> int8
+            {24, 23, "", "a", "b"}, // regproc -> int4
+            {24, 26, "", "i", "b"}, // regproc -> oid
+            {24, 2202, "", "i", "b"}, // regproc -> regprocedure
+            {25, 18, "char", "a", "f"}, // text -> char
+            {25, 19, "name", "i", "f"}, // text -> name
+            {25, 142, "xml", "e", "f"}, // text -> xml
+            {25, 1042, "", "i", "b"}, // text -> bpchar
+            {25, 1043, "", "i", "b"}, // text -> varchar
+            {25, 2205, "regclass", "i", "f"}, // text -> regclass
+            {26, 20, "int8", "a", "f"}, // oid -> int8
+            {26, 23, "", "a", "b"}, // oid -> int4
+            {26, 24, "", "i", "b"}, // oid -> regproc
+            {26, 2202, "", "i", "b"}, // oid -> regprocedure
+            {26, 2203, "", "i", "b"}, // oid -> regoper
+            {26, 2204, "", "i", "b"}, // oid -> regoperator
+            {26, 2205, "", "i", "b"}, // oid -> regclass
+            {26, 2206, "", "i", "b"}, // oid -> regtype
+            {26, 3734, "", "i", "b"}, // oid -> regconfig
+            {26, 3769, "", "i", "b"}, // oid -> regdictionary
+            {26, 4089, "", "i", "b"}, // oid -> regnamespace
+            {26, 4096, "", "i", "b"}, // oid -> regrole
+            {26, 4191, "", "i", "b"}, // oid -> regcollation
+            {114, 3802, "", "a", "i"}, // json -> jsonb
+            {142, 25, "", "a", "b"}, // xml -> text
+            {142, 1042, "", "a", "b"}, // xml -> bpchar
+            {142, 1043, "", "a", "b"}, // xml -> varchar
+            {194, 25, "", "i", "b"}, // pg_node_tree -> text
+            {600, 603, "box", "a", "f"}, // point -> box
+            {601, 600, "point", "e", "f"}, // lseg -> point
+            {602, 604, "polygon", "a", "f"}, // path -> polygon
+            {603, 600, "point", "e", "f"}, // box -> point
+            {603, 601, "lseg", "e", "f"}, // box -> lseg
+            {603, 604, "polygon", "a", "f"}, // box -> polygon
+            {603, 718, "circle", "e", "f"}, // box -> circle
+            {604, 600, "point", "e", "f"}, // polygon -> point
+            {604, 602, "path", "a", "f"}, // polygon -> path
+            {604, 603, "box", "e", "f"}, // polygon -> box
+            {604, 718, "circle", "e", "f"}, // polygon -> circle
+            {650, 25, "text", "a", "f"}, // cidr -> text
+            {650, 869, "", "i", "b"}, // cidr -> inet
+            {650, 1042, "text", "a", "f"}, // cidr -> bpchar
+            {650, 1043, "text", "a", "f"}, // cidr -> varchar
+            {700, 20, "int8", "a", "f"}, // float4 -> int8
+            {700, 21, "int2", "a", "f"}, // float4 -> int2
+            {700, 23, "int4", "a", "f"}, // float4 -> int4
+            {700, 701, "float8", "i", "f"}, // float4 -> float8
+            {700, 1700, "numeric", "a", "f"}, // float4 -> numeric
+            {701, 20, "int8", "a", "f"}, // float8 -> int8
+            {701, 21, "int2", "a", "f"}, // float8 -> int2
+            {701, 23, "int4", "a", "f"}, // float8 -> int4
+            {701, 700, "float4", "a", "f"}, // float8 -> float4
+            {701, 1700, "numeric", "a", "f"}, // float8 -> numeric
+            {718, 600, "point", "e", "f"}, // circle -> point
+            {718, 603, "box", "e", "f"}, // circle -> box
+            {718, 604, "polygon", "e", "f"}, // circle -> polygon
+            {774, 829, "macaddr", "i", "f"}, // macaddr8 -> macaddr
+            {790, 1700, "numeric", "a", "f"}, // money -> numeric
+            {829, 774, "macaddr8", "i", "f"}, // macaddr -> macaddr8
+            {869, 25, "text", "a", "f"}, // inet -> text
+            {869, 650, "cidr", "a", "f"}, // inet -> cidr
+            {869, 1042, "text", "a", "f"}, // inet -> bpchar
+            {869, 1043, "text", "a", "f"}, // inet -> varchar
+            {1042, 18, "char", "a", "f"}, // bpchar -> char
+            {1042, 19, "name", "i", "f"}, // bpchar -> name
+            {1042, 25, "text", "i", "f"}, // bpchar -> text
+            {1042, 142, "xml", "e", "f"}, // bpchar -> xml
+            {1042, 1042, "bpchar", "i", "f"}, // bpchar -> bpchar
+            {1042, 1043, "text", "i", "f"}, // bpchar -> varchar
+            {1043, 18, "char", "a", "f"}, // varchar -> char
+            {1043, 19, "name", "i", "f"}, // varchar -> name
+            {1043, 25, "", "i", "b"}, // varchar -> text
+            {1043, 142, "xml", "e", "f"}, // varchar -> xml
+            {1043, 1042, "", "i", "b"}, // varchar -> bpchar
+            {1043, 1043, "varchar", "i", "f"}, // varchar -> varchar
+            {1043, 2205, "regclass", "i", "f"}, // varchar -> regclass
+            {1082, 1114, "timestamp", "i", "f"}, // date -> timestamp
+            {1082, 1184, "timestamptz", "i", "f"}, // date -> timestamptz
+            {1083, 1083, "time", "i", "f"}, // time -> time
+            {1083, 1186, "interval", "i", "f"}, // time -> interval
+            {1083, 1266, "timetz", "i", "f"}, // time -> timetz
+            {1114, 1082, "date", "a", "f"}, // timestamp -> date
+            {1114, 1083, "time", "a", "f"}, // timestamp -> time
+            {1114, 1114, "timestamp", "i", "f"}, // timestamp -> timestamp
+            {1114, 1184, "timestamptz", "i", "f"}, // timestamp -> timestamptz
+            {1184, 1082, "date", "a", "f"}, // timestamptz -> date
+            {1184, 1083, "time", "a", "f"}, // timestamptz -> time
+            {1184, 1114, "timestamp", "a", "f"}, // timestamptz -> timestamp
+            {1184, 1184, "timestamptz", "i", "f"}, // timestamptz -> timestamptz
+            {1184, 1266, "timetz", "a", "f"}, // timestamptz -> timetz
+            {1186, 1083, "time", "a", "f"}, // interval -> time
+            {1186, 1186, "interval", "i", "f"}, // interval -> interval
+            {1266, 1083, "time", "a", "f"}, // timetz -> time
+            {1266, 1266, "timetz", "i", "f"}, // timetz -> timetz
+            {1560, 20, "int8", "e", "f"}, // bit -> int8
+            {1560, 23, "int4", "e", "f"}, // bit -> int4
+            {1560, 1560, "bit", "i", "f"}, // bit -> bit
+            {1560, 1562, "", "i", "b"}, // bit -> varbit
+            {1562, 1560, "", "i", "b"}, // varbit -> bit
+            {1562, 1562, "varbit", "i", "f"}, // varbit -> varbit
+            {1700, 20, "int8", "a", "f"}, // numeric -> int8
+            {1700, 21, "int2", "a", "f"}, // numeric -> int2
+            {1700, 23, "int4", "a", "f"}, // numeric -> int4
+            {1700, 700, "float4", "i", "f"}, // numeric -> float4
+            {1700, 701, "float8", "i", "f"}, // numeric -> float8
+            {1700, 790, "money", "a", "f"}, // numeric -> money
+            {1700, 1700, "numeric", "i", "f"}, // numeric -> numeric
+            {2202, 20, "int8", "a", "f"}, // regprocedure -> int8
+            {2202, 23, "", "a", "b"}, // regprocedure -> int4
+            {2202, 24, "", "i", "b"}, // regprocedure -> regproc
+            {2202, 26, "", "i", "b"}, // regprocedure -> oid
+            {2203, 20, "int8", "a", "f"}, // regoper -> int8
+            {2203, 23, "", "a", "b"}, // regoper -> int4
+            {2203, 26, "", "i", "b"}, // regoper -> oid
+            {2203, 2204, "", "i", "b"}, // regoper -> regoperator
+            {2204, 20, "int8", "a", "f"}, // regoperator -> int8
+            {2204, 23, "", "a", "b"}, // regoperator -> int4
+            {2204, 26, "", "i", "b"}, // regoperator -> oid
+            {2204, 2203, "", "i", "b"}, // regoperator -> regoper
+            {2205, 20, "int8", "a", "f"}, // regclass -> int8
+            {2205, 23, "", "a", "b"}, // regclass -> int4
+            {2205, 26, "", "i", "b"}, // regclass -> oid
+            {2206, 20, "int8", "a", "f"}, // regtype -> int8
+            {2206, 23, "", "a", "b"}, // regtype -> int4
+            {2206, 26, "", "i", "b"}, // regtype -> oid
+            {3361, 17, "", "i", "b"}, // pg_ndistinct -> bytea
+            {3361, 25, "", "i", "i"}, // pg_ndistinct -> text
+            {3402, 17, "", "i", "b"}, // pg_dependencies -> bytea
+            {3402, 25, "", "i", "i"}, // pg_dependencies -> text
+            {3734, 20, "int8", "a", "f"}, // regconfig -> int8
+            {3734, 23, "", "a", "b"}, // regconfig -> int4
+            {3734, 26, "", "i", "b"}, // regconfig -> oid
+            {3769, 20, "int8", "a", "f"}, // regdictionary -> int8
+            {3769, 23, "", "a", "b"}, // regdictionary -> int4
+            {3769, 26, "", "i", "b"}, // regdictionary -> oid
+            {3802, 16, "bool", "e", "f"}, // jsonb -> bool
+            {3802, 20, "int8", "e", "f"}, // jsonb -> int8
+            {3802, 21, "int2", "e", "f"}, // jsonb -> int2
+            {3802, 23, "int4", "e", "f"}, // jsonb -> int4
+            {3802, 114, "", "a", "i"}, // jsonb -> json
+            {3802, 700, "float4", "e", "f"}, // jsonb -> float4
+            {3802, 701, "float8", "e", "f"}, // jsonb -> float8
+            {3802, 1700, "numeric", "e", "f"}, // jsonb -> numeric
+            {3904, 4451, "int4multirange", "e", "f"}, // int4range -> int4multirange
+            {3906, 4532, "nummultirange", "e", "f"}, // numrange -> nummultirange
+            {3908, 4533, "tsmultirange", "e", "f"}, // tsrange -> tsmultirange
+            {3910, 4534, "tstzmultirange", "e", "f"}, // tstzrange -> tstzmultirange
+            {3912, 4535, "datemultirange", "e", "f"}, // daterange -> datemultirange
+            {3926, 4536, "int8multirange", "e", "f"}, // int8range -> int8multirange
+            {4089, 20, "int8", "a", "f"}, // regnamespace -> int8
+            {4089, 23, "", "a", "b"}, // regnamespace -> int4
+            {4089, 26, "", "i", "b"}, // regnamespace -> oid
+            {4096, 20, "int8", "a", "f"}, // regrole -> int8
+            {4096, 23, "", "a", "b"}, // regrole -> int4
+            {4096, 26, "", "i", "b"}, // regrole -> oid
+            {4191, 20, "int8", "a", "f"}, // regcollation -> int8
+            {4191, 23, "", "a", "b"}, // regcollation -> int4
+            {4191, 26, "", "i", "b"}, // regcollation -> oid
+            {5017, 17, "", "i", "b"}, // pg_mcv_list -> bytea
+            {5017, 25, "", "i", "i"}, // pg_mcv_list -> text
+            {5069, 28, "xid", "e", "f"}, // xid8 -> xid
     };
 }

@@ -36,26 +36,16 @@ public class InfoSchemaBuilder {
         "view_routine_usage", "view_table_usage", "views"
     );
 
-    /** pg_catalog tables whose columns should be listed in information_schema.columns. */
-    private static final List<String> PG_CATALOG_TABLES_FOR_IS = Cols.listOf(
-        "pg_stat_user_tables", "pg_stat_all_tables",
-        "pg_stat_user_indexes", "pg_stat_all_indexes",
-        "pg_stat_database", "pg_statio_user_tables",
-        "pg_stat_activity", "pg_stat_replication",
-        "pg_am", "pg_prepared_statements", "pg_cursors",
-        "pg_class", "pg_attribute", "pg_namespace", "pg_type",
-        "pg_proc", "pg_index", "pg_description",
-        "pg_constraint", "pg_depend", "pg_roles", "pg_collation",
-        "pg_database", "pg_tablespace", "pg_settings",
-        "pg_extension", "pg_enum", "pg_operator",
-        "pg_aggregate", "pg_trigger", "pg_rewrite",
-        "pg_event_trigger",
-        "pg_stat_bgwriter", "pg_stat_wal",
-        "pg_replication_slots",
-        "pg_seclabel", "pg_shseclabel",
-        "pg_policies",
-        "pg_authid"
-    );
+    /**
+     * The pg_catalog relations information_schema lists.
+     *
+     * <p>Every relation memgres publishes, not a chosen forty of them: PostgreSQL lists all of
+     * its catalogs in information_schema.tables and all of their columns in
+     * information_schema.columns, and the same list pg_class and pg_attribute are built from is
+     * what keeps the three from disagreeing about which relations exist.
+     */
+    private static final List<String> PG_CATALOG_TABLES_FOR_IS =
+            new ArrayList<>(PgCatalogRelations.ALL);
 
     private final Database database;
     private final OidSupplier oids;
@@ -393,17 +383,15 @@ public class InfoSchemaBuilder {
             });
         }
 
-        // The catalog relations information_schema.columns describes are listed here too: a tool
-        // that reads the listing to decide what it may describe has to find them in both.
+        // The system catalogs are relations too, and PostgreSQL lists every one of them here.
+        // A schema browser that enumerates through information_schema rather than pg_class saw
+        // an empty system schema and never reached the columns pg_attribute describes — the two
+        // halves of the introspection surface have to agree about what exists.
         for (String pgTable : PG_CATALOG_TABLES_FOR_IS) {
-            boolean isView = pgTable.startsWith("pg_stat") || pgTable.startsWith("pg_statio")
-                    || "pg_settings".equals(pgTable) || "pg_roles".equals(pgTable)
-                    || "pg_policies".equals(pgTable) || "pg_indexes".equals(pgTable)
-                    || "pg_cursors".equals(pgTable) || "pg_prepared_statements".equals(pgTable)
-                    || "pg_replication_slots".equals(pgTable);
+            boolean isTable = "r".equals(PgCatalogRelations.relkind(pgTable));
             table.insertRow(new Object[]{
-                    catalogName(), "pg_catalog", pgTable, isView ? "VIEW" : "BASE TABLE",
-                    null, null, null, null, null, isView ? "NO" : "YES", "NO", null
+                    catalogName(), "pg_catalog", pgTable, isTable ? "BASE TABLE" : "VIEW",
+                    null, null, null, null, null, isTable ? "YES" : "NO", "NO"
             });
         }
 
@@ -489,13 +477,20 @@ public class InfoSchemaBuilder {
         // SELECT ... FROM information_schema.columns WHERE table_schema = 'pg_catalog' work.
         PgCatalogBuilder pgBuilder = new PgCatalogBuilder(database, oids);
         for (String pgTable : PG_CATALOG_TABLES_FOR_IS) {
+            Table pgCatTable;
             try {
-                Table pgCatTable = pgBuilder.build(pgTable);
-                if (pgCatTable != null && !pgCatTable.getColumns().isEmpty()) {
-                    addColumnsForTable(table, "pg_catalog", pgCatTable, false);
-                }
-            } catch (Exception ignored) {
-                // Skip tables that can't be built without session context
+                pgCatTable = pgBuilder.build(pgTable);
+            } catch (MemgresException notAvailable) {
+                // A relation the server declines to answer for at all (pg_stat_statements needs
+                // shared_preload_libraries) has no columns to list. Anything else is a defect,
+                // and swallowing it here would silently drop columns instead of reporting it.
+                continue;
+            }
+            if (pgCatTable != null && !pgCatTable.getColumns().isEmpty()) {
+                // Several names answer from one builder (pg_stat_all_tables and
+                // pg_stat_user_tables are the same relation), so the listing is made under the
+                // name that was asked for rather than the name the builder gave the table.
+                addColumnsForTable(table, "pg_catalog", pgTable, pgCatTable, false);
             }
         }
 
@@ -600,23 +595,32 @@ public class InfoSchemaBuilder {
     }
 
     /**
-     * The columns every relation carries without declaring them. PostgreSQL answers for them but
-     * does not describe them here, so a tool that reads this view to learn a relation's shape sees
-     * the columns the relation was defined with and no others.
+     * Add column entries for a table to the information_schema.columns table.
+     *
+     * <p>The rows are gathered before any of them is added, so a relation is either listed with
+     * every column it has or not listed at all. A listing that stopped partway would contradict
+     * pg_attribute about the same relation while still looking like an answer.
      */
-    private static final java.util.Set<String> SYSTEM_COLUMN_NAMES =
-            new java.util.HashSet<>(java.util.Arrays.asList(
-                    "xmin", "xmax", "cmin", "cmax", "ctid", "tableoid"));
-
-    /** Add column entries for a table to the information_schema.columns table. */
     private void addColumnsForTable(Table isTable, String schemaName, Table t, boolean isUserTable) {
+        addColumnsForTable(isTable, schemaName, t.getName(), t, isUserTable);
+    }
+
+    /** @param relationName the name to list the columns under, which may be an alias of t */
+    private void addColumnsForTable(Table isTable, String schemaName, String relationName,
+                                    Table t, boolean isUserTable) {
+        List<Object[]> pending = new ArrayList<Object[]>();
         int ordinal = 0;
         for (int i = 0; i < t.getColumns().size(); i++) {
             Column col = t.getColumns().get(i);
-            if (!isUserTable && SYSTEM_COLUMN_NAMES.contains(col.getName().toLowerCase())) continue;
+            // Asked of the catalog rather than by name alone: pg_replication_slots has a
+            // genuine xmin column of type xid, and dropping it here would leave this view
+            // one column short of what pg_class and pg_attribute say the relation has.
+            if (!isUserTable && CatalogCoreBuilder.isSystemColumn(col)) continue;
             ordinal++;
             DataType dt = col.getType();
-            boolean isArrayType = dt.getPgName().startsWith("_");
+            // PG reports every array column as data_type 'ARRAY' and leaves the element type to
+            // udt_name, so the test is the type's arrayness rather than a list of four of them.
+            boolean isArrayType = DataType.isArrayType(dt) || dt == DataType.ACLITEM_ARRAY;
             // H14: data_type — arrays report "ARRAY", composite types report
             // "USER-DEFINED", but DOMAIN columns report their BASE type (PG puts
             // the domain name in domain_name and the base type in data_type).
@@ -681,10 +685,10 @@ public class InfoSchemaBuilder {
             // H14: is_nullable — view columns are always YES (PG semantics)
             String isNullable = isUserTable ? (col.isNullable() ? "YES" : "NO") : "YES";
 
-            isTable.insertRow(new Object[]{
+            pending.add(new Object[]{
                     catalogName(),                           // table_catalog
                     schemaName,                             // table_schema
-                    t.getName(),                            // table_name
+                    relationName,                           // table_name
                     col.getName(),                          // column_name
                     ordinal,                                // ordinal_position
                     isUserTable ? CatalogHelper.formatColumnDefault(col) : null, // column_default
@@ -716,6 +720,7 @@ public class InfoSchemaBuilder {
                     "YES"                                   // is_updatable
             });
         }
+        for (Object[] row : pending) isTable.insertRow(row);
     }
 
     private Table buildIsSchemata() {

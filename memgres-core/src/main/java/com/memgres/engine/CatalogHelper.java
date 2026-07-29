@@ -132,6 +132,58 @@ public final class CatalogHelper {
                 return "tsmultirange";
             case TSTZMULTIRANGE:
                 return "tstzmultirange";
+            case TEXT_ARRAY:
+                return "text[]";
+            case INT4_ARRAY:
+                return "integer[]";
+            case ACLITEM_ARRAY:
+                return "aclitem[]";
+            case NAME_ARRAY:
+                return "name[]";
+            case BOOL_ARRAY:
+                return "boolean[]";
+            case INT2_ARRAY:
+                return "smallint[]";
+            case INT8_ARRAY:
+                return "bigint[]";
+            case FLOAT4_ARRAY:
+                return "real[]";
+            case FLOAT8_ARRAY:
+                return "double precision[]";
+            case NUMERIC_ARRAY:
+                return "numeric[]";
+            case VARCHAR_ARRAY:
+                return "character varying[]";
+            case CHAR_ARRAY:
+                return "character[]";
+            case DATE_ARRAY:
+                return "date[]";
+            case TIMESTAMP_ARRAY:
+                return "timestamp without time zone[]";
+            case TIMESTAMPTZ_ARRAY:
+                return "timestamp with time zone[]";
+            case TIME_ARRAY:
+                return "time without time zone[]";
+            case TIMETZ_ARRAY:
+                return "time with time zone[]";
+            case INTERVAL_ARRAY:
+                return "interval[]";
+            case UUID_ARRAY:
+                return "uuid[]";
+            case BYTEA_ARRAY:
+                return "bytea[]";
+            case JSON_ARRAY:
+                return "json[]";
+            case JSONB_ARRAY:
+                return "jsonb[]";
+            case INET_ARRAY:
+                return "inet[]";
+            case RECORD_ARRAY:
+                return "record[]";
+            case OID_ARRAY:
+                return "oid[]";
+            case INTERNAL_CHAR_ARRAY:
+                return "\"char\"[]";
             case ENUM:
                 return "USER-DEFINED";
             case XID:
@@ -150,6 +202,27 @@ public final class CatalogHelper {
                 return "int2vector";
             case HSTORE:
                 return "hstore";
+            // The types the system catalogs declare columns of. PostgreSQL spells its
+            // single-byte flag type with the quotes, and a caller pasting the name into a
+            // cast needs them: "char" is a different type from char.
+            case INTERNAL_CHAR:
+                return "\"char\"";
+            case PG_NODE_TREE:
+                return "pg_node_tree";
+            case ANYARRAY:
+                return "anyarray";
+            case PG_LSN:
+                return "pg_lsn";
+            case PG_NDISTINCT:
+                return "pg_ndistinct";
+            case PG_DEPENDENCIES:
+                return "pg_dependencies";
+            case PG_MCV_LIST:
+                return "pg_mcv_list";
+            case RECORD:
+                return "record";
+            case VOID:
+                return "void";
             default:
                 // Every remaining type spells its SQL name the same way pg_type does. An array
                 // is written as its element type followed by [], and a type with no case above

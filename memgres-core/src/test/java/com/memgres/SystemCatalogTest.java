@@ -100,9 +100,9 @@ class SystemCatalogTest {
     @Test
     void testPgAttributeNotNull() throws SQLException {
         try (Statement stmt = conn.createStatement()) {
-            // The column is named by its relation: every relation the catalog describes may hold
-            // a column called "name", and PG 18 answers 20 rows for the name alone, only one of
-            // them NOT NULL. The question is about the users table's column.
+            // Scoped to the relation under test: pg_catalog has its own nullable 'name'
+            // columns (pg_available_extensions, pg_timezone_names), and PostgreSQL answers
+            // this query with a mixture of t and f when it is not narrowed to one relation.
             ResultSet rs = stmt.executeQuery(
                     "SELECT a.attname, a.attnotnull FROM pg_catalog.pg_attribute a " +
                     "JOIN pg_catalog.pg_class c ON c.oid = a.attrelid " +

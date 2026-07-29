@@ -1234,6 +1234,9 @@ class CatalogMetadataFunctions {
     }
 
     private String formatTypeByOid(int oid, int typmod) {
+        // PG quotes "char" so it is not read as the SQL type char; format_type is where a client
+        // learns a catalog flag column is the single-byte type and not a bpchar.
+        if (oid == 18) return "\"char\"";
         // An array is named after its element with the modifier applied to that element, so the
         // array's own row is answered by formatting the element and adding the brackets.
         DataType arrayType = null;
@@ -1334,7 +1337,11 @@ class CatalogMetadataFunctions {
                         base = "integer[]";
                         break;
                     default:
-                        base = dt.getPgName();
+                        // An array type is named "_elem" in pg_type but printed "elem[]": a
+                        // client reading format_type sees a type name it could write in SQL.
+                        DataType elem = DataType.elementOf(dt);
+                        base = elem != null ? formatTypeByOid(elem.getOid(), -1) + "[]"
+                                : dt.getPgName();
                         break;
                 }
                 return base;

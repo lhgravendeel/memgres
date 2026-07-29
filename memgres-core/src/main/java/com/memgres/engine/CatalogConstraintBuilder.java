@@ -43,34 +43,34 @@ class CatalogConstraintBuilder {
 
     Table buildPgConstraint() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("conname", DataType.TEXT),
-                colNN("connamespace", DataType.INTEGER),
-                colNN("contype", DataType.CHAR),
-                colNN("conrelid", DataType.INTEGER),
-                colNN("confrelid", DataType.INTEGER),
-                col("conkey", DataType.INT4_ARRAY),
-                col("confkey", DataType.INT4_ARRAY),
+                colNN("oid", DataType.OID),
+                colNN("conname", DataType.NAME),
+                colNN("connamespace", DataType.OID),
+                colNN("contype", DataType.INTERNAL_CHAR),
+                colNN("conrelid", DataType.OID),
+                colNN("confrelid", DataType.OID),
+                col("conkey", DataType.INT2_ARRAY),
+                col("confkey", DataType.INT2_ARRAY),
                 col("condeferrable", DataType.BOOLEAN),
                 col("condeferred", DataType.BOOLEAN),
                 col("convalidated", DataType.BOOLEAN),
                 col("conislocal", DataType.BOOLEAN),
-                col("conindid", DataType.INTEGER),
-                col("confupdtype", DataType.CHAR),
-                col("confdeltype", DataType.CHAR),
-                col("confmatchtype", DataType.CHAR),
-                col("conpfeqop", DataType.INT4_ARRAY),
-                col("conppeqop", DataType.INT4_ARRAY),
-                col("conffeqop", DataType.INT4_ARRAY),
-                col("confdelsetcols", DataType.INT4_ARRAY),
-                col("coninhcount", DataType.INTEGER),
+                col("conindid", DataType.OID),
+                col("confupdtype", DataType.INTERNAL_CHAR),
+                col("confdeltype", DataType.INTERNAL_CHAR),
+                col("confmatchtype", DataType.INTERNAL_CHAR),
+                col("conpfeqop", DataType.OID_ARRAY),
+                col("conppeqop", DataType.OID_ARRAY),
+                col("conffeqop", DataType.OID_ARRAY),
+                col("confdelsetcols", DataType.INT2_ARRAY),
+                col("coninhcount", DataType.SMALLINT),
                 col("connoinherit", DataType.BOOLEAN),
                 col("conenforced", DataType.BOOLEAN),
-                col("conbin", DataType.TEXT),
-                col("conexclop", DataType.TEXT),
+                col("conbin", DataType.PG_NODE_TREE),
+                col("conexclop", DataType.OID_ARRAY),
                 col("conperiod", DataType.BOOLEAN),
-                col("conparentid", DataType.INTEGER),
-                col("contypid", DataType.INTEGER),
+                col("conparentid", DataType.OID),
+                col("contypid", DataType.OID),
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_constraint", cols);
@@ -319,26 +319,29 @@ class CatalogConstraintBuilder {
 
     Table buildPgIndex() {
         List<Column> cols = Cols.listOf(
-                colNN("indexrelid", DataType.INTEGER),
-                colNN("indrelid", DataType.INTEGER),
+                colNN("indexrelid", DataType.OID),
+                colNN("indrelid", DataType.OID),
                 colNN("indisunique", DataType.BOOLEAN),
                 colNN("indisprimary", DataType.BOOLEAN),
                 colNN("indisexclusion", DataType.BOOLEAN),
                 col("indimmediate", DataType.BOOLEAN),
-                col("indkey", DataType.TEXT),
+                col("indkey", DataType.INT2VECTOR),
                 col("indnkeyatts", DataType.SMALLINT),
                 col("indnatts", DataType.SMALLINT),
                 col("indisvalid", DataType.BOOLEAN),
                 col("indisready", DataType.BOOLEAN),
                 col("indislive", DataType.BOOLEAN),
-                col("indexprs", DataType.TEXT),
-                col("indpred", DataType.TEXT),
+                col("indcheckxmin", DataType.BOOLEAN),
+                // An expression column is an internal parse tree, not text a client may read:
+                // pg_node_tree is what tells it so.
+                col("indexprs", DataType.PG_NODE_TREE),
+                col("indpred", DataType.PG_NODE_TREE),
                 col("indisclustered", DataType.BOOLEAN),
                 col("indisreplident", DataType.BOOLEAN),
-                col("indoption", DataType.TEXT),
+                col("indoption", DataType.INT2VECTOR),
                 col("indnullsnotdistinct", DataType.BOOLEAN),
-                col("indclass", DataType.TEXT),
-                col("indcollation", DataType.TEXT)
+                col("indclass", DataType.OIDVECTOR),
+                col("indcollation", DataType.OIDVECTOR)
         );
         Table table = new Table("pg_index", cols);
         // Populate from stored index metadata
@@ -441,7 +444,7 @@ class CatalogConstraintBuilder {
                                 isExclusion,
                                 true, // indimmediate
                                 indkeyVec,
-                                (short) nKeyAtts, (short) totalAtts, true, true, true, indexprs, whereClause, isClustered,
+                                (short) nKeyAtts, (short) totalAtts, true, true, true, false, indexprs, whereClause, isClustered,
                                 false, // indisreplident
                                 new PgVector(optionElems),
                                 nullsNotDistinct, new PgVector(classElems), new PgVector(collElems)});
@@ -494,7 +497,7 @@ class CatalogConstraintBuilder {
                                     true, // indimmediate
                                     indkeyVec,
                                     (short) indkeyList.size(), (short) indkeyList.size(),
-                                    true, true, true, null, null, constraintClustered,
+                                    true, true, true, false, null, null, constraintClustered,
                                     false, // indisreplident
                                     new PgVector(optElems),
                                     // The index a UNIQUE constraint is backed by keeps the
@@ -513,11 +516,10 @@ class CatalogConstraintBuilder {
 
     Table buildPgAttrdef() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("adrelid", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("adrelid", DataType.OID),
                 colNN("adnum", DataType.SMALLINT),
-                col("adbin", DataType.TEXT),
-                col("adsrc", DataType.TEXT)
+                col("adbin", DataType.PG_NODE_TREE)
         );
         Table table = new Table("pg_attrdef", cols);
         for (Map.Entry<String, Schema> schemaEntry : database.getSchemas().entrySet()) {
@@ -538,7 +540,7 @@ class CatalogConstraintBuilder {
                         String genExpr = c.getGeneratedExpr();
                         table.insertRow(new Object[]{
                                 oids.oid("attrdef:" + t.getName() + "." + c.getName()),
-                                relOid, (short) (i + 1), genExpr, genExpr
+                                relOid, (short) (i + 1), genExpr
                         });
                     } else if (c.getDefaultValue() != null || c.getType() == DataType.SERIAL
                             || c.getType() == DataType.BIGSERIAL || c.getType() == DataType.SMALLSERIAL) {
@@ -547,7 +549,7 @@ class CatalogConstraintBuilder {
                                 : "nextval('" + t.getName() + "_" + c.getName() + "_seq'::regclass)";
                         table.insertRow(new Object[]{
                                 oids.oid("attrdef:" + t.getName() + "." + c.getName()),
-                                relOid, (short) (i + 1), defaultExpr, defaultExpr
+                                relOid, (short) (i + 1), defaultExpr
                         });
                     }
                 }
@@ -558,13 +560,13 @@ class CatalogConstraintBuilder {
 
     Table buildPgDepend() {
         List<Column> cols = Cols.listOf(
-                colNN("classid", DataType.INTEGER),
-                colNN("objid", DataType.INTEGER),
+                colNN("classid", DataType.OID),
+                colNN("objid", DataType.OID),
                 colNN("objsubid", DataType.INTEGER),
-                colNN("refclassid", DataType.INTEGER),
-                colNN("refobjid", DataType.INTEGER),
+                colNN("refclassid", DataType.OID),
+                colNN("refobjid", DataType.OID),
                 colNN("refobjsubid", DataType.INTEGER),
-                colNN("deptype", DataType.CHAR)
+                colNN("deptype", DataType.INTERNAL_CHAR)
         );
         Table table = new Table("pg_depend", cols);
         int pgClassOid = oids.oid("rel:pg_catalog.pg_class");
@@ -648,14 +650,15 @@ class CatalogConstraintBuilder {
 
     Table buildPgRewrite() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("rulename", DataType.TEXT),
-                colNN("ev_class", DataType.INTEGER),
-                col("ev_type", DataType.CHAR),
-                col("ev_enabled", DataType.CHAR),
+                colNN("oid", DataType.OID),
+                colNN("rulename", DataType.NAME),
+                colNN("ev_class", DataType.OID),
+                col("ev_type", DataType.INTERNAL_CHAR),
+                col("ev_enabled", DataType.INTERNAL_CHAR),
                 col("is_instead", DataType.BOOLEAN),
-                col("ev_qual", DataType.TEXT),
-                col("ev_action", DataType.TEXT),
+                // A rule's qualification and action are parse trees, not text a client can read
+                col("ev_qual", DataType.PG_NODE_TREE),
+                col("ev_action", DataType.PG_NODE_TREE),
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_rewrite", cols);
@@ -673,8 +676,8 @@ class CatalogConstraintBuilder {
 
     Table buildPgDescription() {
         List<Column> cols = Cols.listOf(
-                colNN("objoid", DataType.INTEGER),
-                colNN("classoid", DataType.INTEGER),
+                colNN("objoid", DataType.OID),
+                colNN("classoid", DataType.OID),
                 colNN("objsubid", DataType.INTEGER),
                 col("description", DataType.TEXT),
                 col("xmin", DataType.INTEGER)
@@ -796,29 +799,25 @@ class CatalogConstraintBuilder {
 
     Table buildPgTrigger() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("tgrelid", DataType.INTEGER),
-                colNN("tgname", DataType.TEXT),
-                col("tgfoid", DataType.INTEGER),
+                colNN("oid", DataType.OID),
+                colNN("tgrelid", DataType.OID),
+                colNN("tgname", DataType.NAME),
+                col("tgfoid", DataType.OID),
                 col("tgtype", DataType.SMALLINT),
-                col("tgenabled", DataType.CHAR),
+                col("tgenabled", DataType.INTERNAL_CHAR),
                 col("tgisinternal", DataType.BOOLEAN),
-                col("tgconstrrelid", DataType.INTEGER),
+                col("tgconstrrelid", DataType.OID),
+                col("tgconstrindid", DataType.OID),
                 col("tgdeferrable", DataType.BOOLEAN),
                 col("tginitdeferred", DataType.BOOLEAN),
-                // How many arguments the trigger passes to its function, and the arguments
-                // themselves. A tool that reads tgargs has to know how many are in it.
                 col("tgnargs", DataType.SMALLINT),
-                col("tgargs", DataType.TEXT),
-                col("tgattr", DataType.TEXT),
-                col("tgconstraint", DataType.INTEGER),
-                // The index a constraint trigger enforces, and the WHEN condition the trigger
-                // was declared with. Both are what PostgreSQL keeps here, empty or not.
-                col("tgconstrindid", DataType.INTEGER),
-                col("tgqual", DataType.TEXT),
-                col("tgoldtable", DataType.TEXT),
-                col("tgnewtable", DataType.TEXT),
-                col("tgparentid", DataType.INTEGER),
+                col("tgargs", DataType.BYTEA),
+                col("tgattr", DataType.INT2VECTOR),
+                col("tgqual", DataType.PG_NODE_TREE),
+                col("tgconstraint", DataType.OID),
+                col("tgoldtable", DataType.NAME),
+                col("tgnewtable", DataType.NAME),
+                col("tgparentid", DataType.OID),
                 col("xmin", DataType.INTEGER)
         );
         Table table = new Table("pg_trigger", cols);
@@ -880,9 +879,8 @@ class CatalogConstraintBuilder {
             table.insertRow(new Object[]{
                     oids.oid("trig:" + trigSchema + "." + first.getTableName() + "." + first.getName()),
                     relOid, first.getName(),
-                    tgfoid, (short) tgtype, tgenabled, false, 0, false, false,
-                    (short) 0, "", null, 0,
-                    0, whenCondition,
+                    tgfoid, (short) tgtype, tgenabled, false, 0, 0, false, false,
+                    (short) 0, "", null, whenCondition, 0,
                     first.getOldTransitionTable(), first.getNewTransitionTable(), 0, 1
             });
         }

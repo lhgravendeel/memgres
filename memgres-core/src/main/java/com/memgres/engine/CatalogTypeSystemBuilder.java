@@ -23,15 +23,15 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgCollation() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER),
-                colNN("collname", DataType.TEXT),
-                colNN("collnamespace", DataType.INTEGER),
-                colNN("collowner", DataType.INTEGER),
-                colNN("collprovider", DataType.CHAR),
+                colNN("oid", DataType.OID),
+                colNN("collname", DataType.NAME),
+                colNN("collnamespace", DataType.OID),
+                colNN("collowner", DataType.OID),
+                colNN("collprovider", DataType.INTERNAL_CHAR),
                 col("collisdeterministic", DataType.BOOLEAN),
                 col("collencoding", DataType.INTEGER),
                 col("colllocale", DataType.TEXT),
-                col("colliculocale", DataType.TEXT),
+                col("collicurules", DataType.TEXT),
                 col("collcollate", DataType.TEXT),
                 col("collctype", DataType.TEXT),
                 col("collversion", DataType.TEXT),
@@ -39,33 +39,31 @@ class CatalogTypeSystemBuilder {
         );
         Table table = new Table("pg_collation", cols);
         int pgCatalogNs = oids.oid("ns:pg_catalog");
-        // Built-in libc collations always present in PG
+        // The collations every PostgreSQL installation has. A name listed here that the real
+        // server does not have is a hazard rather than clutter: a tool that reads pg_collation and
+        // offers "C.UTF-8" or "en_US.utf8" produces SQL that fails there, and memgres itself
+        // rejects those names in COLLATE, so they are not claimed here either.
         table.insertRow(new Object[]{ oids.oid("collation:default"), "default", pgCatalogNs, 10, "d", true, -1, null, null, null, null, null, 1 });
         table.insertRow(new Object[]{ oids.oid("collation:C"), "C", pgCatalogNs, 10, "c", true, -1, null, null, "C", "C", null, 1 });
         table.insertRow(new Object[]{ oids.oid("collation:POSIX"), "POSIX", pgCatalogNs, 10, "c", true, -1, null, null, "POSIX", "POSIX", null, 1 });
-        // Default-shipped libc locale names. Memgres maps all of these to
-        // Java's locale-aware comparison so COLLATE "en_US.utf8" never errors
-        // out with 42704, even on minimal systems where the libc locale is
-        // not installed. collversion is reported as a Java version tag to
-        // survive information_schema.collations existence checks.
+        // ucs_basic is the SQL standard's code-point ordering: provider 'b', UTF8 only.
+        table.insertRow(new Object[]{ oids.oid("collation:ucs_basic"), "ucs_basic", pgCatalogNs, 10, "b", true, 6, "C", null, "C", "C", null, 1 });
         String javaColl = "java-" + System.getProperty("java.version", "17");
-        table.insertRow(new Object[]{ oids.oid("collation:C.UTF-8"), "C.UTF-8", pgCatalogNs, 10, "c", true, 6, null, null, "C.UTF-8", "C.UTF-8", javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:C.utf8"), "C.utf8", pgCatalogNs, 10, "c", true, 6, null, null, "C.UTF-8", "C.UTF-8", javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en_US"), "en_US", pgCatalogNs, 10, "c", true, 6, null, null, "en_US", "en_US", javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en_US.UTF-8"), "en_US.UTF-8", pgCatalogNs, 10, "c", true, 6, null, null, "en_US.UTF-8", "en_US.UTF-8", javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en_US.utf8"), "en_US.utf8", pgCatalogNs, 10, "c", true, 6, null, null, "en_US.UTF-8", "en_US.UTF-8", javaColl, 1 });
-        // ICU-provider collations (PG 10+ default on many distros)
-        table.insertRow(new Object[]{ oids.oid("collation:und-x-icu"), "und-x-icu", pgCatalogNs, 10, "i", true, -1, "und", "und", null, null, javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en-US-x-icu"), "en-US-x-icu", pgCatalogNs, 10, "i", true, -1, "en-US", "en-US", null, null, javaColl, 1 });
-        table.insertRow(new Object[]{ oids.oid("collation:en-x-icu"), "en-x-icu", pgCatalogNs, 10, "i", true, -1, "en", "en", null, null, javaColl, 1 });
+        // ICU-provider collations. PG spells an ICU locale with a hyphen — en-US, not en_US —
+        // and that spelling is what a client passes back to COLLATE.
+        table.insertRow(new Object[]{ oids.oid("collation:und-x-icu"), "und-x-icu", pgCatalogNs, 10, "i", true, -1, "und", null, null, null, javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en-US-x-icu"), "en-US-x-icu", pgCatalogNs, 10, "i", true, -1, "en-US", null, null, null, javaColl, 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:en-x-icu"), "en-x-icu", pgCatalogNs, 10, "i", true, -1, "en", null, null, null, javaColl, 1 });
+        // en_US is a name PostgreSQL does have; what it does not have is the ".UTF-8" spellings.
+        // Removing the name along with them took away a collation COLLATE "en_US" accepts.
+        table.insertRow(new Object[]{ oids.oid("collation:en_US"), "en_US", pgCatalogNs, 10, "i", true, 6, "en-US", null, "en-US", "en-US", javaColl, 1 });
         // User-defined collations (from CREATE COLLATION)
         for (java.util.Map.Entry<String, Database.CollationDef> entry : database.getUserCollations().entrySet()) {
             Database.CollationDef coll = entry.getValue();
             int publicNs = oids.oid("ns:public");
-            String icuLocale = "i".equals(coll.provider) ? coll.locale : null;
             table.insertRow(new Object[]{
                     oids.oid("collation:" + coll.name), coll.name, publicNs, 10, coll.provider,
-                    coll.deterministic, 6, coll.locale, icuLocale,
+                    coll.deterministic, 6, coll.locale, null,
                     coll.lcCollate != null ? coll.lcCollate : coll.locale,
                     coll.lcCtype != null ? coll.lcCtype : coll.locale,
                     javaColl, 1
@@ -76,13 +74,13 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgRange() {
         List<Column> cols = Cols.listOf(
-                colNN("rngtypid", DataType.INTEGER),
-                col("rngsubtype", DataType.INTEGER),
-                col("rngmultitypid", DataType.INTEGER),
-                col("rngcollation", DataType.INTEGER),
-                col("rngsubopc", DataType.INTEGER),
-                col("rngcanonical", DataType.INTEGER),
-                col("rngsubdiff", DataType.INTEGER)
+                colNN("rngtypid", DataType.OID),
+                col("rngsubtype", DataType.OID),
+                col("rngmultitypid", DataType.OID),
+                col("rngcollation", DataType.OID),
+                col("rngsubopc", DataType.OID),
+                col("rngcanonical", DataType.REGPROC),
+                col("rngsubdiff", DataType.REGPROC)
         );
         Table table = new Table("pg_range", cols);
         // PG built-in range types: rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff
@@ -158,15 +156,20 @@ class CatalogTypeSystemBuilder {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID), colNN("castsource", DataType.OID),
                 colNN("casttarget", DataType.OID), col("castfunc", DataType.OID),
-                col("castcontext", DataType.CHAR), col("castmethod", DataType.CHAR),
+                col("castcontext", DataType.INTERNAL_CHAR),
+                col("castmethod", DataType.INTERNAL_CHAR),
                 col("xmin", DataType.INTEGER));
         Table table = new Table("pg_cast", cols);
         // Exactly the conversions PostgreSQL registers between the types memgres models. A row
         // here is a claim the server will perform the conversion, and an implicit row changes
-        // what the server accepts without being asked, so nothing is added on a guess.
+        // what the server accepts without being asked, so nothing is added on a guess. castfunc
+        // is resolved through the same name pg_proc registers the function under, so the join
+        // from pg_cast to pg_proc — the normal way to read the table — lands on a row.
         int castOid = 5000;
         for (Object[] c : PgCastTable.CASTS) {
-            table.insertRow(new Object[]{castOid++, c[0], c[1], c[2], c[3], c[4], 1});
+            String fname = (String) c[2];
+            int castfunc = fname.isEmpty() ? 0 : oids.oid("proc:" + fname);
+            table.insertRow(new Object[]{castOid++, c[0], c[1], castfunc, c[3], c[4], 1});
         }
 
         // User-defined casts (CREATE CAST)
@@ -180,56 +183,32 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgOperator() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), colNN("oprname", DataType.TEXT),
-                col("oprnamespace", DataType.INTEGER), col("oprowner", DataType.INTEGER),
-                col("oprkind", DataType.CHAR), col("oprleft", DataType.INTEGER),
-                col("oprright", DataType.INTEGER), col("oprresult", DataType.INTEGER),
-                col("oprcode", DataType.INTEGER), col("oprrest", DataType.INTEGER),
-                col("oprjoin", DataType.INTEGER), col("oprcom", DataType.INTEGER),
-                col("oprnegate", DataType.INTEGER), col("oprcanmerge", DataType.BOOLEAN),
-                col("oprcanhash", DataType.BOOLEAN), col("xmin", DataType.INTEGER));
+                colNN("oid", DataType.OID), colNN("oprname", DataType.NAME),
+                col("oprnamespace", DataType.OID), col("oprowner", DataType.OID),
+                col("oprkind", DataType.INTERNAL_CHAR),
+                col("oprcanmerge", DataType.BOOLEAN), col("oprcanhash", DataType.BOOLEAN),
+                col("oprleft", DataType.OID), col("oprright", DataType.OID),
+                col("oprresult", DataType.OID),
+                col("oprcom", DataType.OID), col("oprnegate", DataType.OID),
+                col("oprcode", DataType.REGPROC), col("oprrest", DataType.REGPROC),
+                col("oprjoin", DataType.REGPROC), col("xmin", DataType.INTEGER));
         Table table = new Table("pg_operator", cols);
         int pgCatalogNs = oids.oid("ns:pg_catalog");
         int publicNs = oids.oid("ns:public");
 
-        // Bootstrap built-in binary operators (non-comparison operators without type info)
-        String[][] builtinBinary = {
-                {"+", "b"}, {"-", "b"}, {"*", "b"}, {"/", "b"}, {"%", "b"},
-                {"||", "b"}, {"&&", "b"},
-                {"~~", "b"}, {"!~~", "b"}, {"~~*", "b"}, {"!~~*", "b"},
-                {"~", "b"}, {"!~", "b"}, {"~*", "b"}, {"!~*", "b"},
-                {"@>", "b"}, {"<@", "b"}, {"?", "b"}, {"?|", "b"}, {"?&", "b"},
-                {"->", "b"}, {"->>", "b"}, {"#>", "b"}, {"#>>", "b"},
-                {"IS", "b"}, {"^", "b"}, {"&", "b"}, {"|", "b"},
-                {"<<", "b"}, {">>", "b"},
-        };
-        for (String[] op : builtinBinary) {
-            int opOid = oids.oid("operator:pg_catalog." + op[0]);
-            table.insertRow(new Object[]{opOid, op[0], pgCatalogNs, 10,
-                    op[1], 0, 0, 0, 0, 0, 0, 0, 0, false, false, 1});
-        }
-
-        // Comparison operators with int4 type info and non-zero oprcode.
-        // The generic versions (=, <>, !=, <, >, <=, >=) are emitted here with
-        // oprleft/oprright pointing to int4 (OID 23) so queries like
-        // "SELECT ... FROM pg_operator WHERE oprname='=' AND oprleft=23" work.
-        // Format: {oprname, oprleft, oprright, oprresult, oprcodeFuncName}
-        String[][] compOps = {
-                {"=",  "23", "23", "16", "int4eq"},
-                {"<>", "23", "23", "16", "int4ne"},
-                {"!=", "23", "23", "16", "int4ne"},
-                {"<",  "23", "23", "16", "int4lt"},
-                {">",  "23", "23", "16", "int4gt"},
-                {"<=", "23", "23", "16", "int4le"},
-                {">=", "23", "23", "16", "int4ge"},
-        };
-        for (String[] top : compOps) {
-            int topOid = oids.oid("operator:pg_catalog." + top[0]);
-            int opcodeOid = oids.oid("proc:" + top[4]);
-            table.insertRow(new Object[]{topOid, top[0], pgCatalogNs, 10,
-                    "b", Integer.parseInt(top[1]), Integer.parseInt(top[2]), Integer.parseInt(top[3]),
-                    opcodeOid, 0, 0, 0, 0,
-                    "=".equals(top[0]), "=".equals(top[0]), 1});
+        // Built-in operators, one row per operand-type combination PostgreSQL registers. A row
+        // is keyed by its full signature rather than by its spelling, so the several operators
+        // that share a name stay distinguishable and each carries a result type.
+        for (Object[] op : PgOperatorTable.OPERATORS) {
+            table.insertRow(new Object[]{
+                    builtinOperatorOid(op), op[0], pgCatalogNs, 10,
+                    op[1], op[6], op[7],
+                    op[2], op[3], op[4],
+                    signatureOid((String) op[8]), signatureOid((String) op[9]),
+                    // A regproc value, so oprcode::text answers the function's name the way
+                    // PostgreSQL does rather than handing the reader back an OID.
+                    new RegprocValue(oids.oid("proc:" + op[5]), (String) op[5]),
+                    new RegprocValue(0, "-"), new RegprocValue(0, "-"), 1});
         }
 
         // User-defined operators
@@ -277,11 +256,33 @@ class CatalogTypeSystemBuilder {
                 }
             }
             table.insertRow(new Object[]{opOid, op.getName(), ns, ownerOid,
-                    op.getKind(), leftOid, rightOid, resultOid, opcodeOid, 0, 0, comOid, negOid,
-                    op.isMerges(), op.isHashes(), 1});
+                    op.getKind(), op.isMerges(), op.isHashes(),
+                    leftOid, rightOid, resultOid, comOid, negOid,
+                    opcodeOid, 0, 0, 1});
         }
 
         return table;
+    }
+
+    /** The OID of a built-in operator, keyed by the signature that identifies it. */
+    private int builtinOperatorOid(Object[] op) {
+        return oids.oid("operator:pg_catalog." + op[0] + " " + op[2] + " " + op[3]);
+    }
+
+    /** Resolve an "name left right" reference to another built-in operator; 0 when there is none. */
+    private int signatureOid(String signature) {
+        if (signature == null || signature.isEmpty()) return 0;
+        return oids.oid("operator:pg_catalog." + signature);
+    }
+
+    /** The OID of the built-in operator with this name and operand types, or 0. */
+    int operatorOid(String name, int left, int right) {
+        for (Object[] op : PgOperatorTable.OPERATORS) {
+            if (op[0].equals(name) && ((Integer) op[2]) == left && ((Integer) op[3]) == right) {
+                return builtinOperatorOid(op);
+            }
+        }
+        return 0;
     }
 
     /**
@@ -323,11 +324,11 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgOpclass() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), colNN("opcname", DataType.TEXT),
-                col("opcnamespace", DataType.INTEGER), col("opcowner", DataType.INTEGER),
-                col("opcfamily", DataType.INTEGER), col("opcintype", DataType.INTEGER),
-                col("opckeytype", DataType.INTEGER), col("opcdefault", DataType.BOOLEAN),
-                col("opcmethod", DataType.INTEGER), col("xmin", DataType.INTEGER));
+                colNN("oid", DataType.OID), colNN("opcname", DataType.NAME),
+                col("opcnamespace", DataType.OID), col("opcowner", DataType.OID),
+                col("opcfamily", DataType.OID), col("opcintype", DataType.OID),
+                col("opckeytype", DataType.OID), col("opcdefault", DataType.BOOLEAN),
+                col("opcmethod", DataType.OID), col("xmin", DataType.INTEGER));
         Table table = new Table("pg_opclass", cols);
         int pgCatalogNs = oids.oid("ns:pg_catalog");
         // Standard btree operator classes (one per data type family)
@@ -355,8 +356,13 @@ class CatalogTypeSystemBuilder {
                 oids.oid("opfamily:datetime_ops"), DataType.TIMESTAMPTZ.getOid(), 0, true, 403, 1});
         table.insertRow(new Object[]{oids.oid("opclass:uuid_ops"), "uuid_ops", pgCatalogNs, 10,
                 oids.oid("opfamily:uuid_ops"), DataType.UUID.getOid(), 0, true, 403, 1});
+        // varchar_ops is an alias for text_ops, and PG does *not* mark it the default: the
+        // default btree class for varchar is text_ops itself. PG keys it on text rather than
+        // on varchar — a client resolving "which class handles this type" reads opcintype.
         table.insertRow(new Object[]{oids.oid("opclass:varchar_ops"), "varchar_ops", pgCatalogNs, 10,
-                oids.oid("opfamily:text_ops"), DataType.VARCHAR.getOid(), 0, true, 403, 1});
+                oids.oid("opfamily:text_ops"), DataType.TEXT.getOid(), 0, false, 403, 1});
+        table.insertRow(new Object[]{oids.oid("opclass:hash_varchar_ops"), "varchar_ops", pgCatalogNs, 10,
+                oids.oid("opfamily:hash_text_ops"), DataType.TEXT.getOid(), 0, false, 405, 1});
         // Hash operator classes (same names as btree; this is correct PG behavior)
         table.insertRow(new Object[]{oids.oid("opclass:hash_int4_ops"), "int4_ops", pgCatalogNs, 10,
                 oids.oid("opfamily:hash_integer_ops"), DataType.INTEGER.getOid(), 0, true, 405, 1});
@@ -374,19 +380,18 @@ class CatalogTypeSystemBuilder {
 
         // GIN operator classes
         table.insertRow(new Object[]{oids.oid("opclass:gin_tsvector_ops"), "tsvector_ops", pgCatalogNs, 10,
-                oids.oid("opfamily:gin_tsvector_ops"), oids.oid("type:tsvector"), 0, true, 2742, 1});
+                oids.oid("opfamily:gin_tsvector_ops"), DataType.TSVECTOR.getOid(), 0, true, 2742, 1});
         table.insertRow(new Object[]{oids.oid("opclass:gin_jsonb_ops"), "jsonb_ops", pgCatalogNs, 10,
                 oids.oid("opfamily:gin_jsonb_ops"), DataType.JSONB.getOid(), 0, true, 2742, 1});
+        // GIN array_ops is polymorphic: PG types it anyarray, not "no type at all".
         table.insertRow(new Object[]{oids.oid("opclass:gin_array_ops"), "array_ops", pgCatalogNs, 10,
-                oids.oid("opfamily:gin_array_ops"), 0, 0, true, 2742, 1});
+                oids.oid("opfamily:gin_array_ops"), DataType.ANYARRAY.getOid(), 0, true, 2742, 1});
 
         // GIST operator classes
         table.insertRow(new Object[]{oids.oid("opclass:gist_point_ops"), "point_ops", pgCatalogNs, 10,
-                oids.oid("opfamily:gist_point_ops"), oids.oid("type:point"), 0, true, 783, 1});
+                oids.oid("opfamily:gist_point_ops"), DataType.POINT.getOid(), 0, true, 783, 1});
         table.insertRow(new Object[]{oids.oid("opclass:gist_box_ops"), "box_ops", pgCatalogNs, 10,
-                oids.oid("opfamily:gist_box_ops"), oids.oid("type:box"), 0, true, 783, 1});
-        table.insertRow(new Object[]{oids.oid("opclass:gist_inet_ops"), "inet_ops", pgCatalogNs, 10,
-                oids.oid("opfamily:gist_inet_ops"), oids.oid("type:inet"), 0, false, 783, 1});
+                oids.oid("opfamily:gist_box_ops"), DataType.BOX.getOid(), 0, true, 783, 1});
 
         // User-defined operator classes
         int publicNsOpc = oids.oid("ns:public");
@@ -412,9 +417,9 @@ class CatalogTypeSystemBuilder {
 
     Table buildPgOpfamily() {
         List<Column> cols = Cols.listOf(
-                colNN("oid", DataType.INTEGER), colNN("opfname", DataType.TEXT),
-                col("opfnamespace", DataType.INTEGER), col("opfowner", DataType.INTEGER),
-                col("opfmethod", DataType.INTEGER), col("xmin", DataType.INTEGER));
+                colNN("oid", DataType.OID), colNN("opfname", DataType.NAME),
+                col("opfnamespace", DataType.OID), col("opfowner", DataType.OID),
+                col("opfmethod", DataType.OID), col("xmin", DataType.INTEGER));
         Table table = new Table("pg_opfamily", cols);
         int pgCatalogNs = oids.oid("ns:pg_catalog");
         // Btree operator families
@@ -438,7 +443,6 @@ class CatalogTypeSystemBuilder {
         // GIST operator families
         table.insertRow(new Object[]{oids.oid("opfamily:gist_point_ops"), "point_ops", pgCatalogNs, 10, 783, 1});
         table.insertRow(new Object[]{oids.oid("opfamily:gist_box_ops"), "box_ops", pgCatalogNs, 10, 783, 1});
-        table.insertRow(new Object[]{oids.oid("opfamily:gist_inet_ops"), "inet_ops", pgCatalogNs, 10, 783, 1});
 
         // User-defined operator families
         int publicNsOpf = oids.oid("ns:public");
@@ -455,97 +459,103 @@ class CatalogTypeSystemBuilder {
         return table;
     }
 
+    /**
+     * pg_aggregate, in PostgreSQL's own column order and with one row per aggregate overload.
+     *
+     * <p>The row is what says an aggregate is an aggregate: every tool that asks what aggregates
+     * a server has joins pg_proc to here on aggfnoid, and an overload with no row of its own
+     * drops out of that join. Listing one row per name where pg_proc lists one per overload left
+     * a hundred and fifteen of them unreachable.
+     */
     Table buildPgAggregate() {
         List<Column> cols = Cols.listOf(
-                colNN("aggfnoid", DataType.INTEGER), col("aggtransfn", DataType.INTEGER),
-                col("aggtranstype", DataType.INTEGER), col("aggfinalfn", DataType.INTEGER),
-                col("agginitval", DataType.TEXT), col("aggsortop", DataType.INTEGER),
-                col("aggfinalextra", DataType.BOOLEAN), col("aggtransspace", DataType.INTEGER),
-                col("aggmtransfn", DataType.INTEGER), col("aggminvtransfn", DataType.INTEGER),
-                col("aggmtranstype", DataType.INTEGER), col("aggmtransspace", DataType.INTEGER),
-                col("aggmfinalfn", DataType.INTEGER), col("aggmfinalextra", DataType.BOOLEAN),
-                col("aggminitval", DataType.TEXT), col("aggkind", DataType.CHAR),
+                colNN("aggfnoid", DataType.REGPROC), col("aggkind", DataType.INTERNAL_CHAR),
                 col("aggnumdirectargs", DataType.SMALLINT),
-                col("aggcombinefn", DataType.INTEGER), col("aggserialfn", DataType.INTEGER),
-                col("aggdeserialfn", DataType.INTEGER), col("xmin", DataType.INTEGER));
+                col("aggtransfn", DataType.REGPROC), col("aggfinalfn", DataType.REGPROC),
+                col("aggcombinefn", DataType.REGPROC), col("aggserialfn", DataType.REGPROC),
+                col("aggdeserialfn", DataType.REGPROC), col("aggmtransfn", DataType.REGPROC),
+                col("aggminvtransfn", DataType.REGPROC), col("aggmfinalfn", DataType.REGPROC),
+                col("aggfinalextra", DataType.BOOLEAN), col("aggmfinalextra", DataType.BOOLEAN),
+                col("aggfinalmodify", DataType.INTERNAL_CHAR),
+                col("aggmfinalmodify", DataType.INTERNAL_CHAR),
+                col("aggsortop", DataType.OID), col("aggtranstype", DataType.OID),
+                col("aggtransspace", DataType.INTEGER), col("aggmtranstype", DataType.OID),
+                col("aggmtransspace", DataType.INTEGER),
+                col("agginitval", DataType.TEXT), col("aggminitval", DataType.TEXT));
         Table table = new Table("pg_aggregate", cols);
 
-        // Built-in aggregate entries (matching pg_proc built-in aggregate functions)
-        String[] builtinAggs = {"count", "sum", "avg", "min", "max", "array_agg",
-                "string_agg", "bool_and", "bool_or", "every", "json_agg", "jsonb_agg",
-                "json_object_agg", "jsonb_object_agg", "xmlagg", "bit_and", "bit_or"};
-        for (String aggName : builtinAggs) {
-            int aggOid = oids.oid("proc:" + aggName);
-            table.insertRow(new Object[]{
-                    aggOid, 0,         // aggfnoid, aggtransfn
-                    0, 0,              // aggtranstype, aggfinalfn
-                    null, 0,           // agginitval, aggsortop
-                    false, 0,          // aggfinalextra, aggtransspace
-                    0, 0,              // aggmtransfn, aggminvtransfn
-                    0, 0,              // aggmtranstype, aggmtransspace
-                    0, false,          // aggmfinalfn, aggmfinalextra
-                    null, "n",         // aggminitval, aggkind (normal)
-                    (short) 0,         // aggnumdirectargs
-                    0, 0,              // aggcombinefn, aggserialfn
-                    0, 1               // aggdeserialfn, xmin
-            });
+        // One row per built-in overload, keyed the way pg_proc keys the same overload, so the
+        // join on aggfnoid reaches every aggregate row pg_proc reports.
+        Map<String, Integer> aggIndex = new java.util.HashMap<>();
+        for (String[] agg : BuiltinAggregateSignatures.AGGREGATES) {
+            String aggName = agg[0];
+            int idx = aggIndex.merge(aggName, 0, (a, b) -> a + 1);
+            String oidKey = idx == 0 ? "proc:" + aggName : "proc:" + aggName + "#agg" + idx;
+            table.insertRow(builtinAggregateRow(
+                    new RegprocValue(oids.oid(oidKey), aggName), Integer.parseInt(agg[1]), null));
         }
 
         // Populate with user-defined aggregates
         for (Map.Entry<String, PgAggregate> entry : database.getUserAggregates().entrySet()) {
             PgAggregate agg = entry.getValue();
-            int aggOid = oids.oid("proc:" + agg.getName());
-            int sfuncOid = oids.oid("proc:" + agg.getSfunc());
-            int finalfuncOid = agg.getFinalfunc() != null ? oids.oid("proc:" + agg.getFinalfunc()) : 0;
-            int combinefuncOid = agg.getCombinefunc() != null ? oids.oid("proc:" + agg.getCombinefunc()) : 0;
-            int sortopOid = 0; // sort operator not commonly used
-            // Resolve stype to a type OID
-            int stypeOid = resolveTypeOid(agg.getStype());
-            // Use RegprocValue for function OID columns so ::text resolves to function name
-            Object sfuncVal = new RegprocValue(sfuncOid, agg.getSfunc());
+            Object aggFn = new RegprocValue(oids.oid("proc:" + agg.getName()), agg.getName());
+            Object sfuncVal = new RegprocValue(oids.oid("proc:" + agg.getSfunc()), agg.getSfunc());
             Object finalfuncVal = agg.getFinalfunc() != null
-                    ? new RegprocValue(finalfuncOid, agg.getFinalfunc()) : 0;
+                    ? new RegprocValue(oids.oid("proc:" + agg.getFinalfunc()), agg.getFinalfunc())
+                    : new RegprocValue(0, "-");
             Object combinefuncVal = agg.getCombinefunc() != null
-                    ? new RegprocValue(combinefuncOid, agg.getCombinefunc()) : 0;
-            table.insertRow(new Object[]{
-                    aggOid, sfuncVal,
-                    stypeOid, finalfuncVal,
-                    agg.getInitcond(), sortopOid,
-                    false, 0,          // aggfinalextra, aggtransspace
-                    0, 0,              // aggmtransfn, aggminvtransfn
-                    0, 0,              // aggmtranstype, aggmtransspace
-                    0, false,          // aggmfinalfn, aggmfinalextra
-                    null, "n",         // aggminitval, aggkind (normal)
-                    (short) 0,         // aggnumdirectargs
-                    combinefuncVal, 0, // aggcombinefn, aggserialfn
-                    0, 1               // aggdeserialfn, xmin
-            });
+                    ? new RegprocValue(oids.oid("proc:" + agg.getCombinefunc()), agg.getCombinefunc())
+                    : new RegprocValue(0, "-");
+            Object[] row = builtinAggregateRow(aggFn, resolveTypeOid(agg.getStype()), agg.getInitcond());
+            row[3] = sfuncVal;      // aggtransfn
+            row[4] = finalfuncVal;  // aggfinalfn
+            row[5] = combinefuncVal; // aggcombinefn
+            table.insertRow(row);
         }
         return table;
+    }
+
+    /** A pg_aggregate row with the support functions left unclaimed rather than invented. */
+    private Object[] builtinAggregateRow(Object aggfnoid, int transType, String initval) {
+        RegprocValue none = new RegprocValue(0, "-");
+        return new Object[]{
+                aggfnoid, "n", (short) 0,
+                none, none, none, none, none, none, none, none,
+                false, false, "r", "r",
+                0, transType, 0, 0, 0,
+                initval, null
+        };
     }
 
     Table buildPgAmop() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.INTEGER), col("amopfamily", DataType.INTEGER),
                 col("amoplefttype", DataType.INTEGER), col("amoprighttype", DataType.INTEGER),
-                col("amopstrategy", DataType.SMALLINT), col("amopopr", DataType.INTEGER),
+                col("amopstrategy", DataType.SMALLINT), col("amoppurpose", DataType.CHAR),
+                col("amopopr", DataType.INTEGER),
                 col("amopmethod", DataType.INTEGER), col("amopsortfamily", DataType.INTEGER),
                 col("xmin", DataType.INTEGER));
         Table table = new Table("pg_amop", cols);
         int btreeAm = 403;
-        int int4Type = 23;
-        int textType = 25;
-        // btree integer_ops: strategies 1-5 (less, leq, eq, geq, gt)
-        int intFamOid = oids.oid("opfamily:integer_ops");
-        for (short strat = 1; strat <= 5; strat++) {
-            table.insertRow(new Object[]{oids.oid("amop:int:" + strat), intFamOid,
-                    int4Type, int4Type, strat, 0, btreeAm, 0, 1});
-        }
-        // btree text_ops: strategies 1-5
-        int textFamOid = oids.oid("opfamily:text_ops");
-        for (short strat = 1; strat <= 5; strat++) {
-            table.insertRow(new Object[]{oids.oid("amop:text:" + strat), textFamOid,
-                    textType, textType, strat, 0, btreeAm, 0, 1});
+        // btree strategies 1-5, in PG's order: less, leq, eq, geq, gt. Each names the operator it
+        // stands for, so a join from pg_amop to pg_operator -- the normal way to read this table
+        // -- resolves instead of dropping every row.
+        String[] btreeOps = {"<", "<=", "=", ">=", ">"};
+        Object[][] families = {
+                {"integer_ops", DataType.INTEGER.getOid()},
+                {"text_ops", DataType.TEXT.getOid()},
+        };
+        for (Object[] fam : families) {
+            String famName = (String) fam[0];
+            int typeOid = (Integer) fam[1];
+            int famOid = oids.oid("opfamily:" + famName);
+            for (short strat = 1; strat <= 5; strat++) {
+                table.insertRow(new Object[]{
+                        oids.oid("amop:" + famName + ":" + strat), famOid,
+                        typeOid, typeOid, strat, "s",
+                        operatorOid(btreeOps[strat - 1], typeOid, typeOid),
+                        btreeAm, 0, 1});
+            }
         }
         return table;
     }
