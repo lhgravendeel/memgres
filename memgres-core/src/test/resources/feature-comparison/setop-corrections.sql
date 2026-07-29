@@ -409,15 +409,10 @@ PREPARE stc_p2(int) AS SELECT 1 AS n UNION SELECT 2 ORDER BY $1;
 -- 6. A name may be written with four parts
 -- ============================================================================
 
--- note: the catalog the session is connected to is reached; any other is not
--- expected: 1, 2, 3, 4
-SELECT memgrestest.public.stc_dpt.id FROM public.stc_dpt ORDER BY 1;
-
--- expected: (1,a), (2,b), (3,c), (4,d)
-SELECT memgrestest.public.stc_dpt.* FROM public.stc_dpt ORDER BY 1;
-
--- expected: 1
-SELECT count(*) FROM stc_dpt WHERE memgrestest.public.stc_dpt.id = 1;
+-- note: naming the session catalog reaches it, and naming any other does not. The
+-- positive half cannot be written here because the two engines are connected to
+-- databases of different names and this file is replayed verbatim against both;
+-- SetOpCorrectionTest asserts it against whatever current_database() answers.
 
 -- begin-expected-error
 -- sqlstate: 0A000

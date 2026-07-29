@@ -1720,16 +1720,16 @@ class SelectExecutor {
                 }
                 return false;
             }
-            // IN is mostly not one of these. PostgreSQL rewrites it into comparisons and expands
-            // a set written on either side of them, so "gs IN (1,2)" answers a row per element
-            // and "1 IN (gs, 5)" does too. What it will not do is compare one set against one
-            // other set: a list of exactly one element with a set on both sides is refused, while
-            // the same two sets among a longer list are expanded like anything else.
+            // IN is one of these only when its list holds a single value. PostgreSQL rewrites a
+            // longer list into comparisons and expands a set written on either side of them, so
+            // "gs IN (1,2)" and "1 IN (gs, 5)" each answer a row per element, and so does the
+            // ANY spelling however long its array. A one-element list keeps the IN itself, and
+            // that is what will not take a set — on either side, and NOT IN with it.
             if (node instanceof InExpr) {
                 InExpr in = (InExpr) node;
+                if (in.fromAny() || in.values() == null || in.values().size() != 1) return false;
                 if (isSubqueryIn(in)) return containsSrf(in.expr());
-                return in.values() != null && in.values().size() == 1
-                        && containsSrf(in.expr()) && containsSrf(in.values().get(0));
+                return containsSrf(in.expr()) || containsSrf(in.values().get(0));
             }
             if (node instanceof BetweenExpr) return containsSrf(node);
             if (node instanceof BinaryExpr) {

@@ -748,8 +748,12 @@ public class ExpressionParser {
                 Expression arrayExpr = parseExpression();
                 expect(TokenType.RIGHT_PAREN);
                 if (!isAll && arrayExpr instanceof ArrayExpr) {
+                    // Marked as the ANY spelling even though the elements are written out, so that
+                    // it is not mistaken for a written IN afterwards: the two are the same
+                    // comparison but not the same construct, and a one-element IN forbids things
+                    // a one-element ANY allows.
                     ArrayExpr arr = (ArrayExpr) arrayExpr;
-                    return new InExpr(left, arr.elements(), false);
+                    return new InExpr(left, arr.elements(), false, true);
                 }
                 // ANY/ALL with array expression: evaluate element by element
                 if (!isAll) {
