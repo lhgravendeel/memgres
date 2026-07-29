@@ -27,8 +27,10 @@ import static org.junit.jupiter.api.Assertions.*;
  * or hash-joinable join conditions}. What it accepts was measured across forty conditions rather
  * than guessed, and the shape of the rule follows from them: one AND-ed clause being a cross-side
  * equality is enough however unmergeable the rest are, a condition that folds to a constant is
- * always fine, and a WHERE that reads either side lifts the restriction because the join is then
- * planned as an inner one.
+ * always fine, and a WHERE that rejects the rows a side was padded with lifts the restriction
+ * because the join is then planned as an inner one. PostgreSQL normalises the condition before it
+ * judges it and only a strict qual above the join downgrades it; both are measured in
+ * {@link FullJoinAdmissibilityTest}, which this class leaves to it.
  *
  * <p><b>A NATURAL join merges the columns both sides share</b>, exactly as a USING clause naming
  * them would. Only the USING half was known to the ambiguity check, so a reference to a merged

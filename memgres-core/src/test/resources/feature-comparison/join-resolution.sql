@@ -15,9 +15,11 @@
 --    the other's. Anything else is refused where the query is planned. What it accepts was
 --    measured across forty conditions rather than guessed: one AND-ed clause being a cross-side
 --    equality is enough however unmergeable the rest are, a condition that folds to a constant is
---    always fine, and a WHERE that reads either side lifts the restriction entirely because the
---    join is then planned as an inner one. A view body is only analysed and not planned, so a view
---    over such a join is still created -- and fails when it is read.
+--    always fine, and a WHERE that rejects the rows a side was padded with lifts the restriction
+--    because the join is then planned as an inner one. A view body is only analysed and not
+--    planned, so a view over such a join is still created -- and fails when it is read. The
+--    normalisation PostgreSQL applies before it judges the condition, and which quals above the
+--    join downgrade it, are measured in full-join-admissibility.sql.
 --
 -- 3. A NATURAL join merges the columns both sides share, exactly as a USING clause naming them
 --    would. Only the USING half was known to the ambiguity check. The merges are counted rather

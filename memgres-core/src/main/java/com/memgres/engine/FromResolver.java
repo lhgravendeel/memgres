@@ -20,14 +20,187 @@ class FromResolver {
     /**
      * The WHERE of the query whose FROM is being resolved. A full join reads it: a WHERE that
      * discards the null-padded rows makes the join an inner one, which lifts the restriction on
-     * what its condition may be. See {@code FromJoinExecutor.rejectUnmergeableFullJoin}.
+     * what its condition may be. See {@link FullJoinAdmissibility}.
      */
     Expression enclosingWhere;
+    /** The HAVING of that query; the clauses of it with no aggregate are WHERE clauses too. */
+    Expression enclosingHaving;
+    /** The ON conditions of the joins above the one being resolved that filter its rows. */
+    final List<Expression> joinQualsAbove = new ArrayList<>();
+    /**
+     * Column names of the query being resolved that a qual of an enclosing query proves are not
+     * null, once that query has been pulled up into the enclosing one.
+     */
+    Set<String> inheritedNonNullNames = Collections.emptySet();
+    /** Set when the enclosing query could not be read, which accepts every full join below. */
+    boolean inheritedQualsUnreadable;
+    /** Set while a stored definition is being analysed rather than planned. */
+    boolean suppressFullJoinCheck;
+
+    final FullJoinAdmissibility fullJoinCheck;
 
     FromResolver(AstExecutor executor) {
         this.executor = executor;
         this.functionResolver = new FromFunctionResolver(executor);
         this.joinExecutor = new FromJoinExecutor(this);
+        this.fullJoinCheck = new FullJoinAdmissibility(this);
+    }
+
+    // ---- Quals a nested query inherits from the query above it ----
+
+    /**
+     * What the full-join check knew before a nested query was entered, so that it can be put back
+     * when the nested query is done with.
+     */
+    static final class QualScope {
+        private final Expression where;
+        private final Expression having;
+        private final List<Expression> joinQuals;
+        private final Set<String> inherited;
+        private final boolean unreadable;
+
+        private QualScope(FromResolver r) {
+            this.where = r.enclosingWhere;
+            this.having = r.enclosingHaving;
+            this.joinQuals = new ArrayList<>(r.joinQualsAbove);
+            this.inherited = r.inheritedNonNullNames;
+            this.unreadable = r.inheritedQualsUnreadable;
+        }
+    }
+
+    /**
+     * Enter a subquery, WITH query or view body, carrying down what the quals of this query prove
+     * about the rows it will answer with.
+     *
+     * <p>PostgreSQL pulls a simple subquery up into the query that reads it, and a qual of that
+     * query then sits directly above whatever joins the subquery holds. Reproducing which columns
+     * that qual proves non-null is what lets a full join below it be planned as an inner one. When
+     * the subquery is one PostgreSQL would not pull up — it counts rows, sorts and cuts them, or
+     * groups them — nothing reaches down and the join is judged on its own; when its shape cannot
+     * be read at all, every full join inside it is accepted.
+     */
+    QualScope enterNestedQuery(Statement body, String alias, List<String> columnAliases,
+                               boolean inlinable) {
+        QualScope saved = new QualScope(this);
+        Set<String> outerNonNull = namesProvedNonNullFor(alias);
+        Set<String> inner;
+        if (outerNonNull == null) {
+            inner = null;
+        } else if (!inlinable) {
+            inner = Collections.emptySet();
+        } else {
+            inner = mapNamesThroughTargets(body, columnAliases, outerNonNull);
+        }
+        enclosingWhere = null;
+        enclosingHaving = null;
+        joinQualsAbove.clear();
+        inheritedNonNullNames = inner == null ? Collections.<String>emptySet() : inner;
+        inheritedQualsUnreadable = inner == null;
+        return saved;
+    }
+
+    void leaveNestedQuery(QualScope saved) {
+        enclosingWhere = saved.where;
+        enclosingHaving = saved.having;
+        joinQualsAbove.clear();
+        joinQualsAbove.addAll(saved.joinQuals);
+        inheritedNonNullNames = saved.inherited;
+        inheritedQualsUnreadable = saved.unreadable;
+    }
+
+    /**
+     * The output names of the FROM item called {@code alias} that this query's quals prove are not
+     * null, or null when a qual names something that cannot be placed.
+     */
+    private Set<String> namesProvedNonNullFor(String alias) {
+        List<Expression> quals = new ArrayList<>();
+        if (enclosingWhere != null) FullJoinAdmissibility.flattenAnd(enclosingWhere, quals);
+        if (enclosingHaving != null) {
+            List<Expression> having = new ArrayList<>();
+            FullJoinAdmissibility.flattenAnd(enclosingHaving, having);
+            for (Expression h : having) {
+                if (!StoredExprCheck.hasAggregate(h)) quals.add(h);
+            }
+        }
+        quals.addAll(joinQualsAbove);
+        Set<ColumnRef> nonNull = new HashSet<>();
+        for (Expression q : quals) fullJoinCheck.nonNullableVars(q, nonNull);
+        Set<String> names = new HashSet<>();
+        for (String inherited : inheritedNonNullNames) names.add(inherited);
+        for (ColumnRef ref : nonNull) {
+            if (ref.column() == null) continue;
+            if (ref.table() == null || ref.table().equalsIgnoreCase(alias)) {
+                names.add(ref.column().toLowerCase());
+            }
+        }
+        return names;
+    }
+
+    /**
+     * The columns of {@code body} that produce the given output names, or null when the target
+     * list cannot be followed.
+     */
+    private Set<String> mapNamesThroughTargets(Statement body, List<String> columnAliases,
+                                               Set<String> outputNames) {
+        if (outputNames.isEmpty()) return Collections.emptySet();
+        if (!(body instanceof SelectStmt)) return null;
+        SelectStmt sel = (SelectStmt) body;
+        List<SelectStmt.SelectTarget> targets = sel.targets();
+        if (targets == null || targets.isEmpty()) return null;
+        boolean hasWildcard = false;
+        for (SelectStmt.SelectTarget t : targets) {
+            if (t.expr() instanceof WildcardExpr || t.expr() instanceof CompositeStarExpr) hasWildcard = true;
+        }
+        Set<String> inner = new HashSet<>();
+        for (String name : outputNames) {
+            SelectStmt.SelectTarget target = null;
+            if (columnAliases != null && !columnAliases.isEmpty()) {
+                for (int i = 0; i < columnAliases.size() && i < targets.size(); i++) {
+                    if (columnAliases.get(i).equalsIgnoreCase(name)) {
+                        target = targets.get(i);
+                        break;
+                    }
+                }
+            }
+            if (target == null) {
+                for (SelectStmt.SelectTarget t : targets) {
+                    if (t.alias() != null ? t.alias().equalsIgnoreCase(name)
+                            : t.expr() instanceof ColumnRef
+                              && name.equalsIgnoreCase(((ColumnRef) t.expr()).column())) {
+                        target = t;
+                        break;
+                    }
+                }
+            }
+            if (target == null) {
+                // A wildcard answers with names of its own, which are the names below unchanged.
+                if (hasWildcard) inner.add(name.toLowerCase());
+                continue;
+            }
+            Set<ColumnRef> refs = new HashSet<>();
+            fullJoinCheck.nonNullableVars(target.expr(), refs);
+            for (ColumnRef r : refs) {
+                if (r.column() != null) inner.add(r.column().toLowerCase());
+            }
+        }
+        return inner;
+    }
+
+    /** Whether PostgreSQL would pull this query up into the one reading it. */
+    static boolean isInlinableSubquery(Statement body) {
+        if (!(body instanceof SelectStmt)) return false;
+        SelectStmt sel = (SelectStmt) body;
+        if (sel.distinct() || sel.limit() != null || sel.offset() != null) return false;
+        if (sel.groupBy() != null && !sel.groupBy().isEmpty()) return false;
+        if (sel.groupingSets() != null && !sel.groupingSets().isEmpty()) return false;
+        if (sel.having() != null) return false;
+        if (sel.windowDefs() != null && !sel.windowDefs().isEmpty()) return false;
+        if (sel.targets() != null) {
+            for (SelectStmt.SelectTarget t : sel.targets()) {
+                if (StoredExprCheck.hasAggregate(t.expr())) return false;
+            }
+        }
+        return true;
     }
 
     // ---- Table Bindings (column structure without data) ----
@@ -52,12 +225,18 @@ class FromResolver {
      */
     List<RowContext.TableBinding> resolveItemShape(SelectStmt.FromItem item) {
         List<RowContext.TableBinding> bindings = new ArrayList<>();
+        // Describing an item can mean running it a second time; anything it holds has already been
+        // judged on the first run, so nothing is judged again here.
+        boolean priorSuppress = suppressFullJoinCheck;
+        suppressFullJoinCheck = true;
         try {
             resolveTableBindingsFromItem(item, bindings);
         } catch (RuntimeException e) {
             // The shape is a convenience, not the answer: a FROM item that cannot be described
             // (an unreadable lateral, say) leaves the padding as it was before.
             return Cols.listOf();
+        } finally {
+            suppressFullJoinCheck = priorSuppress;
         }
         return bindings;
     }
@@ -237,10 +416,34 @@ class FromResolver {
      * Resolve FROM clause with optional WHERE pushdown for early filtering during cross-product.
      */
     List<RowContext> resolveFromClause(List<SelectStmt.FromItem> fromItems, Expression where) {
+        return resolveFromClause(fromItems, where, null);
+    }
+
+    List<RowContext> resolveFromClause(List<SelectStmt.FromItem> fromItems, Expression where,
+                                       Expression having) {
+        Expression priorWhere = enclosingWhere;
+        Expression priorHaving = enclosingHaving;
+        enclosingWhere = where;
+        enclosingHaving = having;
+        try {
+            return resolveFromClauseInner(fromItems, where);
+        } finally {
+            enclosingWhere = priorWhere;
+            enclosingHaving = priorHaving;
+        }
+    }
+
+    /**
+     * Resolve the FROM of an UPDATE or the USING of a DELETE. The statement's WHERE is the qual
+     * above these relations, and a full join among them is planned as an inner one when it
+     * rejects the rows a side was padded with — but the WHERE also names the table being written,
+     * which is not one of them, so it is not pushed into the scan.
+     */
+    List<RowContext> resolveWrittenFromClause(List<SelectStmt.FromItem> fromItems, Expression where) {
         Expression priorWhere = enclosingWhere;
         enclosingWhere = where;
         try {
-            return resolveFromClauseInner(fromItems, where);
+            return resolveFromClauseInner(fromItems, null);
         } finally {
             enclosingWhere = priorWhere;
         }
@@ -418,8 +621,16 @@ class FromResolver {
         // Check CTEs first
         SelectStmt.CommonTableExpr cte = executor.selectExecutor.lookupCte(tableRef.table());
         if (cte != null) {
-            QueryResult cteResult = executor.selectExecutor.executeCte(cte);
-            String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+            String cteAlias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+            QualScope cteScope = enterNestedQuery(cte.query(), cteAlias, cte.columnNames(),
+                    !cte.recursive() && isInlinableSubquery(cte.query()));
+            QueryResult cteResult;
+            try {
+                cteResult = executor.selectExecutor.executeCte(cte);
+            } finally {
+                leaveNestedQuery(cteScope);
+            }
+            String alias = cteAlias;
             Table virtualTable = new Table(alias, cteResult.getColumns());
             lastResolvedRightTable = virtualTable;
             lastResolvedRightAlias = alias;
@@ -458,9 +669,12 @@ class FromResolver {
                         "view:" + viewSchema.toLowerCase() + "." + tableRef.table().toLowerCase());
                 if (viewOwner != null) executor.viewOwnerRole = viewOwner;
                 QueryResult viewResult;
+                QualScope viewScope = enterNestedQuery(view.query(), alias, null,
+                        isInlinableSubquery(view.query()));
                 try {
                     viewResult = executor.executeViewQuery(tableRef.table(), view.query());
                 } finally {
+                    leaveNestedQuery(viewScope);
                     executor.viewOwnerRole = priorViewOwner;
                 }
                 cols = viewResult.getColumns();
@@ -786,14 +1000,20 @@ class FromResolver {
     }
 
     private List<RowContext> resolveSubquery(SelectStmt.SubqueryFrom subqFrom) {
-        QueryResult subResult;
-        if (subqFrom.subquery() instanceof SelectStmt) {
-            SelectStmt sel = (SelectStmt) subqFrom.subquery();
-            subResult = executor.executeSelect(sel);
-        } else {
-            subResult = executor.executeStatement(subqFrom.subquery());
-        }
         String alias = subqFrom.alias() != null ? subqFrom.alias() : "subquery";
+        QueryResult subResult;
+        QualScope scope = enterNestedQuery(subqFrom.subquery(), alias, subqFrom.columnAliases(),
+                !subqFrom.lateral() && isInlinableSubquery(subqFrom.subquery()));
+        try {
+            if (subqFrom.subquery() instanceof SelectStmt) {
+                SelectStmt sel = (SelectStmt) subqFrom.subquery();
+                subResult = executor.executeSelect(sel);
+            } else {
+                subResult = executor.executeStatement(subqFrom.subquery());
+            }
+        } finally {
+            leaveNestedQuery(scope);
+        }
         List<Column> columns = FromFunctionResolver.applyColumnAliases(
                 new ArrayList<>(subResult.getColumns()), subqFrom.columnAliases());
         Table virtualTable = new Table(alias, columns);

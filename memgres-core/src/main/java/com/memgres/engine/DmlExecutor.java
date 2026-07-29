@@ -1266,7 +1266,9 @@ class DmlExecutor {
         // Resolve FROM clause tables (for multi-table UPDATE)
         List<RowContext> fromContexts = null;
         if (stmt.from() != null && !stmt.from().isEmpty()) {
-            fromContexts = executor.fromResolver.resolveFromClause(stmt.from());
+            // The WHERE goes with the FROM: it is the qual above whatever joins the FROM holds,
+            // and a full join below it is planned as an inner one when it rejects padded rows.
+            fromContexts = executor.fromResolver.resolveWrittenFromClause(stmt.from(), stmt.where());
         }
 
         // Pre-flight type validation of WHERE clause (PG checks at plan time, even on empty tables)
@@ -1923,7 +1925,8 @@ class DmlExecutor {
         Map<Object[], RowContext> deleteUsingCtxMap = new IdentityHashMap<>();
         if (stmt.using() != null && !stmt.using().isEmpty()) {
             // DELETE ... USING: join main table with USING tables, delete matching main rows
-            List<RowContext> usingContexts = executor.fromResolver.resolveFromClause(stmt.using());
+            List<RowContext> usingContexts =
+                    executor.fromResolver.resolveWrittenFromClause(stmt.using(), stmt.where());
             for (Object[] row : allRows) {
                 Object[] evalRow = deleteHasVirtual ? computeVirtualColumns(table, row) : row;
                 RowContext mainCtx = viewAwareCtx(table, stmt.alias(), evalRow);
