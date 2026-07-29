@@ -378,10 +378,11 @@ class DdlParser {
                 name = parser.readIdentifier();
             }
         }
-        // Routines and indexes carry the qualifier onward, because an unqualified name of either
-        // only reaches what the search path makes visible; the other kinds key by bare name.
-        String dropSchema = objectType == DropStmt.ObjectType.FUNCTION
-                || objectType == DropStmt.ObjectType.INDEX ? qualifier : null;
+        // Every kind carries the qualifier onward so the executor can tell a missing schema from
+        // a missing object; routines and indexes are also looked up by it, because an unqualified
+        // name of either only reaches what the search path makes visible, and the rest still key
+        // by bare name. An operator writes its own schema into its name above.
+        String dropSchema = objectType == DropStmt.ObjectType.OPERATOR ? null : qualifier;
 
         java.util.List<String> funcParamTypes = null;
         if ((objectType == DropStmt.ObjectType.FUNCTION || objectType == DropStmt.ObjectType.AGGREGATE)

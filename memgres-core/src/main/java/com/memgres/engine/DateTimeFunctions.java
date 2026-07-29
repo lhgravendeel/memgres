@@ -839,7 +839,11 @@ class DateTimeFunctions {
         }
         // Group separators are positional noise; only the decimal marker carries meaning
         s = s.replaceAll("[^0-9.]", "");
-        if (s.isEmpty()) return java.math.BigDecimal.ZERO;
+        if (s.isEmpty()) {
+            // Nothing the format could read as a number was there. PG reports what it was left
+            // holding, which is a blank, rather than quietly answering zero.
+            throw new MemgresException("invalid input syntax for type numeric: \" \"", "22P02");
+        }
         java.math.BigDecimal value;
         try {
             value = new java.math.BigDecimal(s);

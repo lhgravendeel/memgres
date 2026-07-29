@@ -548,7 +548,16 @@ public class AstExecutor {
         if (col.getEnumTypeName() != null) return col.getEnumTypeName();
         if (col.getCompositeTypeName() != null) return null;
         if (col.getArrayElementType() != null) return col.getArrayElementType().getPgName() + "[]";
-        return col.getType() != null ? col.getType().getPgName() : null;
+        if (col.getType() == null) return null;
+        // %TYPE copies the column's type exactly, length and precision included: a variable
+        // declared from a varchar(3) column is itself a varchar(3)
+        String name = col.getType().getPgName();
+        if (col.getPrecision() != null) {
+            name += col.getScale() != null
+                    ? "(" + col.getPrecision() + "," + col.getScale() + ")"
+                    : "(" + col.getPrecision() + ")";
+        }
+        return name;
     }
 
     Object evalBinaryValues(BinaryExpr.BinOp op, Object left, Object right) {
@@ -977,6 +986,13 @@ public class AstExecutor {
         if (schemaName != null && database.getSchema(schemaName) == null
                 && !"pg_catalog".equalsIgnoreCase(schemaName)
                 && !"information_schema".equalsIgnoreCase(schemaName)) {
+            // A query names a relation, not a schema: PG resolves schema.table as one name and
+            // reports the whole of it missing, and a client that branches on 42P01 to mean
+            // "no such table" is right either way
+            if (userQualified) {
+                throw new MemgresException("relation \"" + schemaName + "." + tableName
+                        + "\" does not exist", "42P01");
+            }
             throw new MemgresException("schema \"" + schemaName + "\" does not exist", "3F000");
         }
         Database.ViewDef view = database.getView(tableName);

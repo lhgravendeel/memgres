@@ -232,8 +232,9 @@ class RelationKindTest {
                 + " WHERE schema_name = 'rkt_r1'"));
         assertEquals("rkt_r2", scalar("SELECT table_schema FROM information_schema.tables"
                 + " WHERE table_name = 'rkt_rt'"));
-        // and the old name no longer resolves
-        assertState("3F000", "SELECT count(*) FROM rkt_r1.rkt_rt");
+        // and the old name no longer resolves. A query names a relation, not a schema, so
+        // PostgreSQL reports the whole qualified name missing rather than the schema.
+        assertState("42P01", "SELECT count(*) FROM rkt_r1.rkt_rt");
         exec("DROP SCHEMA rkt_r2 CASCADE");
     }
 

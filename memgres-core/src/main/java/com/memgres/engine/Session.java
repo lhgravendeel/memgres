@@ -928,7 +928,42 @@ public class Session {
         return -1;
     }
 
+    /**
+     * A savepoint marks a point inside a transaction block to come back to, so there has to be a
+     * block: outside one there is nothing for it to divide and nothing later to roll back to,
+     * and PostgreSQL refuses all three savepoint commands rather than open a transaction of its
+     * own that the next statement would immediately commit.
+     */
+    private void requireTransactionBlock(String command) {
+        if (!explicitTransactionBlock) {
+            throw new MemgresException(
+                    command + " can only be used in transaction blocks", "25P01");
+        }
+    }
+
+    /**
+     * Once the transaction has failed the only thing left to do with it is leave it, so
+     * PostgreSQL lets ROLLBACK, COMMIT and ROLLBACK TO SAVEPOINT through and refuses everything
+     * else with 25P02 — SAVEPOINT and RELEASE SAVEPOINT included. Marking a point inside a block
+     * that can no longer do any work would only give the caller somewhere to come back to that
+     * is already aborted.
+     */
+    private void refuseInAbortedTransaction() {
+        if (status == TransactionStatus.FAILED) {
+            throw new MemgresException(
+                    "current transaction is aborted, commands ignored until end of transaction block",
+                    "25P02");
+        }
+    }
+
     public void savepoint(String name) {
+        requireTransactionBlock("SAVEPOINT");
+        refuseInAbortedTransaction();
+        internalSavepoint(name);
+    }
+
+    /** A savepoint the engine takes for itself, such as a PL/pgSQL exception block. */
+    public void internalSavepoint(String name) {
         if (status != TransactionStatus.IN_TRANSACTION) {
             // Implicit BEGIN
             begin();
@@ -986,6 +1021,13 @@ public class Session {
     }
 
     public void releaseSavepoint(String name) {
+        requireTransactionBlock("RELEASE SAVEPOINT");
+        refuseInAbortedTransaction();
+        internalReleaseSavepoint(name);
+    }
+
+    /** Release of a savepoint the engine took for itself. */
+    public void internalReleaseSavepoint(String name) {
         if (status == TransactionStatus.IDLE) {
             throw new MemgresException("RELEASE SAVEPOINT can only be used in transaction blocks", "25P01");
         }
@@ -998,6 +1040,12 @@ public class Session {
     }
 
     public void rollbackToSavepoint(String name) {
+        requireTransactionBlock("ROLLBACK TO SAVEPOINT");
+        internalRollbackToSavepoint(name);
+    }
+
+    /** Rollback to a savepoint the engine took for itself. */
+    public void internalRollbackToSavepoint(String name) {
         if (status == TransactionStatus.IDLE) {
             throw new MemgresException("ROLLBACK TO SAVEPOINT can only be used in transaction blocks", "25P01");
         }

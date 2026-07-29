@@ -77,7 +77,6 @@ public final class PlpgsqlBodyValidator {
     private final Deque<Map<String, VarInfo>> scopes = new ArrayDeque<Map<String, VarInfo>>();
     private final Deque<Label> labels = new ArrayDeque<Label>();
     private int loopDepth;
-    private int handlerDepth;
 
     private PlpgsqlBodyValidator(AstExecutor executor, Routine routine) {
         this.executor = executor;
@@ -120,6 +119,16 @@ public final class PlpgsqlBodyValidator {
                     throw new MemgresException(
                             "duplicate declaration at or near \"" + decl.name() + "\"", "42601");
                 }
+                if (decl.aliasFor() != null) {
+                    // An alias names something that has to be there already; it declares nothing
+                    VarInfo target = lookup(decl.aliasFor());
+                    if (target == null) {
+                        throw new MemgresException(
+                                "variable \"" + decl.aliasFor() + "\" does not exist", "42704");
+                    }
+                    frame.put(key, target);
+                    continue;
+                }
                 boolean bound = decl.isCursor()
                         && decl.cursorQuery() != null && !decl.cursorQuery().isEmpty();
                 if (!decl.isCursor()) {
@@ -134,14 +143,9 @@ public final class PlpgsqlBodyValidator {
                 frame.put(key, new VarInfo(decl.constant(), refcursor, bound));
             }
             validateStatements(block.body());
-            handlerDepth++;
-            try {
-                for (PlpgsqlStatement.ExceptionHandler handler : block.exceptionHandlers()) {
-                    for (String condition : handler.conditionNames()) validateCondition(condition);
-                    validateStatements(handler.body());
-                }
-            } finally {
-                handlerDepth--;
+            for (PlpgsqlStatement.ExceptionHandler handler : block.exceptionHandlers()) {
+                for (String condition : handler.conditionNames()) validateCondition(condition);
+                validateStatements(handler.body());
             }
         } finally {
             if (block.label() != null) labels.pop();
@@ -247,6 +251,52 @@ public final class PlpgsqlBodyValidator {
         for (String target : targets) checkWritable(target);
     }
 
+    // ---- FOR … IN query ----
+
+    /**
+     * The target of a FOR over rows names variables the block already declared — unlike the
+     * integer FOR, which defines its own. PostgreSQL says so while compiling the body: a single
+     * name it cannot find is not a record variable, and in a list every name has to be one it
+     * knows. The two loop forms report the same complaint under different SQLSTATEs, which is
+     * PostgreSQL's own inconsistency rather than a choice worth smoothing over.
+     */
+    private void checkLoopTargetDeclared(List<String> varNames, String sqlState) {
+        if (varNames == null || varNames.isEmpty()) return;
+        if (varNames.size() == 1) {
+            if (lookup(varNames.get(0)) == null) {
+                throw new MemgresException("loop variable of loop over rows must be a record"
+                        + " variable or list of scalar variables", sqlState);
+            }
+            return;
+        }
+        for (String name : varNames) {
+            if (lookup(name) == null) {
+                throw new MemgresException("\"" + name + "\" is not a known variable", "42601");
+            }
+        }
+    }
+
+    // ---- FETCH … INTO ----
+
+    /**
+     * A FETCH with an INTO has one row to put somewhere, so PostgreSQL refuses the directions
+     * that are defined to return more than one — FORWARD and BACKWARD with a count, and ALL. It
+     * is the direction and not the count's value that decides: {@code FETCH FORWARD 1 … INTO} is
+     * refused as surely as {@code FETCH FORWARD ALL … INTO}. MOVE takes no INTO, and the
+     * single-row directions (NEXT, PRIOR, FIRST, LAST, ABSOLUTE n, RELATIVE n, bare FORWARD or
+     * BACKWARD) are all fine. The check belongs here because PostgreSQL makes it while reading
+     * the body: a branch that never runs still refuses to compile.
+     */
+    private void checkFetchIntoIsSingleRow(PlpgsqlStatement.FetchStmt stmt) {
+        if (stmt.move() || stmt.intoVars() == null || stmt.intoVars().isEmpty()) return;
+        String direction = stmt.direction() == null ? "NEXT" : stmt.direction().toUpperCase();
+        boolean counted = ("FORWARD".equals(direction) || "BACKWARD".equals(direction))
+                && stmt.countExpr() != null;
+        if (counted) {
+            throw new MemgresException("FETCH statement cannot return multiple rows", "0A000");
+        }
+    }
+
     // ---- Exception conditions ----
 
     private void validateCondition(String condition) {
@@ -288,29 +338,63 @@ public final class PlpgsqlBodyValidator {
     private static final Set<String> CURRENT_ITEMS = Cols.setOf(
             "ROW_COUNT", "PG_CONTEXT", "PG_ROUTINE_OID");
 
+    /**
+     * PostgreSQL reads the whole item list before it judges any item against the form it was
+     * written in, so an unknown item name is reported ahead of a known one the form does not
+     * offer. Whether a handler is running is not a question the compiler can answer at all; that
+     * check belongs to the run and lives in the executor.
+     */
     private void validateDiagnostics(PlpgsqlStatement.GetDiagnosticsStmt stmt) {
-        if (stmt.stacked() && handlerDepth == 0) {
-            throw new MemgresException(
-                    "GET STACKED DIAGNOSTICS cannot be used outside an exception handler", "0Z002");
-        }
         for (PlpgsqlStatement.DiagItem item : stmt.items()) {
+            // Each item is read target first, so an undeclared target outranks a bad item name
+            if (!inScope(item.varName())) {
+                throw new MemgresException(
+                        "\"" + item.varName() + "\" is not a known variable", "42601");
+            }
             checkWritable(item.varName());
             String name = item.itemName().trim();
-            String upper = name.toUpperCase();
-            boolean stackedItem = STACKED_ITEMS.contains(upper);
-            boolean currentItem = CURRENT_ITEMS.contains(upper);
-            if (!stackedItem && !currentItem) {
+            if (!STACKED_ITEMS.contains(name.toUpperCase())
+                    && !CURRENT_ITEMS.contains(name.toUpperCase())) {
                 throw new MemgresException("unrecognized GET DIAGNOSTICS item at or near \""
                         + name.toLowerCase() + "\"", "42601");
             }
-            if (stmt.stacked() && !stackedItem) {
+        }
+        for (PlpgsqlStatement.DiagItem item : stmt.items()) {
+            String upper = item.itemName().trim().toUpperCase();
+            if (stmt.stacked() && !STACKED_ITEMS.contains(upper)) {
                 throw new MemgresException("diagnostics item " + upper
                         + " is not allowed in GET STACKED DIAGNOSTICS", "42601");
             }
-            if (!stmt.stacked() && !currentItem) {
+            if (!stmt.stacked() && !CURRENT_ITEMS.contains(upper)) {
                 throw new MemgresException("diagnostics item " + upper
                         + " is not allowed in GET CURRENT DIAGNOSTICS", "42601");
             }
+        }
+    }
+
+    // ---- RAISE ----
+
+    /**
+     * The format string and its arguments have to agree, and PostgreSQL settles that while it
+     * compiles: both counts are written out in the body, so neither depends on anything the run
+     * would discover. A {@code %} with nothing to fill it would otherwise print as itself and the
+     * value it stood for would simply be missing from the line.
+     */
+    private void validateRaise(PlpgsqlStatement.RaiseStmt stmt) {
+        String format = stmt.format();
+        if (format == null) return;
+        int placeholders = 0;
+        for (int i = 0; i < format.length(); i++) {
+            if (format.charAt(i) != '%') continue;
+            if (i + 1 < format.length() && format.charAt(i + 1) == '%') i++;
+            else placeholders++;
+        }
+        int args = stmt.argExprs() == null ? 0 : stmt.argExprs().size();
+        if (args < placeholders) {
+            throw new MemgresException("too few parameters specified for RAISE", "42601");
+        }
+        if (args > placeholders) {
+            throw new MemgresException("too many parameters specified for RAISE", "42601");
         }
     }
 
@@ -434,10 +518,14 @@ public final class PlpgsqlBodyValidator {
         } else if (stmt instanceof PlpgsqlStatement.ForQueryStmt) {
             PlpgsqlStatement.ForQueryStmt s = (PlpgsqlStatement.ForQueryStmt) stmt;
             validateCursorLoop(s.sql());
+            // A cursor FOR loop declares its own record for the cursor's rows, so the target
+            // there is nothing the block had to declare
+            if (!namesACursor(s.sql())) checkLoopTargetDeclared(s.varNames(), "42601");
             checkWritable(s.varNames());
             validateLoop(s.label(), s.body());
         } else if (stmt instanceof PlpgsqlStatement.ForExecuteStmt) {
             PlpgsqlStatement.ForExecuteStmt s = (PlpgsqlStatement.ForExecuteStmt) stmt;
+            checkLoopTargetDeclared(s.varNames(), "42804");
             checkWritable(s.varNames());
             validateLoop(s.label(), s.body());
         } else if (stmt instanceof PlpgsqlStatement.ForeachStmt) {
@@ -461,8 +549,13 @@ public final class PlpgsqlBodyValidator {
             checkWritable(((PlpgsqlStatement.ExecuteStmt) stmt).intoVars());
         } else if (stmt instanceof PlpgsqlStatement.FetchStmt) {
             checkWritable(((PlpgsqlStatement.FetchStmt) stmt).intoVars());
+            checkFetchIntoIsSingleRow((PlpgsqlStatement.FetchStmt) stmt);
         } else if (stmt instanceof PlpgsqlStatement.GetDiagnosticsStmt) {
             validateDiagnostics((PlpgsqlStatement.GetDiagnosticsStmt) stmt);
+        } else if (stmt instanceof PlpgsqlStatement.RaiseStmt) {
+            PlpgsqlStatement.RaiseStmt raise = (PlpgsqlStatement.RaiseStmt) stmt;
+            validateRaise(raise);
+            if (raise.condition() != null) validateCondition(raise.condition());
         }
     }
 
@@ -470,6 +563,15 @@ public final class PlpgsqlBodyValidator {
      * {@code FOR r IN c LOOP} reads a cursor rather than a query, and only a cursor declared with
      * its query has one to read — an unbound refcursor names a portal that does not exist yet.
      */
+    /** True when what the loop reads is a cursor variable rather than a query of its own. */
+    private boolean namesACursor(String sql) {
+        if (sql == null) return false;
+        String name = sql.trim();
+        if (!name.matches("[A-Za-z_][A-Za-z0-9_$]*")) return false;
+        VarInfo info = lookup(name);
+        return info != null && info.cursor;
+    }
+
     private void validateCursorLoop(String sql) {
         if (sql == null) return;
         String name = sql.trim();

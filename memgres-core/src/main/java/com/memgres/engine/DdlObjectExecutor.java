@@ -674,15 +674,18 @@ class DdlObjectExecutor {
             hasUnsupportedTxnCmd = containsUnsupportedTransactionCommand(stmt.body());
         }
         if (checkBodies && "plpgsql".equalsIgnoreCase(stmt.language()) && stmt.body() != null) {
-            validatePlpgsqlRaiseArgs(stmt.body());
             // PG compiles the body at CREATE time, so a body it cannot parse never becomes a
             // function that only fails when someone calls it.
             com.memgres.engine.plpgsql.PlpgsqlStatement.Block parsedBody =
                     com.memgres.engine.plpgsql.PlpgsqlParser.parse(stmt.body());
             List<String> paramNames = new ArrayList<>();
             boolean hasOutParams = false;
-            for (PgFunction.Param p : params) {
+            for (int i = 0; i < params.size(); i++) {
+                PgFunction.Param p = params.get(i);
                 if (p.name() != null) paramNames.add(p.name());
+                // Every parameter also answers to its position, which is the only name an
+                // unnamed one has and what ALIAS FOR usually points at
+                paramNames.add("$" + (i + 1));
                 String mode = p.mode() == null ? "IN" : p.mode().toUpperCase();
                 if ("OUT".equals(mode) || "INOUT".equals(mode)) hasOutParams = true;
             }
@@ -1337,68 +1340,6 @@ class DdlObjectExecutor {
     }
 
     /**
-     * Validate PL/pgSQL RAISE format string vs argument count at CREATE FUNCTION time.
-     * PG validates this eagerly during function creation, not at execution time.
-     */
-    private void validatePlpgsqlRaiseArgs(String body) {
-        try {
-            com.memgres.engine.plpgsql.PlpgsqlStatement.Block block =
-                    com.memgres.engine.plpgsql.PlpgsqlParser.parse(body);
-            validateRaiseInStatements(block.body());
-        } catch (MemgresException e) {
-            throw e;
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void validateRaiseInStatements(java.util.List<com.memgres.engine.plpgsql.PlpgsqlStatement> stmts) {
-        if (stmts == null) return;
-        for (com.memgres.engine.plpgsql.PlpgsqlStatement stmt : stmts) {
-            if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.RaiseStmt) {
-                com.memgres.engine.plpgsql.PlpgsqlStatement.RaiseStmt raise =
-                        (com.memgres.engine.plpgsql.PlpgsqlStatement.RaiseStmt) stmt;
-                if (raise.format != null && raise.argExprs != null) {
-                    int placeholderCount = 0;
-                    for (int i = 0; i < raise.format.length(); i++) {
-                        if (raise.format.charAt(i) == '%') {
-                            if (i + 1 < raise.format.length() && raise.format.charAt(i + 1) == '%') {
-                                i++;
-                            } else {
-                                placeholderCount++;
-                            }
-                        }
-                    }
-                    if (raise.argExprs.size() > placeholderCount) {
-                        throw new MemgresException("too many parameters specified for RAISE", "42601");
-                    }
-                }
-            }
-            // Recurse into nested blocks and control structures
-            if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.Block) {
-                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.Block) stmt).body());
-            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt) {
-                com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt ifStmt =
-                        (com.memgres.engine.plpgsql.PlpgsqlStatement.IfStmt) stmt;
-                validateRaiseInStatements(ifStmt.thenBody());
-                if (ifStmt.elsifClauses() != null) {
-                    for (com.memgres.engine.plpgsql.PlpgsqlStatement.ElsifClause elsif : ifStmt.elsifClauses()) {
-                        validateRaiseInStatements(elsif.body());
-                    }
-                }
-                validateRaiseInStatements(ifStmt.elseBody());
-            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.LoopStmt) {
-                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.LoopStmt) stmt).body());
-            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.WhileStmt) {
-                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.WhileStmt) stmt).body());
-            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.ForStmt) {
-                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.ForStmt) stmt).body());
-            } else if (stmt instanceof com.memgres.engine.plpgsql.PlpgsqlStatement.ForeachStmt) {
-                validateRaiseInStatements(((com.memgres.engine.plpgsql.PlpgsqlStatement.ForeachStmt) stmt).body());
-            }
-        }
-    }
-
-    /**
      * Checks if a PL/pgSQL body contains unsupported transaction commands
      * (SAVEPOINT, ROLLBACK TO SAVEPOINT) that PG rejects at creation time.
      */
@@ -1917,6 +1858,14 @@ class DdlObjectExecutor {
     // ---- DROP (generic) ----
 
     QueryResult executeDropStmt(DropStmt stmt) {
+        // A DROP that names a schema of its own is looking in that schema, so a schema which is
+        // not there is what is missing — PostgreSQL reports 3F000 rather than naming an object
+        // it never went looking for. SCHEMA and EXTENSION name no schema of their own.
+        if (stmt.objectType() != DropStmt.ObjectType.SCHEMA
+                && stmt.objectType() != DropStmt.ObjectType.EXTENSION
+                && ddl.tableExecutor.checkDropSchemaExists(stmt.schema(), stmt.ifExists())) {
+            return QueryResult.command(QueryResult.Type.DROP_TABLE, 0);
+        }
         switch (stmt.objectType()) {
             case VIEW:
             case MATERIALIZED_VIEW:
@@ -2302,6 +2251,11 @@ class DdlObjectExecutor {
         Schema schema = executor.database.getSchema(stmt.name());
         if (schema == null && !stmt.ifExists()) {
             throw new MemgresException("schema \"" + stmt.name() + "\" does not exist", "3F000");
+        }
+        if (schema == null && executor.session != null) {
+            // IF EXISTS says what to skip, and PostgreSQL says which one it skipped
+            executor.session.addNotice("NOTICE", "00000",
+                    "schema \"" + stmt.name() + "\" does not exist, skipping", null);
         }
         if (schema != null) {
             if (stmt.cascade()) {

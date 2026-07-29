@@ -1119,7 +1119,9 @@ class StringFunctions {
                     }
                     return sb.toString();
                 }
-                return data.toString();
+                // Only base64, hex and escape exist; anything else names no encoding at all and
+                // returning the input unchanged would look like it had been encoded
+                throw new MemgresException("unrecognized encoding: \"" + fmt + "\"", "22023");
             }
             case "decode": {
                 Object data = executor.evalExpr(fn.args().get(0), ctx);
