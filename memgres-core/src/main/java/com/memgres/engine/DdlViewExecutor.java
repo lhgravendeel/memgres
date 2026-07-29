@@ -11,6 +11,10 @@ import java.util.*;
  * Extracted from DdlExecutor to separate concerns.
  */
 class DdlViewExecutor {
+    /** Errors about the query itself rather than about the rows it happens to read. */
+    private static final Set<String> ANALYSIS_ERRORS =
+            Cols.setOf("42803", "42P10", "42P20", "42601", "42809");
+
     private final DdlExecutor ddl;
     private final AstExecutor executor;
 
@@ -113,6 +117,14 @@ class DdlViewExecutor {
                     throw e;
                 }
                 if ("42703".equals(e.getSqlState())) {
+                    throw e;
+                }
+                // A query PostgreSQL refuses to analyse is refused as a view definition too:
+                // an ungrouped column, a sort position past the select list or a misplaced
+                // window function is wrong about the query itself, not about the rows it would
+                // read, and storing it only defers the error to every SELECT from the view — a
+                // view over an ungrouped column then answered with an arbitrary row's value.
+                if (ANALYSIS_ERRORS.contains(e.getSqlState())) {
                     throw e;
                 }
             } catch (Exception e) {

@@ -15,6 +15,14 @@ import java.util.Set;
  */
 public class Parser extends ExpressionParser {
 
+    /**
+     * Marks a partition bound that was written as an expression rather than a literal. The text
+     * after the marker is the expression's source; whoever creates the partition evaluates it,
+     * because only the engine can say what {@code abs(-1)} is worth or that {@code count(1)} is
+     * an aggregate.
+     */
+    public static final String BOUND_EXPRESSION_MARKER = "__bound_expr__:";
+
     private final SelectParser selectParser;
     private final DmlParser dmlParser;
     private final DdlParser ddlParser;
@@ -120,7 +128,9 @@ public class Parser extends ExpressionParser {
                     stmt = selectParser.parseValues();
                     break;
                 case "TABLE":
-                    stmt = selectParser.parseTableCommand();
+                    // Read as a query rather than as a bare relation name, so the ORDER BY and
+                    // LIMIT PostgreSQL allows after one are read here too.
+                    stmt = selectParser.parseSelectFull();
                     break;
                 case "INSERT":
                     stmt = dmlParser.parseInsert();

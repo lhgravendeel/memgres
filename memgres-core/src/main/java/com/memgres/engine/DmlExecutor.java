@@ -194,6 +194,33 @@ class DmlExecutor {
     private void validateOnConflictTarget(InsertStmt stmt, Table table) {
         InsertStmt.OnConflict oc = stmt.onConflict();
         if (oc == null) return;
+        // The conflict target names an index, and an index is built from one row at a time; the
+        // action it triggers is an UPDATE of that one row. Neither has a group to aggregate or a
+        // result to be numbered against, so PostgreSQL names the clause the same way it does for
+        // a CREATE INDEX or a plain UPDATE — and it settles all of this before it touches a row.
+        // The arbiter columns are read first, as PostgreSQL reads them: a target that names no
+        // column of the relation is that error, not whatever the action would also have been.
+        if (oc.columns() != null) {
+            for (String col : oc.columns()) {
+                if (table.getColumnIndex(col) < 0) {
+                    throw new MemgresException("column \"" + col + "\" of relation \""
+                            + table.getName() + "\" does not exist", "42703");
+                }
+            }
+        }
+        PlacementCheck placement = executor.selectExecutor.placementCheck;
+        if (oc.conflictExpressionAsts() != null) {
+            for (Expression target : oc.conflictExpressionAsts()) {
+                placement.reject(target, "index expressions");
+            }
+        }
+        placement.reject(oc.whereClause(), "index predicates");
+        if (oc.doUpdate() != null) {
+            for (InsertStmt.SetClause set : oc.doUpdate()) {
+                placement.reject(set.value(), "UPDATE");
+            }
+        }
+        placement.reject(oc.doUpdateWhereClause(), "WHERE");
         if (oc.constraint() != null) {
             StoredConstraint named = null;
             for (StoredConstraint sc : table.getConstraints()) {
@@ -302,6 +329,15 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "insert into";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // A VALUES row is written out in full; it is not read from any relation, so there is
+        // nothing for an aggregate to aggregate or for a window call to be numbered against.
+        if (stmt.values() != null) {
+            for (List<Expression> valueRow : stmt.values()) {
+                for (Expression value : valueRow) {
+                    executor.selectExecutor.placementCheck.reject(value, "VALUES");
+                }
+            }
+        }
         // Capture view column mapping/order before any further resolveTable calls clobber them.
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -1180,6 +1216,9 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "update";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // An UPDATE names one row at a time; there is no group behind it to aggregate and no
+        // result to number a window against, in either the assignments or the WHERE.
+        checkUpdatePlacement(stmt, table);
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -1745,6 +1784,12 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
         Table table = executor.resolveTable(schemaName, stmt.table(), stmt.schema() != null);
+        // As for UPDATE: a DELETE's WHERE picks rows one at a time, so nothing in it may need a
+        // group or a finished result to have a value.
+        PlacementCheck placement = executor.selectExecutor.placementCheck;
+        placement.reject(stmt.where(), "WHERE");
+        placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table,
+                stmt.alias() != null ? stmt.alias() : stmt.table());
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
@@ -2030,6 +2075,7 @@ class DmlExecutor {
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
+        checkMergePlacement(stmt);
 
         // Validate: source cannot be the same unaliased table as target
         if (stmt.source() instanceof SelectStmt.TableRef) {
@@ -3034,18 +3080,66 @@ class DmlExecutor {
         return false;
     }
 
+    /**
+     * Every clause of a MERGE that is read one row at a time: the condition that pairs a source
+     * row with a target row, the condition that chooses which action fires, and the action itself.
+     * PostgreSQL names the ON clause a JOIN condition, the WHEN condition its own thing, and an
+     * action by the command it is — the same names it uses for a plain join, UPDATE and INSERT.
+     */
+    private void checkMergePlacement(MergeStmt stmt) {
+        PlacementCheck placement = executor.selectExecutor.placementCheck;
+        placement.reject(stmt.onCondition(), "JOIN conditions");
+        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            Expression when = null;
+            List<InsertStmt.SetClause> sets = null;
+            List<Expression> values = null;
+            if (clause instanceof MergeStmt.WhenMatched) {
+                MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
+                when = wm.andCondition();
+                sets = wm.setClauses();
+            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                MergeStmt.WhenNotMatchedBySource ws = (MergeStmt.WhenNotMatchedBySource) clause;
+                when = ws.andCondition();
+                sets = ws.setClauses();
+            } else if (clause instanceof MergeStmt.WhenNotMatched) {
+                MergeStmt.WhenNotMatched wn = (MergeStmt.WhenNotMatched) clause;
+                when = wn.andCondition();
+                values = wn.values();
+            }
+            placement.reject(when, "MERGE WHEN conditions");
+            if (sets != null) {
+                for (InsertStmt.SetClause set : sets) placement.reject(set.value(), "UPDATE");
+            }
+            if (values != null) {
+                for (Expression value : values) placement.reject(value, "VALUES");
+            }
+        }
+    }
+
+    /**
+     * An UPDATE's assignments and WHERE, both of which PostgreSQL reads per row.
+     *
+     * <p>The two clauses carry different names in the message: an aggregate in the SET list is
+     * reported as being "in UPDATE", the one in WHERE as being "in WHERE".
+     */
+    private void checkUpdatePlacement(UpdateStmt stmt, Table table) {
+        PlacementCheck placement = executor.selectExecutor.placementCheck;
+        String targetName = stmt.alias() != null ? stmt.alias() : stmt.table();
+        for (InsertStmt.SetClause set : stmt.setClauses()) {
+            placement.reject(set.value(), "UPDATE");
+            placement.rejectOuterLevelAggregate(set.value(), "UPDATE", table, targetName);
+        }
+        placement.reject(stmt.where(), "WHERE");
+        placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table, targetName);
+    }
+
     /** Validate that all column references in RETURNING exist in the table. */
     void validateReturning(List<SelectStmt.SelectTarget> returning, Table table) {
         if (returning == null) return;
         for (SelectStmt.SelectTarget target : returning) {
             // RETURNING reports the rows the statement touched one at a time; there is no
             // group and no window frame for an aggregate or a window function to run over.
-            if (executor.selectExecutor.containsAggregate(target.expr())) {
-                throw new MemgresException("aggregate functions are not allowed in RETURNING", "42803");
-            }
-            if (executor.selectExecutor.containsWindowFunction(target.expr())) {
-                throw new MemgresException("window functions are not allowed in RETURNING", "42P20");
-            }
+            executor.selectExecutor.placementCheck.reject(target.expr(), "RETURNING");
             if (target.expr() instanceof WildcardExpr) continue;
             if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();

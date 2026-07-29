@@ -24,6 +24,14 @@ class FromJoinExecutor {
      */
     List<RowContext> executeJoin(SelectStmt.JoinFrom join) {
         List<RowContext> leftContexts = fromResolver.resolveFromItem(join.left());
+        // Both arms name themselves to the query before the condition is read, so a name given
+        // twice is reported ahead of anything the condition holds.
+        executor.selectExecutor.validateJoinNames(join);
+        // The ON condition pairs one row with one row, so nothing that needs a whole group or a
+        // finished result may stand in it. Judged here, once the left side has been resolved: a
+        // relation that does not exist is still reported first, and the condition is refused
+        // before it is evaluated rather than after an evaluation has said something else.
+        executor.selectExecutor.placementCheck.reject(join.on(), "JOIN conditions");
 
         boolean lateral = join.right() instanceof SelectStmt.SubqueryFrom && ((SelectStmt.SubqueryFrom) join.right()).lateral();
         boolean funcLateral = join.right() instanceof SelectStmt.FunctionFrom;

@@ -220,6 +220,11 @@ class SelectParser {
      * Parse the SELECT body (without WITH clause). Used by both parseSelect() and parseWithStatement().
      */
     Statement parseSelectBody() {
+        // TABLE t is one of PostgreSQL's simple_select productions, alongside SELECT and VALUES,
+        // so it is a query wherever a query may stand: a view body, a set-operation arm, a CTE, a
+        // sub-select, an INSERT source. Reading it here rather than only as a statement is what
+        // makes it one, because every one of those callers arrives through this method.
+        if (parser.checkKeyword("TABLE")) return parseTableQuery();
         parser.expectKeyword("SELECT");
 
         boolean distinct = false;
@@ -309,8 +314,10 @@ class SelectParser {
         if (parser.matchKeywords("GROUP", "BY")) {
             if (sawOrderBy) throw new ParseException("syntax error at or near \"GROUP\"", parser.peek());
             if (sawLimit) throw new ParseException("syntax error at or near \"GROUP\"", parser.peek());
-            // GROUP BY DISTINCT: consume the optional DISTINCT modifier (deduplicates grouping sets)
+            // GROUP BY takes the same set quantifier SELECT does: DISTINCT drops grouping sets
+            // the specification produces more than once, ALL (the default) keeps every one.
             boolean groupByDistinct = parser.matchKeyword("DISTINCT");
+            if (!groupByDistinct) parser.matchKeyword("ALL");
             // Parse potentially multiple GROUP BY elements that may include GROUPING SETS/ROLLUP/CUBE
             groupingSets = parseGroupByClause();
             if (groupingSets != null) {
@@ -319,8 +326,11 @@ class SelectParser {
                     List<List<Expression>> deduped = new ArrayList<>();
                     java.util.Set<String> seenSets = new java.util.LinkedHashSet<>();
                     for (List<Expression> gs : groupingSets) {
-                        String key = gs.toString();
-                        if (seenSets.add(key)) deduped.add(gs);
+                        // A set is what it contains, so the key ignores the order it was written in.
+                        List<String> parts = new ArrayList<>();
+                        for (Expression e : gs) parts.add(String.valueOf(e));
+                        java.util.Collections.sort(parts);
+                        if (seenSets.add(parts.toString())) deduped.add(gs);
                     }
                     groupingSets = deduped;
                 }
@@ -569,7 +579,8 @@ class SelectParser {
         for (int i = 0; i < firstRow.size(); i++) {
             firstTargets.add(new SelectStmt.SelectTarget(firstRow.get(i), "column" + (i + 1)));
         }
-        SelectStmt first = new SelectStmt(false, firstTargets, null, null, null, null, null, null, null);
+        SelectStmt first = new SelectStmt(false, firstTargets, null, null, null, null, null, null, null)
+                .asValuesList();
 
         if (rows.size() == 1) {
             return first;
@@ -583,7 +594,8 @@ class SelectParser {
             for (int i = 0; i < row.size(); i++) {
                 rowTargets.add(new SelectStmt.SelectTarget(row.get(i), null));
             }
-            SelectStmt rowSelect = new SelectStmt(false, rowTargets, null, null, null, null, null, null, null);
+            SelectStmt rowSelect = new SelectStmt(false, rowTargets, null, null, null, null, null, null, null)
+                    .asValuesList();
             result = new SetOpStmt(result, SetOpStmt.SetOpType.UNION, true, rowSelect, null, null, null);
         }
         return result;
@@ -745,16 +757,14 @@ class SelectParser {
      * Parse a GROUP BY list that may include GROUPING SETS, ROLLUP, CUBE, or the empty
      * grouping set (). Returns null if the GROUP BY is a simple expression list (handled
      * separately), or a list-of-lists representing the grouping sets.
-     * Also handles mixed: GROUP BY a, GROUPING SETS ((b), ()) -> cross product.
+     *
+     * <p>Every element of the list contributes a list of grouping sets — one for a plain
+     * expression, several for GROUPING SETS / ROLLUP / CUBE — and the query groups by the
+     * <em>Cartesian product</em> of those lists, not by the first of them. So
+     * {@code GROUP BY ROLLUP(a), ROLLUP(b)} has the four sets {@code (a,b), (a), (b), ()},
+     * and {@code GROUP BY a, GROUPING SETS ((b), ())} has {@code (a,b)} and {@code (a)}.
      */
     List<List<Expression>> parseGroupByClause() {
-        // Check if the first token is GROUPING SETS / ROLLUP / CUBE
-        if (parser.checkKeyword("GROUPING") && parser.checkKeywordAt(1, "SETS")) {
-            return parseGroupingSetsOnly();
-        }
-        if (parser.checkKeyword("ROLLUP") || parser.checkKeyword("CUBE")) {
-            return parseRollupOrCube();
-        }
         // Check if any element in the comma-separated list is GROUPING SETS/ROLLUP/CUBE
         // or the empty grouping set (), by scanning ahead at the top level
         boolean hasGroupingSets = false;
@@ -826,12 +836,27 @@ class SelectParser {
                 for (List<Expression> setFromPart : part) {
                     List<Expression> combined = new ArrayList<>(existing);
                     combined.addAll(setFromPart);
-                    newResult.add(combined);
+                    newResult.add(dedupeWithinSet(combined));
                 }
             }
             result = newResult;
         }
         return result;
+    }
+
+    /**
+     * One grouping set with repeated expressions dropped. Grouping by the same expression twice
+     * partitions the rows exactly as grouping by it once does, and PostgreSQL folds the repeat
+     * away: that is why the six sets of {@code ROLLUP(a), ROLLUP(a,b)} include {@code (a,a,b)}
+     * as a plain {@code (a,b)}, and why GROUP BY DISTINCT can then recognise it as a duplicate.
+     */
+    private static List<Expression> dedupeWithinSet(List<Expression> set) {
+        List<Expression> out = new ArrayList<>(set.size());
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (Expression e : set) {
+            if (seen.add(String.valueOf(e))) out.add(e);
+        }
+        return out;
     }
 
     /** True when the parser sits on "()", the empty grouping set. */
@@ -1106,6 +1131,7 @@ class SelectParser {
         if (second.type() == TokenType.KEYWORD) {
             String kw = second.value();
             return kw.equals("SELECT") || kw.equals("VALUES") || kw.equals("WITH")
+                    || kw.equals("TABLE")
                     || kw.equals("UPDATE") || kw.equals("DELETE") || kw.equals("INSERT");
         }
         // Check for nested parens: ((SELECT ...) UNION ALL ...)
@@ -1628,6 +1654,96 @@ class SelectParser {
      */
     Expression parseLimitOffsetExpr() {
         return parser.parseExpression();
+    }
+
+    /**
+     * {@code TABLE t} with the clauses PostgreSQL's {@code select_no_parens} hangs off a query
+     * rather than off a select list: ORDER BY, LIMIT/OFFSET/FETCH and row locking. WHERE, GROUP BY
+     * and HAVING are not among them — {@code TABLE t WHERE ...} is a syntax error there too.
+     */
+    private SelectStmt parseTableQuery() {
+        SelectStmt base = parseTableCommand();
+
+        List<SelectStmt.OrderByItem> orderBy = null;
+        if (parser.checkKeyword("ORDER")) {
+            if (!parser.matchKeywords("ORDER", "BY")) {
+                throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                        parser.peek());
+            }
+            orderBy = parser.parseOrderByList();
+        }
+        Expression limit = null;
+        if (parser.matchKeyword("LIMIT") && !parser.matchKeyword("ALL")) {
+            limit = parseLimitOffsetExpr();
+        }
+        Expression offset = null;
+        if (parser.matchKeyword("OFFSET")) {
+            offset = parseLimitOffsetExpr();
+            parser.matchKeyword("ROW");
+            parser.matchKeyword("ROWS");
+        }
+        boolean withTies = false;
+        if (parser.matchKeyword("FETCH")) {
+            parser.matchKeyword("FIRST");
+            parser.matchKeyword("NEXT");
+            limit = parser.checkKeyword("ROW") || parser.checkKeyword("ROWS")
+                    ? Literal.ofInt("1") : parseLimitOffsetExpr();
+            parser.matchKeyword("ROW");
+            parser.matchKeyword("ROWS");
+            if (parser.matchKeyword("WITH")) {
+                parser.expectKeyword("TIES");
+                if (orderBy == null || orderBy.isEmpty()) {
+                    throw new com.memgres.engine.MemgresException(
+                            "WITH TIES cannot be specified without ORDER BY clause", "42601");
+                }
+                withTies = true;
+            } else {
+                parser.matchKeyword("ONLY");
+            }
+        }
+        SelectStmt.LockClause lockClause = parseRowLockClause();
+
+        return new SelectStmt(false, null, base.targets(), base.from(), null, null, null, null,
+                orderBy, limit, offset, null, null, lockClause, withTies);
+    }
+
+    /** FOR UPDATE / FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE, with its options. */
+    private SelectStmt.LockClause parseRowLockClause() {
+        String lockMode = null;
+        boolean nowait = false;
+        boolean skipLocked = false;
+        List<String> ofTables = new ArrayList<>();
+        while (parser.checkKeyword("FOR")) {
+            parser.advance();
+            if (parser.matchKeyword("NO")) {
+                parser.matchKeyword("KEY");
+                parser.matchKeyword("UPDATE");
+                lockMode = "NO KEY UPDATE";
+            } else if (parser.matchKeyword("KEY")) {
+                parser.matchKeyword("SHARE");
+                lockMode = "KEY SHARE";
+            } else if (parser.matchKeyword("UPDATE")) {
+                lockMode = "UPDATE";
+            } else if (parser.matchKeyword("SHARE")) {
+                lockMode = "SHARE";
+            } else {
+                throw new ParseException("syntax error at or near \"" + parser.peek().value() + "\"",
+                        parser.peek());
+            }
+            if (parser.matchKeyword("OF")) {
+                ofTables = new ArrayList<>();
+                ofTables.add(parser.readIdentifier());
+                while (parser.match(TokenType.COMMA)) ofTables.add(parser.readIdentifier());
+            }
+            if (parser.matchKeyword("NOWAIT")) {
+                nowait = true;
+            } else if (parser.matchKeyword("SKIP")) {
+                parser.matchKeyword("LOCKED");
+                skipLocked = true;
+            }
+        }
+        return lockMode == null ? null
+                : new SelectStmt.LockClause(lockMode, nowait, skipLocked, ofTables);
     }
 
     SelectStmt parseTableCommand() {

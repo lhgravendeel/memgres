@@ -83,35 +83,44 @@ public class RowContext {
         return mapped != null ? mapped : columnName;
     }
     /**
-     * Identity-keyed substitutions for set-returning function calls nested inside a larger
-     * SELECT-list expression (e.g. {@code day_start + interval '1h' * generate_series(0,23,2)}).
-     * The SRF is evaluated once per row to get its element list; the owning expression is then
-     * re-evaluated once per generated element with the specific {@code FunctionCallExpr} AST
-     * node (by identity, not structural equality — the same query text used twice would be two
-     * distinct node instances) bound to that element instead of being recomputed as a fresh SRF
-     * call. See {@code SelectExecutor.findSrfCall} / {@code ExprEvaluator.evalExpr}.
+     * Values already settled for particular AST nodes, keyed by identity rather than by
+     * structural equality — the same query text written twice is two distinct node instances,
+     * and only the one that was bound may read the bound value. Evaluation returns the bound
+     * value instead of computing the node again. Two callers need this:
+     *
+     * <ul>
+     *   <li>a set-returning function nested inside a larger SELECT-list expression (e.g.
+     *       {@code day_start + interval '1h' * generate_series(0,23,2)}): the SRF is evaluated
+     *       once per row to get its element list, and the owning expression is re-evaluated once
+     *       per element with the call bound to that element. See
+     *       {@code SelectExecutor.findSrfCall};</li>
+     *   <li>the inputs of a window function over a grouped query ({@code sum(sum(v)) OVER ()},
+     *       {@code rank() OVER (ORDER BY sum(v))}): those are values of the grouped row, computed
+     *       once per group before the window runs over the groups. See
+     *       {@code SelectAggregateEvaluator.GroupedWindowPass}.</li>
+     * </ul>
      */
-    private java.util.Map<com.memgres.engine.parser.ast.Expression, Object> srfOverrides;
+    private java.util.Map<com.memgres.engine.parser.ast.Expression, Object> boundValues;
 
     /** Binds a value to substitute for {@code node} the next time it is evaluated in this context. */
-    public void setSrfOverride(com.memgres.engine.parser.ast.Expression node, Object value) {
-        if (srfOverrides == null) srfOverrides = new java.util.IdentityHashMap<>();
-        srfOverrides.put(node, value);
+    public void setBoundValue(com.memgres.engine.parser.ast.Expression node, Object value) {
+        if (boundValues == null) boundValues = new java.util.IdentityHashMap<>();
+        boundValues.put(node, value);
     }
 
     /** Removes any substitution bound for {@code node} (call after re-evaluating the owning expr). */
-    public void clearSrfOverride(com.memgres.engine.parser.ast.Expression node) {
-        if (srfOverrides != null) srfOverrides.remove(node);
+    public void clearBoundValue(com.memgres.engine.parser.ast.Expression node) {
+        if (boundValues != null) boundValues.remove(node);
     }
 
     /** Returns true if a substitution is currently bound for {@code node} (may map to a null value). */
-    public boolean hasSrfOverride(com.memgres.engine.parser.ast.Expression node) {
-        return srfOverrides != null && srfOverrides.containsKey(node);
+    public boolean hasBoundValue(com.memgres.engine.parser.ast.Expression node) {
+        return boundValues != null && boundValues.containsKey(node);
     }
 
-    /** Returns the substituted value for {@code node}; only valid when {@link #hasSrfOverride} is true. */
-    public Object getSrfOverride(com.memgres.engine.parser.ast.Expression node) {
-        return srfOverrides == null ? null : srfOverrides.get(node);
+    /** Returns the substituted value for {@code node}; only valid when {@link #hasBoundValue} is true. */
+    public Object getBoundValue(com.memgres.engine.parser.ast.Expression node) {
+        return boundValues == null ? null : boundValues.get(node);
     }
 
     /** Single-table context (used by UPDATE, DELETE, triggers). */

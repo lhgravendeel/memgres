@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * ({@code SelectExecutor.findSrfCall}) and, when found, evaluates the SRF once per row to get
  * its element list, then re-evaluates the *entire* owning expression once per element with that
  * one function-call node bound to the corresponding element (via
- * {@code RowContext.setSrfOverride}/{@code ExprEvaluator.evalExpr}), rather than trying to
+ * {@code RowContext.setBoundValue}/{@code ExprEvaluator.evalExpr}), rather than trying to
  * evaluate the raw list as if it were a scalar.
  */
 class SrfInSelectExpressionTest {

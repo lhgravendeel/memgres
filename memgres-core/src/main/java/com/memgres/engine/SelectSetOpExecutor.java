@@ -20,6 +20,7 @@ class SelectSetOpExecutor {
     }
 
     QueryResult executeSetOp(SetOpStmt stmt) {
+        rejectLock(stmt);
         // If the left side has CTEs, they should be available to both sides
         if (stmt.left() instanceof SelectStmt && ((SelectStmt) stmt.left()).withClauses() != null && !((SelectStmt) stmt.left()).withClauses().isEmpty()) {
             SelectStmt sel = (SelectStmt) stmt.left();
@@ -43,6 +44,29 @@ class SelectSetOpExecutor {
         QueryResult leftResult = executor.executeStatement(stmt.left());
         QueryResult rightResult = executor.executeStatement(stmt.right());
         return executeSetOpInner(stmt, leftResult, rightResult);
+    }
+
+    /**
+     * A row lock points at the base-table row behind an output row, and a set operation has
+     * already combined rows from different relations by the time it has an output row to point
+     * at. PostgreSQL rejects the lock wherever in the set operation it was written — on an arm,
+     * parenthesised or not, or after the whole thing.
+     */
+    private void rejectLock(SetOpStmt stmt) {
+        SelectStmt.LockClause lock = lockIn(stmt.left());
+        if (lock == null) lock = lockIn(stmt.right());
+        if (lock == null) return;
+        throw new MemgresException("FOR " + (lock.mode() == null ? "UPDATE" : lock.mode())
+                + " is not allowed with UNION/INTERSECT/EXCEPT", "0A000");
+    }
+
+    private SelectStmt.LockClause lockIn(Statement arm) {
+        if (arm instanceof SelectStmt) return ((SelectStmt) arm).lockClause();
+        if (arm instanceof SetOpStmt) {
+            SelectStmt.LockClause left = lockIn(((SetOpStmt) arm).left());
+            return left != null ? left : lockIn(((SetOpStmt) arm).right());
+        }
+        return null;
     }
 
     /**

@@ -24,6 +24,22 @@ public final class SelectStmt implements Statement {
     public final List<List<Expression>> groupingSets;
     public final LockClause lockClause;
     public final boolean withTies;
+    /**
+     * True when this SELECT is what a VALUES list was rewritten into. A VALUES row is not a
+     * query over any relation, so it may hold neither an aggregate nor a window call — and after
+     * the rewrite it is indistinguishable from an ordinary FROM-less SELECT, which may hold an
+     * aggregate quite legally ({@code SELECT count(*)} over no rows answers 0). Only where the
+     * text came from tells the two apart, so the rewrite records it.
+     */
+    private boolean fromValues;
+
+    /** Marks this SELECT as the rewritten form of a VALUES list. */
+    public SelectStmt asValuesList() {
+        this.fromValues = true;
+        return this;
+    }
+
+    public boolean fromValues() { return fromValues; }
 
     public SelectStmt(
             boolean distinct,
@@ -611,6 +627,14 @@ public final class SelectStmt implements Statement {
         public String toString() {
             return "WindowDef[name=" + name + ", " + "refName=" + refName + ", " + "partitionBy=" + partitionBy + ", " + "orderBy=" + orderBy + ", " + "frame=" + frame + "]";
         }
+    }
+
+    /** The same statement with a different select list, for star expansion. */
+    public SelectStmt withTargets(List<SelectTarget> newTargets) {
+        SelectStmt copy = new SelectStmt(distinct, distinctOn, newTargets, from, where, groupBy, having,
+                windowDefs, orderBy, limit, offset, withClauses, groupingSets, lockClause, withTies);
+        copy.fromValues = fromValues;
+        return copy;
     }
 
     public boolean distinct() { return distinct; }

@@ -1,5 +1,6 @@
 package com.memgres.engine.parser;
 
+import com.memgres.engine.MemgresException;
 import com.memgres.engine.util.Cols;
 
 import com.memgres.engine.parser.ast.*;
@@ -110,7 +111,7 @@ public class ExpressionParser {
     }
 
     private static final java.util.Set<String> QUERY_START_KEYWORDS = Cols.setOf(
-            "SELECT", "WITH", "VALUES", "INSERT", "UPDATE", "DELETE", "MERGE");
+            "SELECT", "WITH", "VALUES", "TABLE", "INSERT", "UPDATE", "DELETE", "MERGE");
 
     /**
      * Scans ahead through consecutive LEFT_PAREN tokens to check if a query keyword
@@ -435,15 +436,23 @@ public class ExpressionParser {
      */
     protected boolean lastColumnListHadExpression;
 
+    /**
+     * The parsed form of each expression entry of the last {@link #parseColumnOrExpressionList()},
+     * so a caller that has to judge what was written — an aggregate in an ON CONFLICT index
+     * expression, say — can read the tree instead of the reconstructed text.
+     */
+    protected List<Expression> lastColumnListExpressions;
+
     protected List<String> parseColumnOrExpressionList() {
         List<String> list = new ArrayList<>();
+        List<Expression> parsed = new ArrayList<>();
         boolean anyExpr = false;
         do {
             if (check(TokenType.LEFT_PAREN)) {
                 anyExpr = true;
                 expect(TokenType.LEFT_PAREN);
                 int exprStart = pos;
-                parseExpression();
+                parsed.add(parseExpression());
                 StringBuilder sb = new StringBuilder();
                 for (int i = exprStart; i < pos; i++) {
                     if (i > exprStart) {
@@ -463,6 +472,7 @@ public class ExpressionParser {
             }
         } while (match(TokenType.COMMA));
         lastColumnListHadExpression = anyExpr;
+        lastColumnListExpressions = parsed;
         return list;
     }
 
@@ -1605,11 +1615,21 @@ public class ExpressionParser {
             expectKeyword("BY");
             List<SelectStmt.OrderByItem> withinOrderBy = parseOrderByList();
             expect(TokenType.RIGHT_PAREN);
+            if (checkKeyword("OVER")) {
+                throw new MemgresException("OVER is not supported for ordered-set aggregate "
+                        + name.toLowerCase(), "0A000");
+            }
             return new OrderedSetAggExpr(name.toLowerCase(), args, withinOrderBy);
         }
 
         // Check for OVER clause: window function
         if (checkKeyword("OVER")) {
+            // An aggregate's own ORDER BY decides the order it accumulates its input in, which a
+            // window frame already fixes; PostgreSQL has never implemented the combination.
+            if (innerOrderBy != null) {
+                throw new MemgresException(
+                        "aggregate ORDER BY is not implemented for window functions", "0A000");
+            }
             return specialFormParser.parseWindowFunction(name, args, distinct, isStar, ignoreNulls, fromLast, filter);
         }
 

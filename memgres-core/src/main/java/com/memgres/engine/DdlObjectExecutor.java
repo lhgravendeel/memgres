@@ -913,6 +913,8 @@ class DdlObjectExecutor {
                 "over", "partition", "rows", "range", "groups", "filter",
                 "within", "window", "lateral", "distinct", "all", "any",
                 "some", "array", "default", "null", "true", "false",
+                // The words that stand before a parenthesis without naming a function
+                "grouping", "sets", "cube", "rollup", "tablesample", "ordinality",
                 "asc", "desc", "nulls", "first", "last", "fetch", "next",
                 "coalesce", "greatest", "least", "cast",
                 "count", "sum", "avg", "min", "max",
@@ -965,11 +967,39 @@ class DdlObjectExecutor {
 
         validateTableRefsInStatement(parsed);
 
+        // A SQL function's body is analysed when the function is written, not when it is called,
+        // so a clause that cannot hold an aggregate or a window call is judged here — the same
+        // judgement a view body gets, and for the same reason: storing it only defers the error.
+        // Clause by clause in the order PostgreSQL reads them, so a body wrong in two places is
+        // refused for the same one.
+        if (parsed instanceof SelectStmt) {
+            SelectStmt sel = (SelectStmt) parsed;
+            PlacementCheck placement = executor.selectExecutor.placementCheck;
+            placement.rejectWindowCallWithoutOverInTargets(sel);
+            placement.reject(sel.where(), "WHERE");
+            placement.rejectWindowCallWithoutOverAfterWhere(sel);
+            // And what the query groups by, which needs the relations the FROM names.
+            executor.selectExecutor.validateStoredQueryGrouping(sel);
+        }
+
         if (parsed instanceof SelectStmt && ((SelectStmt) parsed).from() != null) {
             SelectStmt sel = (SelectStmt) parsed;
+            Set<String> bodyCtes = new HashSet<>();
+            if (sel.withClauses() != null) {
+                for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
+                    bodyCtes.add(cte.name.toLowerCase(java.util.Locale.ROOT));
+                }
+            }
             for (SelectStmt.FromItem fromItem : sel.from()) {
                 if (fromItem instanceof SelectStmt.TableRef) {
                     SelectStmt.TableRef tr = (SelectStmt.TableRef) fromItem;
+                    // A CTE the body defines and a catalog relation are both relations this
+                    // query may read; neither is a table the schema answers for.
+                    if (tr.schema() == null && tr.table() != null
+                            && bodyCtes.contains(tr.table().toLowerCase(java.util.Locale.ROOT))) {
+                        continue;
+                    }
+                    if (SystemCatalog.isSystemCatalog(tr.schema(), tr.table())) continue;
                     try {
                         String trSchema = tr.schema() != null ? tr.schema() : "public";
                         Table t = executor.resolveTable(trSchema, tr.table());
@@ -1017,17 +1047,58 @@ class DdlObjectExecutor {
             }
         } else if (parsed instanceof SelectStmt) {
             SelectStmt sel = (SelectStmt) parsed;
-            if (sel.from() != null) {
-                for (SelectStmt.FromItem fi : sel.from()) {
-                    validateFromItem(fi);
+            // A name the body's own WITH clause defines is a relation of this query, not one the
+            // schema has to answer for. What the CTE itself reads still is: a body that defines
+            // one over a table that does not exist is refused for that table.
+            Set<String> cteNames = collectCteNames(sel);
+            if (sel.withClauses() != null) {
+                for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
+                    validateCteBody(cte.query, cteNames);
                 }
             }
+            if (sel.from() != null) {
+                for (SelectStmt.FromItem fi : sel.from()) {
+                    validateFromItem(fi, cteNames);
+                }
+            }
+        }
+    }
+
+    private static Set<String> collectCteNames(SelectStmt sel) {
+        Set<String> names = new HashSet<>();
+        if (sel.withClauses() != null) {
+            for (SelectStmt.CommonTableExpr cte : sel.withClauses()) {
+                if (cte.name != null) names.add(cte.name.toLowerCase(java.util.Locale.ROOT));
+            }
+        }
+        return names;
+    }
+
+    /** A CTE's own body, with the WITH clause's names in scope so a self-reference is not a miss. */
+    private void validateCteBody(Statement body, Set<String> inScope) {
+        if (!(body instanceof SelectStmt)) {
+            validateTableRefsInStatement(body);
+            return;
+        }
+        SelectStmt sel = (SelectStmt) body;
+        Set<String> names = new HashSet<>(inScope);
+        names.addAll(collectCteNames(sel));
+        if (sel.withClauses() != null) {
+            for (SelectStmt.CommonTableExpr nested : sel.withClauses()) {
+                validateCteBody(nested.query, names);
+            }
+        }
+        if (sel.from() != null) {
+            for (SelectStmt.FromItem fi : sel.from()) validateFromItem(fi, names);
         }
     }
 
     private void resolveTableIfPresent(String schema, String tableName) {
         if (tableName != null) {
             String s = schema != null ? schema : executor.defaultSchema();
+            // A catalog relation is answered by the catalog rather than by a schema's table map,
+            // so asking the schema for one would refuse a body that reads pg_class.
+            if (SystemCatalog.isSystemCatalog(schema, tableName)) return;
             try {
                 executor.resolveTable(s, tableName);
             } catch (MemgresException e) {
@@ -1037,13 +1108,21 @@ class DdlObjectExecutor {
     }
 
     private void validateFromItem(SelectStmt.FromItem fi) {
+        validateFromItem(fi, java.util.Collections.<String>emptySet());
+    }
+
+    private void validateFromItem(SelectStmt.FromItem fi, Set<String> cteNames) {
         if (fi instanceof SelectStmt.TableRef) {
             SelectStmt.TableRef tr = (SelectStmt.TableRef) fi;
+            if (tr.schema() == null && tr.table() != null
+                    && cteNames.contains(tr.table().toLowerCase(java.util.Locale.ROOT))) {
+                return;
+            }
             resolveTableIfPresent(tr.schema(), tr.table());
         } else if (fi instanceof SelectStmt.JoinFrom) {
             SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) fi;
-            validateFromItem(join.left());
-            validateFromItem(join.right());
+            validateFromItem(join.left(), cteNames);
+            validateFromItem(join.right(), cteNames);
         } else if (fi instanceof SelectStmt.SubqueryFrom) {
             SelectStmt.SubqueryFrom sub = (SelectStmt.SubqueryFrom) fi;
             validateTableRefsInStatement(sub.subquery());
@@ -2561,10 +2640,8 @@ class DdlObjectExecutor {
                 } catch (Exception ignored) {
                     continue;
                 }
-                if (executor.selectExecutor.containsAggregate(expr)) {
-                    throw new MemgresException(
-                            "aggregate functions are not allowed in index expressions", "42803");
-                }
+                executor.selectExecutor.placementCheck.rejectSubquery(expr, "index expression");
+                executor.selectExecutor.placementCheck.reject(expr, "index expressions");
             }
         }
         if (s.whereClause() != null) {
@@ -2574,14 +2651,8 @@ class DdlObjectExecutor {
             } catch (Exception ignored) {
                 return;
             }
-            if (AstWalk.anyMatch(pred, n -> n instanceof SubqueryExpr || n instanceof ExistsExpr
-                    || n instanceof AnyAllExpr || n instanceof ArraySubqueryExpr)) {
-                throw PgErrors.notImplemented("cannot use subquery in index predicate");
-            }
-            if (executor.selectExecutor.containsAggregate(pred)) {
-                throw new MemgresException(
-                        "aggregate functions are not allowed in index predicates", "42803");
-            }
+            executor.selectExecutor.placementCheck.rejectSubquery(pred, "index predicate");
+            executor.selectExecutor.placementCheck.reject(pred, "index predicates");
         }
     }
 

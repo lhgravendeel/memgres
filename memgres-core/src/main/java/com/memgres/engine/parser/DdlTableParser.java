@@ -86,10 +86,10 @@ class DdlTableParser {
                     parser.expect(TokenType.LEFT_PAREN);
                     bounds.add("HASH");
                     parser.expectKeyword("MODULUS");
-                    bounds.add(parser.advance().value());
+                    bounds.add(DdlParser.readHashBoundInteger(parser));
                     parser.expect(TokenType.COMMA);
                     parser.expectKeyword("REMAINDER");
-                    bounds.add(parser.advance().value());
+                    bounds.add(DdlParser.readHashBoundInteger(parser));
                     parser.expect(TokenType.RIGHT_PAREN);
                 }
             }

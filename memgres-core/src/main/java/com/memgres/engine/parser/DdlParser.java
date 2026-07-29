@@ -860,7 +860,7 @@ class DdlParser {
             parser.expectKeyword("AS");
             int viewParens = Math.max(0, parser.countLeadingParensBeforeQuery());
             parser.consumeLeadingParens(viewParens);
-            Statement query = parser.tryParseSetOp(parser.parseSelect());
+            Statement query = parser.tryParseSetOp(parseViewBody());
             parser.consumeTrailingParens(viewParens);
             boolean withData = true;
             if (parser.matchKeyword("WITH")) {
@@ -889,7 +889,7 @@ class DdlParser {
         parser.expectKeyword("AS");
         int viewParens2 = Math.max(0, parser.countLeadingParensBeforeQuery());
         parser.consumeLeadingParens(viewParens2);
-        Statement query = parser.tryParseSetOp(parser.parseSelect());
+        Statement query = parser.tryParseSetOp(parseViewBody());
         parser.consumeTrailingParens(viewParens2);
 
         String checkOption = null;
@@ -902,6 +902,16 @@ class DdlParser {
         }
 
         return new CreateViewStmt(name, query, orReplace, false, columnNames, true, checkOption, withOptions);
+    }
+
+    /**
+     * A view's body. It is usually a SELECT, but a bare VALUES list is a query in its own right
+     * and PostgreSQL accepts one — {@code CREATE VIEW v AS VALUES (1), (2)} defines a two-row
+     * view — so the same body parser the standalone statement uses is used here.
+     */
+    private Statement parseViewBody() {
+        if (parser.checkKeyword("VALUES")) return parser.parseValuesBody();
+        return parser.parseSelect();
     }
 
     private Map<String, String> parseViewWithOptions() {
@@ -1575,8 +1585,26 @@ class DdlParser {
             return "'" + value + "'";
         }
 
+        // Anything else is an expression. PostgreSQL evaluates a partition bound when the
+        // partition is created, so FOR VALUES FROM (abs(-1)) and FROM (1 + 1) are ordinary bounds,
+        // and a bound that has no value then is reported for what is wrong with it rather than as
+        // a syntax error. The source text is carried under a marker; the executor evaluates it.
+        if (isBoundExpression(parser)) {
+            int exprStart = parser.pos;
+            parser.parseExpression();
+            StringBuilder sb = new StringBuilder(Parser.BOUND_EXPRESSION_MARKER);
+            for (int i = exprStart; i < parser.pos; i++) {
+                Token t = parser.tokens.get(i);
+                if (i > exprStart) sb.append(' ');
+                sb.append(t.type() == TokenType.STRING_LITERAL
+                        ? "'" + t.value().replace("'", "''") + "'" : t.value());
+            }
+            return sb.toString();
+        }
+
         // Plain literal with optional cast
         Token valueTok = parser.advance();
+        rejectColumnReferenceBound(valueTok);
         String value = valueTok.value();
         skipBoundCast(parser);
         if (valueTok.type() == TokenType.STRING_LITERAL
@@ -1584,6 +1612,51 @@ class DdlParser {
             return "'" + value + "'";
         }
         return value;
+    }
+
+    /**
+     * A bound is a value the partition is given once, not something read off a row, so a name in
+     * one is a column reference and PostgreSQL says so — {@code FOR VALUES FROM (id) TO (10)} and
+     * {@code FOR VALUES IN (sad)} alike, the second being why an enum label has to be quoted here.
+     *
+     * <p>Only an identifier is refused. A keyword that stands for a value of its own —
+     * MINVALUE, MAXVALUE, NULL, TRUE, FALSE, {@code current_date} — is a value, not a name.
+     */
+    static void rejectColumnReferenceBound(Token tok) {
+        if (tok.type() == TokenType.IDENTIFIER || tok.type() == TokenType.QUOTED_IDENTIFIER) {
+            throw new com.memgres.engine.MemgresException(
+                    "cannot use column reference in partition bound expression", "0A000");
+        }
+    }
+
+    /**
+     * MODULUS and REMAINDER take an integer literal and nothing else: PostgreSQL's grammar has
+     * {@code Iconst} there, so anything else is a syntax error rather than a bad bound.
+     */
+    static String readHashBoundInteger(Parser parser) {
+        Token tok = parser.peek();
+        if (tok.type() != TokenType.INTEGER_LITERAL) {
+            throw new com.memgres.engine.MemgresException(
+                    "syntax error at or near \"" + tok.value() + "\"", "42601");
+        }
+        return parser.advance().value();
+    }
+
+    /**
+     * Whether the bound at this position is more than one literal token: a call, or a literal
+     * followed by an operator. A bound that ends at a comma, the closing paren or a cast is the
+     * plain literal the caller reads directly.
+     */
+    private static boolean isBoundExpression(Parser parser) {
+        Token cur = parser.peek();
+        Token next = parser.pos + 1 < parser.tokens.size() ? parser.tokens.get(parser.pos + 1) : null;
+        if (next == null) return false;
+        if ((cur.type() == TokenType.KEYWORD || cur.type() == TokenType.IDENTIFIER)
+                && next.type() == TokenType.LEFT_PAREN) {
+            return true;
+        }
+        return next.type() != TokenType.COMMA && next.type() != TokenType.RIGHT_PAREN
+                && next.type() != TokenType.CAST;
     }
 
     private static void skipBoundCast(Parser parser) {

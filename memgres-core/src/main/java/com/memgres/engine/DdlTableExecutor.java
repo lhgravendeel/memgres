@@ -210,6 +210,20 @@ class DdlTableExecutor {
                 }
             }
 
+            // A DEFAULT and a generation expression are both evaluated for one row at a time, with
+            // no other row in sight; PostgreSQL names each context in its own words.
+            executor.selectExecutor.placementCheck.reject(def.defaultExpr(), "DEFAULT expressions");
+            if (def.generatedExpr() != null) {
+                Expression generated = null;
+                try {
+                    generated = com.memgres.engine.parser.Parser.parseExpression(def.generatedExpr());
+                } catch (RuntimeException ignored) {
+                    // An expression that will not parse is reported by whatever reads it next
+                }
+                executor.selectExecutor.placementCheck.reject(
+                        generated, "column generation expressions");
+            }
+
             // Validate generated column expression
             if (def.generatedExpr() != null) {
                 // PG rejects DEFAULT + GENERATED ALWAYS AS on same column
@@ -328,6 +342,11 @@ class DdlTableExecutor {
                     continue;
                 }
                 if (tc.type() == TableConstraint.ConstraintType.CHECK) {
+                    // A CHECK is tested against the row being written, on its own; it can see no
+                    // other row, so nothing in it may need a group or a finished result.
+                    executor.selectExecutor.placementCheck.rejectSubquery(
+                            tc.checkExpr(), "check constraint");
+                    executor.selectExecutor.placementCheck.reject(tc.checkExpr(), "check constraints");
                     DdlDefinitionChecks.requireBooleanPredicate(tc.checkExpr(), table, "CHECK");
                 }
                 StoredConstraint sc = ddl.convertTableConstraint(stmt.name(), tc);
@@ -538,10 +557,60 @@ class DdlTableExecutor {
     }
 
     /**
+     * A bound written as an expression rather than a literal, reduced to the literal it is worth.
+     *
+     * <p>PostgreSQL settles a partition bound when the partition is created, so it may be any
+     * expression that has a value then — {@code abs(-1)}, {@code 1 + 1} — and it may not be one
+     * that depends on a row or on other rows. An aggregate or a window call there is refused by
+     * the same walk and under the same clause name every other definition uses.
+     */
+    private List<String> evaluateBoundExpressions(List<String> bounds) {
+        String marker = com.memgres.engine.parser.Parser.BOUND_EXPRESSION_MARKER;
+        boolean any = false;
+        for (String bound : bounds) {
+            if (bound != null && bound.startsWith(marker)) any = true;
+        }
+        if (!any) return bounds;
+        List<String> resolved = new ArrayList<>(bounds.size());
+        for (String bound : bounds) {
+            if (bound == null || !bound.startsWith(marker)) {
+                resolved.add(bound);
+                continue;
+            }
+            String text = bound.substring(marker.length());
+            Expression expr = com.memgres.engine.parser.Parser.parseExpression(text);
+            executor.selectExecutor.placementCheck.reject(expr, "partition bound");
+            // A bound is settled once, with no row to read and no query to read one from, so a
+            // column reference and a sub-select are both refused for what they are rather than
+            // reported as a name nothing answers for.
+            rejectColumnReferenceInBound(expr);
+            executor.selectExecutor.placementCheck.rejectSubquery(expr, "partition bound");
+            Object value = executor.evalExpr(expr, new RowContext(Cols.listOf()));
+            if (value == null) {
+                resolved.add("NULL");
+            } else if (value instanceof Number || value instanceof Boolean) {
+                resolved.add(value.toString());
+            } else {
+                resolved.add("'" + value.toString().replace("'", "''") + "'");
+            }
+        }
+        return resolved;
+    }
+
+    /** The same refusal the bound parser makes for a bare name, for one written inside an expression. */
+    private static void rejectColumnReferenceInBound(Expression expr) {
+        if (AstWalk.anyMatch(expr, n -> n instanceof com.memgres.engine.parser.ast.ColumnRef)) {
+            throw new MemgresException(
+                    "cannot use column reference in partition bound expression", "0A000");
+        }
+    }
+
+    /**
      * Apply partition bounds (FROM/IN/HASH/DEFAULT) to a partition, validating against siblings.
      * Shared between CREATE TABLE PARTITION OF and ALTER TABLE ATTACH PARTITION.
      */
     void applyPartitionBounds(Table partition, Table parent, List<String> bounds, String partitionName) {
+        bounds = evaluateBoundExpressions(bounds);
         String boundType = bounds.get(0);
         String strategy = parent.getPartitionStrategy();
         if (boundType.equals("DEFAULT")) {
