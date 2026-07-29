@@ -173,10 +173,16 @@ class SelectExecutor {
         validateFromClause(stmt.from());
 
         List<RowContext.TableBinding> baseBindings;
+        // What the FROM clause exposes, in order: every relation's columns except where a USING
+        // or NATURAL join merged two into one, which SELECT * lists first. Taken from a row when
+        // there is one and worked out from the clause itself when there is not.
+        List<RowContext.OutCol> baseOutput;
         if (!contexts.isEmpty()) {
             baseBindings = contexts.get(0).getBindings();
+            baseOutput = contexts.get(0).outputColumnsOrDefault();
         } else {
             baseBindings = executor.fromResolver.resolveTableBindings(stmt.from());
+            baseOutput = executor.fromResolver.resolveClauseOutput(stmt.from(), baseBindings);
         }
 
         // The relations are resolved first: a window frame's offset is resolved against the
@@ -186,9 +192,10 @@ class SelectExecutor {
         // Validate column references against table schema
         boolean simpleFrom = stmt.from().stream().allMatch(f -> f instanceof SelectStmt.TableRef);
         boolean hasJoins = stmt.from().stream().anyMatch(f -> f instanceof SelectStmt.JoinFrom);
-        Map<String, Integer> usingMerges = new java.util.LinkedHashMap<>();
-        collectUsingColumns(stmt.from(), usingMerges);
-        Set<String> usingColumnsLower = new java.util.HashSet<>(usingMerges.keySet());
+        Set<String> usingColumnsLower = new java.util.HashSet<>();
+        for (RowContext.OutCol oc : baseOutput) {
+            if (oc.merged()) usingColumnsLower.add(oc.name.toLowerCase());
+        }
         if (!contexts.isEmpty()) {
             Set<String> ctxUsing = contexts.get(0).getUsingColumns();
             if (ctxUsing != null) usingColumnsLower.addAll(ctxUsing);
@@ -199,13 +206,14 @@ class SelectExecutor {
                         && !isSystemColumn(((ColumnRef) target.expr()).column())) {
                     ColumnRef cr = (ColumnRef) target.expr();
                     if (cr.table() == null) {
+                        // A merged column is one column of the join's output however many
+                        // relations fed it, so what decides ambiguity is how many output columns
+                        // answer to the name, not how many relations hold one.
                         int matchCount = 0;
-                        for (RowContext.TableBinding b : baseBindings) {
-                            if (b.table().getColumnIndex(cr.column()) >= 0) matchCount++;
+                        for (RowContext.OutCol oc : baseOutput) {
+                            if (oc.name.equalsIgnoreCase(cr.column())) matchCount++;
                         }
-                        Integer merged = usingMerges.get(cr.column().toLowerCase());
-                        int distinctSources = merged == null ? matchCount : matchCount - merged.intValue();
-                        if (distinctSources > 1) {
+                        if (matchCount > 1) {
                             throw new MemgresException("column reference \"" + cr.column() + "\" is ambiguous", "42702");
                         }
                         if (matchCount == 0) {
@@ -267,11 +275,7 @@ class SelectExecutor {
                             }
                             throw new MemgresException("missing FROM-clause entry for table \"" + cr.table() + "\"", "42P01");
                         }
-                        // A column a join merged is still readable through the relation it came
-                        // from, so a qualified reference to it is valid even though the shape
-                        // this check reads has already merged the column away.
-                        boolean mergedAway = usingMerges.containsKey(cr.column().toLowerCase());
-                        if (!colFound && !mayResolveViaAttributeNotation && !mergedAway) {
+                        if (!colFound && !mayResolveViaAttributeNotation) {
                             // A qualified reference is named in full, the way RowContext names it
                             // when the same lookup fails at evaluation time.
                             MemgresException colEx = new MemgresException(
@@ -373,7 +377,7 @@ class SelectExecutor {
             // ordinals counted — over those columns, not over the star itself.
             SelectStmt grouped = stmt;
             List<SelectStmt.SelectTarget> groupedTargets =
-                    expandTargetsForOrdinals(stmt.targets(), baseBindings);
+                    expandTargetsForOrdinals(stmt.targets(), baseBindings, baseOutput);
             if (groupedTargets != stmt.targets()) grouped = stmt.withTargets(groupedTargets);
             groupByValidator.validate(grouped, groupedTargets, baseBindings);
             return aggregateEvaluator.executeAggregateSelect(grouped, contexts, baseBindings);
@@ -393,12 +397,12 @@ class SelectExecutor {
         List<java.util.function.Function<RowContext, Object>> projections = new ArrayList<>();
 
         Set<Integer> srfIndices = new HashSet<>();
-        buildProjections(stmt.targets(), baseBindings, resultColumns, projections, usingColumnsLower,
+        buildProjections(stmt.targets(), baseBindings, baseOutput, resultColumns, projections,
                 srfIndices);
 
         // An ordinal ORDER BY counts output columns, so a star target has to be expanded
         // first: SELECT * FROM t ORDER BY 2 means the table's second column.
-        List<SelectStmt.SelectTarget> ordinalTargets = expandTargetsForOrdinals(stmt.targets(), baseBindings);
+        List<SelectStmt.SelectTarget> ordinalTargets = expandTargetsForOrdinals(stmt.targets(), baseBindings, baseOutput);
         List<SelectStmt.OrderByItem> resolvedOrderBy = resolveOrderBy(stmt.orderBy(), ordinalTargets);
 
         // Validate: for SELECT DISTINCT, ORDER BY expressions must appear in select list
@@ -799,7 +803,8 @@ class SelectExecutor {
      * original list when there is no star to expand.
      */
     private List<SelectStmt.SelectTarget> expandTargetsForOrdinals(
-            List<SelectStmt.SelectTarget> targets, List<RowContext.TableBinding> bindings) {
+            List<SelectStmt.SelectTarget> targets, List<RowContext.TableBinding> bindings,
+            List<RowContext.OutCol> output) {
         if (targets == null || bindings == null || bindings.isEmpty()) return targets;
         boolean hasStar = false;
         for (SelectStmt.SelectTarget t : targets) {
@@ -810,6 +815,16 @@ class SelectExecutor {
         for (SelectStmt.SelectTarget t : targets) {
             if (!(t.expr() instanceof WildcardExpr)) { out.add(t); continue; }
             WildcardExpr w = (WildcardExpr) t.expr();
+            if (w.table() == null && output != null) {
+                for (RowContext.OutCol oc : output) {
+                    if (oc.bindings[0] >= bindings.size()) continue;
+                    Expression ref = starColumnExpr(oc, bindings, output);
+                    // A merged column written out as its fallback still answers to its own name.
+                    out.add(new SelectStmt.SelectTarget(ref,
+                            ref instanceof FunctionCallExpr ? oc.name : null));
+                }
+                continue;
+            }
             for (RowContext.TableBinding b : bindings) {
                 if (w.table() != null && !b.alias().equalsIgnoreCase(w.table())
                         && !b.table().getName().equalsIgnoreCase(w.table())) {
@@ -821,6 +836,37 @@ class SelectExecutor {
             }
         }
         return out.isEmpty() ? targets : out;
+    }
+
+    /**
+     * How one column of a star target is written out when a star has to become a list of
+     * expressions — for an ORDER BY or GROUP BY that counts output columns.
+     *
+     * <p>A column of one relation is that relation's column, named in full. A column a USING or
+     * NATURAL join merged is written bare, which is the name the query itself would write for it
+     * and what a GROUP BY of that name matches. Only where a further relation carries the same
+     * name is the bare name no longer that column — {@code a JOIN b USING (id) JOIN c ON true}
+     * exposes two {@code id} and a bare one is ambiguous — and there it is written out as the
+     * fallback it stands for.
+     */
+    private static Expression starColumnExpr(RowContext.OutCol oc,
+                                             List<RowContext.TableBinding> bindings,
+                                             List<RowContext.OutCol> output) {
+        if (!oc.merged()) {
+            return new ColumnRef(bindings.get(oc.bindings[0]).alias(), oc.name);
+        }
+        int sameName = 0;
+        for (RowContext.OutCol other : output) {
+            if (other.name.equalsIgnoreCase(oc.name)) sameName++;
+        }
+        if (sameName == 1) return new ColumnRef(null, oc.name);
+        List<Expression> sources = new ArrayList<>(oc.bindings.length);
+        for (int i = 0; i < oc.bindings.length; i++) {
+            if (oc.bindings[i] >= bindings.size()) continue;
+            sources.add(new ColumnRef(bindings.get(oc.bindings[i]).alias(),
+                    bindings.get(oc.bindings[i]).table().getColumns().get(oc.columns[i]).getName()));
+        }
+        return new FunctionCallExpr("coalesce", sources);
     }
 
     /** True when a DISTINCT ON key is a window function, which only the window pass can evaluate. */
@@ -1013,19 +1059,21 @@ class SelectExecutor {
      */
     private void buildProjections(List<SelectStmt.SelectTarget> targets,
                                    List<RowContext.TableBinding> baseBindings,
+                                   List<RowContext.OutCol> baseOutput,
                                    List<Column> resultColumns,
                                    List<java.util.function.Function<RowContext, Object>> projections,
-                                   Set<String> usingColumnsForDedup,
                                    Set<Integer> srfProjections) {
         for (SelectStmt.SelectTarget target : targets) {
             int projectionStart = projections.size();
             if (target.expr() instanceof WildcardExpr) {
                 WildcardExpr w = (WildcardExpr) target.expr();
                 if (w.table() != null) {
+                    boolean named = false;
                     for (int bIdx = 0; bIdx < baseBindings.size(); bIdx++) {
                         RowContext.TableBinding binding = baseBindings.get(bIdx);
                         if (binding.alias().equalsIgnoreCase(w.table()) ||
                                 binding.table().getName().equalsIgnoreCase(w.table())) {
+                            named = true;
                             final int bindingIdx = bIdx;
                             for (int i = 0; i < binding.table().getColumns().size(); i++) {
                                 resultColumns.add(copyColumnWithOid(binding.table(), i));
@@ -1034,46 +1082,21 @@ class SelectExecutor {
                             }
                         }
                     }
+                    // A qualifier no FROM item answers to expands to nothing at all, which is a
+                    // query returning rows of no columns rather than the refusal it should be.
+                    if (!named && !baseBindings.isEmpty()) {
+                        throw new MemgresException(
+                                "missing FROM-clause entry for table \"" + w.table() + "\"", "42P01");
+                    }
                 } else {
-                    Set<String> emittedUsingCols = new java.util.HashSet<>();
-                    for (int bIdx = 0; bIdx < baseBindings.size(); bIdx++) {
-                        RowContext.TableBinding binding = baseBindings.get(bIdx);
-                        final int bindingIdx = bIdx;
-                        for (int i = 0; i < binding.table().getColumns().size(); i++) {
-                            String colNameLower = binding.table().getColumns().get(i).getName().toLowerCase();
-                            if (usingColumnsForDedup != null && usingColumnsForDedup.contains(colNameLower)
-                                    && !emittedUsingCols.add(colNameLower)) {
-                                continue;
-                            }
-                            resultColumns.add(copyColumnWithOid(binding.table(), i));
-                            final int colIdx = i;
-                            // For USING columns, use COALESCE(left, right) so unmatched
-                            // right rows show the right side's value (PG behavior)
-                            if (usingColumnsForDedup != null && usingColumnsForDedup.contains(colNameLower)) {
-                                // Find the same column in other bindings for COALESCE
-                                final String usingCol = colNameLower;
-                                final int leftBindingIdx = bindingIdx;
-                                final int leftColIdx = colIdx;
-                                projections.add(ctx -> {
-                                    Object val = ctx.getBindings().get(leftBindingIdx).row()[leftColIdx];
-                                    if (val != null) return val;
-                                    // Left is null — search other bindings for the same column
-                                    for (int bi = 0; bi < ctx.getBindings().size(); bi++) {
-                                        if (bi == leftBindingIdx) continue;
-                                        RowContext.TableBinding ob = ctx.getBindings().get(bi);
-                                        for (int ci = 0; ci < ob.table().getColumns().size(); ci++) {
-                                            if (ob.table().getColumns().get(ci).getName().equalsIgnoreCase(usingCol)) {
-                                                Object rval = ob.row()[ci];
-                                                if (rval != null) return rval;
-                                            }
-                                        }
-                                    }
-                                    return null;
-                                });
-                            } else {
-                                projections.add(ctx -> ctx.getBindings().get(bindingIdx).row()[colIdx]);
-                            }
-                        }
+                    // The FROM clause's own columns, in its own order: a column two relations
+                    // merged into one is listed once, where the merge puts it.
+                    for (RowContext.OutCol oc : baseOutput) {
+                        if (oc.bindings[0] >= baseBindings.size()) continue;
+                        RowContext.TableBinding binding = baseBindings.get(oc.bindings[0]);
+                        resultColumns.add(copyColumnWithOid(binding.table(), oc.columns[0]));
+                        final RowContext.OutCol col = oc;
+                        projections.add(ctx -> col.valueIn(ctx.getBindings()));
                     }
                 }
             } else if (target.expr() instanceof CompositeStarExpr) {
@@ -1546,47 +1569,6 @@ class SelectExecutor {
         return rows;
     }
 
-    /**
-     * How many times each column name is merged away by a join, counting both the columns a
-     * USING clause names and the ones a NATURAL join finds for itself.
-     *
-     * <p>A merged column is one column of the join's output however many relations contributed
-     * to it, so a name that appears in three relations under two merges is not ambiguous — while
-     * the same name in three relations under one merge still is. Counting rather than
-     * remembering a set is what keeps {@code t JOIN u USING (s) JOIN v ON true} ambiguous, as
-     * PostgreSQL has it, while {@code t NATURAL JOIN u NATURAL JOIN v} resolves.
-     */
-    private void collectUsingColumns(List<SelectStmt.FromItem> fromItems, Map<String, Integer> result) {
-        if (fromItems == null) return;
-        for (SelectStmt.FromItem item : fromItems) {
-            if (item instanceof SelectStmt.JoinFrom) {
-                SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
-                if (jf.using() != null) {
-                    for (String col : jf.using()) countMerge(result, col);
-                } else if (isNaturalJoin(jf.joinType())) {
-                    for (String col : FromJoinExecutor.commonColumns(
-                            executor.fromResolver.resolveItemShape(jf.left()),
-                            executor.fromResolver.resolveItemShape(jf.right()))) {
-                        countMerge(result, col);
-                    }
-                }
-                collectUsingColumns(Cols.listOf(jf.left()), result);
-                collectUsingColumns(Cols.listOf(jf.right()), result);
-            }
-        }
-    }
-
-    private static void countMerge(Map<String, Integer> result, String col) {
-        String key = col.toLowerCase();
-        Integer prior = result.get(key);
-        result.put(key, prior == null ? 1 : prior + 1);
-    }
-
-    private static boolean isNaturalJoin(SelectStmt.JoinType type) {
-        return type == SelectStmt.JoinType.NATURAL || type == SelectStmt.JoinType.NATURAL_LEFT
-                || type == SelectStmt.JoinType.NATURAL_RIGHT || type == SelectStmt.JoinType.NATURAL_FULL;
-    }
-
     private boolean isSrfCall(Expression expr) {
         return findSrfCall(expr) != null;
     }
@@ -1758,7 +1740,8 @@ class SelectExecutor {
         for (RowContext.TableBinding binding : bindings) {
             if (binding.table() == null) return;
         }
-        List<SelectStmt.SelectTarget> targets = expandTargetsForOrdinals(stmt.targets(), bindings);
+        List<SelectStmt.SelectTarget> targets = expandTargetsForOrdinals(stmt.targets(), bindings,
+                executor.fromResolver.resolveClauseOutput(stmt.from(), bindings));
         SelectStmt judged = targets != stmt.targets() ? stmt.withTargets(targets) : stmt;
         groupByValidator.validate(judged, targets, bindings);
     }

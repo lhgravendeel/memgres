@@ -25,6 +25,10 @@ class SelectWindowEvaluator {
      */
     QueryResult executeWindowSelect(SelectStmt stmt, List<RowContext> contexts,
                                      List<RowContext.TableBinding> baseBindings) {
+        // What the FROM clause exposes: not every relation's columns, when a USING or NATURAL
+        // join merged two of them into one column that is listed where the merge puts it.
+        List<RowContext.OutCol> baseOutput = contexts.isEmpty()
+                ? RowContext.defaultOutput(baseBindings) : contexts.get(0).outputColumnsOrDefault();
         // Build result columns
         List<Column> resultColumns = new ArrayList<>();
         for (SelectStmt.SelectTarget target : stmt.targets()) {
@@ -39,8 +43,10 @@ class SelectWindowEvaluator {
                         }
                     }
                 } else {
-                    for (RowContext.TableBinding b : baseBindings) {
-                        for (Column c : b.table().getColumns()) resultColumns.add(c);
+                    for (RowContext.OutCol oc : baseOutput) {
+                        if (oc.bindings[0] >= baseBindings.size()) continue;
+                        resultColumns.add(baseBindings.get(oc.bindings[0]).table()
+                                .getColumns().get(oc.columns[0]));
                     }
                 }
             } else {
@@ -79,10 +85,8 @@ class SelectWindowEvaluator {
                             }
                         }
                     } else {
-                        for (RowContext.TableBinding b : ctx.getBindings()) {
-                            for (int ci = 0; ci < b.table().getColumns().size(); ci++) {
-                                rowValues.add(b.row()[ci]);
-                            }
+                        for (RowContext.OutCol oc : ctx.outputColumnsOrDefault()) {
+                            rowValues.add(oc.valueIn(ctx.getBindings()));
                         }
                     }
                 } else if (windowResults.containsKey(ti)) {
