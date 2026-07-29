@@ -2197,7 +2197,9 @@ class SelectExecutor {
             FunctionCallExpr fc = (FunctionCallExpr) node;
             if (isAggregateFunction(fc.name())) {
                 for (Expression arg : fc.args()) {
-                    if (containsSrf(arg)) {
+                    // A function the database holds a declaration for is a set-returning call too,
+                    // and containsSrf only knows the built-in names.
+                    if (containsSrf(arg) || containsUserSrf(arg)) {
                         MemgresException e = new MemgresException(
                                 "aggregate function calls cannot contain set-returning function calls", "0A000");
                         e.setHint("You might be able to move the set-returning function "

@@ -305,7 +305,10 @@ class DmlParser {
                                 Literal.ofString(subscriptKeys.get(0))));
                 clauses.add(new InsertStmt.SetClause(col, setExpr, subField));
             } else {
-                rejectRepeatedAssignment(plainlyAssigned, col);
+                // A field of a composite column writes part of it, and writing several parts is
+                // how a statement sets more than one field: "SET pos.x = 1, pos.y = 2" names pos
+                // twice and is not two assignments to it.
+                if (subField == null) rejectRepeatedAssignment(plainlyAssigned, col);
                 clauses.add(new InsertStmt.SetClause(col, val, subField));
             }
         } while (parser.match(TokenType.COMMA));

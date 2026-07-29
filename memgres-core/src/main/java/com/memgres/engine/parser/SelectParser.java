@@ -188,9 +188,17 @@ class SelectParser {
      * where the inner UNION stands and an ordinary set operation was a syntax error.
      */
     private Statement parseSetOpOperand() {
+        // Only an arm written bare may not begin with WITH; inside parentheses it is a query
+        // expression of its own and a WITH clause belongs to it. The check therefore stands here
+        // and not in the recursion, which is what descends through the parentheses.
+        if (!parser.check(TokenType.LEFT_PAREN)) rejectWithClauseArm();
+        return parseParenthesisedOperand();
+    }
+
+    private Statement parseParenthesisedOperand() {
         if (parser.check(TokenType.LEFT_PAREN)) {
             parser.advance();
-            Statement inner = parseSetOpOperand();
+            Statement inner = parseParenthesisedOperand();
             inner = tryParseSetOp(inner);
             parser.expect(TokenType.RIGHT_PAREN);
             return inner;
@@ -199,7 +207,6 @@ class SelectParser {
             // A bare VALUES list is a query in its own right, so it may be a set-op arm
             return parseValuesBody();
         }
-        rejectWithClauseArm();
         return parser.parseSelect();
     }
 
