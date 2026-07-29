@@ -28,15 +28,17 @@ import java.util.Set;
  * iteration produced, sitting at the top of the recursive term's FROM clause. Anything that would
  * need the whole result at once — a second scan of it, an aggregate over it, the null-extended
  * side of an outer join, a sub-select — has no meaning while the result is still being built, so
- * PostgreSQL refuses the query (42P19) rather than answer a different question. A few clauses it
- * simply has not implemented for a recursive query at all — ORDER BY, LIMIT, OFFSET, FOR UPDATE —
- * are 0A000, and a recursive term whose column type differs from the non-recursive term's is
- * 42804.
+ * PostgreSQL refuses the query (42P19) rather than answer a different question. A set operation
+ * counts only where an arm is subtracted or where duplicate counts matter: the right-hand side of
+ * any EXCEPT, and either side of an INTERSECT ALL or EXCEPT ALL. A few clauses PostgreSQL simply
+ * has not implemented for a recursive query at all — ORDER BY, LIMIT, OFFSET, FOR UPDATE — are
+ * 0A000 and are read before the self-reference is looked for, and a recursive term whose column
+ * type differs from the non-recursive term's is 42804.
  *
  * <p>Every rule here fires only on a WITH item that both declares RECURSIVE and actually names
  * itself; ordinary recursion — one self-reference in the FROM clause, joined to anything, under
- * WHERE, GROUP BY, DISTINCT, a window function, or an aggregate in the <em>non</em>-recursive
- * term — is left alone.
+ * WHERE, GROUP BY, DISTINCT, a window function, an aggregate in the <em>non</em>-recursive term,
+ * a plain INTERSECT, or the left side of a plain EXCEPT — is left alone.
  */
 public final class RecursiveCteCheck {
 
@@ -63,41 +65,11 @@ public final class RecursiveCteCheck {
         }
         SetOpStmt setOp = (SetOpStmt) cte.query();
 
-        // The seed has to be computable without the result it seeds.
-        if (!selfReferences(setOp.left(), name).isEmpty()) {
-            throw new MemgresException("recursive reference to query \"" + name
-                    + "\" must not appear within its non-recursive term", "42P19");
-        }
-
-        List<Boolean> refs = selfReferences(setOp.right(), name);
-        if (refs.isEmpty()) return;
-
-        // Where the reference sits is decided before how many there are: PostgreSQL names the
-        // context of the offending reference — INTERSECT, EXCEPT, a sub-select, an outer join —
-        // and only says "more than once" when every one of them was in a place that allows one.
-        String setOpContext = refUnderNonUnionSetOp(setOp.right(), name);
-        if (setOpContext != null) {
-            throw new MemgresException("recursive reference to query \"" + name
-                    + "\" must not appear within " + setOpContext, "42P19");
-        }
-        for (Boolean viaExpr : refs) {
-            if (viaExpr) {
-                throw new MemgresException("recursive reference to query \"" + name
-                        + "\" must not appear within a subquery", "42P19");
-            }
-        }
-        if (refUnderOuterJoin(setOp.right(), name)) {
-            throw new MemgresException("recursive reference to query \"" + name
-                    + "\" must not appear within an outer join", "42P19");
-        }
-        if (refs.size() > 1) {
-            throw new MemgresException("recursive reference to query \"" + name
-                    + "\" must not appear more than once", "42P19");
-        }
-
         // Clauses PG has not implemented for a recursive query. These sit on the set operation
         // itself; the same words inside a parenthesised arm or a subquery belong to that arm and
-        // are allowed, which is why only the top node is looked at.
+        // are allowed, which is why only the top node is looked at. PostgreSQL reads them before
+        // it looks for the self-reference at all, so a query that is wrong in both ways — a
+        // second reference and a LIMIT — is refused for the LIMIT.
         if (setOp.orderBy() != null && !setOp.orderBy().isEmpty()) {
             throw new MemgresException("ORDER BY in a recursive query is not implemented", "0A000");
         }
@@ -110,6 +82,29 @@ public final class RecursiveCteCheck {
         if (hasLockClause(setOp.left()) || hasLockClause(setOp.right())) {
             throw new MemgresException("FOR UPDATE/SHARE in a recursive query is not implemented",
                     "0A000");
+        }
+
+        // The seed has to be computable without the result it seeds.
+        if (!selfReferences(setOp.left(), name).isEmpty()) {
+            throw new MemgresException("recursive reference to query \"" + name
+                    + "\" must not appear within its non-recursive term", "42P19");
+        }
+
+        List<String> refs = selfReferences(setOp.right(), name);
+        if (refs.isEmpty()) return;
+
+        // Where the reference sits is decided before how many there are: PostgreSQL names the
+        // context of the offending reference — a sub-select, an outer join, EXCEPT, INTERSECT ALL
+        // — and only says "more than once" when every one of them was in a place that allows one.
+        for (String context : CONTEXT_PRIORITY) {
+            if (refs.contains(context)) {
+                throw new MemgresException("recursive reference to query \"" + name
+                        + "\" must not appear within " + context, "42P19");
+            }
+        }
+        if (refs.size() > 1) {
+            throw new MemgresException("recursive reference to query \"" + name
+                    + "\" must not appear more than once", "42P19");
         }
 
         // An aggregate reads the whole recursive term at once, which is exactly what the
@@ -146,6 +141,7 @@ public final class RecursiveCteCheck {
             boolean baseUntyped = isUntypedNull(baseTerm, i);
             DataType baseType = baseUntyped ? DataType.TEXT : baseColumns.get(i).getType();
             if (baseType == null || recType == null) continue;
+            if (!baseUntyped) checkAcrossCategories(baseType, recType, baseTerm, recTerm, i);
             int baseFamily = baseUntyped ? family(recType) : family(baseType);
             int recFamily = family(recType);
             if (baseFamily == FAMILY_NONE || recFamily == FAMILY_NONE) continue;
@@ -168,10 +164,54 @@ public final class RecursiveCteCheck {
             // PostgreSQL reads it as the other arm's type, so 'x' against an integer column is
             // bad input rather than an unmatched union, and '5' is simply the number five.
             if (statedAsText(baseFamily == FAMILY_TEXT ? baseTerm : recTerm, i)) {
-                throw new MemgresException("UNION types " + displayName(baseType) + " and "
-                        + displayName(recType) + " cannot be matched", "42804");
+                throw cannotBeMatched(baseType, recType);
             }
         }
+    }
+
+    /**
+     * The types a recursive term may not carry at all, whatever the widening rules say.
+     *
+     * <p>The families above are the ones that have a widening ladder to walk; a boolean, a jsonb,
+     * an array or a network address has none, and against a number or a date there is no common
+     * type either. PostgreSQL says so where both sides carry a type of their own — a bare string
+     * literal does not, which is why a text side is only reported when the query wrote the cast.
+     */
+    private static void checkAcrossCategories(DataType baseType, DataType recType,
+                                              Statement baseTerm, Statement recTerm, int i) {
+        if (baseType == null || recType == null || baseType == recType) return;
+        TypeCoercion.TypeCategory baseCat = TypeCoercion.categoryOf(baseType);
+        TypeCoercion.TypeCategory recCat = TypeCoercion.categoryOf(recType);
+        // An array and a scalar are not each other's type whatever their elements are, and this
+        // engine files every array under the same category, so ask the element question first.
+        boolean baseIsArray = DataType.elementOf(baseType) != null;
+        boolean recIsArray = DataType.elementOf(recType) != null;
+        if (baseIsArray != recIsArray) {
+            TypeCoercion.TypeCategory scalarCat = baseIsArray ? recCat : baseCat;
+            if (scalarCat == TypeCoercion.TypeCategory.UNKNOWN) return;
+            if (scalarCat == TypeCoercion.TypeCategory.STRING
+                    && !statedAsText(baseIsArray ? recTerm : baseTerm, i)) {
+                return;
+            }
+            throw cannotBeMatched(baseType, recType);
+        }
+        if (baseCat == recCat) return;
+        if (baseCat == TypeCoercion.TypeCategory.UNKNOWN
+                || recCat == TypeCoercion.TypeCategory.UNKNOWN) return;
+        boolean baseIsText = baseCat == TypeCoercion.TypeCategory.STRING;
+        boolean recIsText = recCat == TypeCoercion.TypeCategory.STRING;
+        if (baseIsText || recIsText) {
+            if (statedAsText(baseIsText ? baseTerm : recTerm, i)) {
+                throw cannotBeMatched(baseType, recType);
+            }
+            return;
+        }
+        throw cannotBeMatched(baseType, recType);
+    }
+
+    private static MemgresException cannotBeMatched(DataType baseType, DataType recType) {
+        return new MemgresException("UNION types " + displayName(baseType) + " and "
+                + displayName(recType) + " cannot be matched", "42804");
     }
 
     private static MemgresException widened(String cteName, int col, DataType base, DataType rec) {
@@ -316,29 +356,41 @@ public final class RecursiveCteCheck {
 
     // ---- self reference discovery ----
 
+    /** The context names, most specific first, so a query with two bad references names one. */
+    private static final String[] CONTEXT_PRIORITY =
+            {"a subquery", "an outer join", "EXCEPT", "INTERSECT"};
+
     /**
-     * One entry per unqualified FROM reference to {@code name} inside {@code node}; the value
-     * says whether the reference sits inside a sub-select of an expression (EXISTS, IN, a scalar
-     * subquery) rather than in a FROM clause. A schema-qualified name is never a WITH item, so it
+     * One entry per unqualified FROM reference to {@code name} inside {@code node}: the name of
+     * the construct that makes the reference inadmissible, or null when the reference sits
+     * somewhere the iteration can evaluate it. A schema-qualified name is never a WITH item, so it
      * is not counted.
+     *
+     * <p>Which constructs those are is what PostgreSQL will actually refuse, no more. A sub-select
+     * of an expression (EXISTS, IN, a scalar subquery) needs the whole result at once, and so does
+     * the null-extended side of an outer join. A set operation only needs it where the arm is
+     * subtracted or where duplicate counts matter: the right-hand side of any EXCEPT, and either
+     * side of an INTERSECT ALL or EXCEPT ALL. Plain {@code INTERSECT} and the left side of a plain
+     * {@code EXCEPT} grow with the rows the previous round produced, so PostgreSQL runs them and
+     * so does this.
      */
-    private static List<Boolean> selfReferences(Object node, String name) {
-        List<Boolean> found = new ArrayList<>();
+    private static List<String> selfReferences(Object node, String name) {
+        List<String> found = new ArrayList<>();
         String lcName = name.toLowerCase();
         Deque<Object> nodes = new ArrayDeque<>();
-        Deque<Boolean> viaExpr = new ArrayDeque<>();
+        Deque<String> contexts = new ArrayDeque<>();
         Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-        nodes.push(node);
-        viaExpr.push(Boolean.FALSE);
+        push(nodes, contexts, node, NONE);
         while (!nodes.isEmpty()) {
             Object cur = nodes.pop();
-            boolean inExpr = viaExpr.pop();
+            String context = contexts.pop();
+            if (NONE.equals(context)) context = null;
             if (cur == null || !seen.add(cur)) continue;
             if (cur instanceof SelectStmt.TableRef) {
                 SelectStmt.TableRef ref = (SelectStmt.TableRef) cur;
                 if (ref.schema() == null && ref.table() != null
                         && ref.table().toLowerCase().equals(lcName)) {
-                    found.add(inExpr);
+                    found.add(context);
                 }
                 continue;
             }
@@ -347,15 +399,43 @@ public final class RecursiveCteCheck {
             // A query that declares a WITH item of this name means that item everywhere below,
             // not the one being defined; nothing under it is a self-reference.
             if (cur instanceof SelectStmt && declaresWithItem((SelectStmt) cur, lcName)) continue;
+            if (cur instanceof SetOpStmt) {
+                SetOpStmt sop = (SetOpStmt) cur;
+                push(nodes, contexts, sop.left(), armContext(sop, context, true));
+                push(nodes, contexts, sop.right(), armContext(sop, context, false));
+                push(nodes, contexts, sop.orderBy(), context);
+                push(nodes, contexts, sop.limit(), context);
+                push(nodes, contexts, sop.offset(), context);
+                continue;
+            }
+            if (cur instanceof SelectStmt.JoinFrom) {
+                SelectStmt.JoinFrom j = (SelectStmt.JoinFrom) cur;
+                SelectStmt.JoinType type = j.joinType();
+                boolean rightNullable = type == SelectStmt.JoinType.LEFT
+                        || type == SelectStmt.JoinType.NATURAL_LEFT
+                        || type == SelectStmt.JoinType.FULL
+                        || type == SelectStmt.JoinType.NATURAL_FULL;
+                boolean leftNullable = type == SelectStmt.JoinType.RIGHT
+                        || type == SelectStmt.JoinType.NATURAL_RIGHT
+                        || type == SelectStmt.JoinType.FULL
+                        || type == SelectStmt.JoinType.NATURAL_FULL;
+                // A join names the reference's context only where nothing nearer already has.
+                push(nodes, contexts, j.left(), leftNullable && context == null
+                        ? "an outer join" : context);
+                push(nodes, contexts, j.right(), rightNullable && context == null
+                        ? "an outer join" : context);
+                push(nodes, contexts, j.on(), context);
+                continue;
+            }
             // Once inside an expression, everything below it is inside a sub-select of that
             // expression — the FROM-clause subqueries PG allows are reached through FromItems.
-            boolean childInExpr = inExpr || cur instanceof Expression;
+            String childContext = cur instanceof Expression ? "a subquery" : context;
             if (cur instanceof Collection) {
-                for (Object item : (Collection<?>) cur) { nodes.push(item); viaExpr.push(childInExpr); }
+                for (Object item : (Collection<?>) cur) push(nodes, contexts, item, childContext);
                 continue;
             }
             if (cur instanceof Map) {
-                for (Object item : ((Map<?, ?>) cur).values()) { nodes.push(item); viaExpr.push(childInExpr); }
+                for (Object item : ((Map<?, ?>) cur).values()) push(nodes, contexts, item, childContext);
                 continue;
             }
             Class<?> cls = cur.getClass();
@@ -365,29 +445,33 @@ public final class RecursiveCteCheck {
                 if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
                 try {
                     f.setAccessible(true);
-                    Object v = f.get(cur);
-                    if (v != null) { nodes.push(v); viaExpr.push(childInExpr); }
+                    push(nodes, contexts, f.get(cur), childContext);
                 } catch (IllegalAccessException | RuntimeException ignored) { }
             }
         }
         return found;
     }
 
-    /**
-     * The name of the set operation the self-reference sits inside, or null.
-     *
-     * <p>The iteration can supply the rows the previous round produced and nothing else, so a set
-     * operation that has to subtract from or intersect with the whole result — every one but the
-     * UNION that defines the recursion — has no meaning over a self-reference.
-     */
-    private static String refUnderNonUnionSetOp(Object node, String name) {
-        for (Object stmt : collect(node, SetOpStmt.class)) {
-            SetOpStmt sop = (SetOpStmt) stmt;
-            if (sop.op() == SetOpStmt.SetOpType.UNION) continue;
-            if (selfReferences(sop, name).isEmpty()) continue;
-            return sop.op() == SetOpStmt.SetOpType.EXCEPT ? "EXCEPT" : "INTERSECT";
+    /** ArrayDeque takes no nulls, so an absent context travels as this marker. */
+    private static final String NONE = "";
+
+    private static void push(Deque<Object> nodes, Deque<String> contexts, Object node,
+                             String context) {
+        if (node == null) return;
+        nodes.push(node);
+        contexts.push(context == null ? NONE : context);
+    }
+
+    /** The context an arm of a set operation puts its self-references in. */
+    private static String armContext(SetOpStmt sop, String context, boolean leftArm) {
+        switch (sop.op()) {
+            case EXCEPT:
+                return !leftArm || sop.all() ? "EXCEPT" : context;
+            case INTERSECT:
+                return sop.all() ? "INTERSECT" : context;
+            default:
+                return context;
         }
-        return null;
     }
 
     /** True when a query's own WITH clause claims the name, shadowing an enclosing one. */
@@ -397,60 +481,6 @@ public final class RecursiveCteCheck {
             if (item.name() != null && item.name().toLowerCase().equals(lcName)) return true;
         }
         return false;
-    }
-
-    /** True when the self-reference sits on a side of a join that the join may null-extend. */
-    private static boolean refUnderOuterJoin(Object node, String name) {
-        for (Object join : collect(node, SelectStmt.JoinFrom.class)) {
-            SelectStmt.JoinFrom j = (SelectStmt.JoinFrom) join;
-            SelectStmt.JoinType type = j.joinType();
-            boolean rightNullable = type == SelectStmt.JoinType.LEFT
-                    || type == SelectStmt.JoinType.NATURAL_LEFT
-                    || type == SelectStmt.JoinType.FULL
-                    || type == SelectStmt.JoinType.NATURAL_FULL;
-            boolean leftNullable = type == SelectStmt.JoinType.RIGHT
-                    || type == SelectStmt.JoinType.NATURAL_RIGHT
-                    || type == SelectStmt.JoinType.FULL
-                    || type == SelectStmt.JoinType.NATURAL_FULL;
-            if (rightNullable && !selfReferences(j.right(), name).isEmpty()) return true;
-            if (leftNullable && !selfReferences(j.left(), name).isEmpty()) return true;
-        }
-        return false;
-    }
-
-    /** Every node of the given class reachable from {@code node}. */
-    private static List<Object> collect(Object node, Class<?> wanted) {
-        List<Object> found = new ArrayList<>();
-        Deque<Object> stack = new ArrayDeque<>();
-        Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-        stack.push(node);
-        while (!stack.isEmpty()) {
-            Object cur = stack.pop();
-            if (cur == null || !seen.add(cur)) continue;
-            if (wanted.isInstance(cur)) found.add(cur);
-            if (cur instanceof String || cur instanceof Number || cur instanceof Boolean
-                    || cur instanceof Character || cur instanceof Enum) continue;
-            if (cur instanceof Collection) {
-                for (Object item : (Collection<?>) cur) stack.push(item);
-                continue;
-            }
-            if (cur instanceof Map) {
-                for (Object item : ((Map<?, ?>) cur).values()) stack.push(item);
-                continue;
-            }
-            Class<?> cls = cur.getClass();
-            Package pkg = cls.getPackage();
-            if (pkg == null || !pkg.getName().startsWith("com.memgres")) continue;
-            for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
-                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) continue;
-                try {
-                    f.setAccessible(true);
-                    Object v = f.get(cur);
-                    if (v != null) stack.push(v);
-                } catch (IllegalAccessException | RuntimeException ignored) { }
-            }
-        }
-        return found;
     }
 
     // ---- clause inspection ----
@@ -496,7 +526,7 @@ public final class RecursiveCteCheck {
             case TIMESTAMP: return "timestamp without time zone";
             case TIMESTAMPTZ: return "timestamp with time zone";
             case BOOLEAN: return "boolean";
-            default: return type.getPgName();
+            default: return type.toRegtypeDisplay();
         }
     }
 }
