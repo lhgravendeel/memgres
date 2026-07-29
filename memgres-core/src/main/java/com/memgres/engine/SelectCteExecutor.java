@@ -105,7 +105,8 @@ class SelectCteExecutor {
 
         if (cte.columnNames() != null && !cte.columnNames().isEmpty()) {
             if (cte.columnNames().size() != result.getColumns().size()) {
-                throw new MemgresException("table \"" + cte.name() + "\" has " + result.getColumns().size()
+                // PostgreSQL names a WITH query as one, not as a table
+                throw new MemgresException("WITH query \"" + cte.name() + "\" has " + result.getColumns().size()
                         + " columns available but " + cte.columnNames().size() + " columns specified", "42P10");
             }
             List<Column> renamedCols = new ArrayList<>();

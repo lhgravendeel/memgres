@@ -25,6 +25,14 @@ class SelectWindowEvaluator {
      */
     QueryResult executeWindowSelect(SelectStmt stmt, List<RowContext> contexts,
                                      List<RowContext.TableBinding> baseBindings) {
+        // A set-returning call in a window's PARTITION BY or ORDER BY is a sort key, and the sort
+        // keys are computed below the window: PostgreSQL expands the input rows first and the
+        // window is then numbered over the rows the expansion produced. Doing this before anything
+        // reads the contexts is what makes OVER (ORDER BY generate_series(1,2)) two rows and not
+        // one whose key happens to be an array.
+        contexts = expandContextsForWindowSpecSrfs(stmt, contexts);
+        final List<RowContext> sourceContexts = contexts;
+
         // Build result columns
         List<Column> resultColumns = new ArrayList<>();
         for (SelectStmt.SelectTarget target : stmt.targets()) {
@@ -61,10 +69,17 @@ class SelectWindowEvaluator {
             }
         }
 
+        // The input row each output row came from. Ordinarily that is the row's own index, but a
+        // set-returning target turns one input row into several, and both the ORDER BY below and
+        // DISTINCT ON after it read per-input-row window values through this.
+        List<Integer> sourceRows = new ArrayList<>(contexts.size());
+
         // Now project all rows
         for (int ri = 0; ri < contexts.size(); ri++) {
             RowContext ctx = contexts.get(ri);
             List<Object> rowValues = new ArrayList<>();
+            // Which projected values are a set to expand into rows of their own
+            Map<Integer, List<?>> sets = new LinkedHashMap<>();
 
             for (int ti = 0; ti < stmt.targets().size(); ti++) {
                 SelectStmt.SelectTarget target = stmt.targets().get(ti);
@@ -87,17 +102,41 @@ class SelectWindowEvaluator {
                     }
                 } else if (windowResults.containsKey(ti)) {
                     rowValues.add(windowResults.get(ti)[ri]);
+                } else if (SelectExecutor.findSrfCall(target.expr()) != null) {
+                    // PostgreSQL expands the sets of the select list above the window, so each
+                    // output row of the window becomes one row per element and carries the same
+                    // window value -- which is why count(*) OVER () beside generate_series(1,3)
+                    // answers three rows of 1 rather than one row holding an array.
+                    Object value = select.evalSrfExpandedTarget(target.expr(), ctx);
+                    if (value instanceof List<?>) sets.put(rowValues.size(), (List<?>) value);
+                    rowValues.add(value);
                 } else {
                     rowValues.add(executor.evalExpr(target.expr(), ctx));
                 }
             }
-            resultRows.add(rowValues.toArray());
+            if (sets.isEmpty()) {
+                resultRows.add(rowValues.toArray());
+                sourceRows.add(ri);
+                continue;
+            }
+            int width = 0;
+            for (List<?> set : sets.values()) width = Math.max(width, set.size());
+            for (int ei = 0; ei < width; ei++) {
+                Object[] expanded = rowValues.toArray();
+                for (Map.Entry<Integer, List<?>> entry : sets.entrySet()) {
+                    List<?> set = entry.getValue();
+                    expanded[entry.getKey()] = ei < set.size() ? set.get(ei) : null;
+                }
+                resultRows.add(expanded);
+                sourceRows.add(ri);
+            }
         }
 
         // ORDER BY. The row order is tracked as the input rows it came from, because DISTINCT ON
         // below has to read window values, and those are computed per input row.
         int[] rowOrder = new int[resultRows.size()];
-        for (int i = 0; i < rowOrder.length; i++) rowOrder[i] = i;
+        for (int i = 0; i < rowOrder.length; i++) rowOrder[i] = sourceRows.get(i);
+        final int[] sourceOf = rowOrder.clone();
         List<SelectStmt.OrderByItem> resolvedOrderBy = select.resolveOrderBy(stmt.orderBy(), stmt.targets());
         if (resolvedOrderBy != null && !resolvedOrderBy.isEmpty()) {
             // A window function ordered by rather than selected has no output column to read, and
@@ -125,10 +164,10 @@ class SelectWindowEvaluator {
                     if (colIdx >= 0) {
                         va = a[colIdx]; vb = b[colIdx];
                     } else if (windowValues != null) {
-                        va = windowValues[ai]; vb = windowValues[bi];
+                        va = windowValues[sourceOf[ai]]; vb = windowValues[sourceOf[bi]];
                     } else {
-                        va = executor.evalExpr(item.expr(), contexts.get(ai));
-                        vb = executor.evalExpr(item.expr(), contexts.get(bi));
+                        va = executor.evalExpr(item.expr(), sourceContexts.get(sourceOf[ai]));
+                        vb = executor.evalExpr(item.expr(), sourceContexts.get(sourceOf[bi]));
                     }
 
                     if (va == null && vb == null) continue;
@@ -146,15 +185,58 @@ class SelectWindowEvaluator {
             List<Object[]> sorted = new ArrayList<>(resultRows.size());
             for (int i = 0; i < indices.length; i++) {
                 sorted.add(finalResultRows.get(indices[i]));
-                rowOrder[i] = indices[i];
+                rowOrder[i] = sourceOf[indices[i]];
             }
             resultRows = sorted;
         }
 
-        resultRows = applyDistinctOn(stmt, resultRows, contexts, rowOrder);
+        resultRows = applyDistinctOn(stmt, resultRows, sourceContexts, rowOrder);
         resultRows = select.applyDistinct(stmt, resultRows);
         resultRows = select.applyOffsetAndLimit(stmt, resultRows);
         return QueryResult.select(resultColumns, resultRows);
+    }
+
+    /**
+     * The input rows a window sees, once the set-returning calls in its specification have been
+     * expanded.
+     *
+     * <p>A PARTITION BY or ORDER BY expression is computed for each input row before the window
+     * runs, so a set written in one multiplies the input the same way one in the select list
+     * multiplies the output: {@code count(*) OVER (ORDER BY generate_series(1,2))} is numbered
+     * over two rows. Frame bounds are left out — a bound is read once for the whole window and
+     * cannot expand anything.
+     */
+    private List<RowContext> expandContextsForWindowSpecSrfs(SelectStmt stmt,
+                                                             List<RowContext> contexts) {
+        List<Expression> specExprs = new ArrayList<>();
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            collectWindowSpecExprs(target.expr(), specExprs);
+        }
+        if (stmt.windowDefs() != null) {
+            for (SelectStmt.WindowDef def : stmt.windowDefs()) {
+                if (def.partitionBy() != null) specExprs.addAll(def.partitionBy());
+                if (def.orderBy() != null) {
+                    for (SelectStmt.OrderByItem o : def.orderBy()) specExprs.add(o.expr());
+                }
+            }
+        }
+        return select.expandContextsForSrfs(specExprs, contexts);
+    }
+
+    /**
+     * The PARTITION BY and ORDER BY expressions of every window call written in this query's own
+     * scope. It stops at a nested query, whose windows are numbered over that query's rows.
+     */
+    private static void collectWindowSpecExprs(Object node, List<Expression> out) {
+        if (node == null || node instanceof Statement) return;
+        if (node instanceof WindowFuncExpr) {
+            WindowFuncExpr w = (WindowFuncExpr) node;
+            if (w.partitionBy() != null) out.addAll(w.partitionBy());
+            if (w.orderBy() != null) {
+                for (SelectStmt.OrderByItem o : w.orderBy()) out.add(o.expr());
+            }
+        }
+        AstWalk.forEachChild(node, child -> collectWindowSpecExprs(child, out));
     }
 
     /**

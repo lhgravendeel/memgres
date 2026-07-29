@@ -199,16 +199,20 @@ class FromResolver {
                 Table virtualTable = new Table(alias, cols);
                 bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
             } else {
+                // The shape describes an item that produced no row, so the type has to come from
+                // the call rather than from a value; text is only the fallback.
+                DataType known = functionResolver.singleColumnType(funcFrom);
+                DataType colType = known != null ? known : DataType.TEXT;
                 List<String> ca = funcFrom.columnAliases();
                 if (ca != null && !ca.isEmpty()) {
                     List<Column> cols = new ArrayList<>();
                     for (String colName : ca) {
-                        cols.add(new Column(FromFunctionResolver.stripColType(colName), DataType.TEXT, true, false, null));
+                        cols.add(new Column(FromFunctionResolver.stripColType(colName), colType, true, false, null));
                     }
                     Table virtualTable = new Table(alias, cols);
                     bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[cols.size()]));
                 } else {
-                    List<Column> cols = Cols.listOf(new Column(alias, DataType.TEXT, true, false, null));
+                    List<Column> cols = Cols.listOf(new Column(alias, colType, true, false, null));
                     Table virtualTable = new Table(alias, cols);
                     bindings.add(new RowContext.TableBinding(virtualTable, alias, new Object[1]));
                 }
@@ -346,22 +350,12 @@ class FromResolver {
                 for (RowContext leftCtx : accumulated) {
                     executor.outerContextStack.push(leftCtx);
                     try {
-                        List<RowContext> funcRows = functionResolver.resolveFunctionFrom(funcFrom);
-                        if (funcRows.isEmpty()) {
-                            String alias = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
-                            List<Column> emptyCols = funcFrom.columnAliases() != null
-                                    ? funcFrom.columnAliases().stream()
-                                        .map(c -> new Column(FromFunctionResolver.stripColType(c), DataType.TEXT, true, false, null))
-                                        .collect(java.util.stream.Collectors.toList())
-                                    : Cols.listOf();
-                            Table virtualTable = new Table(alias, emptyCols);
-                            Object[] nullRow = new Object[emptyCols.size()];
-                            RowContext rightCtx = new RowContext(virtualTable, alias, nullRow);
+                        // A comma between two FROM items is an inner join, so a function that
+                        // produces no rows for this left row removes it -- the same as the
+                        // lateral-subquery branch above, which skips it. Padding it with NULLs
+                        // instead answered LEFT JOIN LATERAL to a query that did not write one.
+                        for (RowContext rightCtx : functionResolver.resolveFunctionFrom(funcFrom)) {
                             newAccumulated.add(joinExecutor.mergeContexts(leftCtx, rightCtx));
-                        } else {
-                            for (RowContext rightCtx : funcRows) {
-                                newAccumulated.add(joinExecutor.mergeContexts(leftCtx, rightCtx));
-                            }
                         }
                     } finally {
                         executor.outerContextStack.pop();
@@ -795,7 +789,7 @@ class FromResolver {
         }
         String alias = subqFrom.alias() != null ? subqFrom.alias() : "subquery";
         List<Column> columns = FromFunctionResolver.applyColumnAliases(
-                new ArrayList<>(subResult.getColumns()), subqFrom.columnAliases());
+                new ArrayList<>(subResult.getColumns()), subqFrom.columnAliases(), alias);
         Table virtualTable = new Table(alias, columns);
         for (Object[] row : subResult.getRows()) {
             virtualTable.insertRow(row);

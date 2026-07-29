@@ -621,6 +621,13 @@ class FunctionEvaluator {
                 // so `pg_notify(...) IS NULL` is false, as it is in PG
                 return "";
             }
+            // Set-returning, and PostgreSQL lets a set-returning call stand in the select list as
+            // readily as in FROM. Both were reachable only through FROM, so writing one in the
+            // select list answered that the function does not exist.
+            case "string_to_table":
+                return FromFunctionResolver.stringToTableValues(evaluatedArgs(fn, ctx));
+            case "regexp_split_to_table":
+                return FromFunctionResolver.regexpSplitToTableValues(evaluatedArgs(fn, ctx));
             case "generate_series": {
                 if (fn.args().size() < 2) {
                     throw new MemgresException("function generate_series() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
@@ -1368,6 +1375,11 @@ class FunctionEvaluator {
                 if (fn.args().isEmpty()) {
                     throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
                 }
+                // The many-argument form of unnest exists only as a FROM item -- it produces a
+                // row of several columns, which a select-list expression has no room for, and
+                // PostgreSQL has no such function to call there. Dropping the extra arguments
+                // answered the one-argument call to a query that did not write one.
+                if (fn.args().size() > 1) throw noMultiArgUnnest(fn, ctx);
                 // unnest returns set; expand array into individual elements as a List
                 Object arr = executor.evalExpr(fn.args().get(0), ctx);
                 if (arr instanceof TsVector) {
@@ -3608,6 +3620,30 @@ class FunctionEvaluator {
         } catch (RuntimeException e) {
             return null;
         }
+    }
+
+    /** "function unnest(integer[], text[]) does not exist", named after the arguments written. */
+    private MemgresException noMultiArgUnnest(FunctionCallExpr fn, RowContext ctx) {
+        StringBuilder types = new StringBuilder();
+        for (Expression arg : fn.args()) {
+            if (types.length() > 0) types.append(", ");
+            DataType t = executor.exprEvaluator.inferTypeFromContext(arg,
+                    ctx != null ? ctx.getBindings() : new ArrayList<RowContext.TableBinding>());
+            types.append(t == null ? "unknown" : t.toRegtypeDisplay());
+        }
+        MemgresException e = new MemgresException(
+                "function unnest(" + types + ") does not exist", "42883");
+        e.setHint("No function matches the given name and argument types."
+                + " You might need to add explicit type casts.");
+        e.setPositionToken("unnest");
+        return e;
+    }
+
+    /** Every argument of a call, evaluated left to right. */
+    private List<Object> evaluatedArgs(FunctionCallExpr fn, RowContext ctx) {
+        List<Object> values = new ArrayList<>(fn.args().size());
+        for (Expression arg : fn.args()) values.add(executor.evalExpr(arg, ctx));
+        return values;
     }
 
     /** Strip well-known schema prefixes (pg_catalog., information_schema.) from a function name. */

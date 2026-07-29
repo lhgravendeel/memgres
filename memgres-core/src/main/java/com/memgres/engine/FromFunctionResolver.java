@@ -76,7 +76,7 @@ class FromFunctionResolver {
         if (aliases.size() > available) {
             String rel = funcFrom.alias() != null ? funcFrom.alias() : funcFrom.functionName();
             throw new MemgresException("table \"" + rel + "\" has " + available
-                    + " columns available but " + aliases.size() + " columns specified", "42P10");
+                    + " columns available but " + aliases.size() + " columns specified", "42P10").suppressPosition();
         }
     }
 
@@ -151,7 +151,7 @@ class FromFunctionResolver {
         if (userFunc != null) {
             checkRecordColumnDefinitionList(userFunc, funcFrom);
             // Raw, not stripped: a column definition list gives the columns their types too.
-            return resolveUserFunction(userFunc, alias, rawColAliases, evalArgs);
+            return resolveUserFunction(userFunc, alias, rawColAliases, evalArgs, funcFrom.withOrdinality());
         }
 
         return resolveScalarFunctionInFrom(funcFrom, fname, alias, colAliases);
@@ -190,6 +190,46 @@ class FromFunctionResolver {
     private static MemgresException onlyForRecord() {
         return PgErrors.syntax(
                 "a column definition list is only allowed for functions returning \"record\"");
+    }
+
+    /**
+     * The type the single column of a set-returning FROM item carries, or null when unknown.
+     *
+     * <p>Needed where the item produced no row and there is nothing to read the type off: an
+     * outer join still has to describe the columns it padded with NULLs, and describing them as
+     * text made {@code LEFT JOIN generate_series(1,0) AS a(g)} answer a text column where
+     * PostgreSQL answers an integer one. Only the two functions whose result type is decided by
+     * their arguments are answered for; anything else keeps the type its caller already assumed.
+     */
+    DataType singleColumnType(SelectStmt.FunctionFrom funcFrom) {
+        String fname = FunctionEvaluator.stripSchemaPrefix(funcFrom.functionName().toLowerCase());
+        if (funcFrom.args().isEmpty()) return null;
+        if (fname.equals("unnest") && funcFrom.args().size() == 1) {
+            return DataType.elementOf(inferInOuterScope(funcFrom.args().get(0)));
+        }
+        if (fname.equals("generate_series")) {
+            DataType start = inferInOuterScope(funcFrom.args().get(0));
+            // The numeric overload answers int4 unless a bound is wider; the date and timestamp
+            // ones answer their own type, which is what the bound already is.
+            if (start == DataType.BIGINT || start == DataType.NUMERIC || start == DataType.DATE
+                    || start == DataType.TIMESTAMP || start == DataType.TIMESTAMPTZ) {
+                return start == DataType.DATE ? DataType.TIMESTAMPTZ : start;
+            }
+            return DataType.INTEGER;
+        }
+        return null;
+    }
+
+    /** The type of an expression, read against whatever row context encloses this FROM item. */
+    private DataType inferInOuterScope(Expression expr) {
+        List<RowContext.TableBinding> bindings = executor.outerContextStack.isEmpty()
+                ? new ArrayList<RowContext.TableBinding>()
+                : executor.outerContextStack.peek().getBindings();
+        try {
+            return executor.exprEvaluator.inferTypeFromContext(expr, bindings);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /** A column definition list names types; an alias list only renames what is already there. */
@@ -244,9 +284,10 @@ class FromFunctionResolver {
 
     private List<RowContext> resolveGenerateSeries(String alias, List<String> colAliases, List<Object> evalArgs,
                                                    boolean withOrdinality) {
-        // WITH ORDINALITY (parser flag) is the source of truth; the second-column-alias heuristic
-        // is kept as a lenient fallback for callers that pass 2 aliases without the clause.
-        boolean hasOrdinality = withOrdinality || (colAliases != null && colAliases.size() >= 2);
+        // WITH ORDINALITY is what adds the second column. Inferring it from a second alias
+        // instead invented a column to hang the alias on, so an alias list too long for the
+        // function silently succeeded where PostgreSQL says how many columns are available.
+        boolean hasOrdinality = withOrdinality;
         String ordColName = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "ordinality";
         Object stepObj = evalArgs.size() > 2 ? evalArgs.get(2) : null;
         // A zero step can never reach the stop value, so PG rejects it rather than looping
@@ -403,58 +444,68 @@ class FromFunctionResolver {
     // ---- generate_subscripts ----
 
     private List<RowContext> resolveStringToTable(String alias, List<String> colAliases, List<Object> evalArgs) {
+        return oneColumnRows(alias, colAliases, stringToTableValues(evalArgs));
+    }
+
+    /**
+     * The values {@code string_to_table} produces, one per row.
+     *
+     * <p>Shared with the select-list path: a set-returning function is the same function wherever
+     * it is written, and PostgreSQL answers {@code SELECT string_to_table('a,b,c', ',')} with the
+     * three rows that {@code FROM string_to_table('a,b,c', ',')} answers with.
+     */
+    static List<Object> stringToTableValues(List<Object> evalArgs) {
         if (evalArgs.isEmpty()) throw new MemgresException("function string_to_table() requires at least 2 arguments", "42883");
         Object strObj = evalArgs.get(0);
         Object delimObj = evalArgs.size() > 1 ? evalArgs.get(1) : null;
-        if (strObj == null) return new ArrayList<>();
+        List<Object> values = new ArrayList<>();
+        if (strObj == null) return values;
         String str = strObj.toString();
         // PG: string_to_table('', delim) returns 0 rows when the input string is empty
-        if (str.isEmpty() && delimObj != null && delimObj.toString().length() > 0) return new ArrayList<>();
-        String colName = firstColAlias(colAliases, alias);
-        Column col = new Column(colName, DataType.TEXT, true, false, null);
-        Table virtualTable = new Table(alias, Cols.listOf(col));
-        List<RowContext> contexts = new ArrayList<>();
+        if (str.isEmpty() && delimObj != null && delimObj.toString().length() > 0) return values;
         if (delimObj == null) {
             // NULL delimiter: each character as separate row
-            for (int i = 0; i < str.length(); i++) {
-                Object[] row = new Object[]{ String.valueOf(str.charAt(i)) };
-                virtualTable.insertRow(row);
-                contexts.add(new RowContext(virtualTable, alias, row));
-            }
-        } else {
-            String delim = delimObj.toString();
-            String nullStr = evalArgs.size() > 2 && evalArgs.get(2) != null ? evalArgs.get(2).toString() : null;
-            String[] parts = delim.isEmpty() ? new String[]{ str } : str.split(java.util.regex.Pattern.quote(delim), -1);
-            for (String part : parts) {
-                Object val = (nullStr != null && part.equals(nullStr)) ? null : part;
-                Object[] row = new Object[]{ val };
-                virtualTable.insertRow(row);
-                contexts.add(new RowContext(virtualTable, alias, row));
-            }
+            for (int i = 0; i < str.length(); i++) values.add(String.valueOf(str.charAt(i)));
+            return values;
         }
-        return contexts;
+        String delim = delimObj.toString();
+        String nullStr = evalArgs.size() > 2 && evalArgs.get(2) != null ? evalArgs.get(2).toString() : null;
+        String[] parts = delim.isEmpty() ? new String[]{ str } : str.split(java.util.regex.Pattern.quote(delim), -1);
+        for (String part : parts) {
+            values.add(nullStr != null && part.equals(nullStr) ? null : part);
+        }
+        return values;
     }
 
     // ---- regexp_split_to_table ----
 
     private List<RowContext> resolveRegexpSplitToTable(String alias, List<String> colAliases, List<Object> evalArgs) {
+        return oneColumnRows(alias, colAliases, regexpSplitToTableValues(evalArgs));
+    }
+
+    /** The values {@code regexp_split_to_table} produces, one per row. See above. */
+    static List<Object> regexpSplitToTableValues(List<Object> evalArgs) {
         if (evalArgs.size() < 2) throw new MemgresException("function regexp_split_to_table() requires at least 2 arguments", "42883");
         Object strObj = evalArgs.get(0);
         Object patternObj = evalArgs.get(1);
-        if (strObj == null) return new ArrayList<>();
-        String str = strObj.toString();
-        if (patternObj == null) return new ArrayList<>();
-        String pattern = patternObj.toString();
-        if (evalArgs.size() > 2 && evalArgs.get(2) == null) return new ArrayList<>();
+        List<Object> values = new ArrayList<>();
+        if (strObj == null || patternObj == null) return values;
+        if (evalArgs.size() > 2 && evalArgs.get(2) == null) return values;
         String flags = evalArgs.size() > 2 ? evalArgs.get(2).toString() : "";
-        String colName = firstColAlias(colAliases, alias);
-        Column col = new Column(colName, DataType.TEXT, true, false, null);
+        for (String part : PgRegex.split(strObj.toString(), PgRegex.compile(patternObj.toString(),
+                PgRegex.parseFlags(flags, false, "regexp_split_to_table")))) {
+            values.add(part);
+        }
+        return values;
+    }
+
+    /** One row per value, in a single text column named for the alias or the column alias. */
+    private List<RowContext> oneColumnRows(String alias, List<String> colAliases, List<Object> values) {
+        Column col = new Column(firstColAlias(colAliases, alias), DataType.TEXT, true, false, null);
         Table virtualTable = new Table(alias, Cols.listOf(col));
         List<RowContext> contexts = new ArrayList<>();
-        List<String> parts = PgRegex.split(str,
-                PgRegex.compile(pattern, PgRegex.parseFlags(flags, false, "regexp_split_to_table")));
-        for (String part : parts) {
-            Object[] row = new Object[]{ part };
+        for (Object value : values) {
+            Object[] row = new Object[]{ value };
             virtualTable.insertRow(row);
             contexts.add(new RowContext(virtualTable, alias, row));
         }
@@ -690,7 +741,7 @@ class FromFunctionResolver {
             throw new MemgresException("function unnest() does not exist\n  Hint: No function matches the given name and argument types.", "42883");
         }
         if (evalArgs.size() > 1) {
-            return resolveMultiUnnest(alias, colAliases, evalArgs, withOrdinality);
+            return resolveMultiUnnest(alias, colAliases, evalArgs, withOrdinality, argExprs);
         }
         // Single array/multirange unnest
         Object arr = evalArgs.get(0);
@@ -713,12 +764,14 @@ class FromFunctionResolver {
         List<Column> cols = new ArrayList<>();
         // The rows unnest produces are the array's elements, so the column carries the element
         // type: an int4[] unnests to int4, not to the text the driver could not decode.
+        // Read against the enclosing row: a lateral unnest(ARRAY[a]) names a column of the item
+        // to its left, and inferring with no bindings answered text for an integer array.
         DataType elementType = argExprs == null || argExprs.isEmpty() ? null
-                : DataType.elementOf(executor.exprEvaluator.inferExprType(argExprs.get(0)));
+                : DataType.elementOf(inferInOuterScope(argExprs.get(0)));
         cols.add(new Column(colName, elementType != null ? elementType : DataType.TEXT, true, false, null));
         // The WITH ORDINALITY clause decides; a short alias list just leaves the extra
         // column with its default name rather than dropping it
-        boolean hasOrdinality = withOrdinality || (colAliases != null && colAliases.size() >= 2);
+        boolean hasOrdinality = withOrdinality;
         String ordColName = (colAliases != null && colAliases.size() >= 2) ? colAliases.get(1) : "ordinality";
         if (hasOrdinality) {
             cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
@@ -735,7 +788,7 @@ class FromFunctionResolver {
     }
 
     private List<RowContext> resolveMultiUnnest(String alias, List<String> colAliases, List<Object> evalArgs,
-                                                boolean withOrdinality) {
+                                                boolean withOrdinality, List<Expression> argExprs) {
         List<List<Object>> allElements = new ArrayList<>();
         int maxLen = 0;
         for (Object arr : evalArgs) {
@@ -746,11 +799,15 @@ class FromFunctionResolver {
         }
         List<Column> cols = new ArrayList<>();
         for (int i = 0; i < evalArgs.size(); i++) {
-            String cname = (colAliases != null && i < colAliases.size()) ? colAliases.get(i) : ("col" + (i+1));
-            cols.add(new Column(cname, DataType.TEXT, true, false, null));
+            // Every column of a multi-argument unnest is named for the function, as each column
+            // of the equivalent ROWS FROM would be -- not col1..colN, which is a name PostgreSQL
+            // never gives a column. Each carries its own array's element type.
+            String cname = (colAliases != null && i < colAliases.size()) ? colAliases.get(i) : "unnest";
+            DataType elementType = argExprs != null && i < argExprs.size()
+                    ? DataType.elementOf(executor.exprEvaluator.inferExprType(argExprs.get(i))) : null;
+            cols.add(new Column(cname, elementType != null ? elementType : DataType.TEXT, true, false, null));
         }
-        boolean hasOrdinality = withOrdinality
-                || (colAliases != null && colAliases.size() > evalArgs.size());
+        boolean hasOrdinality = withOrdinality;
         String ordColName = (colAliases != null && colAliases.size() > evalArgs.size())
                 ? colAliases.get(evalArgs.size()) : "ordinality";
         if (hasOrdinality) cols.add(new Column(ordColName, DataType.BIGINT, true, false, null));
@@ -1338,7 +1395,7 @@ class FromFunctionResolver {
 
     // ---- User-defined functions ----
 
-    private List<RowContext> resolveUserFunction(PgFunction userFunc, String alias, List<String> colAliases, List<Object> evalArgs) {
+    private List<RowContext> resolveUserFunction(PgFunction userFunc, String alias, List<String> colAliases, List<Object> evalArgs, boolean withOrdinality) {
         // STRICT: return empty set if any argument is NULL (PG returns empty set for strict SRFs)
         if (userFunc.isStrict()) {
             for (Object arg : evalArgs) {
@@ -1355,8 +1412,12 @@ class FromFunctionResolver {
             String returnType = userFunc.getReturnType();
 
             List<Column> cols = new ArrayList<>();
+            // The type a SETOF of a scalar returns. RETURNS SETOF int answers int4 columns, and
+            // reporting them as text left the driver decoding integers as strings.
+            DataType scalarSetofType = null;
             if (returnType != null && returnType.toUpperCase().startsWith("SETOF ")) {
                 String refTable = returnType.substring(6).trim();
+                scalarSetofType = DataType.fromPgName(refTable);
                 if (!"record".equalsIgnoreCase(refTable)) {
                     // Try composite type first
                     List<com.memgres.engine.parser.ast.CreateTypeStmt.CompositeField> ctFields =
@@ -1451,10 +1512,18 @@ class FromFunctionResolver {
                         }
                     }
                 }
-                cols.add(new Column(colName, DataType.TEXT, true, false, null));
+                if (colAliases != null && !colAliases.isEmpty()) colName = stripColType(colAliases.get(0));
+                cols.add(new Column(colName,
+                        scalarSetofType != null ? scalarSetofType : DataType.TEXT, true, false, null));
+                if (withOrdinality) {
+                    String ordName = colAliases != null && colAliases.size() > 1
+                            ? stripColType(colAliases.get(1)) : "ordinality";
+                    cols.add(new Column(ordName, DataType.BIGINT, true, false, null));
+                }
                 virtualTable = new Table(alias, cols);
+                long ord = 1;
                 for (Object val : resultList) {
-                    Object[] row = new Object[]{val};
+                    Object[] row = withOrdinality ? new Object[]{val, ord++} : new Object[]{val};
                     virtualTable.insertRow(row);
                     contexts.add(new RowContext(virtualTable, alias, row));
                 }
@@ -1634,7 +1703,23 @@ class FromFunctionResolver {
      * Shared by subquery and LATERAL handling code.
      */
     static List<Column> applyColumnAliases(List<Column> columns, List<String> aliases) {
+        return applyColumnAliases(columns, aliases, null);
+    }
+
+    /**
+     * As above, refusing an alias list longer than the relation is when the relation is named.
+     *
+     * <p>An alias list renames the columns a FROM item exposes, so naming more of them than exist
+     * names nothing — PostgreSQL says so rather than dropping the extras, and dropping them left
+     * {@code (SELECT 1, 2) AS t(a, b, c)} looking like it had worked. Fewer aliases than columns
+     * is ordinary: the ones past the list keep their own names.
+     */
+    static List<Column> applyColumnAliases(List<Column> columns, List<String> aliases, String relation) {
         if (aliases == null) return columns;
+        if (relation != null && aliases.size() > columns.size()) {
+            throw new MemgresException("table \"" + relation + "\" has " + columns.size()
+                    + " columns available but " + aliases.size() + " columns specified", "42P10").suppressPosition();
+        }
         List<Column> result = new ArrayList<>(columns);
         for (int i = 0; i < aliases.size() && i < result.size(); i++) {
             Column orig = result.get(i);

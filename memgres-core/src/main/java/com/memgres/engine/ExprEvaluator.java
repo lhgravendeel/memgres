@@ -2546,6 +2546,7 @@ class ExprEvaluator {
                 SelectStmt sel = (SelectStmt) sq.subquery();
                 SelectStmt.SelectTarget inner = sel.targets().get(0);
                 if (inner.alias() != null) return inner.alias();
+                if (inner.expr() instanceof WildcardExpr) return starSubqueryAlias(sel);
                 return exprToAlias(inner.expr());
             }
             return "?column?";
@@ -2580,6 +2581,65 @@ class ExprEvaluator {
         if (expr instanceof CompositeStarExpr) return "?column?";
         if (expr instanceof ArraySliceExpr) return exprToAlias(((ArraySliceExpr) expr).array());
         return "?column?";
+    }
+
+    /**
+     * The type of the single column a sub-query answers with, or null when it cannot be read.
+     *
+     * <p>Typing the target needs the names its own FROM supplies, which is what a shape is for.
+     * Deliberately quiet: a sub-query this cannot describe leaves the type unknown rather than
+     * guessing, and unknown is what the callers already handled.
+     */
+    private DataType subqueryColumnType(Statement subquery) {
+        if (!(subquery instanceof SelectStmt)) return null;
+        SelectStmt sel = (SelectStmt) subquery;
+        if (sel.targets() == null || sel.targets().size() != 1) return null;
+        Expression target = sel.targets().get(0).expr();
+        try {
+            List<RowContext.TableBinding> inner = new ArrayList<>();
+            if (sel.from() != null) {
+                for (SelectStmt.FromItem item : sel.from()) {
+                    inner.addAll(executor.fromResolver.resolveItemShape(item));
+                }
+            }
+            // A star stands for the columns the FROM item exposes, and a sub-query used as a
+            // value has exactly one, so its type is that column's own.
+            if (target instanceof WildcardExpr) {
+                Column only = null;
+                for (RowContext.TableBinding b : inner) {
+                    for (Column c : b.table().getColumns()) {
+                        if (only != null) return null;
+                        only = c;
+                    }
+                }
+                return only == null ? null : only.getType();
+            }
+            return inferTypeFromContext(target, inner);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The label a scalar sub-query written {@code (SELECT * FROM one_column_thing)} carries.
+     *
+     * <p>A star stands for the columns the FROM item exposes, and a sub-query used as a value has
+     * exactly one, so the label is that column's own name — {@code (SELECT id FROM c)} and
+     * {@code (SELECT * FROM c)} answer under the same name in PostgreSQL. Deliberately narrow: one
+     * FROM item exposing exactly one column, and any difficulty describing it leaves the label as
+     * the unnamed one it was.
+     */
+    private String starSubqueryAlias(SelectStmt sel) {
+        if (sel.from() == null || sel.from().size() != 1) return "?column?";
+        try {
+            List<Column> columns = new ArrayList<>();
+            for (RowContext.TableBinding b : executor.fromResolver.resolveItemShape(sel.from().get(0))) {
+                columns.addAll(b.table().getColumns());
+            }
+            return columns.size() == 1 ? columns.get(0).getName() : "?column?";
+        } catch (RuntimeException e) {
+            return "?column?";
+        }
     }
 
     /** Map a cast type name to the PG column name (e.g. "int" -> "int4", "boolean" -> "bool"). */
@@ -3040,6 +3100,15 @@ class ExprEvaluator {
                     || name.equals("grouping")
                     || name.equals("array_position")) return DataType.INTEGER;
             if (name.equals("array_positions")) return DataType.INT4_ARRAY;
+            // The set-returning calls, whose row type is the type of the column the query gets.
+            // Described as text they decoded as strings, though pg_typeof already answered right.
+            if (name.equals("regexp_matches")) return DataType.TEXT_ARRAY;
+            if (name.equals("json_array_elements")) return DataType.JSON;
+            if (name.equals("jsonb_array_elements")) return DataType.JSONB;
+            if (name.equals("json_each") || name.equals("jsonb_each")
+                    || name.equals("json_each_text") || name.equals("jsonb_each_text")) {
+                return DataType.RECORD;
+            }
             if (name.equals("sum") || name.equals("avg")) {
                 DataType dt = fn.args().isEmpty() ? null : inferTypeFromContext(fn.args().get(0), bindings);
                 if (dt == DataType.DOUBLE_PRECISION) return DataType.DOUBLE_PRECISION;
@@ -3306,6 +3375,17 @@ class ExprEvaluator {
         if (expr instanceof BetweenExpr) return DataType.BOOLEAN;
         if (expr instanceof LikeExpr) return DataType.BOOLEAN;
         if (expr instanceof ExistsExpr) return DataType.BOOLEAN;
+        // A sub-query used as a value has the type of the one column it answers with, and
+        // ARRAY(...) has the array of that type. Reporting either as text made the driver decode
+        // integers as strings, even though pg_typeof already answered correctly.
+        if (expr instanceof SubqueryExpr) {
+            return subqueryColumnType(((SubqueryExpr) expr).subquery());
+        }
+        if (expr instanceof ArraySubqueryExpr) {
+            DataType element = subqueryColumnType(((ArraySubqueryExpr) expr).subquery());
+            DataType array = element == null ? null : DataType.arrayOf(element);
+            return array != null ? array : DataType.TEXT_ARRAY;
+        }
         if (expr instanceof AnyAllExpr) return DataType.BOOLEAN;
         if (expr instanceof AnyAllArrayExpr) return DataType.BOOLEAN;
         if (expr instanceof IsBooleanExpr) return DataType.BOOLEAN;

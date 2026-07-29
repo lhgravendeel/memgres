@@ -15,6 +15,8 @@ public class MemgresException extends RuntimeException {
     private String table;
     private String schema;
     private int position; // 1-based character position in the query (P field)
+    private String positionToken; // the token in the query text the position points at
+    private boolean positionSuppressed; // PostgreSQL sends no P field for this error
     private String pgContext; // PL/pgSQL exception context (function name + line)
 
     public MemgresException(String message) {
@@ -47,6 +49,30 @@ public class MemgresException extends RuntimeException {
     public void setSchema(String schema) { this.schema = schema; }
     public int getPosition() { return position; }
     public void setPosition(int position) { this.position = position; }
+
+    /**
+     * The token in the statement text the position should point at.
+     *
+     * <p>The engine analyses an AST that carries no source offsets, so where PostgreSQL reports a
+     * parse-analysis error against the exact character it read, this names the word to look for
+     * instead and the protocol layer finds it in the statement text. Naming the token is what
+     * separates {@code LIMIT generate_series(1,1)} — where PostgreSQL points at the call and not
+     * at the clause — from a message whose quoted name happens to occur elsewhere.
+     */
+    public String getPositionToken() { return positionToken; }
+    public void setPositionToken(String positionToken) { this.positionToken = positionToken; }
+
+    /**
+     * True when PostgreSQL sends no Position field for this error at all.
+     *
+     * <p>Not every error PostgreSQL raises has a parse location: the ones raised while a query's
+     * range table is being built — a FROM name given twice, a USING column named twice or missing
+     * — carry none, because the check runs over the built namespace rather than over a node the
+     * parser located. A message with a quoted name in it otherwise looks exactly like one that
+     * does, so the throw site is what has to say so.
+     */
+    public boolean isPositionSuppressed() { return positionSuppressed; }
+    public MemgresException suppressPosition() { this.positionSuppressed = true; return this; }
     public String getPgContext() { return pgContext; }
     public void setPgContext(String pgContext) { this.pgContext = pgContext; }
 

@@ -335,7 +335,18 @@ class DmlExecutor {
             for (List<Expression> valueRow : stmt.values()) {
                 for (Expression value : valueRow) {
                     executor.selectExecutor.placementCheck.reject(value, "VALUES");
+                    // A single VALUES row is projected like a select list and a set in it expands
+                    // into rows. Two or more rows are a scan of a constant table, which has
+                    // nowhere to expand a set, and PostgreSQL refuses it -- measured: the same
+                    // call in a one-row VALUES is accepted and writes one row per element.
+                    if (stmt.values().size() > 1) SelectExecutor.rejectSrfIn(value, "VALUES");
                 }
+            }
+        }
+        // ON CONFLICT DO UPDATE assigns to one row, the same as an UPDATE, and is named so.
+        if (stmt.onConflict() != null && stmt.onConflict().doUpdate() != null) {
+            for (InsertStmt.SetClause set : stmt.onConflict().doUpdate()) {
+                SelectExecutor.rejectSrfIn(set.value(), "UPDATE");
             }
         }
         // Capture view column mapping/order before any further resolveTable calls clobber them.
@@ -426,6 +437,12 @@ class DmlExecutor {
             valueRows = stmt.values();
         }
 
+        // A VALUES row holding a set-returning call is as many rows as the call produces, so the
+        // expansion happens before anything counts the rows or writes one.
+        List<List<Expression>> srfExpandedRows = new ArrayList<>();
+        List<RowContext> valueRowContexts = expandSrfValueRows(valueRows, srfExpandedRows);
+        if (valueRowContexts != null) valueRows = srfExpandedRows;
+
         // Pre-validate all rows' column counts before inserting any rows (atomicity)
         for (List<Expression> valueRow : valueRows) {
             if (stmt.columns() != null && stmt.columns().size() != valueRow.size()) {
@@ -458,7 +475,12 @@ class DmlExecutor {
         Map<Table, List<Object[]>> insSnapshot = triggers.isEmpty() ? null
                 : snapshotTargetTables(collectTargetTables(table));
         try {
+        int valueRowIdx = -1;
         for (List<Expression> valueRow : valueRows) {
+            valueRowIdx++;
+            // Non-null only for a VALUES row a set-returning call expanded, and then it holds the
+            // element of each call that belongs to this row.
+            RowContext valueCtx = valueRowContexts == null ? null : valueRowContexts.get(valueRowIdx);
             Object[] row = new Object[table.getColumns().size()];
 
             // Fill provided values FIRST (with type coercion); validates before consuming serials
@@ -477,7 +499,7 @@ class DmlExecutor {
                     if (genCol.isGenerated()) {
                         throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
                     }
-                    Object val = executor.evalExpr(valueRow.get(i), null);
+                    Object val = executor.evalExpr(valueRow.get(i), valueCtx);
                     row[colIdx] = TypeCoercion.coerceForStorage(val, table.getColumns().get(colIdx));
                     filledCols.add(colIdx);
                 }
@@ -489,7 +511,7 @@ class DmlExecutor {
                     if (genCol.isGenerated()) {
                         throw new MemgresException("cannot insert a non-DEFAULT value into column \"" + genCol.getName() + "\"\n  Detail: Column \"" + genCol.getName() + "\" is a generated column.", "428C9");
                     }
-                    Object val = executor.evalExpr(valueRow.get(i), null);
+                    Object val = executor.evalExpr(valueRow.get(i), valueCtx);
                     row[i] = TypeCoercion.coerceForStorage(val, table.getColumns().get(i));
                     filledCols.add(i);
                 }
@@ -3127,10 +3149,50 @@ class DmlExecutor {
         String targetName = stmt.alias() != null ? stmt.alias() : stmt.table();
         for (InsertStmt.SetClause set : stmt.setClauses()) {
             placement.reject(set.value(), "UPDATE");
+            // An assignment writes one value into one row's column. A set has no single value to
+            // write and no rows of its own to multiply an UPDATE by, so PostgreSQL refuses it
+            // whether or not the WHERE finds a row to try it on.
+            SelectExecutor.rejectSrfIn(set.value(), "UPDATE");
             placement.rejectOuterLevelAggregate(set.value(), "UPDATE", table, targetName);
         }
         placement.reject(stmt.where(), "WHERE");
+        SelectExecutor.rejectSrfIn(stmt.where(), "WHERE");
         placement.rejectOuterLevelAggregate(stmt.where(), "WHERE", table, targetName);
+    }
+
+    /**
+     * The rows a VALUES list actually writes, once its set-returning calls have been expanded.
+     *
+     * <p>{@code INSERT INTO t VALUES (generate_series(5,6))} writes two rows in PostgreSQL, not
+     * one holding an array: a VALUES list is a query, and a set in one of its columns multiplies
+     * the row exactly as it does in a select list. The calls of one row run side by side, so a row
+     * written with two of them is as long as the longer and the shorter reads NULL past its end.
+     *
+     * <p>Returns null when nothing in the list produces a set, which leaves every row evaluated
+     * with the null context it was evaluated with before. Otherwise {@code expandedOut} is filled
+     * with one entry per output row — the same expression list each time — and the returned list
+     * holds the context that binds each call to its element for that row.
+     */
+    private List<RowContext> expandSrfValueRows(List<List<Expression>> valueRows,
+                                                List<List<Expression>> expandedOut) {
+        boolean anySrf = false;
+        for (List<Expression> valueRow : valueRows) {
+            for (Expression value : valueRow) {
+                if (!SelectExecutor.collectSrfCalls(value).isEmpty()) { anySrf = true; break; }
+            }
+            if (anySrf) break;
+        }
+        if (!anySrf) return null;
+        List<RowContext> contexts = new ArrayList<>();
+        for (List<Expression> valueRow : valueRows) {
+            List<RowContext> one = new ArrayList<>();
+            one.add(new RowContext(Cols.<RowContext.TableBinding>listOf()));
+            for (RowContext ctx : executor.selectExecutor.expandContextsForSrfs(valueRow, one)) {
+                expandedOut.add(valueRow);
+                contexts.add(ctx);
+            }
+        }
+        return contexts;
     }
 
     /** Validate that all column references in RETURNING exist in the table. */
@@ -3138,8 +3200,11 @@ class DmlExecutor {
         if (returning == null) return;
         for (SelectStmt.SelectTarget target : returning) {
             // RETURNING reports the rows the statement touched one at a time; there is no
-            // group and no window frame for an aggregate or a window function to run over.
+            // group and no window frame for an aggregate or a window function to run over, and
+            // no room for a set to expand into either -- RETURNING answers one row per row
+            // written, so a call producing two values has nowhere to put the second.
             executor.selectExecutor.placementCheck.reject(target.expr(), "RETURNING");
+            SelectExecutor.rejectSrfIn(target.expr(), "RETURNING");
             if (target.expr() instanceof WildcardExpr) continue;
             if (target.expr() instanceof ColumnRef) {
                 ColumnRef cr = (ColumnRef) target.expr();
