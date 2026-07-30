@@ -260,6 +260,17 @@ class CatalogSystemFunctions {
                     if (inferred == DataType.NUMERIC) return "numeric";
                 }
 
+                // A JSON document is carried as its own text, so an object's braces read as an
+                // array literal and nothing in the value tells json from jsonb. The expression's
+                // declared type is the only witness there is; it overrules nothing else.
+                {
+                    DataType json = executor.exprEvaluator.inferTypeFromContext(
+                            rawExpr, ctx != null ? ctx.getBindings()
+                                    : new ArrayList<RowContext.TableBinding>());
+                    if (json == DataType.JSON || json == DataType.JSONB) {
+                        return pgTypeDisplayName(json);
+                    }
+                }
                 if (arg instanceof java.util.List<?>) {
                     java.util.List<?> list = (java.util.List<?>) arg;
                     if (!list.isEmpty() && list.get(0) instanceof String && ((String) list.get(0)).startsWith("(")) {

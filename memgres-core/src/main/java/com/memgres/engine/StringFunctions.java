@@ -24,6 +24,23 @@ class StringFunctions {
         return new MemgresException("requested length too large", "54000");
     }
 
+    /**
+     * A range's text form carries the bounds but not the width they were declared at, so a bound
+     * read out of it is a long whichever range it came from. {@code lower(int4range(...))} is an
+     * integer in PostgreSQL and only the argument's own type says so, which is what this reads.
+     */
+    private Object narrowRangeBound(Object bound, FunctionCallExpr fn, RowContext ctx) {
+        if (!(bound instanceof Long) || fn.args().isEmpty()) return bound;
+        long v = (Long) bound;
+        if (v < Integer.MIN_VALUE || v > Integer.MAX_VALUE) return bound;
+        DataType declared = executor.exprEvaluator.inferTypeFromContext(fn.args().get(0),
+                ctx != null ? ctx.getBindings() : new ArrayList<RowContext.TableBinding>());
+        if (declared == DataType.INT4RANGE || declared == DataType.INT4MULTIRANGE) {
+            return (int) v;
+        }
+        return bound;
+    }
+
     /** Bytes {@code s} occupies in UTF-8, which is the length PostgreSQL budgets against. */
     private static long utf8Length(String s) {
         long n = 0;
@@ -243,7 +260,7 @@ class StringFunctions {
                 if (arg instanceof String && RangeOperations.isRangeString(((String) arg))) {
                     String s = (String) arg;
                     RangeOperations.PgRange r = RangeOperations.parse(s);
-                    return r.isEmpty() ? null : r.upperValue();
+                    return r.isEmpty() ? null : narrowRangeBound(r.upperValue(), fn, ctx);
                 }
                 if (arg instanceof Number) throw new MemgresException("function upper(integer) does not exist", "42883");
                 if (asciiOnly) {
@@ -308,7 +325,7 @@ class StringFunctions {
                 if (arg instanceof String && RangeOperations.isRangeString(((String) arg))) {
                     String s = (String) arg;
                     RangeOperations.PgRange r = RangeOperations.parse(s);
-                    return r.isEmpty() ? null : r.lowerValue();
+                    return r.isEmpty() ? null : narrowRangeBound(r.lowerValue(), fn, ctx);
                 }
                 if (arg instanceof Number) throw new MemgresException("function lower(integer) does not exist", "42883");
                 {
