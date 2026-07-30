@@ -1,6 +1,7 @@
 package com.memgres.engine;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -96,29 +97,89 @@ public class Table {
         return columns;
     }
 
+    /**
+     * Where each column name sits, built on demand and dropped whenever the column list changes.
+     * Null when it has to be built again.
+     */
+    private volatile Map<String, Integer> columnPositions;
+
     public int getColumnIndex(String columnName) {
-        for (int i = 0; i < columns.size(); i++) {
-            if (columns.get(i).getName().equalsIgnoreCase(columnName)) {
-                return i;
+        if (columnName == null) return -1;
+        Map<String, Integer> positions = columnPositions;
+        if (positions == null) {
+            // A name may appear twice -- an ALTER that renames one column on to another's name,
+            // a virtual relation built from a join -- and the answer has always been the first
+            // of them, so a later entry does not replace an earlier one.
+            positions = new java.util.HashMap<String, Integer>();
+            for (int i = 0; i < columns.size(); i++) {
+                String n = columns.get(i).getName();
+                if (n == null) continue;
+                String key = n.toLowerCase(java.util.Locale.ROOT);
+                if (!positions.containsKey(key)) positions.put(key, Integer.valueOf(i));
             }
+            columnPositions = positions;
         }
-        return -1;
+        Integer at = positions.get(columnName.toLowerCase(java.util.Locale.ROOT));
+        return at == null ? -1 : at.intValue();
+    }
+
+    /** The column list changed, so where the names sit has to be worked out again. */
+    private void columnsChanged() {
+        columnPositions = null;
     }
 
     public void insertRow(Object[] row) {
         writeLock.lock();
         try {
-            List<Object[]> current = rows;
-            List<Object[]> newRows = new ArrayList<>(current.size() + 1);
-            newRows.addAll(current);
-            newRows.add(row);
-            rows = newRows;
+            append(row);
             for (TableIndex idx : indexes.values()) {
                 idx.put(row);
             }
         } finally {
             writeLock.unlock();
         }
+    }
+
+    /**
+     * Room past the end of {@link #rows} for the next appends, or null when the rows in front
+     * of readers are a list this table does not own. Written only under {@link #writeLock}.
+     */
+    private Object[][] spare;
+
+    /**
+     * Add one row without copying the ones already there.
+     *
+     * <p>Readers walk {@link #rows} without holding the lock, so a row list may never be added
+     * to once it has been handed out -- which made loading a relation cost a copy of everything
+     * already in it, and loading n rows cost n squared. Reading a CTE or a system catalogue of
+     * any size spent most of its time there.
+     *
+     * <p>What is handed out instead is a window on to an array with room to spare: the next row
+     * is written past the end of every window already given away, and only then is a window one
+     * longer published. A reader holding the shorter window cannot reach the new entry, and the
+     * array it is reading is never moved out from under it -- when the room runs out the rows
+     * are copied into a larger array and the old one is left to the readers still on it.
+     *
+     * <p>Caller holds {@link #writeLock}.
+     */
+    private void append(Object[] row) {
+        int n = rows.size();
+        if (spare == null || n >= spare.length) {
+            Object[][] grown = new Object[Math.max(8, n + (n >> 1) + 1)][];
+            for (int i = 0; i < n; i++) grown[i] = rows.get(i);
+            spare = grown;
+        }
+        spare[n] = row;
+        rows = Arrays.asList(spare).subList(0, n + 1);
+    }
+
+    /**
+     * Put a row list in front of readers. Anything but an append replaces the list wholesale,
+     * which leaves the room {@link #append} was keeping behind an array nothing points at.
+     */
+    private void publish(List<Object[]> replacement) {
+        spare = null;
+        rows = replacement;
     }
 
     public ReentrantLock getWriteLock() {
@@ -133,7 +194,7 @@ public class Table {
     public void replaceAllRows(List<Object[]> newRows) {
         writeLock.lock();
         try {
-            rows = new ArrayList<>(newRows);
+            publish(new ArrayList<>(newRows));
         } finally {
             writeLock.unlock();
         }
@@ -145,7 +206,7 @@ public class Table {
     public void replaceAllRowsAndRebuildIndexes(List<Object[]> newRows) {
         writeLock.lock();
         try {
-            rows = new ArrayList<>(newRows);
+            publish(new ArrayList<>(newRows));
             for (TableIndex idx : indexes.values()) {
                 idx.clear();
                 for (Object[] row : rows) {
@@ -161,7 +222,7 @@ public class Table {
     public void clearRows() {
         writeLock.lock();
         try {
-            rows = new ArrayList<>();
+            publish(new ArrayList<Object[]>());
         } finally {
             writeLock.unlock();
         }
@@ -272,7 +333,7 @@ public class Table {
         writeLock.lock();
         try {
             int count = rows.size();
-            rows = new ArrayList<>();
+            publish(new ArrayList<Object[]>());
             for (TableIndex idx : indexes.values()) {
                 idx.clear();
             }
@@ -303,7 +364,7 @@ public class Table {
                     surviving.add(row);
                 }
             }
-            rows = surviving;
+            publish(surviving);
             return deleted;
         } finally {
             writeLock.unlock();
@@ -326,6 +387,7 @@ public class Table {
         writeLock.lock();
         try {
             columns.add(column);
+            columnsChanged();
             int newColIdx = columns.size() - 1;
             List<Object[]> current = rows;
             List<Object[]> newRows = new ArrayList<>(current.size());
@@ -337,7 +399,7 @@ public class Table {
                 }
                 newRows.add(newRow);
             }
-            rows = newRows;
+            publish(newRows);
             rebuildAllIndexes();
         } finally {
             writeLock.unlock();
@@ -362,6 +424,7 @@ public class Table {
                 if (sc.getName() != null) indexes.remove(sc.getName());
             }
             columns.remove(idx);
+            columnsChanged();
             List<Object[]> current = rows;
             List<Object[]> newRows = new ArrayList<>(current.size());
             for (Object[] oldRow : current) {
@@ -371,7 +434,7 @@ public class Table {
                 }
                 newRows.add(newRow);
             }
-            rows = newRows;
+            publish(newRows);
             // Column indices changed, so rebuild index column mappings
             // Remove indexes referencing the dropped column, rebuild the rest
             List<String> toRemove = new ArrayList<>();
@@ -423,6 +486,7 @@ public class Table {
         writeLock.lock();
         try {
             columns.add(position, column);
+            columnsChanged();
             List<Object[]> current = rows;
             List<Object[]> newRows = new ArrayList<>(current.size());
             for (int i = 0; i < current.size(); i++) {
@@ -433,7 +497,7 @@ public class Table {
                 System.arraycopy(oldRow, position, newRow, position + 1, oldRow.length - position);
                 newRows.add(newRow);
             }
-            rows = newRows;
+            publish(newRows);
             rebuildIndexesFromConstraints();
         } finally {
             writeLock.unlock();
@@ -455,6 +519,7 @@ public class Table {
             if (idx < 0) throw new MemgresException("Column not found: " + oldName);
             Column old = columns.get(idx);
             columns.set(idx, old.withName(newName));
+            columnsChanged();
             // Keep constraints attached to the column under its new name
             for (StoredConstraint sc : constraints) {
                 sc.renameColumn(oldName, newName);
@@ -466,6 +531,7 @@ public class Table {
                 String updated = StoredConstraint.renameIdentifier(c.getGeneratedExpr(), oldName, newName);
                 if (!updated.equals(c.getGeneratedExpr())) {
                     columns.set(i, c.withGeneratedExpr(updated));
+                    columnsChanged();
                 }
             }
         } finally {
@@ -505,18 +571,21 @@ public class Table {
         if (idx < 0) throw new MemgresException("Column not found: " + columnName);
         Column old = columns.get(idx);
         columns.set(idx, old.withType(newType, precision, scale, enumTypeName, arrayElementType));
+        columnsChanged();
     }
 
     public void alterColumnDefault(String columnName, String defaultValue) {
         int idx = getColumnIndex(columnName);
         if (idx < 0) throw new MemgresException("Column not found: " + columnName);
         columns.set(idx, columns.get(idx).withDefault(defaultValue));
+        columnsChanged();
     }
 
     public void alterColumnNullable(String columnName, boolean nullable) {
         int idx = getColumnIndex(columnName);
         if (idx < 0) throw new MemgresException("Column not found: " + columnName);
         columns.set(idx, columns.get(idx).withNullable(nullable));
+        columnsChanged();
     }
 
     public long getSerialCounter() {
@@ -582,7 +651,7 @@ public class Table {
             for (Object[] r : current) {
                 if (r != row) newRows.add(r);
             }
-            rows = newRows;
+            publish(newRows);
         } finally {
             writeLock.unlock();
         }

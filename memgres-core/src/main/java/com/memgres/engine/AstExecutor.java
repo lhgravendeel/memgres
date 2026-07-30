@@ -197,6 +197,8 @@ public class AstExecutor {
             if (outermost) {
                 systemCatalog.beginStatement();
                 existsIndexes.clear();
+                baseTablesByName.clear();
+                scalarSubqueries.clear();
             }
             executeDepth++;
             try {
@@ -207,6 +209,8 @@ public class AstExecutor {
                     fromResolver.outermostQuery = priorOutermost;
                     systemCatalog.endStatement();
                     existsIndexes.clear();
+                    baseTablesByName.clear();
+                    scalarSubqueries.clear();
                 }
             }
         } finally {
@@ -323,10 +327,43 @@ public class AstExecutor {
         return idx;
     }
 
+    /**
+     * The one answer a scalar subquery of the statement now running has, once it has been asked.
+     *
+     * <p>Only kept for subqueries that read nothing outside themselves; see
+     * {@link UncorrelatedSubquery} for what that means and how it is decided.
+     */
+    static final class ScalarSubqueryValue {
+        boolean answered;
+        Object value;
+    }
+
+    /** Stands for a subquery that has to be run again for every row. */
+    private static final ScalarSubqueryValue PER_ROW = new ScalarSubqueryValue();
+
+    private final java.util.IdentityHashMap<SubqueryExpr, ScalarSubqueryValue> scalarSubqueries =
+            new java.util.IdentityHashMap<>();
+
+    /**
+     * Where this subquery's answer is kept for the statement, or null when it has to be run for
+     * every row. Which of the two it is, is settled once per statement.
+     */
+    ScalarSubqueryValue scalarSubqueryValue(SubqueryExpr sq) {
+        ScalarSubqueryValue held = scalarSubqueries.get(sq);
+        if (held == null) {
+            held = UncorrelatedSubquery.readsNothingOutside(sq.subquery(), this)
+                    ? new ScalarSubqueryValue() : PER_ROW;
+            scalarSubqueries.put(sq, held);
+        }
+        return held == PER_ROW ? null : held;
+    }
+
     /** Forget everything derived from the database for the statement now running. */
     private void dropStatementCaches() {
         systemCatalog.invalidateStatementCache();
         existsIndexes.clear();
+        baseTablesByName.clear();
+        scalarSubqueries.clear();
     }
 
     private QueryResult executeReadOrWrite(Statement stmt) {
@@ -1092,6 +1129,66 @@ public class AstExecutor {
         } catch (MemgresException e) {
             return null;
         }
+    }
+
+    /** The base tables a name reached during the statement now running, {@link #NO_TABLE} for none. */
+    private final Map<String, Table> baseTablesByName = new java.util.HashMap<>();
+
+    /** Stands in a {@link #baseTablesByName} entry for a name no schema holds a table under. */
+    private static final Table NO_TABLE = new Table("", Collections.<Column>emptyList());
+
+    /**
+     * The table a schema holds under this name, or null when no schema holds one — the same walk
+     * {@link #resolveTable} makes, stopping where the tables stop.
+     *
+     * <p>This exists to be compared with a relation the caller already has in hand, which is what
+     * makes it right to leave out everything {@code resolveTable} goes on to try. A view, a
+     * sequence read as a relation and the virtual table built for a view with INSTEAD OF triggers
+     * are all relations a name reaches, and none of them is ever the same object as the one being
+     * compared: the first two are built fresh on every resolution and the third describes a view
+     * rather than a table. So the comparison answers false for them either way, and asking the
+     * short question instead of the long one costs no accuracy.
+     *
+     * <p>It also answers without throwing. The long question reports a name it cannot resolve by
+     * raising, and the caller here asks it for every column reference of every comparison of
+     * every row; filling in those stack traces was, measured over the verification corpus, the
+     * single largest cost in the engine.
+     */
+    Table baseTableNamed(String tableName) {
+        if (tableName == null) return null;
+        Table cached = baseTablesByName.get(tableName);
+        if (cached != null) return cached == NO_TABLE ? null : cached;
+        Table found = lookUpBaseTable(tableName);
+        baseTablesByName.put(tableName, found == null ? NO_TABLE : found);
+        return found;
+    }
+
+    private Table lookUpBaseTable(String tableName) {
+        // Temp tables shadow the search path, exactly as in resolveTable.
+        String tempSchemaName = session != null ? session.getTempSchemaName() : "pg_temp";
+        Schema pgTemp = database.getSchema(tempSchemaName);
+        if (pgTemp != null) {
+            Table tempTable = visibleTable(pgTemp.getTable(tableName));
+            if (tempTable != null) return tempTable;
+        }
+        Schema schema = database.getSchema(defaultSchema());
+        if (schema != null) {
+            Table table = visibleTable(schema.getTable(tableName));
+            if (table != null) return table;
+        }
+        if (session == null) return null;
+        String searchPath = session.getGucSettings().get("search_path");
+        if (searchPath == null) return null;
+        for (String sp : searchPath.split(",")) {
+            String s = sp.trim().replace("\"", "").replace("'", "");
+            if (s.isEmpty() || s.equals("$user")) continue;
+            Schema spSchema = database.getSchema(s);
+            if (spSchema != null) {
+                Table table = visibleTable(spSchema.getTable(tableName));
+                if (table != null) return table;
+            }
+        }
+        return null;
     }
 
     private Table resolveViewToBaseTable(Database.ViewDef view) {

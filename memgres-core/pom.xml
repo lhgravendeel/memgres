@@ -61,6 +61,19 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!-- The suite is almost pure test execution: class time and wall clock agree
+                         to within a few seconds, so the only way to shorten it is to run classes
+                         at the same time. Separate JVMs rather than threads, because a class
+                         holding a static server or a static counter is safe from its neighbours
+                         that way and needs no annotation to say so. -->
+                    <forkCount>${memgres.test.forkCount}</forkCount>
+                    <reuseForks>true</reuseForks>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>
