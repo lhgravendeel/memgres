@@ -15,6 +15,9 @@ import java.util.*;
  */
 class CatalogSystemFunctions {
 
+    /** A function declared to return void answers with this, never with NULL. */
+    static final Object VOID_RESULT = "";
+
     static final Object NOT_HANDLED = FunctionEvaluator.NOT_HANDLED;
 
     private final AstExecutor executor;
@@ -406,15 +409,15 @@ class CatalogSystemFunctions {
                         }
                     }
                 }
-                return null;
+                return VOID_RESULT;
             }
             case "pg_sleep_for": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
-                return null;
+                return VOID_RESULT;
             }
             case "pg_sleep_until": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
-                return null;
+                return VOID_RESULT;
             }
             case "pg_blocking_pids": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
@@ -423,10 +426,10 @@ class CatalogSystemFunctions {
             case "pg_export_snapshot":
                 return executor.database.exportSnapshot();
             case "pg_stat_clear_snapshot": {
-                return null; 
+                return VOID_RESULT;
             }
             case "pg_stat_reset": {
-                return null; 
+                return VOID_RESULT;
             }
             case "pg_stat_reset_shared": {
                 if (!fn.args().isEmpty()) {
@@ -438,12 +441,12 @@ class CatalogSystemFunctions {
                         throw new MemgresException("unrecognized reset target: \"" + target + "\"", "22023");
                     }
                 }
-                return null;
+                return VOID_RESULT;
             }
             case "pg_stat_reset_single_table_counters":
             case "pg_stat_reset_single_function_counters": {
                 if (!fn.args().isEmpty()) executor.evalExpr(fn.args().get(0), ctx);
-                return null;
+                return VOID_RESULT;
             }
             case "txid_current":
                 return executor.session != null ? executor.session.getTransactionId() : (long) (System.nanoTime() / 1000);
