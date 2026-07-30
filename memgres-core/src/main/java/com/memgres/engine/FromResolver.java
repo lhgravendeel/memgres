@@ -462,6 +462,21 @@ class FromResolver {
         return resolveFromClauseInner(fromItems, null);
     }
 
+    /**
+     * Whether one of the schemas PostgreSQL searches implicitly answers to this bare name.
+     *
+     * <p>pg_temp and pg_catalog are searched whether or not search_path names them, so an empty
+     * path hides the user's schemas and neither of those. A name this says yes to is left to the
+     * ordinary resolution below, which reads the catalog or the temp schema and still refuses a
+     * name neither of them has.
+     */
+    private boolean implicitlySearchedSchemaHolds(String name) {
+        Schema pgTemp = executor.database.getSchema(executor.session.getTempSchemaName());
+        if (pgTemp != null && pgTemp.getTable(name) != null) return true;
+        return SystemCatalog.isSystemCatalog(null, name)
+                && executor.systemCatalog.resolve(null, name, executor.session) != null;
+    }
+
     private List<RowContext> resolveFromClauseInner(List<SelectStmt.FromItem> fromItems, Expression where) {
         rejectSiblingReferenceWithoutLateral(fromItems);
         if (fromItems.size() == 1) {
@@ -737,8 +752,13 @@ class FromResolver {
         String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
         // H35: pass userQualified=true when user explicitly wrote schema.table
         boolean userQualified = tableRef.schema() != null;
-        // H35: empty search_path with unqualified name → reject unless temp table exists
-        // PG always implicitly includes pg_temp, so temp tables are still findable
+        // An empty search_path leaves an unqualified name nowhere to be found -- except in the
+        // two schemas PostgreSQL searches whether or not the path names them. pg_temp is one and
+        // was already allowed for here; pg_catalog is the other, and leaving it out is why
+        // pg_dump could not read this server at all. pg_dump clears the search_path on purpose,
+        // so that a schema planted by someone else cannot answer to a name it means to read as
+        // the catalog's, and then reads pg_settings by its bare name -- which PostgreSQL answers
+        // and this refused.
         if (!userQualified && executor.session != null) {
             String sp = executor.session.getGucSettings().get("search_path");
             if (sp != null) {
@@ -747,13 +767,8 @@ class FromResolver {
                     String s = part.trim().replace("\"", "").replace("'", "");
                     if (!s.isEmpty() && !s.equals("$user")) { hasEntries = true; break; }
                 }
-                if (!hasEntries) {
-                    // Check if temp table exists before rejecting (pg_temp is always implicit)
-                    String tempSchemaName = executor.session.getTempSchemaName();
-                    Schema pgTemp = executor.database.getSchema(tempSchemaName);
-                    if (pgTemp == null || pgTemp.getTable(tableRef.table()) == null) {
-                        throw new MemgresException("relation \"" + tableRef.table() + "\" does not exist", "42P01");
-                    }
+                if (!hasEntries && !implicitlySearchedSchemaHolds(tableRef.table())) {
+                    throw new MemgresException("relation \"" + tableRef.table() + "\" does not exist", "42P01");
                 }
             }
         }

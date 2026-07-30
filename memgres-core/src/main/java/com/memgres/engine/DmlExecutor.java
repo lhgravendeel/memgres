@@ -1028,18 +1028,10 @@ class DmlExecutor {
                 table.getColumns().get(colIndices.get(values.size())).getName() + "\"", "22P04");
         }
 
-        // Check for GENERATED ALWAYS identity columns and reject explicit non-null values
-        for (int i = 0; i < values.size(); i++) {
-            int colIdx = colIndices.get(i);
-            Column col = table.getColumns().get(colIdx);
-            if (col.getDefaultValue() != null && col.getDefaultValue().contains("__identity__:always")) {
-                if (values.get(i) != null) {
-                    throw new MemgresException("cannot insert a non-DEFAULT value into column \"" +
-                        col.getName() + "\"\n  Detail: Column \"" + col.getName() +
-                        "\" is an identity column defined as GENERATED ALWAYS.", "428C9");
-                }
-            }
-        }
+        // A GENERATED ALWAYS identity refuses a written value from INSERT and UPDATE, but not
+        // from COPY: PostgreSQL lets COPY write the column as given, which is what carries the
+        // identity values across a dump and restore. Refusing it here meant pg_dump could write
+        // a dump of this server that this server would not read back.
 
         // FORCE_NOT_NULL: for specified columns, do not match against the null string
         List<String> forceNotNull = stmt.forceNotNull();

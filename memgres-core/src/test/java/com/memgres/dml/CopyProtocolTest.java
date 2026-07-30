@@ -1352,12 +1352,20 @@ class CopyProtocolTest {
     }
 
     @Test @Order(252)
-    void specialCol_identityAlways_errorOnValueProvided() throws Exception {
+    void specialCol_identityAlways_takesTheValueCopyGivesIt() throws Exception {
         exec("CREATE TABLE cf_ident(id int GENERATED ALWAYS AS IDENTITY, name text)");
-        // Providing a value for GENERATED ALWAYS identity column should error
-        assertThrows(Exception.class,
-                () -> copyIn("COPY cf_ident FROM STDIN WITH (FORMAT csv)", "99,alice\n"),
-                "GENERATED ALWAYS identity column should reject explicit values");
+        // A GENERATED ALWAYS identity refuses a value from INSERT, but COPY writes what it is
+        // given -- measured against PostgreSQL 18, which stores the 99. That is what carries
+        // identity values across a dump and restore, so refusing it here would mean pg_dump
+        // could write a dump of this server that this server would not read back.
+        copyIn("COPY cf_ident FROM STDIN WITH (FORMAT csv)", "99,alice\n");
+        try (Statement s = conn.createStatement();
+             ResultSet rs = s.executeQuery("SELECT id, name FROM cf_ident")) {
+            assertTrue(rs.next(), "the copied row should be there");
+            assertEquals(99, rs.getInt(1), "COPY writes the identity value it was given");
+            assertEquals("alice", rs.getString(2));
+            assertFalse(rs.next());
+        }
         exec("DROP TABLE cf_ident");
     }
 
