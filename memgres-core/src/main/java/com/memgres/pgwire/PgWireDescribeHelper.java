@@ -871,6 +871,7 @@ class PgWireDescribeHelper {
     private void sendParameterDescription(ChannelHandlerContext ctx, String sql, int[] oids) {
         int numParams = countParameters(sql);
         int[] inferred = inferParamOidsFromCasts(sql, numParams);
+        int[] fromContext = PgWireParamTypes.infer(sql, numParams, database, session);
         ByteBuf buf = ctx.alloc().buffer();
         buf.writeByte('t');
         buf.writeInt(4 + 2 + numParams * 4);
@@ -881,6 +882,8 @@ class PgWireDescribeHelper {
                 oid = oids[i];                       // client-specified type wins
             } else if (inferred[i] != 0) {
                 oid = inferred[i];                   // inferred from an enclosing cast context
+            } else if (fromContext[i] != 0) {
+                oid = fromContext[i];                // resolved from what the statement compares it to
             } else {
                 oid = 25;                            // default to TEXT (not 0, which crashes pgjdbc)
             }

@@ -326,6 +326,7 @@ class DmlExecutor {
     }
 
     private QueryResult executeInsertInner(InsertStmt stmt) {
+        rejectDuplicateInsertColumns(stmt.columns());
         // Check read-only transaction
         checkReadOnly("INSERT");
         rejectMaterializedViewWrite(stmt.table());
@@ -387,9 +388,8 @@ class DmlExecutor {
             return QueryResult.command(QueryResult.Type.INSERT, 0);
         }
         if (ruleVal != null && ruleVal.startsWith("INSTEAD:")) {
-            List<List<Expression>> ruleValueRows = stmt.values();
-            runInsertRuleActions(ruleVal.substring("INSTEAD:".length()), stmt, table, ruleRelation);
-            return QueryResult.command(QueryResult.Type.INSERT, ruleValueRows != null ? ruleValueRows.size() : 0);
+            int ruleCount = runInsertRuleActions(ruleVal.substring("INSTEAD:".length()), stmt, table, ruleRelation);
+            return QueryResult.command(QueryResult.Type.INSERT, ruleCount);
         }
 
         // Validate RETURNING columns exist before processing rows
@@ -2282,28 +2282,7 @@ class DmlExecutor {
             }
         }
 
-        // An unconditional WHEN clause takes every row its category can reach, so anything written
-        // after it in the same category never runs. PostgreSQL refuses the whole statement rather
-        // than silently carrying dead arms — including a *conditional* arm after an unconditional
-        // one, which is the shape that used to be accepted. Categories are independent: a WHEN NOT
-        // MATCHED after an unconditional WHEN MATCHED is reachable and stays legal.
-        boolean sawUnconditionalMatched = false;
-        boolean sawUnconditionalNotMatched = false;
-        boolean sawUnconditionalNotMatchedBySource = false;
-        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
-            if (clause instanceof MergeStmt.WhenMatched) {
-                if (sawUnconditionalMatched) throw unreachableWhenClause();
-                if (((MergeStmt.WhenMatched) clause).andCondition() == null) sawUnconditionalMatched = true;
-            } else if (clause instanceof MergeStmt.WhenNotMatched) {
-                if (sawUnconditionalNotMatched) throw unreachableWhenClause();
-                if (((MergeStmt.WhenNotMatched) clause).andCondition() == null) sawUnconditionalNotMatched = true;
-            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
-                if (sawUnconditionalNotMatchedBySource) throw unreachableWhenClause();
-                if (((MergeStmt.WhenNotMatchedBySource) clause).andCondition() == null) {
-                    sawUnconditionalNotMatchedBySource = true;
-                }
-            }
-        }
+        checkMergeWhenClauses(stmt, targetAlias);
 
         // Validate UPDATE SET columns exist in target table before executing
         for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
@@ -2499,6 +2478,7 @@ class DmlExecutor {
                                 }
                                 executor.constraintValidator.handleFkOnDelete(targetTable, targetRow);
                                 rowsToDelete.add(targetRow);
+                                mergeCount++;
                             } else if (wnmbs.setClauses() != null && !wnmbs.setClauses().isEmpty()) {
                                 Object[] oldRow = Arrays.copyOf(targetRow, targetRow.length);
                                 Object[] newRow = Arrays.copyOf(targetRow, targetRow.length);
@@ -2529,10 +2509,10 @@ class DmlExecutor {
                                     executor.currentMergeAction = "UPDATE";
                                     returningRows.add(evalReturning(stmt.returning(), targetTable, targetAlias, targetRow, oldRow, targetRow, nullSourceCtx));
                                 }
+                                mergeCount++;
                             }
-                            // DO NOTHING: empty setClauses, no action
+                            // DO NOTHING: empty setClauses, no action and nothing to count
                             processedTargetRows.add(targetRow);
-                            mergeCount++;
                             break;
                         }
                     }
@@ -2914,13 +2894,18 @@ class DmlExecutor {
         QueryResult affected = selectAffectedRows(tableName, where);
         List<Column> cols = affected.getColumns();
         Table rowShape = new Table(tableName, cols);
-        int count = 0;
+        String[] actions = Database.ruleActions(ruleSql);
+        // The statement the client sent never runs, so its row count is not the answer. PostgreSQL
+        // lets the last action that is the same kind of command as the original speak for it, and
+        // reports nothing at all when no action is: a DELETE replaced by an INSERT deleted nothing.
+        int[] actionCounts = new int[actions.length];
+        boolean[] actionSetsTag = new boolean[actions.length];
         executor.enterRuleExpansion(tableName, event);
         try {
             for (Object[] row : affected.getRows()) {
                 RowContext rowCtx = new RowContext(rowShape, null, row);
-                for (String action : Database.ruleActions(ruleSql)) {
-                    String sql = action;
+                for (int a = 0; a < actions.length; a++) {
+                    String sql = actions[a];
                     for (int i = 0; i < cols.size(); i++) {
                         String colName = cols.get(i).getName();
                         Object oldVal = row[i];
@@ -2936,12 +2921,19 @@ class DmlExecutor {
                         sql = substituteRowAlias(sql, "NEW", colName, newVal);
                         sql = substituteRowAlias(sql, "OLD", colName, oldVal);
                     }
-                    executor.execute(sql, Cols.listOf());
+                    QueryResult actionResult = executor.execute(sql, Cols.listOf());
+                    if (actionResult != null && actionResult.getType() == type) {
+                        actionSetsTag[a] = true;
+                        actionCounts[a] += actionResult.getAffectedRows();
+                    }
                 }
-                count++;
             }
         } finally {
             executor.exitRuleExpansion(tableName, event);
+        }
+        int count = 0;
+        for (int a = actions.length - 1; a >= 0; a--) {
+            if (actionSetsTag[a]) { count = actionCounts[a]; break; }
         }
         return QueryResult.command(type, count);
     }
@@ -2950,19 +2942,23 @@ class DmlExecutor {
      * Run each action of an INSERT rule once per inserted row, with {@code NEW.col} replaced by
      * the value the statement supplied for that column.
      */
-    private void runInsertRuleActions(String storedBody, InsertStmt stmt, Table table,
+    private int runInsertRuleActions(String storedBody, InsertStmt stmt, Table table,
                                       String ruleRelation) {
-        if (stmt.values() == null) return;
+        if (stmt.values() == null) return 0;
         // A rule whose action writes back to the same relation would expand forever.
         executor.enterRuleExpansion(ruleRelation, "INSERT");
         try {
-            runInsertRuleActionRows(storedBody, stmt, table);
+            return runInsertRuleActionRows(storedBody, stmt, table);
         } finally {
             executor.exitRuleExpansion(ruleRelation, "INSERT");
         }
     }
 
-    private void runInsertRuleActionRows(String storedBody, InsertStmt stmt, Table table) {
+    /** Returns the row count of the last action that is itself an INSERT, or 0 when none is. */
+    private int runInsertRuleActionRows(String storedBody, InsertStmt stmt, Table table) {
+        String[] allActions = Database.ruleActions(storedBody);
+        int[] actionCounts = new int[allActions.length];
+        boolean[] actionSetsTag = new boolean[allActions.length];
         for (List<Expression> valueRow : stmt.values()) {
             // Values arrive in the order the statement names them, and through a view that is
             // the view's own column order mapped onto the base table.
@@ -2972,8 +2968,8 @@ class DmlExecutor {
                 colNames = new ArrayList<>();
                 for (Column c : table.getColumns()) colNames.add(c.getName());
             }
-            for (String action : Database.ruleActions(storedBody)) {
-                String sql = action;
+            for (int a = 0; a < allActions.length; a++) {
+                String sql = allActions[a];
                 for (int ci = 0; ci < Math.min(colNames.size(), valueRow.size()); ci++) {
                     Object val = executor.evalExpr(valueRow.get(ci), null);
                     String colName = colNames.get(ci);
@@ -2987,9 +2983,17 @@ class DmlExecutor {
                 for (Column c : table.getColumns()) {
                     sql = sql.replaceAll("(?i)NEW\\s*\\.\\s*" + c.getName(), "NULL");
                 }
-                executor.execute(sql, Cols.listOf());
+                QueryResult actionResult = executor.execute(sql, Cols.listOf());
+                if (actionResult != null && actionResult.getType() == QueryResult.Type.INSERT) {
+                    actionSetsTag[a] = true;
+                    actionCounts[a] += actionResult.getAffectedRows();
+                }
             }
         }
+        for (int a = allActions.length - 1; a >= 0; a--) {
+            if (actionSetsTag[a]) return actionCounts[a];
+        }
+        return 0;
     }
 
     /** The rows the statement would have acted on, read through the relation it names. */
@@ -3278,6 +3282,109 @@ class DmlExecutor {
             return exprReferencesOldNew(be.expr()) || exprReferencesOldNew(be.low()) || exprReferencesOldNew(be.high());
         }
         return false;
+    }
+
+    /**
+     * The rules a MERGE's WHEN list has to satisfy before any row is read.
+     *
+     * <p>Each of the three kinds of WHEN clause — MATCHED, NOT MATCHED BY SOURCE and NOT MATCHED
+     * BY TARGET — is tried in written order against the rows that reach it, so a clause written
+     * after an unconditional clause of the same kind can never fire. The kinds are independent:
+     * an unconditional MATCHED clause says nothing about a later NOT MATCHED clause.
+     *
+     * <p>The other two rules come from what each kind of clause can see. A NOT MATCHED BY SOURCE
+     * clause fires for a target row that no source row paired with, so there is no source row to
+     * read; a NOT MATCHED BY TARGET clause fires for a source row that paired with no target row,
+     * so there is no target row to read. Naming the absent relation is a reference to a FROM entry
+     * that exists but is out of reach here, which is a different complaint from naming a relation
+     * that is not in the query at all.
+     */
+    private void checkMergeWhenClauses(MergeStmt stmt, String targetAlias) {
+        // WITH RECURSIVE is refused outright, self-referencing or not.
+        if (stmt.withClauses() != null) {
+            for (SelectStmt.CommonTableExpr cte : stmt.withClauses()) {
+                if (cte.recursive()) {
+                    throw new MemgresException("WITH RECURSIVE is not supported for MERGE statement", "42601");
+                }
+            }
+        }
+
+        String sourceAlias = mergeSourceAlias(stmt.source());
+        boolean terminalMatched = false;
+        boolean terminalNotMatchedBySource = false;
+        boolean terminalNotMatchedByTarget = false;
+
+        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            if (clause instanceof MergeStmt.WhenMatched) {
+                MergeStmt.WhenMatched wm = (MergeStmt.WhenMatched) clause;
+                if (terminalMatched) throw unreachableWhenClause();
+                if (wm.andCondition() == null) terminalMatched = true;
+            } else if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                MergeStmt.WhenNotMatchedBySource ws = (MergeStmt.WhenNotMatchedBySource) clause;
+                if (terminalNotMatchedBySource) throw unreachableWhenClause();
+                if (ws.andCondition() == null) terminalNotMatchedBySource = true;
+                if (sourceAlias != null) {
+                    rejectOutOfReachAlias(ws.andCondition(), sourceAlias);
+                    if (ws.setClauses() != null) {
+                        for (InsertStmt.SetClause set : ws.setClauses()) {
+                            rejectOutOfReachAlias(set.value(), sourceAlias);
+                        }
+                    }
+                }
+            } else if (clause instanceof MergeStmt.WhenNotMatched) {
+                MergeStmt.WhenNotMatched wn = (MergeStmt.WhenNotMatched) clause;
+                if (terminalNotMatchedByTarget) throw unreachableWhenClause();
+                if (wn.andCondition() == null) terminalNotMatchedByTarget = true;
+                if (targetAlias != null) {
+                    rejectOutOfReachAlias(wn.andCondition(), targetAlias);
+                    if (wn.values() != null) {
+                        for (Expression value : wn.values()) rejectOutOfReachAlias(value, targetAlias);
+                    }
+                }
+                rejectDuplicateInsertColumns(wn.columns());
+            }
+        }
+    }
+
+    /** The name a MERGE's source is known by inside the WHEN clauses, or null when it has none. */
+    private static String mergeSourceAlias(SelectStmt.FromItem source) {
+        if (source instanceof SelectStmt.TableRef) {
+            SelectStmt.TableRef ref = (SelectStmt.TableRef) source;
+            return ref.alias() != null ? ref.alias() : ref.table;
+        }
+        if (source instanceof SelectStmt.SubqueryFrom) return ((SelectStmt.SubqueryFrom) source).alias();
+        if (source instanceof SelectStmt.FunctionFrom) return ((SelectStmt.FunctionFrom) source).alias();
+        return null;
+    }
+
+    /**
+     * Refuse a qualified reference to a relation that this part of the MERGE cannot see. An
+     * expression holding a subquery is left alone: the subquery brings its own FROM list, so the
+     * same name inside it may well be a relation of its own.
+     */
+    private void rejectOutOfReachAlias(Expression expr, String alias) {
+        if (expr == null) return;
+        if (AstWalk.anyMatch(expr, n -> n instanceof SelectStmt || n instanceof SetOpStmt)) return;
+        Object hit = AstWalk.findFirst(expr, n -> n instanceof ColumnRef
+                && ((ColumnRef) n).table() != null
+                && ((ColumnRef) n).table().equalsIgnoreCase(alias));
+        if (hit != null) {
+            throw new MemgresException("invalid reference to FROM-clause entry for table \"" + alias + "\""
+                    + "\n  Detail: There is an entry for table \"" + alias
+                    + "\", but it cannot be referenced from this part of the query.", "42P01");
+        }
+    }
+
+    /** A target column may be written once per INSERT, whether the INSERT stands alone or is a MERGE arm. */
+    static void rejectDuplicateInsertColumns(List<String> columns) {
+        if (columns == null || columns.size() < 2) return;
+        Set<String> seen = new HashSet<>();
+        for (String col : columns) {
+            if (col == null) continue;
+            if (!seen.add(col.toLowerCase())) {
+                throw new MemgresException("column \"" + col + "\" specified more than once", "42701");
+            }
+        }
     }
 
     /**

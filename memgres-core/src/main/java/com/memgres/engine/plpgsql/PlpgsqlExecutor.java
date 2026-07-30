@@ -488,6 +488,54 @@ public class PlpgsqlExecutor {
             throw new MemgresException(
                     "returned record type does not match expected record type", "42804");
         }
+        // A row constructor builds an anonymous record whose fields are whatever its expressions
+        // were: nothing has coerced them to the declared type, so a field holding text where the
+        // type says a number is that record being handed back under a name it does not fit.
+        if (value instanceof AstExecutor.PgRow) {
+            List<Object> values = ((AstExecutor.PgRow) value).values();
+            for (int i = 0; i < fields.size(); i++) {
+                String want = valueClass(fields.get(i).typeName());
+                String got = valueClassOf(values.get(i));
+                if (want != null && got != null && !want.equals(got)) {
+                    throw new MemgresException(
+                            "returned record type does not match expected record type", "42804");
+                }
+            }
+        }
+    }
+
+    /**
+     * The broad kind of value a declared type holds, or null for a type whose values this check
+     * cannot tell apart from another's. Only kinds that can never stand in for each other are
+     * named: a narrower comparison would refuse records PostgreSQL accepts.
+     */
+    private static String valueClass(String typeName) {
+        if (typeName == null) return null;
+        String t = typeName.trim().toLowerCase();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        if (t.endsWith("[]")) return null;
+        switch (t) {
+            case "smallint": case "int2": case "integer": case "int": case "int4":
+            case "bigint": case "int8": case "numeric": case "decimal":
+            case "real": case "float4": case "double precision": case "float8":
+                return "number";
+            case "text": case "varchar": case "character varying": case "char":
+            case "character": case "bpchar": case "name":
+                return "text";
+            case "boolean": case "bool":
+                return "boolean";
+            default:
+                return null;
+        }
+    }
+
+    /** The same broad kind, read off a value, or null when the value does not say. */
+    private static String valueClassOf(Object value) {
+        if (value instanceof Number) return "number";
+        if (value instanceof Boolean) return "boolean";
+        if (value instanceof String) return "text";
+        return null;
     }
 
     private Object executeInternalFunction(String name, List<Object> args) {
@@ -2822,7 +2870,7 @@ public class PlpgsqlExecutor {
         if (sql == null) {
             if (bound instanceof BoundCursor) {
                 BoundCursor cursor = (BoundCursor) bound;
-                sql = cursor.sql;
+                sql = nameBareParamColumns(cursor.sql, cursor.params);
                 argScope = bindCursorArgs(cursor, stmt, scope);
             } else if (bound instanceof String) {
                 sql = (String) bound;
@@ -2852,6 +2900,73 @@ public class PlpgsqlExecutor {
                         sql, false, false, false, false));
             }
         }
+    }
+
+    /**
+     * Give a select-list item that is nothing but a cursor parameter the parameter's own name.
+     *
+     * <p>PostgreSQL names an output column after the expression as written, before it resolves
+     * what the name refers to, so {@code for select param1, param2} yields columns param1 and
+     * param2 even though both are parameters. Here the parameter's value is written into the
+     * query text, which loses the name unless the query says it, so the query is made to say it.
+     */
+    static String nameBareParamColumns(String sql, List<String> params) {
+        if (sql == null || params == null || params.isEmpty()) return sql;
+        List<Token> tokens;
+        try {
+            tokens = new Lexer(sql).tokenize();
+        } catch (RuntimeException e) {
+            return sql;
+        }
+        // Find the select list: from the first SELECT at depth 0 up to its FROM, or to the end.
+        int start = -1;
+        int end = tokens.size();
+        int depth = 0;
+        for (int i = 0; i < tokens.size(); i++) {
+            Token t = tokens.get(i);
+            if (t.type() == TokenType.EOF) { end = Math.min(end, i); break; }
+            if (t.type() == TokenType.LEFT_PAREN) { depth++; continue; }
+            if (t.type() == TokenType.RIGHT_PAREN) { depth--; continue; }
+            if (depth != 0 || t.type() != TokenType.KEYWORD) continue;
+            if (start < 0 && "SELECT".equalsIgnoreCase(t.value())) { start = i + 1; continue; }
+            if (start >= 0 && ("FROM".equalsIgnoreCase(t.value()) || "INTO".equalsIgnoreCase(t.value()))) {
+                end = i;
+                break;
+            }
+        }
+        if (start < 0) return sql;
+
+        // Each depth-0 comma separates one select-list item; an item of one bare parameter name
+        // is the only one whose column name the substitution would lose.
+        List<Integer> insertAfter = new java.util.ArrayList<>();
+        List<String> insertName = new java.util.ArrayList<>();
+        int itemStart = start;
+        depth = 0;
+        for (int i = start; i <= end; i++) {
+            boolean atEnd = i == end;
+            if (!atEnd) {
+                Token t = tokens.get(i);
+                if (t.type() == TokenType.LEFT_PAREN) { depth++; continue; }
+                if (t.type() == TokenType.RIGHT_PAREN) { depth--; continue; }
+                if (!(depth == 0 && t.type() == TokenType.COMMA)) continue;
+            }
+            if (i - itemStart == 1) {
+                Token only = tokens.get(itemStart);
+                if ((only.type() == TokenType.IDENTIFIER || only.type() == TokenType.QUOTED_IDENTIFIER)
+                        && containsIgnoreCase(params, only.value())) {
+                    insertAfter.add(only.position() + only.raw().length());
+                    insertName.add(only.raw());
+                }
+            }
+            itemStart = i + 1;
+        }
+        if (insertAfter.isEmpty()) return sql;
+        StringBuilder out = new StringBuilder(sql);
+        for (int k = insertAfter.size() - 1; k >= 0; k--) {
+            int at = Math.min(insertAfter.get(k), out.length());
+            out.insert(at, " AS " + insertName.get(k));
+        }
+        return out.toString();
     }
 
     /**
@@ -2944,6 +3059,15 @@ public class PlpgsqlExecutor {
             cursor.closed = true;
             if (session != null) session.removeCursor(cursor.portal);
             return;
+        }
+        if (cursorObj == null || cursorObj instanceof BoundCursor) {
+            // Nothing has been opened, so the variable still holds no portal. Closing it quietly
+            // would tell a caller that a cursor it never opened has been shut.
+            throw new MemgresException(
+                    "cursor variable \"" + stmt.cursorName() + "\" is null", "22004");
+        }
+        if (cursorObj instanceof String && session != null) {
+            session.removeCursor(((String) cursorObj).trim());
         }
         scope.set(stmt.cursorName(), null);
     }
@@ -3337,6 +3461,14 @@ public class PlpgsqlExecutor {
                     boolean isPrecededByDot = i > 0 && tokens.get(i - 1).type() == TokenType.DOT;
                     boolean isInInsertColList = insertColListRanges.contains(i);
                     boolean isOutputOnly = scope.isOutputOnly(t.value());
+                    // The name after AS is a name being given, not one being read: a column alias,
+                    // a CTE name, a type in a cast. Substituting a value there writes nonsense.
+                    boolean isAliasName = i > 0 && tokens.get(i - 1).type() == TokenType.KEYWORD
+                            && "AS".equalsIgnoreCase(tokens.get(i - 1).value());
+                    if (isAliasName) {
+                        appendTokenToSb(sb, t);
+                        continue;
+                    }
                     // Don't substitute if preceded by dot (it's a field access like table.column)
                     // Don't substitute if inside INSERT column list (these are column names, not variables)
                     // Don't substitute table names/aliases or UPDATE SET target columns

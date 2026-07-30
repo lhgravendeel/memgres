@@ -27,7 +27,17 @@ public class PlpgsqlParser {
     }
 
     public static PlpgsqlStatement.Block parse(String body) {
-        return new PlpgsqlParser(body).parseBlock();
+        PlpgsqlParser parser = new PlpgsqlParser(body);
+        try {
+            return parser.parseBlock();
+        } catch (MemgresException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            // Whatever way the parser ran off the rails, the client sent a body that does not
+            // parse. Reporting that as a syntax error at the token it stopped on says the same
+            // thing PostgreSQL does; reporting it as an internal fault does not.
+            throw syntaxError(parser.peek());
+        }
     }
 
     // ---- Token navigation ----
@@ -82,7 +92,19 @@ public class PlpgsqlParser {
             advance();
             return t.value();
         }
-        throw new RuntimeException("Expected identifier at position " + t.position() + ", found: " + t.value());
+        throw syntaxError(t);
+    }
+
+    /**
+     * A body that does not parse is the writer's mistake, not the engine's. PostgreSQL reports it
+     * as a syntax error naming the token it stopped at; reporting it as an internal error instead
+     * tells the caller nothing they can act on and hides a plain typo behind a fault report.
+     */
+    static MemgresException syntaxError(Token t) {
+        if (t == null || t.type() == TokenType.EOF) {
+            return new MemgresException("syntax error at end of input", "42601");
+        }
+        return new MemgresException("syntax error at or near \"" + t.raw() + "\"", "42601");
     }
 
     // ---- Block parsing ----
@@ -588,7 +610,7 @@ public class PlpgsqlParser {
                 return;
             }
         }
-        throw new RuntimeException("Expected '..' in FOR range");
+        throw syntaxError(peek());
     }
 
     private PlpgsqlStatement parseForeach(String label) {
