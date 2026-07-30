@@ -1001,4 +1001,86 @@ class TableRowConcurrencyTest {
             st.execute("DROP TABLE t_sp_stress");
         }
     }
+
+    // =========================================================================
+    // A row a concurrent UPDATE is not moving stays visible to an index reader
+    // =========================================================================
+
+    /**
+     * An UPDATE rewrote every index entry of the row it touched, dropping the old key before
+     * writing the new one. Readers probe an index without the table's write lock, so for the
+     * width of that gap a committed row was under no key at all and a primary-key lookup
+     * answered with no rows. The update here never changes the key it is looked up under, so
+     * there is no moment at which the row is legitimately absent.
+     */
+    @Test
+    void concurrentUpdateNeverHidesARowFromAnIndexLookup() throws Exception {
+        try (Connection c = connect(); Statement st = c.createStatement()) {
+            st.execute("CREATE TABLE t_idx_vis (id SERIAL PRIMARY KEY, tag TEXT NOT NULL UNIQUE, "
+                    + "counter INT NOT NULL DEFAULT 0)");
+            for (int i = 1; i <= 60; i++) {
+                st.execute("INSERT INTO t_idx_vis (tag) VALUES ('tag" + i + "')");
+            }
+        }
+
+        AtomicInteger byId = new AtomicInteger();
+        AtomicInteger byTag = new AtomicInteger();
+        AtomicInteger errors = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        List<Future<?>> futures = new ArrayList<>();
+
+        for (int r = 0; r < 4; r++) {
+            futures.add(pool.submit(() -> {
+                try (Connection c = connect();
+                     PreparedStatement byPk = c.prepareStatement(
+                             "SELECT id, counter FROM t_idx_vis WHERE id = ?");
+                     PreparedStatement byUniq = c.prepareStatement(
+                             "SELECT id FROM t_idx_vis WHERE tag = ?")) {
+                    for (int round = 0; round < 25; round++) {
+                        for (int i = 1; i <= 60; i++) {
+                            byPk.setInt(1, i);
+                            try (ResultSet rs = byPk.executeQuery()) {
+                                if (!rs.next()) byId.incrementAndGet();
+                            }
+                            byUniq.setString(1, "tag" + i);
+                            try (ResultSet rs = byUniq.executeQuery()) {
+                                if (!rs.next()) byTag.incrementAndGet();
+                            }
+                        }
+                    }
+                } catch (SQLException e) {
+                    errors.incrementAndGet();
+                }
+            }));
+        }
+        for (int w = 0; w < 4; w++) {
+            final int off = w;
+            futures.add(pool.submit(() -> {
+                try (Connection c = connect();
+                     PreparedStatement ps = c.prepareStatement(
+                             "UPDATE t_idx_vis SET counter = counter + 1 WHERE id = ?")) {
+                    for (int round = 0; round < 25; round++) {
+                        for (int i = 1 + off; i <= 60; i += 4) {
+                            ps.setInt(1, i);
+                            ps.executeUpdate();
+                        }
+                    }
+                } catch (SQLException e) {
+                    errors.incrementAndGet();
+                }
+            }));
+        }
+
+        for (Future<?> f : futures) f.get(120, TimeUnit.SECONDS);
+        pool.shutdown();
+
+        assertEquals(0, errors.get(), "No errors during concurrent read/update");
+        assertEquals(0, byId.get(), "Primary-key lookup must never miss a committed row");
+        assertEquals(0, byTag.get(), "Unique-index lookup must never miss a committed row");
+
+        try (Connection c = connect(); Statement st = c.createStatement()) {
+            assertEquals(60, queryInt(st, "SELECT COUNT(*) FROM t_idx_vis"));
+            st.execute("DROP TABLE t_idx_vis");
+        }
+    }
 }

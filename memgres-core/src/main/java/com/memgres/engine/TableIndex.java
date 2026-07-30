@@ -81,6 +81,27 @@ public class TableIndex {
         entries.put(key, list);
     }
 
+    /**
+     * Move an updated row's entry from the key its old values gave it to the key its new ones do.
+     *
+     * <p>Readers probe an index without holding the table's write lock, so the row has to be
+     * reachable under some key at every instant of the update. A key the update does not change is
+     * therefore left standing rather than removed and written back, and a key it does change is
+     * written under the new value before the old one is given up. A reader that finds the row under
+     * both keys for a moment still has the query's own WHERE clause to decide whether it answers;
+     * a reader that finds it under neither has nothing left to look at and reports a committed row
+     * missing.
+     *
+     * <p>Call with {@code row} already holding its new values.
+     */
+    public void moveEntry(Object[] row, Object[] oldValues) {
+        IndexKey oldKey = keyOfValues(oldValues);
+        put(row);
+        if (!oldKey.equals(extractKey(row))) {
+            removeByKey(oldKey, row);
+        }
+    }
+
     /** Remove a row from the index using the current column values in the row. */
     public void remove(Object[] row) {
         removeByKey(extractKey(row), row);
@@ -88,11 +109,16 @@ public class TableIndex {
 
     /** Remove a row from the index using explicitly provided old key values. */
     public void removeByOldValues(Object[] oldValues, Object[] row) {
+        removeByKey(keyOfValues(oldValues), row);
+    }
+
+    /** The key a full-width array of column values falls under. */
+    private IndexKey keyOfValues(Object[] values) {
         Object[] vals = new Object[columnIndices.length];
         for (int i = 0; i < columnIndices.length; i++) {
-            vals[i] = normalize(oldValues[columnIndices[i]]);
+            vals[i] = normalize(values[columnIndices[i]]);
         }
-        removeByKey(new IndexKey(vals), row);
+        return new IndexKey(vals);
     }
 
     private void removeByKey(IndexKey key, Object[] row) {
