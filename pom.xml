@@ -40,8 +40,9 @@
     </modules>
 
     <properties>
-        <!-- How many JVMs run test classes at once. 1 restores the old serial run. -->
-        <memgres.test.forkCount>6</memgres.test.forkCount>
+        <!-- How many JVMs run test classes at once, as a multiple of the machine's cores, so a
+             two-core CI runner does not start six. "1" restores the old serial run. -->
+        <memgres.test.forkCount>0.5C</memgres.test.forkCount>
         <java.version>8</java.version>
         <maven.compiler.source>${java.version}</maven.compiler.source>
         <maven.compiler.target>${java.version}</maven.compiler.target>

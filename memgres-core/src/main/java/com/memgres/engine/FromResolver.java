@@ -465,10 +465,11 @@ class FromResolver {
     private List<RowContext> resolveFromClauseInner(List<SelectStmt.FromItem> fromItems, Expression where) {
         rejectSiblingReferenceWithoutLateral(fromItems);
         if (fromItems.size() == 1) {
-            // For single-table queries, try index scan optimization
+            // A single relation with a WHERE is the one shape an index can narrow. The clause is
+            // handed to the same resolver the sequential scan uses, which decides for itself
+            // whether an index may answer it; every check the scan makes is made either way.
             if (where != null && fromItems.get(0) instanceof SelectStmt.TableRef) {
-                List<RowContext> indexed = tryIndexScan((SelectStmt.TableRef) fromItems.get(0), where);
-                if (indexed != null) return indexed;
+                return resolveTableRef((SelectStmt.TableRef) fromItems.get(0), where);
             }
             return resolveFromItem(fromItems.get(0));
         }
@@ -564,7 +565,7 @@ class FromResolver {
                     executor.outerContextStack.push(leftCtx);
                     try {
                         // A comma between two FROM items is an inner join, so a function that
-                        // produces no rows for this left row removes it -- the same as the
+                        // produces no rows for this left row removes it — the same as the
                         // lateral-subquery branch above, which skips it. Padding it with NULLs
                         // instead answered LEFT JOIN LATERAL to a query that did not write one.
                         for (RowContext rightCtx : functionResolver.resolveFunctionFrom(funcFrom)) {
@@ -651,6 +652,22 @@ class FromResolver {
     }
 
     private List<RowContext> resolveTableRef(SelectStmt.TableRef tableRef) {
+        return resolveTableRef(tableRef, null);
+    }
+
+    /**
+     * Resolve a relation named in a FROM clause.
+     *
+     * <p>{@code indexWhere} is the query's WHERE, offered so that an equality on an indexed column
+     * can be answered from the index instead of by reading every row. It is an optimisation and
+     * nothing more: the caller applies the WHERE again to whatever comes back, so a probe is
+     * allowed to return rows the clause will later discard but never to leave one out. Everything
+     * that decides which rows a reader may see at all — the SELECT privilege, the ACCESS SHARE
+     * lock, the repeatable-read snapshot, uncommitted work in other sessions and row-level
+     * security — is settled below on the one path, so an index scan and a sequential scan cannot
+     * disagree about it.
+     */
+    private List<RowContext> resolveTableRef(SelectStmt.TableRef tableRef, Expression indexWhere) {
         // Check CTEs first
         SelectStmt.CommonTableExpr cte = lookupCteFor(tableRef);
         if (cte != null) {
@@ -793,7 +810,14 @@ class FromResolver {
         // Use getAllRowsWithSource for inheritance/partitioning
         boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
         List<RowContext> contexts = new ArrayList<>();
-        if (tableRef.only()) {
+        List<Object[]> probed = indexWhere == null ? null
+                : indexProbe(tableRef, table, indexWhere, schemaTableKey, currentSession);
+        if (probed != null) {
+            for (Object[] row : probed) {
+                Object[] r = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
+                contexts.add(new RowContext(table, alias, r));
+            }
+        } else if (tableRef.only()) {
             for (Object[] row : table.getRows()) {
                 Object[] r = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
                 contexts.add(new RowContext(table, alias, r));
@@ -820,149 +844,231 @@ class FromResolver {
     }
 
     /**
-     * Try to use an index scan for a single-table query with equality predicates in WHERE.
-     * Returns null if no suitable index is found and we should fall back to sequential scan.
+     * The rows an index can answer an equality with, or null to read the relation in full.
+     *
+     * <p>An index holds every stored row of the relation under the value of its columns, so a
+     * {@code WHERE col = value} that names all of an index's columns can be answered by one lookup
+     * instead of a pass over the table. A 10,000-row relation read 5,000 times by primary key is
+     * 50 million row visits done as 5,000 hash lookups.
+     *
+     * <p>Returning null is always safe — it means read everything — and every doubt is settled
+     * that way. The probe is refused unless the value written in the query is the same value the
+     * relation stores, because the index compares stored values and the query does not: a function
+     * or a cast over the column, a value of another type, a domain or an enum with its own storage
+     * rules, all send the query back to a sequential scan rather than risk a row that answers the
+     * clause not being found under the key that was looked up. {@code = NULL} matches nothing in
+     * SQL, so it is not a key to look anything up under either.
+     *
+     * <p>The rows come from the index and are therefore the relation as it stands now. That is the
+     * right answer only when now is what the reader is entitled to see, so a transaction reading
+     * from a repeatable-read snapshot, and a reader with another session's uncommitted work on the
+     * relation to account for, both read it in full: the snapshot is the whole relation and cannot
+     * be rebuilt from a lookup, and an uncommitted update to an indexed column has already moved
+     * the row to its new key while the reader is still owed its old one.
      */
-    private List<RowContext> tryIndexScan(SelectStmt.TableRef tableRef, Expression where) {
-        // Only optimize regular user tables (skip CTEs, views, system catalogs)
-        if (executor.selectExecutor.lookupCte(tableRef.table()) != null) return null;
-        if (viewFor(tableRef) != null) return null;
-        String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
-        Table table;
-        try {
-            table = executor.resolveTable(schemaName, tableRef.table());
-        } catch (MemgresException e) {
-            return null;
-        }
-        // Skip if table has partitions/inheritance (complex row sources)
-        if (!table.getPartitions().isEmpty() || table.getParentTable() != null) return null;
-        // Skip ONLY queries (rare, let normal path handle)
+    private List<Object[]> indexProbe(SelectStmt.TableRef tableRef, Table table, Expression where,
+                                      String schemaTableKey, Session session) {
+        if (table.getIndexes().isEmpty()) return null;
+        // ONLY, inheritance and partitioning spread the relation's rows over tables of their own,
+        // each with an index of its own; one index answers for one of them.
         if (tableRef.only()) return null;
+        if (!table.getPartitions().isEmpty() || !table.getChildren().isEmpty()
+                || table.getParentTable() != null) return null;
+        if (session != null && !indexReflectsWhatSessionMaySee(schemaTableKey, session)) return null;
 
-        // Extract equality predicates: flatten ANDs and look for col = literal patterns
-        List<Expression> predicates = flattenAndPredicates(where);
-        Map<String, Object> equalityMap = new LinkedHashMap<>();
-        List<Expression> remainingPredicates = new ArrayList<>();
+        Map<String, Object> equalities = collectEqualityKeys(tableRef, table, where);
+        if (equalities == null || equalities.isEmpty()) return null;
 
-        for (Expression pred : predicates) {
-            String colName = null;
-            Object value = null;
-            if (pred instanceof BinaryExpr) {
-                BinaryExpr bin = (BinaryExpr) pred;
-                if ("=".equals(bin.op())) {
-                    if (bin.left() instanceof ColumnRef && isLiteralOrParam(bin.right())) {
-                        colName = ((ColumnRef) bin.left()).column();
-                        if (((ColumnRef) bin.left()).table() != null) {
-                            String tRef = ((ColumnRef) bin.left()).table();
-                            String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
-                            if (!tRef.equalsIgnoreCase(alias) && !tRef.equalsIgnoreCase(tableRef.table())) {
-                                remainingPredicates.add(pred);
-                                continue;
-                            }
-                        }
-                        value = extractLiteralValue(bin.right());
-                    } else if (bin.right() instanceof ColumnRef && isLiteralOrParam(bin.left())) {
-                        colName = ((ColumnRef) bin.right()).column();
-                        if (((ColumnRef) bin.right()).table() != null) {
-                            String tRef = ((ColumnRef) bin.right()).table();
-                            String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
-                            if (!tRef.equalsIgnoreCase(alias) && !tRef.equalsIgnoreCase(tableRef.table())) {
-                                remainingPredicates.add(pred);
-                                continue;
-                            }
-                        }
-                        value = extractLiteralValue(bin.left());
-                    }
-                }
-            }
-            if (colName != null && value != null && table.getColumnIndex(colName) >= 0) {
-                equalityMap.put(colName.toLowerCase(), value);
-            } else {
-                remainingPredicates.add(pred);
-            }
-        }
+        // A unique index answers with at most one row, so it is preferred where both would do.
+        List<Object[]> found = probeIndexes(table, equalities, true);
+        if (found == null) found = probeIndexes(table, equalities, false);
+        return found;
+    }
 
-        if (equalityMap.isEmpty()) return null;
-
-        // Find a matching index
-        for (Map.Entry<String, TableIndex> entry : table.getIndexes().entrySet()) {
-            TableIndex idx = entry.getValue();
+    /** Look up {@code equalities} in the table's unique or non-unique indexes, or null for none. */
+    private List<Object[]> probeIndexes(Table table, Map<String, Object> equalities, boolean unique) {
+        List<Column> columns = table.getColumns();
+        for (TableIndex idx : table.getIndexes().values()) {
+            if (idx.isUnique() != unique) continue;
             int[] colIndices = idx.getColumnIndices();
-            // Check if all index columns have equality predicates
-            boolean allMatch = true;
+            if (colIndices.length == 0) continue;
             Object[] keyValues = new Object[colIndices.length];
+            boolean complete = true;
             for (int i = 0; i < colIndices.length; i++) {
-                Column col = table.getColumns().get(colIndices[i]);
-                Object val = equalityMap.get(col.getName().toLowerCase());
-                if (val == null && !equalityMap.containsKey(col.getName().toLowerCase())) {
-                    allMatch = false;
-                    break;
-                }
-                // Coerce the lookup value to match the column's storage type.
-                // For CHAR(n) columns, the stored value is padded with spaces; the
-                // literal must be padded too so the index hash lookup matches.
-                keyValues[i] = TypeCoercion.coerceForStorage(val, col);
+                if (colIndices[i] < 0 || colIndices[i] >= columns.size()) { complete = false; break; }
+                String name = columns.get(colIndices[i]).getName().toLowerCase(Locale.ROOT);
+                if (!equalities.containsKey(name)) { complete = false; break; }
+                keyValues[i] = equalities.get(name);
             }
-            if (!allMatch) continue;
-
-            // Found a matching index — do the lookup
-            List<Object[]> matchedRows = idx.findAll(keyValues);
-
-            String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
-            lastResolvedRightTable = table;
-            lastResolvedRightAlias = alias;
-            boolean hasVirtual = executor.dmlExecutor.hasVirtualColumns(table);
-            List<RowContext> contexts = new ArrayList<>();
-            for (Object[] row : matchedRows) {
-                Object[] r = hasVirtual ? executor.dmlExecutor.computeVirtualColumns(table, row) : row;
-                contexts.add(new RowContext(table, alias, r));
-            }
-
-            // Apply remaining WHERE predicates that weren't covered by the index
-            if (!remainingPredicates.isEmpty()) {
-                contexts = contexts.stream()
-                        .filter(ctx -> {
-                            for (Expression rp : remainingPredicates) {
-                                if (!executor.isTruthy(executor.evalExpr(rp, ctx))) return false;
-                            }
-                            return true;
-                        })
-                        .collect(java.util.stream.Collectors.toList());
-            }
-
-            // MVCC visibility
-            String schemaTableKey = schemaName + "." + tableRef.table();
-            Session currentSession = executor.session;
-            if (currentSession != null) {
-                contexts = applyMvccVisibility(contexts, table, alias, schemaTableKey, currentSession);
-            }
-            // RLS
-            if (table.isRlsEnabled()) {
-                contexts = applyRlsFiltering(contexts, table, schemaName);
-            }
-            return contexts;
+            if (!complete) continue;
+            return idx.findAll(keyValues);
         }
-        return null; // no matching index
+        return null;
     }
 
-    private boolean isLiteralOrParam(Expression expr) {
-        return expr instanceof Literal || expr instanceof ParamRef;
+    /**
+     * Whether what the index holds now is what this session is entitled to read.
+     *
+     * <p>A repeatable-read transaction reads the relation as it stood when it first looked, which
+     * is a list of rows the session keeps and the index knows nothing of. Building that list from
+     * a probe would fix the snapshot at the few rows one lookup returned, and every later
+     * statement in the transaction would read the relation as if it held only those — so a
+     * transaction at that isolation level reads in full whether it has taken its snapshot yet or
+     * not.
+     *
+     * <p>Another session's uncommitted work is undone for this reader row by row, which needs the
+     * rows: an update it has not committed has already moved its row to the new key, and this
+     * reader is owed the row under the old one.
+     */
+    private boolean indexReflectsWhatSessionMaySee(String schemaTableKey, Session session) {
+        if (session.hasRRSnapshot(schemaTableKey)) return false;
+        if (session.isInTransaction()) {
+            String isolation = session.getEffectiveIsolationLevel();
+            if ("repeatable read".equals(isolation) || "serializable".equals(isolation)) return false;
+        }
+        for (Session other : executor.database.getActiveSessions()) {
+            if (other == session) continue;
+            if (!other.isInTransaction()) continue;
+            if (!other.getUncommittedInserts(schemaTableKey).isEmpty()) return false;
+            if (!other.getUncommittedUpdates(schemaTableKey).isEmpty()) return false;
+            if (!other.getUncommittedDeletes(schemaTableKey).isEmpty()) return false;
+        }
+        return true;
     }
 
-    private Object extractLiteralValue(Expression expr) {
-        if (expr instanceof Literal) {
-            // Evaluate literal to get typed value (Integer, BigDecimal, String, Boolean, etc.)
-            try {
-                return executor.evalExpr(expr, null);
-            } catch (Exception e) {
+    /**
+     * The column-name-to-stored-value pairs an index may be looked up under, from the ANDed
+     * equalities of a WHERE. Null when the clause holds none usable.
+     *
+     * <p>Only a bare column against a written value counts. A cast or a function over the column
+     * is a different value from the one the index holds, and a qualifier naming something other
+     * than this relation is not this relation's column at all.
+     */
+    private Map<String, Object> collectEqualityKeys(SelectStmt.TableRef tableRef, Table table,
+                                                    Expression where) {
+        String alias = tableRef.alias() != null ? tableRef.alias() : tableRef.table();
+        Map<String, Object> equalities = null;
+        for (Expression pred : flattenAndPredicates(where)) {
+            if (!(pred instanceof BinaryExpr)) continue;
+            BinaryExpr bin = (BinaryExpr) pred;
+            if (bin.op() != BinaryExpr.BinOp.EQUAL) continue;
+            ColumnRef ref = null;
+            Expression valueExpr = null;
+            if (bin.left() instanceof ColumnRef && isWrittenValue(bin.right())) {
+                ref = (ColumnRef) bin.left();
+                valueExpr = bin.right();
+            } else if (bin.right() instanceof ColumnRef && isWrittenValue(bin.left())) {
+                ref = (ColumnRef) bin.right();
+                valueExpr = bin.left();
+            }
+            if (ref == null || ref.column() == null) continue;
+            if (ref.table() != null && !ref.table().equalsIgnoreCase(alias)
+                    && !ref.table().equalsIgnoreCase(tableRef.table())) continue;
+            int colIdx = table.getColumnIndex(ref.column());
+            if (colIdx < 0) continue;
+            Column column = table.getColumns().get(colIdx);
+            Object key = storedFormOf(valueExpr, column);
+            if (key == null) continue;
+            String name = column.getName().toLowerCase(Locale.ROOT);
+            if (equalities == null) equalities = new LinkedHashMap<String, Object>();
+            Object prior = equalities.put(name, key);
+            // Two equalities on one column with different values match nothing; there is no one
+            // key to look that up under, so the clause is left to the scan.
+            if (prior != null
+                    && !Objects.equals(TableIndex.normalize(prior), TableIndex.normalize(key))) {
                 return null;
             }
         }
-        if (expr instanceof ParamRef) {
-            // Parameters need runtime resolution, can't extract statically
+        return equalities;
+    }
+
+    /** A value written in the query itself, which is the same for every row and reads no column. */
+    private boolean isWrittenValue(Expression expr) {
+        return expr instanceof Literal || expr instanceof ParamRef;
+    }
+
+    /**
+     * The value as this column stores it, or null when the query's value cannot be turned into a
+     * key the index would have filed the row under.
+     *
+     * <p>Stored values were put through {@link TypeCoercion#coerceForStorage} on their way in, so
+     * a lookup value has to make the same trip — CHAR(n) pads, NUMERIC(p,s) rounds — or a row
+     * that answers the clause sits under a key the probe never asks for. The trip is only taken
+     * for types where it lands somewhere the index compares the way SQL does: an enum, a domain,
+     * an array, a composite, JSON, a network address and a geometric value each have an equality
+     * of their own that comparing stored forms does not reproduce, and a value of the wrong type
+     * altogether is a question for the scan, which raises whatever PostgreSQL raises for it.
+     */
+    private Object storedFormOf(Expression valueExpr, Column column) {
+        if (!hasProbeableStorage(column)) return null;
+        Object raw;
+        try {
+            raw = executor.evalExpr(valueExpr, null);
+        } catch (RuntimeException e) {
             return null;
         }
-        return null;
+        // = NULL is unknown for every row, never a key.
+        if (raw == null) return null;
+        if (!valueMatchesColumnType(raw, column.getType())) return null;
+        try {
+            return TypeCoercion.coerceForStorage(raw, column);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Whether this column's stored values are ones an index lookup compares the way SQL does. */
+    private static boolean hasProbeableStorage(Column column) {
+        if (column.isVirtual()) return false;
+        if (column.getEnumTypeName() != null) return false;
+        if (column.getDomainTypeName() != null) return false;
+        if (column.getCompositeTypeName() != null) return false;
+        if (column.getArrayElementType() != null) return false;
+        switch (column.getType()) {
+            case SMALLINT: case INTEGER: case BIGINT:
+            case SMALLSERIAL: case SERIAL: case BIGSERIAL:
+            case NUMERIC: case REAL: case DOUBLE_PRECISION:
+            case TEXT: case VARCHAR: case CHAR: case NAME:
+            case BOOLEAN:
+            case DATE: case TIME: case TIMESTAMP: case TIMESTAMPTZ:
+            case UUID:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Whether the query's value is of the type this column holds.
+     *
+     * <p>A quoted value has no type of its own in PostgreSQL and takes the column's, so a string
+     * is accepted for a date or a UUID. Anything else crossing type families — a number against a
+     * text column, a word against an integer one — is either an error PostgreSQL reports or a
+     * comparison with a rule of its own, and neither is settled by a hash lookup.
+     */
+    private static boolean valueMatchesColumnType(Object value, DataType type) {
+        switch (type) {
+            case SMALLINT: case INTEGER: case BIGINT:
+            case SMALLSERIAL: case SERIAL: case BIGSERIAL:
+            case NUMERIC: case REAL: case DOUBLE_PRECISION:
+                return value instanceof Number;
+            case TEXT: case VARCHAR: case CHAR: case NAME:
+                return value instanceof String;
+            case BOOLEAN:
+                return value instanceof Boolean;
+            case DATE:
+                return value instanceof String || value instanceof java.time.LocalDate;
+            case TIME:
+                return value instanceof String || value instanceof java.time.LocalTime;
+            case TIMESTAMP:
+                return value instanceof String || value instanceof java.time.LocalDateTime;
+            case TIMESTAMPTZ:
+                return value instanceof String || value instanceof java.time.OffsetDateTime;
+            case UUID:
+                return value instanceof String || value instanceof java.util.UUID;
+            default:
+                return false;
+        }
     }
 
     private List<RowContext> applyRlsFiltering(List<RowContext> contexts, Table table, String schemaName) {
