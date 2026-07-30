@@ -2625,7 +2625,7 @@ class SessionExecutor {
     /** Collations PostgreSQL ships with, which exist without ever being created. */
     private static final Set<String> BUILTIN_COLLATIONS = Cols.setOf(
             "default", "c", "posix", "c.utf-8", "c.utf8", "en_us", "en_us.utf-8", "en_us.utf8",
-            "und-x-icu", "en-us-x-icu", "en-x-icu", "ucs_basic");
+            "und-x-icu", "en-us-x-icu", "en-x-icu", "ucs_basic", "unicode", "pg_c_utf8");
 
     /**
      * Conversions, tablespaces and procedural languages are accepted here without being

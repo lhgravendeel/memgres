@@ -136,6 +136,11 @@ class ErrorSqlstateAssertionTest {
         }
     }
 
+    /**
+     * RESTRICT has its own SQLSTATE: PostgreSQL reports 23001 restrict_violation, not the
+     * 23503 a NO ACTION key raises. This test asserted 23503, which no PostgreSQL 18 returns
+     * for a RESTRICT action.
+     */
     @Test
     void foreignKeyViolation_onDelete_restrict() throws SQLException {
         exec("CREATE TABLE esa_fkd_parent (id int PRIMARY KEY)");
@@ -143,7 +148,7 @@ class ErrorSqlstateAssertionTest {
         exec("INSERT INTO esa_fkd_parent VALUES (10)");
         exec("INSERT INTO esa_fkd_child VALUES (1, 10)");
         try {
-            assertSqlState("23503", "DELETE FROM esa_fkd_parent WHERE id = 10");
+            assertSqlState("23001", "DELETE FROM esa_fkd_parent WHERE id = 10");
         } finally {
             exec("DROP TABLE esa_fkd_child");
             exec("DROP TABLE esa_fkd_parent");

@@ -194,8 +194,7 @@ class ConstraintValidator {
             if (sc.isNotEnforced()) continue;
 
             // Deferred constraint handling: defer to COMMIT if currently deferred
-            boolean shouldDefer = sc.isDeferrable() && executor.session != null && executor.session.isInTransaction()
-                    && executor.session.isConstraintCurrentlyDeferred(sc);
+            boolean shouldDefer = checkIsCurrentlyDeferred(sc);
 
             switch (sc.getType()) {
                 case PRIMARY_KEY:
@@ -437,6 +436,91 @@ class ConstraintValidator {
     /** Package-visible for deferred constraint checking from Session.commit(). */
     void validateForeignKeyDeferred(Table table, Object[] row, StoredConstraint sc) {
         validateForeignKey(table, row, sc);
+    }
+
+    /** True while this constraint's checks are being postponed to COMMIT for the current session. */
+    private boolean checkIsCurrentlyDeferred(StoredConstraint sc) {
+        return sc.isDeferrable()
+                && executor.session != null
+                && executor.session.isInTransaction()
+                && executor.session.isConstraintCurrentlyDeferred(sc);
+    }
+
+    /**
+     * The error a still-referenced parent row raises. RESTRICT and NO ACTION report it
+     * differently: PostgreSQL calls RESTRICT out by name under its own SQLSTATE, because that
+     * action refuses the write outright rather than merely finding the key unsatisfied.
+     */
+    private MemgresException referencedRowError(Table parentTable, Table childTable,
+                                                StoredConstraint sc, List<String> refColNames,
+                                                Object[] parentVals, String childSchemaName,
+                                                boolean restrict) {
+        StringBuilder detailSb = new StringBuilder("Key (");
+        for (int i = 0; i < refColNames.size(); i++) {
+            if (i > 0) detailSb.append(", ");
+            detailSb.append(refColNames.get(i));
+        }
+        detailSb.append(")=(");
+        for (int i = 0; i < parentVals.length; i++) {
+            if (i > 0) detailSb.append(", ");
+            detailSb.append(parentVals[i]);
+        }
+        detailSb.append(") is ").append(restrict ? "" : "still ")
+                .append("referenced from table \"").append(childTable.getName()).append("\".");
+        MemgresException ex = new MemgresException(
+                "update or delete on table \"" + parentTable.getName() + "\" violates "
+                        + (restrict ? "RESTRICT setting of " : "")
+                        + "foreign key constraint \"" + sc.getName()
+                        + "\" on table \"" + childTable.getName() + "\"",
+                restrict ? "23001" : "23503");
+        ex.setDetail(detailSb.toString());
+        ex.setConstraint(sc.getName());
+        ex.setTable(childTable.getName());
+        if (childSchemaName != null) ex.setSchema(childSchemaName);
+        return ex;
+    }
+
+    /** True when the row is still one of the table's live rows. */
+    private static boolean rowIsLive(Table table, Object[] row) {
+        for (Object[] candidate : table.getRows()) {
+            if (candidate == row) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Re-check, at COMMIT or at SET CONSTRAINTS ... IMMEDIATE, a child row whose referenced row
+     * was deleted or re-keyed earlier in the transaction. The transaction has had the chance to
+     * put the key back or to move the child row, so the check is made against what the tables
+     * hold now; only a child row that is still there and still points at a missing key fails.
+     */
+    void validateDeferredReferencedFk(Table parentTable, Table childTable, Object[] childRow,
+                                      StoredConstraint sc) {
+        if (!rowIsLive(childTable, childRow)) return;
+
+        int[] childColIndices = new int[sc.getColumns().size()];
+        Object[] childVals = new Object[childColIndices.length];
+        for (int i = 0; i < childColIndices.length; i++) {
+            childColIndices[i] = childTable.getColumnIndex(sc.getColumns().get(i));
+            if (childColIndices[i] < 0) return;
+            childVals[i] = childRow[childColIndices[i]];
+            // A null in the key references nothing, so nothing is left dangling.
+            if (childVals[i] == null) return;
+        }
+
+        try {
+            validateForeignKey(childTable, childRow, sc);
+            return;
+        } catch (MemgresException e) {
+            if (!"23503".equals(e.getSqlState())) throw e;
+        }
+
+        List<String> refColNames = sc.getReferencesColumns();
+        if (refColNames.isEmpty()) {
+            refColNames = findPrimaryKeyColumns(parentTable);
+        }
+        throw referencedRowError(parentTable, childTable, sc, refColNames, childVals,
+                findSchemaName(childTable), false);
     }
 
     /** Validate a deferred constraint at commit time. Dispatches by constraint type. */
@@ -1073,7 +1157,13 @@ class ConstraintValidator {
                         }
                         case RESTRICT:
                         case NO_ACTION: {
-                            // Check if any child rows reference this parent row
+                            // NO ACTION is the deferrable one: it only asks that no child is left
+                            // dangling once the transaction is over, so a transaction is free to
+                            // delete the parent and put it back. RESTRICT refuses the delete
+                            // itself and fires at the statement even when the constraint is
+                            // deferred.
+                            boolean postpone = sc.getOnDelete() == StoredConstraint.FkAction.NO_ACTION
+                                    && checkIsCurrentlyDeferred(sc);
                             for (Object[] childRow : childTable.getRows()) {
                                 // Skip rows that are also being deleted in the same statement
                                 if (alsoDeleting != null && alsoDeleting.contains(childRow)) continue;
@@ -1084,30 +1174,15 @@ class ConstraintValidator {
                                         break;
                                     }
                                 }
-                                if (matches) {
-                                    StringBuilder detailSb = new StringBuilder("Key (");
-                                    for (int i = 0; i < refColNames.size(); i++) {
-                                        if (i > 0) detailSb.append(", ");
-                                        detailSb.append(refColNames.get(i));
-                                    }
-                                    detailSb.append(")=(");
-                                    for (int i = 0; i < parentVals.length; i++) {
-                                        if (i > 0) detailSb.append(", ");
-                                        detailSb.append(parentVals[i]);
-                                    }
-                                    detailSb.append(") is still referenced from table \"")
-                                            .append(childTable.getName()).append("\".");
-                                    MemgresException ex = new MemgresException(
-                                            "update or delete on table \"" + parentTable.getName() +
-                                                    "\" violates foreign key constraint \"" + sc.getName() +
-                                                    "\" on table \"" + childTable.getName() + "\"",
-                                            "23503");
-                                    ex.setDetail(detailSb.toString());
-                                    ex.setConstraint(sc.getName());
-                                    ex.setTable(childTable.getName());
-                                    ex.setSchema(schema.getName());
-                                    throw ex;
+                                if (!matches) continue;
+                                if (postpone) {
+                                    executor.session.addDeferredReferencedCheck(
+                                            childTable, childRow, sc, parentTable);
+                                    continue;
                                 }
+                                throw referencedRowError(parentTable, childTable, sc, refColNames,
+                                        parentVals, schema.getName(),
+                                        sc.getOnDelete() == StoredConstraint.FkAction.RESTRICT);
                             }
                             break;
                         }
@@ -1259,6 +1334,10 @@ class ConstraintValidator {
                         }
                         case RESTRICT:
                         case NO_ACTION: {
+                            // As on the delete side: NO ACTION only wants the key back by the end
+                            // of the transaction, RESTRICT refuses the update where it stands.
+                            boolean postpone = sc.getOnUpdate() == StoredConstraint.FkAction.NO_ACTION
+                                    && checkIsCurrentlyDeferred(sc);
                             for (Object[] childRow : childTable.getRows()) {
                                 boolean matches = true;
                                 for (int i = 0; i < childColIndices.length; i++) {
@@ -1267,13 +1346,15 @@ class ConstraintValidator {
                                         break;
                                     }
                                 }
-                                if (matches) {
-                                    throw new MemgresException(
-                                            "update or delete on table \"" + parentTable.getName() +
-                                                    "\" violates foreign key constraint \"" + sc.getName() +
-                                                    "\" on table \"" + childTable.getName() + "\"",
-                                            "23503");
+                                if (!matches) continue;
+                                if (postpone) {
+                                    executor.session.addDeferredReferencedCheck(
+                                            childTable, childRow, sc, parentTable);
+                                    continue;
                                 }
+                                throw referencedRowError(parentTable, childTable, sc, refColNames,
+                                        oldParentVals, childSchemaName,
+                                        sc.getOnUpdate() == StoredConstraint.FkAction.RESTRICT);
                             }
                             break;
                         }
