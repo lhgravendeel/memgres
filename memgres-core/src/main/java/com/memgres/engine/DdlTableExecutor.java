@@ -362,6 +362,9 @@ class DdlTableExecutor {
         }
 
         schema.addTable(table);
+        // A relation created under a name that once carried rules starts clean: the pg_class row
+        // that remembered them went with the relation that was dropped.
+        executor.database.clearRuleHistory(stmt.name());
         executor.database.markUncommittedObject(table, executor.session);
         executor.recordUndo(new Session.CreateTableUndo(schemaName, stmt.name()));
 
@@ -1592,6 +1595,9 @@ class DdlTableExecutor {
 
         Table table = new Table(stmt.name(), columns);
         schema.addTable(table);
+        // A relation created under a name that once carried rules starts clean: the pg_class row
+        // that remembered them went with the relation that was dropped.
+        executor.database.clearRuleHistory(stmt.name());
         executor.database.markUncommittedObject(table, executor.session);
         executor.recordUndo(new Session.CreateTableUndo(schemaName, stmt.name()));
 

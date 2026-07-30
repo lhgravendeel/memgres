@@ -406,12 +406,37 @@ class CatalogCoreBuilder {
         return new Object[]{
                 rowTypeOid(schemaName, relName), relName, nsOid, 10,
                 (short) -1, false, "c", "C", false, true, ",",
-                oids.oid("rel:" + schemaName + "." + relName), regproc(null), 0, 0,
+                oids.oid("rel:" + schemaName + "." + relName), regproc(null), 0,
+                rowTypeArrayOid(schemaName, relName),
                 regproc("record_in"), regproc("record_out"), regproc("record_recv"),
                 regproc("record_send"),
                 regproc(null), regproc(null), regproc(null), "d", "x",
                 false, 0, -1, 0, 0, null, null, null, 1
         };
+    }
+
+    /**
+     * The {@code _name} array type that goes with a composite. Every composite type in PostgreSQL
+     * has one — {@code pg_type.typarray} is never zero for a {@code typtype = 'c'} row — and a
+     * client following that link to describe an array of the row type found nothing at the far end.
+     */
+    private Object[] rowTypeArray(String schemaName, String relName, int nsOid) {
+        return new Object[]{
+                rowTypeArrayOid(schemaName, relName), "_" + relName, nsOid, 10,
+                (short) -1, false, "b", "A", false, true, ",",
+                0, regproc("array_subscript_handler"), rowTypeOid(schemaName, relName), 0,
+                regproc("array_in"), regproc("array_out"), regproc("array_recv"),
+                regproc("array_send"),
+                regproc(null), regproc(null), regproc("array_typanalyze"), "d", "x",
+                false, 0, -1, 0, 0, null, null, null, 1
+        };
+    }
+
+    private int rowTypeArrayOid(String schemaName, String relName) {
+        if (database.getCompositeTypes().containsKey(relName)) {
+            return oids.oid("type:" + relName + "[]");
+        }
+        return oids.oid("type:" + schemaName + "." + relName + "[]");
     }
 
     /** The OID of a relation's row type, which pg_class.reltype names. */
@@ -633,7 +658,7 @@ class CatalogCoreBuilder {
                         0, database.getAnalyzedTables().contains(schemaEntry.getKey() + "." + t.getName()) ? (double) t.getRows().size() : -1.0, 0, 0, 0, // relpages, reltuples (M22: -1 = never-analyzed), relallvisible, relallfrozen, reltoastrelid
                         hasIdx, false, relPersistence(schemaEntry.getKey(), t.isUnlogged()), relkind, // relhasindex, relisshared, relpersistence, relkind
                         (short) t.getColumns().size(), checkCount, // relnatts, relchecks
-                        false, hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
+                        hasRules(t.getName()), hasTriggers, false, t.isRlsEnabled(), t.isRlsForced(), // relhasrules..relforcerowsecurity
 
                         true, String.valueOf(t.getReplicaIdentity()), relispartition, // relispopulated, relreplident, relispartition
                         0, 0, 0,            // relrewrite, relfrozenxid, relminmxid
@@ -1536,9 +1561,17 @@ class CatalogCoreBuilder {
             table.insertRow(new Object[]{
                     oids.oid("type:" + ctName), ctName, ctNsOid, 10,
                     (short) -1, false, "c", "C", false, true, ",",
-                    ctRelOid, regproc(null), 0, 0,
+                    ctRelOid, regproc(null), 0, oids.oid("type:" + ctName + "[]"),
                     regproc("record_in"), regproc("record_out"), regproc("record_recv"), regproc("record_send"),
                     regproc(null), regproc(null), regproc(null), "d", "x",
+                    false, 0, -1, 0, 0, null, null, null, 1
+            });
+            table.insertRow(new Object[]{
+                    oids.oid("type:" + ctName + "[]"), "_" + ctName, ctNsOid, 10,
+                    (short) -1, false, "b", "A", false, true, ",",
+                    0, regproc("array_subscript_handler"), oids.oid("type:" + ctName), 0,
+                    regproc("array_in"), regproc("array_out"), regproc("array_recv"), regproc("array_send"),
+                    regproc(null), regproc(null), regproc("array_typanalyze"), "d", "x",
                     false, 0, -1, 0, 0, null, null, null, 1
             });
         }
@@ -1567,6 +1600,7 @@ class CatalogCoreBuilder {
                 String relName = rel.getName();
                 if (database.getCompositeTypes().containsKey(relName)) continue;
                 table.insertRow(rowType(schemaName, relName, relNsOid));
+                table.insertRow(rowTypeArray(schemaName, relName, relNsOid));
             }
         }
 
@@ -1575,6 +1609,7 @@ class CatalogCoreBuilder {
             String vSchema = vd.schemaName() != null ? vd.schemaName() : "public";
             if (database.getCompositeTypes().containsKey(vd.name())) continue;
             table.insertRow(rowType(vSchema, vd.name(), oids.oid("ns:" + vSchema)));
+            table.insertRow(rowTypeArray(vSchema, vd.name(), oids.oid("ns:" + vSchema)));
         }
 
         // ... and so does every catalog relation: in PostgreSQL pg_class.reltype names it, and a
@@ -1583,6 +1618,7 @@ class CatalogCoreBuilder {
         // one thing in the catalog whose reltype led nowhere.
         for (String sysRel : PgCatalogRelations.ALL) {
             table.insertRow(rowType("pg_catalog", sysRel, pgCatalogOid));
+            table.insertRow(rowTypeArray("pg_catalog", sysRel, pgCatalogOid));
         }
 
         // Add domain types
@@ -2473,6 +2509,15 @@ class CatalogCoreBuilder {
     }
 
     /** PG marks anything in a pg_temp namespace as temporary, ahead of unlogged. */
+    /**
+     * What {@code relhasrules} reports. PostgreSQL documents it as "has (or once had) rules" and
+     * only clears the flag at VACUUM, so a relation whose rules have all been dropped still
+     * answers true.
+     */
+    private boolean hasRules(String relName) {
+        return database.everHadRules(relName);
+    }
+
     private static String relPersistence(String schemaName, boolean unlogged) {
         if (schemaName != null && schemaName.toLowerCase().startsWith("pg_temp")) return "t";
         return unlogged ? "u" : "p";

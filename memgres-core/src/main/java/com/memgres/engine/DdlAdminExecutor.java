@@ -627,12 +627,27 @@ class DdlAdminExecutor {
         }
         // Track rule name with full definition for pg_rules
         executor.database.addRuleByName(s.name(), s.table(), s.event());
-        // Store rule definition for pg_rules view
-        String definition = "CREATE RULE " + s.name() + " AS ON " + s.event() + " TO " + s.table()
-                + " DO " + s.action() + " " + (s.commands().isEmpty() ? "NOTHING"
-                        : String.join("; ", s.commands())) + ";";
-        executor.database.addRuleDefinition(s.name(), s.table(), definition);
+        boolean instead = "INSTEAD".equals(s.action());
+        executor.database.addRuleDefinition(s.name(), s.table(),
+                ruleDefinitionText(s, instead), s.event(), instead);
         return QueryResult.message(QueryResult.Type.SET, "CREATE RULE");
+    }
+
+    /**
+     * A rule as {@code pg_get_ruledef} writes it: the header on its own line, the event indented
+     * under it, the relation schema-qualified, and ALSO left unwritten because it is the default.
+     * A qualification goes on a line of its own between the two.
+     */
+    private String ruleDefinitionText(CreateRuleStmt s, boolean instead) {
+        StringBuilder sb = new StringBuilder("CREATE RULE ").append(s.name()).append(" AS");
+        sb.append("\n    ON ").append(s.event()).append(" TO ")
+                .append(executor.defaultSchema()).append('.').append(s.table());
+        if (s.whereClause() != null) {
+            sb.append("\n   WHERE ").append(s.whereClause());
+        }
+        sb.append(" DO ").append(instead ? "INSTEAD " : " ");
+        sb.append(s.commands().isEmpty() ? "NOTHING" : String.join(";\n", s.commands()));
+        return sb.append(';').toString();
     }
 
     /**
