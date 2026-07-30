@@ -574,11 +574,28 @@ class SessionExecutor {
             executor.database.addPublication(new Database.PubDef(pubName, allTables, tables, schemaName));
             return QueryResult.command(QueryResult.Type.SET, 0);
         }
+        if (name.equals("alter_publication_rename")) {
+            String[] parts = stmt.value().split("\0", 2);
+            Database.PubDef pub = requirePublication(parts[0]);
+            if (!parts[0].equalsIgnoreCase(parts[1])
+                    && executor.database.getPublication(parts[1]) != null) {
+                throw new MemgresException(
+                        "publication \"" + parts[1] + "\" already exists", "42710");
+            }
+            executor.database.removePublication(parts[0]);
+            executor.database.addPublication(new Database.PubDef(parts[1], pub.allTables,
+                    pub.tables, pub.schemaName));
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
+        if (name.equals("alter_publication_noop")) {
+            requirePublication(stmt.value());
+            return QueryResult.command(QueryResult.Type.SET, 0);
+        }
         if (name.equals("alter_publication_add_table")) {
             String[] parts = stmt.value().split("\0", 2);
             String pubName = parts[0];
             String[] newTables = parts.length > 1 ? parts[1].split(",") : new String[0];
-            Database.PubDef pub = executor.database.getPublication(pubName);
+            Database.PubDef pub = requirePublication(pubName);
             if (pub != null) {
                 for (String t : newTables) {
                     if (!t.isEmpty()) pub.tables.add(t);
@@ -590,7 +607,7 @@ class SessionExecutor {
             String[] parts = stmt.value().split("\0", 2);
             String pubName = parts[0];
             String[] newTables = parts.length > 1 ? parts[1].split(",") : new String[0];
-            Database.PubDef pub = executor.database.getPublication(pubName);
+            Database.PubDef pub = requirePublication(pubName);
             if (pub != null) {
                 pub.tables.clear();
                 for (String t : newTables) {
@@ -603,7 +620,7 @@ class SessionExecutor {
             String[] parts = stmt.value().split("\0", 2);
             String pubName = parts[0];
             String[] dropTables = parts.length > 1 ? parts[1].split(",") : new String[0];
-            Database.PubDef pub = executor.database.getPublication(pubName);
+            Database.PubDef pub = requirePublication(pubName);
             if (pub != null) {
                 for (String t : dropTables) pub.tables.remove(t);
             }
@@ -673,6 +690,12 @@ class SessionExecutor {
         if (name.equals("alter_statistics_rename")) {
             String[] parts = stmt.value().split("\0", 2);
             ExtendedStatistic stat = requireStatistic(parts[0]);
+            // Renaming onto a name already taken would drop the object that holds it, so the
+            // collision has to be refused before anything is removed.
+            if (executor.database.getExtendedStatistic(parts[1]) != null) {
+                throw new MemgresException("statistics object \"" + parts[1]
+                        + "\" already exists in schema \"" + executor.defaultSchema() + "\"", "42710");
+            }
             executor.database.removeExtendedStatistic(parts[0]);
             stat.setName(parts[1]);
             executor.database.addExtendedStatistic(stat);
@@ -873,7 +896,8 @@ class SessionExecutor {
                 "create_user_mapping", "drop_user_mapping",
                 "create_foreign_table", "drop_foreign_table", "import_foreign_schema",
                 "create_publication", "alter_publication_add_table", "alter_publication_set_table",
-                "alter_publication_drop_table", "drop_publication",
+                "alter_publication_drop_table", "alter_publication_rename",
+                "alter_publication_noop", "drop_publication",
                 "create_subscription", "drop_subscription",
                 "create_ts_config", "create_ts_dict", "drop_ts_configuration", "drop_ts_dictionary",
                 "drop_ts_parser", "drop_ts_template", "alter_ts_config_mapping",
@@ -2523,6 +2547,19 @@ class SessionExecutor {
     private static final Set<String> STATISTICS_KINDS =
             Cols.setOf("ndistinct", "dependencies", "mcv");
 
+    /**
+     * An ALTER that names a publication nobody created is a mistake worth reporting: accepting it
+     * reads as "the change was applied", and the next thing to look at the catalog disagrees.
+     */
+    private Database.PubDef requirePublication(String pubName) {
+        Database.PubDef pub = executor.database.getPublication(pubName);
+        if (pub == null) {
+            throw new MemgresException(
+                    "publication \"" + pubName + "\" does not exist", "42704");
+        }
+        return pub;
+    }
+
     private ExtendedStatistic requireStatistic(String statName) {
         ExtendedStatistic stat = executor.database.getExtendedStatistic(statName);
         if (stat == null) {
@@ -2588,7 +2625,7 @@ class SessionExecutor {
     /** Collations PostgreSQL ships with, which exist without ever being created. */
     private static final Set<String> BUILTIN_COLLATIONS = Cols.setOf(
             "default", "c", "posix", "c.utf-8", "c.utf8", "en_us", "en_us.utf-8", "en_us.utf8",
-            "und-x-icu", "en-us-x-icu", "en-x-icu", "ucs_basic");
+            "und-x-icu", "en-us-x-icu", "en-x-icu", "ucs_basic", "unicode", "pg_c_utf8");
 
     /**
      * Conversions, tablespaces and procedural languages are accepted here without being

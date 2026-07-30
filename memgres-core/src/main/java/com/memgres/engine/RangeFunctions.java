@@ -80,17 +80,52 @@ class RangeFunctions {
         return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
+    /**
+     * {@code 42883} when a range constructor is handed a bound of a wider type than the range is
+     * built over. PostgreSQL declares {@code int4range(integer, integer)} and nothing else, and a
+     * bigint argument matches no candidate at all -- it does not quietly narrow. Reading one as an
+     * int instead is what let {@code int4range(1, 99999999999)} answer {@code [1,1215752191)}.
+     *
+     * <p>The rule fires only on the value classes that can only have come from a wider type: an
+     * argument the engine hands over as an Integer or a Short is left alone, so nothing that
+     * PostgreSQL resolves is refused here.
+     */
+    private static void rejectWiderBound(String rangeType, Object lo, Object hi) {
+        String loName = widerBoundTypeName(lo);
+        String hiName = widerBoundTypeName(hi);
+        if (loName == null && hiName == null) return;
+        throw new MemgresException("function " + rangeType + "("
+                + (loName != null ? loName : "integer") + ", "
+                + (hiName != null ? hiName : "integer") + ") does not exist"
+                + "\n  Hint: No function matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
+    }
+
+    /** The PG type name a bound value can only have come from, or null when int4 accepts it. */
+    private static String widerBoundTypeName(Object value) {
+        if (value instanceof Long) return "bigint";
+        if (value instanceof java.math.BigInteger
+                || value instanceof java.math.BigDecimal) return "numeric";
+        if (value instanceof Float) return "real";
+        if (value instanceof Double) return "double precision";
+        return null;
+    }
+
     Object eval(String name, FunctionCallExpr fn, RowContext ctx) {
         switch (name) {
-            case "int4range":
-            case "int8range": {
+            case "int4range": {
                 Object loObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object hiObj = executor.evalExpr(fn.args().get(1), ctx);
+                rejectWiderBound("int4range", loObj, hiObj);
                 String bounds = fn.args().size() > 2 ? executor.evalExpr(fn.args().get(2), ctx).toString() : "[)";
                 Integer lo = loObj == null ? null : executor.toInt(loObj);
                 Integer hi = hiObj == null ? null : executor.toInt(hiObj);
                 return RangeOperations.int4rangeNullable(lo, hi, bounds).toString();
             }
+            case "int8range":
+                // int8range holds bigint bounds; reading them as int wrapped 99999999999 round to
+                // 1215752191 and built a plausible-looking range over a bound nobody asked for.
+                return buildRange(name, fn, ctx);
             case "daterange":
             case "tsrange":
             case "tstzrange":

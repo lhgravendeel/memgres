@@ -627,12 +627,9 @@ public class Table {
     public void updateRowInPlace(Object[] row, Object[] oldValues, Object[] newValues) {
         writeLock.lock();
         try {
-            for (TableIndex idx : indexes.values()) {
-                idx.removeByOldValues(oldValues, row);
-            }
             System.arraycopy(newValues, 0, row, 0, row.length);
             for (TableIndex idx : indexes.values()) {
-                idx.put(row);
+                idx.moveEntry(row, oldValues);
             }
         } finally {
             writeLock.unlock();

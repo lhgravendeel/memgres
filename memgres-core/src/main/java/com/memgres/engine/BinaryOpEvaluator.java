@@ -866,6 +866,23 @@ class BinaryOpEvaluator {
             throw new MemgresException("operator does not exist: text -> integer", "42883");
         }
 
+        // A range beside anything that is not a range has no << or >> to resolve to. Naming the
+        // operands from what the query wrote down is what makes the error read as PostgreSQL's.
+        if (bin.op() == BinaryExpr.BinOp.SHIFT_LEFT || bin.op() == BinaryExpr.BinOp.SHIFT_RIGHT) {
+            // A range the query names as one counts whatever its value looks like: "empty" and
+            // the empty multirange "{}" are ranges that no text form gives away.
+            boolean lRange = isRangeTypeName(declaredOperandType(bin.left(), ctx))
+                    || isRangeText(left);
+            boolean rRange = isRangeTypeName(declaredOperandType(bin.right(), ctx))
+                    || isRangeText(right);
+            if (lRange != rRange) {
+                throw noSuchShiftOperator(
+                        operandTypeName(bin.left(), left, ctx),
+                        bin.op() == BinaryExpr.BinOp.SHIFT_LEFT,
+                        operandTypeName(bin.right(), right, ctx));
+            }
+        }
+
         // Operator type mismatch validation (before coercion)
         executor.validateOperatorTypes(bin.op(), left, right);
 
@@ -1062,6 +1079,7 @@ class BinaryOpEvaluator {
                 }
                 { Boolean rangeCmp = rangeShift(left, right, true);
                 if (rangeCmp != null) return rangeCmp; }
+                rejectRangeShiftMismatch(left, right, true);
                 { long r = executor.toLong(left) << executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
@@ -1086,6 +1104,7 @@ class BinaryOpEvaluator {
                 }
                 { Boolean rangeCmp = rangeShift(left, right, false);
                 if (rangeCmp != null) return rangeCmp; }
+                rejectRangeShiftMismatch(left, right, false);
                 { long r = executor.toLong(left) >> executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
@@ -2081,6 +2100,58 @@ class BinaryOpEvaluator {
 
     /** Shift a bit string left or right, filling with zeros. Preserves length. */
     /**
+     * {@code 42883} when only one side of {@code <<} or {@code >>} is a range. PostgreSQL declares
+     * the operator over a pair of ranges and nothing else, so a range beside an integer matches no
+     * candidate; reading the range's own text as a number instead threw a NumberFormatException
+     * that reached the client as an internal XX000.
+     */
+    private static void rejectRangeShiftMismatch(Object left, Object right, boolean leftward) {
+        boolean lBase = isRangeText(left);
+        boolean rBase = isRangeText(right);
+        // "empty" and "{}" only read as ranges beside one, so the other side decides them
+        boolean lRange = lBase || (rBase && isAmbiguousEmptyRange(left));
+        boolean rRange = rBase || (lBase && isAmbiguousEmptyRange(right));
+        if (lRange == rRange) return;
+        throw noSuchShiftOperator(AstExecutor.pgTypeNameOf(left), leftward,
+                AstExecutor.pgTypeNameOf(right));
+    }
+
+    /** The two empty spellings a range shares with an empty array and a plain word. */
+    private static boolean isAmbiguousEmptyRange(Object value) {
+        if (!(value instanceof String)) return false;
+        String s = ((String) value).trim();
+        return s.equals("{}") || s.equalsIgnoreCase("empty");
+    }
+
+    /** True when a declared type name is one of the range or multirange types. */
+    private static boolean isRangeTypeName(String declared) {
+        if (declared == null) return false;
+        String t = declared.toLowerCase().trim();
+        return RANGE_TYPES.contains(t) || RANGE_TYPES.contains(t.replace("multirange", "range"));
+    }
+
+    private static MemgresException noSuchShiftOperator(String lName, boolean leftward,
+                                                        String rName) {
+        return new MemgresException("operator does not exist: "
+                + lName + (leftward ? " << " : " >> ") + rName
+                + "\n  Hint: No operator matches the given name and argument types."
+                + " You might need to add explicit type casts.", "42883");
+    }
+
+    /** The type an operand was written as, falling back on the one its value carries. */
+    private String operandTypeName(Expression expr, Object value, RowContext ctx) {
+        String declared = declaredOperandType(expr, ctx);
+        return declared != null ? declared : AstExecutor.pgTypeNameOf(value);
+    }
+
+    /** True for a value spelled as a range or a multirange. */
+    private static boolean isRangeText(Object value) {
+        if (!(value instanceof String)) return false;
+        String s = ((String) value).trim();
+        return RangeOperations.isMultirangeString(s) || RangeOperations.isRangeString(s);
+    }
+
+    /**
      * Range and multirange "strictly left/right of". Both spellings arrive as text, so they are
      * recognised here before the operands fall through to integer bit-shifting.
      */
@@ -2384,6 +2455,7 @@ class BinaryOpEvaluator {
                 }
                 { Boolean rangeCmp = rangeShift(left, right, true);
                 if (rangeCmp != null) return rangeCmp; }
+                rejectRangeShiftMismatch(left, right, true);
                 { long r = executor.toLong(left) << executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }
@@ -2395,6 +2467,7 @@ class BinaryOpEvaluator {
                 }
                 { Boolean rangeCmp = rangeShift(left, right, false);
                 if (rangeCmp != null) return rangeCmp; }
+                rejectRangeShiftMismatch(left, right, false);
                 { long r = executor.toLong(left) >> executor.toLong(right);
                 return (left instanceof Long || right instanceof Long || r < Integer.MIN_VALUE || r > Integer.MAX_VALUE) ? r : (int) r; }
             }

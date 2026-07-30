@@ -795,10 +795,14 @@ class TextSearchCoverageTest {
         assertNotNull(result);
     }
 
+    /**
+     * ts_rank is strict: a null document has no rank rather than a rank of zero. Zero is a real
+     * answer meaning "matched nothing", so a caller ordering by rank cannot tell the two apart —
+     * PostgreSQL 18 answers NULL here, and this test used to pin the zero.
+     */
     @Test
     void testNullHandling() throws SQLException {
-        String result = query1("SELECT ts_rank(NULL, to_tsquery('cat'))");
-        assertEquals("0", result);
+        assertNull(query1("SELECT ts_rank(NULL, to_tsquery('cat'))"));
     }
 
     @Test

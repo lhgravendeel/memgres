@@ -118,24 +118,35 @@ class DeferredConstraintTest {
     }
 
     // ========================================================================
-    // CHECK DEFERRABLE INITIALLY DEFERRED
+    // CHECK constraints cannot be deferred at all
     // ========================================================================
 
+    /**
+     * A CHECK is evaluated by the row that writes it, so PostgreSQL refuses to mark one
+     * DEFERRABLE rather than accepting an attribute it would then ignore. These two tests
+     * used to declare such a constraint and assert that the check waited for COMMIT; both
+     * statements are refused by PostgreSQL 18 with 0A000, so what they asserted could never
+     * be reached there.
+     */
     @Test
-    void check_deferred_allows_temporary_violation() throws SQLException {
-        exec("CREATE TABLE t1(id int PRIMARY KEY, val int, " +
-             "CONSTRAINT chk_positive CHECK (val > 0) DEFERRABLE INITIALLY DEFERRED)");
-        exec("INSERT INTO t1 VALUES (1, -5)"); // violates check, but deferred
-        exec("UPDATE t1 SET val = 10 WHERE id = 1"); // fix before commit
-        conn.commit(); // Should succeed — constraint satisfied at commit time
+    void check_cannot_be_declared_deferrable() {
+        SQLException e = assertThrows(SQLException.class, () ->
+                exec("CREATE TABLE t1(id int PRIMARY KEY, val int, " +
+                     "CONSTRAINT chk_positive CHECK (val > 0) DEFERRABLE INITIALLY DEFERRED)"));
+        assertEquals("0A000", e.getSQLState());
+        assertTrue(e.getMessage().contains("CHECK constraints cannot be marked DEFERRABLE"),
+                e.getMessage());
     }
 
     @Test
-    void check_deferred_fails_at_commit_with_violation() throws SQLException {
+    void check_is_accepted_when_it_says_it_is_not_deferrable() throws SQLException {
         exec("CREATE TABLE t1(id int PRIMARY KEY, val int, " +
-             "CONSTRAINT chk_positive CHECK (val > 0) DEFERRABLE INITIALLY DEFERRED)");
-        exec("INSERT INTO t1 VALUES (1, -5)"); // violates check
-        assertThrows(SQLException.class, () -> conn.commit());
+             "CONSTRAINT chk_positive CHECK (val > 0) NOT DEFERRABLE INITIALLY IMMEDIATE)");
+        conn.commit();
+        assertThrows(SQLException.class, () -> exec("INSERT INTO t1 VALUES (1, -5)"));
+        conn.rollback();
+        exec("INSERT INTO t1 VALUES (1, 5)");
+        conn.commit();
     }
 
     // ========================================================================

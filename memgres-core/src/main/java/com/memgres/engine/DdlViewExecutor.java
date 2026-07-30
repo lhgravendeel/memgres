@@ -468,6 +468,9 @@ class DdlViewExecutor {
             Database.ViewDef existing = executor.database.getView(stmt.name());
             if (existing == null) {
                 if (stmt.ifExists()) return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+                // A table or a sequence of that name is a wrong-kind complaint, not a missing one.
+                RelationNamespace.requireKind(executor.database, executor.defaultSchema(),
+                        stmt.name(), RelationNamespace.VIEW);
                 throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
             }
             if (executor.database.hasView(stmt.newName())) {

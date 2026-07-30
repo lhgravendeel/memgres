@@ -11,6 +11,10 @@ package com.memgres.engine;
  */
 final class JsonTextValidator {
 
+    /** What PostgreSQL says under a \\u that is not followed by four hexadecimal digits. */
+    private static final String BAD_UNICODE_ESCAPE =
+            "\"\\u\" must be followed by four hexadecimal digits.";
+
     private final String text;
     private int pos;
     private int depth;
@@ -31,6 +35,17 @@ final class JsonTextValidator {
 
     private static MemgresException invalid() {
         return new MemgresException("invalid input syntax for type json", "22P02");
+    }
+
+    /**
+     * The same error carrying the DETAIL line PostgreSQL writes under it. The primary message is
+     * the same for every way a document can be malformed, so the detail is the only part that
+     * says which one it was.
+     */
+    private static MemgresException invalid(String detail) {
+        MemgresException e = invalid();
+        e.setDetail(detail);
+        return e;
     }
 
     private void readValue() {
@@ -97,14 +112,16 @@ final class JsonTextValidator {
                 char esc = text.charAt(pos++);
                 if ("\"\\/bfnrt".indexOf(esc) >= 0) continue;
                 if (esc == 'u') {
-                    if (pos + 4 > text.length()) throw invalid();
+                    if (pos + 4 > text.length()) throw invalid(BAD_UNICODE_ESCAPE);
                     for (int i = 0; i < 4; i++) {
-                        if (Character.digit(text.charAt(pos + i), 16) < 0) throw invalid();
+                        if (Character.digit(text.charAt(pos + i), 16) < 0) {
+                            throw invalid(BAD_UNICODE_ESCAPE);
+                        }
                     }
                     pos += 4;
                     continue;
                 }
-                throw invalid();
+                throw invalid("Escape sequence \"\\" + esc + "\" is invalid.");
             }
             if (c < 0x20) throw invalid();  // a raw control character is not allowed in a string
         }

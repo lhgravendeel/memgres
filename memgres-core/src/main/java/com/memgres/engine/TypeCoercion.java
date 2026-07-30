@@ -597,6 +597,16 @@ public final class TypeCoercion {
         if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
         if (val instanceof RegtypeValue) return ((RegtypeValue) val).oid();
         if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
+        // PG 18 casts bytea to integer by reading the bytes as the integer's own big-endian
+        // representation. Without this the byte array fell through to the text path and the
+        // client was shown a Java array identity — "[B@5a688f2e" — as if it were its input.
+        if (val instanceof byte[]) {
+            byte[] b = (byte[]) val;
+            if (b.length != 4) {
+                throw new MemgresException("smallint or bigint or integer expected", "22P03");
+            }
+            return ((b[0] & 0xff) << 24) | ((b[1] & 0xff) << 16) | ((b[2] & 0xff) << 8) | (b[3] & 0xff);
+        }
         if (val instanceof java.math.BigDecimal) {
             java.math.BigDecimal bd = (java.math.BigDecimal) val;
             long lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
@@ -1310,6 +1320,8 @@ public final class TypeCoercion {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).toLocalDate();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).atZoneSameInstant(sessionZone()).toLocalDate();
         String s = val.toString().trim();
+        LocalDateTime calendar = parseCalendarLiteral(s, val.toString(), "date", DATE_MAX_YEAR);
+        if (calendar != null) return calendar.toLocalDate();
         if (endsWithEra(s)) {
             LocalDate bc = toLocalDate(stripEra(s));
             return bc.withYear(1 - bc.getYear());
@@ -1399,9 +1411,107 @@ public final class TypeCoercion {
     private static final java.util.regex.Pattern WIDE_YEAR =
             java.util.regex.Pattern.compile("^(\\d{5,})-(\\d{1,2})-(\\d{1,2})$");
 
+    /**
+     * The same wide year, with the time of day a timestamp literal may carry. A timestamp holds
+     * years up to 294276, so its widest legal spellings run past what the ISO parsers will read
+     * and have to be taken apart by hand rather than reported as malformed.
+     */
+    private static final java.util.regex.Pattern WIDE_YEAR_TIMESTAMP =
+            java.util.regex.Pattern.compile(
+                    "^(\\d{5,})-(\\d{1,2})-(\\d{1,2})(?:[ T](\\d{1,2}):(\\d{1,2})(?::(\\d{1,2}(?:\\.\\d+)?))?)?$");
+
     /** The last year date can hold, and the last one timestamp can. */
     private static final long DATE_MAX_YEAR = 5874897L;
     private static final long TIMESTAMP_MAX_YEAR = 294276L;
+
+    /**
+     * A plain calendar date, optionally with a wall-clock time and a BC era marker, and nothing
+     * else: no zone, no offset, no month name. Only a literal of exactly this shape is read by
+     * {@link #parseCalendarLiteral}, so everything else keeps the parsing it already had.
+     */
+    private static final java.util.regex.Pattern CALENDAR_LITERAL =
+            java.util.regex.Pattern.compile(
+                    "^(\\d{4,7})-(\\d{1,2})-(\\d{1,2})"
+                            + "(?:[ T](\\d{1,2}):(\\d{1,2})(?::(\\d{1,2})(\\.\\d+)?)?)?"
+                            + "(?:\\s+(?i:BC))?$");
+
+    /** The first moment either date or timestamp can hold: 4714-11-24 BC, Julian day zero. */
+    private static final LocalDate CALENDAR_MIN = LocalDate.of(-4713, 11, 24);
+
+    /** A calendar literal with a numeric UTC offset written after it. */
+    private static final java.util.regex.Pattern TRAILING_OFFSET =
+            java.util.regex.Pattern.compile("^(.*?)\\s*([+-]\\d{1,2}(?::?\\d{2})?)$");
+
+    /**
+     * Read a literal of the plain calendar shape, raising PostgreSQL's own errors for a field or a
+     * year the type cannot hold, or null when the text is not of that shape at all.
+     *
+     * <p>Three things separate this from letting {@code LocalDateTime.parse} try: PostgreSQL names
+     * a year outside the type's span {@code "<type> out of range"} and a bad month, day or clock
+     * field {@code "date/time field value out of range"}, where the ISO parsers can only say the
+     * spelling was wrong; it has no year zero; and it reads {@code 24:00:00} and a {@code :60}
+     * second as the next day and the next minute rather than refusing them.
+     *
+     * @param outOfRangeNoun what PostgreSQL calls the type in its "out of range" message
+     * @param maxYear the last year that type can hold
+     */
+    private static LocalDateTime parseCalendarLiteral(String s, String original,
+                                                      String outOfRangeNoun, long maxYear) {
+        java.util.regex.Matcher m = CALENDAR_LITERAL.matcher(s);
+        if (!m.matches()) return null;
+        boolean bc = s.toUpperCase().endsWith(" BC");
+        long written = Long.parseLong(m.group(1));
+        // A BC year is a proleptic one of 1 - the written year, so 1 BC is year 0 and 4714 BC
+        // is -4713. Year zero is not a year at all in either era.
+        if (written == 0) throw fieldOutOfRange(original);
+        long year = bc ? 1 - written : written;
+        int month = Integer.parseInt(m.group(2));
+        int day = Integer.parseInt(m.group(3));
+        int hour = m.group(4) == null ? 0 : Integer.parseInt(m.group(4));
+        int minute = m.group(5) == null ? 0 : Integer.parseInt(m.group(5));
+        int second = m.group(6) == null ? 0 : Integer.parseInt(m.group(6));
+        long nanos = m.group(7) == null ? 0
+                : new java.math.BigDecimal(m.group(7)).movePointRight(9).longValue();
+        if (year > maxYear) throw outOfRange(outOfRangeNoun, original);
+        if (month < 1 || month > 12) throw fieldOutOfRange(original);
+        LocalDate date;
+        try {
+            date = LocalDate.of((int) year, month, 1);
+        } catch (RuntimeException e) {
+            throw outOfRange(outOfRangeNoun, original);
+        }
+        if (day < 1 || day > date.lengthOfMonth()) throw fieldOutOfRange(original);
+        // PG reads 24:00:00 as the following midnight and a 60th second as the next minute, but
+        // only when nothing finer is written past them.
+        if (hour > 24 || (hour == 24 && (minute != 0 || second != 0 || nanos != 0))) {
+            throw fieldOutOfRange(original);
+        }
+        if (minute > 59 || second > 60 || (second == 60 && nanos != 0)) throw fieldOutOfRange(original);
+        LocalDateTime result = date.withDayOfMonth(day).atStartOfDay()
+                .plusHours(hour).plusMinutes(minute).plusSeconds(second).plusNanos(nanos);
+        if (result.toLocalDate().isBefore(CALENDAR_MIN) || result.getYear() > maxYear) {
+            throw outOfRange(outOfRangeNoun, original);
+        }
+        return result;
+    }
+
+    /** The moment a timestamptz names has to fall inside the type's span read in UTC. */
+    private static OffsetDateTime checkInstantRange(OffsetDateTime moment, String original) {
+        OffsetDateTime utc = moment.withOffsetSameInstant(ZoneOffset.UTC);
+        if (utc.getYear() > TIMESTAMP_MAX_YEAR || utc.toLocalDate().isBefore(CALENDAR_MIN)) {
+            throw outOfRange("timestamp", original);
+        }
+        return moment;
+    }
+
+    private static MemgresException fieldOutOfRange(String original) {
+        return new MemgresException(
+                "date/time field value out of range: \"" + original + "\"", "22008");
+    }
+
+    private static MemgresException outOfRange(String noun, String original) {
+        return new MemgresException(noun + " out of range: \"" + original + "\"", "22008");
+    }
 
     public static LocalTime toLocalTime(Object val) {
         if (val instanceof LocalTime) return ((LocalTime) val);
@@ -1684,6 +1794,9 @@ public final class TypeCoercion {
         if (val instanceof LocalDate) return ((LocalDate) val).atStartOfDay();
         if (val instanceof OffsetDateTime) return ((OffsetDateTime) val).atZoneSameInstant(sessionZone()).toLocalDateTime();
         String s = val.toString().trim();
+        LocalDateTime calendar = parseCalendarLiteral(s, val.toString(), "timestamp",
+                TIMESTAMP_MAX_YEAR);
+        if (calendar != null) return calendar;
         // A BC era suffix means a proleptic year of 1 - the written year: 44 BC is ISO year -43
         if (endsWithEra(s)) {
             String body = stripEra(s);
@@ -1728,15 +1841,27 @@ public final class TypeCoercion {
         }
         // A timestamp holds years up to 294276; past that it is the range that fails rather than
         // the spelling, and PG says so with its own message
-        java.util.regex.Matcher wideTs = WIDE_YEAR.matcher(val.toString().trim());
+        java.util.regex.Matcher wideTs = WIDE_YEAR_TIMESTAMP.matcher(val.toString().trim());
         if (wideTs.matches()) {
             long year = Long.parseLong(wideTs.group(1));
             if (year > TIMESTAMP_MAX_YEAR) {
                 throw new MemgresException("timestamp out of range: \"" + val + "\"", "22008");
             }
             try {
-                return LocalDate.of((int) year, Integer.parseInt(wideTs.group(2)),
-                        Integer.parseInt(wideTs.group(3))).atStartOfDay();
+                LocalDate day = LocalDate.of((int) year, Integer.parseInt(wideTs.group(2)),
+                        Integer.parseInt(wideTs.group(3)));
+                if (wideTs.group(4) == null) return day.atStartOfDay();
+                int hour = Integer.parseInt(wideTs.group(4));
+                int minute = Integer.parseInt(wideTs.group(5));
+                int second = 0;
+                int nano = 0;
+                if (wideTs.group(6) != null) {
+                    java.math.BigDecimal secs = new java.math.BigDecimal(wideTs.group(6));
+                    second = secs.intValue();
+                    nano = secs.subtract(new java.math.BigDecimal(second))
+                            .movePointRight(9).setScale(0, java.math.RoundingMode.HALF_UP).intValue();
+                }
+                return LocalDateTime.of(day, LocalTime.of(hour, minute, second, nano));
             } catch (RuntimeException e) {
                 throw new MemgresException(
                         "date/time field value out of range: \"" + val + "\"", "22008");
@@ -1762,6 +1887,31 @@ public final class TypeCoercion {
         if (val instanceof LocalDateTime) return ((LocalDateTime) val).atZone(zone).toOffsetDateTime();
         if (val instanceof LocalDate) return ((LocalDate) val).atStartOfDay(zone).toOffsetDateTime();
         String s = val.toString().trim();
+        // A zoneless literal is a wall clock reading east or west of UTC, so its own year may run
+        // one past the type's last: what has to fit is the moment it names, which is why
+        // '294277-01-01 00:00:00' is a timestamptz at +01 and not at +00.
+        LocalDateTime calendar = parseCalendarLiteral(s, val.toString(), "timestamp",
+                TIMESTAMP_MAX_YEAR + 1);
+        if (calendar != null) {
+            return checkInstantRange(calendar.atZone(zone).toOffsetDateTime(), val.toString());
+        }
+        // The same reading with an offset written after it: the calendar part is checked exactly
+        // as above and the offset put on unchanged. Only a literal that already names a time of
+        // day is split here -- after a bare date a trailing "-05" is another date field, not an
+        // offset, and DATE_ONLY_OFFSET below is what knows that rule.
+        java.util.regex.Matcher off = TRAILING_OFFSET.matcher(s);
+        if (off.matches() && off.group(1).indexOf(':') >= 0) {
+            LocalDateTime zoned = parseCalendarLiteral(off.group(1), val.toString(), "timestamp",
+                    TIMESTAMP_MAX_YEAR + 1);
+            if (zoned != null) {
+                try {
+                    return checkInstantRange(zoned.atOffset(ZoneOffset.of(off.group(2))),
+                            val.toString());
+                } catch (java.time.DateTimeException ignore) {
+                    /* not an offset after all — fall through to the parsers below */
+                }
+            }
+        }
         // Handle special keywords
         if (s.equalsIgnoreCase("epoch")) return OffsetDateTime.of(1970, 1, 1, 0, 0, 0, 0, ZoneOffset.UTC);
         if (s.equalsIgnoreCase("now")) return OffsetDateTime.now(zone);
@@ -1876,6 +2026,12 @@ public final class TypeCoercion {
 
     public static byte[] toBytea(Object val) {
         if (val instanceof byte[]) return (byte[]) val;
+        // The other half of PG 18's integer/bytea pair: the bytes are the integer's big-endian
+        // representation, two, four or eight of them by its width. These arrived here as null
+        // before, so nothing that worked depended on the old answer.
+        if (val instanceof Short) return bigEndian(((Short) val).longValue(), 2);
+        if (val instanceof Integer) return bigEndian(((Integer) val).longValue(), 4);
+        if (val instanceof Long) return bigEndian((Long) val, 8);
         if (val instanceof String) {
             String s = (String) val;
             // PG hex format: \xDEADBEEF or \\xDEADBEEF
@@ -1892,6 +2048,16 @@ public final class TypeCoercion {
             return s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         }
         return null;
+    }
+
+    /** An integer's PostgreSQL on-the-wire bytes: most significant first, fixed width. */
+    private static byte[] bigEndian(long v, int width) {
+        byte[] out = new byte[width];
+        for (int i = width - 1; i >= 0; i--) {
+            out[i] = (byte) (v & 0xff);
+            v >>= 8;
+        }
+        return out;
     }
 
     private static Object toUUID(Object val) {

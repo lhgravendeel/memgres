@@ -290,14 +290,10 @@ class DdlTableParser {
                 pkName = pendingName;
                 pendingName = null;
                 // A column-level key may say when it is checked, just as a table-level one can.
-                if (parser.matchKeyword("DEFERRABLE")) {
-                    deferrable = true;
-                    if (parser.matchKeyword("INITIALLY")) {
-                        if (parser.matchKeyword("DEFERRED")) initiallyDeferred = true;
-                        else parser.matchKeyword("IMMEDIATE");
-                    }
-                } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
-                    parser.advance(); parser.advance();
+                Deferrability pkDef = parseDeferrability();
+                if (pkDef.firstClause != null) {
+                    deferrable = pkDef.deferrable;
+                    initiallyDeferred = pkDef.initiallyDeferred;
                 }
                 continue;
             }
@@ -317,14 +313,10 @@ class DdlTableParser {
                         parser.matchKeyword("DISTINCT");
                     }
                 }
-                if (parser.matchKeyword("DEFERRABLE")) {
-                    deferrable = true;
-                    if (parser.matchKeyword("INITIALLY")) {
-                        if (parser.matchKeyword("DEFERRED")) initiallyDeferred = true;
-                        else parser.matchKeyword("IMMEDIATE");
-                    }
-                } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
-                    parser.advance(); parser.advance();
+                Deferrability uqDef = parseDeferrability();
+                if (uqDef.firstClause != null) {
+                    deferrable = uqDef.deferrable;
+                    initiallyDeferred = uqDef.initiallyDeferred;
                 }
                 continue;
             }
@@ -354,14 +346,10 @@ class DdlTableParser {
                         refOnUpdate = parseReferentialAction(false);
                     }
                 }
-                if (parser.matchKeyword("DEFERRABLE")) {
-                    deferrable = true;
-                    if (parser.matchKeyword("INITIALLY")) {
-                        if (parser.matchKeyword("DEFERRED")) initiallyDeferred = true;
-                        else parser.matchKeyword("IMMEDIATE");
-                    }
-                } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
-                    parser.advance(); parser.advance();
+                Deferrability fkDef = parseDeferrability();
+                if (fkDef.firstClause != null) {
+                    deferrable = fkDef.deferrable;
+                    initiallyDeferred = fkDef.initiallyDeferred;
                 }
                 if (parseNotEnforced()) colNotEnforced = true;
                 continue;
@@ -371,6 +359,7 @@ class DdlTableParser {
                 Expression checkExpr = parser.parseExpression();
                 parser.expect(TokenType.RIGHT_PAREN);
                 boolean colChkNoInherit = parser.matchKeywords("NO", "INHERIT");
+                rejectColumnCheckDeferrability(parseDeferrability());
                 boolean checkNotEnforced = parseNotEnforced();
                 columnCheckExpr = checkExpr;
                 // A check the statement named is stored on the table rather than on the column,
@@ -502,6 +491,57 @@ class DdlTableParser {
         return true;
     }
 
+    /**
+     * Whether the key list starting at the open paren carries a {@code WITHOUT OVERLAPS} element.
+     * Looked at before parsing so an ordinary key list — which may hold expressions a temporal key
+     * never does — keeps going down the path that already reads it.
+     */
+    private boolean withoutOverlapsAheadInParens() {
+        int depth = 0;
+        for (int i = parser.pos; i < parser.tokens.size(); i++) {
+            TokenType t = parser.tokens.get(i).type();
+            if (t == TokenType.LEFT_PAREN) depth++;
+            else if (t == TokenType.RIGHT_PAREN) {
+                if (depth == 0) return false;
+                depth--;
+            } else if (depth == 0 && "WITHOUT".equalsIgnoreCase(parser.tokens.get(i).value())
+                    && i + 1 < parser.tokens.size()
+                    && "OVERLAPS".equalsIgnoreCase(parser.tokens.get(i + 1).value())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Read {@code (a, b, period WITHOUT OVERLAPS)} — without the closing paren — as the exclusion
+     * constraint it means: the scalar columns compared for equality, the period for overlap.
+     */
+    private TableConstraint parseWithoutOverlapsKey(String constraintName) {
+        List<String> cols = new ArrayList<String>();
+        String withoutOverlapsCol = null;
+        do {
+            String c = parser.readIdentifier();
+            if (matchWithoutOverlaps()) {
+                withoutOverlapsCol = c;
+            } else {
+                cols.add(c);
+            }
+        } while (parser.match(TokenType.COMMA));
+        List<TableConstraint.ExcludeElement> elems = new ArrayList<TableConstraint.ExcludeElement>();
+        for (String c : cols) {
+            elems.add(new TableConstraint.ExcludeElement(c, "="));
+        }
+        elems.add(new TableConstraint.ExcludeElement(withoutOverlapsCol, "&&"));
+        List<String> allCols = new ArrayList<String>(cols);
+        allCols.add(withoutOverlapsCol);
+        TableConstraint temporal = new TableConstraint(constraintName,
+                TableConstraint.ConstraintType.EXCLUDE,
+                allCols, null, null, null, null, null, false, false, false, false, elems);
+        temporal.setExcludeMethod("gist");
+        return temporal;
+    }
+
     TableConstraint parseTableConstraint() {
         String constraintName = null;
         if (parser.matchKeyword("CONSTRAINT")) {
@@ -522,44 +562,20 @@ class DdlTableParser {
                         Cols.listOf("__using_index__:" + indexName), null, null, null, null, null);
             }
             parser.expect(TokenType.LEFT_PAREN);
-            List<String> cols = new ArrayList<String>();
-            String withoutOverlapsCol = null;
-            do {
-                String c = parser.readIdentifier();
-                // PRIMARY KEY (id, valid WITHOUT OVERLAPS): the key is unique per period rather
-                // than outright, which is an exclusion constraint by another name.
-                if (matchWithoutOverlaps()) {
-                    withoutOverlapsCol = c;
-                } else {
-                    cols.add(c);
-                }
-            } while (parser.match(TokenType.COMMA));
-            parser.expect(TokenType.RIGHT_PAREN);
-            if (withoutOverlapsCol != null) {
-                List<TableConstraint.ExcludeElement> elems = new ArrayList<TableConstraint.ExcludeElement>();
-                for (String c : cols) {
-                    elems.add(new TableConstraint.ExcludeElement(c, "="));
-                }
-                elems.add(new TableConstraint.ExcludeElement(withoutOverlapsCol, "&&"));
-                List<String> allCols = new ArrayList<String>(cols);
-                allCols.add(withoutOverlapsCol);
-                TableConstraint temporal = new TableConstraint(
-                        constraintName != null ? constraintName : null,
-                        TableConstraint.ConstraintType.EXCLUDE,
-                        allCols, null, null, null, null, null, false, false, false, false, elems);
-                temporal.setExcludeMethod("gist");
+            // PRIMARY KEY (id, valid WITHOUT OVERLAPS): the key is unique per period rather
+            // than outright, which is an exclusion constraint by another name.
+            if (withoutOverlapsAheadInParens()) {
+                TableConstraint temporal = parseWithoutOverlapsKey(constraintName);
+                parser.expect(TokenType.RIGHT_PAREN);
                 return temporal;
             }
-            boolean pkDeferrable = false, pkInitiallyDeferred = false;
-            if (parser.matchKeyword("DEFERRABLE")) {
-                pkDeferrable = true;
-                if (parser.matchKeyword("INITIALLY")) {
-                    if (parser.matchKeyword("DEFERRED")) pkInitiallyDeferred = true;
-                    else parser.matchKeyword("IMMEDIATE");
-                }
-            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
-                parser.advance(); parser.advance();
-            }
+            List<String> cols = new ArrayList<String>();
+            do {
+                cols.add(parser.readIdentifier());
+            } while (parser.match(TokenType.COMMA));
+            parser.expect(TokenType.RIGHT_PAREN);
+            Deferrability pkDef = parseDeferrability();
+            boolean pkDeferrable = pkDef.deferrable, pkInitiallyDeferred = pkDef.initiallyDeferred;
             if (parseNotEnforced()) {
                 throw new MemgresException("PRIMARY KEY constraints cannot be marked NOT ENFORCED", "0A000");
             }
@@ -582,18 +598,24 @@ class DdlTableParser {
                 }
             }
             parser.expect(TokenType.LEFT_PAREN);
+            // UNIQUE (id, valid_at WITHOUT OVERLAPS) is the same temporal key as the PRIMARY KEY
+            // spelling: unique per period rather than outright, which is an exclusion constraint
+            // by another name.
+            if (withoutOverlapsAheadInParens()) {
+                TableConstraint temporal = parseWithoutOverlapsKey(constraintName);
+                parser.expect(TokenType.RIGHT_PAREN);
+                // The constraint this becomes carries no deferrability of its own, but the
+                // clauses are still ordinary SQL after the key and have to be read off.
+                parseDeferrability();
+                if (parseNotEnforced()) {
+                    throw new MemgresException("UNIQUE constraints cannot be marked NOT ENFORCED", "0A000");
+                }
+                return temporal;
+            }
             List<String> cols = parser.parseColumnOrExpressionList();
             parser.expect(TokenType.RIGHT_PAREN);
-            boolean uqDeferrable = false, uqInitiallyDeferred = false;
-            if (parser.matchKeyword("DEFERRABLE")) {
-                uqDeferrable = true;
-                if (parser.matchKeyword("INITIALLY")) {
-                    if (parser.matchKeyword("DEFERRED")) uqInitiallyDeferred = true;
-                    else parser.matchKeyword("IMMEDIATE");
-                }
-            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
-                parser.advance(); parser.advance();
-            }
+            Deferrability uqDef = parseDeferrability();
+            boolean uqDeferrable = uqDef.deferrable, uqInitiallyDeferred = uqDef.initiallyDeferred;
             if (parseNotEnforced()) {
                 throw new MemgresException("UNIQUE constraints cannot be marked NOT ENFORCED", "0A000");
             }
@@ -606,19 +628,10 @@ class DdlTableParser {
             Expression checkExpr = parser.parseExpression();
             parser.expect(TokenType.RIGHT_PAREN);
             boolean chkNoInherit = parser.matchKeywords("NO", "INHERIT");
-            boolean chkDeferrable = false, chkInitiallyDeferred = false;
-            if (parser.matchKeyword("DEFERRABLE")) {
-                chkDeferrable = true;
-                if (parser.matchKeyword("INITIALLY")) {
-                    if (parser.matchKeyword("DEFERRED")) chkInitiallyDeferred = true;
-                    else parser.matchKeyword("IMMEDIATE");
-                }
-            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
-                parser.advance(); parser.advance();
-            }
+            rejectDeferrableCheck(parseDeferrability());
             boolean checkNotEnforced = parseNotEnforced();
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.CHECK,
-                    null, checkExpr, null, null, null, null, false, chkDeferrable, chkInitiallyDeferred, checkNotEnforced, chkNoInherit, null, null);
+                    null, checkExpr, null, null, null, null, false, false, false, checkNotEnforced, chkNoInherit, null, null);
         }
 
         if (parser.matchKeywords("FOREIGN", "KEY")) {
@@ -646,17 +659,9 @@ class DdlTableParser {
                 if (parser.matchKeyword("DELETE")) onDelete = parseReferentialAction(true);
                 else if (parser.matchKeyword("UPDATE")) onUpdate = parseReferentialAction(false);
             }
-            boolean fkDeferrable = false;
-            boolean fkInitiallyDeferred = false;
-            if (parser.matchKeyword("DEFERRABLE")) {
-                fkDeferrable = true;
-                if (parser.matchKeyword("INITIALLY")) {
-                    if (parser.matchKeyword("DEFERRED")) fkInitiallyDeferred = true;
-                    else parser.matchKeyword("IMMEDIATE");
-                }
-            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
-                parser.advance(); parser.advance();
-            }
+            Deferrability fkDef = parseDeferrability();
+            boolean fkDeferrable = fkDef.deferrable;
+            boolean fkInitiallyDeferred = fkDef.initiallyDeferred;
             boolean fkNotEnforced = parseNotEnforced();
             return new TableConstraint(constraintName, TableConstraint.ConstraintType.FOREIGN_KEY,
                     cols, null, refTable, refCols, onDelete, onUpdate, false, fkDeferrable, fkInitiallyDeferred, fkNotEnforced, fkMatchType, null);
@@ -700,16 +705,8 @@ class DdlTableParser {
                 parser.advance();
                 consumeUntilParen(parser);
             }
-            boolean exDeferrable = false, exInitiallyDeferred = false;
-            if (parser.matchKeyword("DEFERRABLE")) {
-                exDeferrable = true;
-                if (parser.matchKeyword("INITIALLY")) {
-                    if (parser.matchKeyword("DEFERRED")) exInitiallyDeferred = true;
-                    else parser.matchKeyword("IMMEDIATE");
-                }
-            } else if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
-                parser.advance(); parser.advance();
-            }
+            Deferrability exDef = parseDeferrability();
+            boolean exDeferrable = exDef.deferrable, exInitiallyDeferred = exDef.initiallyDeferred;
             boolean exNotEnforced = parseNotEnforced();
             if (exNotEnforced) {
                 throw new com.memgres.engine.MemgresException(
@@ -768,6 +765,82 @@ class DdlTableParser {
         }
         parser.expect(TokenType.RIGHT_PAREN);
         return colList.toString();
+    }
+
+    /** When a constraint is checked: DEFERRABLE and INITIALLY, resolved together. */
+    static final class Deferrability {
+        boolean deferrable;
+        boolean initiallyDeferred;
+        /** The first clause as it was written, for the error a misplaced one raises. */
+        String firstClause;
+
+        void saw(String clause) {
+            if (firstClause == null) firstClause = clause;
+        }
+    }
+
+    /**
+     * Read the constraint attributes that say when a constraint is checked. PostgreSQL takes
+     * {@code DEFERRABLE}, {@code NOT DEFERRABLE}, {@code INITIALLY DEFERRED} and
+     * {@code INITIALLY IMMEDIATE} as independent clauses in any order and any combination, so
+     * {@code NOT DEFERRABLE INITIALLY IMMEDIATE} and a bare {@code INITIALLY DEFERRED} are both
+     * ordinary SQL; the latter carries DEFERRABLE with it. Reads nothing when none is present.
+     */
+    private Deferrability parseDeferrability() {
+        Deferrability d = new Deferrability();
+        while (true) {
+            if (parser.checkKeyword("NOT") && parser.checkKeywordAt(1, "DEFERRABLE")) {
+                parser.advance();
+                parser.advance();
+                d.deferrable = false;
+                d.initiallyDeferred = false;
+                d.saw("NOT DEFERRABLE");
+                continue;
+            }
+            if (parser.matchKeyword("DEFERRABLE")) {
+                d.deferrable = true;
+                d.saw("DEFERRABLE");
+                continue;
+            }
+            if (parser.checkKeyword("INITIALLY")
+                    && (parser.checkKeywordAt(1, "DEFERRED") || parser.checkKeywordAt(1, "IMMEDIATE"))) {
+                parser.advance();
+                if (parser.matchKeyword("DEFERRED")) {
+                    d.initiallyDeferred = true;
+                    d.deferrable = true;
+                    d.saw("INITIALLY DEFERRED");
+                } else {
+                    parser.advance();
+                    d.initiallyDeferred = false;
+                    d.saw("INITIALLY IMMEDIATE");
+                }
+                continue;
+            }
+            return d;
+        }
+    }
+
+    /**
+     * A CHECK constraint is evaluated by the row that writes it and nothing later can make it
+     * true, so PostgreSQL refuses to mark one DEFERRABLE rather than accepting an attribute it
+     * would then ignore. {@code NOT DEFERRABLE} and {@code INITIALLY IMMEDIATE} say what a CHECK
+     * already is and are accepted.
+     */
+    private void rejectDeferrableCheck(Deferrability d) {
+        if (d.deferrable) {
+            throw new MemgresException("CHECK constraints cannot be marked DEFERRABLE", "0A000");
+        }
+    }
+
+    /**
+     * On a column, the deferrability clauses belong to a key or a reference; written after a
+     * CHECK there is nothing for them to attach to, and PostgreSQL says so by name — including
+     * for {@code NOT DEFERRABLE}, which a table-level CHECK accepts.
+     */
+    private void rejectColumnCheckDeferrability(Deferrability d) {
+        if (d.firstClause != null) {
+            throw new MemgresException("misplaced " + d.firstClause + " clause", "42601");
+        }
     }
 
     /** Parse optional [NOT] ENFORCED clause (PG 18). Returns true if NOT ENFORCED. */

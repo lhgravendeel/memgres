@@ -2238,9 +2238,36 @@ class DmlExecutor {
         return withCteScope(stmt.withClauses(), () -> executeMergeInner(stmt));
     }
 
+    /** PostgreSQL's wording for a WHEN clause that follows an unconditional one; it carries no position. */
+    private static MemgresException unreachableWhenClause() {
+        return new MemgresException(
+                "unreachable WHEN clause specified after unconditional WHEN clause", "42601")
+                .suppressPosition();
+    }
+
+    /**
+     * The verb PostgreSQL blames when a MERGE names a view it cannot write through: the action of
+     * the first WHEN clause, which for a single-arm MERGE is the only action it would perform.
+     */
+    private static String mergeViewDmlVerb(MergeStmt stmt) {
+        for (MergeStmt.WhenClause clause : stmt.whenClauses()) {
+            if (clause instanceof MergeStmt.WhenNotMatched) return "insert into";
+            if (clause instanceof MergeStmt.WhenMatched) {
+                return ((MergeStmt.WhenMatched) clause).isDelete() ? "delete from" : "update";
+            }
+            if (clause instanceof MergeStmt.WhenNotMatchedBySource) {
+                return ((MergeStmt.WhenNotMatchedBySource) clause).isDelete() ? "delete from" : "update";
+            }
+        }
+        return "insert into";
+    }
+
     private QueryResult executeMergeInner(MergeStmt stmt) {
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         rejectMaterializedViewWrite(stmt.targetTable());
+        // A MERGE onto a view that cannot take it is refused by the action it wanted to perform,
+        // not by INSERT: a MERGE whose only arm is an UPDATE reports "cannot update view".
+        executor.viewDmlVerb = mergeViewDmlVerb(stmt);
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         Table targetTable = executor.resolveTable(schemaName, stmt.targetTable(), stmt.schema() != null);
         String targetAlias = stmt.targetAlias() != null ? stmt.targetAlias() : stmt.targetTable();
@@ -2309,9 +2336,11 @@ class DmlExecutor {
         // Rows actually modified. Only these raise 21000: PG's "affect a row a second time"
         // counts real UPDATE/DELETE actions, not DO NOTHING arms or non-firing conditions.
         Set<Object[]> affectedTargetRows = Collections.newSetFromMap(new IdentityHashMap<>());
-        // Rows some source row paired with. NOT MATCHED BY SOURCE is about the ON condition, not
-        // about whether an arm fired, so a row a MATCHED arm declined to act on is still matched.
-        Set<Object[]> matchedTargetRowsAnyArm = Collections.newSetFromMap(new IdentityHashMap<>());
+        // Rows the ON condition paired with some source row. WHEN NOT MATCHED BY SOURCE asks
+        // about the join and nothing else: a target row that a source row matched is matched
+        // whether or not any WHEN MATCHED arm went on to act on it -- and with no WHEN MATCHED
+        // arm at all, every row of the table used to look unmatched.
+        Set<Object[]> matchedBySourceRows = Collections.newSetFromMap(new IdentityHashMap<>());
         // Collect new rows to insert
         List<Object[]> rowsToInsert = new ArrayList<>();
 
@@ -2330,13 +2359,13 @@ class DmlExecutor {
                 RowContext targetCtx = new RowContext(targetTable, targetAlias, evalRow);
                 RowContext combined = targetCtx.merge(sourceCtx);
                 if (executor.isTruthy(executor.evalExpr(stmt.onCondition(), combined))) {
+                    matchedBySourceRows.add(targetRow);
                     // PG 21000: only a second real modification of the row is an error
                     if (affectedTargetRows.contains(targetRow)) {
                         throw new MemgresException(
                                 "MERGE command cannot affect row a second time", "21000");
                     }
                     matchedTargetRows.add(targetRow);
-                    matchedTargetRowsAnyArm.add(targetRow);
                 }
             }
 
@@ -2425,7 +2454,7 @@ class DmlExecutor {
                     .anyMatch(c -> c instanceof MergeStmt.WhenNotMatchedBySource);
             if (hasNotMatchedBySource) {
                 for (Object[] targetRow : originalTargetRows) {
-                    if (matchedTargetRowsAnyArm.contains(targetRow)) continue;
+                    if (matchedBySourceRows.contains(targetRow)) continue;
                     if (processedTargetRows.contains(targetRow)) continue;
                     if (rowsToDelete.contains(targetRow)) continue;
                     Object[] evalRow = mergeTargetHasVirtual ? computeVirtualColumns(targetTable, targetRow) : targetRow;
@@ -3315,11 +3344,6 @@ class DmlExecutor {
                 rejectDuplicateInsertColumns(wn.columns());
             }
         }
-    }
-
-    private static MemgresException unreachableWhenClause() {
-        return new MemgresException(
-                "unreachable WHEN clause specified after unconditional WHEN clause", "42601");
     }
 
     /** The name a MERGE's source is known by inside the WHEN clauses, or null when it has none. */
