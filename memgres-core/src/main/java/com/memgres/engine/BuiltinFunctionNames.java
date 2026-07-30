@@ -126,4 +126,12 @@ final class BuiltinFunctionNames {
             "unistr", "unnest", "upper", "uuidv7", "varbit", "varchar",
             "version", "websearch_to_tsquery", "width", "xml"
     };
+
+    private static final java.util.Set<String> NAME_SET =
+            new java.util.HashSet<String>(java.util.Arrays.asList(NAMES));
+
+    /** True when {@code name} — already lower case and unqualified — is one of these. */
+    static boolean contains(String name) {
+        return NAME_SET.contains(name);
+    }
 }

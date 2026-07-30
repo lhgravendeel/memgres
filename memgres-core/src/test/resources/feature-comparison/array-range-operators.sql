@@ -187,23 +187,29 @@ SELECT 'empty'::int4range && '[1,5)'::int4range AS a,
 -- SECTION E: NULL array elements never match in @> and &&
 -- ============================================================================
 
--- stmt 21: NULL element containment
+-- stmt 21: NULL element containment.
+-- Written over text[] and bigint[] rather than int[]: the intarray extension, which the corpus
+-- installs and never drops, redeclares @>, <@ and && over integer[] and rejects a NULL element
+-- there with 22004. That is intarray's rule and not PostgreSQL's -- a server without the
+-- extension answers exactly what is asserted here -- so the operators are read over the element
+-- types intarray does not touch, where both servers agree. See
+-- array-null-and-filter-validation.sql for the whole boundary.
 -- begin-expected
 -- columns: a | b | c
 -- row: f | f | t
 -- end-expected
-SELECT ARRAY[1,NULL] @> ARRAY[NULL]::int[] AS a,
-       ARRAY[NULL]::int[] <@ ARRAY[1,NULL] AS b,
-       ARRAY[1,NULL] @> ARRAY[1] AS c;
+SELECT ARRAY['a',NULL]::text[] @> ARRAY[NULL]::text[] AS a,
+       ARRAY[NULL]::text[] <@ ARRAY['a',NULL]::text[] AS b,
+       ARRAY[1,NULL]::bigint[] @> ARRAY[1]::bigint[] AS c;
 
 -- stmt 22: NULL element overlap
 -- begin-expected
 -- columns: a | b | c
 -- row: f | t | f
 -- end-expected
-SELECT ARRAY[NULL]::int[] && ARRAY[NULL]::int[] AS a,
-       ARRAY[1,NULL] && ARRAY[1] AS b,
-       ARRAY[NULL,2] && ARRAY[1,NULL] AS c;
+SELECT ARRAY[NULL]::text[] && ARRAY[NULL]::text[] AS a,
+       ARRAY[1,NULL]::bigint[] && ARRAY[1]::bigint[] AS b,
+       ARRAY[NULL,'b']::text[] && ARRAY['a',NULL]::text[] AS c;
 
 -- stmt 23: the string 'NULL' is distinct from SQL NULL
 -- begin-expected
