@@ -583,6 +583,16 @@ class ConstraintValidator {
     }
 
     private void validateForeignKey(Table table, Object[] row, StoredConstraint sc) {
+        validateForeignKey(table, row, sc, null);
+    }
+
+    /**
+     * @param vanishing rows of the referenced table that this statement is about to delete, and
+     *     which therefore cannot satisfy the key even though they are still stored. Identity-based,
+     *     and null when the caller is not deleting anything.
+     */
+    private void validateForeignKey(Table table, Object[] row, StoredConstraint sc,
+                                    java.util.Set<Object[]> vanishing) {
         // Resolve the referenced table (schema-qualified when available)
         Table refTable;
         if (sc.getReferencesSchema() != null) {
@@ -672,10 +682,20 @@ class ConstraintValidator {
             }
             if (!colsOk) continue;
             TableIndex refIdx = findIndexForColumns(searchTable, refColNames);
-            if (refIdx != null) {
+            if (refIdx != null && (vanishing == null || vanishing.isEmpty())) {
                 found = refIdx.containsKey(fkVals);
+            } else if (refIdx != null) {
+                // The key is still in the index, so ask the index which rows hold it and let a row
+                // this statement is deleting count for nothing.
+                for (Object[] refRow : refIdx.findAll(fkVals)) {
+                    if (!vanishing.contains(refRow)) {
+                        found = true;
+                        break;
+                    }
+                }
             } else {
                 for (Object[] refRow : searchTable.getRows()) {
+                    if (vanishing != null && vanishing.contains(refRow)) continue;
                     boolean allMatch = true;
                     for (int i = 0; i < stRefColIndices.length; i++) {
                         if (!valuesEqual(fkVals[i], refRow[stRefColIndices[i]])) {
@@ -1146,8 +1166,10 @@ class ConstraintValidator {
                                     // The default is an ordinary value: nothing guarantees the
                                     // referenced table holds it, so the key is checked against the
                                     // new values before the row is rewritten, leaving the row as
-                                    // it was when the check fails.
-                                    validateForeignKey(childTable, newVals, sc);
+                                    // it was when the check fails. A parent row this same statement
+                                    // is deleting cannot satisfy it either — it is still stored
+                                    // while the action runs, but it will not be there afterwards.
+                                    validateForeignKey(childTable, newVals, sc, alsoDeleting);
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
                                     recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
                                     handleFkOnUpdate(childTable, oldVals, childRow);
