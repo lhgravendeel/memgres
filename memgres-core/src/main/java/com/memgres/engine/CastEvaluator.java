@@ -941,6 +941,28 @@ class CastEvaluator {
                 return val.toString();
             case "jsonpath":
                 return normalizeJsonpath(val.toString());
+            case "oidvector":
+            case "int2vector": {
+                // The catalogs' 0-based vector types, written as space-separated numbers. Held as
+                // a PgVector so a subscript is read from 0 and array_lower answers 0, the way it
+                // does for pg_proc.proargtypes.
+                if (val instanceof PgVector) return val;
+                String vs = val.toString().trim();
+                List<Object> elems = new ArrayList<>();
+                if (!vs.isEmpty()) {
+                    for (String part : vs.split("\\s+")) {
+                        if (part.isEmpty()) continue;
+                        try {
+                            elems.add("oidvector".equals(typeName) ? (Object) Integer.valueOf(part)
+                                    : (Object) Short.valueOf(part));
+                        } catch (NumberFormatException e) {
+                            throw new MemgresException("invalid input syntax for type " + typeName
+                                    + ": \"" + vs + "\"", "22P02");
+                        }
+                    }
+                }
+                return new PgVector(elems);
+            }
             case "xid": {
                 // xid is a transaction ID, essentially an unsigned 32-bit integer
                 if (val instanceof Number) return ((Number) val).longValue();

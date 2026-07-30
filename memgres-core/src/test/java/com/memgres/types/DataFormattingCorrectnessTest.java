@@ -265,14 +265,19 @@ class DataFormattingCorrectnessTest {
     }
 
     @Test
-    void pg_get_viewdef_single_line_without_pretty() throws SQLException {
+    void pg_get_viewdef_laysTheQueryOutOverLines() throws SQLException {
         exec("CREATE VIEW df_v2 AS SELECT id, b FROM df_t WHERE a > 5");
         try {
-            String def = q("SELECT pg_get_viewdef('df_v2'::regclass, false)");
-            assertNotNull(def);
-            // Non-pretty mode should be single line (no newlines)
-            assertFalse(def.contains("\n"),
-                    "Non-pretty viewdef should be single-line: " + def);
+            // PostgreSQL 18 lays the definition out over several lines whether or not pretty
+            // printing is asked for -- measured: the non-pretty form of a two-column view with a
+            // WHERE clause is four lines there. "Non-pretty" controls the indenting, not whether
+            // there are newlines at all.
+            String plain = q("SELECT pg_get_viewdef('df_v2'::regclass, false)");
+            assertNotNull(plain);
+            assertTrue(plain.contains("\n"), "viewdef should span lines: " + plain);
+            assertTrue(plain.startsWith(" SELECT"), plain);
+            assertTrue(plain.trim().endsWith(";"), plain);
+            assertTrue(plain.contains("FROM df_t"), plain);
         } finally {
             exec("DROP VIEW df_v2");
         }

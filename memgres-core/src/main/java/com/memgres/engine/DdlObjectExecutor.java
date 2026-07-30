@@ -887,7 +887,8 @@ class DdlObjectExecutor {
         while (m.find()) {
             String collation = m.group(1).toLowerCase();
             if (collation.equals("c") || collation.equals("posix") || collation.equals("default")
-                    || collation.equals("ucs_basic") || collation.equals("unicode") || collation.equals("icu_root")
+                    || collation.equals("ucs_basic") || collation.equals("unicode")
+                    || collation.equals("icu_root") || collation.equals("pg_c_utf8")
                     || collation.startsWith("c.") || collation.startsWith("pg_catalog.")) {
                 continue;
             }

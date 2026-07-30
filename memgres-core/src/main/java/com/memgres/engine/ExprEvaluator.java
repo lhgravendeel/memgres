@@ -1841,6 +1841,7 @@ class ExprEvaluator {
         // Built-in collations that are always available
         if (lower.equals("c") || lower.equals("posix") || lower.equals("default")
                 || lower.equals("ucs_basic") || lower.equals("unicode") || lower.equals("icu_root")
+                || lower.equals("pg_c_utf8")
                 || lower.equals("c.utf-8") || lower.equals("c.utf8")) {
             return;
         }
@@ -1848,7 +1849,8 @@ class ExprEvaluator {
         if (lower.startsWith("pg_catalog.")) {
             String unqualified = lower.substring("pg_catalog.".length());
             if (unqualified.equals("c") || unqualified.equals("posix") || unqualified.equals("default")
-                    || unqualified.equals("ucs_basic") || unqualified.equals("unicode") || unqualified.equals("icu_root")) {
+                    || unqualified.equals("ucs_basic") || unqualified.equals("unicode")
+                    || unqualified.equals("icu_root") || unqualified.equals("pg_c_utf8")) {
                 return;
             }
         }

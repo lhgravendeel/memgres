@@ -8,13 +8,25 @@ import com.memgres.engine.MemgresException;
 public class ParseException extends MemgresException {
 
     public ParseException(String message, Token token) {
-        super("syntax error at or near \"" + token.value() + "\"", "42601");
+        super(atOrNear(token), "42601");
         if (token.position() >= 0) setPosition(token.position() + 1); // 1-based
     }
 
     public ParseException(String message, Token token, String sqlState) {
-        super("syntax error at or near \"" + token.value() + "\"", sqlState);
+        super(atOrNear(token), sqlState);
         if (token.position() >= 0) setPosition(token.position() + 1); // 1-based
+    }
+
+    /**
+     * PostgreSQL names the word it stopped on, but when the statement simply ran out there is no
+     * word to name and it says so. Quoting the empty string instead — {@code at or near ""} —
+     * names nothing and reads as though a blank token were in the text.
+     */
+    private static String atOrNear(Token token) {
+        if (token != null && token.type() == TokenType.EOF) {
+            return "syntax error at end of input";
+        }
+        return "syntax error at or near \"" + (token == null ? "" : token.value()) + "\"";
     }
 
     private ParseException(String message, Token token, boolean verbatim) {

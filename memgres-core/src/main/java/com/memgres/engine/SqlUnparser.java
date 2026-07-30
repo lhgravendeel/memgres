@@ -17,27 +17,136 @@ public class SqlUnparser {
      * FROM/WHERE on their own indented lines. (M19)
      */
     public static String prettyViewDef(String sql) {
+        return prettyViewDef(sql, 0);
+    }
+
+    /**
+     * The clauses pg_get_viewdef starts a line with, and the indent it right-aligns each to.
+     * Written out rather than derived: PostgreSQL pads LIMIT and OFFSET differently from the rest.
+     */
+    private static final String[][] CLAUSE_INDENTS = {
+            {"FROM", "\n   "},
+            {"WHERE", "\n  "},
+            {"GROUP BY", "\n  "},
+            {"HAVING", "\n "},
+            {"WINDOW", "\n  "},
+            {"ORDER BY", "\n  "},
+            {"LIMIT", "\n "},
+            {"OFFSET", "\n "},
+    };
+
+    /**
+     * As {@link #prettyViewDef(String)}, but keeping the select list on one line when it fits
+     * inside {@code wrapColumn} — the layout pg_get_viewdef(oid, int) produces. A wrap column of
+     * zero means the list always breaks, which is the layout of the other two forms.
+     */
+    public static String prettyViewDef(String sql, int wrapColumn) {
         if (sql == null) return null;
-        String out = sql;
-        java.util.regex.Matcher selectMatcher = java.util.regex.Pattern
-                .compile("(?i)^SELECT\\s+(.*?)\\s+FROM\\s+", java.util.regex.Pattern.DOTALL)
-                .matcher(out);
-        if (selectMatcher.find()) {
-            String columnList = selectMatcher.group(1);
-            String[] columns = splitTopLevel(columnList);
-            StringBuilder formattedCols = new StringBuilder(columns[0].trim());
-            for (int ci = 1; ci < columns.length; ci++) {
-                formattedCols.append(",\n    ").append(columns[ci].trim());
-            }
-            out = " SELECT " + formattedCols
-                    + out.substring(selectMatcher.end() - " FROM ".length());
-        } else if (out.regionMatches(true, 0, "SELECT ", 0, 7)) {
-            // No FROM clause (e.g. SELECT constant): still indent the column list.
-            out = " " + out;
+        if (!sql.regionMatches(true, 0, "SELECT", 0, 6)) return sql;
+        // Find where each top-level clause starts. Scanning rather than matching on the text means
+        // an ORDER BY inside a window frame, or the word FROM inside a string literal, is left
+        // where it is instead of being pulled out onto a line of its own.
+        int[] cut = clauseStarts(sql);
+        int listStart = "SELECT".length();
+        boolean distinct = sql.regionMatches(true, listStart + 1, "DISTINCT", 0, 8);
+        if (distinct) listStart += " DISTINCT".length();
+        int listEnd = sql.length();
+        for (int c : cut) {
+            if (c >= 0) { listEnd = c; break; }
         }
-        out = out.replaceAll("(?i)\\s+FROM\\s+", "\n   FROM ")
-                 .replaceAll("(?i)\\s+WHERE\\s+", "\n  WHERE ");
-        return out;
+        String head = " " + sql.substring(0, listStart);
+        String[] columns = splitTopLevel(sql.substring(listStart, listEnd));
+        StringBuilder cols = new StringBuilder();
+        String oneLine = head + " " + joinTrimmed(columns, ", ");
+        if (wrapColumn > 0 && oneLine.length() <= wrapColumn) {
+            cols.append(joinTrimmed(columns, ", "));
+        } else {
+            cols.append(columns[0].trim());
+            for (int ci = 1; ci < columns.length; ci++) cols.append(",\n    ").append(columns[ci].trim());
+        }
+        StringBuilder out = new StringBuilder(head).append(' ').append(cols);
+        for (int i = 0; i < cut.length; i++) {
+            if (cut[i] < 0) continue;
+            int end = sql.length();
+            for (int j = i + 1; j < cut.length; j++) {
+                if (cut[j] >= 0) { end = cut[j]; break; }
+            }
+            // The space that separated this clause from the one before belongs to neither now
+            // that a newline does; leaving it turns into trailing whitespace at end of line.
+            while (end > cut[i] && Character.isWhitespace(sql.charAt(end - 1))) end--;
+            out.append(CLAUSE_INDENTS[i][1]).append(sql, cut[i], end);
+        }
+        return out.toString();
+    }
+
+    private static String joinTrimmed(String[] parts, String sep) {
+        StringBuilder sb = new StringBuilder();
+        for (String p : parts) {
+            if (sb.length() > 0) sb.append(sep);
+            sb.append(p.trim());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Where each of {@link #CLAUSE_INDENTS} begins in the statement, or -1 when it is not there.
+     * Only a keyword outside every parenthesis and every string literal counts, and only one after
+     * the last one already found, so a subquery's own WHERE stays inside the subquery.
+     */
+    private static int[] clauseStarts(String sql) {
+        int[] found = new int[CLAUSE_INDENTS.length];
+        java.util.Arrays.fill(found, -1);
+        int depth = 0;
+        boolean inString = false;
+        boolean inQuotedName = false;
+        int next = 0;
+        for (int i = 0; i < sql.length(); i++) {
+            char c = sql.charAt(i);
+            if (inString) {
+                if (c == '\'') inString = false;
+                continue;
+            }
+            if (inQuotedName) {
+                if (c == '"') inQuotedName = false;
+                continue;
+            }
+            if (c == '\'') { inString = true; continue; }
+            if (c == '"') { inQuotedName = true; continue; }
+            if (c == '(') { depth++; continue; }
+            if (c == ')') { depth--; continue; }
+            if (depth != 0 || next >= CLAUSE_INDENTS.length) continue;
+            if (i > 0 && !Character.isWhitespace(sql.charAt(i - 1))) continue;
+            for (int k = next; k < CLAUSE_INDENTS.length; k++) {
+                String kw = CLAUSE_INDENTS[k][0];
+                if (!sql.regionMatches(true, i, kw, 0, kw.length())) continue;
+                int after = i + kw.length();
+                if (after < sql.length() && !Character.isWhitespace(sql.charAt(after))) continue;
+                found[k] = i;
+                next = k + 1;
+                i = after - 1;
+                break;
+            }
+        }
+        return found;
+    }
+
+    /** The text in one pair of parentheses, adding a pair only when it does not already have one. */
+    private static String wrapOnce(String text) {
+        if (text.length() > 1 && text.charAt(0) == '(' && text.charAt(text.length() - 1) == ')') {
+            int depth = 0;
+            for (int i = 0; i < text.length(); i++) {
+                char c = text.charAt(i);
+                if (c == '(') depth++;
+                else if (c == ')') {
+                    depth--;
+                    // The opening parenthesis closed before the end, so the outer pair is not one
+                    // group: "(a) AND (b)" needs a pair of its own.
+                    if (depth == 0 && i < text.length() - 1) return "(" + text + ")";
+                }
+            }
+            return text;
+        }
+        return "(" + text + ")";
     }
 
     /** Split a comma-separated list on top-level commas only (ignoring parens). */
@@ -88,9 +197,11 @@ public class SqlUnparser {
                     .collect(Collectors.joining(", ")));
         }
 
-        // WHERE
+        // WHERE. PostgreSQL prints the qualification wrapped in one pair of parentheses; an
+        // operator expression already brings that pair, so adding another unconditionally printed
+        // a level PostgreSQL does not — and a view definition is read back and compared as text.
         if (sel.where() != null) {
-            sb.append(" WHERE (").append(exprToSql(sel.where())).append(")");
+            sb.append(" WHERE ").append(wrapOnce(exprToSql(sel.where())));
         }
 
         // GROUP BY
@@ -246,6 +357,15 @@ public class SqlUnparser {
             LikeExpr like = (LikeExpr) expr;
             return exprToSql(like.left()) + (like.negated() ? " NOT" : "") +
                     (like.caseInsensitive() ? " ILIKE " : " LIKE ") + exprToSql(like.pattern());
+        } else if (expr instanceof InExpr) {
+            // PostgreSQL rewrites a value list into a scalar-array comparison and deparses that,
+            // so a view built with IN reads back as = ANY. Without a case here the AST node fell
+            // through to Object.toString and a Java field dump landed in the view definition.
+            InExpr in = (InExpr) expr;
+            String list = in.values().stream().map(SqlUnparser::exprToSql)
+                    .collect(Collectors.joining(", "));
+            return "(" + exprToSql(in.expr()) + (in.negated() ? " <> ALL (ARRAY[" : " = ANY (ARRAY[")
+                    + list + "]))";
         } else if (expr instanceof ArrayExpr) {
             ArrayExpr arr = (ArrayExpr) expr;
             return arr.isRow() ? "ROW(" +
@@ -254,6 +374,123 @@ public class SqlUnparser {
         } else {
             return expr.toString();
         }
+    }
+
+    // ---- pretty (paren-minimising) rendering ------------------------------------------------
+
+    /**
+     * The statement with only the parentheses operator precedence requires, which is what
+     * {@code pg_get_viewdef(oid, true)} and the wrap-column form print. The default rendering
+     * parenthesises every operator, the way PostgreSQL's own non-pretty deparse does, so the two
+     * forms are produced by two renderers rather than by stripping parentheses out of one.
+     */
+    public static String toSqlPretty(Statement stmt) {
+        if (!(stmt instanceof SelectStmt)) return toSql(stmt);
+        SelectStmt sel = (SelectStmt) stmt;
+        String plain = selectToSql(sel);
+        // Only the clauses that hold a bare expression differ; rebuilding the whole statement
+        // would duplicate every clause rule for a difference that is confined to three of them.
+        StringBuilder sb = new StringBuilder(plain.length());
+        int listEnd = plain.indexOf(" FROM ");
+        String head = listEnd < 0 ? plain : plain.substring(0, listEnd);
+        if (sel.targets() != null && !sel.targets().isEmpty()) {
+            head = "SELECT " + (sel.distinct() ? "DISTINCT " : "")
+                    + sel.targets().stream()
+                        .map(t -> exprToSqlPretty(t.expr(), 0)
+                                + (t.alias() != null ? " AS " + t.alias() : ""))
+                        .collect(Collectors.joining(", "));
+        }
+        sb.append(head);
+        if (sel.from() != null && !sel.from().isEmpty()) {
+            sb.append(" FROM ").append(sel.from().stream()
+                    .map(SqlUnparser::fromItemToSqlPretty).collect(Collectors.joining(", ")));
+        }
+        if (sel.where() != null) sb.append(" WHERE ").append(exprToSqlPretty(sel.where(), 0));
+        if (sel.groupBy() != null && !sel.groupBy().isEmpty()) {
+            sb.append(" GROUP BY ").append(sel.groupBy().stream()
+                    .map(e -> exprToSqlPretty(e, 0)).collect(Collectors.joining(", ")));
+        }
+        if (sel.having() != null) sb.append(" HAVING ").append(exprToSqlPretty(sel.having(), 0));
+        if (sel.orderBy() != null && !sel.orderBy().isEmpty()) {
+            sb.append(" ORDER BY ").append(sel.orderBy().stream()
+                    .map(ob -> exprToSqlPretty(ob.expr(), 0) + (ob.descending() ? " DESC" : "")
+                            + (ob.nullsFirst() != null ? (ob.nullsFirst() ? " NULLS FIRST" : " NULLS LAST") : ""))
+                    .collect(Collectors.joining(", ")));
+        }
+        if (sel.limit() != null) sb.append(" LIMIT ").append(exprToSqlPretty(sel.limit(), 0));
+        if (sel.offset() != null) sb.append(" OFFSET ").append(exprToSqlPretty(sel.offset(), 0));
+        return sb.toString();
+    }
+
+    private static String fromItemToSqlPretty(SelectStmt.FromItem item) {
+        if (item instanceof SelectStmt.JoinFrom) {
+            SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+            String kind = join.joinType().name().replace("_", " ");
+            String prefix = "INNER".equals(kind) ? "" : kind + " ";
+            return fromItemToSqlPretty(join.left()) + " " + prefix + "JOIN "
+                    + fromItemToSqlPretty(join.right())
+                    + (join.on() != null ? " ON " + exprToSqlPretty(join.on(), 0) : "")
+                    + (join.using() != null ? " USING (" + String.join(", ", join.using()) + ")" : "");
+        }
+        return fromItemToSql(item);
+    }
+
+    /** Where an operator binds, so a child that binds tighter needs no parentheses of its own. */
+    private static int precedenceOf(BinaryExpr.BinOp op) {
+        switch (op) {
+            case OR: return 1;
+            case AND: return 2;
+            case EQUAL: case NOT_EQUAL: case LESS_THAN: case GREATER_THAN:
+            case LESS_EQUAL: case GREATER_EQUAL:
+                return 4;
+            case ADD: case SUBTRACT: return 6;
+            case MULTIPLY: case DIVIDE: case MODULO: return 7;
+            case POWER: return 8;
+            default: return 5;
+        }
+    }
+
+    /**
+     * An expression with parentheses only where precedence needs them.
+     *
+     * @param minPrecedence the binding strength of the context; anything looser gets a pair
+     */
+    private static String exprToSqlPretty(Expression expr, int minPrecedence) {
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            int prec = precedenceOf(bin.op());
+            String text = exprToSqlPretty(bin.left(), prec)
+                    + " " + binOpToSql(bin.op()) + " "
+                    // The right operand of a left-associative operator has to say so when it is
+                    // another operator of the same strength: a - (b - c) is not a - b - c.
+                    + exprToSqlPretty(bin.right(), prec + 1);
+            return prec < minPrecedence ? "(" + text + ")" : text;
+        }
+        if (expr instanceof UnaryExpr) {
+            UnaryExpr un = (UnaryExpr) expr;
+            if (un.op() == UnaryExpr.UnaryOp.NOT) {
+                String text = "NOT " + exprToSqlPretty(un.operand(), 4);
+                return 3 < minPrecedence ? "(" + text + ")" : text;
+            }
+            if (un.op() == UnaryExpr.UnaryOp.NEGATE) return "-" + exprToSqlPretty(un.operand(), 9);
+            return exprToSql(expr);
+        }
+        if (expr instanceof IsNullExpr) {
+            IsNullExpr isn = (IsNullExpr) expr;
+            String text = exprToSqlPretty(isn.expr(), 5) + (isn.negated() ? " IS NOT NULL" : " IS NULL");
+            return 4 < minPrecedence ? "(" + text + ")" : text;
+        }
+        if (expr instanceof FunctionCallExpr) {
+            FunctionCallExpr fn = (FunctionCallExpr) expr;
+            if (fn.star() || fn.distinct()) return exprToSql(expr);
+            return fn.name() + "(" + fn.args().stream()
+                    .map(a -> exprToSqlPretty(a, 0)).collect(Collectors.joining(", ")) + ")";
+        }
+        if (expr instanceof CastExpr) {
+            CastExpr cast = (CastExpr) expr;
+            return exprToSqlPretty(cast.expr(), 9) + "::" + cast.typeName();
+        }
+        return exprToSql(expr);
     }
 
     private static String binOpToSql(BinaryExpr.BinOp op) {
