@@ -3597,11 +3597,10 @@ class ExprEvaluator {
                     || name.startsWith("pg_try_advisory_")
                     || name.equals("pg_advisory_unlock") || name.equals("pg_advisory_unlock_shared")
                     || name.equals("overlaps")) return DataType.BOOLEAN;
-            // The blocking advisory lock functions return void: a client reads back an empty
-            // string, not a NULL, and the difference is visible to anything that checks.
-            if (name.equals("pg_advisory_lock") || name.equals("pg_advisory_lock_shared")
-                    || name.equals("pg_advisory_xact_lock") || name.equals("pg_advisory_xact_lock_shared")
-                    || name.equals("pg_advisory_unlock_all")) {
+            // A function declared to return void answers with an empty value of type void, not a
+            // NULL, and the difference is visible to anything that checks. Which functions those
+            // are is read off the signature table rather than listed again here.
+            if (BuiltinFunctionSignatures.returnsVoid(name)) {
                 return DataType.VOID;
             }
             // abs and unary negation answer in the argument's own type; an untyped argument

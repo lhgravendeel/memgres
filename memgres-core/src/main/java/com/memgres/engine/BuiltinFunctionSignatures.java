@@ -18,6 +18,39 @@ final class BuiltinFunctionSignatures {
     private BuiltinFunctionSignatures() {
     }
 
+    /**
+     * Names whose every signature returns void, worked out from the table below. Held in a nested
+     * class so it is built on first use: a static field here would initialise before
+     * {@link #SIGNATURES} further down the file and read a null array.
+     */
+    private static final class VoidNames {
+        static final java.util.Set<String> SET = buildVoidReturning();
+    }
+
+    private static java.util.Set<String> buildVoidReturning() {
+        java.util.Set<String> all = new java.util.HashSet<String>();
+        java.util.Set<String> notVoid = new java.util.HashSet<String>();
+        for (String[] sig : SIGNATURES) {
+            if ("2278".equals(sig[1])) {
+                all.add(sig[0].toLowerCase(java.util.Locale.ROOT));
+            } else {
+                notVoid.add(sig[0].toLowerCase(java.util.Locale.ROOT));
+            }
+        }
+        all.removeAll(notVoid);
+        return java.util.Collections.unmodifiableSet(all);
+    }
+
+    /**
+     * Whether every signature of this name returns void. A void result is not a NULL: PostgreSQL
+     * sends an empty value of type void, so a client reading the column back gets an empty string
+     * and {@code IS NULL} is false. Reading the answer off the signature table keeps the two from
+     * drifting apart as functions are added.
+     */
+    static boolean returnsVoid(String name) {
+        return name != null && VoidNames.SET.contains(name.toLowerCase(java.util.Locale.ROOT));
+    }
+
     static final String[][] SIGNATURES = {
             {"abs", "1700", "1700", "fi"},
             {"abs", "20", "20", "fi"},
@@ -441,6 +474,13 @@ final class BuiltinFunctionSignatures {
             {"pclose", "602", "602", "fi"},
             {"pg_advisory_lock", "2278", "20", "fv"},
             {"pg_advisory_lock", "2278", "23 23", "fv"},
+            {"pg_advisory_lock_shared", "2278", "20", "fv"},
+            {"pg_advisory_lock_shared", "2278", "23 23", "fv"},
+            {"pg_advisory_unlock_all", "2278", "", "fv"},
+            {"pg_advisory_unlock_shared", "16", "20", "fv"},
+            {"pg_advisory_unlock_shared", "16", "23 23", "fv"},
+            {"pg_advisory_xact_lock_shared", "2278", "20", "fv"},
+            {"pg_advisory_xact_lock_shared", "2278", "23 23", "fv"},
             {"pg_advisory_unlock", "16", "20", "fv"},
             {"pg_advisory_unlock", "16", "23 23", "fv"},
             {"pg_advisory_xact_lock", "2278", "20", "fv"},
