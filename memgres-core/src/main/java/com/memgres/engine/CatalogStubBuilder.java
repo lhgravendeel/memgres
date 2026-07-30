@@ -600,14 +600,22 @@ class CatalogStubBuilder {
             if (t == null) continue;
             int relOid = oids.oid("rel:" + schemaTable);
             for (int i = 0; i < t.getColumns().size(); i++) {
-                table.insertRow(new Object[]{
-                        relOid,
-                        (short)(i + 1),
-                        false,
-                        0.0f,
-                        0,
-                        -1.0f
-                });
+                // Every one of the five numbered slots is a column of this relation, so a row has
+                // to carry them whether or not the slot holds a statistic. Supplying only the
+                // first six values left the row shorter than the relation it belongs to, and
+                // reading stakind1 off the end of it was an internal error rather than the zero
+                // PostgreSQL answers for an unused slot.
+                Object[] row = new Object[cols.size()];
+                row[0] = relOid;
+                row[1] = (short) (i + 1);
+                row[2] = false;
+                row[3] = 0.0f;
+                row[4] = 0;
+                row[5] = -1.0f;
+                // stakind/staop/stacoll are zero in an unused slot; stanumbers/stavalues are null.
+                for (int slot = 6; slot < 6 + 5; slot++) row[slot] = (short) 0;
+                for (int slot = 11; slot < 11 + 10; slot++) row[slot] = 0;
+                table.insertRow(row);
             }
         }
         return table;

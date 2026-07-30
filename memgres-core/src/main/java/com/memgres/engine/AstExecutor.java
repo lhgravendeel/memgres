@@ -1709,6 +1709,16 @@ public class AstExecutor {
                     if (database.hasIndex(stmt.name())) found = true;
                 }
                 if (!found) {
+                    // PostgreSQL renames whatever relation the name owns here: ALTER INDEX's
+                    // rename runs the generic relation rename and never checks the kind, so
+                    // ALTER INDEX naming a table renames the table. Refusing it turned SQL
+                    // PostgreSQL accepts into a missing-relation error.
+                    if (RelationNamespace.kindOf(database, defaultSchema(), stmt.name()) != null) {
+                        return ddlExecutor.executeAlterTable(new AlterTableStmt(null, stmt.name(),
+                                java.util.Collections.<AlterTableStmt.AlterAction>singletonList(
+                                        new AlterTableStmt.RenameTable(stmt.targetValue())),
+                                stmt.ifExists()));
+                    }
                     if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER INDEX");
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }

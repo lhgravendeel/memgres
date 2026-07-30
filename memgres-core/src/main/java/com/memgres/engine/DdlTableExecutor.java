@@ -322,6 +322,11 @@ class DdlTableExecutor {
         validateGeneratedColumns(stmt.columns(), columns);
         rejectKeysOnVirtualColumns(stmt, columns);
 
+        // A partitioned parent holds no rows of its own, so there is nothing for UNLOGGED to
+        // mean; PostgreSQL refuses the combination outright rather than silently ignoring it.
+        if (stmt.unlogged() && stmt.partitionBy() != null) {
+            throw new MemgresException("partitioned tables cannot be unlogged", "0A000");
+        }
         Table table = new Table(stmt.name(), columns);
         if (stmt.unlogged()) table.setUnlogged(true);
         if (stmt.withOptions() != null && !stmt.withOptions().isEmpty()) {
@@ -1459,14 +1464,18 @@ class DdlTableExecutor {
                                         if (!sc.getReferencesTable().equalsIgnoreCase(bareName)) continue;
                                         if (sc.getReferencesSchema() != null
                                                 && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
-                                        // PG only blocks if child table has actual rows referencing parent
-                                        if (!otherTable.getRows().isEmpty()) {
-                                            throw new MemgresException(
-                                                    "cannot truncate a table referenced in a foreign key constraint\n"
-                                                    + "  Detail: Table \"" + otherTable.getName() + "\" references \"" + bareName + "\".\n"
-                                                    + "  Hint: Truncate table \"" + otherTable.getName() + "\" at the same time, or use TRUNCATE ... CASCADE.",
-                                                    "0A000");
-                                        }
+                                        // The constraint's existence is what blocks the TRUNCATE,
+                                        // not whether the referencing table currently holds rows:
+                                        // PG refuses an empty child just the same, so a migration
+                                        // that works on an empty database has to work here too.
+                                        MemgresException fkBlocked = new MemgresException(
+                                                "cannot truncate a table referenced in a foreign key constraint",
+                                                "0A000");
+                                        fkBlocked.setDetail("Table \"" + otherTable.getName()
+                                                + "\" references \"" + bareName + "\".");
+                                        fkBlocked.setHint("Truncate table \"" + otherTable.getName()
+                                                + "\" at the same time, or use TRUNCATE ... CASCADE.");
+                                        throw fkBlocked;
                                     }
                                 }
                             }

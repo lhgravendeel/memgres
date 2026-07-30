@@ -229,7 +229,7 @@ class DdlObjectExecutor {
                 break;
             }
             case RENAME_TO: {
-                requireTypeNameFree(stmt.value());
+                requireCompositeRenameTargetFree(stmt.value());
                 executor.database.removeCompositeType(stmt.typeName());
                 executor.database.addCompositeType(stmt.value(), fields);
                 executor.database.registerSchemaObject(
@@ -262,6 +262,21 @@ class DdlObjectExecutor {
                 || tableTakesIt) {
             throw new MemgresException("type \"" + name + "\" already exists", "42710");
         }
+    }
+
+    /**
+     * A composite type owns a pg_class row of its own, so renaming one is a relation rename: the
+     * collision PostgreSQL reports first is with whatever else owns a relation of that name — a
+     * table or another composite — and it reports it as a relation rather than as a type. Names
+     * taken by an enum or a domain, which own no relation, still come back as a type collision.
+     */
+    private void requireCompositeRenameTargetFree(String name) {
+        if (name == null) return;
+        if (executor.database.isCompositeType(name)
+                || RelationNamespace.kindOf(executor.database, executor.defaultSchema(), name) != null) {
+            throw new MemgresException("relation \"" + name + "\" already exists", "42P07");
+        }
+        requireTypeNameFree(name);
     }
 
     /** A destination schema that does not exist has nowhere to put the object. */
@@ -514,7 +529,18 @@ class DdlObjectExecutor {
 
         PgOperator op = executor.database.getOperator(key);
         if (op == null) {
-            throw new MemgresException("operator does not exist: " + stmt.name(), "42704");
+            // PostgreSQL names the operator the way a caller would have to write it — operand
+            // types and all — because the same symbol over other types may well exist.
+            StringBuilder sig = new StringBuilder();
+            // A prefix operator is written NONE on the left and has no left operand to name.
+            if (stmt.leftArg() != null && !"NONE".equalsIgnoreCase(stmt.leftArg().trim())) {
+                sig.append(DataType.canonicalName(stmt.leftArg())).append(' ');
+            }
+            sig.append(stmt.name());
+            if (stmt.rightArg() != null && !"NONE".equalsIgnoreCase(stmt.rightArg().trim())) {
+                sig.append(' ').append(DataType.canonicalName(stmt.rightArg()));
+            }
+            throw new MemgresException("operator does not exist: " + sig, "42883");
         }
 
         switch (stmt.action()) {
@@ -2402,6 +2428,11 @@ class DdlObjectExecutor {
         Sequence seq = executor.database.getSequence(stmt.name());
         if (seq == null) {
             if (stmt.ifExists()) return QueryResult.message(QueryResult.Type.SET, "ALTER SEQUENCE");
+            // A relation of that name that is not a sequence is a different complaint: the name
+            // resolves, the kind is wrong, and reporting it as missing sends the reader looking
+            // for an object that is right there.
+            RelationNamespace.requireKind(executor.database, executor.defaultSchema(),
+                    stmt.name(), RelationNamespace.SEQUENCE);
             throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
         }
         if (stmt.setSchema() != null) {

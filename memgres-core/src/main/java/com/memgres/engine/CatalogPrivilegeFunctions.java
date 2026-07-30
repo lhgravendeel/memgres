@@ -34,6 +34,7 @@ class CatalogPrivilegeFunctions {
     private static final String[] USAGE_PRIVS = {"USAGE"};
     private static final String[] TABLESPACE_PRIVS = {"CREATE"};
     private static final String[] PARAMETER_PRIVS = {"SET", "ALTER SYSTEM"};
+    private static final String[] LARGEOBJECT_PRIVS = {"SELECT", "UPDATE"};
     private static final String[] ROLE_PRIVS = {"USAGE", "MEMBER", "SET"};
 
     /** Schemas every role may look into: PUBLIC holds USAGE on them out of the box. */
@@ -75,6 +76,8 @@ class CatalogPrivilegeFunctions {
             case "has_foreign_data_wrapper_privilege":
                 return hasNamedObjectPrivilege(fn, ctx, "foreign-data wrapper",
                         "pg_foreign_data_wrapper", "fdwname", USAGE_PRIVS, "FOREIGN DATA WRAPPER", false);
+            case "has_largeobject_privilege":
+                return hasLargeobjectPrivilege(fn, ctx);
             case "has_type_privilege":
                 return hasTypePrivilege(fn, ctx);
             case "has_parameter_privilege":
@@ -223,6 +226,20 @@ class CatalogPrivilegeFunctions {
             if (holds(role, p, "SEQUENCE", rel.name)) return true;
         }
         return false;
+    }
+
+    /**
+     * memgres stores no large objects, so every oid names one that is not there — and a large
+     * object that is not there is what PostgreSQL answers NULL for rather than raising. The
+     * privilege name is still read, because a misspelt privilege is a caller's bug either way.
+     */
+    private Object hasLargeobjectPrivilege(FunctionCallExpr fn, RowContext ctx) {
+        List<Object> a = evalArgs(fn, ctx);
+        if (a == null) return null;
+        boolean withRole = a.size() >= 3;
+        if (withRole) role(a.get(0), true);
+        parsePrivileges(str(a.get(withRole ? 2 : 1)), LARGEOBJECT_PRIVS, false);
+        return null;
     }
 
     private Object hasTypePrivilege(FunctionCallExpr fn, RowContext ctx) {

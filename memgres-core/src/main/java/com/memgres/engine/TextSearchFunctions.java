@@ -150,7 +150,9 @@ class TextSearchFunctions {
                 }
                 Object vecObj = executor.evalExpr(fn.args().get(argIdx), ctx);
                 Object queryObj = executor.evalExpr(fn.args().get(argIdx + 1), ctx);
-                if (vecObj == null || queryObj == null) return 0.0f;
+                // A rank over a null document or a null query is unknown, not zero: zero is a real
+                // answer meaning "no match", and a caller ordering by rank cannot tell them apart.
+                if (vecObj == null || queryObj == null) return null;
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 int norm = 0;
@@ -176,7 +178,9 @@ class TextSearchFunctions {
                 }
                 Object vecObj = executor.evalExpr(fn.args().get(argIdx), ctx);
                 Object queryObj = executor.evalExpr(fn.args().get(argIdx + 1), ctx);
-                if (vecObj == null || queryObj == null) return 0.0f;
+                // A rank over a null document or a null query is unknown, not zero: zero is a real
+                // answer meaning "no match", and a caller ordering by rank cannot tell them apart.
+                if (vecObj == null || queryObj == null) return null;
                 TsVector vec = vecObj instanceof TsVector ? ((TsVector) vecObj) : toTsVector(vecObj.toString());
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 int norm = 0;
@@ -187,20 +191,28 @@ class TextSearchFunctions {
                 return (float) vec.rankCd(query, weights, norm);
             }
             case "ts_headline": {
+                // Every argument is strict: a null anywhere makes the headline unknown. Reaching
+                // toString() on one instead is what turned a null query into an XX000 and a null
+                // document into the four-character string "null".
                 String config = null;
                 String document;
                 TsQuery query;
                 String options = null;
                 if (fn.args().size() >= 4) {
-                    config = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
-                    document = String.valueOf(executor.evalExpr(fn.args().get(1), ctx));
+                    Object cfg = executor.evalExpr(fn.args().get(0), ctx);
+                    Object doc = executor.evalExpr(fn.args().get(1), ctx);
                     Object q = executor.evalExpr(fn.args().get(2), ctx);
+                    Object opt = executor.evalExpr(fn.args().get(3), ctx);
+                    if (cfg == null || doc == null || q == null || opt == null) return null;
+                    config = cfg.toString();
+                    document = doc.toString();
                     query = q instanceof TsQuery ? ((TsQuery) q) : TsQuery.parse(q.toString());
-                    options = String.valueOf(executor.evalExpr(fn.args().get(3), ctx));
+                    options = opt.toString();
                 } else if (fn.args().size() == 3) {
                     Object first = executor.evalExpr(fn.args().get(0), ctx);
                     Object second = executor.evalExpr(fn.args().get(1), ctx);
                     Object third = executor.evalExpr(fn.args().get(2), ctx);
+                    if (first == null || second == null || third == null) return null;
                     if (third instanceof TsQuery) {
                         config = first.toString();
                         document = second.toString();
@@ -211,8 +223,10 @@ class TextSearchFunctions {
                         options = third.toString();
                     }
                 } else {
-                    document = String.valueOf(executor.evalExpr(fn.args().get(0), ctx));
+                    Object doc = executor.evalExpr(fn.args().get(0), ctx);
                     Object q = executor.evalExpr(fn.args().get(1), ctx);
+                    if (doc == null || q == null) return null;
+                    document = doc.toString();
                     query = q instanceof TsQuery ? ((TsQuery) q) : TsQuery.parse(q.toString());
                 }
                 return TextSearchOperations.tsHeadline(document, query, options);
@@ -221,6 +235,7 @@ class TextSearchFunctions {
                 Object queryObj = executor.evalExpr(fn.args().get(0), ctx);
                 Object targetObj = executor.evalExpr(fn.args().get(1), ctx);
                 Object subObj = executor.evalExpr(fn.args().get(2), ctx);
+                if (queryObj == null || targetObj == null || subObj == null) return null;
                 TsQuery query = queryObj instanceof TsQuery ? ((TsQuery) queryObj) : TsQuery.parse(queryObj.toString());
                 TsQuery target = targetObj instanceof TsQuery ? ((TsQuery) targetObj) : TsQuery.parse(targetObj.toString());
                 TsQuery sub = subObj instanceof TsQuery ? ((TsQuery) subObj) : TsQuery.parse(subObj.toString());

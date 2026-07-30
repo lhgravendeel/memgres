@@ -208,8 +208,17 @@ class DdlAlterTableExecutor {
                 bare = newName;
             } else if (action instanceof AlterTableStmt.RenameColumn) {
                 AlterTableStmt.RenameColumn rc = (AlterTableStmt.RenameColumn) action;
+                int ordinal = viewColumnOrdinal(view, rc.oldName());
                 List<Column> renamed = renameViewColumn(view, rc.oldName(), rc.newName(), bare);
-                executor.database.addView(withViewName(view, bare, renamed));
+                // The catalog is not the only thing that has to take the rename: a view is read
+                // by running its query, so the query's own output label is what a later
+                // SELECT resolves against. Renaming only the catalog left the two disagreeing,
+                // and the new name was rejected by the very view that advertised it.
+                Statement relabelled = relabelViewOutput(view.query(), ordinal, rc.newName(),
+                        renamed.size());
+                executor.database.addView(new Database.ViewDef(bare, view.schemaName(), relabelled,
+                        view.orReplace(), view.materialized(), renamed, view.cachedRows(),
+                        view.sourceSQL(), view.checkOption(), view.reloptions(), view.populated()));
                 view = executor.database.getView(bare);
             } else if (action instanceof AlterTableStmt.SetSchema) {
                 String target = ((AlterTableStmt.SetSchema) action).newSchema();
@@ -277,6 +286,41 @@ class DdlAlterTableExecutor {
             // OWNER TO is accepted; memgres records no per-index owner to change.
         }
         return QueryResult.command(QueryResult.Type.CREATE_TABLE, 0);
+    }
+
+    /** The position of a view's column, or -1 when the view has no cached column list. */
+    private static int viewColumnOrdinal(Database.ViewDef view, String column) {
+        List<Column> cols = view.cachedColumns();
+        if (cols == null) return -1;
+        for (int i = 0; i < cols.size(); i++) {
+            if (cols.get(i).getName().equalsIgnoreCase(column)) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * Put the new name on the view query's own output column, so the query answers to it. Only a
+     * plain select list of the same length can be relabelled by position — a wildcard or a set
+     * operation has no one target to write the name onto, and is left as it was rather than
+     * relabelled wrongly.
+     */
+    private static Statement relabelViewOutput(Statement query, int ordinal, String newName,
+                                               int columnCount) {
+        if (ordinal < 0 || !(query instanceof SelectStmt)) return query;
+        SelectStmt s = (SelectStmt) query;
+        List<SelectStmt.SelectTarget> targets = s.targets();
+        if (targets == null || targets.size() != columnCount || ordinal >= targets.size()) return query;
+        for (SelectStmt.SelectTarget t : targets) {
+            if (t.expr() instanceof WildcardExpr) return query;
+        }
+        List<SelectStmt.SelectTarget> out = new ArrayList<>();
+        for (int i = 0; i < targets.size(); i++) {
+            SelectStmt.SelectTarget t = targets.get(i);
+            out.add(i == ordinal ? new SelectStmt.SelectTarget(t.expr(), newName) : t);
+        }
+        return new SelectStmt(s.distinct(), s.distinctOn(), out, s.from(), s.where(), s.groupBy(),
+                s.having(), s.windowDefs(), s.orderBy(), s.limit(), s.offset(), s.withClauses(),
+                s.groupingSets(), s.lockClause(), s.withTies());
     }
 
     private Database.ViewDef withViewName(Database.ViewDef view, String name, List<Column> cols) {
@@ -1295,39 +1339,85 @@ class DdlAlterTableExecutor {
             }
         }
         int convIdx = table.getColumnIndex(alterCol.column());
-        if (setType.usingExpr() != null) {
-            Object[] convertedValues = new Object[table.getRows().size()];
-            for (int ri = 0; ri < table.getRows().size(); ri++) {
-                Object[] row = table.getRows().get(ri);
-                RowContext ctx = new RowContext(table, null, row);
-                convertedValues[ri] = executor.evalExpr(setType.usingExpr(), ctx);
+        Column oldCol = table.getColumns().get(convIdx);
+        rejectDefaultThatCannotBeCast(oldCol, currentType, dt, isArrayType, newEnumTypeName);
+        // The new column is built first and used only to coerce, so nothing is written until
+        // every rule already declared over the column has been checked against what the rewrite
+        // would produce: PostgreSQL rolls the whole statement back and the old values have to
+        // still be there afterwards.
+        Column newCol = oldCol.withType(dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
+        newCol.setIntervalQualifier(DataType.intervalQualifier(setType.typeName()));
+        int rowCount = table.getRows().size();
+        Object[] convertedValues = new Object[rowCount];
+        for (int ri = 0; ri < rowCount; ri++) {
+            Object[] row = table.getRows().get(ri);
+            Object raw;
+            if (setType.usingExpr() != null) {
+                raw = executor.evalExpr(setType.usingExpr(), new RowContext(table, null, row));
+            } else {
+                raw = row[convIdx];
             }
-            // The rewritten column has to satisfy what was already declared over it. The
-            // indexes are rebuilt from the new values, so a conversion that maps two rows onto
-            // one value breaks a unique index, and one that yields a null breaks NOT NULL.
-            // Both are checked before anything is written, because PostgreSQL rolls the whole
-            // statement back and the old values have to still be there afterwards.
-            rejectRewriteThatBreaksColumn(table, alterCol.column(), convertedValues,
-                    stmt.table(), schemaName);
-            table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
-            Column newCol = table.getColumns().get(convIdx);
-            newCol.setIntervalQualifier(DataType.intervalQualifier(setType.typeName()));
-            for (int ri = 0; ri < table.getRows().size(); ri++) {
-                Object[] row = table.getRows().get(ri);
-                row[convIdx] = convertedValues[ri] != null
-                        ? TypeCoercion.coerceForStorage(convertedValues[ri], newCol)
-                        : null;
-            }
-        } else {
-            table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
-            Column newCol = table.getColumns().get(convIdx);
-            newCol.setIntervalQualifier(DataType.intervalQualifier(setType.typeName()));
-            for (Object[] row : table.getRows()) {
-                if (row[convIdx] != null) {
-                    row[convIdx] = TypeCoercion.coerceForStorage(row[convIdx], newCol);
-                }
-            }
+            convertedValues[ri] = raw != null ? TypeCoercion.coerceForStorage(raw, newCol) : null;
         }
+        // The indexes are rebuilt from the new values, so a conversion that maps two rows onto
+        // one value breaks a unique index, and one that yields a null breaks NOT NULL.
+        rejectRewriteThatBreaksColumn(table, alterCol.column(), convertedValues,
+                stmt.table(), schemaName);
+        Object[] oldValues = new Object[rowCount];
+        for (int ri = 0; ri < rowCount; ri++) oldValues[ri] = table.getRows().get(ri)[convIdx];
+        table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
+        table.getColumns().get(convIdx).setIntervalQualifier(DataType.intervalQualifier(setType.typeName()));
+        for (int ri = 0; ri < rowCount; ri++) {
+            table.getRows().get(ri)[convIdx] = convertedValues[ri];
+        }
+        // A CHECK constraint reads the stored value, so it can only be re-checked once the new
+        // values are in place. Failing puts the column back the way it was.
+        try {
+            revalidateChecksOverColumn(table);
+        } catch (RuntimeException e) {
+            for (int ri = 0; ri < rowCount; ri++) table.getRows().get(ri)[convIdx] = oldValues[ri];
+            table.alterColumnType(alterCol.column(), oldCol.getType(), oldCol.getPrecision(),
+                    oldCol.getScale(), oldCol.getEnumTypeName(), oldCol.getArrayElementType());
+            table.getColumns().get(convIdx).setIntervalQualifier(oldCol.getIntervalQualifier());
+            throw e;
+        }
+    }
+
+    /**
+     * A retype rewrites the stored values, so a CHECK constraint that reads the column has to
+     * still hold over every row afterwards — PostgreSQL re-runs it and refuses the ALTER when a
+     * row no longer satisfies it, rather than leaving the table holding a row its own constraint
+     * rejects.
+     */
+    private void revalidateChecksOverColumn(Table table) {
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getType() != StoredConstraint.Type.CHECK) continue;
+            if (sc.getCheckExpr() == null) continue;
+            // A constraint that was never validated, or is declared unenforced, is not one the
+            // rewrite has to satisfy — PostgreSQL leaves both alone.
+            if (sc.isNotEnforced() || !sc.isConvalidated()) continue;
+            validateCheckConstraintData(sc, table);
+        }
+    }
+
+    /**
+     * The column's default has to survive the retype too. PostgreSQL coerces it to the new type
+     * with an assignment cast and refuses the whole ALTER when that cast does not exist, which is
+     * what keeps a text default off an integer column instead of letting the next INSERT fail.
+     * The rule is the one applied to the stored values: within a type category, or to a string
+     * type, is automatic; out of a string type into anything else is not.
+     */
+    private void rejectDefaultThatCannotBeCast(Column col, DataType currentType, DataType dt,
+                                               boolean isArrayType, String newEnumTypeName) {
+        if (col.getDefaultValue() == null) return;
+        if (currentType == null || dt == null || currentType == dt) return;
+        TypeCoercion.TypeCategory fromCat = TypeCoercion.categoryOf(currentType);
+        TypeCoercion.TypeCategory toCat = TypeCoercion.categoryOf(dt);
+        if (fromCat == toCat || toCat == TypeCoercion.TypeCategory.STRING) return;
+        String targetName = newEnumTypeName != null ? newEnumTypeName : dt.toRegtypeDisplay();
+        if (isArrayType) targetName += "[]";
+        throw new MemgresException("default for column \"" + col.getName()
+                + "\" cannot be cast automatically to type " + targetName, "42804");
     }
 
     /**
@@ -1353,8 +1443,10 @@ class DdlAlterTableExecutor {
         for (Object v : newValues) {
             if (v == null) continue; // nulls are distinct from each other in a unique index
             if (!seen.add(String.valueOf(v))) {
-                throw new MemgresException("could not create unique index \"" + uniqueIndex
-                        + "\"\n  Detail: Key (" + column + ")=(" + v + ") is duplicated.", "23505");
+                MemgresException dup = new MemgresException("could not create unique index \""
+                        + uniqueIndex + "\"", "23505");
+                dup.setDetail("Key (" + column + ")=(" + v + ") is duplicated.");
+                throw dup;
             }
         }
     }
