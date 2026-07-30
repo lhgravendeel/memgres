@@ -3591,7 +3591,7 @@ class ExprEvaluator {
                     || name.equals("has_sequence_privilege") || name.equals("has_any_column_privilege")
                     || name.equals("has_foreign_data_wrapper_privilege") || name.equals("has_server_privilege")
                     || name.equals("has_tablespace_privilege") || name.equals("has_parameter_privilege")
-                    || name.equals("has_language_privilege")
+                    || name.equals("has_language_privilege") || name.equals("has_largeobject_privilege")
                     || name.equals("pg_is_in_recovery") || name.equals("pg_is_wal_replay_paused")
                     || name.equals("pg_has_role")
                     || name.startsWith("pg_try_advisory_")

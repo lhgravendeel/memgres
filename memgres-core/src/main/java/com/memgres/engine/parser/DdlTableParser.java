@@ -491,6 +491,57 @@ class DdlTableParser {
         return true;
     }
 
+    /**
+     * Whether the key list starting at the open paren carries a {@code WITHOUT OVERLAPS} element.
+     * Looked at before parsing so an ordinary key list — which may hold expressions a temporal key
+     * never does — keeps going down the path that already reads it.
+     */
+    private boolean withoutOverlapsAheadInParens() {
+        int depth = 0;
+        for (int i = parser.pos; i < parser.tokens.size(); i++) {
+            TokenType t = parser.tokens.get(i).type();
+            if (t == TokenType.LEFT_PAREN) depth++;
+            else if (t == TokenType.RIGHT_PAREN) {
+                if (depth == 0) return false;
+                depth--;
+            } else if (depth == 0 && "WITHOUT".equalsIgnoreCase(parser.tokens.get(i).value())
+                    && i + 1 < parser.tokens.size()
+                    && "OVERLAPS".equalsIgnoreCase(parser.tokens.get(i + 1).value())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Read {@code (a, b, period WITHOUT OVERLAPS)} — without the closing paren — as the exclusion
+     * constraint it means: the scalar columns compared for equality, the period for overlap.
+     */
+    private TableConstraint parseWithoutOverlapsKey(String constraintName) {
+        List<String> cols = new ArrayList<String>();
+        String withoutOverlapsCol = null;
+        do {
+            String c = parser.readIdentifier();
+            if (matchWithoutOverlaps()) {
+                withoutOverlapsCol = c;
+            } else {
+                cols.add(c);
+            }
+        } while (parser.match(TokenType.COMMA));
+        List<TableConstraint.ExcludeElement> elems = new ArrayList<TableConstraint.ExcludeElement>();
+        for (String c : cols) {
+            elems.add(new TableConstraint.ExcludeElement(c, "="));
+        }
+        elems.add(new TableConstraint.ExcludeElement(withoutOverlapsCol, "&&"));
+        List<String> allCols = new ArrayList<String>(cols);
+        allCols.add(withoutOverlapsCol);
+        TableConstraint temporal = new TableConstraint(constraintName,
+                TableConstraint.ConstraintType.EXCLUDE,
+                allCols, null, null, null, null, null, false, false, false, false, elems);
+        temporal.setExcludeMethod("gist");
+        return temporal;
+    }
+
     TableConstraint parseTableConstraint() {
         String constraintName = null;
         if (parser.matchKeyword("CONSTRAINT")) {
@@ -511,34 +562,18 @@ class DdlTableParser {
                         Cols.listOf("__using_index__:" + indexName), null, null, null, null, null);
             }
             parser.expect(TokenType.LEFT_PAREN);
-            List<String> cols = new ArrayList<String>();
-            String withoutOverlapsCol = null;
-            do {
-                String c = parser.readIdentifier();
-                // PRIMARY KEY (id, valid WITHOUT OVERLAPS): the key is unique per period rather
-                // than outright, which is an exclusion constraint by another name.
-                if (matchWithoutOverlaps()) {
-                    withoutOverlapsCol = c;
-                } else {
-                    cols.add(c);
-                }
-            } while (parser.match(TokenType.COMMA));
-            parser.expect(TokenType.RIGHT_PAREN);
-            if (withoutOverlapsCol != null) {
-                List<TableConstraint.ExcludeElement> elems = new ArrayList<TableConstraint.ExcludeElement>();
-                for (String c : cols) {
-                    elems.add(new TableConstraint.ExcludeElement(c, "="));
-                }
-                elems.add(new TableConstraint.ExcludeElement(withoutOverlapsCol, "&&"));
-                List<String> allCols = new ArrayList<String>(cols);
-                allCols.add(withoutOverlapsCol);
-                TableConstraint temporal = new TableConstraint(
-                        constraintName != null ? constraintName : null,
-                        TableConstraint.ConstraintType.EXCLUDE,
-                        allCols, null, null, null, null, null, false, false, false, false, elems);
-                temporal.setExcludeMethod("gist");
+            // PRIMARY KEY (id, valid WITHOUT OVERLAPS): the key is unique per period rather
+            // than outright, which is an exclusion constraint by another name.
+            if (withoutOverlapsAheadInParens()) {
+                TableConstraint temporal = parseWithoutOverlapsKey(constraintName);
+                parser.expect(TokenType.RIGHT_PAREN);
                 return temporal;
             }
+            List<String> cols = new ArrayList<String>();
+            do {
+                cols.add(parser.readIdentifier());
+            } while (parser.match(TokenType.COMMA));
+            parser.expect(TokenType.RIGHT_PAREN);
             Deferrability pkDef = parseDeferrability();
             boolean pkDeferrable = pkDef.deferrable, pkInitiallyDeferred = pkDef.initiallyDeferred;
             if (parseNotEnforced()) {
@@ -563,6 +598,20 @@ class DdlTableParser {
                 }
             }
             parser.expect(TokenType.LEFT_PAREN);
+            // UNIQUE (id, valid_at WITHOUT OVERLAPS) is the same temporal key as the PRIMARY KEY
+            // spelling: unique per period rather than outright, which is an exclusion constraint
+            // by another name.
+            if (withoutOverlapsAheadInParens()) {
+                TableConstraint temporal = parseWithoutOverlapsKey(constraintName);
+                parser.expect(TokenType.RIGHT_PAREN);
+                // The constraint this becomes carries no deferrability of its own, but the
+                // clauses are still ordinary SQL after the key and have to be read off.
+                parseDeferrability();
+                if (parseNotEnforced()) {
+                    throw new MemgresException("UNIQUE constraints cannot be marked NOT ENFORCED", "0A000");
+                }
+                return temporal;
+            }
             List<String> cols = parser.parseColumnOrExpressionList();
             parser.expect(TokenType.RIGHT_PAREN);
             Deferrability uqDef = parseDeferrability();

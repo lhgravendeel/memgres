@@ -13,6 +13,29 @@ class DateTimeArithmetic {
         this.executor = executor;
     }
 
+    /**
+     * The last day PostgreSQL's date type can hold. Its storage is a signed day offset from
+     * 2000-01-01, so the type has an end where {@code java.time.LocalDate} has effectively none —
+     * a date past this is a value no PostgreSQL could store or send back.
+     */
+    private static final LocalDate DATE_MAX = LocalDate.of(5874897, 12, 31);
+    /** The first day: 4714-11-24 BC, which is 4713 BC in the era PostgreSQL prints. */
+    private static final LocalDate DATE_MIN = LocalDate.of(-4713, 11, 24);
+
+    /** date +/- an integer number of days, refusing what would land outside the type. */
+    static LocalDate addDays(LocalDate base, long days) {
+        LocalDate result;
+        try {
+            result = base.plusDays(days);
+        } catch (RuntimeException e) {
+            throw new MemgresException("date out of range", "22008");
+        }
+        if (result.isAfter(DATE_MAX) || result.isBefore(DATE_MIN)) {
+            throw new MemgresException("date out of range", "22008");
+        }
+        return result;
+    }
+
     Object dateTimeAdd(Object left, Object right) {
         if (left == null || right == null) return null;
 
@@ -106,8 +129,8 @@ class DateTimeArithmetic {
         }
 
         // date + integer (days)
-        if (left instanceof LocalDate && right instanceof Number) return ((LocalDate) left).plusDays(((Number) right).longValue());
-        if (left instanceof Number && right instanceof LocalDate) return ((LocalDate) right).plusDays(((Number) left).longValue());
+        if (left instanceof LocalDate && right instanceof Number) return addDays((LocalDate) left, ((Number) right).longValue());
+        if (left instanceof Number && right instanceof LocalDate) return addDays((LocalDate) right, ((Number) left).longValue());
 
         // Geometric arithmetic: geom + point = translation
         if (left instanceof String && right instanceof String
@@ -269,7 +292,7 @@ class DateTimeArithmetic {
         }
 
         // date - integer (days)
-        if (left instanceof LocalDate && right instanceof Number) return ((LocalDate) left).minusDays(((Number) right).longValue());
+        if (left instanceof LocalDate && right instanceof Number) return addDays((LocalDate) left, -((Number) right).longValue());
 
         // pg_lsn - pg_lsn → bigint (byte count difference)
         if (left instanceof String && right instanceof String) {

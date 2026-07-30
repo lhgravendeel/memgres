@@ -2731,8 +2731,13 @@ class DdlParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_publication_drop_table", name + "\0" + String.join(",", tables));
         }
+        if (parser.matchKeywords("RENAME", "TO")) {
+            String newName = parser.readIdentifier();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_publication_rename", name + "\0" + newName);
+        }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("alter_noop", "ok");
+        return new SetStmt("alter_publication_noop", name);
     }
 
     private Statement parseCreateSubscription() {

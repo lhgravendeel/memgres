@@ -247,25 +247,37 @@ class NoopDdlCoverageTest {
         exec("CREATE PUBLICATION mypub FOR ALL TABLES WITH (publish = 'insert, update')");
     }
 
-    // ALTER PUBLICATION
+    // ALTER PUBLICATION. Each of these used to name a publication no test had created, and
+    // passed because the ALTER was a silent no-op; PostgreSQL raises 42704 for every one of
+    // them, so the publication has to exist for the statement to be the no-op it is meant to be.
     @Test void testAlterPublication() throws SQLException {
-        exec("ALTER PUBLICATION mypub ADD TABLE t4");
+        exec("CREATE PUBLICATION mypub_add FOR ALL TABLES");
+        exec("ALTER PUBLICATION mypub_add ADD TABLE t4");
     }
 
     @Test void testAlterPublicationSetTable() throws SQLException {
-        exec("ALTER PUBLICATION mypub SET TABLE t1, t2");
+        exec("CREATE PUBLICATION mypub_set FOR ALL TABLES");
+        exec("ALTER PUBLICATION mypub_set SET TABLE t1, t2");
     }
 
     @Test void testAlterPublicationDropTable() throws SQLException {
-        exec("ALTER PUBLICATION mypub DROP TABLE t1");
+        exec("CREATE PUBLICATION mypub_drop FOR TABLE t1");
+        exec("ALTER PUBLICATION mypub_drop DROP TABLE t1");
     }
 
     @Test void testAlterPublicationOwner() throws SQLException {
-        exec("ALTER PUBLICATION mypub OWNER TO newowner");
+        exec("CREATE PUBLICATION mypub_own FOR ALL TABLES");
+        exec("ALTER PUBLICATION mypub_own OWNER TO newowner");
     }
 
     @Test void testAlterPublicationRename() throws SQLException {
-        exec("ALTER PUBLICATION mypub RENAME TO newpub");
+        exec("CREATE PUBLICATION mypub_ren FOR ALL TABLES");
+        exec("ALTER PUBLICATION mypub_ren RENAME TO mypub_ren2");
+    }
+
+    @Test void testAlterPublicationThatIsNotThere() {
+        assertThrows(SQLException.class,
+                () -> exec("ALTER PUBLICATION mypub_nosuch ADD TABLE t1"));
     }
 
     // DROP PUBLICATION

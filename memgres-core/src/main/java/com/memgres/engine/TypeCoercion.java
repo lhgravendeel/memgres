@@ -597,6 +597,16 @@ public final class TypeCoercion {
         if (val instanceof RegclassValue) return ((RegclassValue) val).oid();
         if (val instanceof RegtypeValue) return ((RegtypeValue) val).oid();
         if (val instanceof RegprocValue) return ((RegprocValue) val).oid();
+        // PG 18 casts bytea to integer by reading the bytes as the integer's own big-endian
+        // representation. Without this the byte array fell through to the text path and the
+        // client was shown a Java array identity — "[B@5a688f2e" — as if it were its input.
+        if (val instanceof byte[]) {
+            byte[] b = (byte[]) val;
+            if (b.length != 4) {
+                throw new MemgresException("smallint or bigint or integer expected", "22P03");
+            }
+            return ((b[0] & 0xff) << 24) | ((b[1] & 0xff) << 16) | ((b[2] & 0xff) << 8) | (b[3] & 0xff);
+        }
         if (val instanceof java.math.BigDecimal) {
             java.math.BigDecimal bd = (java.math.BigDecimal) val;
             long lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
@@ -1401,6 +1411,15 @@ public final class TypeCoercion {
     private static final java.util.regex.Pattern WIDE_YEAR =
             java.util.regex.Pattern.compile("^(\\d{5,})-(\\d{1,2})-(\\d{1,2})$");
 
+    /**
+     * The same wide year, with the time of day a timestamp literal may carry. A timestamp holds
+     * years up to 294276, so its widest legal spellings run past what the ISO parsers will read
+     * and have to be taken apart by hand rather than reported as malformed.
+     */
+    private static final java.util.regex.Pattern WIDE_YEAR_TIMESTAMP =
+            java.util.regex.Pattern.compile(
+                    "^(\\d{5,})-(\\d{1,2})-(\\d{1,2})(?:[ T](\\d{1,2}):(\\d{1,2})(?::(\\d{1,2}(?:\\.\\d+)?))?)?$");
+
     /** The last year date can hold, and the last one timestamp can. */
     private static final long DATE_MAX_YEAR = 5874897L;
     private static final long TIMESTAMP_MAX_YEAR = 294276L;
@@ -1822,15 +1841,27 @@ public final class TypeCoercion {
         }
         // A timestamp holds years up to 294276; past that it is the range that fails rather than
         // the spelling, and PG says so with its own message
-        java.util.regex.Matcher wideTs = WIDE_YEAR.matcher(val.toString().trim());
+        java.util.regex.Matcher wideTs = WIDE_YEAR_TIMESTAMP.matcher(val.toString().trim());
         if (wideTs.matches()) {
             long year = Long.parseLong(wideTs.group(1));
             if (year > TIMESTAMP_MAX_YEAR) {
                 throw new MemgresException("timestamp out of range: \"" + val + "\"", "22008");
             }
             try {
-                return LocalDate.of((int) year, Integer.parseInt(wideTs.group(2)),
-                        Integer.parseInt(wideTs.group(3))).atStartOfDay();
+                LocalDate day = LocalDate.of((int) year, Integer.parseInt(wideTs.group(2)),
+                        Integer.parseInt(wideTs.group(3)));
+                if (wideTs.group(4) == null) return day.atStartOfDay();
+                int hour = Integer.parseInt(wideTs.group(4));
+                int minute = Integer.parseInt(wideTs.group(5));
+                int second = 0;
+                int nano = 0;
+                if (wideTs.group(6) != null) {
+                    java.math.BigDecimal secs = new java.math.BigDecimal(wideTs.group(6));
+                    second = secs.intValue();
+                    nano = secs.subtract(new java.math.BigDecimal(second))
+                            .movePointRight(9).setScale(0, java.math.RoundingMode.HALF_UP).intValue();
+                }
+                return LocalDateTime.of(day, LocalTime.of(hour, minute, second, nano));
             } catch (RuntimeException e) {
                 throw new MemgresException(
                         "date/time field value out of range: \"" + val + "\"", "22008");
@@ -1995,6 +2026,12 @@ public final class TypeCoercion {
 
     public static byte[] toBytea(Object val) {
         if (val instanceof byte[]) return (byte[]) val;
+        // The other half of PG 18's integer/bytea pair: the bytes are the integer's big-endian
+        // representation, two, four or eight of them by its width. These arrived here as null
+        // before, so nothing that worked depended on the old answer.
+        if (val instanceof Short) return bigEndian(((Short) val).longValue(), 2);
+        if (val instanceof Integer) return bigEndian(((Integer) val).longValue(), 4);
+        if (val instanceof Long) return bigEndian((Long) val, 8);
         if (val instanceof String) {
             String s = (String) val;
             // PG hex format: \xDEADBEEF or \\xDEADBEEF
@@ -2011,6 +2048,16 @@ public final class TypeCoercion {
             return s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
         }
         return null;
+    }
+
+    /** An integer's PostgreSQL on-the-wire bytes: most significant first, fixed width. */
+    private static byte[] bigEndian(long v, int width) {
+        byte[] out = new byte[width];
+        for (int i = width - 1; i >= 0; i--) {
+            out[i] = (byte) (v & 0xff);
+            v >>= 8;
+        }
+        return out;
     }
 
     private static Object toUUID(Object val) {

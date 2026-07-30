@@ -300,6 +300,14 @@ class CatalogMetadataFunctions {
             }
             case "pg_get_userbyid":
                 return "memgres";
+            case "pg_get_acl": {
+                // PG 18 reads the object's ACL column and answers NULL when it is unset, which is
+                // both what an object nobody has granted on looks like and what an object that is
+                // not there at all looks like. memgres keeps grants outside the catalog rows, so
+                // every object reads as the default ACL — the same NULL.
+                for (Expression a : fn.args()) executor.evalExpr(a, ctx);
+                return null;
+            }
             case "pg_encoding_to_char":
                 return "UTF8";
             case "shobj_description":

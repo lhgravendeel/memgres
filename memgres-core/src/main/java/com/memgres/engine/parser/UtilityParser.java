@@ -1390,6 +1390,28 @@ class UtilityParser {
         return new SetStmt("security_label", value);
     }
 
+    /**
+     * PG 18 lets VACUUM and ANALYZE name a relation as {@code ONLY t}, meaning the relation itself
+     * and not its inheritance children. Nothing here descends into children anyway, so the word is
+     * read and discarded — but it has to be read, or it is taken for the relation's name. Only an
+     * unquoted ONLY that is followed by something counts: {@code VACUUM "only"} still names a
+     * table, since the lexer hands a quoted word over as an identifier rather than a keyword.
+     */
+    private void matchOnlyBeforeRelation() {
+        if (!parser.checkKeyword("ONLY")) return;
+        int next = parser.pos + 1;
+        boolean nothingFollows = next >= parser.tokens.size();
+        if (!nothingFollows) {
+            TokenType t = parser.tokens.get(next).type();
+            nothingFollows = t == TokenType.SEMICOLON || t == TokenType.EOF;
+        }
+        // ONLY is a reserved word, so it can never be the relation it was meant to qualify.
+        if (nothingFollows) {
+            throw ParseException.at(next < parser.tokens.size() ? parser.tokens.get(next) : null);
+        }
+        parser.advance();
+    }
+
     // ---- ANALYZE ----
 
     SetStmt parseAnalyze() {
@@ -1399,6 +1421,7 @@ class UtilityParser {
         String tableName = null;
         String columnList = null;
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            matchOnlyBeforeRelation();
             tableName = parser.readIdentifier(); // table name
             if (parser.match(TokenType.DOT)) tableName = parser.readIdentifier(); // schema.table
             // Optional column list
@@ -1458,6 +1481,7 @@ class UtilityParser {
         // Optional table name
         String vacuumTable = null;
         if (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+            matchOnlyBeforeRelation();
             vacuumTable = parser.readIdentifier();
             if (parser.match(TokenType.DOT)) vacuumTable = parser.readIdentifier();
             if (parser.check(TokenType.LEFT_PAREN)) parser.consumeUntilParen();
