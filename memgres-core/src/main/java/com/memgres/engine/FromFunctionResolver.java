@@ -1513,6 +1513,7 @@ class FromFunctionResolver {
                 boolean namedBySignature = userFunc.hasOutParams();
                 if (cols.isEmpty() && !namedBySignature && colAliases != null && !colAliases.isEmpty()) {
                     checkRecordShape(userFunc, colAliases.size(), firstRow.length);
+                    checkRecordColumnTypes(userFunc, colAliases, firstRow);
                     for (int i = 0; i < colAliases.size(); i++) {
                         cols.add(columnFromDef(colAliases.get(i), i + 1));
                     }
@@ -1633,17 +1634,86 @@ class FromFunctionResolver {
 
     // ---- Shared helpers ----
 
+    /** The complaint PostgreSQL makes when a column definition list does not fit the record. */
+    private static MemgresException recordShapeError(PgFunction userFunc) {
+        String lang = userFunc.getLanguage();
+        if (lang != null && lang.equalsIgnoreCase("plpgsql")) {
+            return new MemgresException(
+                    "structure of query does not match function result type", "42804");
+        }
+        return new MemgresException(
+                "return type mismatch in function declared to return record", "42P13");
+    }
+
     /**
      * The caller's column definition list is the only description of a {@code record} result,
      * so it has to agree with what the function body actually produces.
      */
     private static void checkRecordShape(PgFunction userFunc, int declared, int produced) {
         if (declared == produced) return;
-        MemgresException e = PgErrors.invalidObjectDefinition(
-                "return type mismatch in function declared to return record");
-        e.setDetail("Final statement returns too " + (produced < declared ? "few" : "many") + " columns.");
+        // Which complaint PostgreSQL makes depends on the language. A SQL function's body is
+        // checked against the column definition list as part of resolving the call, so a list
+        // that does not fit is an invalid function definition; PL/pgSQL's RETURN QUERY compares
+        // the query it just ran against the record type it resolved, which is a datatype
+        // mismatch. Same fault, two codes, and a client that branches on SQLSTATE sees both.
+        MemgresException e = recordShapeError(userFunc);
+        e.setDetail("Number of returned columns (" + produced
+                + ") does not match expected column count (" + declared + ").");
         e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
         throw e;
+    }
+
+    /**
+     * A column definition list does not convert what the body produced; it declares what the
+     * caller says it is. A value of a kind the declared type could never hold means the two
+     * descriptions are of different results, which is the same complaint as the wrong width.
+     */
+    private static void checkRecordColumnTypes(PgFunction userFunc, List<String> colAliases, Object[] firstRow) {
+        for (int i = 0; i < colAliases.size() && i < firstRow.length; i++) {
+            String def = colAliases.get(i);
+            int sp = def == null ? -1 : def.indexOf(' ');
+            if (sp <= 0) continue;
+            String want = valueClass(def.substring(sp + 1).trim());
+            String got = valueClass(firstRow[i]);
+            if (want == null || got == null || want.equals(got)) continue;
+            MemgresException e = recordShapeError(userFunc);
+            e.setPgContext("SQL function \"" + userFunc.getName() + "\" statement 1");
+            throw e;
+        }
+    }
+
+    /**
+     * The broad kind of value a declared type holds, or null for a type whose values this check
+     * cannot tell apart from another's. Only kinds that can never stand in for each other are
+     * named: a narrower comparison would refuse results PostgreSQL accepts.
+     */
+    private static String valueClass(String typeName) {
+        if (typeName == null) return null;
+        String t = typeName.trim().toLowerCase();
+        int paren = t.indexOf('(');
+        if (paren > 0) t = t.substring(0, paren).trim();
+        if (t.endsWith("[]")) return null;
+        switch (t) {
+            case "smallint": case "int2": case "integer": case "int": case "int4":
+            case "bigint": case "int8": case "numeric": case "decimal":
+            case "real": case "float4": case "double precision": case "float8":
+                return "number";
+            case "text": case "varchar": case "character varying": case "char":
+            case "character": case "bpchar": case "name":
+                return "text";
+            case "boolean": case "bool":
+                return "boolean";
+            default:
+                return null;
+        }
+    }
+
+    /** The same broad kind, read off a value, or null when the value does not say. */
+    private static String valueClass(Object value) {
+        if (value instanceof Number) return "number";
+        if (value instanceof Boolean) return "boolean";
+        if (value instanceof String) return "text";
+        return null;
     }
 
     private static String firstColAlias(List<String> colAliases, String fallback) {

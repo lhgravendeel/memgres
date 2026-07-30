@@ -248,6 +248,9 @@ class QueryClauseValidationTest {
                 "SELECT * FROM qcv_setof_rec()");
         rejects("42601", "a column definition list is redundant for a function with OUT parameters",
                 "SELECT * FROM qcv_out_fn() AS t(x int, y text)");
+        // A SQL function's column definition list is checked as the call is resolved, so
+        // PostgreSQL calls a list that does not fit an invalid function definition. A plpgsql
+        // body reaches the same fault through RETURN QUERY and reports 42804 instead.
         rejects("42P13", "return type mismatch in function declared to return record",
                 "SELECT * FROM qcv_setof_rec() AS t(x int, y int, z int)");
         rejects("42703", "could not identify column \"y\" in record data type",

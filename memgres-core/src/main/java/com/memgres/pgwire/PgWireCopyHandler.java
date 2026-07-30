@@ -739,6 +739,12 @@ class PgWireCopyHandler {
                 i++;
             }
         }
+        if (inQuote) {
+            // The input ran out with a quote still open, so the last field never ended. There is
+            // no row here to store: the remainder of the input is the inside of a field whose
+            // closing quote the sender did not write.
+            throw new com.memgres.engine.MemgresException("unterminated CSV quoted field", "22P04");
+        }
         if (current.length() > 0) {
             lines.add(current.toString());
         }

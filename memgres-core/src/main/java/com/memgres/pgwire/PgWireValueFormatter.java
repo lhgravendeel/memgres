@@ -423,7 +423,7 @@ class PgWireValueFormatter {
      * element row's own {@code typelem} is 0 (it isn't an array). See
      * {@code CatalogCoreBuilder.buildPgType} for the matching synthesized pg_type array row.
      */
-    private static int columnTypeOid(DataType colType, Column col, Session session) {
+    static int columnTypeOid(DataType colType, Column col, Session session) {
         if (colType == DataType.ENUM && session != null && col.getEnumTypeName() != null) {
             String key = "type:" + col.getEnumTypeName();
             if (col.getArrayElementType() == DataType.ENUM) {

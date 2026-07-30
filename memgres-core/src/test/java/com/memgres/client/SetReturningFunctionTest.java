@@ -360,6 +360,7 @@ class SetReturningFunctionTest {
                 "SELECT * FROM srft_rec() AS t(p, q)");
         assertEquals(List.of("1|a"), rows("SELECT * FROM srft_rec() AS t(x int, y text)"));
         assertEquals(List.of("x", "y"), columns("SELECT * FROM srft_rec() AS t(x int, y text)"));
+        // srft_rec is LANGUAGE sql, so PostgreSQL reports the definition rather than a value.
         rejects("42P13", "return type mismatch in function declared to return record",
                 "SELECT * FROM srft_rec() AS t(x int, y int, z int)");
     }
