@@ -2390,7 +2390,7 @@ class DdlObjectExecutor {
         if (stmt.ownedByTable() != null) applySequenceOwnedBy(seq, stmt.ownedByTable(), stmt.ownedByColumn());
         executor.database.addSequence(seq);
         executor.database.markUncommittedObject(seq, executor.session);
-        executor.database.registerSchemaObject(executor.defaultSchema(), "sequence", seqName);
+        executor.database.registerSchemaObject(seqSchema, "sequence", seqName);
         executor.recordUndo(new Session.CreateSequenceUndo(seqName));
         executor.database.setObjectOwner("sequence:" + seqName, executor.sessionUser());
         return QueryResult.message(QueryResult.Type.SET, "CREATE SEQUENCE");
@@ -2469,12 +2469,23 @@ class DdlObjectExecutor {
         // The base type's modifier is resolved after the name collision and before anything is
         // written, so a domain over a width the type could never carry is never created.
         TypeCoercion.checkDeclaredTypeLimits(stmt.baseType());
+        boolean baseIsArray = stmt.baseType().replaceAll("\\(.*\\)", "").trim().endsWith("[]");
         String baseTypeName = stmt.baseType().replaceAll("\\(.*\\)", "").trim().replace("[]", "").trim();
         DataType baseType = DataType.fromPgName(baseTypeName);
         if (baseType == null) {
             DomainType parent = executor.database.getDomain(baseTypeName);
             if (parent != null) baseType = parent.getBaseType();
             else throw PgErrors.undefinedObject("type", baseTypeName);
+        }
+        // A domain over an array is a domain over the array type, not over its element: the
+        // catalogs describe it as integer[] and a column of it holds an array.
+        DataType elementType = null;
+        if (baseIsArray) {
+            DataType arrayType = DataType.arrayOf(baseType);
+            if (arrayType != null) {
+                elementType = baseType;
+                baseType = arrayType;
+            }
         }
         if (stmt.collation() != null && !isCollatable(baseType)) {
             throw PgErrors.datatypeMismatch(
@@ -2484,24 +2495,50 @@ class DdlObjectExecutor {
 
         String checkExprStr = stmt.checkExpr() != null ? stmt.checkExpr().toString() : null;
         // If constraint has explicit name, store as named constraint; otherwise store as inline
+        DomainType domain;
         if (stmt.constraintName() != null && stmt.checkExpr() != null) {
-            DomainType domain = new DomainType(
+            domain = new DomainType(
                     stmt.name(), baseType, baseTypeName, stmt.notNull(),
                     null, null,
                     stmt.defaultExpr() != null ? DdlExecutor.exprToDefaultString(stmt.defaultExpr()) : null
             );
             domain.addConstraint(stmt.constraintName(), checkExprStr, stmt.checkExpr());
-            executor.database.addDomain(domain);
         } else {
-            executor.database.addDomain(new DomainType(
+            domain = new DomainType(
                     stmt.name(), baseType, baseTypeName, stmt.notNull(),
                     checkExprStr,
                     stmt.checkExpr(),
                     stmt.defaultExpr() != null ? DdlExecutor.exprToDefaultString(stmt.defaultExpr()) : null
-            ));
+            );
         }
-        executor.database.registerSchemaObject(executor.defaultSchema(), "domain", stmt.name());
+        // Keep the base type's modifier: information_schema.domains describes a domain the way
+        // it describes a column, so varchar(12) has to know it is twelve characters wide.
+        int[] typmod = parseTypmod(stmt.baseType());
+        domain.setTypmod(typmod[0] < 0 ? null : Integer.valueOf(typmod[0]),
+                typmod[1] < 0 ? null : Integer.valueOf(typmod[1]));
+        domain.setBaseTypeFacts(DataType.intervalQualifier(stmt.baseType()), elementType);
+        String domainSchema = stmt.schemaName() != null ? stmt.schemaName() : executor.defaultSchema();
+        domain.setSchemaName(domainSchema);
+        executor.database.addDomain(domain);
+        executor.database.registerSchemaObject(domainSchema, "domain", stmt.name());
         return QueryResult.message(QueryResult.Type.SET, "CREATE DOMAIN");
+    }
+
+    /** The {@code (p)} or {@code (p,s)} written after a type name, as {p, s} with -1 for absent. */
+    private static int[] parseTypmod(String declaredType) {
+        int[] out = {-1, -1};
+        if (declaredType == null) return out;
+        int open = declaredType.indexOf('(');
+        int close = declaredType.indexOf(')', open + 1);
+        if (open < 0 || close < 0) return out;
+        String[] parts = declaredType.substring(open + 1, close).split(",");
+        try {
+            out[0] = Integer.parseInt(parts[0].trim());
+            if (parts.length > 1) out[1] = Integer.parseInt(parts[1].trim());
+        } catch (NumberFormatException ignored) {
+            return new int[]{-1, -1};
+        }
+        return out;
     }
 
     /**
@@ -2662,6 +2699,9 @@ class DdlObjectExecutor {
                 DomainType renamed = new DomainType(newName, domain.getBaseType(),
                         domain.getBaseTypeName(), domain.isNotNull(), domain.getCheckExpression(),
                         domain.getParsedCheck(), domain.getDefaultValue());
+                renamed.setTypmod(domain.getPrecision(), domain.getScale());
+                renamed.setBaseTypeFacts(domain.getIntervalQualifier(), domain.getArrayElementType());
+                renamed.setSchemaName(domain.getSchemaName());
                 for (DomainType.NamedConstraint nc : domain.getNamedConstraints()) {
                     renamed.addConstraint(nc.name(), nc.rawCheckExpr(), nc.parsedCheck(),
                             nc.isValidated());

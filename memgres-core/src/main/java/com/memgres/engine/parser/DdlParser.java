@@ -1279,7 +1279,11 @@ class DdlParser {
 
     CreateDomainStmt parseCreateDomain() {
         String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
+        String schema = null;
+        if (parser.match(TokenType.DOT)) {
+            schema = name;
+            name = parser.readIdentifier();
+        }
         parser.expectKeyword("AS");
         String baseType = parser.parseTypeName();
         Expression defaultExpr = null;
@@ -1323,6 +1327,7 @@ class DdlParser {
         CreateDomainStmt domainStmt =
                 new CreateDomainStmt(name, baseType, defaultExpr, notNull, checkExpr, constraintName);
         domainStmt.setCollation(collation);
+        domainStmt.setSchemaName(schema);
         return domainStmt;
     }
 

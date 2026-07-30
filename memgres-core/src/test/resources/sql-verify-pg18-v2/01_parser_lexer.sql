@@ -50,7 +50,7 @@ SELECT ,1;
 SELECT 1 1;
 SELECT (1;
 SELECT 1);
-SELECT FROM pg_class;
+SELECT FROM pg_class WHERE relname = 'pg_class';
 SELECT 1 FROM FROM pg_class;
 SELECT SELECT 1;
 INSERT INTO "MixedCase" VALUES (1,2,3,);

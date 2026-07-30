@@ -515,9 +515,14 @@ public final class TypeCoercion {
             }
             return rounded;
         }
-        // interval(n): the column keeps only n fractional digits of its seconds
-        if (type == DataType.INTERVAL && column.getPrecision() != null && value instanceof PgInterval) {
-            IntervalTypmod typmod = IntervalTypmod.fromTypeSpec("interval(" + column.getPrecision() + ")");
+        // interval day to second(n): the column keeps only the fields its qualifier reaches, and
+        // only n fractional digits of its seconds — the same modifier a cast to the type applies.
+        if (type == DataType.INTERVAL && value instanceof PgInterval
+                && (column.getPrecision() != null || column.getIntervalQualifier() != null)) {
+            StringBuilder spec = new StringBuilder("interval");
+            if (column.getIntervalQualifier() != null) spec.append(' ').append(column.getIntervalQualifier());
+            if (column.getPrecision() != null) spec.append('(').append(column.getPrecision()).append(')');
+            IntervalTypmod typmod = IntervalTypmod.fromTypeSpec(spec.toString());
             if (typmod != null) return typmod.apply((PgInterval) value);
         }
         // BIT(n) / VARBIT(n) length enforcement

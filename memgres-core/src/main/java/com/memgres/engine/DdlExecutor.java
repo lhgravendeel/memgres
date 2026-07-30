@@ -179,10 +179,20 @@ class DdlExecutor {
 
     /** Convert a TableConstraint AST node to a StoredConstraint. */
     StoredConstraint convertTableConstraint(String tableName, TableConstraint tc) {
+        return convertTableConstraint(tableName, tc, null);
+    }
+
+    /**
+     * Convert a TableConstraint AST node to a StoredConstraint. When {@code existing} is given,
+     * a name PostgreSQL would have chosen is made unique against the constraints already on the
+     * table the way PG does it — by appending 1, 2, ... — so two unnamed CHECKs on the same
+     * table do not end up sharing a name that DROP CONSTRAINT could not tell apart.
+     */
+    StoredConstraint convertTableConstraint(String tableName, TableConstraint tc, Table existing) {
         String name = tc.name();
         switch (tc.type()) {
             case PRIMARY_KEY: {
-                if (name == null) name = tableName + "_pkey";
+                if (name == null) name = uniqueConstraintName(tableName + "_pkey", existing);
                 // A key is stored as an index, so it is bounded by what an index tuple holds.
                 DdlIndexValidator.checkIndexColumnCount(tc.columns(), null);
                 StoredConstraint pk = StoredConstraint.primaryKey(name, resolveConstraintColumns(tc.columns()));
@@ -195,7 +205,10 @@ class DdlExecutor {
             case UNIQUE: {
                 DdlIndexValidator.checkIndexColumnCount(tc.columns(), null);
                 List<String> cols = resolveConstraintColumns(tc.columns());
-                if (name == null) name = tableName + "_" + String.join("_", cols) + "_key";
+                if (name == null) {
+                    name = uniqueConstraintName(
+                            tableName + "_" + String.join("_", cols) + "_key", existing);
+                }
                 StoredConstraint sc = StoredConstraint.unique(name, cols);
                 // For expression-based UNIQUE constraints (e.g. UNIQUE (id, (data->>'k'))),
                 // parse every column entry (plain identifiers included) as an expression so
@@ -227,13 +240,15 @@ class DdlExecutor {
             }
             case CHECK: {
                 if (name == null) {
-                    // PG uses {table}_{col}_check for inline column CHECK constraints
-                    List<String> checkCols = tc.columns();
-                    if (checkCols != null && !checkCols.isEmpty()) {
-                        name = tableName + "_" + String.join("_", checkCols) + "_check";
-                    } else {
-                        name = tableName + "_check";
-                    }
+                    // PG names an unnamed CHECK after the one column its expression mentions —
+                    // {table}_{col}_check — and after the table alone when it mentions none or
+                    // several. Which columns those are comes from the expression, not from where
+                    // the constraint was written, so a table-level CHECK on one column is named
+                    // the same as if it had been written on the column.
+                    List<String> checkCols = referencedColumnNames(tc.checkExpr());
+                    name = uniqueConstraintName(checkCols.size() == 1
+                            ? tableName + "_" + checkCols.get(0) + "_check"
+                            : tableName + "_check", existing);
                 }
                 StoredConstraint chk = StoredConstraint.check(name, tc.checkExpr());
                 if (tc.notEnforced()) chk.setNotEnforced(true);
@@ -355,6 +370,21 @@ class DdlExecutor {
             this.domainNotNull = domainNotNull;
         }
 
+        /** The base type's modifier when the column was declared with a domain, else null. */
+        private Integer domainPrecision;
+        private Integer domainScale;
+        private String domainIntervalQualifier;
+
+        void setDomainTypmod(Integer precision, Integer scale, String intervalQualifier) {
+            this.domainPrecision = precision;
+            this.domainScale = scale;
+            this.domainIntervalQualifier = intervalQualifier;
+        }
+
+        public Integer domainPrecision() { return domainPrecision; }
+        public Integer domainScale() { return domainScale; }
+        public String domainIntervalQualifier() { return domainIntervalQualifier; }
+
         public DataType dataType() { return dataType; }
         public String enumTypeName() { return enumTypeName; }
         public String domainTypeName() { return domainTypeName; }
@@ -422,6 +452,9 @@ class DdlExecutor {
         String domainTypeName = null;
         String compositeTypeName = null;
         boolean domainNotNull = false;
+        Integer domainPrecision = null;
+        Integer domainScale = null;
+        String domainInterval = null;
 
         if (dataType == null) {
             if (executor.database.isCustomEnum(baseType)) {
@@ -442,6 +475,13 @@ class DdlExecutor {
                 dataType = domain.getBaseType();
                 domainTypeName = baseType;
                 domainNotNull = domain.isNotNull();
+                // A column declared with a domain is a column of the domain's base type, width
+                // and all: varchar(9) refuses a tenth character whether the nine were written
+                // on the column or on the domain it was declared with.
+                domainPrecision = domain.getPrecision();
+                domainScale = domain.getScale();
+                domainInterval = domain.getIntervalQualifier();
+                if (domain.getArrayElementType() != null) arrayElementType = domain.getArrayElementType();
             } else if (executor.database.isCompositeType(baseType)) {
                 dataType = DataType.TEXT;
                 compositeTypeName = baseType;
@@ -453,7 +493,10 @@ class DdlExecutor {
             }
         }
 
-        return new ResolvedType(dataType, enumTypeName, domainTypeName, compositeTypeName, arrayElementType, domainNotNull);
+        ResolvedType resolved = new ResolvedType(dataType, enumTypeName, domainTypeName,
+                compositeTypeName, arrayElementType, domainNotNull);
+        resolved.setDomainTypmod(domainPrecision, domainScale, domainInterval);
+        return resolved;
     }
 
     // ---- Static helpers ----
@@ -945,6 +988,37 @@ class DdlExecutor {
 
     static boolean isSqlKeywordOrFunction(String ident) {
         return SQL_KEYWORDS_AND_FUNCTIONS.contains(ident.toLowerCase());
+    }
+
+    /** {@code base}, or base with the lowest suffix from 1 upwards that the table does not use. */
+    private static String uniqueConstraintName(String base, Table existing) {
+        if (existing == null) return base;
+        String candidate = base;
+        for (int n = 1; taken(candidate, existing); n++) {
+            candidate = base + n;
+        }
+        return candidate;
+    }
+
+    private static boolean taken(String name, Table table) {
+        for (StoredConstraint sc : table.getConstraints()) {
+            if (sc.getName() != null && sc.getName().equalsIgnoreCase(name)) return true;
+        }
+        return false;
+    }
+
+    /** The distinct column names an expression mentions, in the order they first appear. */
+    static List<String> referencedColumnNames(Expression expr) {
+        final List<String> names = new ArrayList<>();
+        if (expr == null) return names;
+        AstWalk.forEach(expr, new java.util.function.Consumer<Object>() {
+            @Override public void accept(Object node) {
+                if (!(node instanceof ColumnRef)) return;
+                String column = ((ColumnRef) node).column;
+                if (column != null && !names.contains(column)) names.add(column);
+            }
+        });
+        return names;
     }
 
     private List<String> resolveConstraintColumns(List<String> columns) {

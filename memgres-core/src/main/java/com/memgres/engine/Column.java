@@ -27,6 +27,13 @@ public class Column {
     private String attStorageOverride;  // pg_attribute.attstorage override (null = use type default)
     private String attCompression = "";  // pg_attribute.attcompression (empty = default, "p" = pglz, "l" = lz4)
     private boolean attHasMissing;       // pg_attribute.atthasmissing (true when added via ALTER TABLE ADD COLUMN with DEFAULT)
+    /**
+     * The field qualifier of an interval column, lower case and without its precision:
+     * "year to month", "day to second". Null for every other column, and for a plain interval.
+     * The qualifier is part of the type modifier rather than of the type, so it travels here
+     * alongside the precision instead of turning "interval day" into a type of its own.
+     */
+    private String intervalQualifier;
 
     public Column(String name, DataType type, boolean nullable, boolean primaryKey, String defaultValue) {
         this(name, type, nullable, primaryKey, defaultValue, null, null, null, null, null, null, null);
@@ -98,6 +105,7 @@ public class Column {
         c.attStorageOverride = attStorageOverride;
         c.attCompression = attCompression;
         c.attHasMissing = attHasMissing;
+        c.intervalQualifier = intervalQualifier;
     }
 
     /** Copy of this column with a new name; every other attribute is preserved. */
@@ -147,6 +155,7 @@ public class Column {
         Column c = new Column(name, newType, nullable, primaryKey, defaultValue, newEnumTypeName,
                 newPrecision, newScale, generatedExpr, virtual, null, null, newArrayElementType);
         copyRuntimeAttrsTo(c);
+        c.intervalQualifier = null;  // the new declaration carries its own qualifier, if any
         c.parsedDefaultExpr = parsedDefaultExpr;
         return c;
     }
@@ -182,6 +191,8 @@ public class Column {
     public void setAttStorageOverride(String attStorageOverride) { this.attStorageOverride = attStorageOverride; }
     public String getAttCompression() { return attCompression; }
     public void setAttCompression(String attCompression) { this.attCompression = attCompression; }
+    public String getIntervalQualifier() { return intervalQualifier; }
+    public void setIntervalQualifier(String intervalQualifier) { this.intervalQualifier = intervalQualifier; }
     public boolean isAttHasMissing() { return attHasMissing; }
     public void setAttHasMissing(boolean attHasMissing) { this.attHasMissing = attHasMissing; }
 }

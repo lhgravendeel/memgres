@@ -379,6 +379,11 @@ class UtilityParser {
                         val.setLength(val.length() - 1);
                     }
                     val.append(", ");
+                } else if (val.length() == 0
+                        && (tok.type() == TokenType.MINUS || tok.type() == TokenType.PLUS)) {
+                    // The sign of a number belongs to it. Appending a space after every token
+                    // turned "= -15" into "- 15", which is not a number any setting will take.
+                    val.append(tok.value());
                 } else {
                     val.append(tok.value()).append(" ");
                 }
@@ -392,7 +397,13 @@ class UtilityParser {
         // SET name value (e.g., SET TIMEZONE 'UTC')
         StringBuilder val = new StringBuilder();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
-            val.append(parser.advance().value()).append(" ");
+            Token tok = parser.advance();
+            if (val.length() == 0
+                    && (tok.type() == TokenType.MINUS || tok.type() == TokenType.PLUS)) {
+                val.append(tok.value());
+            } else {
+                val.append(tok.value()).append(" ");
+            }
         }
         return new SetStmt(name, val.toString().trim(), isLocal);
     }

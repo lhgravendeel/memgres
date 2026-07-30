@@ -138,7 +138,10 @@ class SessionExecutor {
                 List<Object[]> rows = new ArrayList<>();
                 if (guc != null) {
                     for (Map.Entry<String, String> e : guc.getAll().entrySet()) {
-                        rows.add(new Object[]{e.getKey(), e.getValue(), ""});
+                        GucSettings.Def def = GucSettings.definition(e.getKey());
+                        rows.add(new Object[]{guc.getCanonicalName(e.getKey()),
+                                guc.getForDisplay(e.getKey()),
+                                def != null && def.shortDesc != null ? def.shortDesc : ""});
                     }
                 }
                 return QueryResult.select(cols, rows);
@@ -956,14 +959,20 @@ class SessionExecutor {
             }
             return;
         }
+        // The parameter's own definition decides what may be assigned to it: a preset cannot be
+        // set at all, an enum takes one of its listed values, and a number has to land inside the
+        // range pg_settings reports. Only the settings memgres carries no definition for, and the
+        // few whose spelling needs its own reading, are judged below.
+        GucSettings.checkAssignable(lname, value);
+        boolean defined = GucSettings.definition(lname) != null;
         // Boolean parameters — includes row_security, jit, synchronize_seqscans, etc.
-        if (lname.equals("enable_seqscan") || lname.equals("enable_hashjoin") || lname.equals("enable_indexscan")
+        if (!defined && (lname.equals("enable_seqscan") || lname.equals("enable_hashjoin") || lname.equals("enable_indexscan")
                 || lname.startsWith("enable_") || lname.equals("fsync") || lname.equals("log_checkpoints")
                 || lname.equals("log_connections") || lname.equals("log_disconnections")
                 || lname.equals("row_security") || lname.equals("jit")
                 || lname.equals("synchronize_seqscans") || lname.equals("check_function_bodies")
                 || lname.equals("synchronous_commit") || lname.equals("ssl")
-                || lname.equals("parallel_leader_participation")) {
+                || lname.equals("parallel_leader_participation"))) {
             String lv = value.toLowerCase().trim();
             if (!lv.equals("on") && !lv.equals("off") && !lv.equals("true") && !lv.equals("false")
                     && !lv.equals("yes") && !lv.equals("no") && !lv.equals("1") && !lv.equals("0")) {
@@ -1003,8 +1012,8 @@ class SessionExecutor {
             return;
         }
         // statement_timeout / lock_timeout / timeout params: must be numeric or have valid unit
-        if (lname.equals("statement_timeout") || lname.equals("lock_timeout")
-                || lname.equals("idle_in_transaction_session_timeout") || lname.equals("transaction_timeout")) {
+        if (!defined && (lname.equals("statement_timeout") || lname.equals("lock_timeout")
+                || lname.equals("idle_in_transaction_session_timeout") || lname.equals("transaction_timeout"))) {
             long ms = GucSettings.parseTimeoutMillis(value);
             if (ms < 0) {
                 throw new MemgresException("invalid value for parameter \"" + name + "\": \"" + value + "\"", "22023");
@@ -1012,10 +1021,10 @@ class SessionExecutor {
             return;
         }
         // Memory / integer parameters (accept numbers with optional unit like MB, kB, etc.)
-        if (lname.equals("work_mem") || lname.equals("maintenance_work_mem") || lname.equals("shared_buffers")
+        if (!defined && (lname.equals("work_mem") || lname.equals("maintenance_work_mem") || lname.equals("shared_buffers")
                 || lname.equals("effective_cache_size") || lname.equals("max_connections")
                 || lname.equals("max_wal_size") || lname.equals("min_wal_size")
-                || lname.endsWith("_mem") || lname.endsWith("_buffers")) {
+                || lname.endsWith("_mem") || lname.endsWith("_buffers"))) {
             String trimmed = value.trim().replaceAll("\\s*(kB|MB|GB|TB|B)$", "");
             try {
                 Long.parseLong(trimmed);

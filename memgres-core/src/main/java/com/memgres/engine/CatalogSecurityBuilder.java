@@ -42,83 +42,33 @@ class CatalogSecurityBuilder {
                 col("sourceline", DataType.INTEGER)
         );
         Table table = new Table("pg_settings", cols);
-        GucSettings defaults = new GucSettings();
-        Map<String, String> all = defaults.getAll();
-        // If session GUC is provided, merge session overrides so new keys appear too
-        if (sessionGuc != null) {
-            for (Map.Entry<String, String> e : sessionGuc.getAll().entrySet()) {
-                if (!all.containsKey(e.getKey())) {
-                    all.put(e.getKey(), e.getValue());
-                }
-            }
-        }
-        // Category and description info for well-known settings
-        Map<String, String[]> meta = new LinkedHashMap<>();
-        meta.put("server_version", new String[]{"Preset Options", "Shows the server version.", "internal", "string"});
-        meta.put("server_version_num", new String[]{"Preset Options", "Shows the server version as an integer.", "internal", "integer"});
-        meta.put("server_encoding", new String[]{"Client Connection Defaults", "Shows the server (database) character set encoding.", "internal", "string"});
-        meta.put("client_encoding", new String[]{"Client Connection Defaults", "Sets the client's character set encoding.", "user", "string"});
-        meta.put("search_path", new String[]{"Client Connection Defaults", "Sets the schema search order for names that are not schema-qualified.", "user", "string"});
-        meta.put("timezone", new String[]{"Client Connection Defaults / Locale and Formatting", "Sets the time zone for displaying and interpreting time stamps.", "user", "string"});
-        meta.put("datestyle", new String[]{"Client Connection Defaults / Locale and Formatting", "Sets the display format for date and time values.", "user", "string"});
-        meta.put("intervalstyle", new String[]{"Client Connection Defaults / Locale and Formatting", "Sets the display format for interval values.", "user", "string"});
-        meta.put("standard_conforming_strings", new String[]{"Version and Platform Compatibility", "Causes '...' strings to treat backslashes literally.", "user", "bool"});
-        meta.put("max_connections", new String[]{"Connections and Authentication", "Sets the maximum number of concurrent connections.", "postmaster", "integer"});
-        meta.put("shared_buffers", new String[]{"Resource Usage / Memory", "Sets the number of shared memory buffers used by the server.", "postmaster", "string"});
-        meta.put("work_mem", new String[]{"Resource Usage / Memory", "Sets the maximum memory to be used for query workspaces.", "user", "string"});
-        meta.put("default_transaction_isolation", new String[]{"Client Connection Defaults", "Sets the transaction isolation level of each new transaction.", "user", "enum"});
-        meta.put("transaction_isolation", new String[]{"Client Connection Defaults", "Sets the current transaction's isolation level.", "user", "enum"});
-        meta.put("lc_collate", new String[]{"Preset Options", "Shows the collation order locale.", "internal", "string"});
-        meta.put("lc_ctype", new String[]{"Preset Options", "Shows the character classification and case conversion locale.", "internal", "string"});
-        // Unit metadata for known parameters
-        Map<String, String> units = new LinkedHashMap<>();
-        units.put("shared_buffers", "8kB");
-        units.put("work_mem", "kB");
-        units.put("maintenance_work_mem", "kB");
-        units.put("effective_cache_size", "8kB");
-        units.put("statement_timeout", "ms");
-        units.put("lock_timeout", "ms");
-        units.put("idle_in_transaction_session_timeout", "ms");
-        units.put("transaction_timeout", "ms");
-        units.put("track_activity_query_size", "B");
-        // min_val / max_val for bounded numeric parameters
-        Map<String, String[]> bounds = new LinkedHashMap<>();
-        // bounds: [min_val, max_val]
-        bounds.put("work_mem", new String[]{"64", "2147483647"});
-        bounds.put("maintenance_work_mem", new String[]{"1024", "2147483647"});
-        bounds.put("shared_buffers", new String[]{"16", "1073741823"});
-        bounds.put("effective_cache_size", new String[]{"1", "2147483647"});
-        bounds.put("max_connections", new String[]{"1", "262143"});
-        bounds.put("statement_timeout", new String[]{"0", "2147483647"});
-        bounds.put("lock_timeout", new String[]{"0", "2147483647"});
-        bounds.put("idle_in_transaction_session_timeout", new String[]{"0", "2147483647"});
-        // enumvals for enum parameters
-        Map<String, String> enumvals = new LinkedHashMap<>();
-        enumvals.put("client_min_messages", "{debug5,debug4,debug3,debug2,debug1,log,notice,warning,error}");
-        enumvals.put("log_min_messages", "{debug5,debug4,debug3,debug2,debug1,info,notice,warning,error,log,fatal,panic}");
-        enumvals.put("default_transaction_isolation", "{serializable,repeatable read,read committed,read uncommitted}");
-        enumvals.put("transaction_isolation", "{serializable,repeatable read,read committed,read uncommitted}");
-        for (Map.Entry<String, String> entry : all.entrySet()) {
+        GucSettings guc = sessionGuc != null ? sessionGuc : new GucSettings();
+        for (Map.Entry<String, String> entry : guc.getAll().entrySet()) {
             String name = entry.getKey();
-            String bootValue = entry.getValue();
-            // If session GUC is available, use the session's current value for 'setting'
-            String settingValue = (sessionGuc != null) ? sessionGuc.get(name) : bootValue;
-            if (settingValue == null) settingValue = bootValue;
-            String source = (sessionGuc != null && sessionGuc.hasSessionOverride(name)) ? "session" : "default";
-            String[] m = meta.get(name);
-            String category = m != null ? m[0] : "Ungrouped";
-            String desc = m != null ? m[1] : "";
-            String ctx = m != null ? m[2] : "user";
-            String vartype = m != null ? m[3] : "string";
-            String unit = units.get(name);
-            String[] bound = bounds.get(name);
-            String minVal = bound != null ? bound[0] : null;
-            String maxVal = bound != null ? bound[1] : null;
-            String enumval = enumvals.get(name);
+            // The metadata travels with the setting's own definition, so a parameter answers
+            // for its own type, context and bounds rather than for settings in general.
+            GucSettings.Def def = GucSettings.definition(name);
+            String settingValue = guc.get(name);
+            if (settingValue == null) settingValue = entry.getValue();
+            String resetValue = def != null ? guc.getResetValue(name) : settingValue;
+            if (resetValue == null) resetValue = settingValue;
+            String source = guc.hasSessionOverride(name) ? "session" : "default";
             // L12: PG exposes mixed-case canonical names (e.g. TimeZone, DateStyle)
             // in pg_settings.name.
-            String displayName = defaults.getCanonicalName(name);
-            table.insertRow(new Object[]{displayName, settingValue, unit, category, desc, null, ctx, vartype, source, minVal, maxVal, enumval, bootValue, bootValue, false, null, null});
+            String displayName = guc.getCanonicalName(name);
+            table.insertRow(new Object[]{displayName, settingValue,
+                    def != null ? def.unit : null,
+                    def != null ? def.category : "Customized Options",
+                    def != null ? def.shortDesc : null,
+                    null,
+                    def != null ? def.context : "user",
+                    def != null ? def.vartype : "string",
+                    source,
+                    def != null ? def.minVal : null,
+                    def != null ? def.maxVal : null,
+                    def != null ? def.enumVals : null,
+                    def != null ? def.bootVal : settingValue,
+                    resetValue, false, null, null});
         }
         return table;
     }

@@ -609,9 +609,14 @@ class DdlAlterTableExecutor {
         // (DdlTableExecutor) — hardcoding them to null made an ALTER-added "enum_type[]" column
         // indistinguishable from a scalar enum column, so PgWireValueFormatter.columnTypeOid
         // advertised the enum element's OID instead of the array type's.
+        Integer addPrecision = def.precision() != null ? def.precision() : resolved.domainPrecision();
+        Integer addScale = def.scale() != null ? def.scale() : resolved.domainScale();
         Column col = new Column(def.name(), dt, !notNull, def.primaryKey(), defaultVal,
-                enumTypeName, def.precision(), def.scale(), genExpr, def.generatedVirtual(), domainTypeName,
+                enumTypeName, addPrecision, addScale, genExpr, def.generatedVirtual(), domainTypeName,
                 compositeTypeName, arrayElementType);
+        String addQualifier = DataType.intervalQualifier(def.typeName());
+        col.setIntervalQualifier(addQualifier != null ? addQualifier
+                : resolved.domainIntervalQualifier());
         // Don't pre-evaluate serial/nextval/identity defaults — they are evaluated per-row below.
         // Likewise, other VOLATILE defaults (random(), gen_random_uuid(), ...) must produce a
         // distinct value per existing row, matching PG's table rewrite. STABLE functions such as
@@ -874,7 +879,7 @@ class DdlAlterTableExecutor {
                         && viewSql.toLowerCase().contains(colName)) {
                     throw new MemgresException("cannot drop column \"" + dropCol.column()
                             + "\" of table \"" + stmt.table()
-                            + "\" because view \"" + viewEntry.getKey() + "\" depends on it", "42P16");
+                            + "\" because view \"" + viewEntry.getValue().name() + "\" depends on it", "42P16");
                 }
             }
             // FOREIGN KEY constraints (on any table, including self-references) whose REFERENCED
@@ -1306,6 +1311,7 @@ class DdlAlterTableExecutor {
                     stmt.table(), schemaName);
             table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
             Column newCol = table.getColumns().get(convIdx);
+            newCol.setIntervalQualifier(DataType.intervalQualifier(setType.typeName()));
             for (int ri = 0; ri < table.getRows().size(); ri++) {
                 Object[] row = table.getRows().get(ri);
                 row[convIdx] = convertedValues[ri] != null
@@ -1315,6 +1321,7 @@ class DdlAlterTableExecutor {
         } else {
             table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
             Column newCol = table.getColumns().get(convIdx);
+            newCol.setIntervalQualifier(DataType.intervalQualifier(setType.typeName()));
             for (Object[] row : table.getRows()) {
                 if (row[convIdx] != null) {
                     row[convIdx] = TypeCoercion.coerceForStorage(row[convIdx], newCol);
@@ -1629,7 +1636,7 @@ class DdlAlterTableExecutor {
             String idxName = rawCols.get(0).substring("__using_index__:".length());
             table.removeConstraint(idxName);
         }
-        StoredConstraint sc = ddl.convertTableConstraint(stmt.table(), addConstraint.constraint());
+        StoredConstraint sc = ddl.convertTableConstraint(stmt.table(), addConstraint.constraint(), table);
         if (sc != null && isUsingIndex) {
             sc.setPromotedFromIndex(true);
         }

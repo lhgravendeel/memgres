@@ -260,6 +260,7 @@ public class ExpressionParser {
 
     protected String parseTypeName() {
         StringBuilder sb = new StringBuilder();
+        boolean qualified = false;  // an interval field qualifier has already taken its precision
         String name = readIdentifier();
         // Handle schema-qualified types: schema.typename (strip schema prefix)
         if (check(TokenType.DOT)) {
@@ -294,11 +295,8 @@ public class ExpressionParser {
             // The qualifier is part of the type's identity, so it is spelled one way regardless
             // of how it was written: "interval day to second", never "interval day TO second".
             if (checkIntervalField()) {
-                sb.append(" ").append(advance().value().toLowerCase()); // consume field keyword
-                if (checkKeyword("TO") || checkIdentCI("TO")) {
-                    advance(); // consume TO
-                    sb.append(" to ").append(readIdentifier().toLowerCase());
-                }
+                parseIntervalQualifier(sb);
+                qualified = true;
             }
         } else if (name.equalsIgnoreCase("BIT") && checkKeyword("VARYING")) {
             sb.append(" ").append(advance().value());
@@ -306,6 +304,11 @@ public class ExpressionParser {
 
         // Handle precision: (N) or (N,M), for types not already handled above
         // PG allows negative scale in numeric(p,s), e.g. numeric(10,-2) rounds to hundreds
+        if (qualified && check(TokenType.LEFT_PAREN)) {
+            // Only SECOND carries a precision, and parseIntervalQualifier has already taken it,
+            // so a parenthesis here is the one PostgreSQL points at.
+            throw ParseException.at(peek());
+        }
         if (check(TokenType.LEFT_PAREN)) {
             advance();
             sb.append("(");
@@ -337,6 +340,54 @@ public class ExpressionParser {
         }
 
         return sb.toString();
+    }
+
+    /**
+     * The field qualifier written after {@code interval}, appended to {@code sb} in the one
+     * spelling information_schema reports.
+     *
+     * <p>SQL names the pairs a qualifier may span, and PostgreSQL's grammar names them one by
+     * one: a range runs from the larger field to a smaller one, never the other way and never
+     * across a gap, so {@code interval hour to year} and {@code interval second to day} are
+     * syntax errors rather than types that do not exist. A precision belongs to SECOND alone,
+     * which is why {@code interval year(2)} is a syntax error at the parenthesis.
+     */
+    private void parseIntervalQualifier(StringBuilder sb) {
+        String first = advance().value().toLowerCase();
+        sb.append(" ").append(first);
+        if (first.equals("second")) {
+            appendIntervalPrecision(sb);
+            return;
+        }
+        if (!checkKeyword("TO") && !checkIdentCI("TO")) return;
+        Token to = peek();
+        String[] allowed;
+        if (first.equals("year")) allowed = new String[]{"month"};
+        else if (first.equals("day")) allowed = new String[]{"hour", "minute", "second"};
+        else if (first.equals("hour")) allowed = new String[]{"minute", "second"};
+        else if (first.equals("minute")) allowed = new String[]{"second"};
+        else allowed = new String[0];
+        if (allowed.length == 0) throw ParseException.at(to);
+        advance();  // consume TO
+        Token endTok = peek();
+        String end = checkIntervalField() ? endTok.value().toLowerCase() : null;
+        boolean ok = false;
+        for (int i = 0; i < allowed.length; i++) {
+            if (allowed[i].equals(end)) ok = true;
+        }
+        if (!ok) throw ParseException.at(endTok);
+        advance();
+        sb.append(" to ").append(end);
+        if ("second".equals(end)) appendIntervalPrecision(sb);
+    }
+
+    /** The optional precision SECOND takes, appended to {@code sb} when it is written. */
+    private void appendIntervalPrecision(StringBuilder sb) {
+        if (!check(TokenType.LEFT_PAREN)) return;
+        advance();
+        sb.append("(").append(advance().value());
+        expect(TokenType.RIGHT_PAREN);
+        sb.append(")");
     }
 
     // ---- Order by parsing (used by both expression and statement parsing) ----
