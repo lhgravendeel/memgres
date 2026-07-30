@@ -671,7 +671,29 @@ class CatalogConstraintBuilder {
                     "1", "O", true, null, null, 1
             });
         }
+        // A rule written with CREATE RULE is a row here too, and it is the only place a client can
+        // learn that a relation carries one.
+        for (java.util.Map.Entry<String, String[]> entry : database.getRuleDefinitions().entrySet()) {
+            String ruleName = entry.getKey();
+            String relName = entry.getValue()[0];
+            int relOid = oids.oid("rel:public." + relName);
+            table.insertRow(new Object[]{
+                    oids.oid("rule:" + ruleName + "_" + relName), ruleName, relOid,
+                    ruleEventType(entry.getValue()[2]), "O", "t".equals(entry.getValue()[3]),
+                    null, null, 1
+            });
+        }
         return table;
+    }
+
+    /** The code {@code pg_rewrite.ev_type} gives an event, as PostgreSQL numbers them. */
+    static String ruleEventType(String event) {
+        if (event == null) return "1";
+        if ("SELECT".equalsIgnoreCase(event)) return "1";
+        if ("UPDATE".equalsIgnoreCase(event)) return "2";
+        if ("INSERT".equalsIgnoreCase(event)) return "3";
+        if ("DELETE".equalsIgnoreCase(event)) return "4";
+        return "1";
     }
 
     Table buildPgDescription() {

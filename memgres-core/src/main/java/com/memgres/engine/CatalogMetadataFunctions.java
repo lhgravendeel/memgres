@@ -166,6 +166,13 @@ class CatalogMetadataFunctions {
                                 + vSchema + "." + vd.name() + " DO INSTEAD " + pretty + ";";
                     }
                 }
+                // A rule written with CREATE RULE is stored as the text it deparses to.
+                for (java.util.Map.Entry<String, String[]> entry
+                        : executor.database.getRuleDefinitions().entrySet()) {
+                    int rOid = executor.systemCatalog.getOid(
+                            "rule:" + entry.getKey() + "_" + entry.getValue()[0]);
+                    if (rOid == ruleOid) return entry.getValue()[1];
+                }
                 return "";
             }
             case "pg_get_function_sqlbody": {

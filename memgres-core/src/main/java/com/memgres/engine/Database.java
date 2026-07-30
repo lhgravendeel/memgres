@@ -1809,21 +1809,70 @@ public class Database {
     }
 
     public void addRuleDefinition(String ruleName, String table, String definition) {
-        rules.put("def:" + ruleName.toLowerCase(), table.toLowerCase() + "|" + definition);
+        addRuleDefinition(ruleName, table, definition, null, false);
     }
 
+    /**
+     * Remember a rule well enough for the catalogs to describe it. {@code pg_rewrite} reports the
+     * event a rule fires on and whether it replaces the statement, so those are kept beside the
+     * text rather than parsed back out of it.
+     */
+    public void addRuleDefinition(String ruleName, String table, String definition,
+                                  String event, boolean instead) {
+        // pg_class.relhasrules is documented as "has (or once had) rules": PostgreSQL only clears
+        // the flag at VACUUM, so dropping the rule leaves it standing.
+        rules.put("everhad:" + table.toLowerCase(), "t");
+        rules.put("def:" + ruleName.toLowerCase(), table.toLowerCase()
+                + "|" + (event == null ? "" : event.toUpperCase())
+                + "|" + (instead ? "t" : "f")
+                + "|" + definition);
+    }
+
+    /**
+     * Every stored rule, as {@code name -> {table, definition, event, "t"/"f" for INSTEAD}}.
+     * The definition is last because it is the only part that may itself contain the separator.
+     */
     public java.util.Map<String, String[]> getRuleDefinitions() {
         java.util.Map<String, String[]> result = new java.util.LinkedHashMap<>();
         for (java.util.Map.Entry<String, String> e : rules.entrySet()) {
-            if (e.getKey().startsWith("def:")) {
-                String ruleName = e.getKey().substring(4);
-                int pipe = e.getValue().indexOf('|');
-                if (pipe >= 0) {
-                    result.put(ruleName, new String[]{ e.getValue().substring(0, pipe), e.getValue().substring(pipe + 1) });
-                }
+            if (!e.getKey().startsWith("def:")) continue;
+            String ruleName = e.getKey().substring(4);
+            String[] parts = e.getValue().split("\\|", 4);
+            if (parts.length == 4) {
+                result.put(ruleName, new String[]{ parts[0], parts[3], parts[1], parts[2] });
+            } else if (parts.length >= 2) {
+                // A definition stored before the event was kept alongside it.
+                result.put(ruleName, new String[]{ parts[0],
+                        e.getValue().substring(parts[0].length() + 1), "", "f" });
             }
         }
         return result;
+    }
+
+    /** Whether a relation has, or once had, a rule — what {@code relhasrules} reports. */
+    public boolean everHadRules(String table) {
+        return rules.containsKey("everhad:" + table.toLowerCase());
+    }
+
+    /**
+     * Forget every rule a name carried, for a relation newly created under it. Dropping a relation
+     * takes its rules with it in PostgreSQL, so a table created under the same name afterwards
+     * starts with none and with relhasrules false.
+     */
+    public void clearRuleHistory(String table) {
+        String lower = table.toLowerCase();
+        rules.remove("everhad:" + lower);
+        java.util.List<String> gone = new java.util.ArrayList<>();
+        for (java.util.Map.Entry<String, String> e : rules.entrySet()) {
+            String k = e.getKey();
+            if (k.startsWith("name:") && k.endsWith(":" + lower)) {
+                gone.add(k);
+                gone.add("def:" + k.substring(5, k.length() - lower.length() - 1));
+            } else if (k.startsWith(lower + ":") || k.startsWith("off:" + lower + ":")) {
+                gone.add(k);
+            }
+        }
+        for (String k : gone) rules.remove(k);
     }
 
     public String getRule(String table, String event) {
