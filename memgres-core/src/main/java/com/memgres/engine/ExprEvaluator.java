@@ -351,8 +351,10 @@ class ExprEvaluator {
         if (expr instanceof ArraySliceExpr) return executor.arrayOperationHandler.evalArraySlice(((ArraySliceExpr) expr), ctx);
         if (expr instanceof CollateExpr) {
             CollateExpr ce = (CollateExpr) expr;
+            Object collated = evalExpr(ce.expr(), ctx);
+            rejectUncollatableValue(collated);
             validateCollationAtRuntime(ce.collation());
-            return evalExpr(ce.expr(), ctx);
+            return collated;
         }
         if (expr instanceof CompositeStarExpr) return evalExpr(((CompositeStarExpr) expr).expr(), ctx); // expansion handled by SelectExecutor
         if (expr instanceof QualifiedOperatorExpr) return evalQualifiedOperator(((QualifiedOperatorExpr) expr), ctx);
@@ -2927,9 +2929,151 @@ class ExprEvaluator {
         }
     }
 
+    /**
+     * {@code 42804} when COLLATE is written over a value of a type that carries no collation.
+     * Only the string types have one, but the rule here is stated the other way round on purpose:
+     * it fires on the Java classes that name one non-collatable PG type and nothing else, so a
+     * value whose type the engine is unsure of is left alone. Refusing a COLLATE PostgreSQL
+     * performs would break far more than accepting one it refuses.
+     */
+    private static void rejectUncollatableValue(Object value) {
+        String typeName = null;
+        if (value instanceof Short) typeName = "smallint";
+        else if (value instanceof Integer) typeName = "integer";
+        else if (value instanceof Long) typeName = "bigint";
+        else if (value instanceof java.math.BigDecimal
+                || value instanceof java.math.BigInteger) typeName = "numeric";
+        else if (value instanceof Float) typeName = "real";
+        else if (value instanceof Double) typeName = "double precision";
+        else if (value instanceof Boolean) typeName = "boolean";
+        else if (value instanceof java.time.LocalDate) typeName = "date";
+        else if (value instanceof java.time.LocalTime) typeName = "time without time zone";
+        else if (value instanceof java.time.OffsetTime) typeName = "time with time zone";
+        else if (value instanceof java.time.LocalDateTime) typeName = "timestamp without time zone";
+        else if (value instanceof java.time.OffsetDateTime) {
+            typeName = "timestamp with time zone";
+        } else if (value instanceof PgInterval) typeName = "interval";
+        else if (value instanceof byte[]) typeName = "bytea";
+        else if (value instanceof java.util.UUID) typeName = "uuid";
+        else if (value instanceof AstExecutor.PgRow) typeName = "record";
+        else if (value instanceof InetValue) typeName = "inet";
+        if (typeName != null) {
+            throw PgErrors.datatypeMismatch("collations are not supported by type " + typeName);
+        }
+    }
+
+    /**
+     * The type an ordered-set aggregate answers in. {@code mode} and {@code percentile_disc} give
+     * back one of the values they sorted, so they take the ORDER BY expression's own type; the
+     * continuous percentile interpolates, which it can only do in float8 or in interval; and the
+     * hypothetical-set four have fixed types of their own. Described as text the value reached the
+     * client as a string, even though pg_typeof() already answered correctly.
+     */
+    private DataType orderedSetAggResultType(OrderedSetAggExpr osa,
+                                             List<RowContext.TableBinding> bindings) {
+        String name = osa.funcName() == null ? ""
+                : FunctionEvaluator.stripSchemaPrefix(osa.funcName().toLowerCase());
+        if (name.equals("rank") || name.equals("dense_rank")) return DataType.BIGINT;
+        if (name.equals("percent_rank") || name.equals("cume_dist")) {
+            return DataType.DOUBLE_PRECISION;
+        }
+        DataType sorted = null;
+        if (osa.withinGroupOrderBy() != null && !osa.withinGroupOrderBy().isEmpty()) {
+            sorted = inferTypeFromContext(osa.withinGroupOrderBy().get(0).expr(), bindings);
+        }
+        boolean multi = !osa.args().isEmpty() && osa.args().get(0) instanceof ArrayExpr
+                && !((ArrayExpr) osa.args().get(0)).isRow();
+        if (name.equals("percentile_cont")) {
+            // An interval is the one non-float8 type PG can interpolate in; everything else it
+            // accepts at all resolves through double precision.
+            DataType elem = sorted == DataType.INTERVAL ? DataType.INTERVAL
+                    : DataType.DOUBLE_PRECISION;
+            if (!multi) return elem;
+            DataType arr = DataType.arrayOf(elem);
+            return arr != null ? arr : DataType.TEXT;
+        }
+        if (name.equals("mode") || name.equals("percentile_disc")) {
+            if (sorted == null) return DataType.TEXT;
+            if (!multi || name.equals("mode")) return sorted;
+            DataType arr = DataType.arrayOf(sorted);
+            return arr != null ? arr : DataType.TEXT;
+        }
+        return DataType.TEXT;
+    }
+
+    /**
+     * The range type a constructor of that name builds, or null when the name is not one. Only the
+     * six built-in range constructors and their multirange counterparts are listed: a user-defined
+     * range type's constructor is resolved from the catalogue further down.
+     */
+    private static DataType rangeConstructorResultType(String name) {
+        DataType dt = DataType.fromPgName(name);
+        return dt != null && isRangeType(dt) ? dt : null;
+    }
+
+    /** The type a range is built over — what {@code lower()} and {@code upper()} answer in. */
+    private static DataType rangeSubtypeOf(DataType t) {
+        if (t == null) return null;
+        switch (t) {
+            case INT4RANGE: case INT4MULTIRANGE: return DataType.INTEGER;
+            case INT8RANGE: case INT8MULTIRANGE: return DataType.BIGINT;
+            case NUMRANGE: case NUMMULTIRANGE: return DataType.NUMERIC;
+            case DATERANGE: case DATEMULTIRANGE: return DataType.DATE;
+            case TSRANGE: case TSMULTIRANGE: return DataType.TIMESTAMP;
+            case TSTZRANGE: case TSTZMULTIRANGE: return DataType.TIMESTAMPTZ;
+            default: return null;
+        }
+    }
+
+    /**
+     * The document type a JSON-producing function answers in, or null when the name is not one of
+     * them. The pairs differ only in their prefix, so the {@code jsonb_} spelling of every listed
+     * name answers in jsonb and the bare one in json.
+     */
+    private static DataType jsonFunctionResultType(String name) {
+        boolean b = name.startsWith("jsonb_") || name.equals("to_jsonb");
+        String bare = name.startsWith("jsonb_") ? "json_" + name.substring(6)
+                : name.equals("to_jsonb") ? "to_json" : name;
+        switch (bare) {
+            case "to_json":
+            case "row_to_json":
+            case "array_to_json":
+            case "json_object":
+            case "json_object_agg":
+            case "json_build_object":
+            case "json_build_array":
+            case "json_agg":
+            case "json_strip_nulls":
+            case "json_extract_path":
+            case "json_set":
+            case "json_insert":
+            case "json_set_lax":
+            case "json_path_query":
+            case "json_path_query_first":
+                return b ? DataType.JSONB : DataType.JSON;
+            default:
+                return null;
+        }
+    }
+
     /** True for the network address types, whose operators answer in inet rather than in text. */
     private static boolean isInet(DataType t) {
         return t == DataType.INET || t == DataType.CIDR;
+    }
+
+    /**
+     * The four shapes PostgreSQL declares {@code <<} and {@code >>} over. lseg, line and path have
+     * no such operator at all, so they are deliberately left out: reading them as shapes here
+     * would answer a question PostgreSQL refuses to be asked.
+     */
+    private static boolean isShiftableShape(DataType t) {
+        if (t == null) return false;
+        switch (t) {
+            case POINT: case BOX: case POLYGON: case CIRCLE:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** True for the geometric types: an operator over one of them answers in a shape. */
@@ -3001,9 +3145,14 @@ class ExprEvaluator {
             case JSON_ARROW_TEXT: case JSON_HASH_ARROW_TEXT:
                 return DataType.TEXT;
             case SHIFT_LEFT: case SHIFT_RIGHT:
-                // inet << inet asks whether one network sits inside the other; on integers and
-                // bit strings the same spelling shifts bits and keeps the left operand's type.
+                // inet << inet asks whether one network sits inside the other; a range or a shape
+                // is asked whether it lies wholly to one side of the other. Only on integers and
+                // bit strings does the same spelling shift bits and keep the left operand's type.
                 if (isInet(lt) || isInet(rt)) return DataType.BOOLEAN;
+                if ((lt != null && isRangeType(lt)) || (rt != null && isRangeType(rt))) {
+                    return DataType.BOOLEAN;
+                }
+                if (isShiftableShape(lt) || isShiftableShape(rt)) return DataType.BOOLEAN;
                 return lt != null ? lt : rt;
             case BIT_AND: case BIT_OR: case BIT_XOR:
                 if (isInet(lt) || isInet(rt)) return DataType.INET;
@@ -3381,6 +3530,12 @@ class ExprEvaluator {
                 if (!fn.args().isEmpty()) return inferTypeFromContext(fn.args().get(0), bindings);
                 return DataType.TEXT;
             }
+            // lower/upper of a range answer in the type the range is built over; over anything
+            // else they are the string functions in the list just below.
+            if ((name.equals("lower") || name.equals("upper")) && fn.args().size() == 1) {
+                DataType sub = rangeSubtypeOf(inferTypeFromContext(fn.args().get(0), bindings));
+                if (sub != null) return sub;
+            }
             if (name.equals("lower") || name.equals("upper") || name.equals("trim")
                     || name.equals("ltrim") || name.equals("rtrim") || name.equals("replace")
                     || name.equals("substring") || name.equals("concat")
@@ -3576,6 +3731,19 @@ class ExprEvaluator {
             }
             if (name.equals("uuid_generate_v4") || name.equals("gen_random_uuid") || name.equals("uuidv4")) return DataType.UUID;
             if (name.equals("json_serialize")) return DataType.TEXT;
+            // date_part answers in double precision and extract in numeric, whatever unit either
+            // was asked for. Described as text the value travelled as a string, so a client that
+            // reads the column type saw a number as text and integer division took over
+            // downstream, even though pg_typeof() already answered correctly.
+            if (name.equals("date_part")) return DataType.DOUBLE_PRECISION;
+            if (name.equals("extract")) return DataType.NUMERIC;
+            // A range constructor answers in its own range type, not in the text its value
+            // happens to be spelled as.
+            DataType rangeCtor = rangeConstructorResultType(name);
+            if (rangeCtor != null) return rangeCtor;
+            // The JSON builders answer in json or jsonb by their own name.
+            DataType jsonResult = jsonFunctionResultType(name);
+            if (jsonResult != null) return jsonResult;
             // Check user-defined functions and aggregates for return type
             if (executor != null && executor.database != null) {
                 PgFunction userFunc = resolveUserFunctionForTyping(name, fn, bindings);
@@ -3634,6 +3802,14 @@ class ExprEvaluator {
             if (inner == DataType.TIME) return DataType.TIMETZ;
             return inner != null ? inner : DataType.TIMESTAMP;
         }
+        if (expr instanceof OrderedSetAggExpr) {
+            return orderedSetAggResultType((OrderedSetAggExpr) expr, bindings);
+        }
+        // COLLATE names how a string sorts; it never changes what the string is, so the column
+        // keeps the type it had. Falling through to text made a varchar arrive as text.
+        if (expr instanceof CollateExpr) {
+            return inferTypeFromContext(((CollateExpr) expr).expr(), bindings);
+        }
         if (expr instanceof IsNullExpr) return DataType.BOOLEAN;
         if (expr instanceof InExpr) return DataType.BOOLEAN;
         if (expr instanceof BetweenExpr) return DataType.BOOLEAN;
@@ -3676,7 +3852,14 @@ class ExprEvaluator {
         if (expr instanceof ArrayExpr) {
             ArrayExpr arr = (ArrayExpr) expr;
             // ROW(...) is a record, not an array, and has no single element type to speak of
-            if (arr.isRow()) return DataType.TEXT;
+            if (arr.isRow()) return DataType.RECORD;
+            // An array of records is a record array; its elements have no one element type
+            // either, so they are not asked for one.
+            for (Expression element : arr.elements()) {
+                if (element instanceof ArrayExpr && ((ArrayExpr) element).isRow()) {
+                    return DataType.RECORD_ARRAY;
+                }
+            }
             for (Expression element : arr.elements()) {
                 if (isUnknownLiteral(element)) continue;
                 DataType array = DataType.arrayOf(inferTypeFromContext(element, bindings));

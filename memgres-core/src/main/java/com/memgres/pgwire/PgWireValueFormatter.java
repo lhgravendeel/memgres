@@ -142,17 +142,15 @@ class PgWireValueFormatter {
             for (int i = 0; i < row.values().size(); i++) {
                 if (i > 0) sb.append(",");
                 Object elem = row.values().get(i);
-                if (elem == null) sb.append("");
-                else if (elem instanceof Boolean) sb.append(((Boolean) elem) ? "t" : "f");
-                else if (elem instanceof com.memgres.engine.AstExecutor.PgRow) {
-                    String inner = formatValue(elem, guc);
-                    sb.append("\"").append(inner.replace("\"", "\\\"")).append("\"");
+                // A NULL field prints as nothing at all, which is what tells it from an empty one
+                if (elem == null) continue;
+                String text = elem instanceof Boolean ? (((Boolean) elem) ? "t" : "f")
+                        : formatValue(elem, guc);
+                if (needsCompositeQuote(text)) {
+                    sb.append('"').append(text.replace("\\", "\\\\").replace("\"", "\\\"")).append('"');
+                } else {
+                    sb.append(text);
                 }
-                else if (elem instanceof String && ((String) elem).contains(",")) {
-                    String s = (String) elem;
-                    sb.append("\"").append(s.replace("\"", "\\\"")).append("\"");
-                }
-                else sb.append(elem);
             }
             sb.append(")");
             return sb.toString();
@@ -168,13 +166,21 @@ class PgWireValueFormatter {
                 if (elem == null) {
                     sb.append("NULL");
                 } else if (elem instanceof com.memgres.engine.AstExecutor.PgRow) {
+                    // A composite element is quoted by the same rule as any other: a bare (1) has
+                    // nothing in it an array reader could mistake for structure, and PostgreSQL
+                    // writes it back unquoted. Quoting every composite made {(1),(2)} come out as
+                    // {"(1)","(2)"}, which is a different array of a different two strings.
                     String rowStr = formatValue(elem, guc);
-                    sb.append("\"").append(rowStr.replace("\"", "\\\"")).append("\"");
+                    if (needsArrayQuote(rowStr)) {
+                        sb.append("\"").append(rowStr.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+                    } else {
+                        sb.append(rowStr);
+                    }
                 } else if (elem instanceof String) {
                     String s = (String) elem;
                     // A backslash and the word NULL have to be quoted too: unquoted they read back
                     // as an escape and as the SQL null, so the array would not survive a round trip.
-                    if (s.startsWith("(") || needsArrayQuote(s)) {
+                    if (needsArrayQuote(s)) {
                         sb.append("\"").append(s.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
                     } else {
                         sb.append(s);
@@ -275,6 +281,22 @@ class PgWireValueFormatter {
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
             if (c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || Character.isWhitespace(c)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * True if a composite field must be double-quoted in PG's {@code (a,b)} output syntax: an
+     * empty field, or one carrying a character that would otherwise be read as structure.
+     */
+    private static boolean needsCompositeQuote(String s) {
+        if (s.isEmpty()) return true;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == ',' || c == '(' || c == ')' || c == '"' || c == '\\'
+                    || Character.isWhitespace(c)) {
                 return true;
             }
         }

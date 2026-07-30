@@ -137,7 +137,10 @@ public final class JsonOperations {
                     }
                     i += 4;
                     if (cp == 0) {
-                        throw new MemgresException("unsupported Unicode escape sequence", "22P05");
+                        MemgresException e = new MemgresException(
+                                "unsupported Unicode escape sequence", "22P05");
+                        e.setDetail(String.format("\\u%04x cannot be converted to text.", cp));
+                        throw e;
                     }
                     if (Character.isHighSurrogate((char) cp)) {
                         int low = readSurrogate(body, i);
@@ -172,7 +175,11 @@ public final class JsonOperations {
     }
 
     private static MemgresException invalidEscape() {
-        return new MemgresException("invalid input syntax for type json", "22P02");
+        MemgresException e = new MemgresException("invalid input syntax for type json", "22P02");
+        // Every way a surrogate escape can go wrong -- a high half with nothing after it, a low
+        // half on its own, a pair whose second half is not one -- is the same complaint in PG.
+        e.setDetail("Unicode low surrogate must follow a high surrogate.");
+        return e;
     }
 
     /** Render a text value as a JSON string literal, escaping what JSON cannot hold literally. */
