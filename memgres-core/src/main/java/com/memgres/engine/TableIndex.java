@@ -20,7 +20,12 @@ public class TableIndex {
     private final int[] columnIndices;
     private final boolean unique;
 
-    // For unique indexes: key → single row.  For non-unique: key → list of rows.
+    // key → one row (stored bare) or, once a key holds more than one row, a List of rows.
+    // A unique index has to be able to hold two rows under one key: a DEFERRABLE constraint
+    // whose check has not run yet, and the mid-statement moment of a multi-row UPDATE, both
+    // put a genuine duplicate in the table. Overwriting the entry instead lost the original
+    // row's key, and removing the newcomer then removed the key altogether — after which the
+    // constraint was silently unenforced for every session.
     // ConcurrentHashMap for defensive thread-safety — all mutations are serialized by
     // Table.writeLock, but CHM prevents catastrophic corruption if any path is ever missed.
     private final ConcurrentHashMap<IndexKey, Object> entries = new ConcurrentHashMap<>();
@@ -54,16 +59,26 @@ public class TableIndex {
             for (Object v : key.values) {
                 if (v == null) return;
             }
+        }
+        Object existing = entries.get(key);
+        if (existing == null) {
             entries.put(key, row);
-        } else {
+            return;
+        }
+        if (existing instanceof List) {
             @SuppressWarnings("unchecked")
-            List<Object[]> list = (List<Object[]>) entries.get(key);
-            if (list == null) {
-                list = new ArrayList<>(2);
-                entries.put(key, list);
+            List<Object[]> list = (List<Object[]>) existing;
+            for (Object[] present : list) {
+                if (present == row) return;
             }
             list.add(row);
+            return;
         }
+        if (existing == row) return;
+        List<Object[]> list = new ArrayList<>(2);
+        list.add((Object[]) existing);
+        list.add(row);
+        entries.put(key, list);
     }
 
     /** Remove a row from the index using the current column values in the row. */
@@ -81,20 +96,21 @@ public class TableIndex {
     }
 
     private void removeByKey(IndexKey key, Object[] row) {
-        if (unique) {
-            Object existing = entries.get(key);
-            if (existing == row) {
-                entries.remove(key);
-            }
-        } else {
+        Object existing = entries.get(key);
+        if (existing == null) return;
+        if (existing instanceof List) {
             @SuppressWarnings("unchecked")
-            List<Object[]> list = (List<Object[]>) entries.get(key);
-            if (list != null) {
-                list.removeIf(r -> r == row);
-                if (list.isEmpty()) {
-                    entries.remove(key);
-                }
+            List<Object[]> list = (List<Object[]>) existing;
+            list.removeIf(r -> r == row);
+            if (list.isEmpty()) {
+                entries.remove(key);
+            } else if (list.size() == 1) {
+                // Collapse back to the bare form so the ordinary one-row-per-key case
+                // never pays for a list.
+                entries.put(key, list.get(0));
             }
+        } else if (existing == row) {
+            entries.remove(key);
         }
     }
 
@@ -110,10 +126,7 @@ public class TableIndex {
         }
         Object existing = entries.get(key);
         if (existing == null) return null;
-        if (unique) {
-            Object[] found = (Object[]) existing;
-            return (found != excludeRow) ? found : null;
-        } else {
+        if (existing instanceof List) {
             @SuppressWarnings("unchecked")
             List<Object[]> list = (List<Object[]>) existing;
             for (Object[] found : list) {
@@ -121,6 +134,8 @@ public class TableIndex {
             }
             return null;
         }
+        Object[] found = (Object[]) existing;
+        return (found != excludeRow) ? found : null;
     }
 
     /**
@@ -140,14 +155,12 @@ public class TableIndex {
         IndexKey key = makeKey(keyValues);
         Object existing = entries.get(key);
         if (existing == null) return Cols.listOf();
-        if (unique) {
-            Object[] row = (Object[]) existing;
-            return Collections.singletonList(row);
-        } else {
+        if (existing instanceof List) {
             @SuppressWarnings("unchecked")
             List<Object[]> list = (List<Object[]>) existing;
             return new ArrayList<>(list);
         }
+        return Collections.singletonList((Object[]) existing);
     }
 
     /** Clear all entries. */

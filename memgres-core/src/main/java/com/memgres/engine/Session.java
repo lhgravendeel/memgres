@@ -893,6 +893,8 @@ public class Session {
         final String name;
         final int undoPosition;
         final int notificationCount;
+        /** Postponed checks queued before the savepoint; ones queued after it die with it. */
+        final int deferredCheckCount;
         final long lockMark;
         final Map<String, String> sessionGucs;
         final Map<String, String> localGucs;
@@ -900,12 +902,14 @@ public class Session {
         /** The cursors that existed when the savepoint was taken; later ones die with it. */
         final Set<String> cursorNames;
 
-        SavepointFrame(String name, int undoPosition, int notificationCount, long lockMark,
+        SavepointFrame(String name, int undoPosition, int notificationCount,
+                       int deferredCheckCount, long lockMark,
                        Map<String, String> sessionGucs, Map<String, String> localGucs,
                        MvccSnapshot mvcc, Set<String> cursorNames) {
             this.name = name;
             this.undoPosition = undoPosition;
             this.notificationCount = notificationCount;
+            this.deferredCheckCount = deferredCheckCount;
             this.lockMark = lockMark;
             this.sessionGucs = sessionGucs;
             this.localGucs = localGucs;
@@ -969,7 +973,8 @@ public class Session {
             begin();
         }
         savepoints.add(new SavepointFrame(name, undoLog.size(),
-                deferredNotifications.size(), database.currentRowLockMark(),
+                deferredNotifications.size(), deferredFkChecks.size(),
+                database.currentRowLockMark(),
                 getGucSettings().snapshotSessionOverrides(),
                 getGucSettings().snapshotTransactionOverrides(),
                 // Snapshot current MVCC maps so we can restore on ROLLBACK TO SAVEPOINT.
@@ -1079,6 +1084,12 @@ public class Session {
         // Truncate deferred notifications to the savepoint's count
         if (frame.notificationCount < deferredNotifications.size()) {
             deferredNotifications.subList(frame.notificationCount, deferredNotifications.size()).clear();
+        }
+
+        // A postponed constraint check queued inside the subtransaction refers to a row the undo
+        // has just taken back. Keeping it would fail the COMMIT over a write nobody made.
+        if (frame.deferredCheckCount < deferredFkChecks.size()) {
+            deferredFkChecks.subList(frame.deferredCheckCount, deferredFkChecks.size()).clear();
         }
 
         // A cursor opened inside the subtransaction goes away with it. Closing one does not
@@ -1506,16 +1517,29 @@ public class Session {
         public final Table table;
         public final Object[] row;
         public final StoredConstraint constraint;
+        /**
+         * Set only for the referenced side of a foreign key: the table whose row was deleted or
+         * whose key was changed, leaving {@link #row} of {@link #table} possibly pointing at
+         * nothing. Null for every check that belongs to the row's own table.
+         */
+        public final Table referencedTable;
 
         public DeferredFkCheck(Table table, Object[] row, StoredConstraint constraint) {
+            this(table, row, constraint, null);
+        }
+
+        public DeferredFkCheck(Table table, Object[] row, StoredConstraint constraint,
+                               Table referencedTable) {
             this.table = table;
             this.row = row;
             this.constraint = constraint;
+            this.referencedTable = referencedTable;
         }
 
         public Table table() { return table; }
         public Object[] row() { return row; }
         public StoredConstraint constraint() { return constraint; }
+        public Table referencedTable() { return referencedTable; }
 
         @Override
         public boolean equals(Object o) {
@@ -1524,12 +1548,14 @@ public class Session {
             DeferredFkCheck that = (DeferredFkCheck) o;
             return java.util.Objects.equals(table, that.table)
                 && java.util.Arrays.equals(row, that.row)
-                && java.util.Objects.equals(constraint, that.constraint);
+                && java.util.Objects.equals(constraint, that.constraint)
+                && java.util.Objects.equals(referencedTable, that.referencedTable);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(table, java.util.Arrays.hashCode(row), constraint);
+            return java.util.Objects.hash(table, java.util.Arrays.hashCode(row), constraint,
+                    referencedTable);
         }
 
         @Override
@@ -1540,6 +1566,17 @@ public class Session {
 
     public void addDeferredCheck(Table table, Object[] row, StoredConstraint constraint) {
         deferredFkChecks.add(new DeferredFkCheck(table, row, constraint));
+    }
+
+    /**
+     * Postpone the referenced side of a foreign key: a row of {@code referencedTable} has been
+     * deleted, or had its key changed, while {@code childRow} still refers to the old key. The
+     * check runs again at COMMIT, by which time the transaction may have put the key back or
+     * moved the child row, either of which makes it pass.
+     */
+    public void addDeferredReferencedCheck(Table childTable, Object[] childRow,
+                                           StoredConstraint constraint, Table referencedTable) {
+        deferredFkChecks.add(new DeferredFkCheck(childTable, childRow, constraint, referencedTable));
     }
 
     /**
@@ -1560,7 +1597,13 @@ public class Session {
         }
         for (DeferredFkCheck check : checks) {
             StoredConstraint sc = check.constraint();
-            if (sc.getType() != StoredConstraint.Type.PRIMARY_KEY && sc.getType() != StoredConstraint.Type.UNIQUE) {
+            if (sc.getType() == StoredConstraint.Type.PRIMARY_KEY || sc.getType() == StoredConstraint.Type.UNIQUE) {
+                continue;
+            }
+            if (check.referencedTable() != null) {
+                executor.constraintValidator.validateDeferredReferencedFk(
+                        check.referencedTable(), check.table(), check.row(), sc);
+            } else {
                 executor.constraintValidator.validateDeferredConstraint(check.table(), check.row(), sc);
             }
         }
