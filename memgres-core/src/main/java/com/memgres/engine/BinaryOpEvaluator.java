@@ -485,9 +485,11 @@ class BinaryOpEvaluator {
         if (expr instanceof ColumnRef && ctx != null) {
             ColumnRef ref = (ColumnRef) expr;
             for (RowContext.TableBinding b : ctx.getBindings()) {
-                if (!isBaseTable(b.table())) continue;
+                // The written name first: it costs a comparison, where deciding whether the
+                // binding is a base table costs a walk of the schemas.
                 if (ref.table() != null && !ref.table().equalsIgnoreCase(b.alias())
-                        && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+                        && (b.table() == null || !ref.table().equalsIgnoreCase(b.table().getName()))) continue;
+                if (!isBaseTable(b.table())) continue;
                 int idx = b.table().getColumnIndex(ref.column());
                 if (idx < 0) continue;
                 DataType t = b.table().getColumns().get(idx).getType();
@@ -503,7 +505,7 @@ class BinaryOpEvaluator {
      */
     private boolean isBaseTable(Table table) {
         if (table == null || table.isFunctionResult() || table.isViewProjection()) return false;
-        return executor.resolveTableSafe(table.getName()) == table;
+        return executor.baseTableNamed(table.getName()) == table;
     }
 
     private static boolean isArithmetic(BinaryExpr.BinOp op) {

@@ -55,10 +55,7 @@ final class AstWalk {
                 }
                 continue;
             }
-            if (!isAstNode(node)) continue;
-            for (Field f : node.getClass().getFields()) {
-                if (Modifier.isStatic(f.getModifiers())) continue;
-                if (f.getType().isPrimitive() || f.getType() == String.class) continue;
+            for (Field f : childFields(node.getClass())) {
                 try {
                     Object child = f.get(node);
                     if (child != null) queue.add(child);
@@ -95,10 +92,7 @@ final class AstWalk {
             }
             return;
         }
-        if (!isAstNode(node)) return;
-        for (Field f : node.getClass().getFields()) {
-            if (Modifier.isStatic(f.getModifiers())) continue;
-            if (f.getType().isPrimitive() || f.getType() == String.class) continue;
+        for (Field f : childFields(node.getClass())) {
             try {
                 Object child = f.get(node);
                 if (child != null) action.accept(child);
@@ -108,10 +102,44 @@ final class AstWalk {
         }
     }
 
-    private static boolean isAstNode(Object node) {
-        Class<?> c = node.getClass();
+    private static boolean isAstNode(Class<?> nodeClass) {
+        Class<?> c = nodeClass;
         while (c != null && c.getEnclosingClass() != null) c = c.getEnclosingClass();
         String pkg = c == null || c.getPackage() == null ? "" : c.getPackage().getName();
         return pkg.startsWith("com.memgres.engine.parser.ast");
+    }
+
+    /** Nothing to walk into, shared rather than allocated per node of a type that has no children. */
+    private static final Field[] NONE = new Field[0];
+
+    /** The child fields of each node type, worked out once. */
+    private static final java.util.Map<Class<?>, Field[]> CHILD_FIELDS =
+            new java.util.concurrent.ConcurrentHashMap<Class<?>, Field[]>();
+
+    /**
+     * The fields of a node type that can hold children.
+     *
+     * <p>Which fields those are is a property of the type, so it is settled once per type rather
+     * than once per node. {@link Class#getFields()} hands back a fresh array on every call and
+     * {@link Class#getEnclosingClass()} is not free either; between them they were the largest
+     * cost of walking a statement, and a statement is walked several times over before it runs.
+     */
+    private static Field[] childFields(Class<?> nodeClass) {
+        Field[] cached = CHILD_FIELDS.get(nodeClass);
+        if (cached != null) return cached;
+        Field[] fields;
+        if (!isAstNode(nodeClass)) {
+            fields = NONE;
+        } else {
+            java.util.List<Field> kept = new java.util.ArrayList<Field>();
+            for (Field f : nodeClass.getFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                if (f.getType().isPrimitive() || f.getType() == String.class) continue;
+                kept.add(f);
+            }
+            fields = kept.isEmpty() ? NONE : kept.toArray(new Field[0]);
+        }
+        CHILD_FIELDS.put(nodeClass, fields);
+        return fields;
     }
 }

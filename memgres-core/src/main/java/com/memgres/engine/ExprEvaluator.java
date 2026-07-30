@@ -1933,6 +1933,20 @@ class ExprEvaluator {
     // ---- Subquery evaluation ----
 
     private Object evalSubquery(SubqueryExpr sq, RowContext outerCtx) {
+        // A subquery that reads nothing of the row it stands beside has one answer for the whole
+        // statement, which is both what PostgreSQL gives it and one run of it instead of one per
+        // row. Anything that might read the outer row is left to be run again each time.
+        AstExecutor.ScalarSubqueryValue held = executor.scalarSubqueryValue(sq);
+        if (held != null && held.answered) return held.value;
+        Object answer = runSubquery(sq, outerCtx);
+        if (held != null) {
+            held.value = answer;
+            held.answered = true;
+        }
+        return answer;
+    }
+
+    private Object runSubquery(SubqueryExpr sq, RowContext outerCtx) {
         if (outerCtx != null) executor.outerContextStack.push(outerCtx);
         try {
             QueryResult result = executor.executeStatement(sq.subquery());
