@@ -82,11 +82,11 @@ class CatalogCoreBuilder {
             {3913, 3912, "_daterange", "i"},
             {3927, 3926, "_int8range", "d"},
             {6150, 4451, "_int4multirange", "i"},
-            {6151, 4532, "_int8multirange", "d"},
-            {6152, 4533, "_nummultirange", "i"},
-            {6153, 4534, "_datemultirange", "i"},
-            {6155, 4535, "_tsmultirange", "d"},
-            {6157, 4536, "_tstzmultirange", "d"},
+            {6151, 4532, "_nummultirange", "i"},
+            {6152, 4533, "_tsmultirange", "d"},
+            {6153, 4534, "_tstzmultirange", "d"},
+            {6155, 4535, "_datemultirange", "i"},
+            {6157, 4536, "_int8multirange", "d"},
     };
 
     /** element type OID -> its array type OID, for pg_type.typarray. */

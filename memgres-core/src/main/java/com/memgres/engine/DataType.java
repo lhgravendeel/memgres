@@ -87,11 +87,11 @@ public enum DataType {
 
     // Multirange types (PG 14+)
     INT4MULTIRANGE(4451, "int4multirange"),
-    INT8MULTIRANGE(4532, "int8multirange"),
-    NUMMULTIRANGE(4533, "nummultirange"),
-    DATEMULTIRANGE(4534, "datemultirange"),
-    TSMULTIRANGE(4535, "tsmultirange"),
-    TSTZMULTIRANGE(4536, "tstzmultirange"),
+    NUMMULTIRANGE(4532, "nummultirange"),
+    TSMULTIRANGE(4533, "tsmultirange"),
+    TSTZMULTIRANGE(4534, "tstzmultirange"),
+    DATEMULTIRANGE(4535, "datemultirange"),
+    INT8MULTIRANGE(4536, "int8multirange"),
 
     // Array types (used for system catalog columns and array expressions)
     BOOL_ARRAY(1000, "_bool"),
@@ -312,6 +312,10 @@ public enum DataType {
                 return TSMULTIRANGE;
             case "tstzmultirange":
                 return TSTZMULTIRANGE;
+            case "oidvector":
+                return OIDVECTOR;
+            case "int2vector":
+                return INT2VECTOR;
             case "text[]":
             case "_text":
                 return TEXT_ARRAY;

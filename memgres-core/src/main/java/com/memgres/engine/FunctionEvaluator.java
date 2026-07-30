@@ -1094,6 +1094,10 @@ class FunctionEvaluator {
                 }
                 int dim = fn.args().size() > 1 ? executor.toInt(executor.evalExpr(fn.args().get(1), ctx)) : 1;
                 if (dim < 1) return null; // dimension 0 doesn't exist
+                // A 0-based vector always has one dimension, even with nothing in it: PG stores
+                // an empty oidvector as [0:-1] rather than as a dimensionless empty array, so
+                // array_length answers 0 where a plain empty array answers NULL.
+                if (arr instanceof PgVector) return dim == 1 ? (Object) ((PgVector) arr).size() : null;
                 if (arr instanceof List<?>) {
                     List<?> list = (List<?>) arr;
                     if (dim == 1) return list.isEmpty() ? null : list.size();
@@ -1121,6 +1125,9 @@ class FunctionEvaluator {
                 if (upperBounds != null) {
                     return dim2 <= upperBounds[1].length ? (Object) upperBounds[1][dim2 - 1] : null;
                 }
+                // A 0-based vector runs from 0, so its upper bound is one less than its length —
+                // and -1 when it is empty, which is the bound PG reports for an empty oidvector.
+                if (arr instanceof PgVector) return dim2 == 1 ? (Object) (((PgVector) arr).size() - 1) : null;
                 if (arr instanceof List<?>) {
                     List<?> list = (List<?>) arr;
                     // PG returns NULL for empty arrays (they have no dimensions)
@@ -1147,6 +1154,8 @@ class FunctionEvaluator {
                 if (lowerBounds != null) {
                     return dim2 <= lowerBounds[0].length ? (Object) lowerBounds[0][dim2 - 1] : null;
                 }
+                // int2vector and oidvector are subscripted from 0, empty or not.
+                if (arr instanceof PgVector) return dim2 == 1 ? (Object) 0 : null;
                 if (arr instanceof List<?> && !((List<?>) arr).isEmpty()) {
                     List<?> list = (List<?>) arr;
                     if (dim2 == 1) return 1;

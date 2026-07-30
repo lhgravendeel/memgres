@@ -211,6 +211,8 @@ class CatalogMetadataFunctions {
                     if (func != null) {
                         return buildFunctionArguments(func);
                     }
+                    Object[] row = procRow(fn.args().get(0), ctx);
+                    if (row != null) return renderProcArguments(row, true);
                 }
                 return "";
             }
@@ -220,6 +222,8 @@ class CatalogMetadataFunctions {
                     if (func != null) {
                         return buildFunctionIdentityArguments(func);
                     }
+                    Object[] row = procRow(fn.args().get(0), ctx);
+                    if (row != null) return renderProcArguments(row, false);
                 }
                 return "";
             }
@@ -240,6 +244,8 @@ class CatalogMetadataFunctions {
                         }
                         return normalizePgTypeName(rt);
                     }
+                    Object[] row = procRow(fn.args().get(0), ctx);
+                    if (row != null) return renderProcResult(row);
                 }
                 return "";
             }
@@ -606,13 +612,28 @@ class CatalogMetadataFunctions {
         } else if (arg != null) {
             viewName = arg.toString();
         }
-        // M19: PG's one-argument pg_get_viewdef uses the pretty (multi-line) form.
-        // The two-argument form honours the explicit pretty flag.
-        boolean prettyPrint = fn.args().size() < 2;
+        // Every form of pg_get_viewdef lays the definition out over several lines. What the second
+        // argument adds is parenthesis pruning: the one-argument form parenthesises every operator
+        // the way a plain deparse does, and only an explicit true — or a wrap column, which
+        // implies it — drops the pairs precedence makes unnecessary.
+        boolean minimizeParens = false;
+        int wrapColumn = 0;
         if (fn.args().size() >= 2) {
             Object prettyArg = executor.evalExpr(fn.args().get(1), ctx);
-            if (prettyArg instanceof Boolean) prettyPrint = ((Boolean) prettyArg);
-            else if (prettyArg != null) prettyPrint = Boolean.parseBoolean(prettyArg.toString());
+            if (prettyArg instanceof Boolean) {
+                minimizeParens = ((Boolean) prettyArg);
+            } else if (prettyArg instanceof Number) {
+                minimizeParens = true;
+                wrapColumn = ((Number) prettyArg).intValue();
+            } else if (prettyArg != null) {
+                String text = prettyArg.toString().trim();
+                try {
+                    wrapColumn = Integer.parseInt(text);
+                    minimizeParens = true;
+                } catch (NumberFormatException e) {
+                    minimizeParens = Boolean.parseBoolean(text);
+                }
+            }
         }
         if (viewName != null) {
             if (viewName.contains(".")) {
@@ -621,9 +642,9 @@ class CatalogMetadataFunctions {
             Database.ViewDef view = executor.database.getView(viewName);
             if (view != null && view.query() != null) {
                 String sql = view.sourceSQL() != null ? view.sourceSQL()
-                        : SqlUnparser.toSql(view.query());
-                if (prettyPrint) sql = SqlUnparser.prettyViewDef(sql);
-                return sql + ";";
+                        : (minimizeParens ? SqlUnparser.toSqlPretty(view.query())
+                                          : SqlUnparser.toSql(view.query()));
+                return SqlUnparser.prettyViewDef(sql, wrapColumn) + ";";
             }
         }
         return "";
@@ -1466,6 +1487,121 @@ class CatalogMetadataFunctions {
             sb.append(normalizePgTypeName(p.typeName()));
         }
         return sb.toString();
+    }
+
+    /**
+     * The pg_proc row an OID names, or null when the argument is not an OID with a row behind it.
+     *
+     * <p>The three pg_get_function_* renderers are asked about built-in functions far more often
+     * than about ones a session created — {@code SELECT pg_get_function_arguments(oid) FROM
+     * pg_proc} is how a client lists what a server can do — and a built-in has no {@code
+     * PgFunction} to read. The catalog row is where its signature is recorded, so that is what is
+     * rendered; pg_proc is built once per statement and cached, so the lookup does not rebuild it
+     * per row.
+     */
+    private Object[] procRow(Expression argExpr, RowContext ctx) {
+        Object arg = executor.evalExpr(argExpr, ctx);
+        if (!(arg instanceof Number)) return null;
+        int wanted = ((Number) arg).intValue();
+        Table procs = executor.systemCatalog.resolve("pg_catalog", "pg_proc", executor.session);
+        if (procs == null) return null;
+        int oidIdx = procs.getColumnIndex("oid");
+        if (oidIdx < 0) return null;
+        for (Object[] row : procs.getRows()) {
+            Object o = row[oidIdx];
+            if (o instanceof Number && ((Number) o).intValue() == wanted) return row;
+        }
+        return null;
+    }
+
+    /** A pg_proc column by name, or null when the row is shorter than the catalog. */
+    private Object procCol(Object[] row, String column) {
+        Table procs = executor.systemCatalog.resolve("pg_catalog", "pg_proc", executor.session);
+        if (procs == null) return null;
+        int idx = procs.getColumnIndex(column);
+        return idx < 0 || idx >= row.length ? null : row[idx];
+    }
+
+    /**
+     * The argument list PostgreSQL prints for a pg_proc row: each argument as its mode, its name
+     * when one is recorded, and its type — plus the defaults the tail arguments carry, which
+     * {@code withDefaults} leaves off for the identity form.
+     */
+    private String renderProcArguments(Object[] row, boolean withDefaults) {
+        List<Object> types = asList(procCol(row, "proargtypes"));
+        List<Object> allTypes = asList(procCol(row, "proallargtypes"));
+        List<Object> modes = asList(procCol(row, "proargmodes"));
+        List<Object> names = asList(procCol(row, "proargnames"));
+        if (!allTypes.isEmpty()) types = allTypes;
+        Object variadicObj = procCol(row, "provariadic");
+        int variadic = variadicObj instanceof Number ? ((Number) variadicObj).intValue() : 0;
+        Object ndefObj = procCol(row, "pronargdefaults");
+        int ndefaults = ndefObj instanceof Number ? ((Number) ndefObj).intValue() : 0;
+        List<String> defaults = splitProcDefaults(procCol(row, "proargdefaults"));
+        StringBuilder sb = new StringBuilder();
+        int inputCount = 0;
+        for (int i = 0; i < types.size(); i++) {
+            String mode = i < modes.size() && modes.get(i) != null ? modes.get(i).toString() : "i";
+            boolean isOut = "o".equals(mode);
+            // The identity form names only the arguments a call passes, so OUT drops out of it.
+            if (!withDefaults && isOut) continue;
+            if (sb.length() > 0) sb.append(", ");
+            if ("o".equals(mode)) sb.append("OUT ");
+            else if ("b".equals(mode)) sb.append("INOUT ");
+            else if ("v".equals(mode)) sb.append("VARIADIC ");
+            else if (variadic != 0 && i == types.size() - 1) sb.append("VARIADIC ");
+            if (i < names.size() && names.get(i) != null && !names.get(i).toString().isEmpty()) {
+                sb.append(names.get(i));
+                sb.append(' ');
+            }
+            Object t = types.get(i);
+            sb.append(formatTypeByOid(t instanceof Number ? ((Number) t).intValue() : 0, -1));
+            if (!isOut) {
+                int defaultIdx = inputCount - (countInputArgs(types, modes) - ndefaults);
+                if (withDefaults && defaultIdx >= 0 && defaultIdx < defaults.size()) {
+                    sb.append(" DEFAULT ").append(defaults.get(defaultIdx));
+                }
+                inputCount++;
+            }
+        }
+        return sb.toString();
+    }
+
+    /** The return type PostgreSQL prints for a pg_proc row, SETOF included. */
+    private String renderProcResult(Object[] row) {
+        Object rt = procCol(row, "prorettype");
+        if (!(rt instanceof Number)) return "";
+        Object retset = procCol(row, "proretset");
+        String name = formatTypeByOid(((Number) rt).intValue(), -1);
+        return Boolean.TRUE.equals(retset) ? "SETOF " + name : name;
+    }
+
+    private static int countInputArgs(List<Object> types, List<Object> modes) {
+        int n = 0;
+        for (int i = 0; i < types.size(); i++) {
+            String mode = i < modes.size() && modes.get(i) != null ? modes.get(i).toString() : "i";
+            if (!"o".equals(mode)) n++;
+        }
+        return n;
+    }
+
+    /** The default expressions a pg_proc row records, one per defaulted trailing argument. */
+    private static List<String> splitProcDefaults(Object value) {
+        if (value == null) return Cols.listOf();
+        String text = value.toString().trim();
+        if (text.isEmpty()) return Cols.listOf();
+        List<String> out = new ArrayList<>();
+        for (String part : text.split("\\|")) out.add(part.trim());
+        return out;
+    }
+
+    private static List<Object> asList(Object value) {
+        if (value instanceof List<?>) {
+            List<Object> out = new ArrayList<>();
+            for (Object o : (List<?>) value) out.add(o);
+            return out;
+        }
+        return Cols.listOf();
     }
 
     private boolean isBuiltinFunction(String name) {

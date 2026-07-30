@@ -1186,7 +1186,7 @@ public class ExpressionParser {
             "pg_catalog.c", "pg_catalog.posix", "pg_catalog.default",
             "pg_catalog.\"c\"", "pg_catalog.\"posix\"", "pg_catalog.\"default\"",
             "\"c\"", "\"posix\"", "\"default\"", "\"ucs_basic\"",
-            "unicode", "icu_root"
+            "unicode", "icu_root", "pg_c_utf8", "\"pg_c_utf8\"", "pg_catalog.pg_c_utf8"
     );
 
     private void validateCollation(String collation) {
