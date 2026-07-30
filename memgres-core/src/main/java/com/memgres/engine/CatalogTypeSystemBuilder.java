@@ -46,8 +46,14 @@ class CatalogTypeSystemBuilder {
         table.insertRow(new Object[]{ oids.oid("collation:default"), "default", pgCatalogNs, 10, "d", true, -1, null, null, null, null, null, 1 });
         table.insertRow(new Object[]{ oids.oid("collation:C"), "C", pgCatalogNs, 10, "c", true, -1, null, null, "C", "C", null, 1 });
         table.insertRow(new Object[]{ oids.oid("collation:POSIX"), "POSIX", pgCatalogNs, 10, "c", true, -1, null, null, "POSIX", "POSIX", null, 1 });
-        // ucs_basic is the SQL standard's code-point ordering: provider 'b', UTF8 only.
-        table.insertRow(new Object[]{ oids.oid("collation:ucs_basic"), "ucs_basic", pgCatalogNs, 10, "b", true, 6, "C", null, "C", "C", null, 1 });
+        // The three builtin-provider collations PG 18 ships. A builtin collation states its locale
+        // in colllocale and leaves collcollate and collctype null — those two are the libc
+        // provider's columns, and reporting them filled in tells a client this is a libc
+        // collation, which is what pg_dump and \dO decide on.
+        table.insertRow(new Object[]{ oids.oid("collation:ucs_basic"), "ucs_basic", pgCatalogNs, 10, "b", true, 6, "C", null, null, null, "1", 1 });
+        table.insertRow(new Object[]{ oids.oid("collation:pg_c_utf8"), "pg_c_utf8", pgCatalogNs, 10, "b", true, 6, "C.UTF-8", null, null, null, "1", 1 });
+        // The ICU root collation PG registers under the plain name "unicode".
+        table.insertRow(new Object[]{ oids.oid("collation:unicode"), "unicode", pgCatalogNs, 10, "i", true, -1, "und", null, null, null, null, 1 });
         String javaColl = "java-" + System.getProperty("java.version", "17");
         // ICU-provider collations. PG spells an ICU locale with a hyphen — en-US, not en_US —
         // and that spelling is what a client passes back to COLLATE.
@@ -84,12 +90,12 @@ class CatalogTypeSystemBuilder {
         );
         Table table = new Table("pg_range", cols);
         // PG built-in range types: rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc, rngcanonical, rngsubdiff
-        table.insertRow(new Object[]{3904, 23,   4451, 0, 0, 0, 0}); // int4range   → int4,    int4multirange
-        table.insertRow(new Object[]{3926, 20,   4532, 0, 0, 0, 0}); // int8range   → int8,    int8multirange
-        table.insertRow(new Object[]{3906, 1700, 4533, 0, 0, 0, 0}); // numrange    → numeric, nummultirange
-        table.insertRow(new Object[]{3912, 1082, 4534, 0, 0, 0, 0}); // daterange   → date,    datemultirange
-        table.insertRow(new Object[]{3908, 1114, 4535, 0, 0, 0, 0}); // tsrange     → timestamp, tsmultirange
-        table.insertRow(new Object[]{3910, 1184, 4536, 0, 0, 0, 0}); // tstzrange   → timestamptz, tstzmultirange
+        table.insertRow(new Object[]{3904, 23,   4451, 0, 0, 0, 0}); // int4range   → int4,      int4multirange
+        table.insertRow(new Object[]{3906, 1700, 4532, 0, 0, 0, 0}); // numrange    → numeric,   nummultirange
+        table.insertRow(new Object[]{3908, 1114, 4533, 0, 0, 0, 0}); // tsrange     → timestamp, tsmultirange
+        table.insertRow(new Object[]{3910, 1184, 4534, 0, 0, 0, 0}); // tstzrange   → timestamptz, tstzmultirange
+        table.insertRow(new Object[]{3912, 1082, 4535, 0, 0, 0, 0}); // daterange   → date,      datemultirange
+        table.insertRow(new Object[]{3926, 20,   4536, 0, 0, 0, 0}); // int8range   → int8,      int8multirange
 
         // User-defined range types
         for (Map.Entry<String, String> entry : database.getRangeTypes().entrySet()) {
@@ -322,6 +328,109 @@ class CatalogTypeSystemBuilder {
         }
     }
 
+    /**
+     * The core btree and hash operator classes PostgreSQL 18 ships that are not written out one by
+     * one below. Read off a PG 18 pg_opclass, restricted to the pg_catalog namespace so nothing a
+     * contrib extension supplies is claimed here.
+     *
+     * <p>Columns: opcname, access method, opcintype, opcdefault, opckeytype, opfname.
+     */
+    private static final Object[][] CORE_OPCLASSES = {
+            // btree
+            {"array_ops", "btree", 2277, true, 0, "array_ops"},
+            {"bit_ops", "btree", 1560, true, 0, "bit_ops"},
+            {"bpchar_ops", "btree", 1042, true, 0, "bpchar_ops"},
+            {"bpchar_pattern_ops", "btree", 1042, false, 0, "bpchar_pattern_ops"},
+            {"bytea_ops", "btree", 17, true, 0, "bytea_ops"},
+            {"char_ops", "btree", 18, true, 0, "char_ops"},
+            {"cidr_ops", "btree", 869, false, 0, "network_ops"},
+            {"enum_ops", "btree", 3500, true, 0, "enum_ops"},
+            {"inet_ops", "btree", 869, true, 0, "network_ops"},
+            {"interval_ops", "btree", 1186, true, 0, "interval_ops"},
+            {"jsonb_ops", "btree", 3802, true, 0, "jsonb_ops"},
+            {"macaddr8_ops", "btree", 774, true, 0, "macaddr8_ops"},
+            {"macaddr_ops", "btree", 829, true, 0, "macaddr_ops"},
+            {"money_ops", "btree", 790, true, 0, "money_ops"},
+            {"multirange_ops", "btree", 4537, true, 0, "multirange_ops"},
+            // name_ops sorts as cstring does, which is what opckeytype records.
+            {"name_ops", "btree", 19, true, 2275, "text_ops"},
+            {"oid_ops", "btree", 26, true, 0, "oid_ops"},
+            {"oidvector_ops", "btree", 30, true, 0, "oidvector_ops"},
+            {"pg_lsn_ops", "btree", 3220, true, 0, "pg_lsn_ops"},
+            {"range_ops", "btree", 3831, true, 0, "range_ops"},
+            {"record_image_ops", "btree", 2249, false, 0, "record_image_ops"},
+            {"record_ops", "btree", 2249, true, 0, "record_ops"},
+            {"tid_ops", "btree", 27, true, 0, "tid_ops"},
+            {"time_ops", "btree", 1083, true, 0, "time_ops"},
+            {"timetz_ops", "btree", 1266, true, 0, "timetz_ops"},
+            {"tsquery_ops", "btree", 3615, true, 0, "tsquery_ops"},
+            {"tsvector_ops", "btree", 3614, true, 0, "tsvector_ops"},
+            {"varbit_ops", "btree", 1562, true, 0, "varbit_ops"},
+            {"xid8_ops", "btree", 5069, true, 0, "xid8_ops"},
+            // hash
+            {"aclitem_ops", "hash", 1033, true, 0, "aclitem_ops"},
+            {"array_ops", "hash", 2277, true, 0, "array_ops"},
+            {"bpchar_ops", "hash", 1042, true, 0, "bpchar_ops"},
+            {"bpchar_pattern_ops", "hash", 1042, false, 0, "bpchar_pattern_ops"},
+            {"bytea_ops", "hash", 17, true, 0, "bytea_ops"},
+            {"char_ops", "hash", 18, true, 0, "char_ops"},
+            {"cid_ops", "hash", 29, true, 0, "cid_ops"},
+            {"cidr_ops", "hash", 869, false, 0, "network_ops"},
+            {"date_ops", "hash", 1082, true, 0, "date_ops"},
+            {"enum_ops", "hash", 3500, true, 0, "enum_ops"},
+            {"float4_ops", "hash", 700, true, 0, "float_ops"},
+            {"float8_ops", "hash", 701, true, 0, "float_ops"},
+            {"inet_ops", "hash", 869, true, 0, "network_ops"},
+            {"int2_ops", "hash", 21, true, 0, "integer_ops"},
+            {"int8_ops", "hash", 20, true, 0, "integer_ops"},
+            {"interval_ops", "hash", 1186, true, 0, "interval_ops"},
+            {"jsonb_ops", "hash", 3802, true, 0, "jsonb_ops"},
+            {"macaddr8_ops", "hash", 774, true, 0, "macaddr8_ops"},
+            {"macaddr_ops", "hash", 829, true, 0, "macaddr_ops"},
+            {"multirange_ops", "hash", 4537, true, 0, "multirange_ops"},
+            {"name_ops", "hash", 19, true, 0, "text_ops"},
+            {"numeric_ops", "hash", 1700, true, 0, "numeric_ops"},
+            {"oid_ops", "hash", 26, true, 0, "oid_ops"},
+            {"oidvector_ops", "hash", 30, true, 0, "oidvector_ops"},
+            {"pg_lsn_ops", "hash", 3220, true, 0, "pg_lsn_ops"},
+            {"range_ops", "hash", 3831, true, 0, "range_ops"},
+            {"record_ops", "hash", 2249, true, 0, "record_ops"},
+            {"text_pattern_ops", "hash", 25, false, 0, "text_pattern_ops"},
+            {"tid_ops", "hash", 27, true, 0, "tid_ops"},
+            {"time_ops", "hash", 1083, true, 0, "time_ops"},
+            {"timestamp_ops", "hash", 1114, true, 0, "timestamp_ops"},
+            {"timestamptz_ops", "hash", 1184, true, 0, "timestamptz_ops"},
+            {"timetz_ops", "hash", 1266, true, 0, "timetz_ops"},
+            {"uuid_ops", "hash", 2950, true, 0, "uuid_ops"},
+            {"varchar_pattern_ops", "hash", 25, false, 0, "text_pattern_ops"},
+            {"xid8_ops", "hash", 5069, true, 0, "xid8_ops"},
+            {"xid_ops", "hash", 28, true, 0, "xid_ops"},
+    };
+
+    /** The families {@link #CORE_OPCLASSES} belongs to: opfname, access method. */
+    private static final Object[][] CORE_OPFAMILIES = {
+            {"array_ops", "btree"}, {"bit_ops", "btree"}, {"bpchar_ops", "btree"},
+            {"bpchar_pattern_ops", "btree"}, {"bytea_ops", "btree"}, {"char_ops", "btree"},
+            {"enum_ops", "btree"}, {"interval_ops", "btree"}, {"jsonb_ops", "btree"},
+            {"macaddr8_ops", "btree"}, {"macaddr_ops", "btree"}, {"money_ops", "btree"},
+            {"multirange_ops", "btree"}, {"network_ops", "btree"}, {"oid_ops", "btree"},
+            {"oidvector_ops", "btree"}, {"pg_lsn_ops", "btree"}, {"range_ops", "btree"},
+            {"record_image_ops", "btree"}, {"record_ops", "btree"}, {"tid_ops", "btree"},
+            {"time_ops", "btree"}, {"timetz_ops", "btree"}, {"tsquery_ops", "btree"},
+            {"tsvector_ops", "btree"}, {"varbit_ops", "btree"}, {"xid8_ops", "btree"},
+            {"aclitem_ops", "hash"}, {"array_ops", "hash"}, {"bpchar_ops", "hash"},
+            {"bpchar_pattern_ops", "hash"}, {"bytea_ops", "hash"}, {"char_ops", "hash"},
+            {"cid_ops", "hash"}, {"date_ops", "hash"}, {"enum_ops", "hash"},
+            {"float_ops", "hash"}, {"interval_ops", "hash"}, {"jsonb_ops", "hash"},
+            {"macaddr8_ops", "hash"}, {"macaddr_ops", "hash"}, {"multirange_ops", "hash"},
+            {"network_ops", "hash"}, {"numeric_ops", "hash"}, {"oid_ops", "hash"},
+            {"oidvector_ops", "hash"}, {"pg_lsn_ops", "hash"}, {"range_ops", "hash"},
+            {"record_ops", "hash"}, {"text_pattern_ops", "hash"}, {"tid_ops", "hash"},
+            {"time_ops", "hash"}, {"timestamp_ops", "hash"}, {"timestamptz_ops", "hash"},
+            {"timetz_ops", "hash"}, {"uuid_ops", "hash"}, {"xid8_ops", "hash"},
+            {"xid_ops", "hash"},
+    };
+
     Table buildPgOpclass() {
         List<Column> cols = Cols.listOf(
                 colNN("oid", DataType.OID), colNN("opcname", DataType.NAME),
@@ -374,9 +483,26 @@ class CatalogTypeSystemBuilder {
         // text_pattern_ops (btree, non-default for text)
         table.insertRow(new Object[]{oids.oid("opclass:text_pattern_ops"), "text_pattern_ops", pgCatalogNs, 10,
                 oids.oid("opfamily:text_pattern_ops"), DataType.TEXT.getOid(), 0, false, 403, 1});
-        // varchar_pattern_ops (btree, non-default for varchar)
+        // varchar_pattern_ops (btree, non-default). Keyed on text rather than varchar, the same way
+        // varchar_ops is: PG has one set of comparison operators and both classes name text.
         table.insertRow(new Object[]{oids.oid("opclass:varchar_pattern_ops"), "varchar_pattern_ops", pgCatalogNs, 10,
-                oids.oid("opfamily:text_pattern_ops"), DataType.VARCHAR.getOid(), 0, false, 403, 1});
+                oids.oid("opfamily:text_pattern_ops"), DataType.TEXT.getOid(), 0, false, 403, 1});
+
+        // The rest of the operator classes PostgreSQL itself ships for btree and hash. Every one
+        // of these is a core class, not something a contrib extension supplies, and code that asks
+        // "which class indexes this type" — CREATE INDEX validation, pg_dump, an ORM choosing an
+        // index — reads pg_opclass to find out. Without a row the answer is that the type cannot
+        // be indexed at all.
+        for (Object[] c : CORE_OPCLASSES) {
+            String amName = (String) c[1];
+            boolean btree = "btree".equals(amName);
+            String keyPrefix = btree ? "opclass:" : "opclass:" + amName + "_";
+            String famPrefix = btree ? "opfamily:" : "opfamily:" + amName + "_";
+            table.insertRow(new Object[]{
+                    oids.oid(keyPrefix + c[0]), c[0], pgCatalogNs, 10,
+                    oids.oid(famPrefix + c[5]), c[2], c[4], c[3],
+                    resolveAccessMethodOid(amName), 1});
+        }
 
         // GIN operator classes
         table.insertRow(new Object[]{oids.oid("opclass:gin_tsvector_ops"), "tsvector_ops", pgCatalogNs, 10,
@@ -436,6 +562,16 @@ class CatalogTypeSystemBuilder {
         table.insertRow(new Object[]{oids.oid("opfamily:hash_bool_ops"), "bool_ops", pgCatalogNs, 10, 405, 1});
         // Pattern ops families
         table.insertRow(new Object[]{oids.oid("opfamily:text_pattern_ops"), "text_pattern_ops", pgCatalogNs, 10, 403, 1});
+        // The families the classes above belong to. A class names its family, and every operator
+        // strategy is recorded against the family rather than the class, so a family with no row
+        // leaves each of its classes pointing at nothing.
+        for (Object[] f : CORE_OPFAMILIES) {
+            String amName = (String) f[1];
+            String keyPrefix = "btree".equals(amName) ? "opfamily:" : "opfamily:" + amName + "_";
+            table.insertRow(new Object[]{oids.oid(keyPrefix + f[0]), f[0], pgCatalogNs, 10,
+                    resolveAccessMethodOid(amName), 1});
+        }
+
         // GIN operator families
         table.insertRow(new Object[]{oids.oid("opfamily:gin_tsvector_ops"), "tsvector_ops", pgCatalogNs, 10, 2742, 1});
         table.insertRow(new Object[]{oids.oid("opfamily:gin_jsonb_ops"), "jsonb_ops", pgCatalogNs, 10, 2742, 1});

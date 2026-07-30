@@ -796,7 +796,10 @@ public class InfoSchemaBuilder {
                     table.insertRow(new Object[]{
                             catalogName(), schemaEntry.getKey(), sc.getName(),
                             catalogName(), schemaEntry.getKey(), t.getName(),
-                            type, "NO", "NO", sc.isNotEnforced() ? "NO" : "YES", nullsDistinct
+                            type,
+                            sc.isDeferrable() ? "YES" : "NO",
+                            sc.isInitiallyDeferred() ? "YES" : "NO",
+                            sc.isNotEnforced() ? "NO" : "YES", nullsDistinct
                     });
                 }
                 // PG 18: NOT NULL constraints appear in information_schema.table_constraints

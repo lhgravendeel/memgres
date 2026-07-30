@@ -926,10 +926,38 @@ class JsonFunctions {
             char c = rest.charAt(i);
             if (c == '.') {
                 i++;
-                int start = i;
-                while (i < rest.length() && rest.charAt(i) != '.' && rest.charAt(i) != '[') i++;
-                String key = rest.substring(start, i);
-                if (!key.isEmpty()) {
+                String key;
+                boolean quotedKey = false;
+                // A member name may be written in double quotes, and PostgreSQL's own jsonpath
+                // output always writes it that way: '$.a'::jsonpath prints as $."a". A key read
+                // with its quotes still attached matches no member, so the whole path selects
+                // nothing -- which is how @? and @@ came to answer false for a key that is there.
+                if (i < rest.length() && rest.charAt(i) == '"') {
+                    int q = i + 1;
+                    StringBuilder name = new StringBuilder();
+                    while (q < rest.length() && rest.charAt(q) != '"') {
+                        if (rest.charAt(q) == '\\' && q + 1 < rest.length()) q++;
+                        name.append(rest.charAt(q));
+                        q++;
+                    }
+                    if (q >= rest.length()) {
+                        throw new MemgresException("unexpected end of jsonpath input", "42601");
+                    }
+                    key = name.toString();
+                    quotedKey = true;
+                    i = q + 1;
+                } else {
+                    int start = i;
+                    while (i < rest.length() && rest.charAt(i) != '.' && rest.charAt(i) != '[') i++;
+                    key = rest.substring(start, i);
+                }
+                if (quotedKey) {
+                    // A quoted name is a member name and nothing else: it is never a wildcard and
+                    // never an item method, however it happens to be spelled.
+                    List<String> next = new ArrayList<>();
+                    for (String node : current) applyMember(node.trim(), key, strict, next);
+                    current = next;
+                } else if (!key.isEmpty()) {
                     if (key.equals("*")) {
                         // Wildcard: expand all values of the object
                         List<String> next = new ArrayList<>();
