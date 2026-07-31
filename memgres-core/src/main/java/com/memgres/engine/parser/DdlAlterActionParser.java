@@ -100,7 +100,7 @@ class DdlAlterActionParser {
         if (parser.matchKeyword("SET")) {
             if (parser.check(TokenType.LEFT_PAREN)) {
                 DdlTableParser.consumeUntilParen(parser);
-                return new AlterTableStmt.SetStorageParams();
+                return new AlterTableStmt.SetStorageParams(true);
             }
             // SET TABLESPACE tsname: no-op for in-memory database
             if (parser.matchKeyword("TABLESPACE")) {
@@ -163,15 +163,19 @@ class DdlAlterActionParser {
                 parser.expectKeyword("SECURITY");
                 return new AlterTableStmt.EnableRls();
             }
-            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER / ENABLE RULE
-            parser.matchKeyword("REPLICA");
-            parser.matchKeyword("ALWAYS");
+            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER / ENABLE RULE.
+            // REPLICA is not a reserved word, so the lexer hands it over as a plain identifier
+            // and matchKeyword never sees it — the same reason REPLICA IDENTITY below is matched
+            // on the token's text rather than its type.
+            String state = "O";
+            if (parser.matchKeyword("REPLICA") || parser.matchIdentifier("REPLICA")) state = "R";
+            else if (parser.matchKeyword("ALWAYS") || parser.matchIdentifier("ALWAYS")) state = "A";
             if (parser.matchKeyword("RULE")) {
-                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), true);
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), state);
             }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL
-            return new AlterTableStmt.EnableTrigger(trigName);
+            return new AlterTableStmt.EnableTrigger(trigName, state);
         }
         if (parser.matchKeyword("DISABLE")) {
             if (parser.matchKeyword("ROW")) {
@@ -181,7 +185,7 @@ class DdlAlterActionParser {
             }
             // DISABLE RULE suspends a rule; without it the only way to stop one is to drop it.
             if (parser.matchKeyword("RULE")) {
-                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), false);
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), "D");
             }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL

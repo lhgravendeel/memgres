@@ -22,7 +22,12 @@ public class PgTrigger {
     private final boolean initiallyDeferred; // DEFERRABLE INITIALLY DEFERRED
     private final java.util.List<String> args; // function arguments from EXECUTE FUNCTION func(arg1, arg2, ...)
     private String schemaName; // schema where the trigger's table lives
-    private boolean disabled; // true when ALTER TABLE ... DISABLE TRIGGER sets this
+    /**
+     * The firing mode, as {@code pg_trigger.tgenabled} spells it: {@code O} origin (the default),
+     * {@code D} disabled, {@code R} replica, {@code A} always. Only {@code O} and {@code A} fire in
+     * an ordinary session — a replica trigger waits for a session in replica mode.
+     */
+    private String enabledState = "O";
 
     public PgTrigger(String name, Timing timing, Event event, String tableName, String functionName) {
         this(name, timing, event, tableName, functionName, null, null, null, false, null, false, false);
@@ -111,11 +116,20 @@ public class PgTrigger {
     }
 
     public boolean isDisabled() {
-        return disabled;
+        return !("O".equals(enabledState) || "A".equals(enabledState));
     }
 
     public void setDisabled(boolean disabled) {
-        this.disabled = disabled;
+        this.enabledState = disabled ? "D" : "O";
+    }
+
+    /** The {@code pg_trigger.tgenabled} code this trigger carries. */
+    public String getEnabledState() {
+        return enabledState;
+    }
+
+    public void setEnabledState(String state) {
+        this.enabledState = state;
     }
 
     public String getWhenClause() {

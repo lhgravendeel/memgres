@@ -236,7 +236,10 @@ class DdlTableExecutor {
                         throw new MemgresException("column \"" + def.name() + "\" is of type " + dataType.getPgName()
                                 + " but default expression is of type timestamp with time zone", "42804");
                     }
-                    if (def.defaultExpr() instanceof Literal) {
+                    if (def.defaultExpr() instanceof Literal
+                            && ((Literal) def.defaultExpr()).value() != null) {
+                        // DEFAULT NULL names no value at all, so there is nothing to read as a
+                        // number: reading one threw a NullPointerException out of the wire handler.
                         Literal lit = (Literal) def.defaultExpr();
                         String strVal = lit.value();
                         try {

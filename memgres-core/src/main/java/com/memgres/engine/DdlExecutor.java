@@ -607,6 +607,17 @@ class DdlExecutor {
                     break;
             }
             return op + exprToDefaultString(un.operand());
+        } else if (expr instanceof ArrayExpr) {
+            // Without this an ARRAY[...] default fell through to the "null" below, so the column
+            // was recorded as having no default at all and every insert that relied on it
+            // silently got a null instead of the array that was written.
+            ArrayExpr arr = (ArrayExpr) expr;
+            StringBuilder sb = new StringBuilder(arr.isRow() ? "ROW(" : "ARRAY[");
+            for (int i = 0; i < arr.elements().size(); i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(exprToDefaultString(arr.elements().get(i)));
+            }
+            return sb.append(arr.isRow() ? ")" : "]").toString();
         }
         return "null";
     }
