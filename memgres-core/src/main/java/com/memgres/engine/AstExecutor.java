@@ -300,6 +300,21 @@ public class AstExecutor {
     }
 
     public QueryResult executeStatement(Statement stmt) {
+        // Outside a transaction a statement is a transaction of its own, so what it writes has to
+        // be undone if it does not finish. Nested calls join this scope rather than opening one.
+        if (session == null) return executeStatementInner(stmt);
+        session.beginStatementScope();
+        boolean failed = true;
+        try {
+            QueryResult result = executeStatementInner(stmt);
+            failed = false;
+            return result;
+        } finally {
+            session.endStatementScope(failed);
+        }
+    }
+
+    private QueryResult executeStatementInner(Statement stmt) {
         // A statement that is not a plain query can change what the catalogs report — a
         // data-modifying CTE, a function body running DDL — so what has been built for this
         // statement so far is dropped on either side of it rather than read again.
