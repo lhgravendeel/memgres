@@ -53,7 +53,8 @@ final class FilterCheck {
         if (found == null) return;
         String name = nameOf(found);
         MemgresException e = new MemgresException(
-                "FILTER specified, but " + name + " is not an aggregate function", "42809");
+                clauseOf(found) + " specified, but " + name + " is not an aggregate function",
+                "42809");
         // PostgreSQL points at the first character of the function name, which for a qualified
         // call is the first character of the qualifier.
         int dot = name.indexOf('.');
@@ -65,11 +66,13 @@ final class FilterCheck {
         String rawName = nameOf(node);
         if (rawName == null) return false;
         Expression filter = filterOf(node);
-        if (filter == null) return false;
+        // DISTINCT inside a call means the same thing FILTER does — accumulate a chosen subset —
+        // so PostgreSQL refuses it on a plain function in the same words.
+        if (filter == null && !isDistinct(node)) return false;
         // What is inside the FILTER is judged before the call carrying it: an aggregate written
         // in a FILTER predicate is 42803 "aggregate functions are not allowed in FILTER", and
         // PostgreSQL says that rather than this whichever call the FILTER hangs off.
-        if (select.containsAggregate(filter)) return false;
+        if (filter != null && select.containsAggregate(filter)) return false;
         String bare = FunctionEvaluator.stripSchemaPrefix(rawName.toLowerCase(Locale.ROOT));
         if (select.isAggregateFunction(rawName)) return false;
         if (PlacementCheck.isWindowFunctionName(bare) && !select.hasUserFunction(bare)) return false;
@@ -85,6 +88,15 @@ final class FilterCheck {
                     : select.hasUserFunction(bare);
         }
         return BuiltinFunctionNames.contains(bare) || select.hasUserFunction(bare);
+    }
+
+    /** The clause PostgreSQL names in the message: FILTER when there is one, else DISTINCT. */
+    private static String clauseOf(Object node) {
+        return filterOf(node) != null ? "FILTER" : "DISTINCT";
+    }
+
+    private static boolean isDistinct(Object node) {
+        return node instanceof FunctionCallExpr && ((FunctionCallExpr) node).distinct;
     }
 
     private static String nameOf(Object node) {
