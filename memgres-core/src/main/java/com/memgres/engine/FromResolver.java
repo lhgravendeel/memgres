@@ -70,9 +70,29 @@ class FromResolver {
     List<RowContext.TableBinding> resolveTableBindings(List<SelectStmt.FromItem> fromItems) {
         List<RowContext.TableBinding> bindings = new ArrayList<>();
         for (SelectStmt.FromItem item : fromItems) {
-            resolveTableBindingsFromItem(item, bindings);
+            // A comma between two FROM items exposes the left one to the right the same way an
+            // explicit join does, so a LATERAL written after a comma reads the names before it and
+            // has to be described with them in scope. Without this the item could not be described
+            // at all and the names it exposes went missing from the query level's scope.
+            if (readsItemsToItsLeft(item) && !bindings.isEmpty()) {
+                executor.outerContextStack.push(new RowContext(new ArrayList<>(bindings)));
+                try {
+                    resolveTableBindingsFromItem(item, bindings);
+                } finally {
+                    executor.outerContextStack.pop();
+                }
+            } else {
+                resolveTableBindingsFromItem(item, bindings);
+            }
         }
         return bindings;
+    }
+
+    /** A LATERAL sub-select, and a function in FROM, which is lateral whether or not it says so. */
+    private static boolean readsItemsToItsLeft(SelectStmt.FromItem item) {
+        if (item instanceof SelectStmt.FunctionFrom) return true;
+        return item instanceof SelectStmt.SubqueryFrom
+                && ((SelectStmt.SubqueryFrom) item).lateral();
     }
 
     /**
@@ -125,10 +145,12 @@ class FromResolver {
         List<RowContext.OutCol> out = new ArrayList<>();
         int offset = 0;
         try {
+            List<RowContext.TableBinding> soFar = new ArrayList<>();
             for (SelectStmt.FromItem item : fromItems) {
-                Described described = describe(item);
+                Described described = describeReadingLeft(item, soFar);
                 for (RowContext.OutCol oc : described.output) out.add(oc.shift(offset));
                 offset += described.bindings.size();
+                soFar.addAll(described.bindings);
             }
         } catch (RuntimeException e) {
             return RowContext.defaultOutput(bindings);
@@ -147,6 +169,18 @@ class FromResolver {
         }
     }
 
+    /** {@link #describe} with the FROM items written before this one in scope, for a LATERAL. */
+    private Described describeReadingLeft(SelectStmt.FromItem item,
+                                          List<RowContext.TableBinding> soFar) {
+        if (!readsItemsToItsLeft(item) || soFar.isEmpty()) return describe(item);
+        executor.outerContextStack.push(new RowContext(new ArrayList<>(soFar)));
+        try {
+            return describe(item);
+        } finally {
+            executor.outerContextStack.pop();
+        }
+    }
+
     private Described describe(SelectStmt.FromItem item) {
         if (!(item instanceof SelectStmt.JoinFrom)) {
             List<RowContext.TableBinding> bindings = new ArrayList<>();
@@ -158,8 +192,7 @@ class FromResolver {
         Described right;
         // A LATERAL item reads the names to its left, so describing it needs those names in
         // scope even when they carry no row, exactly as resolveTableBindingsFromItem has it.
-        if (jf.right() instanceof SelectStmt.SubqueryFrom
-                && ((SelectStmt.SubqueryFrom) jf.right()).lateral()) {
+        if (readsItemsToItsLeft(jf.right())) {
             executor.outerContextStack.push(new RowContext(new ArrayList<>(left.bindings)));
             try {
                 right = describe(jf.right());
@@ -233,9 +266,7 @@ class FromResolver {
             // A LATERAL item reads the names to its left, so describing it needs those names in
             // scope even when they carry no row — otherwise the describe fails and the lateral
             // alias goes missing from a query that answers with no rows at all.
-            boolean lateralRight = joinFrom.right() instanceof SelectStmt.SubqueryFrom
-                    && ((SelectStmt.SubqueryFrom) joinFrom.right()).lateral();
-            if (lateralRight) {
+            if (readsItemsToItsLeft(joinFrom.right())) {
                 executor.outerContextStack.push(new RowContext(new ArrayList<>(bindings)));
                 try {
                     resolveTableBindingsFromItem(joinFrom.right(), bindings);

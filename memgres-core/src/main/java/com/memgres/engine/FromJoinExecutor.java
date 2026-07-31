@@ -465,7 +465,12 @@ class FromJoinExecutor {
                     subResult = executor.executeStatement(sqf.subquery());
                 }
                 String alias = sqf.alias() != null ? sqf.alias() : "subquery";
-                Table virtualTable = new Table(alias, subResult.getColumns());
+                // An alias list renames what the item exposes, so it has to be applied here as
+                // well as on the comma-separated form: without it the names in
+                // "JOIN LATERAL (SELECT t.v) l(z)" stayed the sub-select's own and z was a column
+                // that did not exist.
+                Table virtualTable = new Table(alias, FromFunctionResolver.applyColumnAliases(
+                        new ArrayList<>(subResult.getColumns()), sqf.columnAliases()));
                 boolean matched = false;
                 for (Object[] row : subResult.getRows()) {
                     RowContext rightCtx = new RowContext(virtualTable, alias, row);
@@ -877,6 +882,10 @@ class FromJoinExecutor {
             throw PgErrors.datatypeMismatch("argument of JOIN/ON must be type boolean, not type "
                     + TypeCoercion.inferType(val).toRegtypeDisplay());
         }
+        // A condition that came out as text is a condition all the same: PostgreSQL coerced the
+        // qualification to boolean before it ran, so 'off' is false rather than a non-empty string
+        // read as true. The static check has already refused whatever will not coerce.
+        if (val instanceof String) return Boolean.TRUE.equals(TypeCoercion.toBoolean(val));
         return executor.isTruthy(val);
     }
 

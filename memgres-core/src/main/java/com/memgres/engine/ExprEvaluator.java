@@ -3342,6 +3342,40 @@ class ExprEvaluator {
                 || t == DataType.TIME || t == DataType.TIMETZ;
     }
 
+    /**
+     * The type an enclosing query level gives a column reference, walked in the same order the
+     * runtime lookup walks. Null when no enclosing level holds the name, which leaves the caller's
+     * own fallback in place.
+     */
+    Column columnFromOuterContexts(ColumnRef ref) {
+        if (executor == null || ref.column() == null) return null;
+        for (Iterator<RowContext> it = executor.outerContextStack.descendingIterator(); it.hasNext(); ) {
+            for (RowContext.TableBinding b : it.next().getBindings()) {
+                if (b.table() == null) continue;
+                if (ref.table() != null) {
+                    if (!ref.table().equalsIgnoreCase(b.alias())
+                            && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+                }
+                int idx = b.table().getColumnIndex(ref.column());
+                if (idx >= 0) return b.table().getColumns().get(idx);
+            }
+        }
+        return null;
+    }
+
+    /** True when this level's own relations hold the name, so no enclosing one need be asked. */
+    private static boolean resolvesHere(ColumnRef ref, List<RowContext.TableBinding> bindings) {
+        for (RowContext.TableBinding b : bindings) {
+            if (b.table() == null) continue;
+            if (ref.table() != null) {
+                if (!ref.table().equalsIgnoreCase(b.alias())
+                        && !ref.table().equalsIgnoreCase(b.table().getName())) continue;
+            }
+            if (b.table().getColumnIndex(ref.column()) >= 0) return true;
+        }
+        return false;
+    }
+
     DataType inferTypeFromContext(Expression expr, List<RowContext.TableBinding> bindings) {
         if (expr instanceof PrecomputedValueExpr) {
             PrecomputedValueExpr pre = (PrecomputedValueExpr) expr;
@@ -3368,6 +3402,13 @@ class ExprEvaluator {
                     if (fallbackType != null) return fallbackType;
                 }
             }
+            // A name this level does not supply may come from an enclosing one: a LATERAL item
+            // reads the relations to its left and a correlated sub-select reads the query around
+            // it, and evaluation resolves both through outerContextStack. Reading the type from
+            // the same place is what keeps a column a LATERAL exposes the type it actually has --
+            // typed as text, abs() over one answered "function abs(text) does not exist".
+            Column outer = columnFromOuterContexts(ref);
+            if (outer != null) return outer.getType();
             return DataType.TEXT;
         }
         if (expr instanceof CastExpr) {
@@ -4003,6 +4044,20 @@ class ExprEvaluator {
      * </ul>
      */
     Column buildResultColumn(String alias, Expression expr, List<RowContext.TableBinding> bindings) {
+        // A column an enclosing level supplies is that column: a LATERAL that projects one keeps
+        // everything the type is made of, not just the DataType — an int[] exposed through a
+        // LATERAL described itself as _int4 while the same column read directly is integer[].
+        if (expr instanceof ColumnRef && !resolvesHere((ColumnRef) expr, bindings)) {
+            Column outer = columnFromOuterContexts((ColumnRef) expr);
+            // What is copied is what the type is made of. A projection is not the relation's key
+            // and carries neither its default nor its generation expression, so those are dropped.
+            if (outer != null) {
+                return new Column(alias, outer.getType(), true, false, null,
+                        outer.getEnumTypeName(), outer.getPrecision(), outer.getScale(), null,
+                        false, outer.getDomainTypeName(), outer.getCompositeTypeName(),
+                        outer.getArrayElementType());
+            }
+        }
         FunctionCallExpr arrayAgg = findArrayAggCall(expr);
         if (arrayAgg != null && !arrayAgg.args().isEmpty()) {
             List<RowContext.TableBinding> scope = expr instanceof SubqueryExpr

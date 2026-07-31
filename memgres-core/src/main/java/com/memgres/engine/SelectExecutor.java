@@ -216,6 +216,9 @@ class SelectExecutor {
             scope = new QueryLevelScope(this,
                     executor.fromResolver.resolveTableBindings(stmt.from()), null, stmt);
         }
+        // A join condition belongs to the FROM clause, which PostgreSQL transforms before it reads
+        // any other clause, so this is judged before the select list's calls are.
+        rejectNonBooleanJoinConditions(stmt.from(), scope);
         FilterCheck.reject(this, stmt, scope);
         rejectMisplacedSrfs(stmt);
 
@@ -1815,7 +1818,15 @@ class SelectExecutor {
                         ? new Column(alias, DataType.ENUM, true, false, null, enumTypeName)
                         : new Column(alias, DataType.TEXT, true, false, null));
             } else {
-                columns.add(new Column(alias, resultType, true, false, null));
+                // A column an enclosing query level supplies — which is what a LATERAL projects —
+                // keeps the whole of its declared type. A bare DataType does not carry an array's
+                // element type, and an int[] read through a LATERAL called itself _int4.
+                Column outerCol = target.expr() instanceof ColumnRef
+                        ? executor.exprEvaluator.columnFromOuterContexts((ColumnRef) target.expr())
+                        : null;
+                columns.add(outerCol != null
+                        ? buildProjectedColumn(alias, target.expr(), Cols.listOf())
+                        : new Column(alias, resultType, true, false, null));
             }
             if (val instanceof List<?> && srfNode != null) {
                 List<?> list = (List<?>) val;
@@ -2014,6 +2025,124 @@ class SelectExecutor {
             rejectSrfsInJoinConditions(Cols.listOf(jf.left(), jf.right()));
         }
     }
+
+    /**
+     * A join condition has to be a condition.
+     *
+     * <p>{@code ON a.id} joins on nothing at all: PostgreSQL coerces the qualification to boolean
+     * while it builds the range table and refuses what will not coerce, so a text column there is
+     * 42804 and a string that is not a boolean word is 22P02 — while memgres read whatever came out
+     * as truthy and quietly answered the whole cross product.
+     *
+     * <p>Judged before the join runs, because the join running is the wrong answer, and judged
+     * innermost-first left to right, which is the order PostgreSQL reaches the qualifications in.
+     * Deliberately one-sided: only an expression whose type is certain here is refused, so a shape
+     * this cannot type is executed exactly as before.
+     */
+    private void rejectNonBooleanJoinConditions(List<SelectStmt.FromItem> fromItems,
+                                                QueryLevelScope scope) {
+        if (fromItems == null) return;
+        for (SelectStmt.FromItem item : fromItems) {
+            if (!(item instanceof SelectStmt.JoinFrom)) continue;
+            SelectStmt.JoinFrom jf = (SelectStmt.JoinFrom) item;
+            rejectNonBooleanJoinConditions(Cols.listOf(jf.left(), jf.right()), scope);
+            rejectNonBooleanCondition(jf.on(), "JOIN/ON", scope);
+        }
+    }
+
+    /**
+     * Refuses one expression standing where a condition is wanted, naming the construct that wanted
+     * it. AND, OR and NOT each want one of their own and PostgreSQL names the operator rather than
+     * the clause, so the walk descends through them carrying the name with it.
+     */
+    private void rejectNonBooleanCondition(Expression expr, String clause, QueryLevelScope scope) {
+        if (expr == null) return;
+        // An aggregate or a window call cannot stand in a join condition at all, and that refusal
+        // is PostgreSQL's answer whatever type the condition would have had.
+        if (containsAggregate(expr) || containsWindowFunction(expr)) return;
+        if (expr instanceof BinaryExpr) {
+            BinaryExpr bin = (BinaryExpr) expr;
+            if (bin.op() == BinaryExpr.BinOp.AND || bin.op() == BinaryExpr.BinOp.OR) {
+                rejectNonBooleanCondition(bin.left(), bin.op().name(), scope);
+                rejectNonBooleanCondition(bin.right(), bin.op().name(), scope);
+            }
+            // Every other operator is a comparison or an arithmetic one whose result type this
+            // does not settle, so it is left to evaluate as before.
+            return;
+        }
+        if (expr instanceof UnaryExpr && ((UnaryExpr) expr).op() == UnaryExpr.UnaryOp.NOT) {
+            rejectNonBooleanCondition(((UnaryExpr) expr).operand(), "NOT", scope);
+            return;
+        }
+        // A string written without a type is `unknown`, and a condition is what resolves it: 'x' is
+        // not a boolean word, so PostgreSQL reports the input rather than the type.
+        if (expr instanceof Literal
+                && ((Literal) expr).literalType() == Literal.LiteralType.STRING) {
+            TypeCoercion.toBoolean(((Literal) expr).value());
+            return;
+        }
+        DataType type = certainConditionType(expr, scope);
+        if (type == null || type == DataType.BOOLEAN) return;
+        throw PgErrors.datatypeMismatch("argument of " + clause
+                + " must be type boolean, not type " + type.toRegtypeDisplay());
+    }
+
+    /**
+     * The type an expression in a condition certainly has, or null when this cannot settle it.
+     *
+     * <p>Four things are certain: a numeric or boolean literal, a cast to a named built-in type, a
+     * built-in call whose every signature returns one type, and a column of a relation this query
+     * level has already resolved. Of those, only the types on the list below are certainly not a
+     * boolean — a domain or an enum could be over anything, and refusing one wrongly would refuse
+     * SQL PostgreSQL runs.
+     */
+    private DataType certainConditionType(Expression expr, QueryLevelScope scope) {
+        DataType type = null;
+        if (expr instanceof CastExpr) {
+            String name = ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim();
+            type = DataType.fromPgName(name);
+        } else if (expr instanceof FunctionCallExpr) {
+            type = soleReturnType((FunctionCallExpr) expr);
+        } else if (scope != null) {
+            type = scope.certainTypeOf(expr);
+        }
+        if (type == DataType.BOOLEAN) return type;
+        return CERTAINLY_NOT_BOOLEAN.contains(type) ? type : null;
+    }
+
+    /**
+     * The type a built-in call certainly produces: the one every signature of that name returns.
+     * A name whose overloads return different types, one a user has declared a function under, and
+     * one carrying a clause that changes what it is are all left unsettled.
+     */
+    private DataType soleReturnType(FunctionCallExpr call) {
+        if (call.filter() != null || call.distinct || call.star) return null;
+        String bare = FunctionEvaluator.stripSchemaPrefix(call.name().toLowerCase(Locale.ROOT));
+        if (hasUserFunction(bare) || isAggregateFunction(bare)) return null;
+        if (PlacementCheck.isWindowFunctionName(bare)) return null;
+        DataType found = null;
+        for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+            if (!signature[0].equalsIgnoreCase(bare)) continue;
+            // A function that returns a set returns rows, not a value of a type.
+            if (signature[3] == null || signature[3].isEmpty()) return null;
+            if (signature[3].charAt(0) == 't') return null;
+            DataType returned = DataType.fromOid(Integer.parseInt(signature[1]));
+            if (returned == null) return null;
+            if (found != null && found != returned) return null;
+            found = returned;
+        }
+        return found;
+    }
+
+    /** The types a value certainly has when it has one of them, and none of them is boolean. */
+    private static final Set<DataType> CERTAINLY_NOT_BOOLEAN =
+            new java.util.HashSet<>(Arrays.asList(
+                    DataType.SMALLINT, DataType.INTEGER, DataType.BIGINT, DataType.REAL,
+                    DataType.DOUBLE_PRECISION, DataType.NUMERIC, DataType.MONEY,
+                    DataType.VARCHAR, DataType.CHAR, DataType.TEXT, DataType.NAME,
+                    DataType.DATE, DataType.TIMESTAMP, DataType.TIMESTAMPTZ, DataType.TIME,
+                    DataType.TIMETZ, DataType.INTERVAL, DataType.BYTEA, DataType.UUID,
+                    DataType.JSON, DataType.JSONB, DataType.XML));
 
     /**
      * A join or subquery given an alias exposes everything it produces under that single name,

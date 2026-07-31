@@ -90,8 +90,22 @@ final class PlacementCheck {
     void reject(Object node, String clause, QueryLevelScope scope) {
         Object found = findInScope(node, false);
         if (found == null) return;
-        if (scope != null) scope.rejectUnresolvedColumns(found);
+        // What PostgreSQL has already transformed when it refuses the call is the call's own
+        // arguments, not its OVER specification: the window definitions of a query are transformed
+        // as a group, after every clause has been read, so a column that is not there in one is
+        // never reached for a window call the clause could not hold anyway.
+        if (scope != null) scope.rejectUnresolvedColumns(argumentsOf(found));
         throw misplaced(found, clause);
+    }
+
+    /** The parts of a call PostgreSQL resolves before it decides the call may not stand here. */
+    private static Object argumentsOf(Object found) {
+        if (!(found instanceof WindowFuncExpr)) return found;
+        WindowFuncExpr wf = (WindowFuncExpr) found;
+        List<Object> parts = new ArrayList<Object>();
+        if (wf.args() != null) parts.addAll(wf.args());
+        if (wf.filter() != null) parts.add(wf.filter());
+        return parts;
     }
 
     /**
@@ -106,21 +120,45 @@ final class PlacementCheck {
     }
 
     /**
-     * The first misplaced call in the tree, not descending into a nested query. Written as an
-     * explicit search rather than {@link AstWalk#anyMatch} because that walk has no way to refuse a
-     * subtree, and refusing the subtree is the whole scope rule.
+     * The first misplaced call PostgreSQL would reach, not descending into a nested query. Written
+     * as an explicit search rather than {@link AstWalk#anyMatch} because that walk has no way to
+     * refuse a subtree, and refusing the subtree is the whole scope rule — and because the order
+     * matters as well as the answer, which {@link #forEachAnalysedChild} is what settles.
      */
     private Object findInScope(Object node, boolean windowsOnly) {
         if (node == null || node instanceof Statement) return null;
-        if (kindOf(node, windowsOnly) != null) return node;
         Object[] found = new Object[1];
-        AstWalk.forEachChild(node, child -> {
+        forEachAnalysedChild(node, child -> {
             if (found[0] == null) {
                 Object hit = findInScope(child, windowsOnly);
                 if (hit != null) found[0] = hit;
             }
         });
-        return found[0];
+        if (found[0] != null) return found[0];
+        return kindOf(node, windowsOnly) != null ? node : null;
+    }
+
+    /**
+     * The children of a node in the order PostgreSQL analyses them, which is what decides the
+     * message when a clause holds more than one thing it may not hold.
+     *
+     * <p>An expression is transformed from the leaves up, so a call's arguments are analysed before
+     * the call itself: {@code HAVING sum(row_number() OVER ()) > 1} is the window call being
+     * refused, not the aggregate around it, even though the aggregate is written first.
+     *
+     * <p>A window call's OVER specification is the exception. The window definitions of a query are
+     * transformed together once every clause has been read, so nothing in one is reached while the
+     * clause holding the call is being judged — {@code WHERE row_number() OVER (ORDER BY nosuch)}
+     * is the window call standing in WHERE, not the column that is not there.
+     */
+    private static void forEachAnalysedChild(Object node, java.util.function.Consumer<Object> action) {
+        if (!(node instanceof WindowFuncExpr)) {
+            AstWalk.forEachChild(node, action);
+            return;
+        }
+        WindowFuncExpr wf = (WindowFuncExpr) node;
+        if (wf.args() != null) for (Expression arg : wf.args()) if (arg != null) action.accept(arg);
+        if (wf.filter() != null) action.accept(wf.filter());
     }
 
     private Kind kindOf(Object node, boolean windowsOnly) {

@@ -1828,8 +1828,10 @@ class FromFunctionResolver {
         }
         List<Column> result = new ArrayList<>(columns);
         for (int i = 0; i < aliases.size() && i < result.size(); i++) {
-            Column orig = result.get(i);
-            result.set(i, new Column(aliases.get(i), orig.getType(), orig.isNullable(), orig.isPrimaryKey(), orig.getDefaultValue()));
+            // A rename is a rename: the column keeps the type it had, down to the parts a bare
+            // DataType does not carry — an element type, an enum's or a domain's name, a
+            // precision. Rebuilt from the DataType alone, an integer[] came back as _int4.
+            result.set(i, result.get(i).withName(aliases.get(i)));
         }
         return result;
     }
