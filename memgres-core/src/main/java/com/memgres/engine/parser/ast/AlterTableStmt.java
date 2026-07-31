@@ -673,6 +673,31 @@ public final class AlterTableStmt implements Statement {
             return "SetStorageParams[params=" + params + "]";
         }
     }
+    /**
+     * SET WITHOUT CLUSTER / SET WITHOUT OIDS. Neither has anything to change in an in-memory
+     * database, but a partitioned table has no index to mark clustered, and PostgreSQL says so.
+     */
+    public static final class SetWithoutCluster implements AlterAction {
+        public final boolean cluster;
+
+        public SetWithoutCluster(boolean cluster) { this.cluster = cluster; }
+
+        public boolean cluster() { return cluster; }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            return cluster == ((SetWithoutCluster) o).cluster;
+        }
+
+        @Override
+        public int hashCode() { return cluster ? 1 : 0; }
+
+        @Override
+        public String toString() { return "SetWithoutCluster[cluster=" + cluster + "]"; }
+    }
+
         public static final class OwnerTo implements AlterAction {
         public final String newOwner;
 

@@ -2795,8 +2795,26 @@ class DdlObjectExecutor {
     private String requireDefaultReadableAsDomain(DomainType domain, String rawDefault) {
         String literal = bareStringLiteral(rawDefault);
         if (literal == null || domain.getBaseType() == null) return rawDefault;
-        Object value = executor.castEvaluator.applyCast(literal, domain.getBaseTypeName() != null
-                ? domain.getBaseTypeName() : domain.getBaseType().getPgName(), true);
+        String typeName = domain.getBaseTypeName() != null
+                ? domain.getBaseTypeName() : domain.getBaseType().getPgName();
+        // A domain over an array records its ELEMENT type here, so reading '{1,2}' with that
+        // type's input function refuses a default PostgreSQL takes. Neither shape is checked.
+        if (typeName.indexOf('[') >= 0 || literal.startsWith("{")) return rawDefault;
+        Object value;
+        try {
+            value = executor.castEvaluator.applyCast(literal, typeName, true);
+        } catch (MemgresException e) {
+            // The input function is the authority on what it can read, but only where it is the
+            // right one. Anything it cannot make sense of for a reason this method did not
+            // anticipate is left to fail at first use, as it did before the check existed.
+            if ("22P02".equals(e.getSqlState()) || "22003".equals(e.getSqlState())
+                    || "22007".equals(e.getSqlState()) || "22008".equals(e.getSqlState())) {
+                throw e;
+            }
+            return rawDefault;
+        } catch (RuntimeException e) {
+            return rawDefault;
+        }
         // What the catalogs then report is the value the input function read, not the text it was
         // written as — but only for the types whose values PostgreSQL prints unquoted.
         if (value != null && UNQUOTED_DEFAULT_TYPES.contains(domain.getBaseType())) {

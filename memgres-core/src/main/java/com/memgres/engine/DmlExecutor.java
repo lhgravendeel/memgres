@@ -1240,7 +1240,8 @@ class DmlExecutor {
         if (ruled != null) return ruled;
         // A DO ALSO rule is added to the statement, so its actions run against the rows as they
         // are now and the statement then goes on to do its own work.
-        applyAlsoRule(stmt.table(), "UPDATE", stmt.where(), stmt.setClauses());
+        applyAlsoRule(stmt.table(), "UPDATE", stmt.where(), stmt.setClauses(),
+                stmt.alias(), stmt.from());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
@@ -1957,7 +1958,7 @@ class DmlExecutor {
                 stmt.where(), null);
         if (ruledDelete != null) return ruledDelete;
         // As for UPDATE: a DO ALSO rule runs beside the statement, over the rows about to go.
-        applyAlsoRule(stmt.table(), "DELETE", stmt.where(), null);
+        applyAlsoRule(stmt.table(), "DELETE", stmt.where(), null, stmt.alias(), stmt.using());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
@@ -2949,13 +2950,20 @@ class DmlExecutor {
      */
     private void applyAlsoRule(String tableName, String event, Expression where,
                                List<InsertStmt.SetClause> setClauses) {
+        applyAlsoRule(tableName, event, where, setClauses, null, null);
+    }
+
+    private void applyAlsoRule(String tableName, String event, Expression where,
+                               List<InsertStmt.SetClause> setClauses, String alias,
+                               List<SelectStmt.FromItem> extraFrom) {
         String ruleVal = executor.database.getRule(tableName, event);
         if (ruleVal == null || !ruleVal.startsWith("ALSO:")) return;
         if (executor.isRuleExpanding(tableName, event)) {
             throw PgErrors.infiniteRecursionInRules(tableName);
         }
         runRowRuleActions(tableName, event, ruleVal.substring("ALSO:".length()), where,
-                setClauses, null, executor.database.getRuleQualification(tableName, event));
+                setClauses, null, executor.database.getRuleQualification(tableName, event),
+                alias, extraFrom);
     }
 
     /**
@@ -2970,7 +2978,15 @@ class DmlExecutor {
     private int runRowRuleActions(String tableName, String event, String ruleSql, Expression where,
                                   List<InsertStmt.SetClause> setClauses, QueryResult.Type tagType,
                                   String qualification) {
-        QueryResult affected = selectAffectedRows(tableName, where);
+        return runRowRuleActions(tableName, event, ruleSql, where, setClauses, tagType,
+                qualification, null, null);
+    }
+
+    private int runRowRuleActions(String tableName, String event, String ruleSql, Expression where,
+                                  List<InsertStmt.SetClause> setClauses, QueryResult.Type tagType,
+                                  String qualification, String alias,
+                                  List<SelectStmt.FromItem> extraFrom) {
+        QueryResult affected = selectAffectedRows(tableName, alias, extraFrom, where);
         List<Column> cols = affected.getColumns();
         Table rowShape = new Table(tableName, cols);
         String[] actions = Database.ruleActions(ruleSql);
@@ -3113,11 +3129,22 @@ class DmlExecutor {
     }
 
     /** The rows the statement would have acted on, read through the relation it names. */
-    private QueryResult selectAffectedRows(String tableName, Expression where) {
+    /**
+     * The rows the statement acts on, which are the rows its rule fires for.
+     *
+     * <p>The WHERE is the statement's own, so it may name the relation by an alias and may name
+     * the other relations an UPDATE ... FROM or a DELETE ... USING brought in. Rebuilding the
+     * query from the table name alone left those unbound, and an ordinary write turned into
+     * 42P01 "missing FROM-clause entry" as soon as the relation carried a rule.
+     */
+    private QueryResult selectAffectedRows(String tableName, String alias,
+                                           List<SelectStmt.FromItem> extraFrom, Expression where) {
         List<SelectStmt.SelectTarget> targets = Cols.listOf(
-                new SelectStmt.SelectTarget(new WildcardExpr(), null));
-        List<SelectStmt.FromItem> from = Cols.listOf(
-                new SelectStmt.TableRef(null, tableName, null));
+                new SelectStmt.SelectTarget(
+                        new WildcardExpr(null, null, alias != null ? alias : tableName), null));
+        List<SelectStmt.FromItem> from = new ArrayList<>();
+        from.add(new SelectStmt.TableRef(null, tableName, alias));
+        if (extraFrom != null) from.addAll(extraFrom);
         SelectStmt sel = new SelectStmt(false, null, targets, from, where,
                 null, null, null, null, null, null, null, null, null, false);
         return executor.executeStatement(sel);

@@ -397,7 +397,11 @@ class DdlAlterTableResidualsTest {
         // an ordinary table takes them, and the other SET forms are not storage parameters
         run("CREATE TABLE atr_q9 (id int, v text)");
         run("ALTER TABLE atr_q9 SET (fillfactor = 50)");
-        run("ALTER TABLE atr_q8 SET WITHOUT CLUSTER");
+        // atr_q8 is the partitioned one: a partitioned table has no index to mark clustered, so
+        // PostgreSQL refuses this form there while taking the other SET spellings.
+        assertError("0A000", "cannot mark index clustered in partitioned table",
+                "ALTER TABLE atr_q8 SET WITHOUT CLUSTER");
+        run("ALTER TABLE atr_q9 SET WITHOUT CLUSTER");
         run("ALTER TABLE atr_q8 SET TABLESPACE pg_default");
         run("ALTER TABLE atr_q8 RESET (fillfactor)");
     }

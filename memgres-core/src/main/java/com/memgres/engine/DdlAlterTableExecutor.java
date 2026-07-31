@@ -594,6 +594,11 @@ class DdlAlterTableExecutor {
                 DdlIndexValidator.checkRelOptions("heap",
                         ((AlterTableStmt.SetStorageParams) action).params());
             }
+        } else if (action instanceof AlterTableStmt.SetWithoutCluster) {
+            if (((AlterTableStmt.SetWithoutCluster) action).cluster() && isPartitioned(table)) {
+                throw new MemgresException(
+                        "cannot mark index clustered in partitioned table", "0A000");
+            }
         } else if (action instanceof AlterTableStmt.SetLogged) {
             AlterTableStmt.SetLogged sl = (AlterTableStmt.SetLogged) action;
             table.setUnlogged(!sl.logged());
@@ -846,8 +851,15 @@ class DdlAlterTableExecutor {
      * Ordinary inheritance is looser — a child there is a table in its own right — and
      * PostgreSQL accepts ONLY on an inheritance parent for this one.
      */
-    private static void rejectOnlyNotNullOnPartitioned(Table table, AlterTableStmt stmt) {
-        if (stmt.only() && !table.getPartitions().isEmpty()) throw onlyOnParent();
+    private static void rejectOnlyNotNullOnPartitioned(Table table, AlterTableStmt stmt,
+                                                       String columnName) {
+        if (!stmt.only() || table.getPartitions().isEmpty()) return;
+        // Only a constraint the partitions would have to take on as well is refused. A column
+        // that is already NOT NULL has nothing to add, so PostgreSQL accepts the statement -- and
+        // an idempotent migration re-asserting NOT NULL is exactly the shape that writes it.
+        int idx = columnName == null ? -1 : table.getColumnIndex(columnName);
+        if (idx >= 0 && !table.getColumns().get(idx).isNullable()) return;
+        throw onlyOnParent();
     }
 
     /**
@@ -1225,7 +1237,7 @@ class DdlAlterTableExecutor {
             rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table());
             table.alterColumnDefault(alterCol.column(), null);
         } else if (alterCol.action() instanceof AlterTableStmt.SetNotNull) {
-            rejectOnlyNotNullOnPartitioned(table, stmt);
+            rejectOnlyNotNullOnPartitioned(table, stmt, alterCol.column());
             int colIdx = table.getColumnIndex(alterCol.column());
             if (colIdx >= 0) {
                 for (Object[] row : table.getRows()) {
@@ -1881,7 +1893,7 @@ class DdlAlterTableExecutor {
             throw onlyOnParent();
         }
         if (addedType == TableConstraint.ConstraintType.NOT_NULL) {
-            rejectOnlyNotNullOnPartitioned(table, stmt);
+            rejectOnlyNotNullOnPartitioned(table, stmt, null);
         }
         if (addedType == TableConstraint.ConstraintType.FOREIGN_KEY
                 && stmt.only() && isPartitioned(table)) {

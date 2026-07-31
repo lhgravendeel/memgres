@@ -102,7 +102,11 @@ class DdlAlterActionParser {
             if (parser.match(TokenType.LEFT_PAREN)) {
                 java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
                 while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                    // A parameter may be namespaced, as toast.autovacuum_enabled is.
                     String key = parser.readIdentifier().toLowerCase();
+                    if (parser.match(TokenType.DOT)) {
+                        key = key + "." + parser.readIdentifier().toLowerCase();
+                    }
                     String val = null;
                     if (parser.match(TokenType.EQUALS)) {
                         StringBuilder sb = new StringBuilder();
@@ -144,7 +148,7 @@ class DdlAlterActionParser {
                 if (!"cluster".equalsIgnoreCase(word) && !"oids".equalsIgnoreCase(word)) {
                     throw new ParseException("Expected CLUSTER or OIDS", what);
                 }
-                return new AlterTableStmt.SetStorageParams();
+                return new AlterTableStmt.SetWithoutCluster("cluster".equalsIgnoreCase(word));
             }
             // Fall through; could be other SET variants, but for now error
             throw new ParseException("Unsupported ALTER TABLE SET action", parser.peek());

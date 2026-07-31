@@ -543,6 +543,10 @@ final class DdlIndexValidator {
         relopt("heap", "user_catalog_table", RelOption.bool());
         relopt("heap", "vacuum_truncate", RelOption.bool());
         relopt("heap", "autovacuum_vacuum_threshold", RelOption.integer(0, 2147483647.0));
+        // PostgreSQL 18 added this one; leaving it out refused a CREATE TABLE that PG runs.
+        relopt("heap", "autovacuum_vacuum_max_threshold", RelOption.integer(-1, 2147483647.0));
+        // The legacy spelling is still accepted on CREATE TABLE, and pg_dump still writes it.
+        relopt("heap", "oids", RelOption.bool());
         relopt("heap", "autovacuum_vacuum_insert_threshold", RelOption.integer(-1, 2147483647.0));
         relopt("heap", "autovacuum_analyze_threshold", RelOption.integer(0, 2147483647.0));
         relopt("heap", "autovacuum_vacuum_cost_limit", RelOption.integer(1, 10000));
@@ -558,7 +562,8 @@ final class DdlIndexValidator {
         relopt("heap", "autovacuum_vacuum_insert_scale_factor", RelOption.real(0, 100));
         relopt("heap", "autovacuum_analyze_scale_factor", RelOption.real(0, 100));
         relopt("heap", "vacuum_index_cleanup", RelOption.enumerated("auto", "on", "off"));
-        relopt("heap", "vacuum_max_eager_scan_fraction", RelOption.real(0, 1));
+        // vacuum_max_eager_scan_fraction is a GUC, not a storage parameter: PostgreSQL 18
+        // refuses it in WITH (...), so listing it here made memgres accept what PG does not.
 
         relopt("btree", "fillfactor", RelOption.integer(10, 100));
         relopt("btree", "deduplicate_items", RelOption.bool());
