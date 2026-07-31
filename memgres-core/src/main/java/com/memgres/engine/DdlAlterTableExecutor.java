@@ -582,7 +582,12 @@ class DdlAlterTableExecutor {
                         + stmt.table() + "\" does not exist", "42704");
             }
         } else if (action instanceof AlterTableStmt.SetStorageParams) {
-            // no-op
+            // Nothing is stored, but a parameter PostgreSQL does not recognise or a value it
+            // will not take stops the statement here rather than being quietly accepted.
+            if (table != null && !table.isViewProjection()) {
+                DdlIndexValidator.checkRelOptions("heap",
+                        ((AlterTableStmt.SetStorageParams) action).params());
+            }
         } else if (action instanceof AlterTableStmt.SetLogged) {
             AlterTableStmt.SetLogged sl = (AlterTableStmt.SetLogged) action;
             table.setUnlogged(!sl.logged());

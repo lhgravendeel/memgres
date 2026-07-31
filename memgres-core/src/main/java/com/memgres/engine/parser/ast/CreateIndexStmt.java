@@ -20,6 +20,8 @@ public final class CreateIndexStmt implements Statement {
     public final List<String> columnOptions;
     /** NULLS NOT DISTINCT (PG 15+ for unique indexes). */
     public final boolean nullsNotDistinct;
+    /** WITH (...) storage parameters, checked against what the access method accepts. */
+    public final java.util.Map<String, String> withOptions;
 
     public CreateIndexStmt(
             String name,
@@ -35,6 +37,26 @@ public final class CreateIndexStmt implements Statement {
             List<String> columnOptions,
             boolean nullsNotDistinct
     ) {
+        this(name, schema, table, columns, unique, ifNotExists, concurrently, method,
+                includeColumns, whereClause, columnOptions, nullsNotDistinct, null);
+    }
+
+    public CreateIndexStmt(
+            String name,
+            String schema,
+            String table,
+            List<String> columns,
+            boolean unique,
+            boolean ifNotExists,
+            boolean concurrently,
+            String method,
+            List<String> includeColumns,
+            String whereClause,
+            List<String> columnOptions,
+            boolean nullsNotDistinct,
+            java.util.Map<String, String> withOptions
+    ) {
+        this.withOptions = withOptions;
         this.name = name;
         this.schema = schema;
         this.table = table;
@@ -88,6 +110,7 @@ public final class CreateIndexStmt implements Statement {
     public String whereClause() { return whereClause; }
     public List<String> columnOptions() { return columnOptions; }
     public boolean nullsNotDistinct() { return nullsNotDistinct; }
+    public java.util.Map<String, String> withOptions() { return withOptions; }
 
     @Override
     public boolean equals(Object o) {

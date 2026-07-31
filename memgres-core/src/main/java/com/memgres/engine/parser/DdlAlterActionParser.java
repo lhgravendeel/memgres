@@ -96,11 +96,27 @@ class DdlAlterActionParser {
             String newSchema = parser.readIdentifier();
             return new AlterTableStmt.SetSchema(newSchema);
         }
-        // SET (storage_parameter = value, ...): no-op for in-memory database
+        // SET (storage_parameter = value, ...): nothing is stored for it, but the parameters are
+        // kept so the executor can refuse a name or a value PostgreSQL would refuse.
         if (parser.matchKeyword("SET")) {
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                DdlTableParser.consumeUntilParen(parser);
-                return new AlterTableStmt.SetStorageParams();
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
+                while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                    String key = parser.readIdentifier().toLowerCase();
+                    String val = null;
+                    if (parser.match(TokenType.EQUALS)) {
+                        StringBuilder sb = new StringBuilder();
+                        while (!parser.isAtEnd() && !parser.check(TokenType.COMMA)
+                                && !parser.check(TokenType.RIGHT_PAREN)) {
+                            sb.append(parser.advance().value());
+                        }
+                        val = sb.toString().trim();
+                    }
+                    params.put(key, val);
+                    parser.match(TokenType.COMMA);
+                }
+                parser.match(TokenType.RIGHT_PAREN);
+                return new AlterTableStmt.SetStorageParams(params);
             }
             // SET TABLESPACE tsname: no-op for in-memory database
             if (parser.matchKeyword("TABLESPACE")) {

@@ -617,23 +617,30 @@ public final class AlterTableStmt implements Statement {
     }
 
         public static final class SetStorageParams implements AlterAction {
-        public SetStorageParams() {}
+        /** The WITH-style parameters written, or null for the forms that carry none. */
+        public final java.util.Map<String, String> params;
+
+        public SetStorageParams() { this(null); }
+
+        public SetStorageParams(java.util.Map<String, String> params) { this.params = params; }
+
+        public java.util.Map<String, String> params() { return params; }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
-            return true;
+            return java.util.Objects.equals(params, ((SetStorageParams) o).params);
         }
 
         @Override
         public int hashCode() {
-            return 0;
+            return java.util.Objects.hashCode(params);
         }
 
         @Override
         public String toString() {
-            return "SetStorageParams[]";
+            return "SetStorageParams[params=" + params + "]";
         }
     }
         public static final class OwnerTo implements AlterAction {

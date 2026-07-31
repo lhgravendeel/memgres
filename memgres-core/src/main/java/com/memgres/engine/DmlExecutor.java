@@ -392,6 +392,11 @@ class DmlExecutor {
             return QueryResult.command(QueryResult.Type.INSERT, ruleCount);
         }
 
+        // Every name the statement writes to is resolved against the relation before any row is
+        // looked at, so an INSERT into a column that is not there is refused the same way whether
+        // the VALUES list is empty, the SELECT behind it returns nothing, or the table is empty.
+        requireTargetColumns(table, stmt.table(), stmt.columns());
+
         // Validate RETURNING columns exist before processing rows
         validateReturning(stmt.returning(), table);
 
@@ -1233,6 +1238,9 @@ class DmlExecutor {
         QueryResult ruled = applyInsteadRule(stmt.table(), "UPDATE", QueryResult.Type.UPDATE,
                 stmt.where(), stmt.setClauses());
         if (ruled != null) return ruled;
+        // A DO ALSO rule is added to the statement, so its actions run against the rows as they
+        // are now and the statement then goes on to do its own work.
+        applyAlsoRule(stmt.table(), "UPDATE", stmt.where(), stmt.setClauses());
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // Collect WITH CHECK OPTION constraints from views we're updating through
         List<Expression> viewCheckExprs = validationHelper.collectViewCheckExprs(stmt.table());
@@ -1253,6 +1261,21 @@ class DmlExecutor {
                     throw new MemgresException("cannot update column \"" + set.column()
                             + "\" of view \"" + stmt.table() + "\"", "0A000");
                 }
+            }
+        }
+        // An assignment names a column of the relation, and PostgreSQL resolves it while it is
+        // still rewriting the statement. Leaving it to the per-row apply meant an UPDATE over a
+        // table with no rows — or one whose WHERE matched none — quietly reported success.
+        List<String> setTargets = new ArrayList<>();
+        for (InsertStmt.SetClause set : stmt.setClauses()) setTargets.add(set.column());
+        requireTargetColumns(table, stmt.table(), setTargets);
+        // The rest of the statement is resolved against the same relation, so a name in the
+        // WHERE or on the right of an assignment is refused before the scan rather than by
+        // whichever row happened to reach the evaluator first.
+        if (stmt.from() == null || stmt.from().isEmpty()) {
+            requireReadableColumns(table, stmt.where(), stmt.alias(), stmt.table());
+            for (InsertStmt.SetClause set : stmt.setClauses()) {
+                requireReadableColumns(table, set.value(), stmt.alias(), stmt.table());
             }
         }
         // C6: Enforce UPDATE privilege
@@ -1933,6 +1956,8 @@ class DmlExecutor {
         QueryResult ruledDelete = applyInsteadRule(stmt.table(), "DELETE", QueryResult.Type.DELETE,
                 stmt.where(), null);
         if (ruledDelete != null) return ruledDelete;
+        // As for UPDATE: a DO ALSO rule runs beside the statement, over the rows about to go.
+        applyAlsoRule(stmt.table(), "DELETE", stmt.where(), null);
         String schemaName = stmt.schema() != null ? stmt.schema() : executor.defaultSchema();
         // H35: honor explicit schema qualifier so a same-named temp table cannot shadow it
         executor.viewDmlVerb = "delete from";
@@ -1950,6 +1975,11 @@ class DmlExecutor {
         // Capture view column mapping before further resolveTable calls clobber it (renamed-column views).
         this.activeViewColMap = executor.lastViewColumnMapping;
         this.activeViewColOrder = executor.lastViewColumnOrder;
+        // The WHERE is resolved against the relation before the scan, so a name that is not a
+        // column of it is refused whether or not there is a row for the evaluator to trip over.
+        if (stmt.using() == null || stmt.using().isEmpty()) {
+            requireReadableColumns(table, stmt.where(), stmt.alias(), stmt.table());
+        }
         // INSTEAD OF DELETE triggers on a view: the trigger performs the actual work; the virtual
         // view table's rows are only used to match WHERE and populate OLD for the trigger.
         List<PgTrigger> deleteTriggersEarly = triggersDisabled() ? Cols.listOf()
@@ -2903,38 +2933,94 @@ class DmlExecutor {
         // statement would have touched. PG rewrites the query to say the same thing; here the
         // rows are read back through the relation and the command runs once per row.
         String ruleSql = ruleVal.substring("INSTEAD:".length());
+        // The statement the client sent never runs, so its row count is not the answer. PostgreSQL
+        // lets the last action that is the same kind of command as the original speak for it, and
+        // reports nothing at all when no action is: a DELETE replaced by an INSERT deleted nothing.
+        int count = runRowRuleActions(tableName, event, ruleSql, where, setClauses, type, null);
+        return QueryResult.command(type, count);
+    }
+
+    /**
+     * Run the actions of a DO ALSO rule on an UPDATE or DELETE. PostgreSQL adds them to the
+     * statement rather than in place of it, so they run against the rows as they stand before the
+     * statement writes and the statement itself goes on to run and report its own row count.
+     * Only the INSERT event ever reached its rules here, so an ON UPDATE or ON DELETE rule
+     * declared DO ALSO never fired at all.
+     */
+    private void applyAlsoRule(String tableName, String event, Expression where,
+                               List<InsertStmt.SetClause> setClauses) {
+        String ruleVal = executor.database.getRule(tableName, event);
+        if (ruleVal == null || !ruleVal.startsWith("ALSO:")) return;
+        if (executor.isRuleExpanding(tableName, event)) {
+            throw PgErrors.infiniteRecursionInRules(tableName);
+        }
+        runRowRuleActions(tableName, event, ruleVal.substring("ALSO:".length()), where,
+                setClauses, null, executor.database.getRuleQualification(tableName, event));
+    }
+
+    /**
+     * Run each action of a rule once for every row the statement acts on, with {@code OLD.col}
+     * standing for the row as it is and {@code NEW.col} for the row the assignments would make.
+     *
+     * @param tagType    the command kind whose row count the caller reports, or null when the
+     *                   caller reports its own
+     * @param qualification the rule's WHERE, evaluated per row against OLD/NEW, or null
+     * @return the row count of the last action of {@code tagType}, or 0
+     */
+    private int runRowRuleActions(String tableName, String event, String ruleSql, Expression where,
+                                  List<InsertStmt.SetClause> setClauses, QueryResult.Type tagType,
+                                  String qualification) {
         QueryResult affected = selectAffectedRows(tableName, where);
         List<Column> cols = affected.getColumns();
         Table rowShape = new Table(tableName, cols);
         String[] actions = Database.ruleActions(ruleSql);
-        // The statement the client sent never runs, so its row count is not the answer. PostgreSQL
-        // lets the last action that is the same kind of command as the original speak for it, and
-        // reports nothing at all when no action is: a DELETE replaced by an INSERT deleted nothing.
         int[] actionCounts = new int[actions.length];
         boolean[] actionSetsTag = new boolean[actions.length];
+        // An action that never says OLD or NEW is the same command for every row, and PostgreSQL
+        // runs it once for the whole statement rather than once per row — but not at all when the
+        // statement touched nothing. Measured: two rows updated writes one log row, none writes
+        // none, while the same action reading NEW.b writes one per row.
+        boolean[] perRow = new boolean[actions.length];
+        for (int a = 0; a < actions.length; a++) {
+            perRow[a] = mentionsRowAlias(actions[a]);
+        }
+        boolean[] ranOnce = new boolean[actions.length];
         executor.enterRuleExpansion(tableName, event);
         try {
             for (Object[] row : affected.getRows()) {
                 RowContext rowCtx = new RowContext(rowShape, null, row);
-                for (int a = 0; a < actions.length; a++) {
-                    String sql = actions[a];
-                    for (int i = 0; i < cols.size(); i++) {
-                        String colName = cols.get(i).getName();
-                        Object oldVal = row[i];
-                        Object newVal = oldVal;
-                        if (setClauses != null) {
-                            for (InsertStmt.SetClause set : setClauses) {
-                                if (set.column().equalsIgnoreCase(colName)) {
-                                    newVal = executor.evalExpr(set.value(), rowCtx);
-                                    break;
-                                }
+                // Substitute once per row: the values do not change between the actions.
+                String[] substituted = new String[actions.length];
+                for (int a = 0; a < actions.length; a++) substituted[a] = actions[a];
+                String qual = qualification;
+                for (int i = 0; i < cols.size(); i++) {
+                    String colName = cols.get(i).getName();
+                    Object oldVal = row[i];
+                    Object newVal = oldVal;
+                    if (setClauses != null) {
+                        for (InsertStmt.SetClause set : setClauses) {
+                            if (set.column().equalsIgnoreCase(colName)) {
+                                newVal = executor.evalExpr(set.value(), rowCtx);
+                                break;
                             }
                         }
-                        sql = substituteRowAlias(sql, "NEW", colName, newVal);
-                        sql = substituteRowAlias(sql, "OLD", colName, oldVal);
                     }
-                    QueryResult actionResult = executor.execute(sql, Cols.listOf());
-                    if (actionResult != null && actionResult.getType() == type) {
+                    for (int a = 0; a < actions.length; a++) {
+                        substituted[a] = substituteRowAlias(substituted[a], "NEW", colName, newVal);
+                        substituted[a] = substituteRowAlias(substituted[a], "OLD", colName, oldVal);
+                    }
+                    if (qual != null) {
+                        qual = substituteRowAlias(qual, "NEW", colName, newVal);
+                        qual = substituteRowAlias(qual, "OLD", colName, oldVal);
+                    }
+                }
+                // A qualified rule fires only for the rows its WHERE holds for.
+                if (qual != null && !ruleQualificationHolds(qual)) continue;
+                for (int a = 0; a < actions.length; a++) {
+                    if (!perRow[a] && ranOnce[a]) continue;
+                    ranOnce[a] = true;
+                    QueryResult actionResult = executor.execute(substituted[a], Cols.listOf());
+                    if (tagType != null && actionResult != null && actionResult.getType() == tagType) {
                         actionSetsTag[a] = true;
                         actionCounts[a] += actionResult.getAffectedRows();
                     }
@@ -2943,11 +3029,29 @@ class DmlExecutor {
         } finally {
             executor.exitRuleExpansion(tableName, event);
         }
-        int count = 0;
         for (int a = actions.length - 1; a >= 0; a--) {
-            if (actionSetsTag[a]) { count = actionCounts[a]; break; }
+            if (actionSetsTag[a]) return actionCounts[a];
         }
-        return QueryResult.command(type, count);
+        return 0;
+    }
+
+    /** Whether a rule action says anything about the row it fires for. */
+    private static boolean mentionsRowAlias(String sql) {
+        return sql != null && java.util.regex.Pattern
+                .compile("(?i)\\b(OLD|NEW)\\s*\\.").matcher(sql).find();
+    }
+
+    /** Evaluate a rule's qualification once OLD and NEW have been replaced by the row's values. */
+    private boolean ruleQualificationHolds(String qualification) {
+        try {
+            QueryResult r = executor.execute("SELECT (" + qualification + ")", Cols.listOf());
+            if (r == null || r.getRows().isEmpty()) return true;
+            Object v = r.getRows().get(0)[0];
+            return Boolean.TRUE.equals(v) || "t".equals(v) || "true".equals(String.valueOf(v));
+        } catch (RuntimeException e) {
+            // A qualification this engine cannot evaluate must not swallow the rule.
+            return true;
+        }
     }
 
     /**
@@ -3516,6 +3620,63 @@ class DmlExecutor {
             }
         }
         return contexts;
+    }
+
+    /**
+     * The columns every relation has without declaring them. They are not in the column list, so
+     * a check for "is this a column of the relation" has to let them past: PostgreSQL has its own
+     * complaint about assigning to one, and reads them like any other name.
+     */
+    private static final Set<String> SYSTEM_COLUMNS = Cols.setOf(
+            "ctid", "xmin", "xmax", "cmin", "cmax", "tableoid", "oid");
+
+    /**
+     * Every column a statement writes to has to be a column of the relation it names. PostgreSQL
+     * resolves the target list while it is still analysing the statement, so it says the same
+     * thing whether the relation holds rows or not — and it names the relation the statement
+     * wrote, which is the view when the write goes through one.
+     */
+    private void requireTargetColumns(Table table, String relationName, List<String> columnNames) {
+        if (table == null || columnNames == null) return;
+        for (String name : columnNames) {
+            if (name == null || SYSTEM_COLUMNS.contains(name.toLowerCase())) continue;
+            if (table.getColumnIndex(mapViewColumn(name)) < 0) {
+                throw new MemgresException("column \"" + name + "\" of relation \""
+                        + relationName + "\" does not exist", "42703");
+            }
+        }
+    }
+
+    /**
+     * The names an UPDATE reads — in its WHERE and on the right of each assignment — are resolved
+     * against the one relation it names, so a name that is not a column of it is refused before
+     * the scan starts rather than by the first row to reach the evaluator. Only the shapes where
+     * the target relation is demonstrably the whole scope are checked: a FROM clause, a subquery
+     * or a set-returning call brings other columns into scope, and those are left to run.
+     */
+    private void requireReadableColumns(Table table, Expression expr, String alias, String relationName) {
+        if (table == null || expr == null) return;
+        if (AstWalk.anyMatch(expr, n -> n instanceof SubqueryExpr || n instanceof ExistsExpr
+                || n instanceof ArraySubqueryExpr || n instanceof SelectStmt)) {
+            return;
+        }
+        final String self = alias != null ? alias : relationName;
+        AstWalk.forEach(expr, node -> {
+            if (!(node instanceof ColumnRef)) return;
+            ColumnRef cr = (ColumnRef) node;
+            String qualifier = cr.table();
+            if (qualifier != null && !qualifier.equalsIgnoreCase(self)
+                    && !qualifier.equalsIgnoreCase(relationName)) {
+                return;   // another relation's name: not this scope's to judge
+            }
+            if (SYSTEM_COLUMNS.contains(cr.column().toLowerCase())) return;
+            if (table.getColumnIndex(mapViewColumn(cr.column())) < 0) {
+                // PostgreSQL quotes a bare name and leaves a qualified one as written.
+                throw new MemgresException("column " + (qualifier == null
+                        ? "\"" + cr.column() + "\"" : qualifier + "." + cr.column())
+                        + " does not exist", "42703");
+            }
+        });
     }
 
     /** Validate that all column references in RETURNING exist in the table. */

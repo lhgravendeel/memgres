@@ -2920,8 +2920,8 @@ class DdlObjectExecutor {
         checkIndexExpressionsAndPredicate(s);
         Table indexTarget = resolveIndexTarget(s);
         if (indexTarget != null) {
-            DdlIndexValidator.validate(indexTarget, s.method(), s.unique(), s.columns(),
-                    s.columnOptions(), s.includeColumns());
+            DdlIndexValidator.validate(executor.database, indexTarget, s.method(), s.unique(),
+                    s.columns(), s.columnOptions(), s.includeColumns(), s.withOptions());
         }
         if (s.whereClause() != null) {
             // Type resolution happens while the statement is analysed, so a predicate that does
