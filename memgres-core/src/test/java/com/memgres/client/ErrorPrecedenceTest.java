@@ -22,11 +22,11 @@ import static org.junit.jupiter.api.Assertions.*;
  * FILTER (WHERE 1)} is 42804, {@code "ABS"(1) FILTER (…)} is 42883, and only a call that resolves
  * to a real non-aggregate earns 42809.
  *
- * <p>memgres runs its placement checks over the raw syntax tree, before anything is resolved, so a
- * later complaint can win. The cases where the two engines already agree are asserted here and in
- * error-precedence.sql. The cases where they do not are asserted too — against what memgres does
- * today, each one carrying the answer PostgreSQL gives — so that the gap is measured rather than
- * forgotten, and so that closing one makes this test fail and say so.
+ * <p>memgres judges a query level's clauses after its FROM clause has been resolved, and resolves
+ * what a call names before refusing the call, so those orderings now agree. The cases where the two
+ * engines still differ are asserted too — against what memgres does today, each one carrying the
+ * answer PostgreSQL gives — so that the gap is measured rather than forgotten, and so that closing
+ * one makes this test fail and say so.
  */
 class ErrorPrecedenceTest {
 
@@ -66,6 +66,14 @@ class ErrorPrecedenceTest {
         }
     }
 
+    /** The first column of the first row, as text. */
+    private static String rowsOf(String sql) throws SQLException {
+        try (Statement s = conn.createStatement();
+             java.sql.ResultSet rs = s.executeQuery(sql)) {
+            return rs.next() ? rs.getString(1) : "(no rows)";
+        }
+    }
+
     private static String messageOf(String sql) {
         try (Statement s = conn.createStatement()) {
             s.execute(sql);
@@ -92,6 +100,85 @@ class ErrorPrecedenceTest {
         assertEquals("42P01", stateOf("SELECT v, count(*) FROM ept_nosuch GROUP BY id"));
         assertEquals("42P01", stateOf("SELECT nosuchcol FROM ept_nosuch"));
         assertEquals("42P01", stateOf("SELECT 1 FROM ept_nosuch_a, ept_nosuch_b"));
+    }
+
+    /**
+     * Only the NAMES of the relations are resolved before the clauses are judged, never their
+     * rows: reading a FROM item is observable, and this statement may yet be refused. So a missing
+     * relation is reported first without a WITH item that writes ever being applied.
+     */
+    @Test
+    void aMissingRelationOutranksTheClauseChecksToo() {
+        assertEquals("42P01", stateOf("SELECT abs(id) FILTER (WHERE true) FROM ept_nosuch"));
+        assertEquals("42P01", stateOf("SELECT abs(DISTINCT id) FROM ept_nosuch"));
+        assertEquals("42P01",
+                stateOf("SELECT id FROM ept_nosuch WHERE generate_series(1,2) > 0"));
+        assertEquals("42P01", stateOf(
+                "SELECT * FROM ept_nosuch x WHERE EXISTS (SELECT abs(1) FILTER (WHERE true))"),
+                "the range table covers the whole statement, sub-queries included");
+    }
+
+    /** A statement PostgreSQL refuses performs none of the writes its WITH items describe. */
+    @Test
+    void aRefusedStatementAppliesNoneOfItsDataModifyingWithItems() throws Exception {
+        exec("DROP TABLE IF EXISTS ept_sink CASCADE");
+        exec("CREATE TABLE ept_sink (id int PRIMARY KEY)");
+
+        assertEquals("42809", stateOf(
+                "WITH ins AS (INSERT INTO ept_sink VALUES (1) RETURNING id) "
+                        + "SELECT abs(1) FILTER (WHERE true) FROM ins"));
+        assertEquals("0", rowsOf("SELECT count(*) FROM ept_sink"),
+                "the INSERT must not have run");
+
+        assertEquals("42P01", stateOf(
+                "WITH ins AS (INSERT INTO ept_sink VALUES (2) RETURNING id) "
+                        + "SELECT id FROM ept_nosuch"));
+        assertEquals("0", rowsOf("SELECT count(*) FROM ept_sink"));
+        exec("DROP TABLE IF EXISTS ept_sink CASCADE");
+    }
+
+    /**
+     * Within one call PostgreSQL transforms the arguments, then the FILTER expression — coercing it
+     * to boolean — and only then resolves the function. Each of those faults therefore outranks the
+     * complaint that the call is not an aggregate.
+     */
+    @Test
+    void withinOneCallTheArgumentsAndTheFilterAreReadFirst() {
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("SELECT abs(nosuchcol) FILTER (WHERE true) FROM ept_t"));
+        assertEquals("column \"nosuchcol\" does not exist",
+                messageOf("SELECT abs(id) FILTER (WHERE nosuchcol) FROM ept_t"));
+        assertEquals("42703", stateOf("SELECT abs(nosuchcol) OVER () FROM ept_t"));
+        assertEquals("42703", stateOf("SELECT abs(DISTINCT nosuchcol) FROM ept_t"));
+        assertEquals("column x.nosuchcol does not exist",
+                messageOf("SELECT abs(x.nosuchcol) FILTER (WHERE true) FROM ept_t x"),
+                "a qualified reference is named in full");
+        assertEquals("42703", stateOf("SELECT id FROM ept_t WHERE count(nosuchcol) > 0"),
+                "an aggregate's arguments are read before the clause it may not stand in");
+    }
+
+    @Test
+    void aFilterPredicateIsCoercedToBooleanBeforeTheCallIsResolved() {
+        assertEquals("argument of FILTER must be type boolean, not type integer",
+                messageOf("SELECT abs(id) FILTER (WHERE 1) FROM ept_t"));
+        assertEquals("argument of FILTER must be type boolean, not type text",
+                messageOf("SELECT abs(v) FILTER (WHERE txt) FROM ept_t"));
+    }
+
+    @Test
+    void aCallThatResolvesToNothingIsReportedAsThat() {
+        assertEquals("function ABS(integer) does not exist",
+                messageOf("SELECT \"ABS\"(1) FILTER (WHERE true)"),
+                "a quoted name keeps its case, and \"ABS\" is not abs");
+        assertEquals("function ABS(integer) does not exist", messageOf("SELECT \"ABS\"(1)"));
+        assertEquals("function abs(text) does not exist",
+                messageOf("SELECT abs(txt) FILTER (WHERE b) FROM ept_t"),
+                "a function is resolved by argument type as well as by name");
+        assertEquals("function information_schema.abs(integer) does not exist",
+                messageOf("SELECT information_schema.abs(v) FILTER (WHERE true) FROM ept_t"),
+                "a qualifier has to name the schema the function is really in");
+        assertEquals("function information_schema.abs(integer) does not exist",
+                messageOf("SELECT information_schema.abs(-1)"));
     }
 
     @Test
@@ -124,6 +211,25 @@ class ErrorPrecedenceTest {
         assertEquals("42809", stateOf("SELECT abs(v) FILTER (WHERE b) FROM ept_t WHERE id = -1"));
         assertEquals("42809",
                 stateOf("WITH c AS (SELECT abs(1) FILTER (WHERE true)) SELECT * FROM c"));
+        assertEquals("42809",
+                stateOf("WITH c AS (SELECT abs(1) FILTER (WHERE true)) SELECT 1"),
+                "a WITH item nothing reads is analysed all the same");
+        assertEquals("42809",
+                stateOf("SELECT 'a' AS c WHERE false AND (abs(1) FILTER (WHERE true)) > 0"),
+                "and so is a sub-query the WHERE never reaches");
+    }
+
+    @Test
+    void aScopeThisCannotReadIsAScopeItDoesNotJudge() {
+        assertEquals("42809",
+                stateOf("SELECT abs(s.v) FILTER (WHERE s.b) FROM (SELECT * FROM ept_t) s"),
+                "a derived table supplies columns like any other relation");
+        assertEquals("42809",
+                stateOf("SELECT abs(g) FILTER (WHERE true) FROM generate_series(1,3) g"),
+                "a FROM-function's column is not knowable from the catalog");
+        assertEquals("OK", stateOf("SELECT pg_catalog.abs(-1)"));
+        assertEquals("OK", stateOf("SELECT \"abs\"(-1)"));
+        assertEquals("OK", stateOf("SELECT count(*) FROM pg_class WHERE relname = 'ept_t'"));
     }
 
     @Test
@@ -145,37 +251,37 @@ class ErrorPrecedenceTest {
      * memgres reports the later. They are asserted against memgres's present answer so the branch
      * is honest about its own scope: closing one of them fails this test, which is the intent.
      *
-     * <p>Every one has the same cause — the placement checks run over the raw syntax tree, before
-     * relations, columns and functions are resolved. Closing them means running those checks after
-     * resolution, which is a larger change than this branch makes.
+     * <p>What they have in common is a fault memgres finds only by running something. A data
+     * modifying statement is still refused for a FILTER over its raw syntax tree, because it
+     * resolves its target inside its own executor rather than before it. A FILTER predicate is only
+     * coerced where the call carrying it is refused anyway, so a real aggregate's is not read. And
+     * a column reference is still resolved a row at a time everywhere except a query level's own
+     * clauses, so a query that reads no rows never reaches it.
      */
     @Test
     void theCasesStillOutOfOrderAreRecordedRatherThanAsserted() {
-        // PostgreSQL: 42P01, because the range table is built first.
-        assertEquals("42809", stateOf("SELECT abs(id) FILTER (WHERE true) FROM ept_nosuch"));
-        assertEquals("0A000",
-                stateOf("SELECT id FROM ept_nosuch WHERE generate_series(1,2) > 0"));
+        // PostgreSQL: 42P01 — a data-modifying statement's target is resolved after the FILTER
+        // rule has already run over the whole statement.
+        assertEquals("42809",
+                stateOf("INSERT INTO ept_nosuch VALUES (9, abs(1) FILTER (WHERE true))"));
+        assertEquals("42809",
+                stateOf("DELETE FROM ept_nosuch WHERE abs(1) FILTER (WHERE true) > 0"));
+        assertEquals("42809", stateOf("UPDATE ept_nosuch SET v = abs(1) FILTER (WHERE true)"));
+
+        // PostgreSQL: 42804 — a FILTER predicate is a condition whatever it hangs off, so an
+        // aggregate's is coerced to boolean too.
+        assertEquals("OK", stateOf("SELECT count(v) FILTER (WHERE 1) FROM ept_t"));
+        assertEquals("OK", stateOf("SELECT max(v) FILTER (WHERE v) FROM ept_t"));
+
+        // PostgreSQL: 42703 — a column reference nested in an expression is resolved when the
+        // clause is analysed, not when a row reaches it.
+        assertEquals("OK", stateOf("SELECT abs(nosuchcol) FROM ept_t WHERE false"));
         assertEquals("42809", stateOf(
-                "SELECT * FROM ept_nosuch x WHERE EXISTS (SELECT abs(1) FILTER (WHERE true))"));
-        assertEquals("42809", stateOf("SELECT abs(DISTINCT id) FROM ept_nosuch"));
+                "SELECT * FROM ept_t t WHERE EXISTS (SELECT abs(t.nosuchcol) FILTER (WHERE true))"),
+                "a sub-query's own scope is not this query level's, so it is not judged here");
 
-        // PostgreSQL: 42703 — the arguments and the FILTER expression are transformed before the
-        // function is resolved, so an unknown column in either is reported first.
-        assertEquals("42809", stateOf("SELECT abs(nosuchcol) FILTER (WHERE true) FROM ept_t"));
-        assertEquals("42809", stateOf("SELECT abs(id) FILTER (WHERE nosuchcol) FROM ept_t"));
-        assertEquals("42809", stateOf("SELECT abs(nosuchcol) OVER () FROM ept_t"));
-        assertEquals("42809", stateOf("SELECT abs(DISTINCT nosuchcol) FROM ept_t"));
-        assertEquals("42803", stateOf("SELECT id FROM ept_t WHERE count(nosuchcol) > 0"));
-
-        // PostgreSQL: 42804 "argument of FILTER must be type boolean, not type integer".
-        assertEquals("42809", stateOf("SELECT abs(id) FILTER (WHERE 1) FROM ept_t"));
-
-        // PostgreSQL: 42883 — the call resolves to nothing, so it never reaches the FILTER rule.
-        assertEquals("42809", stateOf("SELECT \"ABS\"(1) FILTER (WHERE true)"));
-        assertEquals("42809", stateOf("SELECT abs(txt) FILTER (WHERE b) FROM ept_t"));
-
-        // PostgreSQL: 42883 — memgres ignores an unknown schema qualifier and runs the call.
-        assertEquals("OK",
-                stateOf("SELECT information_schema.abs(v) FILTER (WHERE true) FROM ept_t"));
+        // PostgreSQL: 42803 — a FROM-less query has no range table, but its WHERE is still a
+        // clause an aggregate may not stand in.
+        assertEquals("OK", stateOf("SELECT 1 WHERE count(*) > 0"));
     }
 }

@@ -76,8 +76,22 @@ final class PlacementCheck {
      * @param clause the clause name PostgreSQL puts in the message ("WHERE", "VALUES", ...)
      */
     void reject(Object node, String clause) {
+        reject(node, clause, null);
+    }
+
+    /**
+     * The same, for a clause whose query level has already resolved its relations.
+     *
+     * <p>An aggregate's arguments are transformed before the aggregate is placed, so a column that
+     * is not there is what PostgreSQL reports for {@code WHERE count(nosuchcol) > 0} — the
+     * misplacement is the second fault, not the first. {@code scope} is what says which columns
+     * exist; a null one leaves the misplacement to be reported on its own as before.
+     */
+    void reject(Object node, String clause, QueryLevelScope scope) {
         Object found = findInScope(node, false);
-        if (found != null) throw misplaced(found, clause);
+        if (found == null) return;
+        if (scope != null) scope.rejectUnresolvedColumns(found);
+        throw misplaced(found, clause);
     }
 
     /**

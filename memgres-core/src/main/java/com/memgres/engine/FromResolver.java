@@ -470,6 +470,69 @@ class FromResolver {
      * ordinary resolution below, which reads the catalog or the temp schema and still refuses a
      * name neither of them has.
      */
+    /**
+     * Reports a relation the statement names that does not exist, before any clause of the
+     * statement is judged.
+     *
+     * <p>PostgreSQL builds the range table first and transforms the rest of the query against it,
+     * so a query that both names a missing relation and misuses a clause is reported as the
+     * missing relation. memgres has no such phase — resolving a FROM item here means running it,
+     * and running it is observable: a WITH item that writes would be applied, and a fault inside a
+     * derived table would surface, for a statement PostgreSQL refuses outright. So this asks only
+     * whether each name resolves to <em>something</em>, along the same ladder
+     * {@link #resolveTableRef} walks, and reads nothing.
+     *
+     * <p>It can only report a name the ordinary lookup would also have reported: every branch that
+     * finds anything at all returns without complaint, and the refusal itself is raised by that
+     * same lookup so the message, hint and SQLSTATE are the ones it gives.
+     */
+    void checkRelationNamesExist(Object statement) {
+        final Set<String> withNames = new HashSet<String>();
+        AstWalk.forEach(statement, node -> {
+            if (node instanceof SelectStmt.CommonTableExpr) {
+                String n = ((SelectStmt.CommonTableExpr) node).name();
+                if (n != null) withNames.add(n.toLowerCase(Locale.ROOT));
+            }
+        });
+        AstWalk.forEach(statement, node -> {
+            if (node instanceof SelectStmt.TableRef) {
+                checkOneRelationName((SelectStmt.TableRef) node, withNames);
+            }
+        });
+    }
+
+    private void checkOneRelationName(SelectStmt.TableRef tableRef, Set<String> withNames) {
+        if (tableRef.table() == null) return;
+        // A WITH item is not a stored relation. Its name is taken from anywhere in the statement
+        // rather than from the scope stack, because a name defined at another query level is
+        // still not a table, and refusing a query PostgreSQL runs is the worse mistake.
+        if (tableRef.schema() == null
+                && withNames.contains(tableRef.table().toLowerCase(Locale.ROOT))) {
+            return;
+        }
+        if (lookupCteFor(tableRef) != null) return;
+        if (viewFor(tableRef) != null) return;
+
+        String schemaName = tableRef.schema() != null ? tableRef.schema() : executor.defaultSchema();
+        boolean userQualified = tableRef.schema() != null;
+        try {
+            executor.resolveTable(schemaName, tableRef.table(), userQualified);
+            return;
+        } catch (MemgresException e) {
+            // Anything other than "no such relation" means the name found something and the
+            // ordinary lookup has a better answer than this pass does.
+            if (!"42P01".equals(e.getSqlState())) return;
+        }
+        if (SystemCatalog.isSystemCatalog(tableRef.schema(), tableRef.table())
+                && executor.systemCatalog.resolve(
+                        tableRef.schema(), tableRef.table(), executor.session) != null) {
+            return;
+        }
+        // Nothing answers to the name. Raise it the way the ordinary lookup does, so the message
+        // and the "there is a WITH item" hint are identical.
+        executor.resolveTable(schemaName, tableRef.table(), userQualified);
+    }
+
     private boolean implicitlySearchedSchemaHolds(String name) {
         Schema pgTemp = executor.database.getSchema(executor.session.getTempSchemaName());
         if (pgTemp != null && pgTemp.getTable(name) != null) return true;

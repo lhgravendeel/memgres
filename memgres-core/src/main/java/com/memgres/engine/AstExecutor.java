@@ -368,11 +368,13 @@ public class AstExecutor {
 
     private QueryResult executeReadOrWrite(Statement stmt) {
         checkReadOnlyTransaction(stmt);
-        // FILTER belongs to a call that accumulates rows, so a query or a data-modifying
-        // statement is refused for one written anywhere in it -- select list, WHERE, a CTE, a
-        // derived table, the SET list of an UPDATE -- before any of it is run.
-        if (stmt instanceof SelectStmt || stmt instanceof SetOpStmt || isDataModifying(stmt)) {
-            FilterCheck.reject(selectExecutor, stmt);
+        // FILTER belongs to a call that accumulates rows, so a statement is refused for one
+        // written anywhere in it -- select list, WHERE, a CTE, a derived table, the SET list of an
+        // UPDATE -- before any of it is run. A SELECT is judged where its own relations have been
+        // resolved instead (SelectExecutor.executeSelectInner), because PostgreSQL builds the
+        // range table before it looks at any clause and reports a missing relation on its own.
+        if (stmt instanceof SetOpStmt || isDataModifying(stmt)) {
+            FilterCheck.reject(selectExecutor, stmt, null);
         }
         if (stmt instanceof SelectStmt) return selectExecutor.executeSelect(((SelectStmt) stmt));
         if (stmt instanceof SetOpStmt) return selectExecutor.executeSetOp(((SetOpStmt) stmt));

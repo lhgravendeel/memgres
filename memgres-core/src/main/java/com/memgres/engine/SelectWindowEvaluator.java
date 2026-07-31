@@ -469,7 +469,8 @@ class SelectWindowEvaluator {
      * Checking here rather than in the evaluator means a meaningless specification is refused even
      * when the table is empty, and refused identically on every execution path.
      */
-    void validateWindowUsage(SelectStmt stmt, List<RowContext.TableBinding> bindings) {
+    void validateWindowUsage(SelectStmt stmt, QueryLevelScope scope) {
+        List<RowContext.TableBinding> bindings = scope == null ? null : scope.bindings();
         // A window function written as a plain call is a window function all the same, and saying
         // so is more use than reporting a function nobody spelled wrong as missing. Only the
         // select list is judged here; the clauses PostgreSQL reads after WHERE are judged after
@@ -515,7 +516,7 @@ class SelectWindowEvaluator {
             if (wf.distinct()) {
                 throw PgErrors.notImplemented("DISTINCT is not implemented for window functions");
             }
-            rejectOverOnPlainFunction(wf);
+            rejectOverOnPlainFunction(wf, scope);
             for (Expression arg : wf.args()) {
                 if (select.containsWindowFunction(arg)) {
                     throw new MemgresException("window function calls cannot be nested", "42P20");
@@ -552,9 +553,15 @@ class SelectWindowEvaluator {
      * aggregate can be asked to do. Written on anything else it is not a missing function but a
      * clause the function has no use for, and PostgreSQL says so rather than answering NULL.
      */
-    private void rejectOverOnPlainFunction(WindowFuncExpr wf) {
+    private void rejectOverOnPlainFunction(WindowFuncExpr wf, QueryLevelScope scope) {
         String name = FunctionEvaluator.stripSchemaPrefix(wf.name().toLowerCase());
         if (PlacementCheck.isWindowFunctionName(name) || select.isAggregateFunction(name)) return;
+        // The arguments are transformed before the call is resolved, so a column that is not there
+        // is reported first -- as it is for the same call carrying FILTER rather than OVER.
+        if (scope != null) {
+            for (Expression arg : wf.args()) scope.rejectUnresolvedColumns(arg);
+            scope.rejectUnresolvableCall(wf, name);
+        }
         throw new MemgresException("OVER specified, but " + name
                 + " is not a window function nor an aggregate function", "42809");
     }

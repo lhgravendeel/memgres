@@ -135,8 +135,36 @@ class SelectExecutor {
         return stmt instanceof InsertStmt || stmt instanceof UpdateStmt || stmt instanceof DeleteStmt;
     }
 
+    /** Whether any WITH item of this statement writes, at any depth. */
+    private static boolean hasDataModifyingCte(SelectStmt stmt) {
+        return AstWalk.anyMatch(stmt, node -> {
+            if (!(node instanceof SelectStmt.CommonTableExpr)) return false;
+            Statement q = ((SelectStmt.CommonTableExpr) node).query;
+            return q instanceof InsertStmt || q instanceof UpdateStmt
+                    || q instanceof DeleteStmt || q instanceof MergeStmt;
+        });
+    }
+
     private QueryResult executeSelectInner(SelectStmt stmt) {
-        rejectMisplacedSrfs(stmt);
+        // The range table is built before any clause is read, so a relation the statement names
+        // and does not have is reported on its own. Only the NAMES are resolved here and nothing
+        // is read: reading a FROM item is observable -- a WITH item that writes would be applied,
+        // a fault inside a derived table would surface -- and the statement may yet be refused.
+        executor.fromResolver.checkRelationNamesExist(stmt);
+
+        boolean noFromClause = stmt.from() == null || stmt.from().isEmpty();
+        // A query with no FROM clause has no range table to build, so nothing can outrank its
+        // clause-level faults and they are judged straight away. One that has a FROM clause is
+        // judged below, after the relations have been resolved.
+        if (noFromClause) {
+            FilterCheck.reject(this, stmt, null);
+            rejectMisplacedSrfs(stmt);
+        } else {
+            // A join condition is part of the FROM clause, so PostgreSQL judges it while it builds
+            // the range table rather than after -- and so does this, or the join is executed and
+            // fails on the set it was going to be refused for.
+            rejectSrfsInJoinConditions(stmt.from());
+        }
         rejectLockOnCollapsedRows(stmt);
         // A VALUES list is a query with no rows to read, so an aggregate or a window call in one
         // has nothing to aggregate or to be numbered against; the parser records where the SELECT
@@ -152,7 +180,7 @@ class SelectExecutor {
             }
         }
         // SELECT without FROM
-        if (stmt.from() == null || stmt.from().isEmpty()) {
+        if (noFromClause) {
             rejectSrfInAggregates(stmt);
             validateDistinctOn(stmt);
             windowEvaluator.validateWindowUsage(stmt, null);
@@ -171,13 +199,32 @@ class SelectExecutor {
             return executeSelectExpressions(stmt);
         }
 
+        // The clause-level checks consult what the relations SUPPLY, which is their shape, not
+        // their rows. Describing the FROM clause is enough for that and runs none of it, which
+        // matters because running it is observable: a data-modifying CTE would be applied, and a
+        // fault in a derived table would be reported, for a statement PostgreSQL refuses outright.
+        // resolveTableBindings swallows every resolution failure, so it cannot invent an error of
+        // its own; a name that does not resolve is still reported by resolveFromClause below.
+        // Describing a WITH item means running it, and a WITH item may be an INSERT. For a
+        // statement carrying one, the clauses are judged on the raw tree instead -- the older,
+        // coarser order -- because refusing the statement after its INSERT has been applied would
+        // be a write PostgreSQL never performs.
+        QueryLevelScope scope;
+        if (hasDataModifyingCte(stmt)) {
+            scope = null;
+        } else {
+            scope = new QueryLevelScope(this,
+                    executor.fromResolver.resolveTableBindings(stmt.from()), null, stmt);
+        }
+        FilterCheck.reject(this, stmt, scope);
+        rejectMisplacedSrfs(stmt);
+
         List<RowContext> contexts = executor.fromResolver.resolveFromClause(
                 stmt.from(), stmt.where(), stmt.having(), stmt);
 
         // PostgreSQL builds the range table before it analyses the rest of the query, so a name
-        // that does not resolve is reported on its own even when the clauses are also wrong.
-        rejectSrfInAggregates(stmt);
-        validateDistinctOn(stmt);
+        // that does not resolve is reported on its own even when the clauses are also wrong, and
+        // two FROM items answering to one name are reported before any clause is read at all.
         validateFromClause(stmt.from());
 
         List<RowContext.TableBinding> baseBindings;
@@ -193,9 +240,17 @@ class SelectExecutor {
             baseOutput = executor.fromResolver.resolveClauseOutput(stmt.from(), baseBindings);
         }
 
+        // What the relations supply is now known, which is what the checks below consult to report
+        // an unresolvable column or call before the clause it stands in is complained about. The
+        // clause-level refusals themselves keep the order they had when they ran ahead of the
+        // query: a call carrying a FILTER it may not have is judged first.
+        scope = new QueryLevelScope(this, baseBindings, baseOutput, stmt);
+        rejectSrfInAggregates(stmt);
+        validateDistinctOn(stmt);
+
         // The relations are resolved first: a window frame's offset is resolved against the
         // column the window is ordered by, which is one of them.
-        windowEvaluator.validateWindowUsage(stmt, baseBindings);
+        windowEvaluator.validateWindowUsage(stmt, scope);
 
         // Validate column references against table schema
         boolean simpleFrom = stmt.from().stream().allMatch(f -> f instanceof SelectStmt.TableRef);
@@ -332,7 +387,7 @@ class SelectExecutor {
 
         // WHERE
         if (stmt.where() != null) {
-            placementCheck.reject(stmt.where(), "WHERE");
+            placementCheck.reject(stmt.where(), "WHERE", scope);
             // Pre-flight type validation of WHERE clause (PG checks at plan time)
             // Only validate for simple single-table SELECTs (not CTEs/subqueries/joins)
             if (simpleFrom && baseBindings.size() == 1 && !hasJoins
