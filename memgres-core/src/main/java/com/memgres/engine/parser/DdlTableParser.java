@@ -35,6 +35,18 @@ class DdlTableParser {
             name = parser.readIdentifier();
         }
 
+        // CREATE TABLE ... (a, b) AS query -- a bare name list renaming the query's columns,
+        // told from an ordinary column definition list by what follows the closing paren.
+        List<String> ctasColumns = null;
+        if (parser.check(TokenType.LEFT_PAREN) && bareNameListFollowedByAs()) {
+            parser.expect(TokenType.LEFT_PAREN);
+            ctasColumns = new ArrayList<String>();
+            do {
+                ctasColumns.add(parser.readIdentifier());
+            } while (parser.match(TokenType.COMMA));
+            parser.expect(TokenType.RIGHT_PAREN);
+        }
+
         // CREATE TABLE ... AS query
         if (parser.matchKeyword("AS")) {
             Statement query = parser.parseStatement();
@@ -48,7 +60,8 @@ class DdlTableParser {
                     withData = true;
                 }
             }
-            return new CreateTableAsStmt(schema, name, ifNotExists, temporary, query, withData);
+            return new CreateTableAsStmt(schema, name, ifNotExists, temporary, query, withData,
+                    ctasColumns);
         }
 
         // PARTITION OF parent FOR VALUES ...
@@ -423,6 +436,11 @@ class DdlTableParser {
                     String collation = parser.readIdentifier();
                     if (parser.match(TokenType.DOT)) collation = collation + "." + parser.readIdentifier();
                     ExpressionParser.validateCollationStatic(collation, parser.peek());
+                    // A column carries one collation, so a second clause is a syntax error
+                    // rather than an override.
+                    if (parser.checkKeyword("COLLATE")) {
+                        throw new MemgresException("multiple COLLATE clauses not allowed", "42601");
+                    }
                 }
                 continue;
             }
@@ -540,6 +558,37 @@ class DdlTableParser {
                 allCols, null, null, null, null, null, false, false, false, false, elems);
         temporal.setExcludeMethod("gist");
         return temporal;
+    }
+
+    /**
+     * Whether the parenthesised list starting here is a bare list of names with {@code AS} after
+     * it, which is the CREATE TABLE t (a, b) AS query form rather than a column definition list.
+     * Every item has to be a single identifier: anything carrying a type, a constraint or an
+     * expression is an ordinary definition and is left to the path that reads those.
+     */
+    private boolean bareNameListFollowedByAs() {
+        int i = parser.pos;
+        if (parser.tokens.get(i).type() != TokenType.LEFT_PAREN) return false;
+        i++;
+        boolean wantName = true;
+        while (i < parser.tokens.size()) {
+            TokenType t = parser.tokens.get(i).type();
+            if (t == TokenType.RIGHT_PAREN) {
+                if (wantName) return false;
+                i++;
+                break;
+            }
+            if (wantName) {
+                if (t == TokenType.COMMA || t == TokenType.LEFT_PAREN) return false;
+                wantName = false;
+            } else {
+                if (t != TokenType.COMMA) return false;
+                wantName = true;
+            }
+            i++;
+        }
+        return i < parser.tokens.size()
+                && "AS".equalsIgnoreCase(parser.tokens.get(i).value());
     }
 
     TableConstraint parseTableConstraint() {

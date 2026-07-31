@@ -1562,7 +1562,13 @@ class DdlTableExecutor {
                 }
             }
             if (!found) {
-                throw new MemgresException("Table not found: " + bareName);
+                // A name that resolves to something which is not a table is a different
+                // complaint from a name that resolves to nothing, and PostgreSQL says so.
+                if (executor.database.hasView(bareName)) {
+                    throw new MemgresException("\"" + bareName + "\" is not a table", "42809");
+                }
+                throw new MemgresException(
+                        "relation \"" + bareName + "\" does not exist", "42P01");
             }
         }
         return QueryResult.command(QueryResult.Type.DELETE, 0);
@@ -1580,16 +1586,26 @@ class DdlTableExecutor {
         }
 
         QueryResult result = executor.executeStatement(stmt.query());
+        // CREATE TABLE t (a, b) AS query renames the query's columns left to right. Fewer names
+        // than columns is allowed and leaves the rest as the query named them; more is not.
+        List<String> given = stmt.columnNames();
+        if (given != null && given.size() > result.getColumns().size()) {
+            throw new MemgresException("too many column names were specified", "42601");
+        }
         List<Column> columns = new ArrayList<>();
+        int givenIdx = 0;
         // The query's output names become the table's column names, so they have to satisfy the
         // same rules a column list does — a repeated or system name is rejected here, not later.
         Set<String> seenNames = new HashSet<>();
         for (Column srcCol : result.getColumns()) {
-            DdlDefinitionChecks.rejectSystemColumnName(srcCol.getName());
-            if (!seenNames.add(srcCol.getName().toLowerCase())) {
-                throw PgErrors.duplicateColumn(srcCol.getName());
+            String colName = given != null && givenIdx < given.size()
+                    ? given.get(givenIdx) : srcCol.getName();
+            givenIdx++;
+            DdlDefinitionChecks.rejectSystemColumnName(colName);
+            if (!seenNames.add(colName.toLowerCase())) {
+                throw PgErrors.duplicateColumn(colName);
             }
-            columns.add(new Column(srcCol.getName(), srcCol.getType(), true, false, null,
+            columns.add(new Column(colName, srcCol.getType(), true, false, null,
                     srcCol.getEnumTypeName(), srcCol.getPrecision(), srcCol.getScale(), null));
         }
 

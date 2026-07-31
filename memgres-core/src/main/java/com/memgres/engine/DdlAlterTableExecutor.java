@@ -9,6 +9,27 @@ import java.util.*;
  * Extracted from DdlExecutor to separate concerns.
  */
 class DdlAlterTableExecutor {
+
+    /**
+     * A VIRTUAL generated column is computed on read and never stored, so there is nothing for an
+     * index to hold: PostgreSQL refuses a primary key or a unique constraint over one. The column
+     * form is already refused where the table is created; this is the ALTER TABLE path.
+     */
+    private void rejectKeyOnVirtualColumn(Table table, java.util.List<String> columns,
+                                          String what) {
+        if (columns == null) return;
+        for (String name : columns) {
+            if (name == null) continue;
+            int idx = table.getColumnIndex(name);
+            if (idx < 0) continue;
+            Column col = table.getColumns().get(idx);
+            if (col.isVirtual()) {
+                throw new MemgresException(
+                        what + " on virtual generated columns are not supported", "0A000");
+            }
+        }
+    }
+
     private final DdlExecutor ddl;
     private final AstExecutor executor;
 
@@ -1688,6 +1709,13 @@ class DdlAlterTableExecutor {
 
     private void executeAddConstraint(AlterTableStmt.AddConstraint addConstraint, Table table,
                                        AlterTableStmt stmt, String schemaName) {
+        TableConstraint.ConstraintType addedType = addConstraint.constraint().type();
+        if (addedType == TableConstraint.ConstraintType.PRIMARY_KEY) {
+            rejectKeyOnVirtualColumn(table, addConstraint.constraint().columns(), "primary keys");
+        } else if (addedType == TableConstraint.ConstraintType.UNIQUE) {
+            rejectKeyOnVirtualColumn(table, addConstraint.constraint().columns(),
+                    "unique constraints");
+        }
         if (addConstraint.constraint().type() == TableConstraint.ConstraintType.NOT_NULL) {
             for (String colName : addConstraint.constraint().columns()) {
                 // The rows already stored decide whether the rule can hold at all.

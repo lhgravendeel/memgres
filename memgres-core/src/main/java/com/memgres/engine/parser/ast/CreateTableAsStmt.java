@@ -12,16 +12,27 @@ public final class CreateTableAsStmt implements Statement {
     public final boolean temporary;
     public final Statement query;
     public final boolean withData;
+    /** The names written as CREATE TABLE t (a, b) AS ..., or null when none were. */
+    public final java.util.List<String> columnNames;
 
     public CreateTableAsStmt(String schema, String name, boolean ifNotExists, boolean temporary,
                              Statement query, boolean withData) {
+        this(schema, name, ifNotExists, temporary, query, withData, null);
+    }
+
+    public CreateTableAsStmt(String schema, String name, boolean ifNotExists, boolean temporary,
+                             Statement query, boolean withData,
+                             java.util.List<String> columnNames) {
         this.schema = schema;
         this.name = name;
         this.ifNotExists = ifNotExists;
         this.temporary = temporary;
         this.query = query;
         this.withData = withData;
+        this.columnNames = columnNames;
     }
+
+    public java.util.List<String> columnNames() { return columnNames; }
 
     public String schema() { return schema; }
     public String name() { return name; }

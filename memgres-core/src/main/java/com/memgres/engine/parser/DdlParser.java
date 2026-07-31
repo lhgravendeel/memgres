@@ -1295,6 +1295,9 @@ class DdlParser {
         if (parser.matchKeyword("COLLATE")) {
             collation = parser.readIdentifierOrString();
             ExpressionParser.validateCollationStatic(collation, parser.peek());
+            if (parser.checkKeyword("COLLATE")) {
+                throw PgErrors.syntax("multiple COLLATE clauses not allowed");
+            }
         }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeyword("DEFAULT")) {
@@ -1302,7 +1305,14 @@ class DdlParser {
                 sawDefault = true;
                 defaultExpr = parser.parseExpression();
             }
-            else if (parser.matchKeywords("NOT", "NULL")) { notNull = true; sawNotNull = true; }
+            else if (parser.matchKeywords("NOT", "NULL")) {
+                // Writing it twice is not merely redundant to PostgreSQL: it refuses the domain.
+                if (sawNotNull) {
+                    throw new MemgresException("redundant NOT NULL constraint definition", "42P17");
+                }
+                notNull = true;
+                sawNotNull = true;
+            }
             else if (parser.matchKeyword("NULL")) { notNull = false; sawNull = true; }
             else if (parser.matchKeyword("CHECK")) {
                 parser.expect(TokenType.LEFT_PAREN);
