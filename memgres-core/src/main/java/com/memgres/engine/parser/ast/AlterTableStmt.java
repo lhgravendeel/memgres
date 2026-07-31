@@ -640,26 +640,37 @@ public final class AlterTableStmt implements Statement {
      * {@code SET (name = value, ...)}, which is the one PostgreSQL refuses on a partitioned table.
      */
         public static final class SetStorageParams implements AlterAction {
-        public final boolean reloptions;
-        public SetStorageParams() { this(false); }
-        public SetStorageParams(boolean reloptions) { this.reloptions = reloptions; }
-        public boolean reloptions() { return reloptions; }
+        /** The WITH-style parameters written, or null for the forms that carry none. */
+        public final java.util.Map<String, String> params;
+
+        public SetStorageParams() { this(null); }
+
+        public SetStorageParams(java.util.Map<String, String> params) { this.params = params; }
+
+        public java.util.Map<String, String> params() { return params; }
+
+        /**
+         * Whether the form written was the storage-parameter list {@code SET (name = value, ...)},
+         * which is the one PostgreSQL refuses on a partitioned table. That is exactly the form
+         * that carries parameters, so the two questions have one answer.
+         */
+        public boolean reloptions() { return params != null; }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
-            return reloptions == ((SetStorageParams) o).reloptions;
+            return java.util.Objects.equals(params, ((SetStorageParams) o).params);
         }
 
         @Override
         public int hashCode() {
-            return reloptions ? 1 : 0;
+            return java.util.Objects.hashCode(params);
         }
 
         @Override
         public String toString() {
-            return "SetStorageParams[reloptions=" + reloptions + "]";
+            return "SetStorageParams[params=" + params + "]";
         }
     }
         public static final class OwnerTo implements AlterAction {

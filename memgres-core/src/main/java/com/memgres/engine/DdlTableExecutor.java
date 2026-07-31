@@ -11,6 +11,11 @@ import java.util.*;
  * Extracted from DdlExecutor to separate concerns.
  */
 class DdlTableExecutor {
+    /** What INCLUDING ALL stands for, so that a later EXCLUDING can take one of them back. */
+    private static final Set<String> LIKE_OPTION_NAMES = Cols.setOf(
+            "COMMENTS", "COMPRESSION", "CONSTRAINTS", "DEFAULTS", "GENERATED",
+            "IDENTITY", "INDEXES", "STATISTICS", "STORAGE");
+
     final DdlExecutor ddl;
     final AstExecutor executor;
 
@@ -100,6 +105,10 @@ class DdlTableExecutor {
         List<StoredConstraint> likeConstraints = new ArrayList<>();
         // Track indexes to clone from LIKE ... INCLUDING INDEXES
         List<String[]> likeIndexesToClone = new ArrayList<>(); // each: {srcIndexName, newTableName}
+        // The name each copied NOT NULL constraint keeps, and the comments INCLUDING COMMENTS
+        // brings along, both applied once the table itself exists.
+        Map<String, String> likeNotNullNames = new LinkedHashMap<>();
+        Map<String, String> likeColumnComments = new LinkedHashMap<>();
         if (stmt.likeTables() != null) {
             for (String likeEntry : stmt.likeTables()) {
                 // Parse "tablename:OPT1,OPT2" format
@@ -108,17 +117,44 @@ class DdlTableExecutor {
                 int colonIdx = likeEntry.indexOf(':');
                 if (colonIdx >= 0) {
                     likeTableName = likeEntry.substring(0, colonIdx);
+                    // The options are applied in the order they were written, so a later
+                    // EXCLUDING takes back what an earlier INCLUDING ALL brought in.
                     for (String opt : likeEntry.substring(colonIdx + 1).split(",")) {
-                        likeOptions.add(opt.trim().toUpperCase());
+                        String what = opt.trim().toUpperCase();
+                        boolean excluding = what.startsWith("-");
+                        if (excluding) what = what.substring(1);
+                        Collection<String> affected = "ALL".equals(what) ? LIKE_OPTION_NAMES
+                                : Cols.setOf(what);
+                        if (excluding) likeOptions.removeAll(affected);
+                        else likeOptions.addAll(affected);
                     }
                 } else {
                     likeTableName = likeEntry;
                 }
                 Table likeTable = executor.resolveTable(schemaName, likeTableName);
+                // LIKE copies the shape of a column and nothing more unless the option that
+                // carries the rest is written out. Adding the source column object itself gave
+                // the new table the source's defaults, its identity and its generation
+                // expression, none of which PostgreSQL copies unasked.
                 for (Column col : likeTable.getColumns()) {
                     boolean exists = inheritedColumns.stream()
                             .anyMatch(c -> c.getName().equalsIgnoreCase(col.getName()));
-                    if (!exists) inheritedColumns.add(col);
+                    if (!exists) {
+                        inheritedColumns.add(likeColumnCopy(col, likeOptions));
+                        // A NOT NULL constraint travels with the column, under the name it has
+                        // on the source table: PostgreSQL copies the constraint, not the rule.
+                        if (!col.isNullable()) {
+                            likeNotNullNames.put(col.getName().toLowerCase(),
+                                    likeTable.notNullConstraintName(col.getName()));
+                        }
+                        if (wants(likeOptions, "COMMENTS")) {
+                            String srcComment = executor.database.getComment("column",
+                                    likeTable.getName() + "." + col.getName());
+                            if (srcComment != null) {
+                                likeColumnComments.put(col.getName().toLowerCase(), srcComment);
+                            }
+                        }
+                    }
                 }
                 // LIKE copies the columns and their NOT NULL, and nothing else unless asked.
                 // The keys travel with INCLUDING INDEXES, because it is the index they need;
@@ -333,6 +369,9 @@ class DdlTableExecutor {
         Table table = new Table(stmt.name(), columns);
         if (stmt.unlogged()) table.setUnlogged(true);
         if (stmt.withOptions() != null && !stmt.withOptions().isEmpty()) {
+            // A storage parameter is read while the table is being defined: an unknown name or a
+            // value outside the range stops the statement rather than being stored as written.
+            DdlIndexValidator.checkRelOptions("heap", stmt.withOptions());
             table.setReloptions(stmt.withOptions());
         }
 
@@ -473,6 +512,18 @@ class DdlTableExecutor {
             table.addConstraint(likeSc);
         }
 
+        // A NOT NULL constraint that came in over LIKE answers to the name it had on the source
+        // table, and INCLUDING COMMENTS brings the source's column comments with it.
+        for (Map.Entry<String, String> nn : likeNotNullNames.entrySet()) {
+            if (nn.getValue() != null && !table.getColumns().isEmpty()) {
+                table.setNotNullConstraintName(nn.getKey(), nn.getValue());
+            }
+        }
+        for (Map.Entry<String, String> cc : likeColumnComments.entrySet()) {
+            executor.database.addComment("column",
+                    (stmt.name() + "." + cc.getKey()).toLowerCase(), cc.getValue());
+        }
+
         // Clone indexes from LIKE ... INCLUDING INDEXES
         for (String[] idxInfo : likeIndexesToClone) {
             String srcIdx = idxInfo[0];
@@ -499,6 +550,48 @@ class DdlTableExecutor {
      * nothing for a unique index to hold; PostgreSQL refuses to key on one. Checked before the
      * table exists, so a rejected definition leaves nothing behind.
      */
+    /** Whether a LIKE option was asked for, either by name or through INCLUDING ALL. */
+    private static boolean wants(Set<String> options, String option) {
+        return options.contains(option) || options.contains("ALL");
+    }
+
+    /**
+     * The column LIKE actually copies: name, type and NOT NULL always; the default, the identity,
+     * the generation expression, the storage settings and the statistics target only when the
+     * matching INCLUDING option asked for them. A serial or identity column whose default does
+     * not travel is left as the plain integer type underneath it, because without the default
+     * there is no sequence behind it to draw from.
+     */
+    private static Column likeColumnCopy(Column src, Set<String> options) {
+        String defaultValue = src.getDefaultValue();
+        boolean identity = defaultValue != null && defaultValue.startsWith("__identity__:");
+        boolean keepDefault = identity ? wants(options, "IDENTITY") : wants(options, "DEFAULTS");
+        if (!keepDefault) defaultValue = null;
+        DataType type = src.getType();
+        if (defaultValue == null) type = withoutSerial(type);
+        String generated = wants(options, "GENERATED") ? src.getGeneratedExpr() : null;
+        Column copy = new Column(src.getName(), type, src.isNullable(),
+                src.isPrimaryKey() && wants(options, "INDEXES"), defaultValue,
+                src.getEnumTypeName(), src.getPrecision(), src.getScale(), generated,
+                generated != null && src.isVirtual(), src.getDomainTypeName(),
+                src.getCompositeTypeName(), src.getArrayElementType());
+        copy.setIntervalQualifier(src.getIntervalQualifier());
+        if (wants(options, "STORAGE")) {
+            copy.setAttStorageOverride(src.getAttStorageOverride());
+            copy.setAttCompression(src.getAttCompression());
+        }
+        if (wants(options, "STATISTICS")) copy.setAttStattarget(src.getAttStattarget());
+        return copy;
+    }
+
+    /** The integer type a serial column is stored in, for a copy that carries no sequence. */
+    private static DataType withoutSerial(DataType type) {
+        if (type == DataType.SERIAL) return DataType.INTEGER;
+        if (type == DataType.BIGSERIAL) return DataType.BIGINT;
+        if (type == DataType.SMALLSERIAL) return DataType.SMALLINT;
+        return type;
+    }
+
     /**
      * Drops the UNIQUE constraint a cloned index already stands for, matching on the columns
      * because that is what the two have in common. A PRIMARY KEY is left alone: PostgreSQL does
@@ -1304,6 +1397,16 @@ class DdlTableExecutor {
                         executor.database.getTriggersForTable(schemaName, name)));
             }
             schema.removeTable(name);
+            // An index belongs to its table and goes with it. Leaving it registered kept the
+            // name taken, so re-creating the table and its index reported a name clash for an
+            // index over a relation that no longer existed.
+            for (String indexName : new ArrayList<>(executor.database.getIndexColumns().keySet())) {
+                String owner = executor.database.getIndexTable(indexName);
+                if (owner != null && (owner.equalsIgnoreCase(schemaName + "." + name)
+                        || owner.equalsIgnoreCase(name))) {
+                    executor.database.removeIndex(indexName);
+                }
+            }
             // Remove only this schema's triggers: a same-named table elsewhere keeps its own
             executor.database.removeTriggersForTable(schemaName, name);
             // Drop implicit sequences owned by SERIAL/IDENTITY columns

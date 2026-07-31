@@ -1791,6 +1791,7 @@ public class Database {
         if (event != null && !"exists".equals(event)) {
             rules.remove(table.toLowerCase() + ":" + event);
             rules.remove("off:" + table.toLowerCase() + ":" + event);
+            rules.remove("qual:" + table.toLowerCase() + ":" + event);
         }
     }
 
@@ -1893,7 +1894,8 @@ public class Database {
                 gone.add(k);
                 gone.add("def:" + k.substring(5, k.length() - lower.length() - 1));
                 gone.add("state:" + k.substring(5));
-            } else if (k.startsWith(lower + ":") || k.startsWith("off:" + lower + ":")) {
+            } else if (k.startsWith(lower + ":") || k.startsWith("off:" + lower + ":")
+                    || k.startsWith("qual:" + lower + ":")) {
                 gone.add(k);
             }
         }
@@ -1902,6 +1904,20 @@ public class Database {
 
     public String getRule(String table, String event) {
         return rules.get(table.toLowerCase() + ":" + event.toUpperCase());
+    }
+
+    /**
+     * A rule's WHERE, kept beside its actions so the rows it fires for can be told apart from
+     * the rows it does not. Without it a qualified rule either fires for every row or for none.
+     */
+    public void addRuleQualification(String table, String event, String qualification) {
+        String key = "qual:" + table.toLowerCase() + ":" + event.toUpperCase();
+        if (qualification == null) rules.remove(key);
+        else rules.put(key, qualification);
+    }
+
+    public String getRuleQualification(String table, String event) {
+        return rules.get("qual:" + table.toLowerCase() + ":" + event.toUpperCase());
     }
 
     // Comments

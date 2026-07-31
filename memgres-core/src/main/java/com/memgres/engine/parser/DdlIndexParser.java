@@ -63,9 +63,24 @@ class DdlIndexParser {
             }
         }
 
+        // WITH (storage_parameter = value, ...) — kept rather than skipped, so the executor can
+        // check each one against what the access method accepts.
+        java.util.Map<String, String> withOptions = null;
         if (parser.matchKeyword("WITH")) {
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                DdlTableParser.consumeUntilParen(parser);
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                withOptions = new java.util.LinkedHashMap<>();
+                do {
+                    String key = parser.readIdentifier();
+                    String val = null;
+                    if (parser.match(TokenType.EQUALS)) {
+                        StringBuilder sb = new StringBuilder();
+                        if (parser.check(TokenType.MINUS)) sb.append(parser.advance().value());
+                        sb.append(parser.advance().value());
+                        val = sb.toString();
+                    }
+                    withOptions.put(key.toLowerCase(), val);
+                } while (parser.match(TokenType.COMMA));
+                parser.expect(TokenType.RIGHT_PAREN);
             }
         }
 
@@ -89,7 +104,7 @@ class DdlIndexParser {
         }
 
         return new CreateIndexStmt(name, indexSchema, table, columns, unique, ifNotExists, concurrently,
-                method, includeColumns, whereClause, columnOptions, nullsNotDistinct);
+                method, includeColumns, whereClause, columnOptions, nullsNotDistinct, withOptions);
     }
 
     /**
@@ -175,13 +190,12 @@ class DdlIndexParser {
                     && !parser.checkKeyword("ASC") && !parser.checkKeyword("DESC")
                     && !parser.checkKeyword("NULLS") && !parser.checkKeyword("INCLUDE") && !parser.checkKeyword("WHERE")
                     && !parser.checkKeyword("WITH") && !parser.check(TokenType.COMMA) && !parser.check(TokenType.RIGHT_PAREN)) {
-                Token next = parser.peek();
-                if (next.value().endsWith("_ops") || next.value().endsWith("_pattern_ops")
-                        || next.value().contains("_")) {
-                    String opclass = parser.advance().value();
-                    if (opts.length() > 0) opts.append(' ');
-                    opts.append("opclass:").append(opclass);
-                }
+                // Any bare name here is an operator class, whatever it is called: PostgreSQL's
+                // grammar has nothing else in this position. Requiring an "_ops" suffix turned a
+                // misspelt class into a syntax error instead of the 42704 PostgreSQL reports.
+                String opclass = parser.advance().value();
+                if (opts.length() > 0) opts.append(' ');
+                opts.append("opclass:").append(opclass);
             }
             // Capture ASC/DESC
             if (parser.matchKeyword("ASC")) {

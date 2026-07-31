@@ -636,6 +636,8 @@ class DdlAdminExecutor {
         } else if ("ALSO".equals(s.action()) && !joined.isEmpty()) {
             executor.database.addRule(s.table(), s.event(), "ALSO:" + joined);
         }
+        // The qualification decides which rows the rule fires for, so it is kept with it.
+        executor.database.addRuleQualification(s.table(), s.event(), s.whereClause());
         // Track rule name with full definition for pg_rules
         executor.database.addRuleByName(s.name(), s.table(), s.event());
         boolean instead = "INSTEAD".equals(s.action());
@@ -654,11 +656,101 @@ class DdlAdminExecutor {
         sb.append("\n    ON ").append(s.event()).append(" TO ")
                 .append(executor.defaultSchema()).append('.').append(s.table());
         if (s.whereClause() != null) {
-            sb.append("\n   WHERE ").append(s.whereClause());
+            sb.append("\n   WHERE ").append(normaliseRuleQualification(s));
         }
-        sb.append(" DO ").append(instead ? "INSTEAD " : " ");
-        sb.append(s.commands().isEmpty() ? "NOTHING" : String.join(";\n", s.commands()));
-        return sb.append(';').toString();
+        List<String> commands = s.commands();
+        boolean nothing = commands.isEmpty()
+                || (commands.size() == 1 && "NOTHING".equals(commands.get(0)));
+        if (nothing) {
+            return sb.append(" DO ").append(instead ? "INSTEAD " : " ").append("NOTHING;").toString();
+        }
+        List<String> written = new ArrayList<>();
+        for (String command : commands) written.add(normaliseRuleAction(command));
+        // A single action is written after an extra space where ALSO would have stood; the
+        // parenthesised form of several actions does without it.
+        sb.append(" DO ").append(instead ? "INSTEAD " : "").append(written.size() > 1 ? "" : " ");
+        if (written.size() == 1) return sb.append(written.get(0)).append(';').toString();
+        // Several actions are written as PostgreSQL writes them: parenthesised, each closed by
+        // its own semicolon, with the closing parenthesis on a line of its own. Writing them
+        // bare left the definition unable to be read back as the rule it came from.
+        sb.append("( ");
+        for (int i = 0; i < written.size(); i++) {
+            if (i > 0) sb.append("\n ");
+            sb.append(written.get(i)).append(';');
+        }
+        return sb.append("\n);").toString();
+    }
+
+    /**
+     * A rule's qualification as {@code pg_get_ruledef} writes it: the analysed expression, so it
+     * comes back parenthesised and with OLD and NEW written in lower case. The token text the
+     * parser kept came out as {@code NEW . b > 5}.
+     */
+    private String normaliseRuleQualification(CreateRuleStmt s) {
+        try {
+            Expression parsed = new com.memgres.engine.parser.Parser(
+                    new com.memgres.engine.parser.Lexer(s.whereClause()).tokenize()).parseExpression();
+            Table on = executor.resolveTable(executor.defaultSchema(), s.table());
+            return lowerRowAliases(RuleDeparser.deparse(parsed, RuleDeparser.forTable(on)));
+        } catch (RuntimeException e) {
+            return s.whereClause();
+        }
+    }
+
+    /**
+     * OLD and NEW are relation names in the rewritten query, and PostgreSQL writes them in lower
+     * case rather than as the quoted identifiers a deparser would otherwise make of them.
+     */
+    private static String lowerRowAliases(String sql) {
+        return sql.replace("\"OLD\".", "old.").replace("\"NEW\".", "new.");
+    }
+
+    /**
+     * One rule action as {@code pg_get_ruledef} writes it. PostgreSQL deparses the analysed
+     * statement rather than echoing the text: an INSERT gets its target column list written out
+     * and each value printed in the column's own type. Anything this engine cannot rewrite that
+     * way is echoed as it was written, which is what the whole definition used to be.
+     */
+    private String normaliseRuleAction(String action) {
+        try {
+            com.memgres.engine.parser.ast.Statement parsed =
+                    com.memgres.engine.parser.Parser.parse(action);
+            if (!(parsed instanceof InsertStmt)) return action;
+            InsertStmt ins = (InsertStmt) parsed;
+            if (ins.values() == null || ins.values().isEmpty()) return action;
+            Table target = executor.resolveTable(executor.defaultSchema(), ins.table());
+            List<String> columnNames = new ArrayList<>();
+            if (ins.columns() != null && !ins.columns().isEmpty()) {
+                columnNames.addAll(ins.columns());
+            } else {
+                for (Column c : target.getColumns()) columnNames.add(c.getName());
+            }
+            StringBuilder sb = new StringBuilder("INSERT INTO ").append(ins.table()).append(" (");
+            for (int i = 0; i < columnNames.size(); i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(columnNames.get(i));
+            }
+            sb.append(")\n  VALUES ");
+            RuleDeparser.ColumnTypes types = RuleDeparser.forTable(target);
+            for (int r = 0; r < ins.values().size(); r++) {
+                if (r > 0) sb.append(", ");
+                List<Expression> row = ins.values().get(r);
+                sb.append('(');
+                for (int i = 0; i < row.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    RuleDeparser.PgType want = null;
+                    if (i < columnNames.size()) {
+                        int idx = target.getColumnIndex(columnNames.get(i));
+                        if (idx >= 0) want = RuleDeparser.fromColumn(target.getColumns().get(idx));
+                    }
+                    sb.append(RuleDeparser.deparseValue(row.get(i), want, types));
+                }
+                sb.append(')');
+            }
+            return lowerRowAliases(sb.toString());
+        } catch (RuntimeException e) {
+            return action;
+        }
     }
 
     /**

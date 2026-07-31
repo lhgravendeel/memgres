@@ -143,10 +143,11 @@ class DdlTableParser {
                     if (!LIKE_OPTIONS.contains(what)) {
                         throw new ParseException("syntax error", optToken);
                     }
-                    if (including) {
-                        if (likeOpts.length() > 0) likeOpts.append(",");
-                        likeOpts.append(what);
-                    }
+                    // EXCLUDING is written down too: the options are applied left to right, so
+                    // INCLUDING ALL EXCLUDING DEFAULTS has to be able to take the defaults back
+                    // out again. A dropped EXCLUDING left ALL standing on its own.
+                    if (likeOpts.length() > 0) likeOpts.append(",");
+                    likeOpts.append(including ? "" : "-").append(what);
                 }
                 if (likeOpts.length() > 0) {
                     likeTables.add(likeTableName + ":" + likeOpts);
