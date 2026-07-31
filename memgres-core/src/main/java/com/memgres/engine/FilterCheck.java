@@ -14,11 +14,14 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Who may carry a FILTER clause, and which of a statement's faults is reported.
+ * Who may carry a FILTER clause — and, in the same words, a DISTINCT or an ORDER BY among its
+ * arguments — and which of a statement's faults is reported.
  *
- * <p>FILTER says which rows a call accumulates, so it means something only to a call that
- * accumulates rows. Written on an ordinary function it is not a clause that can be ignored but a
- * call that cannot be built, and PostgreSQL refuses it naming the function:
+ * <p>FILTER says which rows a call accumulates, DISTINCT says which of them it counts once, and an
+ * ORDER BY among the arguments says which order it accumulates them in. All three mean something
+ * only to a call that accumulates rows. Written on an ordinary function none of them is a clause
+ * that can be ignored but a call that cannot be built, and PostgreSQL refuses it naming the
+ * function:
  * {@code FILTER specified, but abs is not an aggregate function} (42809). The refusal is a
  * property of the call rather than of the clause it stands in, so it holds in a select list, in
  * WHERE, in HAVING, in ORDER BY, inside a CTE or a derived table, in an aggregate's own argument
@@ -303,8 +306,10 @@ final class FilterCheck {
         if (rawName == null) return false;
         Expression filter = filterOf(node);
         // DISTINCT inside a call means the same thing FILTER does — accumulate a chosen subset —
-        // so PostgreSQL refuses it on a plain function in the same words.
-        if (filter == null && !isDistinct(node)) return false;
+        // and an ORDER BY written among a call's arguments says which order it accumulates them
+        // in. Both belong to a call that accumulates rows, so PostgreSQL refuses either on a plain
+        // function in the same words it refuses FILTER.
+        if (filter == null && !isDistinct(node) && !hasAggregateOrderBy(node)) return false;
         // What is inside the FILTER is judged before the call carrying it: an aggregate written
         // in a FILTER predicate is 42803 "aggregate functions are not allowed in FILTER", and
         // PostgreSQL says that rather than this whichever call the FILTER hangs off.
@@ -330,13 +335,31 @@ final class FilterCheck {
         return BuiltinFunctionNames.contains(written) || select.hasUserFunction(bare);
     }
 
-    /** The clause PostgreSQL names in the message: FILTER when there is one, else DISTINCT. */
+    /**
+     * The clause PostgreSQL names when a call carries more than one of them. It reads them in a
+     * fixed order — DISTINCT, then WITHIN GROUP, then ORDER BY, then FILTER, then OVER — and stops
+     * at the first, so {@code abs(v ORDER BY v) FILTER (WHERE true)} is complained about for its
+     * ORDER BY and not for its FILTER.
+     */
     private static String clauseOf(Object node) {
-        return filterOf(node) != null ? "FILTER" : "DISTINCT";
+        if (isDistinct(node)) return "DISTINCT";
+        if (hasAggregateOrderBy(node)) return "ORDER BY";
+        return "FILTER";
     }
 
     private static boolean isDistinct(Object node) {
         return node instanceof FunctionCallExpr && ((FunctionCallExpr) node).distinct;
+    }
+
+    /**
+     * An ORDER BY written among a call's arguments, which only an aggregate has a use for. A
+     * window call cannot carry one at all — the parser refuses the combination — so this is a
+     * plain call's property alone.
+     */
+    private static boolean hasAggregateOrderBy(Object node) {
+        if (!(node instanceof FunctionCallExpr)) return false;
+        List<SelectStmt.OrderByItem> orderBy = ((FunctionCallExpr) node).orderBy();
+        return orderBy != null && !orderBy.isEmpty();
     }
 
     private static String nameOf(Object node) {

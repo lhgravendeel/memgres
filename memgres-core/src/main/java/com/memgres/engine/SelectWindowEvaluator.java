@@ -479,7 +479,13 @@ class SelectWindowEvaluator {
         for (SelectStmt.SelectTarget target : stmt.targets()) {
             validateCallPlacement(target.expr(), false);
         }
-        validateCallPlacement(stmt.having(), false);
+        // HAVING may not hold a window call at all, and PostgreSQL says so while it reads the
+        // clause — before it has any occasion to work out whether a call written inside an
+        // aggregate would have had somewhere to stand. The refusal itself belongs after WHERE and
+        // is raised there, by validateAfterWhere; all this does is not pre-empt it.
+        if (!select.containsWindowFunction(stmt.having())) {
+            validateCallPlacement(stmt.having(), false);
+        }
         if (stmt.orderBy() != null) {
             for (SelectStmt.OrderByItem item : stmt.orderBy()) validateCallPlacement(item.expr(), false);
         }
