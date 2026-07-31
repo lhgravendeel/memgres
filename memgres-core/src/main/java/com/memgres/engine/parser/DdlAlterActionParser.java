@@ -96,11 +96,31 @@ class DdlAlterActionParser {
             String newSchema = parser.readIdentifier();
             return new AlterTableStmt.SetSchema(newSchema);
         }
-        // SET (storage_parameter = value, ...): no-op for in-memory database
+        // SET (storage_parameter = value, ...): nothing is stored for it, but the parameters are
+        // kept so the executor can refuse a name or a value PostgreSQL would refuse.
         if (parser.matchKeyword("SET")) {
-            if (parser.check(TokenType.LEFT_PAREN)) {
-                DdlTableParser.consumeUntilParen(parser);
-                return new AlterTableStmt.SetStorageParams();
+            if (parser.match(TokenType.LEFT_PAREN)) {
+                java.util.Map<String, String> params = new java.util.LinkedHashMap<>();
+                while (!parser.isAtEnd() && !parser.check(TokenType.RIGHT_PAREN)) {
+                    // A parameter may be namespaced, as toast.autovacuum_enabled is.
+                    String key = parser.readIdentifier().toLowerCase();
+                    if (parser.match(TokenType.DOT)) {
+                        key = key + "." + parser.readIdentifier().toLowerCase();
+                    }
+                    String val = null;
+                    if (parser.match(TokenType.EQUALS)) {
+                        StringBuilder sb = new StringBuilder();
+                        while (!parser.isAtEnd() && !parser.check(TokenType.COMMA)
+                                && !parser.check(TokenType.RIGHT_PAREN)) {
+                            sb.append(parser.advance().value());
+                        }
+                        val = sb.toString().trim();
+                    }
+                    params.put(key, val);
+                    parser.match(TokenType.COMMA);
+                }
+                parser.match(TokenType.RIGHT_PAREN);
+                return new AlterTableStmt.SetStorageParams(params);
             }
             // SET TABLESPACE tsname: no-op for in-memory database
             if (parser.matchKeyword("TABLESPACE")) {
@@ -128,7 +148,7 @@ class DdlAlterActionParser {
                 if (!"cluster".equalsIgnoreCase(word) && !"oids".equalsIgnoreCase(word)) {
                     throw new ParseException("Expected CLUSTER or OIDS", what);
                 }
-                return new AlterTableStmt.SetStorageParams();
+                return new AlterTableStmt.SetWithoutCluster("cluster".equalsIgnoreCase(word));
             }
             // Fall through; could be other SET variants, but for now error
             throw new ParseException("Unsupported ALTER TABLE SET action", parser.peek());
@@ -163,15 +183,19 @@ class DdlAlterActionParser {
                 parser.expectKeyword("SECURITY");
                 return new AlterTableStmt.EnableRls();
             }
-            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER / ENABLE RULE
-            parser.matchKeyword("REPLICA");
-            parser.matchKeyword("ALWAYS");
+            // ENABLE TRIGGER / ENABLE REPLICA TRIGGER / ENABLE ALWAYS TRIGGER / ENABLE RULE.
+            // REPLICA is not a reserved word, so the lexer hands it over as a plain identifier
+            // and matchKeyword never sees it — the same reason REPLICA IDENTITY below is matched
+            // on the token's text rather than its type.
+            String state = "O";
+            if (parser.matchKeyword("REPLICA") || parser.matchIdentifier("REPLICA")) state = "R";
+            else if (parser.matchKeyword("ALWAYS") || parser.matchIdentifier("ALWAYS")) state = "A";
             if (parser.matchKeyword("RULE")) {
-                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), true);
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), state);
             }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL
-            return new AlterTableStmt.EnableTrigger(trigName);
+            return new AlterTableStmt.EnableTrigger(trigName, state);
         }
         if (parser.matchKeyword("DISABLE")) {
             if (parser.matchKeyword("ROW")) {
@@ -181,7 +205,7 @@ class DdlAlterActionParser {
             }
             // DISABLE RULE suspends a rule; without it the only way to stop one is to drop it.
             if (parser.matchKeyword("RULE")) {
-                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), false);
+                return new AlterTableStmt.SetRuleEnabled(parser.readIdentifier(), "D");
             }
             parser.expectKeyword("TRIGGER");
             String trigName = parser.readIdentifier(); // trigger name or ALL

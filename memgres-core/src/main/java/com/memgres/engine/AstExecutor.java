@@ -508,6 +508,9 @@ public class AstExecutor {
         }
         if (stmt instanceof AlterSchemaOwnerStmt) {
             AlterSchemaOwnerStmt s = (AlterSchemaOwnerStmt) stmt;
+            // A schema that was never created has no owner to change, and reporting success
+            // leaves a script believing the schema is there.
+            ddlExecutor.requireSchemaExists(s.name());
             String newOwner = ddlExecutor.resolveOwnerName(s.newOwner());
             if (!database.hasRole(newOwner)) {
                 throw new MemgresException("role \"" + newOwner + "\" does not exist", "42704");
@@ -1763,6 +1766,9 @@ public class AstExecutor {
                     throw new MemgresException("relation \"" + stmt.name() + "\" does not exist", "42P01");
                 }
                 if (stmt.params != null && !stmt.params.isEmpty()) {
+                    // A parameter the access method does not have, or a value outside its range,
+                    // is refused here rather than stored as written.
+                    DdlIndexValidator.checkRelOptions(database.getIndexMethod(stmt.name()), stmt.params);
                     java.util.Map<String, String> existing = database.getIndexReloptions(stmt.name());
                     java.util.Map<String, String> merged = existing != null ? new java.util.LinkedHashMap<>(existing) : new java.util.LinkedHashMap<>();
                     merged.putAll(stmt.params);

@@ -475,6 +475,7 @@ class SessionExecutor {
         if (name.equals("alter_ts_config_mapping")) {
             String[] parts = stmt.value().split("\0", -1);
             String cfgName = parts[0];
+            executor.ddlExecutor.requireObjectExists("text search configuration", cfgName);
             String[] tokenTypes = parts[1].split(",");
             String dictNames = parts[2]; // comma-separated dict names
             for (String tt : tokenTypes) {
@@ -511,6 +512,7 @@ class SessionExecutor {
             String[] parts = stmt.value().split("\0", -1);
             String srvName = parts[0];
             String newOptions = parts.length > 1 && !parts[1].isEmpty() ? parts[1] : null;
+            executor.ddlExecutor.requireObjectExists("server", srvName);
             Database.FdwServer srv = executor.database.getForeignServer(srvName);
             if (srv != null) {
                 srv.options = newOptions != null ? newOptions : srv.options;
@@ -864,12 +866,20 @@ class SessionExecutor {
             return executeStubObject(name, stmt.value());
         }
 
+        if (name.equals("alter_object")) {
+            return executor.ddlExecutor.executeAlterObject(stmt.value());
+        }
+        if (name.equals("drop_object")) {
+            return executor.ddlExecutor.executeDropObject(stmt.value());
+        }
+
         if (name.equals("alter_extension_set_schema")) {
             String val = stmt.value();
             int colonIdx = val.indexOf(':');
             if (colonIdx > 0) {
                 String extName = val.substring(0, colonIdx);
                 String newSchema = val.substring(colonIdx + 1);
+                executor.ddlExecutor.requireObjectExists("extension", extName);
                 executor.database.setExtensionSchema(extName, newSchema);
             }
             return QueryResult.message(QueryResult.Type.SET, "ALTER EXTENSION");

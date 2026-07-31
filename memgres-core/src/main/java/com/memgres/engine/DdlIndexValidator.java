@@ -276,6 +276,16 @@ final class DdlIndexValidator {
      */
     static void validate(Table table, String method, boolean unique, List<String> columns,
                          List<String> columnOptions, List<String> includeColumns) {
+        validate(null, table, method, unique, columns, columnOptions, includeColumns, null);
+    }
+
+    /**
+     * @param database  the catalog a named collation is looked up in, or null to skip that check
+     * @param withOptions the WITH clause's storage parameters, or null when there is none
+     */
+    static void validate(Database database, Table table, String method, boolean unique,
+                         List<String> columns, List<String> columnOptions,
+                         List<String> includeColumns, Map<String, String> withOptions) {
         // The width of the index tuple is settled from the statement alone, so PostgreSQL checks
         // it before it looks the access method up.
         checkIndexColumnCount(columns, includeColumns);
@@ -284,6 +294,7 @@ final class DdlIndexValidator {
         if (amInfo == null) {
             throw PgErrors.undefinedObject("access method", method);
         }
+        checkRelOptions(am, withOptions);
         if (unique && !amInfo.canUnique) {
             throw PgErrors.notImplemented("access method \"" + am + "\" does not support unique indexes");
         }
@@ -297,6 +308,7 @@ final class DdlIndexValidator {
         for (int i = 0; i < columns.size(); i++) {
             String opts = columnOptions != null && i < columnOptions.size() ? columnOptions.get(i) : "";
             if (opts == null) opts = "";
+            checkCollationExists(database, opts);
             checkCollatable(table, columns.get(i), opts);
             checkOpclass(table, am, columns.get(i), opts);
             checkDefaultOpclass(table, am, columns.get(i), opts);
@@ -310,6 +322,32 @@ final class DdlIndexValidator {
                             "access method \"" + am + "\" does not support NULLS FIRST/LAST options");
                 }
             }
+        }
+    }
+
+    /** The collations every PostgreSQL carries, whatever the machine's locales happen to be. */
+    private static final Set<String> BUILTIN_COLLATIONS = Cols.setOf(
+            "c", "posix", "default", "ucs_basic", "unicode", "icu_root", "pg_c_utf8",
+            "c.utf-8", "c.utf8");
+
+    /**
+     * A collation named on an index key has to exist, the same as one named in an expression.
+     * The check was there for {@code x COLLATE "nosuch"} in a select list but not on the index
+     * key, so the index was built over a collation nothing could resolve.
+     */
+    private static void checkCollationExists(Database database, String opts) {
+        for (String part : opts.split(" ")) {
+            if (!part.startsWith("collate:")) continue;
+            String written = part.substring("collate:".length());
+            String lower = written.toLowerCase().replace("\"", "");
+            if (BUILTIN_COLLATIONS.contains(lower)) return;
+            if (lower.startsWith("pg_catalog.")
+                    && BUILTIN_COLLATIONS.contains(lower.substring("pg_catalog.".length()))) {
+                return;
+            }
+            if (database != null && database.getCollation(lower) != null) return;
+            throw new MemgresException("collation \"" + written
+                    + "\" for encoding \"UTF8\" does not exist", "42704");
         }
     }
 
@@ -451,6 +489,173 @@ final class DdlIndexValidator {
             return name.endsWith("multirange") ? "anymultirange" : "anyrange";
         }
         return name;
+    }
+
+    // ---- Storage parameters (reloptions) ----
+
+    /**
+     * One storage parameter: the kind of value it takes and, for a number, the range PostgreSQL
+     * will accept. {@code allowed} lists the words an enumerated option answers to.
+     */
+    private static final class RelOption {
+        final char kind;          // 'i' integer, 'r' real, 'b' boolean, 'e' enumerated
+        final double min;
+        final double max;
+        final List<String> allowed;
+
+        RelOption(char kind, double min, double max, List<String> allowed) {
+            this.kind = kind;
+            this.min = min;
+            this.max = max;
+            this.allowed = allowed;
+        }
+
+        static RelOption integer(double min, double max) { return new RelOption('i', min, max, null); }
+        static RelOption real(double min, double max) { return new RelOption('r', min, max, null); }
+        static RelOption bool() { return new RelOption('b', 0, 0, null); }
+        static RelOption enumerated(String... values) {
+            return new RelOption('e', 0, 0, Cols.listOf(values));
+        }
+    }
+
+    /**
+     * The storage parameters each relation kind accepts, keyed by access method — {@code "heap"}
+     * standing for a table's own WITH clause. Written from PostgreSQL 18's {@code reloptions.c}
+     * and measured against a live server: a parameter this engine does not know about is refused
+     * exactly as one PostgreSQL does not know about, because both are typing mistakes.
+     */
+    private static final Map<String, Map<String, RelOption>> REL_OPTIONS = new HashMap<>();
+
+    private static void relopt(String kind, String name, RelOption option) {
+        Map<String, RelOption> byName = REL_OPTIONS.get(kind);
+        if (byName == null) {
+            byName = new HashMap<>();
+            REL_OPTIONS.put(kind, byName);
+        }
+        byName.put(name, option);
+    }
+
+    static {
+        relopt("heap", "fillfactor", RelOption.integer(10, 100));
+        relopt("heap", "toast_tuple_target", RelOption.integer(128, 8160));
+        relopt("heap", "parallel_workers", RelOption.integer(0, 1024));
+        relopt("heap", "autovacuum_enabled", RelOption.bool());
+        relopt("heap", "user_catalog_table", RelOption.bool());
+        relopt("heap", "vacuum_truncate", RelOption.bool());
+        relopt("heap", "autovacuum_vacuum_threshold", RelOption.integer(0, 2147483647.0));
+        // PostgreSQL 18 added this one; leaving it out refused a CREATE TABLE that PG runs.
+        relopt("heap", "autovacuum_vacuum_max_threshold", RelOption.integer(-1, 2147483647.0));
+        // The legacy spelling is still accepted on CREATE TABLE, and pg_dump still writes it.
+        relopt("heap", "oids", RelOption.bool());
+        relopt("heap", "autovacuum_vacuum_insert_threshold", RelOption.integer(-1, 2147483647.0));
+        relopt("heap", "autovacuum_analyze_threshold", RelOption.integer(0, 2147483647.0));
+        relopt("heap", "autovacuum_vacuum_cost_limit", RelOption.integer(1, 10000));
+        relopt("heap", "autovacuum_freeze_min_age", RelOption.integer(0, 1000000000.0));
+        relopt("heap", "autovacuum_freeze_max_age", RelOption.integer(100000, 2000000000.0));
+        relopt("heap", "autovacuum_freeze_table_age", RelOption.integer(0, 2000000000.0));
+        relopt("heap", "autovacuum_multixact_freeze_min_age", RelOption.integer(0, 1000000000.0));
+        relopt("heap", "autovacuum_multixact_freeze_max_age", RelOption.integer(10000, 2000000000.0));
+        relopt("heap", "autovacuum_multixact_freeze_table_age", RelOption.integer(0, 2000000000.0));
+        relopt("heap", "log_autovacuum_min_duration", RelOption.integer(-1, 2147483647.0));
+        relopt("heap", "autovacuum_vacuum_cost_delay", RelOption.real(-1, 100));
+        relopt("heap", "autovacuum_vacuum_scale_factor", RelOption.real(0, 100));
+        relopt("heap", "autovacuum_vacuum_insert_scale_factor", RelOption.real(0, 100));
+        relopt("heap", "autovacuum_analyze_scale_factor", RelOption.real(0, 100));
+        relopt("heap", "vacuum_index_cleanup", RelOption.enumerated("auto", "on", "off"));
+        // vacuum_max_eager_scan_fraction is a GUC, not a storage parameter: PostgreSQL 18
+        // refuses it in WITH (...), so listing it here made memgres accept what PG does not.
+
+        relopt("btree", "fillfactor", RelOption.integer(10, 100));
+        relopt("btree", "deduplicate_items", RelOption.bool());
+        relopt("btree", "vacuum_cleanup_index_scale_factor", RelOption.real(0, 1e10));
+        relopt("hash", "fillfactor", RelOption.integer(10, 100));
+        relopt("gist", "fillfactor", RelOption.integer(10, 100));
+        relopt("gist", "buffering", RelOption.enumerated("auto", "on", "off"));
+        relopt("spgist", "fillfactor", RelOption.integer(10, 100));
+        relopt("gin", "fastupdate", RelOption.bool());
+        relopt("gin", "gin_pending_list_limit", RelOption.integer(64, 2147483647.0));
+        relopt("brin", "pages_per_range", RelOption.integer(1, 131072));
+        relopt("brin", "autosummarize", RelOption.bool());
+    }
+
+    /** The words PostgreSQL reads as a boolean in a storage parameter. */
+    private static final Set<String> TRUE_WORDS = Cols.setOf("true", "on", "yes", "1", "t", "y");
+    private static final Set<String> FALSE_WORDS = Cols.setOf("false", "off", "no", "0", "f", "n");
+
+    /**
+     * Check a WITH clause of storage parameters against what the relation kind accepts.
+     * PostgreSQL parses these while it is still defining the relation, so a parameter it does
+     * not recognise or a value out of range stops the statement before anything is created.
+     *
+     * @param kind {@code "heap"} for a table, or the index access method
+     */
+    static void checkRelOptions(String kind, Map<String, String> options) {
+        if (options == null || options.isEmpty()) return;
+        Map<String, RelOption> known = REL_OPTIONS.get(kind == null ? "btree" : kind.toLowerCase());
+        if (known == null) return;   // an access method this engine does not model: leave it be
+        for (Map.Entry<String, String> entry : options.entrySet()) {
+            String name = entry.getKey().toLowerCase();
+            // A namespaced parameter belongs to the TOAST table rather than to this relation.
+            if (name.startsWith("toast.")) continue;
+            RelOption option = known.get(name);
+            if (option == null) {
+                throw new MemgresException("unrecognized parameter \"" + entry.getKey() + "\"", "22023");
+            }
+            String value = entry.getValue();
+            // A bare parameter name means "true", which only a boolean option can mean.
+            if (value == null) value = "true";
+            value = value.trim();
+            if (value.length() > 1 && value.startsWith("'") && value.endsWith("'")) {
+                value = value.substring(1, value.length() - 1);
+            }
+            switch (option.kind) {
+                case 'b':
+                    if (!TRUE_WORDS.contains(value.toLowerCase())
+                            && !FALSE_WORDS.contains(value.toLowerCase())) {
+                        throw new MemgresException("invalid value for boolean option \""
+                                + name + "\": " + value, "22023");
+                    }
+                    break;
+                case 'e':
+                    if (!option.allowed.contains(value.toLowerCase())) {
+                        MemgresException ex = new MemgresException(
+                                "invalid value for \"" + name + "\" option", "22023");
+                        StringBuilder valid = new StringBuilder("Valid values are ");
+                        for (int i = 0; i < option.allowed.size(); i++) {
+                            if (i > 0) valid.append(i == option.allowed.size() - 1 ? ", and " : ", ");
+                            valid.append('"').append(option.allowed.get(i)).append('"');
+                        }
+                        ex.setDetail(valid.append('.').toString());
+                        throw ex;
+                    }
+                    break;
+                default:
+                    checkNumericOption(name, value, option);
+            }
+        }
+    }
+
+    /** An integer or floating-point storage parameter: it must parse, and it must be in range. */
+    private static void checkNumericOption(String name, String value, RelOption option) {
+        double parsed;
+        try {
+            parsed = option.kind == 'i' ? Long.parseLong(value) : Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            throw new MemgresException("invalid value for "
+                    + (option.kind == 'i' ? "integer" : "floating point")
+                    + " option \"" + name + "\": " + value, "22023");
+        }
+        if (parsed < option.min || parsed > option.max) {
+            MemgresException ex = new MemgresException("value " + value
+                    + " out of bounds for option \"" + name + "\"", "22023");
+            ex.setDetail("Valid values are between \"" + number(option.min, option.kind)
+                    + "\" and \"" + number(option.max, option.kind) + "\".");
+            throw ex;
+        }
+    }
+
+    private static String number(double value, char kind) {
+        return kind == 'i' ? String.valueOf((long) value) : String.valueOf(value);
     }
 
     /** Included columns are stored verbatim: they cannot be expressions, and must exist. */

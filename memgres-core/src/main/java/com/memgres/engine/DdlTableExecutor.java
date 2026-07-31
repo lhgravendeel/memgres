@@ -11,6 +11,11 @@ import java.util.*;
  * Extracted from DdlExecutor to separate concerns.
  */
 class DdlTableExecutor {
+    /** What INCLUDING ALL stands for, so that a later EXCLUDING can take one of them back. */
+    private static final Set<String> LIKE_OPTION_NAMES = Cols.setOf(
+            "COMMENTS", "COMPRESSION", "CONSTRAINTS", "DEFAULTS", "GENERATED",
+            "IDENTITY", "INDEXES", "STATISTICS", "STORAGE");
+
     final DdlExecutor ddl;
     final AstExecutor executor;
 
@@ -100,6 +105,10 @@ class DdlTableExecutor {
         List<StoredConstraint> likeConstraints = new ArrayList<>();
         // Track indexes to clone from LIKE ... INCLUDING INDEXES
         List<String[]> likeIndexesToClone = new ArrayList<>(); // each: {srcIndexName, newTableName}
+        // The name each copied NOT NULL constraint keeps, and the comments INCLUDING COMMENTS
+        // brings along, both applied once the table itself exists.
+        Map<String, String> likeNotNullNames = new LinkedHashMap<>();
+        Map<String, String> likeColumnComments = new LinkedHashMap<>();
         if (stmt.likeTables() != null) {
             for (String likeEntry : stmt.likeTables()) {
                 // Parse "tablename:OPT1,OPT2" format
@@ -108,17 +117,44 @@ class DdlTableExecutor {
                 int colonIdx = likeEntry.indexOf(':');
                 if (colonIdx >= 0) {
                     likeTableName = likeEntry.substring(0, colonIdx);
+                    // The options are applied in the order they were written, so a later
+                    // EXCLUDING takes back what an earlier INCLUDING ALL brought in.
                     for (String opt : likeEntry.substring(colonIdx + 1).split(",")) {
-                        likeOptions.add(opt.trim().toUpperCase());
+                        String what = opt.trim().toUpperCase();
+                        boolean excluding = what.startsWith("-");
+                        if (excluding) what = what.substring(1);
+                        Collection<String> affected = "ALL".equals(what) ? LIKE_OPTION_NAMES
+                                : Cols.setOf(what);
+                        if (excluding) likeOptions.removeAll(affected);
+                        else likeOptions.addAll(affected);
                     }
                 } else {
                     likeTableName = likeEntry;
                 }
                 Table likeTable = executor.resolveTable(schemaName, likeTableName);
+                // LIKE copies the shape of a column and nothing more unless the option that
+                // carries the rest is written out. Adding the source column object itself gave
+                // the new table the source's defaults, its identity and its generation
+                // expression, none of which PostgreSQL copies unasked.
                 for (Column col : likeTable.getColumns()) {
                     boolean exists = inheritedColumns.stream()
                             .anyMatch(c -> c.getName().equalsIgnoreCase(col.getName()));
-                    if (!exists) inheritedColumns.add(col);
+                    if (!exists) {
+                        inheritedColumns.add(likeColumnCopy(col, likeOptions));
+                        // A NOT NULL constraint travels with the column, under the name it has
+                        // on the source table: PostgreSQL copies the constraint, not the rule.
+                        if (!col.isNullable()) {
+                            likeNotNullNames.put(col.getName().toLowerCase(),
+                                    likeTable.notNullConstraintName(col.getName()));
+                        }
+                        if (wants(likeOptions, "COMMENTS")) {
+                            String srcComment = executor.database.getComment("column",
+                                    likeTable.getName() + "." + col.getName());
+                            if (srcComment != null) {
+                                likeColumnComments.put(col.getName().toLowerCase(), srcComment);
+                            }
+                        }
+                    }
                 }
                 // LIKE copies the columns and their NOT NULL, and nothing else unless asked.
                 // The keys travel with INCLUDING INDEXES, because it is the index they need;
@@ -236,7 +272,10 @@ class DdlTableExecutor {
                         throw new MemgresException("column \"" + def.name() + "\" is of type " + dataType.getPgName()
                                 + " but default expression is of type timestamp with time zone", "42804");
                     }
-                    if (def.defaultExpr() instanceof Literal) {
+                    if (def.defaultExpr() instanceof Literal
+                            && ((Literal) def.defaultExpr()).value() != null) {
+                        // DEFAULT NULL names no value at all, so there is nothing to read as a
+                        // number: reading one threw a NullPointerException out of the wire handler.
                         Literal lit = (Literal) def.defaultExpr();
                         String strVal = lit.value();
                         try {
@@ -330,6 +369,9 @@ class DdlTableExecutor {
         Table table = new Table(stmt.name(), columns);
         if (stmt.unlogged()) table.setUnlogged(true);
         if (stmt.withOptions() != null && !stmt.withOptions().isEmpty()) {
+            // A storage parameter is read while the table is being defined: an unknown name or a
+            // value outside the range stops the statement rather than being stored as written.
+            DdlIndexValidator.checkRelOptions("heap", stmt.withOptions());
             table.setReloptions(stmt.withOptions());
         }
 
@@ -470,6 +512,18 @@ class DdlTableExecutor {
             table.addConstraint(likeSc);
         }
 
+        // A NOT NULL constraint that came in over LIKE answers to the name it had on the source
+        // table, and INCLUDING COMMENTS brings the source's column comments with it.
+        for (Map.Entry<String, String> nn : likeNotNullNames.entrySet()) {
+            if (nn.getValue() != null && !table.getColumns().isEmpty()) {
+                table.setNotNullConstraintName(nn.getKey(), nn.getValue());
+            }
+        }
+        for (Map.Entry<String, String> cc : likeColumnComments.entrySet()) {
+            executor.database.addComment("column",
+                    (stmt.name() + "." + cc.getKey()).toLowerCase(), cc.getValue());
+        }
+
         // Clone indexes from LIKE ... INCLUDING INDEXES
         for (String[] idxInfo : likeIndexesToClone) {
             String srcIdx = idxInfo[0];
@@ -496,6 +550,48 @@ class DdlTableExecutor {
      * nothing for a unique index to hold; PostgreSQL refuses to key on one. Checked before the
      * table exists, so a rejected definition leaves nothing behind.
      */
+    /** Whether a LIKE option was asked for, either by name or through INCLUDING ALL. */
+    private static boolean wants(Set<String> options, String option) {
+        return options.contains(option) || options.contains("ALL");
+    }
+
+    /**
+     * The column LIKE actually copies: name, type and NOT NULL always; the default, the identity,
+     * the generation expression, the storage settings and the statistics target only when the
+     * matching INCLUDING option asked for them. A serial or identity column whose default does
+     * not travel is left as the plain integer type underneath it, because without the default
+     * there is no sequence behind it to draw from.
+     */
+    private static Column likeColumnCopy(Column src, Set<String> options) {
+        String defaultValue = src.getDefaultValue();
+        boolean identity = defaultValue != null && defaultValue.startsWith("__identity__:");
+        boolean keepDefault = identity ? wants(options, "IDENTITY") : wants(options, "DEFAULTS");
+        if (!keepDefault) defaultValue = null;
+        DataType type = src.getType();
+        if (defaultValue == null) type = withoutSerial(type);
+        String generated = wants(options, "GENERATED") ? src.getGeneratedExpr() : null;
+        Column copy = new Column(src.getName(), type, src.isNullable(),
+                src.isPrimaryKey() && wants(options, "INDEXES"), defaultValue,
+                src.getEnumTypeName(), src.getPrecision(), src.getScale(), generated,
+                generated != null && src.isVirtual(), src.getDomainTypeName(),
+                src.getCompositeTypeName(), src.getArrayElementType());
+        copy.setIntervalQualifier(src.getIntervalQualifier());
+        if (wants(options, "STORAGE")) {
+            copy.setAttStorageOverride(src.getAttStorageOverride());
+            copy.setAttCompression(src.getAttCompression());
+        }
+        if (wants(options, "STATISTICS")) copy.setAttStattarget(src.getAttStattarget());
+        return copy;
+    }
+
+    /** The integer type a serial column is stored in, for a copy that carries no sequence. */
+    private static DataType withoutSerial(DataType type) {
+        if (type == DataType.SERIAL) return DataType.INTEGER;
+        if (type == DataType.BIGSERIAL) return DataType.BIGINT;
+        if (type == DataType.SMALLSERIAL) return DataType.SMALLINT;
+        return type;
+    }
+
     /**
      * Drops the UNIQUE constraint a cloned index already stands for, matching on the columns
      * because that is what the two have in common. A PRIMARY KEY is left alone: PostgreSQL does
@@ -1092,16 +1188,30 @@ class DdlTableExecutor {
     // ---- DROP TABLE ----
 
     QueryResult executeDropTable(DropTableStmt stmt) {
-        dropSingleTable(stmt.schema(), stmt.name(), stmt.ifExists(), stmt.cascade());
+        // One DROP naming several tables drops them together, so a table in the list is not a
+        // dependency that blocks another one in the same list — PostgreSQL takes the whole set.
+        Set<String> together = new HashSet<>();
+        together.add(RelationNamespace.bareName(stmt.name()).toLowerCase());
         if (stmt.additionalTables() != null) {
             for (String tableName : stmt.additionalTables()) {
-                dropSingleTable(null, tableName, stmt.ifExists(), stmt.cascade());
+                together.add(RelationNamespace.bareName(tableName).toLowerCase());
+            }
+        }
+        dropSingleTable(stmt.schema(), stmt.name(), stmt.ifExists(), stmt.cascade(), together);
+        if (stmt.additionalTables() != null) {
+            for (String tableName : stmt.additionalTables()) {
+                dropSingleTable(null, tableName, stmt.ifExists(), stmt.cascade(), together);
             }
         }
         return QueryResult.command(QueryResult.Type.DROP_TABLE, 0);
     }
 
     void dropSingleTable(String schemaHint, String name, boolean ifExists, boolean cascade) {
+        dropSingleTable(schemaHint, name, ifExists, cascade, java.util.Collections.<String>emptySet());
+    }
+
+    void dropSingleTable(String schemaHint, String name, boolean ifExists, boolean cascade,
+                         Set<String> together) {
         if (checkDropSchemaExists(schemaHint, ifExists)) return;
         String schemaName = schemaHint != null ? schemaHint : executor.defaultSchema();
         String tempSchema = executor.session != null ? executor.session.getTempSchemaName() : "pg_temp";
@@ -1144,9 +1254,27 @@ class DdlTableExecutor {
                             }
                         }
                     }
-                    if (!ViewDependencies.directDependents(executor.database, schemaName, name).isEmpty()) {
-                        throw new MemgresException("cannot drop table " + visibleName(schemaName, name)
+                    // An inheritance child reads its parent's definition, so the parent cannot go
+                    // while the child is still there — and a reader of either would otherwise find
+                    // a child whose inherited columns come from a table that no longer exists.
+                    List<String> dependents = new ArrayList<>();
+                    for (Table child : droppedTable.getChildren()) {
+                        if (together.contains(child.getName().toLowerCase())) continue;
+                        dependents.add("table " + child.getName()
+                                + " depends on table " + visibleName(schemaName, name));
+                    }
+                    for (String v : ViewDependencies.directDependents(
+                            executor.database, schemaName, name)) {
+                        dependents.add("view " + RelationNamespace.bareName(v)
+                                + " depends on table " + visibleName(schemaName, name));
+                    }
+                    if (!dependents.isEmpty()) {
+                        MemgresException e = new MemgresException("cannot drop table "
+                                + visibleName(schemaName, name)
                                 + " because other objects depend on it", "2BP01");
+                        e.setDetail(String.join("\n", dependents));
+                        e.setHint("Use DROP ... CASCADE to drop the dependent objects too.");
+                        throw e;
                     }
                     // Check function dependencies (%ROWTYPE, %TYPE, RETURNS table_type, SETOF table_type)
                     for (PgFunction fn : executor.database.getFunctions().values()) {
@@ -1181,6 +1309,9 @@ class DdlTableExecutor {
                         }
                     }
                 } else {
+                    // CASCADE names what it took with it, so a script that meant to drop one
+                    // table learns it dropped four.
+                    List<String> cascaded = new ArrayList<>();
                     // CASCADE: remove FK constraints from tables referencing this table
                     for (Schema s : executor.database.getSchemas().values()) {
                         for (Table otherTable : s.getTables().values()) {
@@ -1193,13 +1324,41 @@ class DdlTableExecutor {
                                         && !sc.getReferencesSchema().equalsIgnoreCase(schemaName)) continue;
                                 fksToRemove.add(sc.getName());
                             }
-                            for (String fkName : fksToRemove) otherTable.removeConstraint(fkName);
+                            for (String fkName : fksToRemove) {
+                                cascaded.add("constraint " + fkName + " on table " + otherTable.getName());
+                                otherTable.removeConstraint(fkName);
+                            }
                         }
                     }
-                    // A view over a dependent view has to go too, or it is left reading a view
-                    // that no longer exists.
+                    // An inheritance child goes with its parent, and so does everything reading
+                    // either — all of it named in one notice, because that is what PostgreSQL
+                    // reports for one DROP.
+                    List<Table> descendants = inheritanceDescendants(droppedTable);
+                    List<String> viewsToDrop = new ArrayList<>();
                     for (String v : ViewDependencies.cascadeDependents(executor.database, schemaName, name)) {
+                        if (!viewsToDrop.contains(v)) viewsToDrop.add(v);
+                    }
+                    for (Table child : descendants) {
+                        String childSchema = findSchemaNameOf(child, schemaName);
+                        for (String v : ViewDependencies.cascadeDependents(
+                                executor.database, childSchema, child.getName())) {
+                            if (!viewsToDrop.contains(v)) viewsToDrop.add(v);
+                        }
+                    }
+                    for (String v : viewsToDrop) {
+                        cascaded.add("view " + RelationNamespace.bareName(v));
                         executor.database.removeView(v);
+                    }
+                    for (Table child : descendants) {
+                        cascaded.add("table " + child.getName());
+                    }
+                    // The whole tree is accounted for here, so each child is dropped with no
+                    // children of its own left — one DROP reports one cascade, not one per level.
+                    droppedTable.getChildren().clear();
+                    for (Table child : descendants) child.getChildren().clear();
+                    for (int d = descendants.size() - 1; d >= 0; d--) {
+                        Table child = descendants.get(d);
+                        dropSingleTable(findSchemaNameOf(child, schemaName), child.getName(), true, true);
                     }
                     // CASCADE: also drop dependent functions (e.g., BEGIN ATOMIC bodies referencing this table)
                     List<String> funcsToDrop = new ArrayList<>();
@@ -1208,7 +1367,11 @@ class DdlTableExecutor {
                             funcsToDrop.add(fn.getName());
                         }
                     }
-                    for (String f : funcsToDrop) executor.database.removeFunction(f);
+                    for (String f : funcsToDrop) {
+                        cascaded.add("function " + f + "()");
+                        executor.database.removeFunction(f);
+                    }
+                    DdlObjectExecutor.noticeDropCascades(executor, cascaded);
                 }
                 // PG drops all partitions together with a partitioned parent (no CASCADE needed)
                 if (!droppedTable.getPartitions().isEmpty()) {
@@ -1223,10 +1386,27 @@ class DdlTableExecutor {
                 if (partitionParent != null) {
                     partitionParent.removePartition(droppedTable);
                 }
+                // Dropping an inheritance child must unlink it from its parent for the same
+                // reason: a parent still listing a child that is gone is a dependency on nothing,
+                // and the parent could then never be dropped.
+                Table inheritanceParent = droppedTable.getParentTable();
+                if (inheritanceParent != null) {
+                    inheritanceParent.removeChild(droppedTable);
+                }
                 executor.recordUndo(new Session.DropTableUndo(schemaName, name, droppedTable,
                         executor.database.getTriggersForTable(schemaName, name)));
             }
             schema.removeTable(name);
+            // An index belongs to its table and goes with it. Leaving it registered kept the
+            // name taken, so re-creating the table and its index reported a name clash for an
+            // index over a relation that no longer existed.
+            for (String indexName : new ArrayList<>(executor.database.getIndexColumns().keySet())) {
+                String owner = executor.database.getIndexTable(indexName);
+                if (owner != null && (owner.equalsIgnoreCase(schemaName + "." + name)
+                        || owner.equalsIgnoreCase(name))) {
+                    executor.database.removeIndex(indexName);
+                }
+            }
             // Remove only this schema's triggers: a same-named table elsewhere keeps its own
             executor.database.removeTriggersForTable(schemaName, name);
             // Drop implicit sequences owned by SERIAL/IDENTITY columns
@@ -1291,6 +1471,19 @@ class DdlTableExecutor {
                     "schema \"" + schemaHint + "\" does not exist, skipping", null);
         }
         return true;
+    }
+
+    /** Every table below this one in the inheritance tree, parents before their own children. */
+    private static List<Table> inheritanceDescendants(Table parent) {
+        List<Table> out = new ArrayList<>();
+        List<Table> queue = new ArrayList<>(parent.getChildren());
+        while (!queue.isEmpty()) {
+            Table next = queue.remove(0);
+            if (out.contains(next)) continue;
+            out.add(next);
+            queue.addAll(next.getChildren());
+        }
+        return out;
     }
 
     /** Find the schema name that holds this exact table instance, falling back to the given name. */
@@ -1562,7 +1755,13 @@ class DdlTableExecutor {
                 }
             }
             if (!found) {
-                throw new MemgresException("Table not found: " + bareName);
+                // A name that resolves to something which is not a table is a different
+                // complaint from a name that resolves to nothing, and PostgreSQL says so.
+                if (executor.database.hasView(bareName)) {
+                    throw new MemgresException("\"" + bareName + "\" is not a table", "42809");
+                }
+                throw new MemgresException(
+                        "relation \"" + bareName + "\" does not exist", "42P01");
             }
         }
         return QueryResult.command(QueryResult.Type.DELETE, 0);
@@ -1580,16 +1779,26 @@ class DdlTableExecutor {
         }
 
         QueryResult result = executor.executeStatement(stmt.query());
+        // CREATE TABLE t (a, b) AS query renames the query's columns left to right. Fewer names
+        // than columns is allowed and leaves the rest as the query named them; more is not.
+        List<String> given = stmt.columnNames();
+        if (given != null && given.size() > result.getColumns().size()) {
+            throw new MemgresException("too many column names were specified", "42601");
+        }
         List<Column> columns = new ArrayList<>();
+        int givenIdx = 0;
         // The query's output names become the table's column names, so they have to satisfy the
         // same rules a column list does — a repeated or system name is rejected here, not later.
         Set<String> seenNames = new HashSet<>();
         for (Column srcCol : result.getColumns()) {
-            DdlDefinitionChecks.rejectSystemColumnName(srcCol.getName());
-            if (!seenNames.add(srcCol.getName().toLowerCase())) {
-                throw PgErrors.duplicateColumn(srcCol.getName());
+            String colName = given != null && givenIdx < given.size()
+                    ? given.get(givenIdx) : srcCol.getName();
+            givenIdx++;
+            DdlDefinitionChecks.rejectSystemColumnName(colName);
+            if (!seenNames.add(colName.toLowerCase())) {
+                throw PgErrors.duplicateColumn(colName);
             }
-            columns.add(new Column(srcCol.getName(), srcCol.getType(), true, false, null,
+            columns.add(new Column(colName, srcCol.getType(), true, false, null,
                     srcCol.getEnumTypeName(), srcCol.getPrecision(), srcCol.getScale(), null));
         }
 

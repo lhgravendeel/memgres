@@ -230,7 +230,7 @@ class DdlParser {
 
         DropStmt.ObjectType objectType;
         if (parser.matchKeyword("FUNCTION")) objectType = DropStmt.ObjectType.FUNCTION;
-        else if (parser.matchKeyword("PROCEDURE")) objectType = DropStmt.ObjectType.FUNCTION;
+        else if (parser.matchKeyword("PROCEDURE")) objectType = DropStmt.ObjectType.PROCEDURE;
         else if (parser.matchKeyword("ROUTINE")) objectType = DropStmt.ObjectType.FUNCTION;
         else if (parser.matchKeyword("TRIGGER")) objectType = DropStmt.ObjectType.TRIGGER;
         else if (parser.matchKeyword("TYPE")) objectType = DropStmt.ObjectType.TYPE;
@@ -253,16 +253,10 @@ class DdlParser {
             return parseDropTextSearch();
         }
         else if (parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")) {
-            boolean fdwIfExists = parser.matchKeywords("IF", "EXISTS");
-            String fdwName = parser.readIdentifier();
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_fdw", fdwName);
+            return parseDropObject("foreign-data wrapper");
         }
         else if (parser.matchKeyword("SERVER")) {
-            boolean srvIfExists = parser.matchKeywords("IF", "EXISTS");
-            String srvName = parser.readIdentifier();
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_server", srvName);
+            return parseDropObject("server");
         }
         else if (parser.matchKeywords("FOREIGN", "TABLE")) {
             boolean ftIfExists = parser.matchKeywords("IF", "EXISTS");
@@ -272,16 +266,10 @@ class DdlParser {
             return new SetStmt("drop_foreign_table", ftName);
         }
         else if (parser.matchKeyword("PUBLICATION")) {
-            boolean pubIfExists = parser.matchKeywords("IF", "EXISTS");
-            String pubName = parser.readIdentifier();
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_publication", pubName);
+            return parseDropObject("publication");
         }
         else if (parser.matchKeyword("SUBSCRIPTION")) {
-            boolean subIfExists = parser.matchKeywords("IF", "EXISTS");
-            String subName = parser.readIdentifier();
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("drop_subscription", subName);
+            return parseDropObject("subscription");
         }
         else if (parser.matchKeyword("DATABASE")) {
             boolean ifExists = parser.matchKeywords("IF", "EXISTS");
@@ -385,7 +373,9 @@ class DdlParser {
         String dropSchema = objectType == DropStmt.ObjectType.OPERATOR ? null : qualifier;
 
         java.util.List<String> funcParamTypes = null;
-        if ((objectType == DropStmt.ObjectType.FUNCTION || objectType == DropStmt.ObjectType.AGGREGATE)
+        if ((objectType == DropStmt.ObjectType.FUNCTION
+                || objectType == DropStmt.ObjectType.PROCEDURE
+                || objectType == DropStmt.ObjectType.AGGREGATE)
                 && parser.check(TokenType.LEFT_PAREN)) {
             funcParamTypes = parseFunctionDropParamTypes();
         }
@@ -489,8 +479,15 @@ class DdlParser {
         if (parser.matchKeyword("TYPE")) return parseAlterType();
         if (parser.matchKeyword("SEQUENCE")) return parseAlterSequence();
         if (parser.matchKeywords("USER", "MAPPING")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("alter_noop", "ok");
+            // The mapping is named by its server, so a server that was never created is what
+            // PostgreSQL reports missing.
+            String mappingServer = "";
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
+                if (parser.matchKeyword("SERVER")) { mappingServer = parser.readIdentifier(); continue; }
+                parser.advance();
+            }
+            if (mappingServer.isEmpty()) return new SetStmt("alter_noop", "ok");
+            return new SetStmt("alter_object", "server" + STUB_SEP + mappingServer + STUB_SEP + "");
         }
         if (parser.matchKeyword("ROLE") || parser.matchKeyword("USER")) return roleParser.parseAlterRole();
         if (parser.matchKeyword("POLICY")) return policyParser.parseAlterPolicy();
@@ -616,22 +613,19 @@ class DdlParser {
         if (parser.matchKeywords("EVENT", "TRIGGER")) return parseAlterEventTrigger();
 
         if (parser.matchKeywords("FOREIGN", "DATA", "WRAPPER")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("alter_noop", "ok");
+            return parseAlterObject("foreign-data wrapper");
         }
         if (parser.matchKeyword("SERVER")) {
             return parseAlterServer();
         }
         if (parser.matchKeywords("FOREIGN", "TABLE")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("alter_noop", "ok");
+            return parseAlterObject("foreign table");
         }
         if (parser.matchKeyword("PUBLICATION")) {
             return parseAlterPublication();
         }
         if (parser.matchKeyword("SUBSCRIPTION")) {
-            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("alter_noop", "ok");
+            return parseAlterObject("subscription");
         }
 
         // ALTER EXTENSION — parse SET SCHEMA and UPDATE
@@ -642,17 +636,13 @@ class DdlParser {
                 while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
                 return new SetStmt("alter_extension_set_schema", extName + ":" + newSchema);
             }
-            if (parser.matchKeyword("UPDATE")) {
-                // ALTER EXTENSION name UPDATE [TO version]
-                String toVersion = null;
-                if (parser.matchKeyword("TO")) {
-                    toVersion = parser.readIdentifierOrString();
-                }
-                while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-                return new SetStmt("alter_extension_update", extName + (toVersion != null ? ":" + toVersion : ""));
-            }
+            // UPDATE, ADD/DROP member and the rest change nothing memgres records, but PostgreSQL
+            // still refuses one on an extension that was never installed. A bare UPDATE also says
+            // so when the installed version is already the newest one.
+            boolean bareUpdate = parser.matchKeyword("UPDATE") && !parser.checkKeyword("TO");
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-            return new SetStmt("alter_noop", "ok");
+            return new SetStmt("alter_object", "extension" + STUB_SEP + extName + STUB_SEP + ""
+                    + STUB_SEP + (bareUpdate ? "update" : ""));
         }
         if (parser.matchKeyword("AGGREGATE")) return parseAlterAggregate();
         // ALTER on a name that was never created is an error in PostgreSQL, so each of these
@@ -665,8 +655,12 @@ class DdlParser {
         }
         if (parser.matchKeyword("RULE")) return parseAlterRuleStub();
         if (parser.matchKeyword("TRIGGER")) return parseAlterTriggerStub();
-        if (parser.matchKeywords("LARGE", "OBJECT")
-                || parser.matchKeyword("TRANSFORM")) {
+        if (parser.matchKeywords("LARGE", "OBJECT")) {
+            String loid = parser.advance().value();
+            while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+            return new SetStmt("alter_object", "large object" + STUB_SEP + loid + STUB_SEP + "");
+        }
+        if (parser.matchKeyword("TRANSFORM")) {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_noop", "ok");
         }
@@ -1295,6 +1289,9 @@ class DdlParser {
         if (parser.matchKeyword("COLLATE")) {
             collation = parser.readIdentifierOrString();
             ExpressionParser.validateCollationStatic(collation, parser.peek());
+            if (parser.checkKeyword("COLLATE")) {
+                throw PgErrors.syntax("multiple COLLATE clauses not allowed");
+            }
         }
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) {
             if (parser.matchKeyword("DEFAULT")) {
@@ -1302,7 +1299,14 @@ class DdlParser {
                 sawDefault = true;
                 defaultExpr = parser.parseExpression();
             }
-            else if (parser.matchKeywords("NOT", "NULL")) { notNull = true; sawNotNull = true; }
+            else if (parser.matchKeywords("NOT", "NULL")) {
+                // Writing it twice is not merely redundant to PostgreSQL: it refuses the domain.
+                if (sawNotNull) {
+                    throw new MemgresException("redundant NOT NULL constraint definition", "42P17");
+                }
+                notNull = true;
+                sawNotNull = true;
+            }
             else if (parser.matchKeyword("NULL")) { notNull = false; sawNull = true; }
             else if (parser.matchKeyword("CHECK")) {
                 parser.expect(TokenType.LEFT_PAREN);
@@ -1511,6 +1515,20 @@ class DdlParser {
 
     /** Separator inside the encoded payload of a stub statement; SQL text cannot contain it. */
     private static final String STUB_SEP = "\u0001";
+
+    /**
+     * {@code ALTER <kind> name ...} for the object kinds memgres keeps in a registry of its own
+     * rather than among the stubs. The kind and the name travel with the statement so the executor
+     * can refuse one that was never created, and a RENAME takes effect on the registered name.
+     */
+    private Statement parseAlterObject(String kind) {
+        String name = parser.readIdentifierOrString();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifierOrString();
+        String newName = "";
+        if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
+        while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
+        return new SetStmt("alter_object", kind + STUB_SEP + name + STUB_SEP + newName);
+    }
 
     AlterDomainStmt parseAlterDomain() {
         String domainName = parser.readIdentifier();
@@ -2663,8 +2681,10 @@ class DdlParser {
             while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
             return new SetStmt("alter_server_options", name + "\0" + (options != null ? options : ""));
         }
+        String newName = "";
+        if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("alter_noop", "ok");
+        return new SetStmt("alter_object", "server" + STUB_SEP + name + STUB_SEP + newName);
     }
 
     // ---- Publication / Subscription DDL parsing ----
@@ -2834,24 +2854,36 @@ class DdlParser {
     }
 
     private Statement parseDropTextSearch() {
-        String tsType = "CONFIGURATION";
-        if (matchIdentCI("CONFIGURATION")) tsType = "CONFIGURATION";
-        else if (matchIdentCI("DICTIONARY")) tsType = "DICTIONARY";
-        else if (matchIdentCI("PARSER")) tsType = "PARSER";
-        else if (matchIdentCI("TEMPLATE")) tsType = "TEMPLATE";
+        String kind = "text search configuration";
+        if (matchIdentCI("CONFIGURATION")) kind = "text search configuration";
+        else if (matchIdentCI("DICTIONARY")) kind = "text search dictionary";
+        else if (matchIdentCI("PARSER")) kind = "text search parser";
+        else if (matchIdentCI("TEMPLATE")) kind = "text search template";
+        return parseDropObject(kind);
+    }
+
+    /**
+     * {@code DROP <kind> [IF EXISTS] name} for the kinds memgres keeps in a registry of its own.
+     * The kind and the name travel with the statement so the executor can refuse a name that was
+     * never created and say which one IF EXISTS skipped.
+     */
+    private Statement parseDropObject(String kind) {
         boolean ifExists = parser.matchKeywords("IF", "EXISTS");
-        String name = parser.readIdentifier();
-        if (parser.match(TokenType.DOT)) name = parser.readIdentifier();
-        // consume CASCADE/RESTRICT
+        String name = parser.readIdentifierOrString();
+        if (parser.match(TokenType.DOT)) name = parser.readIdentifierOrString();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("drop_ts_" + tsType.toLowerCase(), name);
+        return new SetStmt("drop_object", kind + STUB_SEP + name + STUB_SEP + (ifExists ? "1" : ""));
     }
 
     private Statement parseAlterTextSearch() {
         if (matchIdentCI("CONFIGURATION")) {
             return parseAlterTextSearchConfiguration();
         }
-        // For DICTIONARY / PARSER / TEMPLATE - no-op
+        // A dictionary, a parser and a template each change nothing memgres records, but the name
+        // still has to be one that exists.
+        if (matchIdentCI("DICTIONARY")) return parseAlterObject("text search dictionary");
+        if (matchIdentCI("PARSER")) return parseAlterObject("text search parser");
+        if (matchIdentCI("TEMPLATE")) return parseAlterObject("text search template");
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
         return new SetStmt("alter_noop", "ok");
     }
@@ -2883,9 +2915,13 @@ class DdlParser {
                 }
             }
         }
-        // Consume rest for other ALTER variants
+        // Every other variant changes nothing memgres records, but the configuration still has
+        // to be one that exists — and a RENAME has to move the name it is registered under.
+        String newName = "";
+        if (parser.matchKeywords("RENAME", "TO")) newName = parser.readIdentifierOrString();
         while (!parser.isAtEnd() && !parser.check(TokenType.SEMICOLON)) parser.advance();
-        return new SetStmt("alter_noop", "ok");
+        return new SetStmt("alter_object",
+                "text search configuration" + STUB_SEP + name + STUB_SEP + newName);
     }
 
     // ---- CREATE COLLATION ----

@@ -168,6 +168,19 @@ public final class RuleDeparser {
     }
 
     /**
+     * Deparses a value in a context that wants a particular type — a VALUES item written against
+     * a known column, say — so that an untyped literal is printed in that type's own form.
+     */
+    static String deparseValue(Expression e, PgType target, ColumnTypes cols) {
+        if (e == null) return "NULL";
+        try {
+            return render(e, target, cols == null ? NO_COLUMNS : cols, false);
+        } catch (RuntimeException ex) {
+            return SqlUnparser.exprToSql(e);
+        }
+    }
+
+    /**
      * Deparses one index key expression, applying PG's {@code looks_like_function} rule:
      * a bare function call is printed as-is, anything else is wrapped in parentheses
      * (so {@code lower(name)} but {@code ((qty + 1))}).

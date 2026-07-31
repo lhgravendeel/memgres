@@ -154,9 +154,22 @@ class ExtensionsDDLCoverageTest {
         assertNoError("CREATE EXTENSION IF NOT EXISTS citext");
     }
 
+    // PostgreSQL raises 42704 for a DROP or an ALTER on an extension that was never installed,
+    // so these name one they install first rather than relying on a silent no-op.
     @Test
     void ext_drop_pgcrypto() {
+        assertNoError("CREATE EXTENSION IF NOT EXISTS pgcrypto");
         assertNoError("DROP EXTENSION pgcrypto");
+    }
+
+    @Test
+    void ext_drop_nonexistent_is_refused() {
+        assertThrows(SQLException.class, () -> exec("DROP EXTENSION nonexistent_ext"));
+    }
+
+    @Test
+    void ext_alter_nonexistent_is_refused() {
+        assertThrows(SQLException.class, () -> exec("ALTER EXTENSION nonexistent_ext UPDATE"));
     }
 
     @Test
@@ -178,11 +191,13 @@ class ExtensionsDDLCoverageTest {
 
     @Test
     void ext_alter_set_schema() {
+        assertNoError("CREATE EXTENSION IF NOT EXISTS pgcrypto");
         assertNoError("ALTER EXTENSION pgcrypto SET SCHEMA public");
     }
 
     @Test
     void ext_alter_update_to_version() {
+        assertNoError("CREATE EXTENSION IF NOT EXISTS pgcrypto");
         assertNoError("ALTER EXTENSION pgcrypto UPDATE TO '1.3'");
     }
 

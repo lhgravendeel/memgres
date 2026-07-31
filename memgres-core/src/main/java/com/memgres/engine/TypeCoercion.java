@@ -29,6 +29,25 @@ public final class TypeCoercion {
         UNKNOWN     // X: everything else
     }
 
+    /**
+     * Whether a value of the named PostgreSQL type can be assigned to a column of the target type
+     * without being cast explicitly. PostgreSQL's assignment casts stay inside a type category —
+     * any number to any number, any string to any string — and additionally reach every type from
+     * a string, since every type has a text representation to read back. Going the other way, out
+     * of a category into one that is not string, needs an explicit cast.
+     *
+     * <p>A type name this engine does not recognise is left alone: guessing would refuse
+     * definitions PostgreSQL accepts.
+     */
+    public static boolean assignableFrom(String sourceTypeName, DataType target) {
+        DataType source = DataType.fromPgName(sourceTypeName);
+        if (source == null || target == null || source == target) return true;
+        TypeCategory from = categoryOf(source);
+        TypeCategory to = categoryOf(target);
+        if (from == TypeCategory.UNKNOWN || to == TypeCategory.UNKNOWN) return true;
+        return from == to || to == TypeCategory.STRING;
+    }
+
     public static TypeCategory categoryOf(DataType type) {
         if (type == null) return TypeCategory.UNKNOWN;
         switch (type) {
@@ -609,7 +628,15 @@ public final class TypeCoercion {
         }
         if (val instanceof java.math.BigDecimal) {
             java.math.BigDecimal bd = (java.math.BigDecimal) val;
-            long lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
+            long lv;
+            try {
+                lv = bd.setScale(0, java.math.RoundingMode.HALF_UP).longValueExact();
+            } catch (ArithmeticException e) {
+                // Past a long the exact conversion gives up, and the ArithmeticException was
+                // reported as invalid input syntax — the value is perfectly good input, it is
+                // only too big for the column.
+                throw integerOutOfRange();
+            }
             if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE)
                 throw integerOutOfRange();
             return (int) lv;

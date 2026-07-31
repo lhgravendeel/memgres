@@ -24,6 +24,14 @@ class NoopDdlCoverageTest {
         String url = "jdbc:postgresql://localhost:" + memgres.getPort() + "/test";
         conn = DriverManager.getConnection(url, "test", "test");
         stmt = conn.createStatement();
+        // The objects the ALTER and IMPORT tests below name. PostgreSQL refuses every one of
+        // those statements on a name that was never created, and the tests run in an order
+        // nothing here fixes, so the names have to exist before any of them runs.
+        stmt.execute("CREATE FOREIGN DATA WRAPPER myfdw");
+        stmt.execute("CREATE SERVER myserver FOREIGN DATA WRAPPER myfdw");
+        stmt.execute("CREATE FOREIGN TABLE ft1 (id int, name text) SERVER myserver");
+        stmt.execute("CREATE PUBLICATION mypub FOR ALL TABLES");
+        stmt.execute("CREATE SUBSCRIPTION mysub CONNECTION 'host=localhost' PUBLICATION mypub");
     }
 
     @AfterAll
@@ -68,34 +76,51 @@ class NoopDdlCoverageTest {
         exec("CREATE FOREIGN DATA WRAPPER myfdw HANDLER myhandler VALIDATOR myvalidator");
     }
 
-    // ALTER FOREIGN DATA WRAPPER
+    // ALTER FOREIGN DATA WRAPPER. Each of these used to name a wrapper no test had created and
+    // passed because the ALTER was a silent no-op; PostgreSQL raises 42704 for every one of them,
+    // so the wrapper has to exist for the statement to be the no-op it is meant to be.
     @Test void testAlterForeignDataWrapper() throws SQLException {
-        exec("ALTER FOREIGN DATA WRAPPER myfdw HANDLER newhandler");
+        exec("CREATE FOREIGN DATA WRAPPER myfdw_h");
+        exec("ALTER FOREIGN DATA WRAPPER myfdw_h HANDLER newhandler");
     }
 
     @Test void testAlterForeignDataWrapperOptions() throws SQLException {
-        exec("ALTER FOREIGN DATA WRAPPER myfdw OPTIONS (SET debug 'false')");
+        exec("CREATE FOREIGN DATA WRAPPER myfdw_o");
+        exec("ALTER FOREIGN DATA WRAPPER myfdw_o OPTIONS (SET debug 'false')");
     }
 
     @Test void testAlterForeignDataWrapperOwner() throws SQLException {
-        exec("ALTER FOREIGN DATA WRAPPER myfdw OWNER TO newowner");
+        exec("CREATE FOREIGN DATA WRAPPER myfdw_w");
+        exec("ALTER FOREIGN DATA WRAPPER myfdw_w OWNER TO newowner");
     }
 
     @Test void testAlterForeignDataWrapperRename() throws SQLException {
-        exec("ALTER FOREIGN DATA WRAPPER myfdw RENAME TO newfdw");
+        exec("CREATE FOREIGN DATA WRAPPER myfdw_r");
+        exec("ALTER FOREIGN DATA WRAPPER myfdw_r RENAME TO newfdw");
+    }
+
+    @Test void testAlterForeignDataWrapperThatIsNotThere() {
+        assertThrows(SQLException.class,
+                () -> exec("ALTER FOREIGN DATA WRAPPER myfdw_nosuch OPTIONS (a 'b')"));
     }
 
     // DROP FOREIGN DATA WRAPPER
     @Test void testDropForeignDataWrapper() throws SQLException {
-        exec("DROP FOREIGN DATA WRAPPER myfdw");
+        exec("CREATE FOREIGN DATA WRAPPER myfdw_d");
+        exec("DROP FOREIGN DATA WRAPPER myfdw_d");
     }
 
     @Test void testDropForeignDataWrapperIfExists() throws SQLException {
-        exec("DROP FOREIGN DATA WRAPPER IF EXISTS myfdw");
+        exec("DROP FOREIGN DATA WRAPPER IF EXISTS myfdw_none");
     }
 
     @Test void testDropForeignDataWrapperCascade() throws SQLException {
-        exec("DROP FOREIGN DATA WRAPPER IF EXISTS myfdw CASCADE");
+        exec("DROP FOREIGN DATA WRAPPER IF EXISTS myfdw_none CASCADE");
+    }
+
+    @Test void testDropForeignDataWrapperThatIsNotThere() {
+        assertThrows(SQLException.class,
+                () -> exec("DROP FOREIGN DATA WRAPPER myfdw_nosuch"));
     }
 
     // CREATE SERVER
@@ -115,34 +140,48 @@ class NoopDdlCoverageTest {
         exec("CREATE SERVER myserver FOREIGN DATA WRAPPER myfdw OPTIONS (host 'localhost', port '5432')");
     }
 
-    // ALTER SERVER
+    // ALTER SERVER, on a server that was created — the same correction as for the wrapper above
     @Test void testAlterServer() throws SQLException {
-        exec("ALTER SERVER myserver OPTIONS (SET host 'newhost')");
+        exec("CREATE SERVER myserver_o FOREIGN DATA WRAPPER myfdw");
+        exec("ALTER SERVER myserver_o OPTIONS (SET host 'newhost')");
     }
 
     @Test void testAlterServerOwner() throws SQLException {
-        exec("ALTER SERVER myserver OWNER TO newowner");
+        exec("CREATE SERVER myserver_w FOREIGN DATA WRAPPER myfdw");
+        exec("ALTER SERVER myserver_w OWNER TO newowner");
     }
 
     @Test void testAlterServerRename() throws SQLException {
-        exec("ALTER SERVER myserver RENAME TO newserver");
+        exec("CREATE SERVER myserver_r FOREIGN DATA WRAPPER myfdw");
+        exec("ALTER SERVER myserver_r RENAME TO newserver");
     }
 
     @Test void testAlterServerVersion() throws SQLException {
-        exec("ALTER SERVER myserver VERSION '2.0'");
+        exec("CREATE SERVER myserver_v FOREIGN DATA WRAPPER myfdw");
+        exec("ALTER SERVER myserver_v VERSION '2.0'");
+    }
+
+    @Test void testAlterServerThatIsNotThere() {
+        assertThrows(SQLException.class,
+                () -> exec("ALTER SERVER myserver_nosuch OPTIONS (SET host 'h')"));
     }
 
     // DROP SERVER
     @Test void testDropServer() throws SQLException {
-        exec("DROP SERVER myserver");
+        exec("CREATE SERVER myserver_d FOREIGN DATA WRAPPER myfdw");
+        exec("DROP SERVER myserver_d");
     }
 
     @Test void testDropServerIfExists() throws SQLException {
-        exec("DROP SERVER IF EXISTS myserver");
+        exec("DROP SERVER IF EXISTS myserver_none");
     }
 
     @Test void testDropServerCascade() throws SQLException {
-        exec("DROP SERVER IF EXISTS myserver CASCADE");
+        exec("DROP SERVER IF EXISTS myserver_none CASCADE");
+    }
+
+    @Test void testDropServerThatIsNotThere() {
+        assertThrows(SQLException.class, () -> exec("DROP SERVER myserver_nosuch"));
     }
 
     // CREATE USER MAPPING
@@ -194,17 +233,23 @@ class NoopDdlCoverageTest {
         exec("ALTER FOREIGN TABLE ft1 OPTIONS (SET table_name 'other')");
     }
 
-    // DROP FOREIGN TABLE
+    // DROP FOREIGN TABLE, on one of its own so the shared ft1 survives for the ALTERs
     @Test void testDropForeignTable() throws SQLException {
-        exec("DROP FOREIGN TABLE ft1");
+        exec("CREATE FOREIGN TABLE ft_drop (id int) SERVER myserver");
+        exec("DROP FOREIGN TABLE ft_drop");
     }
 
     @Test void testDropForeignTableIfExists() throws SQLException {
-        exec("DROP FOREIGN TABLE IF EXISTS ft1");
+        exec("DROP FOREIGN TABLE IF EXISTS ft_none");
     }
 
     @Test void testDropForeignTableCascade() throws SQLException {
-        exec("DROP FOREIGN TABLE IF EXISTS ft1 CASCADE");
+        exec("DROP FOREIGN TABLE IF EXISTS ft_none CASCADE");
+    }
+
+    @Test void testAlterForeignTableThatIsNotThere() {
+        assertThrows(SQLException.class,
+                () -> exec("ALTER FOREIGN TABLE ft_nosuch RENAME TO ft_other"));
     }
 
     // IMPORT FOREIGN SCHEMA — must error because FDW has no handler
@@ -280,13 +325,18 @@ class NoopDdlCoverageTest {
                 () -> exec("ALTER PUBLICATION mypub_nosuch ADD TABLE t1"));
     }
 
-    // DROP PUBLICATION
+    // DROP PUBLICATION, on one of its own so the shared mypub survives
     @Test void testDropPublication() throws SQLException {
-        exec("DROP PUBLICATION mypub");
+        exec("CREATE PUBLICATION mypub_del FOR ALL TABLES");
+        exec("DROP PUBLICATION mypub_del");
     }
 
     @Test void testDropPublicationIfExists() throws SQLException {
-        exec("DROP PUBLICATION IF EXISTS mypub");
+        exec("DROP PUBLICATION IF EXISTS mypub_none");
+    }
+
+    @Test void testDropPublicationThatIsNotThere() {
+        assertThrows(SQLException.class, () -> exec("DROP PUBLICATION mypub_nosuch"));
     }
 
     // CREATE SUBSCRIPTION
@@ -323,13 +373,22 @@ class NoopDdlCoverageTest {
         exec("ALTER SUBSCRIPTION mysub OWNER TO newowner");
     }
 
-    // DROP SUBSCRIPTION
+    @Test void testAlterSubscriptionThatIsNotThere() {
+        assertThrows(SQLException.class, () -> exec("ALTER SUBSCRIPTION mysub_nosuch ENABLE"));
+    }
+
+    // DROP SUBSCRIPTION, on one of its own so the shared mysub survives for the ALTERs
     @Test void testDropSubscription() throws SQLException {
-        exec("DROP SUBSCRIPTION mysub");
+        exec("CREATE SUBSCRIPTION mysub_del CONNECTION 'host=localhost' PUBLICATION mypub");
+        exec("DROP SUBSCRIPTION mysub_del");
     }
 
     @Test void testDropSubscriptionIfExists() throws SQLException {
-        exec("DROP SUBSCRIPTION IF EXISTS mysub");
+        exec("DROP SUBSCRIPTION IF EXISTS mysub_none");
+    }
+
+    @Test void testDropSubscriptionThatIsNotThere() {
+        assertThrows(SQLException.class, () -> exec("DROP SUBSCRIPTION mysub_nosuch"));
     }
 
     // ========================================================================
@@ -624,8 +683,15 @@ class NoopDdlCoverageTest {
         assertNotNull(rs.getObject(1));
     }
 
+    // PostgreSQL raises 42704 for an ALTER on a large object that was never created, so this
+    // alters one it made rather than an OID nothing stands behind.
     @Test void testAlterLargeObject() throws SQLException {
-        exec("ALTER LARGE OBJECT 12345 OWNER TO test");
+        String oid = query1("SELECT lo_from_bytea(0, '\\x4869'::bytea)");
+        exec("ALTER LARGE OBJECT " + oid + " OWNER TO test");
+    }
+
+    @Test void testAlterLargeObjectThatIsNotThere() {
+        assertThrows(SQLException.class, () -> exec("ALTER LARGE OBJECT 987654 OWNER TO test"));
     }
 
     // ========================================================================

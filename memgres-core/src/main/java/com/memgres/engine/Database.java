@@ -1780,14 +1780,18 @@ public class Database {
         rules.put("name:" + newName.toLowerCase() + ":" + table.toLowerCase(), event);
         String definition = rules.remove("def:" + ruleName.toLowerCase());
         if (definition != null) rules.put("def:" + newName.toLowerCase(), definition);
+        String state = rules.remove("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+        if (state != null) rules.put("state:" + newName.toLowerCase() + ":" + table.toLowerCase(), state);
     }
 
     public void removeRule(String ruleName, String table) {
         String event = rules.remove("name:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
         rules.remove("def:" + ruleName.toLowerCase());
+        rules.remove("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
         if (event != null && !"exists".equals(event)) {
             rules.remove(table.toLowerCase() + ":" + event);
             rules.remove("off:" + table.toLowerCase() + ":" + event);
+            rules.remove("qual:" + table.toLowerCase() + ":" + event);
         }
     }
 
@@ -1806,6 +1810,27 @@ public class Database {
         String spec = rules.remove(enabled ? parked : live);
         if (spec != null) rules.put(enabled ? live : parked, spec);
         return true;
+    }
+
+    /**
+     * Record which of PostgreSQL's four firing modes a rule is in, as {@code pg_rewrite.ev_enabled}
+     * spells them: {@code O} origin (the default), {@code D} disabled, {@code R} replica, {@code A}
+     * always. Only {@code O} and {@code A} fire in an ordinary session — a replica rule waits for a
+     * session in replica mode — so the behaviour follows the code rather than being set apart.
+     *
+     * @return false when no rule of that name is defined on the relation
+     */
+    public boolean setRuleEnabledState(String ruleName, String table, String state) {
+        boolean firesHere = "O".equals(state) || "A".equals(state);
+        if (!setRuleEnabled(ruleName, table, firesHere)) return false;
+        rules.put("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase(), state);
+        return true;
+    }
+
+    /** The {@code ev_enabled} code a rule carries; {@code O} until something else is asked for. */
+    public String getRuleEnabledState(String ruleName, String table) {
+        String s = rules.get("state:" + ruleName.toLowerCase() + ":" + table.toLowerCase());
+        return s != null ? s : "O";
     }
 
     public void addRuleDefinition(String ruleName, String table, String definition) {
@@ -1868,7 +1893,9 @@ public class Database {
             if (k.startsWith("name:") && k.endsWith(":" + lower)) {
                 gone.add(k);
                 gone.add("def:" + k.substring(5, k.length() - lower.length() - 1));
-            } else if (k.startsWith(lower + ":") || k.startsWith("off:" + lower + ":")) {
+                gone.add("state:" + k.substring(5));
+            } else if (k.startsWith(lower + ":") || k.startsWith("off:" + lower + ":")
+                    || k.startsWith("qual:" + lower + ":")) {
                 gone.add(k);
             }
         }
@@ -1877,6 +1904,20 @@ public class Database {
 
     public String getRule(String table, String event) {
         return rules.get(table.toLowerCase() + ":" + event.toUpperCase());
+    }
+
+    /**
+     * A rule's WHERE, kept beside its actions so the rows it fires for can be told apart from
+     * the rows it does not. Without it a qualified rule either fires for every row or for none.
+     */
+    public void addRuleQualification(String table, String event, String qualification) {
+        String key = "qual:" + table.toLowerCase() + ":" + event.toUpperCase();
+        if (qualification == null) rules.remove(key);
+        else rules.put(key, qualification);
+    }
+
+    public String getRuleQualification(String table, String event) {
+        return rules.get("qual:" + table.toLowerCase() + ":" + event.toUpperCase());
     }
 
     // Comments
