@@ -185,6 +185,18 @@ class SelectExecutor {
             validateDistinctOn(stmt);
             windowEvaluator.validateWindowUsage(stmt, null);
             windowEvaluator.validateAfterWhere(stmt);
+            // Nothing supplies a column here, so only what the expressions write down is typed.
+            // The select list is read before WHERE, and an aggregate may not stand in WHERE at
+            // all -- which is what PostgreSQL says about SELECT 1 WHERE count(*).
+            BooleanContext.Types noColumns = BooleanContext.Types.none();
+            for (SelectStmt.SelectTarget target : stmt.targets()) {
+                BooleanContext.scan(target.expr(), noColumns);
+            }
+            if (stmt.where() != null) {
+                placementCheck.reject(stmt.where(), "WHERE");
+                BooleanContext.check(stmt.where(), "WHERE", noColumns);
+            }
+            BooleanContext.check(stmt.having(), "HAVING", noColumns);
             boolean hasAgg = hasAggregateInTargets(stmt.targets())
                     || stmt.having() != null;
             if (hasAgg) {
@@ -358,6 +370,16 @@ class SelectExecutor {
 
         rejectAmbiguousQualifiedRefs(stmt, baseBindings, usingColumnsLower);
 
+        // Every condition is coerced to boolean as the clause holding it is transformed, and
+        // PostgreSQL transforms the FROM clause before the select list and the select list before
+        // WHERE. Nothing in a select list has to be a condition, but a CASE, a FILTER or an AND
+        // written there still holds one.
+        BooleanContext.Types columnTypes = BooleanContext.Types.of(executor, baseBindings);
+        for (SelectStmt.FromItem item : stmt.from()) checkJoinConditions(item, columnTypes);
+        for (SelectStmt.SelectTarget target : stmt.targets()) {
+            BooleanContext.scan(target.expr(), columnTypes);
+        }
+
         // Validate array subscript type errors for empty tables
         if (contexts.isEmpty() && simpleFrom && !baseBindings.isEmpty()) {
             for (SelectStmt.SelectTarget target : stmt.targets()) {
@@ -388,19 +410,13 @@ class SelectExecutor {
         // WHERE
         if (stmt.where() != null) {
             placementCheck.reject(stmt.where(), "WHERE", scope);
+            BooleanContext.check(stmt.where(), "WHERE", columnTypes);
             // Pre-flight type validation of WHERE clause (PG checks at plan time)
             // Only validate for simple single-table SELECTs (not CTEs/subqueries/joins)
             if (simpleFrom && baseBindings.size() == 1 && !hasJoins
                     && (stmt.withClauses() == null || stmt.withClauses().isEmpty())
                     && executor.cteStack.isEmpty()) {
                 executor.validateWhereTypesAgainstTable(stmt.where(), baseBindings.get(0).table());
-            }
-            if (!contexts.isEmpty()) {
-                Object testVal = executor.evalExpr(stmt.where(), contexts.get(0));
-                if (testVal instanceof Number) {
-                    throw new MemgresException("argument of WHERE must be type boolean, not type " +
-                            TypeCoercion.inferType(testVal).getPgName(), "42804");
-                }
             }
             contexts = contexts.stream()
                     .filter(ctx -> executor.isTruthy(executor.evalExpr(stmt.where(), ctx)))
@@ -421,6 +437,15 @@ class SelectExecutor {
         // definitions, ORDER BY, GROUP BY, LIMIT and OFFSET, so what it says about a query wrong
         // in two clauses is what the earlier one is wrong about.
         windowEvaluator.validateAfterWhere(stmt);
+        BooleanContext.check(stmt.having(), "HAVING", columnTypes);
+        if (stmt.orderBy() != null) {
+            for (SelectStmt.OrderByItem item : stmt.orderBy()) {
+                BooleanContext.scan(item.expr(), columnTypes);
+            }
+        }
+        if (stmt.groupBy() != null) {
+            for (Expression g : stmt.groupBy()) BooleanContext.scan(g, columnTypes);
+        }
 
         // Check if this query uses aggregation
         boolean hasGroupBy = stmt.groupBy() != null && !stmt.groupBy().isEmpty();
@@ -1700,6 +1725,15 @@ class SelectExecutor {
         return resultRows;
     }
 
+    /** Every ON condition the FROM clause writes, each of which has to be a condition. */
+    private void checkJoinConditions(SelectStmt.FromItem item, BooleanContext.Types types) {
+        if (!(item instanceof SelectStmt.JoinFrom)) return;
+        SelectStmt.JoinFrom join = (SelectStmt.JoinFrom) item;
+        checkJoinConditions(join.left(), types);
+        checkJoinConditions(join.right(), types);
+        BooleanContext.check(join.on(), "JOIN/ON", types);
+    }
+
     // ---- SELECT without FROM ----
 
     private QueryResult executeSelectExpressions(SelectStmt stmt) {
@@ -1721,10 +1755,6 @@ class SelectExecutor {
         if (stmt.offset() != null) limitOffsetValue(stmt.offset(), false);
         if (stmt.where() != null) {
             Object whereVal = executor.evalExpr(stmt.where(), null);
-            if (whereVal instanceof Number) {
-                throw new MemgresException("argument of WHERE must be type boolean, not type " +
-                        TypeCoercion.inferType(whereVal).getPgName(), "42804");
-            }
             if (!executor.isTruthy(whereVal)) {
                 List<Column> columns = new ArrayList<>();
                 for (SelectStmt.SelectTarget target : stmt.targets()) {
