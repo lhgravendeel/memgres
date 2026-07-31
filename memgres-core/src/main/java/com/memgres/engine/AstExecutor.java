@@ -388,6 +388,11 @@ public class AstExecutor {
         // UPDATE -- before any of it is run. A SELECT is judged where its own relations have been
         // resolved instead (SelectExecutor.executeSelectInner), because PostgreSQL builds the
         // range table before it looks at any clause and reports a missing relation on its own.
+        // The range table comes first for a data-modifying statement too, and the relation it
+        // writes goes into it before the ones it reads, so both are resolved before the clauses
+        // are judged. Only names are resolved and the target is only described: nothing is read
+        // and nothing is written by the check itself.
+        if (isDataModifying(stmt)) dmlExecutor.checkTargetsResolvable(stmt);
         if (stmt instanceof SetOpStmt || isDataModifying(stmt)) {
             FilterCheck.reject(selectExecutor, stmt, null);
         }

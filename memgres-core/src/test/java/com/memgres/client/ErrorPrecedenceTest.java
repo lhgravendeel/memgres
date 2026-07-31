@@ -251,23 +251,17 @@ class ErrorPrecedenceTest {
      * memgres reports the later. They are asserted against memgres's present answer so the branch
      * is honest about its own scope: closing one of them fails this test, which is the intent.
      *
-     * <p>What they have in common is a fault memgres finds only by running something. A data
-     * modifying statement is still refused for a FILTER over its raw syntax tree, because it
-     * resolves its target inside its own executor rather than before it. A FILTER predicate is only
-     * coerced where the call carrying it is refused anyway, so a real aggregate's is not read. And
-     * a column reference is still resolved a row at a time everywhere except a query level's own
-     * clauses, so a query that reads no rows never reaches it.
+     * <p>What they have in common is a fault memgres finds only by running something. A FILTER
+     * predicate is only coerced where the call carrying it is refused anyway, so a real
+     * aggregate's is not read. And a column reference is still resolved a row at a time everywhere
+     * except a query level's own clauses, so a query that reads no rows never reaches it.
+     *
+     * <p>The three data-modifying cases that stood here are now the other way round: the relation
+     * a statement writes is resolved before its clauses are judged, so they report 42P01. They are
+     * asserted as such in {@code DmlErrorPrecedenceTest}.
      */
     @Test
     void theCasesStillOutOfOrderAreRecordedRatherThanAsserted() {
-        // PostgreSQL: 42P01 — a data-modifying statement's target is resolved after the FILTER
-        // rule has already run over the whole statement.
-        assertEquals("42809",
-                stateOf("INSERT INTO ept_nosuch VALUES (9, abs(1) FILTER (WHERE true))"));
-        assertEquals("42809",
-                stateOf("DELETE FROM ept_nosuch WHERE abs(1) FILTER (WHERE true) > 0"));
-        assertEquals("42809", stateOf("UPDATE ept_nosuch SET v = abs(1) FILTER (WHERE true)"));
-
         // PostgreSQL: 42804 — a FILTER predicate is a condition whatever it hangs off, so an
         // aggregate's is coerced to boolean too.
         assertEquals("OK", stateOf("SELECT count(v) FILTER (WHERE 1) FROM ept_t"));

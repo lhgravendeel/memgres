@@ -321,6 +321,72 @@ class DmlExecutor {
         }
     }
 
+    /**
+     * What PostgreSQL settles about a data-modifying statement before it judges any clause of it.
+     *
+     * <p>PostgreSQL builds the range table first — putting the relation the statement writes into
+     * it ahead of the ones it reads — and validates the written column list against that relation
+     * while it is still analysing the statement. A statement that both names something that is not
+     * there and misuses a clause therefore reports the name. A SELECT already gets this from
+     * {@link FromResolver#checkRelationNamesExist}; INSERT, UPDATE, DELETE and MERGE resolve their
+     * target inside the methods below instead, which is why a clause-level refusal used to win.
+     *
+     * <p>This is the same resolution those methods perform, by name, reading no rows: it can only
+     * report what they would have reported, one step earlier. Where it cannot settle the answer
+     * without reading — a view, a relation it cannot describe — it says nothing and leaves the
+     * later check where it was.
+     */
+    void checkTargetsResolvable(Statement stmt) {
+        executor.fromResolver.checkRelationNamesExist(stmt);
+        SelectStmt.TableRef target = FromResolver.writtenRelationOf(stmt);
+        if (target == null) return;
+        Table table = describeWrittenRelation(target);
+        if (table == null) return;
+        // The column list of an INSERT is validated against the target the moment the target is
+        // known, before the VALUES or the SELECT behind them is looked at.
+        if (stmt instanceof InsertStmt) {
+            requireTargetColumns(table, target.table, ((InsertStmt) stmt).columns());
+        }
+        // An UPDATE's FROM and a DELETE's USING bring other relations into scope; without one the
+        // target is the whole scope, and PostgreSQL resolves the WHERE against it before it
+        // reaches the assignments or anything they carry.
+        if (stmt instanceof UpdateStmt) {
+            UpdateStmt u = (UpdateStmt) stmt;
+            if (u.from() == null || u.from().isEmpty()) {
+                requireReadableColumns(table, u.where(), u.alias(), u.table());
+            }
+        }
+        if (stmt instanceof DeleteStmt) {
+            DeleteStmt d = (DeleteStmt) stmt;
+            if (d.using() == null || d.using().isEmpty()) {
+                requireReadableColumns(table, d.where(), d.alias(), d.table());
+            }
+        }
+    }
+
+    /**
+     * The stored relation a data-modifying statement writes, described rather than read.
+     *
+     * <p>A view is left alone: it has columns of its own and a rewrite behind it, and the write
+     * path resolves both and has its own words for what is wrong with them.
+     */
+    private Table describeWrittenRelation(SelectStmt.TableRef target) {
+        if (target.table == null) return null;
+        Database.ViewDef view = target.schema != null
+                ? executor.database.getView(target.schema, target.table)
+                : executor.database.getView(target.table);
+        if (view != null) return null;
+        try {
+            return executor.resolveTable(
+                    target.schema != null ? target.schema : executor.defaultSchema(),
+                    target.table, target.schema != null);
+        } catch (RuntimeException e) {
+            // Anything this cannot resolve is left to the write path, which resolves it again and
+            // reports whatever it finds in its own words.
+            return null;
+        }
+    }
+
     QueryResult executeInsert(InsertStmt stmt) {
         return withCteScope(stmt.withClauses(), () -> executeInsertInner(stmt));
     }

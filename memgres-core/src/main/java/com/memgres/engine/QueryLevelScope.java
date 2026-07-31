@@ -1,5 +1,6 @@
 package com.memgres.engine;
 
+import com.memgres.engine.parser.ast.CastExpr;
 import com.memgres.engine.parser.ast.ColumnRef;
 import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.FunctionCallExpr;
@@ -162,6 +163,12 @@ final class QueryLevelScope {
             if (lit.literalType() == Literal.LiteralType.BOOLEAN) return DataType.BOOLEAN;
             return null;
         }
+        // A cast says what the value is, whatever it was written as, so its type is certain.
+        if (expr instanceof CastExpr) {
+            String typeName = ((CastExpr) expr).typeName();
+            if (typeName == null || typeName.trim().endsWith("[]")) return null;
+            return DataType.fromPgName(typeName.trim().toLowerCase(Locale.ROOT));
+        }
         if (!(expr instanceof ColumnRef)) return null;
         if (bindings == null || bindings.isEmpty()) return null;
         if (!select.executor.outerContextStack.isEmpty()) return null;
@@ -221,9 +228,11 @@ final class QueryLevelScope {
             argOids[i] = type.getOid();
             argNames[i] = CatalogHelper.pgTypeName(type);
         }
+        boolean recorded = false;
         boolean comparable = false;
         for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
             if (!signature[0].equalsIgnoreCase(bareName)) continue;
+            recorded = true;
             String[] params = signature[2].isEmpty() ? new String[0] : signature[2].split(" ");
             if (params.length != argOids.length) continue;
             comparable = true;
@@ -236,9 +245,22 @@ final class QueryLevelScope {
             }
             if (accepts) return;
         }
-        // No signature of this arity is a different fault -- too few arguments, or a function
-        // whose signatures are not recorded -- and PostgreSQL words those differently.
-        if (!comparable) return;
+        // A name with no recorded signature says nothing about what it takes. When one is
+        // recorded but not at this length, only a call longer than every form of it is judged:
+        // the table under-records the short forms, so "too few" would refuse working SQL, while
+        // the longest form recorded is the longest memgres implements. See
+        // {@link FunctionEvaluator#rejectWrongArity}.
+        if (!recorded) return;
+        if (!comparable) {
+            if (FunctionEvaluator.acceptsAnyArity(bareName)) return;
+            int longest = 0;
+            for (String[] signature : BuiltinFunctionSignatures.SIGNATURES) {
+                if (!signature[0].equalsIgnoreCase(bareName)) continue;
+                int params = signature[2].isEmpty() ? 0 : signature[2].split(" ").length;
+                if (params > longest) longest = params;
+            }
+            if (argOids.length <= longest) return;
+        }
         StringBuilder types = new StringBuilder();
         for (int i = 0; i < argNames.length; i++) {
             if (i > 0) types.append(", ");

@@ -495,10 +495,36 @@ class FromResolver {
             }
         });
         AstWalk.forEach(statement, node -> {
+            // The relation a data-modifying statement writes goes into the range table before the
+            // ones it reads, so it is the one reported when neither of them exists. It is held as
+            // a schema and a name rather than as a reference, so it is made into one here.
+            SelectStmt.TableRef written = writtenRelationOf(node);
+            if (written != null) checkOneRelationName(written, withNames);
             if (node instanceof SelectStmt.TableRef) {
                 checkOneRelationName((SelectStmt.TableRef) node, withNames);
             }
         });
+    }
+
+    /** The relation a data-modifying statement writes, as a reference this can resolve. */
+    static SelectStmt.TableRef writtenRelationOf(Object node) {
+        if (node instanceof InsertStmt) {
+            InsertStmt s = (InsertStmt) node;
+            return new SelectStmt.TableRef(s.schema(), s.table(), null, false);
+        }
+        if (node instanceof UpdateStmt) {
+            UpdateStmt s = (UpdateStmt) node;
+            return new SelectStmt.TableRef(s.schema(), s.table(), null, false);
+        }
+        if (node instanceof DeleteStmt) {
+            DeleteStmt s = (DeleteStmt) node;
+            return new SelectStmt.TableRef(s.schema(), s.table(), null, false);
+        }
+        if (node instanceof MergeStmt) {
+            MergeStmt s = (MergeStmt) node;
+            return new SelectStmt.TableRef(s.schema(), s.targetTable(), null, false);
+        }
+        return null;
     }
 
     private void checkOneRelationName(SelectStmt.TableRef tableRef, Set<String> withNames) {

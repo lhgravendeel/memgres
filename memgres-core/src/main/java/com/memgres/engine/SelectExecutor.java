@@ -157,7 +157,9 @@ class SelectExecutor {
         // clause-level faults and they are judged straight away. One that has a FROM clause is
         // judged below, after the relations have been resolved.
         if (noFromClause) {
-            FilterCheck.reject(this, stmt, null);
+            // No relations to describe, but a call still has to resolve: a literal and a cast
+            // carry a type of their own, which is what settles whether the call names a function.
+            FilterCheck.reject(this, stmt, new QueryLevelScope(this, Cols.listOf(), null, stmt));
             rejectMisplacedSrfs(stmt);
         } else {
             // A join condition is part of the FROM clause, so PostgreSQL judges it while it builds
