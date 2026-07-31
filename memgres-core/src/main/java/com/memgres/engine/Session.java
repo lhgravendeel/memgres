@@ -2078,8 +2078,84 @@ public class Session {
     // ---- Undo log ----
 
     public void recordUndo(UndoEntry entry) {
-        if (status == TransactionStatus.IN_TRANSACTION) {
+        if (status == TransactionStatus.IN_TRANSACTION || stmtScopeDepth > 0) {
             undoLog.add(entry);
+        }
+    }
+
+    /** Where the undo log stands now, for a caller that may need to drop what it adds. */
+    public int undoMark() {
+        return undoLog.size();
+    }
+
+    /**
+     * Forget the undo entries recorded since {@code mark}.
+     *
+     * <p>For a caller that has already put the tables back by another route: the DML paths keep a
+     * snapshot of their target tables when triggers are involved and restore it wholesale on
+     * failure, and applying the row-by-row undo on top of that would write the same rows twice.
+     */
+    public void discardUndoSince(int mark) {
+        if (mark >= 0 && mark < undoLog.size()) {
+            undoLog.subList(mark, undoLog.size()).clear();
+        }
+    }
+
+    /**
+     * Forget everything the statement now running has recorded. Used by a DML path that has put
+     * its target tables back from a snapshot of its own: the entries describe changes that have
+     * already been reversed, and applying them again would write the same rows a second time.
+     */
+    public void discardUndoForCurrentStatement() {
+        discardUndoSince(stmtScopeMark);
+    }
+
+    /** Nesting depth of the statement now running; only the outermost owns the scope. */
+    private int stmtScopeDepth = 0;
+    /** Where the undo log stood when the outermost statement began, or -1 outside one. */
+    private int stmtScopeMark = -1;
+    /** Whether that statement began outside an explicit transaction. */
+    private boolean stmtScopeOutsideTransaction = false;
+
+    /**
+     * Open the scope a single statement runs in.
+     *
+     * <p>Outside an explicit transaction every statement is a transaction of its own, so a
+     * statement that fails partway must leave nothing behind: PostgreSQL rolls back a multi-row
+     * UPDATE that divides by zero on its third row, and a query whose data-modifying WITH item has
+     * already written when a later clause turns out to be invalid. That needs the writes to be
+     * undoable, which they were not -- the undo log only recorded inside a transaction.
+     *
+     * <p>Nested calls (a CTE, a function body) join the scope the outermost statement opened
+     * rather than starting one of their own, so an inner failure that an outer statement catches
+     * does not undo work the outer statement means to keep.
+     */
+    public void beginStatementScope() {
+        if (stmtScopeDepth == 0) {
+            stmtScopeMark = undoLog.size();
+            stmtScopeOutsideTransaction = status != TransactionStatus.IN_TRANSACTION;
+        }
+        stmtScopeDepth++;
+    }
+
+    /**
+     * Close it. Inside a transaction the entries stay for COMMIT or ROLLBACK to deal with;
+     * outside one they are undone if the statement failed and dropped if it succeeded, because
+     * nothing after the statement can roll it back.
+     */
+    public void endStatementScope(boolean failed) {
+        if (stmtScopeDepth > 0) stmtScopeDepth--;
+        if (stmtScopeDepth > 0) return;
+        int mark = stmtScopeMark;
+        boolean outside = stmtScopeOutsideTransaction;
+        stmtScopeMark = -1;
+        stmtScopeOutsideTransaction = false;
+        if (mark < 0 || !outside || status == TransactionStatus.IN_TRANSACTION) return;
+        if (mark > undoLog.size()) return;
+        if (failed) {
+            applyUndo(mark);
+        } else if (mark < undoLog.size()) {
+            undoLog.subList(mark, undoLog.size()).clear();
         }
     }
 

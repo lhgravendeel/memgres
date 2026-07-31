@@ -423,7 +423,8 @@ class ConstraintValidator {
         Object result = executor.evalExpr(sc.getCheckExpr(), ctx);
         if (result instanceof Boolean && !((Boolean) result)) {
             MemgresException ex = new MemgresException(
-                    "new row violates check constraint \"" + sc.getName() + "\"",
+                    "new row for relation \"" + table.getName()
+                            + "\" violates check constraint \"" + sc.getName() + "\"",
                     "23514");
             ex.setConstraint(sc.getName());
             ex.setTable(table.getName());
@@ -580,6 +581,68 @@ class ConstraintValidator {
                 throw ex;
             }
         }
+    }
+
+    /**
+     * The key an ON DELETE SET DEFAULT is about to write, checked against the referenced table as
+     * it will be once the statement is over.
+     *
+     * <p>PostgreSQL has two complaints here and picks by which side is at fault. A default no row
+     * ever held is the child's fault, reported as the row it would write: <em>insert or update on
+     * table "c" violates ..., Key (pid)=(9) is not present in table "p"</em>. A default whose row
+     * exists but is being deleted is the parent's fault -- the delete is what cannot go ahead --
+     * and is reported from that side: <em>update or delete on table "p" violates ... on table "c",
+     * Key (id)=(9) is still referenced from table "c"</em>.
+     *
+     * @param vanishing rows of the referenced table this statement is removing
+     */
+    private void checkDefaultKeyStillThere(Table childTable, Object[] newRow, StoredConstraint sc,
+                                           java.util.Set<Object[]> vanishing, Table parentTable,
+                                           List<String> refColNames) {
+        // PostgreSQL names whichever side its own referential triggers reach first, and which
+        // that is depends on the order the rows come up in: the same DELETE reports the child's
+        // "is not present" for one arrangement of parent rows and the parent's "still referenced"
+        // for another. The SQLSTATE is 23503 either way, so this keeps the child-side message
+        // rather than model an ordering it cannot reproduce.
+        validateForeignKey(childTable, newRow, sc, vanishing);
+    }
+
+    /** The columns a foreign key references, falling back to the referenced table's key. */
+    private List<String> updateRefColNames(StoredConstraint sc, Table parentTable) {
+        List<String> refColNames = sc.getReferencesColumns();
+        if (refColNames == null || refColNames.isEmpty()) {
+            refColNames = findPrimaryKeyColumns(parentTable);
+        }
+        return refColNames;
+    }
+
+    /** PostgreSQL's parent-side wording for a key a statement may not take away. */
+    private MemgresException parentSideViolation(Table parentTable, Table childTable,
+                                                 StoredConstraint sc, Object[] childRow,
+                                                 List<String> refColNames) {
+        MemgresException ex = new MemgresException(
+                "update or delete on table \"" + parentTable.getName()
+                        + "\" violates foreign key constraint \"" + sc.getName()
+                        + "\" on table \"" + childTable.getName() + "\"", "23503");
+        ex.setConstraint(sc.getName());
+        ex.setTable(parentTable.getName());
+        String schemaName = findSchemaName(parentTable);
+        if (schemaName != null) ex.setSchema(schemaName);
+        StringBuilder detail = new StringBuilder("Key (");
+        for (int i = 0; i < refColNames.size(); i++) {
+            if (i > 0) detail.append(", ");
+            detail.append(refColNames.get(i));
+        }
+        detail.append(")=(");
+        for (int i = 0; i < sc.getColumns().size(); i++) {
+            if (i > 0) detail.append(", ");
+            int idx = childTable.getColumnIndex(sc.getColumns().get(i));
+            detail.append(idx >= 0 ? childRow[idx] : null);
+        }
+        detail.append(") is still referenced from table \"")
+              .append(childTable.getName()).append("\".");
+        ex.setDetail(detail.toString());
+        return ex;
     }
 
     private void validateForeignKey(Table table, Object[] row, StoredConstraint sc) {
@@ -1110,7 +1173,10 @@ class ConstraintValidator {
                             if (!deleteSet.isEmpty()) {
                                 // Recurse: handle FK cascades on the child table's dependents before deleting
                                 for (Object[] childRow : deleteSet) {
-                                    handleFkOnDelete(childTable, childRow, null, cascaded);
+                                    // The rows this cascade is about to remove are as gone, to
+                                    // anything referencing them, as the ones the statement named:
+                                    // a SET DEFAULT further down may not point at one of them.
+                                    handleFkOnDelete(childTable, childRow, deleteSet, cascaded);
                                 }
                                 childTable.deleteRows(deleteSet);
                                 // Record undo so ROLLBACK can restore the deleted rows
@@ -1154,6 +1220,13 @@ class ConstraintValidator {
                                         break;
                                     }
                                 }
+                                // A child row the same statement is deleting needs no default:
+                                // it will not be there to carry one. Writing one anyway is how a
+                                // self-referential DELETE came to be refused over a key that
+                                // nothing was going to reference.
+                                if (matches && alsoDeleting != null && alsoDeleting.contains(childRow)) {
+                                    continue;
+                                }
                                 if (matches) {
                                     Object[] oldVals = Arrays.copyOf(childRow, childRow.length);
                                     Object[] newVals = Arrays.copyOf(childRow, childRow.length);
@@ -1169,7 +1242,8 @@ class ConstraintValidator {
                                     // it was when the check fails. A parent row this same statement
                                     // is deleting cannot satisfy it either — it is still stored
                                     // while the action runs, but it will not be there afterwards.
-                                    validateForeignKey(childTable, newVals, sc, alsoDeleting);
+                                    checkDefaultKeyStillThere(childTable, newVals, sc, alsoDeleting,
+                                            parentTable, refColNames);
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
                                     recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);
                                     handleFkOnUpdate(childTable, oldVals, childRow);
@@ -1346,6 +1420,15 @@ class ConstraintValidator {
                                         newVals[childColIndices[i]] = col.getDefaultValue() != null
                                                 ? executor.evaluateDefault(col.getDefaultValue(), col.getType(), col.getParsedDefaultExpr())
                                                 : null;
+                                    }
+                                    // The default has to name a key the referenced table still
+                                    // holds. Moving a key away from under it is the update's
+                                    // fault, so PostgreSQL reports it from the parent's side.
+                                    try {
+                                        validateForeignKey(childTable, newVals, sc, null);
+                                    } catch (MemgresException notThere) {
+                                        throw parentSideViolation(parentTable, childTable, sc,
+                                                newVals, updateRefColNames(sc, parentTable));
                                     }
                                     childTable.updateRowInPlace(childRow, oldVals, newVals);
                                     recordCascadeUpdateUndo(childSchemaName, childTable.getName(), childRow, oldVals);

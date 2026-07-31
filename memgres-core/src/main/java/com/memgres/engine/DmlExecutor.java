@@ -830,7 +830,10 @@ class DmlExecutor {
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.INSERT, table, insertedRows, null);
         } catch (MemgresException e) {
             // Statement is atomic: undo any rows already inserted/updated before the failure.
-            if (insSnapshot != null) restoreTargetTables(insSnapshot);
+            if (insSnapshot != null) {
+                restoreTargetTables(insSnapshot);
+                if (executor.session != null) executor.session.discardUndoForCurrentStatement();
+            }
             throw e;
         }
 
@@ -1557,7 +1560,10 @@ class DmlExecutor {
         return QueryResult.command(QueryResult.Type.UPDATE, updatedCount);
         } catch (MemgresException e) {
             // Statement is atomic: undo any rows already updated before the failure.
-            if (updSnapshot != null) restoreTargetTables(updSnapshot);
+            if (updSnapshot != null) {
+                restoreTargetTables(updSnapshot);
+                if (executor.session != null) executor.session.discardUndoForCurrentStatement();
+            }
             throw e;
         }
     }
@@ -2218,7 +2224,10 @@ class DmlExecutor {
         // Fire statement-level AFTER DELETE triggers with transition tables
         triggerHelper.fireStatementTriggers(triggers, PgTrigger.Timing.AFTER, PgTrigger.Event.DELETE, table, null, oldRowsForTransition);
         } catch (MemgresException e) {
-            if (delSnapshot != null) restoreTargetTables(delSnapshot);
+            if (delSnapshot != null) {
+                restoreTargetTables(delSnapshot);
+                if (executor.session != null) executor.session.discardUndoForCurrentStatement();
+            }
             throw e;
         }
 
@@ -2647,6 +2656,9 @@ class DmlExecutor {
             } finally {
                 targetTable.getWriteLock().unlock();
             }
+            // The table is back as it was, so the statement's undo entries describe changes that
+            // have already been reversed; replaying them would write the same rows twice.
+            if (executor.session != null) executor.session.discardUndoForCurrentStatement();
             throw e;
         }
 
