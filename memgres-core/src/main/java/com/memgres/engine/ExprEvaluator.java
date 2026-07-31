@@ -2436,7 +2436,18 @@ class ExprEvaluator {
         if (val == null) return false;
         if (val instanceof Boolean) return ((Boolean) val);
         if (val instanceof Number) return ((Number) val).doubleValue() != 0;
-        if (val instanceof String) return !((String) val).isEmpty() && !((String) val).equalsIgnoreCase("false") && !((String) val).equals("0");
+        if (val instanceof String) {
+            // A string standing where a condition does is read by boolean's input function, which
+            // knows more words than "true" and "false": 'f', 'no', 'off' and 'n' are all false and
+            // were all being read as true because they are neither empty nor the word "false".
+            // A string that is no boolean word at all is left as it was — the clause-level checks
+            // refuse the ones PostgreSQL refuses, and guessing here would refuse more than that.
+            try {
+                return Boolean.TRUE.equals(TypeCoercion.toBoolean(val));
+            } catch (MemgresException e) {
+                return !((String) val).isEmpty();
+            }
+        }
         return true;
     }
 

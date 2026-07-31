@@ -197,10 +197,8 @@ final class QueryLevelScope {
      * the FILTER hangs off.
      */
     void rejectNonBooleanFilter(Expression filter) {
-        DataType type = certainTypeOf(filter);
-        if (type == null || type == DataType.BOOLEAN) return;
-        throw new MemgresException("argument of FILTER must be type boolean, not type "
-                + CatalogHelper.pgTypeName(type), "42804");
+        BooleanContext.require(filter, "FILTER",
+                BooleanContext.Types.of(select.executor, bindings));
     }
 
     // ---- Function resolution ----

@@ -163,6 +163,12 @@ class ErrorPrecedenceTest {
                 messageOf("SELECT abs(id) FILTER (WHERE 1) FROM ept_t"));
         assertEquals("argument of FILTER must be type boolean, not type text",
                 messageOf("SELECT abs(v) FILTER (WHERE txt) FROM ept_t"));
+        // A FILTER predicate is a condition whatever it hangs off, so an aggregate's is coerced
+        // too even though nothing else about the call is wrong.
+        assertEquals("argument of FILTER must be type boolean, not type integer",
+                messageOf("SELECT count(v) FILTER (WHERE 1) FROM ept_t"));
+        assertEquals("argument of FILTER must be type boolean, not type integer",
+                messageOf("SELECT max(v) FILTER (WHERE v) FROM ept_t"));
     }
 
     @Test
@@ -200,6 +206,9 @@ class ErrorPrecedenceTest {
                 "DISTINCT inside a call is refused in the same words as FILTER");
         assertEquals("42809", stateOf("SELECT abs(v) OVER () FROM ept_t"));
         assertEquals("42803", stateOf("SELECT id FROM ept_t WHERE count(*) > 0"));
+        assertEquals("42803", stateOf("SELECT 1 WHERE count(*) > 0"),
+                "a FROM-less query has no range table, but its WHERE is still a clause an "
+                        + "aggregate may not stand in");
         assertEquals("0A000", stateOf("SELECT id FROM ept_t WHERE generate_series(1,2) > 0"));
         assertEquals("42883", stateOf("SELECT ept_nosuchfn(id) FILTER (WHERE true) FROM ept_t"));
     }
@@ -251,31 +260,22 @@ class ErrorPrecedenceTest {
      * memgres reports the later. They are asserted against memgres's present answer so the branch
      * is honest about its own scope: closing one of them fails this test, which is the intent.
      *
-     * <p>What they have in common is a fault memgres finds only by running something. A FILTER
-     * predicate is only coerced where the call carrying it is refused anyway, so a real
-     * aggregate's is not read. And a column reference is still resolved a row at a time everywhere
-     * except a query level's own clauses, so a query that reads no rows never reaches it.
+     * <p>What they have in common is a fault memgres finds only by running something. A column
+     * reference is still resolved a row at a time everywhere except a query level's own clauses,
+     * so a query that reads no rows never reaches it.
      *
-     * <p>The three data-modifying cases that stood here are now the other way round: the relation
-     * a statement writes is resolved before its clauses are judged, so they report 42P01. They are
-     * asserted as such in {@code DmlErrorPrecedenceTest}.
+     * <p>Two groups that stood here are now the other way round. The relation a data-modifying
+     * statement writes is resolved before its clauses are judged, so those report 42P01 and are
+     * asserted in {@code DmlErrorPrecedenceTest}. And a FILTER predicate is coerced to boolean
+     * wherever it hangs, an aggregate's included, so those are asserted above.
      */
     @Test
     void theCasesStillOutOfOrderAreRecordedRatherThanAsserted() {
-        // PostgreSQL: 42804 — a FILTER predicate is a condition whatever it hangs off, so an
-        // aggregate's is coerced to boolean too.
-        assertEquals("OK", stateOf("SELECT count(v) FILTER (WHERE 1) FROM ept_t"));
-        assertEquals("OK", stateOf("SELECT max(v) FILTER (WHERE v) FROM ept_t"));
-
         // PostgreSQL: 42703 — a column reference nested in an expression is resolved when the
         // clause is analysed, not when a row reaches it.
         assertEquals("OK", stateOf("SELECT abs(nosuchcol) FROM ept_t WHERE false"));
         assertEquals("42809", stateOf(
                 "SELECT * FROM ept_t t WHERE EXISTS (SELECT abs(t.nosuchcol) FILTER (WHERE true))"),
                 "a sub-query's own scope is not this query level's, so it is not judged here");
-
-        // PostgreSQL: 42803 — a FROM-less query has no range table, but its WHERE is still a
-        // clause an aggregate may not stand in.
-        assertEquals("OK", stateOf("SELECT 1 WHERE count(*) > 0"));
     }
 }

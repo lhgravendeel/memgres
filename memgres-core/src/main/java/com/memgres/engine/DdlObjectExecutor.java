@@ -3092,6 +3092,21 @@ class DdlObjectExecutor {
     }
 
     /**
+     * A partial index's predicate says which rows the index holds, so it is a condition and
+     * PostgreSQL coerces it to boolean while it analyses the statement — naming WHERE, the clause
+     * it was written in.
+     */
+    private void checkPredicateIsBoolean(Table table, String whereClause) {
+        Expression pred;
+        try {
+            pred = com.memgres.engine.parser.Parser.parseExpression(whereClause);
+        } catch (RuntimeException ignored) {
+            return; // a predicate this cannot read is reported by the checks that follow
+        }
+        BooleanContext.check(pred, "WHERE", BooleanContext.Types.of(table));
+    }
+
+    /**
      * Evaluate a partial index's predicate once against a row of placeholder values, so that an
      * operator or function that does not exist for the column types is reported now.
      */
@@ -3150,6 +3165,7 @@ class DdlObjectExecutor {
         if (s.whereClause() != null) {
             // Type resolution happens while the statement is analysed, so a predicate that does
             // not type-check is reported as that rather than as a mutable-function predicate.
+            checkPredicateIsBoolean(indexTarget, s.whereClause());
             checkPredicateTypes(indexTarget, s.whereClause());
             DdlExecutor.checkBuiltinVolatileInExpression(s.whereClause(), executor.database,
                     "functions in index predicate must be marked IMMUTABLE");
