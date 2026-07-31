@@ -3498,6 +3498,9 @@ class ExprEvaluator {
                     || name.equals("grouping")
                     || name.equals("array_position")) return DataType.INTEGER;
             if (name.equals("array_positions")) return DataType.INT4_ARRAY;
+            // The function spellings of @>, <@ and && answer the yes/no question the operators do.
+            if (name.equals("arraycontains") || name.equals("arraycontained")
+                    || name.equals("arrayoverlap")) return DataType.BOOLEAN;
             // The set-returning calls, whose row type is the type of the column the query gets.
             // Described as text they decoded as strings, though pg_typeof already answered right.
             if (name.equals("regexp_matches")) return DataType.TEXT_ARRAY;

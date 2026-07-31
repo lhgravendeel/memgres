@@ -241,6 +241,16 @@ class FunctionEvaluator {
         return AstExecutor.pgTypeNameOf(value);
     }
 
+    /** An operand of the array containment functions, which take arrays and nothing else. */
+    private static List<?> asElementList(Object value, String functionName) {
+        if (value instanceof List<?>) return (List<?>) value;
+        throw new MemgresException("function " + functionName + "("
+                + AstExecutor.pgTypeNameOf(value) + ", " + AstExecutor.pgTypeNameOf(value)
+                + ") does not exist\n"
+                + "  Hint: No function matches the given name and argument types. "
+                + "You might need to add explicit type casts.", "42883");
+    }
+
     /** The element type of an argument that is already a proper array, or null. */
     private static String elementTypeNameOfArray(Object value) {
         if (!(value instanceof List<?>)) return null;
@@ -1595,6 +1605,7 @@ class FunctionEvaluator {
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
                 Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
                         elementTypeNameOf(elem));
+                if (arr == null) return null;
                 List<Object> result = new ArrayList<>();
                 if (arr instanceof List<?>) {
                     for (Object o : (List<?>) arr) {
@@ -1607,6 +1618,7 @@ class FunctionEvaluator {
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
                 Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
                         elementTypeNameOf(elem));
+                if (arr == null) return null;
                 int startPos = 1;
                 if (fn.args().size() > 2) {
                     Object startArg = executor.evalExpr(fn.args().get(2), ctx);
@@ -1624,6 +1636,7 @@ class FunctionEvaluator {
                 Object elem = executor.evalExpr(fn.args().get(1), ctx);
                 Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
                         elementTypeNameOf(elem));
+                if (arr == null) return null;
                 List<Object> positions = new ArrayList<>();
                 if (arr instanceof List<?>) {
                     List<?> la = (List<?>) arr;
@@ -1637,6 +1650,7 @@ class FunctionEvaluator {
                 Object oldVal = executor.evalExpr(fn.args().get(1), ctx);
                 Object arr = readArrayOperand(executor.evalExpr(fn.args().get(0), ctx),
                         elementTypeNameOf(oldVal));
+                if (arr == null) return null;
                 Object newVal = executor.evalExpr(fn.args().get(2), ctx);
                 List<Object> result = new ArrayList<>();
                 if (arr instanceof List<?>) {
@@ -1645,6 +1659,22 @@ class FunctionEvaluator {
                     }
                 }
                 return result;
+            }
+            case "arraycontains":
+            case "arraycontained":
+            case "arrayoverlap": {
+                requireArgs(fn, 2);
+                Object leftVal = executor.evalExpr(fn.args().get(0), ctx);
+                Object rightVal = executor.evalExpr(fn.args().get(1), ctx);
+                Object left = readArrayOperand(leftVal, elementTypeNameOfArray(rightVal));
+                Object right = readArrayOperand(rightVal, elementTypeNameOfArray(leftVal));
+                if (left == null || right == null) return null;
+                List<?> la = asElementList(left, name);
+                List<?> ra = asElementList(right, name);
+                if (name.equals("arrayoverlap")) return BinaryOpEvaluator.arrayOverlaps(la, ra);
+                return name.equals("arraycontains")
+                        ? BinaryOpEvaluator.arrayContainsAll(la, ra)
+                        : BinaryOpEvaluator.arrayContainsAll(ra, la);
             }
             case "__similar_to_escape__": {
                 // SIMILAR TO with ESCAPE: __similar_to_escape__(str, pattern, escape_char)

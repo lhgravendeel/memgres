@@ -1864,7 +1864,6 @@ class SelectExecutor {
         if (stmt.targets() != null) {
             for (SelectStmt.SelectTarget t : stmt.targets()) {
                 rejectSrfWhereOneBooleanIsWanted(t.expr());
-                rejectSrfInFilter(t.expr());
                 MemgresException conditional = conditionalHidingSrf(t.expr());
                 if (conditional != null) throw conditional;
             }
@@ -1876,24 +1875,6 @@ class SelectExecutor {
         if (expr == null) return;
         List<FunctionCallExpr> found = collectSrfCalls(expr);
         if (!found.isEmpty()) throw misplacedSrf(clause, found.get(0));
-    }
-
-    /**
-     * FILTER selects which rows an aggregate accumulates, so only an aggregate may carry one.
-     * PostgreSQL names the function rather than the clause, because what is wrong is the call.
-     */
-    private void rejectSrfInFilter(Expression expr) {
-        Object found = AstWalk.findFirst(expr, node -> node instanceof FunctionCallExpr
-                && ((FunctionCallExpr) node).filter() != null
-                && SRF_FUNCTIONS.contains(FunctionEvaluator.stripSchemaPrefix(
-                        ((FunctionCallExpr) node).name().toLowerCase())));
-        if (found == null) return;
-        String name = FunctionEvaluator.stripSchemaPrefix(
-                ((FunctionCallExpr) found).name().toLowerCase());
-        MemgresException e = new MemgresException(
-                "FILTER specified, but " + name + " is not an aggregate function", "42809");
-        e.setPositionToken(name);
-        throw e;
     }
 
     /**

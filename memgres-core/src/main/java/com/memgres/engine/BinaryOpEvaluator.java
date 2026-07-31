@@ -1962,7 +1962,7 @@ class BinaryOpEvaluator {
      * PG array containment (@>): every element of sub must equal some element of sup.
      * NULL elements never match anything, so a sub containing NULL is never contained.
      */
-    private static boolean arrayContainsAll(List<?> sup, List<?> sub) {
+    static boolean arrayContainsAll(List<?> sup, List<?> sub) {
         List<Object> supFlat = leafElements(sup);
         for (Object o : leafElements(sub)) {
             if (o == null) return false; // NULL never equals anything
@@ -1980,7 +1980,7 @@ class BinaryOpEvaluator {
      * PG array overlap (&&): true if the arrays share any non-NULL element.
      * NULL elements never match anything.
      */
-    private static boolean arrayOverlaps(List<?> a, List<?> b) {
+    static boolean arrayOverlaps(List<?> a, List<?> b) {
         Set<String> as = new HashSet<>();
         for (Object o : leafElements(a)) {
             if (o != null) as.add(o.toString());
