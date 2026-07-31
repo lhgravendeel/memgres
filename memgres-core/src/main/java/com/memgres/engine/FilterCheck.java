@@ -4,6 +4,7 @@ import com.memgres.engine.parser.ast.Expression;
 import com.memgres.engine.parser.ast.FunctionCallExpr;
 import com.memgres.engine.parser.ast.WindowFuncExpr;
 
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -47,10 +48,20 @@ final class FilterCheck {
      *
      * <p>The walk is the reflective one, so it reaches every expression position in the statement
      * — including the ones inside sub-queries and CTEs, which is where PostgreSQL raises this too.
+     *
+     * <p>PostgreSQL reaches this complaint last, so before it is raised the call is put through
+     * the analysis that comes first: its arguments are resolved, then its FILTER predicate, which
+     * is coerced to boolean, and only then is the function itself looked up. Each of those can
+     * report a fault of its own, and PostgreSQL reports that one instead. {@code scope} is what
+     * makes that possible and is null wherever the query level's relations are not resolved yet,
+     * in which case the call is refused on its name alone as before.
      */
-    static void reject(SelectExecutor select, Object root) {
+    static void reject(SelectExecutor select, Object root, QueryLevelScope scope) {
         Object found = AstWalk.findFirst(root, node -> carriesRefusedFilter(select, node));
         if (found == null) return;
+        if (scope != null && QueryLevelScope.isOwnLevel(root, found)) {
+            reportEarlierFault(select, scope, found);
+        }
         String name = nameOf(found);
         MemgresException e = new MemgresException(
                 clauseOf(found) + " specified, but " + name + " is not an aggregate function",
@@ -60,6 +71,22 @@ final class FilterCheck {
         int dot = name.indexOf('.');
         e.setPositionToken(dot > 0 ? name.substring(0, dot) : name);
         throw e;
+    }
+
+    /**
+     * Whatever PostgreSQL would have complained about before it got this far: an argument naming a
+     * column that is not there, then the same in the FILTER predicate, then a predicate that is not
+     * a condition, then a call whose argument types resolve to no function of that name.
+     */
+    private static void reportEarlierFault(SelectExecutor select, QueryLevelScope scope,
+                                           Object found) {
+        List<Expression> args = found instanceof FunctionCallExpr
+                ? ((FunctionCallExpr) found).args() : ((WindowFuncExpr) found).args();
+        for (Expression arg : args) scope.rejectUnresolvedColumns(arg);
+        Expression filter = filterOf(found);
+        scope.rejectUnresolvedColumns(filter);
+        if (filter != null) scope.rejectNonBooleanFilter(filter);
+        scope.rejectUnresolvableCall(found, QueryLevelScope.bareName(nameOf(found)));
     }
 
     private static boolean carriesRefusedFilter(SelectExecutor select, Object node) {
@@ -81,13 +108,17 @@ final class FilterCheck {
         // 42883, not a complaint about abs not being an aggregate. Built-ins answer to pg_catalog
         // and nothing else; anything a user declared is looked for by name.
         int dot = rawName.lastIndexOf('.');
+        // The lexer folds an unquoted name and leaves a quoted one as written, so a name that
+        // still carries a capital was written in quotes. "ABS" is not abs and resolves to no
+        // built-in at all, and PostgreSQL reports the missing function rather than the FILTER.
+        String written = rawName.substring(dot + 1);
         if (dot > 0) {
             String qualifier = rawName.substring(0, dot).toLowerCase(Locale.ROOT);
             return "pg_catalog".equals(qualifier)
-                    ? BuiltinFunctionNames.contains(bare)
+                    ? BuiltinFunctionNames.contains(written)
                     : select.hasUserFunction(bare);
         }
-        return BuiltinFunctionNames.contains(bare) || select.hasUserFunction(bare);
+        return BuiltinFunctionNames.contains(written) || select.hasUserFunction(bare);
     }
 
     /** The clause PostgreSQL names in the message: FILTER when there is one, else DISTINCT. */

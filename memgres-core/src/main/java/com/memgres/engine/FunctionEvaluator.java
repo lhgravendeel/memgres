@@ -262,9 +262,9 @@ class FunctionEvaluator {
     }
 
     Object evalFunction(FunctionCallExpr fn, RowContext ctx) {
-        String name = fn.name().toLowerCase();
-        // Strip schema prefixes for built-in function resolution
-        name = stripSchemaPrefix(name);
+        String name = foldedName(fn.name());
+        // Strip a schema prefix that names the schema the function is really in
+        name = stripCallableSchemaPrefix(name);
 
         // Reject DEFAULT as a function argument; PG gives 42601 (syntax error)
         for (Expression arg : fn.args()) {
@@ -3693,6 +3693,44 @@ class FunctionEvaluator {
             return name.substring("pg_catalog.".length());
         }
         if (name.startsWith("information_schema.")) {
+            return name.substring("information_schema.".length());
+        }
+        return name;
+    }
+
+    /**
+     * The name to resolve a call by, with a qualifier removed only where it names the schema the
+     * function is really in.
+     *
+     * <p>A qualifier is part of the call, not decoration on it: {@code pg_catalog.abs(1)} is abs
+     * because abs lives in pg_catalog, and {@code information_schema.abs(1)} is a function that
+     * does not exist, which is what PostgreSQL says. information_schema holds only its own
+     * helpers, every one of them named {@code _pg_*}, so those keep resolving through it and
+     * nothing else does.
+     *
+     * <p>Separate from {@link #stripSchemaPrefix}, which the placement checks use to classify a
+     * name rather than to resolve one, and which must keep answering for both prefixes.
+     */
+    /**
+     * The name a call resolves by. The lexer folds an unquoted identifier and leaves a quoted one
+     * as written, so a name that still carries a capital was written in quotes: {@code "ABS"} is
+     * not abs, and PostgreSQL finds no function of that name at all. Folding it anyway answered a
+     * call PostgreSQL refuses. A name the user declared is looked for as written first, so a
+     * function created under a quoted mixed-case name keeps working.
+     */
+    private String foldedName(String written) {
+        String folded = written.toLowerCase(Locale.ROOT);
+        if (written.equals(folded)) return folded;
+        if (executor.database.getFunction(written) != null) return folded;
+        if (executor.database.getFunction(folded) != null) return folded;
+        return written;
+    }
+
+    static String stripCallableSchemaPrefix(String name) {
+        if (name.startsWith("pg_catalog.")) {
+            return name.substring("pg_catalog.".length());
+        }
+        if (name.startsWith("information_schema._pg_")) {
             return name.substring("information_schema.".length());
         }
         return name;
