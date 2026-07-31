@@ -679,7 +679,9 @@ class CatalogConstraintBuilder {
             int relOid = oids.oid("rel:public." + relName);
             table.insertRow(new Object[]{
                     oids.oid("rule:" + ruleName + "_" + relName), ruleName, relOid,
-                    ruleEventType(entry.getValue()[2]), "O", "t".equals(entry.getValue()[3]),
+                    ruleEventType(entry.getValue()[2]),
+                    database.getRuleEnabledState(ruleName, relName),
+                    "t".equals(entry.getValue()[3]),
                     null, null, 1
             });
         }
@@ -896,7 +898,7 @@ class CatalogConstraintBuilder {
             // Resolve trigger function OID from pg_proc
             int tgfoid = oids.oid("proc:" + first.getFunctionName());
 
-            String tgenabled = first.isDisabled() ? "D" : "O";
+            String tgenabled = first.getEnabledState();
             String whenCondition = first.getWhenClause();
             table.insertRow(new Object[]{
                     oids.oid("trig:" + trigSchema + "." + first.getTableName() + "." + first.getName()),

@@ -9,6 +9,7 @@ import com.memgres.engine.parser.ast.FunctionCallExpr;
 import com.memgres.engine.parser.ast.Literal;
 import com.memgres.engine.parser.ast.SelectStmt;
 import com.memgres.engine.parser.ast.SubqueryExpr;
+import com.memgres.engine.parser.ast.UnaryExpr;
 import com.memgres.engine.util.Cols;
 
 import java.util.Set;
@@ -151,6 +152,36 @@ public final class DdlDefinitionChecks {
                 case BOOLEAN: return "boolean";
                 // A bare string literal is still of type unknown and coerces to boolean.
                 default: return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The type a DEFAULT expression plainly has, where that is decidable without a full type
+     * resolver: a cast names its type, and a literal that is not the untyped string kind carries
+     * one of its own. An integer literal's type follows its magnitude, the way PostgreSQL's lexer
+     * settles it — {@code 2147483648} is a bigint, not an integer.
+     *
+     * <p>Returns null when the type is not decidable here, which leaves the caller to judge the
+     * expression by what it evaluates to rather than guessing.
+     */
+    public static String defaultExpressionTypeName(Expression expr, Object value) {
+        if (expr instanceof CastExpr) {
+            DataType dt = DataType.fromPgName(baseTypeName(((CastExpr) expr).typeName()));
+            boolean isArray = ((CastExpr) expr).typeName() != null
+                    && ((CastExpr) expr).typeName().replaceAll("\\(.*\\)", "").trim().endsWith("[]");
+            return dt == null || isArray ? null : dt.toRegtypeDisplay();
+        }
+        if (expr instanceof UnaryExpr && ((UnaryExpr) expr).op() == UnaryExpr.UnaryOp.NEGATE) {
+            return defaultExpressionTypeName(((UnaryExpr) expr).operand(), value);
+        }
+        if (expr instanceof Literal) {
+            switch (((Literal) expr).literalType()) {
+                case INTEGER: return runtimeTypeName(value);
+                case FLOAT: return "numeric";
+                case BOOLEAN: return "boolean";
+                default: return null; // a bare string literal is still of type unknown
             }
         }
         return null;

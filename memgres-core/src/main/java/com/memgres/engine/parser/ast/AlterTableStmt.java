@@ -569,22 +569,40 @@ public final class AlterTableStmt implements Statement {
         public String triggerName() { return triggerName; }
     }
 
+    /**
+     * ENABLE [REPLICA | ALWAYS] TRIGGER name. The state is the {@code pg_trigger.tgenabled} code
+     * the form asks for: {@code O} origin (the plain ENABLE), {@code R} replica, {@code A} always.
+     */
         public static final class EnableTrigger implements AlterAction {
         public final String triggerName;
-        public EnableTrigger(String triggerName) { this.triggerName = triggerName; }
+        public final String state;
+        public EnableTrigger(String triggerName) { this(triggerName, "O"); }
+        public EnableTrigger(String triggerName, String state) {
+            this.triggerName = triggerName;
+            this.state = state;
+        }
         public String triggerName() { return triggerName; }
+        public String state() { return state; }
     }
 
-    /** ENABLE RULE name (enabled=true) or DISABLE RULE name (enabled=false). */
+    /**
+     * ENABLE [REPLICA | ALWAYS] RULE name or DISABLE RULE name. The state is the
+     * {@code pg_rewrite.ev_enabled} code: {@code O}, {@code R}, {@code A} or {@code D}.
+     */
         public static final class SetRuleEnabled implements AlterAction {
         public final String ruleName;
-        public final boolean enabled;
+        public final String state;
         public SetRuleEnabled(String ruleName, boolean enabled) {
+            this(ruleName, enabled ? "O" : "D");
+        }
+        public SetRuleEnabled(String ruleName, String state) {
             this.ruleName = ruleName;
-            this.enabled = enabled;
+            this.state = state;
         }
         public String ruleName() { return ruleName; }
-        public boolean enabled() { return enabled; }
+        public String state() { return state; }
+        /** Whether the rule still fires in an ordinary (origin) session under this state. */
+        public boolean enabled() { return "O".equals(state) || "A".equals(state); }
     }
 
     /** SET LOGGED (logged=true) or SET UNLOGGED (logged=false). */
@@ -616,24 +634,32 @@ public final class AlterTableStmt implements Statement {
         }
     }
 
+    /**
+     * The ALTER TABLE forms that describe on-disk layout and so have nothing to change in an
+     * in-memory database. {@code reloptions} says whether the form was the storage-parameter list
+     * {@code SET (name = value, ...)}, which is the one PostgreSQL refuses on a partitioned table.
+     */
         public static final class SetStorageParams implements AlterAction {
-        public SetStorageParams() {}
+        public final boolean reloptions;
+        public SetStorageParams() { this(false); }
+        public SetStorageParams(boolean reloptions) { this.reloptions = reloptions; }
+        public boolean reloptions() { return reloptions; }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
-            return true;
+            return reloptions == ((SetStorageParams) o).reloptions;
         }
 
         @Override
         public int hashCode() {
-            return 0;
+            return reloptions ? 1 : 0;
         }
 
         @Override
         public String toString() {
-            return "SetStorageParams[]";
+            return "SetStorageParams[reloptions=" + reloptions + "]";
         }
     }
         public static final class OwnerTo implements AlterAction {

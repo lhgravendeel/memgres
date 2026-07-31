@@ -427,7 +427,49 @@ public final class CatalogHelper {
             else if (col.getEnumTypeName() != null) typeName = col.getEnumTypeName();
             return def + "::" + typeName;
         }
-        return def;
+        String folded = foldCastOfLiteral(def);
+        return folded != null ? folded : def;
+    }
+
+    /** {@code 'literal'::typename} written as a column default, split into its two parts. */
+    private static final java.util.regex.Pattern CAST_OF_LITERAL =
+            java.util.regex.Pattern.compile("^'((?:[^']|'')*)'::\\s*([A-Za-z_][A-Za-z0-9_ ]*(?:\\[])?)$");
+
+    /**
+     * How PostgreSQL reports a cast of a literal, which is not how it was written.
+     *
+     * <p>Parse analysis turns {@code '7'::int} into a constant of the target type, and
+     * {@code pg_get_expr} then prints that constant. A constant is printed bare when reading the
+     * printed text back gives the same type again, which is true of {@code integer} and
+     * {@code boolean} and of nothing else here — {@code '7'::bigint} still reads as an integer, so
+     * it keeps its label. The label itself is the type's canonical name, so {@code int[]} is
+     * reported as {@code integer[]}.
+     *
+     * @return the reported form, or null when the default is not a cast of a literal
+     */
+    private static String foldCastOfLiteral(String def) {
+        java.util.regex.Matcher m = CAST_OF_LITERAL.matcher(def.trim());
+        if (!m.matches()) return null;
+        String literal = m.group(1);
+        String written = m.group(2).trim();
+        boolean isArray = written.endsWith("[]");
+        DataType dt = DataType.fromPgName(isArray
+                ? written.substring(0, written.length() - 2).trim() : written);
+        if (dt == null) return null;
+        if (!isArray && dt == DataType.INTEGER) {
+            try {
+                return String.valueOf(Integer.parseInt(literal.trim()));
+            } catch (NumberFormatException e) {
+                return null; // not a value of the type; leave the default as written
+            }
+        }
+        if (!isArray && dt == DataType.BOOLEAN) {
+            String v = literal.trim().toLowerCase();
+            if ("t".equals(v) || "true".equals(v)) return "true";
+            if ("f".equals(v) || "false".equals(v)) return "false";
+            return null;
+        }
+        return "'" + literal + "'::" + pgTypeName(dt) + (isArray ? "[]" : "");
     }
 
     /**

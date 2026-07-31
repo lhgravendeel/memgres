@@ -571,18 +571,23 @@ class DdlAlterTableExecutor {
             table.setParentTable(null);
         } else if (action instanceof AlterTableStmt.DisableTrigger) {
             AlterTableStmt.DisableTrigger dt = (AlterTableStmt.DisableTrigger) action;
-            setTriggerEnabled(table, dt.triggerName(), true);
+            setTriggerEnabled(table, dt.triggerName(), "D");
         } else if (action instanceof AlterTableStmt.EnableTrigger) {
             AlterTableStmt.EnableTrigger et = (AlterTableStmt.EnableTrigger) action;
-            setTriggerEnabled(table, et.triggerName(), false);
+            setTriggerEnabled(table, et.triggerName(), et.state());
         } else if (action instanceof AlterTableStmt.SetRuleEnabled) {
             AlterTableStmt.SetRuleEnabled sr = (AlterTableStmt.SetRuleEnabled) action;
-            if (!executor.database.setRuleEnabled(sr.ruleName(), stmt.table(), sr.enabled())) {
+            if (!executor.database.setRuleEnabledState(sr.ruleName(), stmt.table(), sr.state())) {
                 throw new MemgresException("rule \"" + sr.ruleName() + "\" for relation \""
                         + stmt.table() + "\" does not exist", "42704");
             }
         } else if (action instanceof AlterTableStmt.SetStorageParams) {
-            // no-op
+            // A partitioned table holds no rows of its own, so there is no storage for a storage
+            // parameter to describe and PostgreSQL refuses the form outright.
+            if (((AlterTableStmt.SetStorageParams) action).reloptions() && isPartitioned(table)) {
+                throw new MemgresException(
+                        "cannot specify storage parameters for a partitioned table", "42809");
+            }
         } else if (action instanceof AlterTableStmt.SetLogged) {
             AlterTableStmt.SetLogged sl = (AlterTableStmt.SetLogged) action;
             table.setUnlogged(!sl.logged());
@@ -812,6 +817,45 @@ class DdlAlterTableExecutor {
         }
     }
 
+    /** True when the table is the parent of a partition hierarchy, whether or not it has any yet. */
+    private static boolean isPartitioned(Table table) {
+        return table.getPartitionStrategy() != null || !table.getPartitions().isEmpty();
+    }
+
+    /**
+     * {@code 42P16} for a constraint the whole hierarchy has to carry, written with ONLY on a
+     * table that has children. PostgreSQL names the way out in the hint rather than in the
+     * message, because the statement is right apart from the one keyword.
+     */
+    private static MemgresException onlyOnParent() {
+        MemgresException e = new MemgresException(
+                "constraint must be added to child tables too", "42P16");
+        e.setHint("Do not specify the ONLY keyword.");
+        return e;
+    }
+
+    /**
+     * A NOT NULL written on a partitioned parent alone would let a partition hold a null the
+     * parent's own declaration forbids, and every row of a partition is a row of the parent.
+     * Ordinary inheritance is looser — a child there is a table in its own right — and
+     * PostgreSQL accepts ONLY on an inheritance parent for this one.
+     */
+    private static void rejectOnlyNotNullOnPartitioned(Table table, AlterTableStmt stmt) {
+        if (stmt.only() && !table.getPartitions().isEmpty()) throw onlyOnParent();
+    }
+
+    /**
+     * A partition always carries its parent's constraints, so a constraint declared NO INHERIT on
+     * a partitioned table asks for something the hierarchy cannot express. Ordinary inheritance
+     * can express it, and PostgreSQL accepts it there.
+     */
+    private static void rejectNoInheritOnPartitioned(TableConstraint tc, Table table,
+                                                     String tableName) {
+        if (tc == null || !tc.noInherit() || !isPartitioned(table)) return;
+        throw new MemgresException("cannot add NO INHERIT constraint to partitioned table \""
+                + tableName + "\"", "42P16");
+    }
+
     /** The relations that mirror this table's column list: inheritance children and partitions. */
     private static List<Table> childRelations(Table table) {
         List<Table> out = new ArrayList<>(table.getChildren());
@@ -826,15 +870,58 @@ class DdlAlterTableExecutor {
      * {@code attinhcount}; here it is reconstructed by looking up the ancestor chain, which is
      * equivalent because a child always carries every one of its parent's columns.
      */
-    private static boolean isInheritedColumn(Table table, String column) {
-        for (Table parent = parentOf(table); parent != null; parent = parentOf(parent)) {
+    private boolean isInheritedColumn(Table table, String column) {
+        for (Table parent : ancestorsOf(table)) {
             if (parent.getColumnIndex(column) >= 0) return true;
         }
         return false;
     }
 
-    private static Table parentOf(Table table) {
-        return table.getParentTable() != null ? table.getParentTable() : table.getPartitionParent();
+    /**
+     * Every table this one inherits from, at any depth. A table written with
+     * {@code INHERITS (p1, p2)} keeps only the last of its parents in its own field, so the rest
+     * are found the way {@code pg_inherits} is read — from the parent's side.
+     */
+    private List<Table> ancestorsOf(Table table) {
+        List<Table> found = new ArrayList<>();
+        List<Table> frontier = new ArrayList<>();
+        frontier.add(table);
+        while (!frontier.isEmpty()) {
+            List<Table> next = new ArrayList<>();
+            for (Table t : frontier) {
+                for (Table parent : directParentsOf(t)) {
+                    if (parent == table || containsIdentity(found, parent)) continue;
+                    found.add(parent);
+                    next.add(parent);
+                }
+            }
+            frontier = next;
+        }
+        return found;
+    }
+
+    /** The tables this one directly inherits from or is a partition of. */
+    private List<Table> directParentsOf(Table table) {
+        List<Table> out = new ArrayList<>();
+        if (table.getParentTable() != null) out.add(table.getParentTable());
+        if (table.getPartitionParent() != null
+                && !containsIdentity(out, table.getPartitionParent())) {
+            out.add(table.getPartitionParent());
+        }
+        for (Schema sch : executor.database.getSchemas().values()) {
+            for (Table candidate : sch.getTables().values()) {
+                if (candidate == table || containsIdentity(out, candidate)) continue;
+                if (containsIdentity(childRelations(candidate), table)) out.add(candidate);
+            }
+        }
+        return out;
+    }
+
+    private static boolean containsIdentity(List<Table> tables, Table target) {
+        for (Table t : tables) {
+            if (t == target) return true;
+        }
+        return false;
     }
 
     /**
@@ -919,6 +1006,13 @@ class DdlAlterTableExecutor {
         if (isInheritedColumn(table, dropCol.column())) {
             throw new MemgresException("cannot drop inherited column \""
                     + dropCol.column() + "\"", "42P16");
+        }
+        // A partition holds exactly the parent's columns, so dropping one from the parent alone
+        // would leave the two disagreeing about a shape they are required to share.
+        if (stmt.only() && !table.getPartitions().isEmpty()) {
+            throw new MemgresException(
+                    "cannot drop column from only the partitioned table when partitions exist",
+                    "42P16");
         }
         // Check for dependent generated columns
         String colNameLower = dropCol.column().toLowerCase();
@@ -1125,6 +1219,7 @@ class DdlAlterTableExecutor {
             rejectDefaultOnGeneratedColumn(table, alterCol.column(), stmt.table());
             table.alterColumnDefault(alterCol.column(), null);
         } else if (alterCol.action() instanceof AlterTableStmt.SetNotNull) {
+            rejectOnlyNotNullOnPartitioned(table, stmt);
             int colIdx = table.getColumnIndex(alterCol.column());
             if (colIdx >= 0) {
                 for (Object[] row : table.getRows()) {
@@ -1252,8 +1347,43 @@ class DdlAlterTableExecutor {
         return def != null && def.startsWith("__identity__");
     }
 
+    /**
+     * ALTER COLUMN ... TYPE, over the whole inheritance hierarchy the column belongs to.
+     *
+     * <p>A column a table gets from a parent is the parent's column: PostgreSQL refuses to retype
+     * it on the child alone, because the two would then disagree about the same column and a read
+     * through the parent would find the child holding another type. The change has to be made on
+     * the table that declares the column, and from there it reaches every descendant — which is
+     * also why ONLY is refused on a table that has children.
+     */
     private void executeSetType(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetType setType,
                                  Table table, AlterTableStmt stmt, String schemaName) {
+        if (table.getColumnIndex(alterCol.column()) >= 0) {
+            if (isInheritedColumn(table, alterCol.column())) {
+                throw new MemgresException("cannot alter inherited column \""
+                        + alterCol.column() + "\"", "42P16");
+            }
+            if (stmt.only() && !childRelations(table).isEmpty()) {
+                throw new MemgresException("type of inherited column \"" + alterCol.column()
+                        + "\" must be changed in child tables too", "42P16");
+            }
+        }
+        retypeColumn(alterCol, setType, table, stmt.table(), schemaName);
+        propagateSetType(alterCol, setType, table, schemaName);
+    }
+
+    /** Apply the same retype to every descendant that carries the column. */
+    private void propagateSetType(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetType setType,
+                                  Table table, String schemaName) {
+        for (Table child : childRelations(table)) {
+            if (child.getColumnIndex(alterCol.column()) < 0) continue;
+            retypeColumn(alterCol, setType, child, child.getName(), schemaName);
+            propagateSetType(alterCol, setType, child, schemaName);
+        }
+    }
+
+    private void retypeColumn(AlterTableStmt.AlterColumn alterCol, AlterTableStmt.SetType setType,
+                              Table table, String tableName, String schemaName) {
         String baseType = setType.typeName().replaceAll("\\(.*\\)", "").replace("[]", "").trim();
         // Extract the new type's typmod (precision/scale) so it replaces the old column's —
         // e.g. ALTER COLUMN capacity TYPE numeric(10, 2) must set precision 10 / scale 2, or
@@ -1294,7 +1424,7 @@ class DdlAlterTableExecutor {
         }
         int colIdx = table.getColumnIndex(alterCol.column());
         if (colIdx < 0) {
-            throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + stmt.table() + "\" does not exist", "42703");
+            throw new MemgresException("column \"" + alterCol.column() + "\" of relation \"" + tableName + "\" does not exist", "42703");
         }
         // The column is looked up before the target type's modifier is resolved, so a retype of a
         // column that is not there is reported as that. ADD COLUMN checks the same limits through
@@ -1331,7 +1461,7 @@ class DdlAlterTableExecutor {
         for (Database.ViewDef view : executor.database.getViews().values()) {
             String viewSql = view.sourceSQL() != null ? view.sourceSQL().toLowerCase()
                     : (view.query() != null ? view.query().toString().toLowerCase() : "");
-            String tblPattern = "\\b" + java.util.regex.Pattern.quote(stmt.table().toLowerCase()) + "\\b";
+            String tblPattern = "\\b" + java.util.regex.Pattern.quote(tableName.toLowerCase()) + "\\b";
             if (java.util.regex.Pattern.compile(tblPattern).matcher(viewSql).find()) {
                 boolean usesWildcard = viewSql.contains("*") || viewSql.contains("wildcard");
                 String colPattern = "\\b" + java.util.regex.Pattern.quote(alterCol.column().toLowerCase()) + "\\b";
@@ -1343,7 +1473,7 @@ class DdlAlterTableExecutor {
         // Check for index dependencies
         if (currentType != dt && setType.usingExpr() == null) {
             String colNameLower = alterCol.column().toLowerCase();
-            String checkTable = schemaName + "." + stmt.table();
+            String checkTable = schemaName + "." + tableName;
             for (Map.Entry<String, java.util.List<String>> idxEntry : executor.database.getIndexColumns().entrySet()) {
                 java.util.List<String> idxCols = idxEntry.getValue();
                 String indexMetaTable = executor.database.getIndexTable(idxEntry.getKey());
@@ -1383,7 +1513,7 @@ class DdlAlterTableExecutor {
         // The indexes are rebuilt from the new values, so a conversion that maps two rows onto
         // one value breaks a unique index, and one that yields a null breaks NOT NULL.
         rejectRewriteThatBreaksColumn(table, alterCol.column(), convertedValues,
-                stmt.table(), schemaName);
+                tableName, schemaName);
         Object[] oldValues = new Object[rowCount];
         for (int ri = 0; ri < rowCount; ri++) oldValues[ri] = table.getRows().get(ri)[convIdx];
         table.alterColumnType(alterCol.column(), dt, newPrecision, newScale, newEnumTypeName, newArrayElementType);
@@ -1521,18 +1651,42 @@ class DdlAlterTableExecutor {
     }
 
     /**
-     * Confirm the evaluated default is storable in the column. Which error that is depends on the
-     * expression: a bare string literal is of type unknown, so a bad one is invalid input for the
-     * column's type, while an expression that already has a type is a type mismatch instead.
+     * Confirm the column could hold what the default expression produces.
+     *
+     * <p>PostgreSQL judges the default's <em>type</em>, not its value: it looks for an assignment
+     * cast from the expression's type to the column's, and records the default when one exists.
+     * Whether the particular value fits is settled later, at the insert that takes the default —
+     * which is why {@code SET DEFAULT 2147483648} on an integer column is accepted and the first
+     * row to rely on it fails with {@code 22003} instead. Refusing the ALTER turns SQL PostgreSQL
+     * runs into an error, so the range is deliberately not consulted here.
+     *
+     * <p>A bare string literal is still of type {@code unknown}: it has no type of its own to
+     * cast from, so it is read as a value of the column's type at once and a bad one is invalid
+     * input syntax. Its length is not judged either — a too-long literal is stored and the insert
+     * reports {@code 22001}, as PostgreSQL does.
      */
     private void checkDefaultFits(Object value, Column col, String columnName, Expression expr) {
+        DataType target = col.getType();
+        if (target == null) return;
+        String declared = DdlDefinitionChecks.defaultExpressionTypeName(expr, value);
+        if (declared != null) {
+            if (!TypeCoercion.assignableFrom(declared, target)) {
+                throw PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
+                        + target.toRegtypeDisplay()
+                        + " but default expression is of type " + declared);
+            }
+            return; // the cast exists; the value is the insert's business
+        }
+        // Read the value as one of the column's base type, with the declared length and precision
+        // left out: those constrain what a row may hold, not what a default may say.
         try {
-            TypeCoercion.coerceForStorage(value, col);
+            TypeCoercion.coerceForStorage(value, col.withType(target, null, null,
+                    col.getEnumTypeName(), col.getArrayElementType()));
         } catch (MemgresException e) {
             String exprType = DdlDefinitionChecks.runtimeTypeName(value);
             if (exprType != null && !DdlDefinitionChecks.isUntypedLiteral(expr)) {
                 throw PgErrors.datatypeMismatch("column \"" + columnName + "\" is of type "
-                        + col.getType().toRegtypeDisplay()
+                        + target.toRegtypeDisplay()
                         + " but default expression is of type " + exprType);
             }
             throw e;
@@ -1710,6 +1864,25 @@ class DdlAlterTableExecutor {
     private void executeAddConstraint(AlterTableStmt.AddConstraint addConstraint, Table table,
                                        AlterTableStmt stmt, String schemaName) {
         TableConstraint.ConstraintType addedType = addConstraint.constraint().type();
+        rejectNoInheritOnPartitioned(addConstraint.constraint(), table, stmt.table());
+        // A CHECK written on the parent belongs to the whole hierarchy: a child that does not
+        // carry it could hold a row the parent's own rule rejects, and reading the hierarchy
+        // through the parent would return it. NO INHERIT says the constraint was never meant to
+        // travel, so ONLY is not a contradiction there.
+        if (addedType == TableConstraint.ConstraintType.CHECK
+                && !addConstraint.constraint().noInherit()
+                && stmt.only() && !childRelations(table).isEmpty()) {
+            throw onlyOnParent();
+        }
+        if (addedType == TableConstraint.ConstraintType.NOT_NULL) {
+            rejectOnlyNotNullOnPartitioned(table, stmt);
+        }
+        if (addedType == TableConstraint.ConstraintType.FOREIGN_KEY
+                && stmt.only() && isPartitioned(table)) {
+            throw new MemgresException("cannot use ONLY for foreign key on partitioned table \""
+                    + stmt.table() + "\" referencing relation \""
+                    + addConstraint.constraint().referencesTable() + "\"", "42809");
+        }
         if (addedType == TableConstraint.ConstraintType.PRIMARY_KEY) {
             rejectKeyOnVirtualColumn(table, addConstraint.constraint().columns(), "primary keys");
         } else if (addedType == TableConstraint.ConstraintType.UNIQUE) {
@@ -2224,19 +2397,19 @@ class DdlAlterTableExecutor {
         return parentRow;
     }
 
-    private void setTriggerEnabled(Table table, String triggerName, boolean disabled) {
+    private void setTriggerEnabled(Table table, String triggerName, String state) {
         List<PgTrigger> triggers = executor.database.getTriggersForTable(table.getName());
         // ALL and USER are group selectors, not names, and match nothing without complaint.
         if ("ALL".equalsIgnoreCase(triggerName) || "USER".equalsIgnoreCase(triggerName)) {
             for (PgTrigger t : triggers) {
-                t.setDisabled(disabled);
+                t.setEnabledState(state);
             }
             return;
         }
         boolean found = false;
         for (PgTrigger t : triggers) {
             if (t.getName().equalsIgnoreCase(triggerName)) {
-                t.setDisabled(disabled);
+                t.setEnabledState(state);
                 found = true;
             }
         }
