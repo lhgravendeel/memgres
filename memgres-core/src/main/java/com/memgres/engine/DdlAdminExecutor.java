@@ -628,6 +628,9 @@ class DdlAdminExecutor {
         executor.resolveTable(executor.defaultSchema(), s.table());
         checkRuleDefinition(s);
         String joined = String.join(Database.RULE_ACTION_SEPARATOR, s.commands());
+        // DO ALSO NOTHING and DO NOTHING are rules that do nothing, not rules whose action is the
+        // word NOTHING. Registering the word made the next write try to run it as a statement.
+        if ("NOTHING".equalsIgnoreCase(joined.trim())) joined = "";
         // Store INSTEAD NOTHING rules for enforcement
         if ("INSTEAD".equals(s.action()) && "NOTHING".equals(s.command())) {
             executor.database.addRule(s.table(), s.event(), "INSTEAD_NOTHING");

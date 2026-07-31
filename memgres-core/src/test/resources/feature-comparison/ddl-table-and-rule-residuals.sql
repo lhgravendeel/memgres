@@ -560,3 +560,86 @@ DROP TABLE IF EXISTS btr_gi2 CASCADE;
 DROP TABLE IF EXISTS btr_gi CASCADE;
 DROP TABLE IF EXISTS btr_lk2 CASCADE;
 DROP TABLE IF EXISTS btr_lk CASCADE;
+
+-- ============================================================================
+-- A rule must not change what the write itself may say
+-- ============================================================================
+-- The rule machinery works out NEW.col by evaluating the statement's own
+-- assignments. It did that against a row of the target table alone, so an
+-- assignment reading one of the other relations the statement brought in could
+-- not be resolved and an ordinary UPDATE ... FROM answered 42P01 as soon as the
+-- relation carried a rule. The assignments are now worked out by the same query
+-- that finds the rows, which can see everything the statement can.
+DROP TABLE IF EXISTS trr_t CASCADE;
+DROP TABLE IF EXISTS trr_o CASCADE;
+DROP TABLE IF EXISTS trr_log CASCADE;
+CREATE TABLE trr_t (id int PRIMARY KEY, a int);
+CREATE TABLE trr_o (id int PRIMARY KEY, b int);
+CREATE TABLE trr_log (m text);
+INSERT INTO trr_t VALUES (1,1),(2,2);
+INSERT INTO trr_o VALUES (1,50),(2,60);
+CREATE RULE trr_ru AS ON UPDATE TO trr_t DO ALSO INSERT INTO trr_log VALUES ('u');
+CREATE RULE trr_rd AS ON DELETE TO trr_t DO ALSO INSERT INTO trr_log VALUES ('d');
+
+UPDATE trr_t SET a = o.b FROM trr_o o WHERE o.id = trr_t.id;
+
+-- begin-expected
+-- columns: id, a
+-- row: 1, 50
+-- row: 2, 60
+-- end-expected
+SELECT id::text AS id, a::text AS a FROM trr_t ORDER BY id;
+
+-- How many times an action that names neither OLD nor NEW runs for a multi-row
+-- statement is a separate question from this one, and the two engines still
+-- differ on it, so only that the rule fired at all is asserted here.
+-- begin-expected
+-- columns: fired
+-- row: true
+-- end-expected
+SELECT (count(*) > 0)::text AS fired FROM trr_log WHERE m = 'u';
+
+-- the alias forms too
+UPDATE trr_t AS x SET a = 7 WHERE x.id = 1;
+
+-- begin-expected
+-- columns: a
+-- row: 7
+-- end-expected
+SELECT a::text AS a FROM trr_t WHERE id = 1;
+
+DELETE FROM trr_t AS x WHERE x.id = 2;
+
+-- begin-expected
+-- columns: n
+-- row: 1
+-- end-expected
+SELECT count(*)::text AS n FROM trr_t;
+
+DELETE FROM trr_t USING trr_o o WHERE o.id = trr_t.id;
+
+-- begin-expected
+-- columns: n
+-- row: 0
+-- end-expected
+SELECT count(*)::text AS n FROM trr_t;
+
+-- a rule that does nothing is a rule whose action list is empty, not one whose
+-- action is the word NOTHING
+DROP TABLE IF EXISTS trr_n CASCADE;
+CREATE TABLE trr_n (id int PRIMARY KEY, a int);
+INSERT INTO trr_n VALUES (1,1);
+CREATE RULE trr_rn AS ON UPDATE TO trr_n DO ALSO NOTHING;
+
+UPDATE trr_n SET a = 2 WHERE id = 1;
+
+-- begin-expected
+-- columns: a
+-- row: 2
+-- end-expected
+SELECT a::text AS a FROM trr_n WHERE id = 1;
+
+DROP TABLE IF EXISTS trr_n CASCADE;
+DROP TABLE IF EXISTS trr_t CASCADE;
+DROP TABLE IF EXISTS trr_o CASCADE;
+DROP TABLE IF EXISTS trr_log CASCADE;

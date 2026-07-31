@@ -2986,8 +2986,11 @@ class DmlExecutor {
                                   List<InsertStmt.SetClause> setClauses, QueryResult.Type tagType,
                                   String qualification, String alias,
                                   List<SelectStmt.FromItem> extraFrom) {
-        QueryResult affected = selectAffectedRows(tableName, alias, extraFrom, where);
-        List<Column> cols = affected.getColumns();
+        QueryResult affected = selectAffectedRows(tableName, alias, extraFrom, where, setClauses);
+        // The assignments were projected after the relation's own columns, so the row carries the
+        // old values first and what each assignment would make after them.
+        int setCount = setClauses == null ? 0 : setClauses.size();
+        List<Column> cols = affected.getColumns().subList(0, affected.getColumns().size() - setCount);
         Table rowShape = new Table(tableName, cols);
         String[] actions = Database.ruleActions(ruleSql);
         int[] actionCounts = new int[actions.length];
@@ -3014,9 +3017,9 @@ class DmlExecutor {
                     Object oldVal = row[i];
                     Object newVal = oldVal;
                     if (setClauses != null) {
-                        for (InsertStmt.SetClause set : setClauses) {
-                            if (set.column().equalsIgnoreCase(colName)) {
-                                newVal = executor.evalExpr(set.value(), rowCtx);
+                        for (int sc = 0; sc < setClauses.size(); sc++) {
+                            if (setClauses.get(sc).column().equalsIgnoreCase(colName)) {
+                                newVal = row[cols.size() + sc];
                                 break;
                             }
                         }
@@ -3138,10 +3141,20 @@ class DmlExecutor {
      * 42P01 "missing FROM-clause entry" as soon as the relation carried a rule.
      */
     private QueryResult selectAffectedRows(String tableName, String alias,
-                                           List<SelectStmt.FromItem> extraFrom, Expression where) {
-        List<SelectStmt.SelectTarget> targets = Cols.listOf(
-                new SelectStmt.SelectTarget(
-                        new WildcardExpr(null, null, alias != null ? alias : tableName), null));
+                                           List<SelectStmt.FromItem> extraFrom, Expression where,
+                                           List<InsertStmt.SetClause> setClauses) {
+        List<SelectStmt.SelectTarget> targets = new ArrayList<>();
+        targets.add(new SelectStmt.SelectTarget(
+                new WildcardExpr(null, null, alias != null ? alias : tableName), null));
+        // Each assignment is worked out by the same query that finds the rows, so NEW.col is the
+        // value the statement would write even when the expression reads one of the other
+        // relations the statement brought in. Evaluating it per row against the target's columns
+        // alone could not see those, and an UPDATE ... FROM under a rule failed with 42P01.
+        if (setClauses != null) {
+            for (InsertStmt.SetClause set : setClauses) {
+                targets.add(new SelectStmt.SelectTarget(set.value(), null));
+            }
+        }
         List<SelectStmt.FromItem> from = new ArrayList<>();
         from.add(new SelectStmt.TableRef(null, tableName, alias));
         if (extraFrom != null) from.addAll(extraFrom);
